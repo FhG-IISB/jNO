@@ -703,6 +703,25 @@ jax.grad(loss)(theta)
 # preconditioner rather than loosening the tolerance.
 ```
 
+!!! warning "Where the refusal surfaces — dispatch is asynchronous"
+    The gate is evaluated *inside* the traced solve, and reports through a host callback. JAX
+    dispatch is asynchronous, so that callback has typically not run when the solve returns: the
+    refusal appears only once something materialises the result. Measured on the same failing solve,
+    the raise reaches the caller on the CPU backend (callbacks run inline) and is swallowed into a log
+    line on GPU.
+
+    So the failure is **recorded** first and raised at a boundary that is guaranteed to exist:
+
+    | you called | when it raises |
+    |---|---|
+    | `fem.solve(...)` | at the call — the result is materialised and the gate drained before returning |
+    | an eager `jno.solve.cg()(A, b)` | at the call, same way |
+    | your own `jax.jit` / `jax.grad` around a solve | jNO has no post-execution hook there. The failure is recorded, and the raise from the callback is best-effort — it lands on some backends and not others |
+
+    The last row is a real limit, not an oversight: once the solve is inside *your* transform, the
+    library gets no callback after it executes. If you need certainty there, materialise inside the
+    transform-free part and let `fem.solve` do the checking.
+
 !!! measured "Why the adjoint gets its own check"
     The adjoint is the half nothing used to check. `lax.custom_linear_solve`'s `transpose_solve` had
     no convergence test, and the eager test on the forward solve is a no-op under tracers — so the

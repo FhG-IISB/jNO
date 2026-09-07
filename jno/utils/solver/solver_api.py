@@ -245,26 +245,80 @@ def gate_suspended():
         _GATE_SUSPENDED = prev
 
 
-def _raise_unconverged(rel, who: str, side: str):
-    """Host side of :func:`residual_gate` -- raises so a bad solve cannot be mistaken for a good one."""
-    rel = float(rel)
-    if np.isfinite(rel) and rel <= _GATE_RTOL:
-        return
-    if side == "forward":
-        advice = (
-            "The problem may be singular/ill-posed or need a preconditioner: try jno.solve.lu(), a "
-            "precond= spec, or your own solve_fn."
-        )
-    else:
-        advice = (
+#: Convergence failures seen by a TRACED :func:`residual_gate`, drained by :func:`raise_if_gate_failed`
+#: at the eager boundary. Raising from inside the callback instead is not reliable: measured, the same
+#: refusal propagates on the CPU backend and is SWALLOWED into a log line on GPU, so the residual
+#: firewall was silently off on the platform this library targets for real work. Recording is
+#: platform-independent; the raise happens where a Python exception is guaranteed to land.
+_GATE_FAILURES: list = []
+
+
+def _gate_message(rel: float, who: str, side: str) -> str:
+    advice = (
+        "The problem may be singular/ill-posed or need a preconditioner: try jno.solve.lu(), a "
+        "precond= spec, or your own solve_fn."
+        if side == "forward"
+        else (
             "This is the ADJOINT (transpose) solve, not the forward one -- the solution itself is "
             "fine and only the GRADIENT is affected. A Krylov method can break down on A^T where it "
             "converges on A, so reach for a transposable-robust inner solver (jno.solve.gmres(), "
             "jno.solve.lu()) or a preconditioner rather than loosening the tolerance."
         )
-    raise RuntimeError(
-        f"{who} did not solve the system: relative residual {rel:.1e} against a {_GATE_RTOL:g} gate. {advice}"
     )
+    return f"{who} did not solve the system: relative residual {rel:.1e} against a {_GATE_RTOL:g} gate. {advice}"
+
+
+def _record_unconverged(rel, who: str, side: str):
+    """Callback side of a TRACED gate: record FIRST, then raise.
+
+    Both, because neither alone is enough. Raising from inside a ``jax.debug.callback`` propagates in
+    some configurations and is swallowed into a log line in others -- measured on the very same
+    refusal, it reaches the caller on the CPU backend and does not on GPU, which left the residual
+    firewall silently off on the platform this library targets for real work. So the failure is
+    recorded before the raise is attempted, and :func:`raise_if_gate_failed` drains it at the eager
+    boundary for the cases where the raise is lost.
+
+    Where the raise DOES propagate it is strictly better -- it lands at the failing solve rather than
+    at the end of the enclosing ``fem.solve``, and it is the only signal available under a caller's
+    own ``jax.grad``, where jNO has no post-execution hook to drain from.
+
+    Re-checks the residual on the host rather than trusting the branch it was reached from: ``vmap``
+    turns the ``lax.cond`` below into a ``select`` that runs both branches, so under a batch this is
+    reached on converged solves too, and must record nothing there.
+    """
+    rel = float(rel)
+    if np.isfinite(rel) and rel <= _GATE_RTOL:
+        return
+    msg = _gate_message(rel, who, side)
+    _GATE_FAILURES.append(msg)
+    raise RuntimeError(msg)
+
+
+def clear_gate_failures():
+    """Drop anything recorded by an earlier solve, so a drain cannot report a stale failure."""
+    _GATE_FAILURES.clear()
+
+
+def raise_if_gate_failed():
+    """Raise if a traced solve recorded a convergence failure. Call once the result is CONCRETE.
+
+    The callback fires while the compiled program runs, so the caller must have materialised the
+    result (``jax.block_until_ready``) before draining, or the failure may not have been recorded yet.
+    """
+    if not _GATE_FAILURES:
+        return
+    msgs = list(_GATE_FAILURES)
+    _GATE_FAILURES.clear()
+    extra = f" ({len(msgs)} failures; first shown)" if len(msgs) > 1 else ""
+    raise RuntimeError(msgs[0] + extra)
+
+
+def _raise_unconverged(rel, who: str, side: str):
+    """Host side of an EAGER gate -- raises directly, since a concrete call has a caller to raise to."""
+    rel = float(rel)
+    if np.isfinite(rel) and rel <= _GATE_RTOL:
+        return
+    raise RuntimeError(_gate_message(rel, who, side))
 
 
 def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
@@ -304,7 +358,7 @@ def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
     jax.lax.cond(
         jnp.isfinite(rel) & (rel <= _GATE_RTOL),
         lambda _r: None,
-        lambda r: jax.debug.callback(_raise_unconverged, r, who, side),
+        lambda r: jax.debug.callback(_record_unconverged, r, who, side),
         rel,
     )
     return x
@@ -384,7 +438,19 @@ class LinearSolver:
         # preconditioner that is not the one asked for.
         if M is not None and hasattr(M, "materialize"):
             M = materialize_precond(M, PrecondContext(op, None))
-        return self._fn(op, b, M=M, x0=x0)
+        prior = len(_GATE_FAILURES)
+        x = self._fn(op, b, M=M, x0=x0)
+        # An EAGER call is a boundary where a Python exception has somewhere to land, so drain the
+        # traced gate here. The block is the point: dispatch is asynchronous, so `residual_gate`'s
+        # callback has typically not run yet when this returns, and the refusal it raises surfaces
+        # only once something materialises the result. That is why the same failing solve raised on
+        # the CPU backend (callbacks run inline) and returned a plausible-but-wrong vector on GPU.
+        # Skipped when the result is traced -- nothing has executed and there is nothing to drain.
+        if not _GATE_SUSPENDED and not isinstance(x, jax.core.Tracer):
+            jax.block_until_ready(x)
+            if len(_GATE_FAILURES) > prior:
+                raise_if_gate_failed()
+        return x
 
     def __eq__(self, other):
         if self.key is None or not isinstance(other, LinearSolver) or other.key is None:

@@ -1695,8 +1695,10 @@ class FEM:
             import time as _time
 
             from .utils.solver.newton_krylov import LAST_NEWTON_STATS
+            from .utils.solver.solver_api import clear_gate_failures, raise_if_gate_failed
 
             LAST_NEWTON_STATS.clear()
+            clear_gate_failures()  # so this solve cannot be blamed for an earlier one's failure
             t0 = _time.perf_counter()
             result = _run()
             self._stats = {
@@ -1718,6 +1720,16 @@ class FEM:
                     self._stats["amgx_cache"] = {"size": gpu.get("size"), "capacity": gpu.get("capacity")}
                 except Exception:  # noqa: BLE001 -- observability must never fail a solve
                     pass
+            # A TRACED residual_gate records rather than raises -- raising from inside the callback
+            # propagates on the CPU backend and is swallowed into a log line on GPU, which left the
+            # firewall silently off on the platform that matters. Drain it here, where there is a
+            # caller to raise to. `block_until_ready` first: the callback fires while the compiled
+            # program runs, so an un-materialised result may not have recorded yet. Only on a
+            # CONCRETE result -- under an outer jit/grad/vmap the solve returns a tracer, nothing has
+            # run, and there is nothing to drain (the limitation is documented in docs/solvers.md).
+            if not any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(result)):
+                jax.block_until_ready(result)
+                raise_if_gate_failed()
             return result
 
         if not profile:  # profile=True: run the (eager) solve inside a JAX Perfetto trace + print a summary
