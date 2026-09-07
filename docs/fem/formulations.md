@@ -66,9 +66,50 @@ velocity = sol[st.blocks[st.block_index(u)]]
 ### What the fluid path is verified to do — and what it is not
 
 Scope first, since it is not obvious from the API: jNO's FEM fluid path is **laminar incompressible**
-flow and nothing else. There is no turbulence model (no RANS, no LES), no compressible or Euler path,
+flow. There is no RANS model (no k–ε, no k–ω SST, no wall functions), no compressible or Euler path,
 no free surface / VOF / level set, and no fluid–structure interaction. Nothing about `jno.fem` stops
 you writing those terms; nothing in the library implements or verifies them.
+
+The one qualification is **algebraic (zero-equation) LES**, below: a subgrid eddy viscosity is a
+formula of the resolved velocity gradient, so it is written in the term list like any other
+coefficient. Those formulas are checked against a textbook oracle in 2-D and 3-D, and run inside a
+Newton solve in the [LES subgrid tutorial](../tutorials/08-fem-and-varpinns/les-subgrid-3d.md) — where
+Vreman and WALE vanish in simple shear (1.1e-6 and 2.0e-19 of `nu`) while Smagorinsky reports 8.0e-2.
+They are still *not* a validated LES capability: that needs a turbulent benchmark against DNS
+(wall-resolved channel, decaying isotropic turbulence), which this library has not run.
+
+#### Subgrid eddy viscosity — a formula, not an API
+
+> Worked end to end, on two flows and with the failure modes measured, in the
+> [LES subgrid tutorial](../tutorials/08-fem-and-varpinns/les-subgrid-3d.md).
+
+An algebraic LES model adds `ν_t(∇u)` to the molecular viscosity. It needs no new API: the filter
+width is `d.cell_size` (or `d.cell_metric` if you want it direction-aware), and the model is
+arithmetic on `grad(u)`. Vreman (*Phys. Fluids* **16** (2004) 3670, eq. 5), written through
+invariants so it reads the same in 2-D and 3-D:
+
+```python
+g     = grad(u, ax)
+tr_b  = delta**2 * inner(g, g, n_contract=2)                       # tr(beta),  beta = delta^2 g gᵀ
+tr_b2 = delta**4 * einsum("...ik,...jk,...jl,...il->...", g, g, g, g)   # tr(beta^2)
+B     = where(0.5 * (tr_b**2 - tr_b2) > 0, 0.5 * (tr_b**2 - tr_b2), 0.0)
+nu_t  = jno.lag(0.07 * sqrt(B / (inner(g, g, n_contract=2) + 1e-30) + 1e-30))
+
+mom = (MU / RHO + nu_t) * inner(g, grad(v, ax), n_contract=2) + ...   # into the viscous term
+```
+
+!!! danger "Three things that will bite, all measured"
+    * **`ν_t` must be lagged.** It is a square root, so its slope at `u = 0` is infinite and Newton
+      diverges from a rest state outright. `jno.lag` freezes it within each linearisation — the same
+      treatment a Carman–Kozeny drag needs.
+    * **Clamp the invariant.** `B_β` and WALE's `S_d:S_d` are non-negative in exact arithmetic but are
+      computed as a *difference of nearly equal numbers*. Measured in pure shear: `B_β` lands at
+      1.4e-20 where it should be 0, from a relative cancellation of 2.7e-16. Unclamped, one round-off
+      excursion below zero is not a small error — `sqrt` and `**1.5` return **NaN**.
+    * **Smagorinsky does not vanish in laminar shear**, and that is a modelling defect, not a detail:
+      `|S|` is non-zero in any shear, so it invents eddy viscosity throughout a laminar boundary layer
+      and needs Van Driest damping. Vreman and WALE (Nicoud & Ducros, *Flow Turb. Combust.* **62**
+      (1999) 183) vanish identically there. `tests/test_fem_les.py` pins exactly that difference.
 
 Within that scope, measured rather than asserted:
 
@@ -90,10 +131,16 @@ Two ceilings worth knowing before you plan a run:
   (0.60 s at 9.1k) and then turns over sharply — 4.02 s at 18.5k, i.e. roughly `O(N^2.7)`. That puts
   the practical ceiling for `lu()` around 30–60k DOF; past it use the block/Schur preconditioners in
   `jno.precond` (verified in 3-D), or `lu(backend="pardiso"/"cudss")`.
-* **No stabilisation.** There is no SUPG/GLS/grad-div term in the library, so convection-dominated
-  flow is unaddressed. The cavity tutorial sits at Re = 200; the practical ceiling for unstabilised
-  P2/P1 is somewhere in the low hundreds and has not been measured. `dom.cell_size` gives you the
-  element size `h` if you want to write a stabilised form yourself.
+* **Stabilisation is a formula, not a feature.** SUPG / PSPG / grad-div are terms you write in the
+  term list, and the two pieces they need are there: `jno.np.laplacian` accepts a **vector** field
+  (the momentum strong residual carries `nu*lap(u)`), and `dom.cell_metric` gives the element metric
+  `G = J^-T J^-1` that a direction-aware `tau` is built on (`dom.cell_size` is isotropic and cannot
+  see a stretched cell). Verified: SUPG cuts the upstream oscillation of a Peclet-1000 transport
+  problem by 3300x, and PSPG makes **equal-order P1/P1** flow converge (Kovasznay, observed rates
+  1.78 velocity / 1.70 pressure, a 4.3x better pressure than unstabilised) — see the
+  [stabilised-flow tutorial](../tutorials/08-fem-and-varpinns/navier-stokes-stabilised-2d.md).
+  What is **not** settled: the grad-div/LSIC coefficient made both errors worse at Re = 20 and is
+  left uncalibrated, and no unstabilised-P2/P1 Reynolds ceiling has been measured.
 * **Higher-order Lagrange** — `order=k` gives degree-`k` elements (P2, P3, P4, … on triangles and tets);
   read the solution at `fem.points`. The geometry stays affine-P1 (straight-sided), so on a *curved*
   boundary the geometric error caps the observed order regardless of `k` — measure high-order convergence

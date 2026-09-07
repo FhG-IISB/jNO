@@ -3396,8 +3396,46 @@ class domain(MeshIOMixin):
         if "cell_size" not in self.context:
             # Placeholder so the Variable constructs; the real per-cell h is packed at assembly time
             # (jno/utils/solver/fem_native.py) and overrides this everywhere it is actually used.
-            self.context["cell_size"] = np.ones((1, 1), dtype=default_np_float_dtype())
+            # NEGATIVE on purpose: an element size is strictly positive, so a path that packs no h is
+            # unmistakable. It used to be `ones`, which read as a silent h = 1.0 off the native path.
+            self.context["cell_size"] = np.full((1, 1), -1.0, dtype=default_np_float_dtype())
         return Variable(tag="cell_size", dim=[0, 1], domain=self, axis="spatial")
+
+    @property
+    def cell_metric(self):
+        """Element **metric tensor** ``G = J⁻ᵀJ⁻¹`` as a symbol usable directly in a weak form.
+
+        The covariant metric of the reference→physical map, ``G_ij = Σ_k (∂ξ_k/∂x_i)(∂ξ_k/∂x_j)``,
+        resolved per quadrature point as a ``(dim, dim)`` tensor. It carries units of ``1/length²``
+        and, unlike :attr:`cell_size`, it sees **direction**: on a stretched boundary-layer cell the
+        streamwise and wall-normal entries differ, which is exactly what a stabilization parameter
+        needs there.
+
+        This is the ``G`` of the residual-based stabilization literature — the SUPG/PSPG τ of
+        Tezduyar & Osawa, *CMAME* **190** (2000) §3::
+
+            G     = dom.cell_metric
+            gG    = lambda a: inner(a, inner(G, a, n_contract=1), n_contract=1)   # aᵀG a
+            tau_m = ((2/dt)**2 + gG(ub) + 36*nu**2 * inner(G, G, n_contract=2)) ** -0.5
+            tau_c = 1.0 / (trace(G) * tau_m)
+
+        ``trace(G)`` (the last two axes) and ``inner(G, G, n_contract=2)`` (``G:G``) both read
+        naturally, since the tensor's quadrature axis leads.
+
+        Contrast :attr:`cell_size`, which is ``|det J|^(1/dim)`` — an isotropic SIZE that cannot see
+        stretch at all: a sliver and a regular element of the same area share it.
+
+        Resolved on the **native 2-D/3-D assembler's volume terms** only, like ``cell_size``. Pure
+        geometry (constant w.r.t. the unknown), so differentiable assembly is unaffected; it *is*
+        differentiable in the mesh coordinates. Every other path (1-D, non-nodal, boundary facets,
+        PINN/collocation) raises rather than quietly reading the placeholder.
+        """
+        if "cell_metric" not in self.context:
+            # Placeholder so the Variable constructs. It is (1, 1) -- rank 2 -- while a packed metric is
+            # always rank 3, `(n_quad, dim, dim)`. The reader keys on that, so a path that packs no
+            # metric fails loudly rather than quietly reading a value that is not one.
+            self.context["cell_metric"] = np.zeros((1, 1), dtype=default_np_float_dtype())
+        return Variable(tag="cell_metric", dim=[0, int(self.dimension)], domain=self, axis="spatial")
 
     # ------------------------------------------------------------------
     # Per-cell mesh geometry as trace nodes (differentiable in the mesh)

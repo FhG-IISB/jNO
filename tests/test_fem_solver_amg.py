@@ -183,3 +183,108 @@ def test_two_amg_hierarchies_do_not_share_a_compilation():
         ref = np.asarray(fem.solve(linear=jno.solve.lu()))
         got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10, maxiter=5000), precond=spec))
         assert np.abs(got - ref).max() < 1e-8
+
+
+def test_amg_refuses_an_indefinite_operator_instead_of_building_a_dead_hierarchy():
+    """Smoothed aggregation assumes a POSITIVE diagonal -- its strength-of-connection graph and its
+    smoothers both do. Handed an operator with negative diagonal entries it does not fail: it builds a
+    degenerate hierarchy whose coarsest operator is NaN, or exactly zero. A zero coarse matrix has a
+    perfectly good pseudo-inverse, so the V-cycle silently contributes nothing and the only symptom is
+    an outer Krylov that converges slowly for no visible reason.
+
+    Measured on the velocity block of a Navier-Stokes Newton tangent: 213 of 538 diagonal entries
+    negative, coarse operator all zeros. Notably this is NOT about non-symmetry (that block is 1.9%
+    non-symmetric), nor about Reynolds number, nor about the field being vector-valued -- AMG handles
+    vector elasticity to 1e-11.
+    """
+    pytest.importorskip("pyamg")
+    import numpy as _np
+
+    n = 40
+    A = _np.diag(2.0 * _np.ones(n)) - _np.diag(_np.ones(n - 1), 1) - _np.diag(_np.ones(n - 1), -1)
+    A[: n // 2] *= -1.0  # flip half the rows -> half the diagonal goes negative
+    spec = jno.precond.amg()
+    with pytest.raises(ValueError, match="negative diagonal"):
+        spec.build(A)
+
+
+def _cavity_velocity_block(re, lagged, mesh_size=0.16):
+    """The velocity block of a Navier-Stokes tangent, linearised two ways.
+
+    `jno.lag` on the CONVECTING velocity is the Picard (Oseen) linearisation: the tangent then loses
+    the reaction term `(du.grad)u`, which is the indefinite one.
+    """
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    import numpy as _np
+    from shapely.geometry import box
+
+    inner_, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
+    nu = 1.0 / re
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    d.tag("lid", lambda x, y: y > 1 - 1e-9)
+    d.tag("wall", lambda x, y: (y < 1e-9) | (x < 1e-9) | (x > 1 - 1e-9))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("lid", split=True)
+    xw, yw, _ = d.variable("wall", split=True)
+    ub, vv = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    conv = inner_(gu, jno.lag(ub) if lagged else ub, n_contract=1)
+    mom = inner_(conv, vv, n_contract=1) + nu * inner_(gu, gv, n_contract=2) - pp * trace(gv)
+    fem = jno.fem(
+        [
+            mom,
+            -qq * trace(gu),
+            u(xl, yl)[0] - 16.0 * xl**2 * (1 - xl) ** 2,
+            u(xl, yl)[1] - 0.0,
+            u(xw, yw)[0] - 0.0,
+            u(xw, yw)[1] - 0.0,
+            p.pin(),
+        ]
+    )
+    sol = _np.asarray(
+        fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-9, atol=1e-9), linear=jno.solve.lu(backend="host"))
+    )
+    J = _np.asarray(fem._op.jacobian(sol).todense())
+    F = J[: fem.offsets[1], : fem.offsets[1]]
+    dg = _np.diag(F)
+    free = _np.abs(dg - 1.0) > 1e-12  # drop the Dirichlet identity rows
+    return F[_np.ix_(free, free)]
+
+
+@pytest.mark.slow
+def test_picard_keeps_the_momentum_block_definite_where_newton_does_not():
+    """**Which linearisation you pick decides whether the momentum block has a scalable preconditioner.**
+
+    The full Newton tangent carries the reaction term `(du.grad)u`, which is indefinite: measured, the
+    smallest eigenvalue of its symmetric part goes NEGATIVE by Re = 100 (-6.4e-04), and AMG degrades
+    with it (rel-resid 1.2e-03 at Re = 100, divergence by Re = 400). The Picard/Oseen block -- the
+    convecting velocity lagged with `jno.lag` -- stays positive-definite (+8.5e-04 at the same Re) and
+    AMG converges to 6.5e-11.
+
+    This is why the NS preconditioning literature builds on Picard rather than Newton, and it is the
+    reason `jno.precond.amg()` is usable on a momentum block at all.
+    """
+    import numpy as _np
+
+    newton = _cavity_velocity_block(100.0, lagged=False)
+    picard = _cavity_velocity_block(100.0, lagged=True)
+    ev_n = _np.linalg.eigvalsh((newton + newton.T) / 2).min()
+    ev_p = _np.linalg.eigvalsh((picard + picard.T) / 2).min()
+    assert ev_n < 0, f"the Newton tangent should be indefinite at Re=100, got min eig {ev_n:.3e}"
+    assert ev_p > 0, f"the Picard/Oseen block should stay definite, got min eig {ev_p:.3e}"
+
+    # and the consequence: AMG is usable on one and not the other
+    pyamg = pytest.importorskip("pyamg")
+    from jno.utils.solver.amg import _to_scipy_csr
+
+    resid = {}
+    for name, F in (("newton", newton), ("picard", picard)):
+        b = _np.random.default_rng(0).standard_normal(F.shape[0])
+        ml = pyamg.smoothed_aggregation_solver(_to_scipy_csr(F), max_levels=10, max_coarse=50)
+        x = ml.solve(b, tol=1e-10, maxiter=100)
+        resid[name] = float(_np.linalg.norm(F @ x - b) / _np.linalg.norm(b))
+    assert resid["picard"] < 1e-8, f"AMG must converge on the Oseen block, got {resid['picard']:.2e}"
+    assert resid["picard"] < resid["newton"] / 100.0, resid

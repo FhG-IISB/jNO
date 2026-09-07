@@ -1,5 +1,43 @@
 # Geometry, regions, and moving meshes
 
+## Mesh sizing — one number, or a function of position
+
+`size=` takes a float for a uniform mesh, or a **callable** for a graded one. A callable becomes a
+gmsh mesh-size callback and composes with every other size control by `min`, so it is the general
+"denser here" knob:
+
+```python
+# THREE arguments, in 2-D as well as 3-D: gmsh calls a size function as f(x, y, z).
+h_of = lambda x, y, z: H_FINE + (H_COARSE - H_FINE) * min(1.0, max(0.0, (LY - y) / BAND))
+d = jno.Shape.rect(0.0, 0.0, LX, LY, size=h_of).domain()
+```
+
+This is what makes a thin feature affordable. Measured on a 1.2 × 0.4 mm rectangle graded from 4 µm at
+the top surface to 30 µm below — the melt pool of the
+[laser melt-pool tutorial](../tutorials/08-fem-and-varpinns/melt-pool-laser.md), ~50 µm deep in a
+400 µm domain:
+
+| mesh | nodes | through the 50 µm feature |
+|---|---|---|
+| uniform 16 µm | 2,296 | 3 cells |
+| uniform 4 µm | 35,226 | 12 cells |
+| **graded 4 → 30 µm** | **2,035** | **12 cells** |
+
+Same near-surface resolution as the uniform 4 µm mesh for **17× fewer nodes** — and fewer nodes than
+the 16 µm mesh that resolved nothing.
+
+!!! danger "`f(x, y)` is the natural thing to write in 2-D, and it is wrong"
+    The callback passes three coordinates whatever the dimension. A two-argument function raises
+    inside gmsh's C callback, where it surfaced as `Wrong mesh element size lc = 0 (lcmin = 0,
+    lcmax = 1e+22)` — naming neither the callable, nor its signature, nor the shape it came from. And
+    whether it surfaced *at all* depended on gmsh's global state: the same wrong function raised in a
+    fresh process and meshed **silently** in one that had already built other meshes. jNO now probes
+    the callable once before registering it and refuses by name.
+
+!!! note "Meshing is lazy"
+    `.domain()` does not build a mesh; the first thing that asks for one does. So a size callable is
+    not called — and a wrong one not diagnosed — until then.
+
 ## Curved (isoparametric) geometry — `Shape.curved()`
 
 By default jNO meshes straight-sided and *synthesises* higher-order nodes at the straight-edge
