@@ -1135,6 +1135,12 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
             M = lambda x: inv * x  # noqa: E731
         return solver(op, rhs, M=M, x0=x0)
 
+    # A CAPABILITY FLAG, read with getattr at the call site -- same convention as `wants_jacobian` /
+    # `wants_project` on the nonlinear side. `linear_solve` is a documented extension point whose
+    # contract is `(matvec, rhs, x0, diag_fn) -> x`; passing `scale=` unconditionally broke every
+    # bring-your-own solver that implements exactly that signature (caught by the moving-mesh march,
+    # whose `_step_solve` takes the four documented arguments and nothing else).
+    step_solve.wants_scale = True
     return step_solve, None
 
 

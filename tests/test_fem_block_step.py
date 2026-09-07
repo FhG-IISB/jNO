@@ -197,3 +197,44 @@ def test_x64_step_tolerance_is_unchanged(monkeypatch, _x64):
     seen = _capture_krylov_kwargs(monkeypatch, block)
     assert seen["_dtype"] == jnp.float64, f"the x64 fixture did not take: {seen['_dtype']}"
     assert seen["tol"] == 1e-10, f"float64 behaviour changed: tol {seen['tol']:.3e} != 1e-10"
+
+
+def test_a_caller_supplied_linear_solve_takes_the_four_documented_arguments(_x64):
+    """`linear_solve` is an EXTENSION POINT, and its contract is `(matvec, rhs, x0, diag_fn) -> x`.
+
+    Regression. The BDF2 work needed the step solve to know the coefficient of A in `M + scale*A` --
+    a scheme may step at something other than the block's own theta*dt -- and `scale=` was added to
+    this call unconditionally. Every bring-your-own solver implementing exactly the four documented
+    arguments then died with
+
+        TypeError: _step_solve() got an unexpected keyword argument 'scale'
+
+    which is what the moving-mesh march does (its `_step_solve` swaps BiCGStab for GMRES on the
+    parametric branch). 40 tests in tests/test_fem_geometry_terms.py went red on CI and none locally,
+    because nothing in the suites touched by that work supplies its own linear solve.
+
+    `scale` is now opt-in through a `wants_scale` capability flag, the same convention the nonlinear
+    side already uses for `wants_jacobian` / `wants_project`.
+    """
+    fem = _heat()
+    block = fem.operator
+    seen = {"calls": 0}
+
+    def four_arg_solve(matvec, rhs, x0, diag_fn):
+        """Exactly the documented signature -- no `scale`, no `**kwargs` to absorb a surprise."""
+        seen["calls"] += 1
+        d = diag_fn()
+        inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
+        return jax.scipy.sparse.linalg.cg(matvec, rhs, x0=x0, M=lambda v: inv * v, tol=1e-12)[0]
+
+    u = jnp.asarray(block.state0)
+    t, dt = float(block.t0), float(block.dt)
+    for _ in range(round((block.t1 - block.t0) / dt)):
+        u = block.step(u, t, dt, linear_solve=four_arg_solve)
+        t += dt
+
+    assert seen["calls"] > 0, "the caller's solver was never reached"
+    pts = np.asarray(fem.points)
+    analytic = np.exp(-2.0 * np.pi**2 * block.t1) * np.sin(np.pi * pts[:, 0]) * np.sin(np.pi * pts[:, 1])
+    rel = float(np.linalg.norm(analytic - np.asarray(u)) / np.linalg.norm(analytic))
+    assert rel < 5e-2, f"the caller's solver produced a wrong march ({rel:.2e})"

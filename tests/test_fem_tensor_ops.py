@@ -24,12 +24,7 @@ import jax
 import numpy as np
 import pytest
 
-# x64 BEFORE `jno` is imported. The autouse fixture below still restores the setting for the rest of
-# the session, but flipping it only at test time leaves this module's einsum matrix products reading
-# 3e-33 where the answer is 1 -- silently, since the value is finite and small rather than NaN.
-jax.config.update("jax_enable_x64", True)
-
-import jno  # noqa: E402
+import jno
 
 inner_, grad, trace, sym, transpose, einsum = (
     jno.np.inner,
@@ -43,8 +38,6 @@ inner_, grad, trace, sym, transpose, einsum = (
 
 @pytest.fixture(autouse=True)
 def _x64():
-    import jax
-
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:

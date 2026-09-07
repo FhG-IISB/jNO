@@ -24,9 +24,7 @@ import jax
 import numpy as np
 import pytest
 
-jax.config.update("jax_enable_x64", True)
-
-import jno  # noqa: E402
+import jno
 
 inner_, grad, trace, sym, einsum, sqrt, where = (
     jno.np.inner,
@@ -45,6 +43,23 @@ inner_, grad, trace, sym, einsum, sqrt, where = (
 _clamp = lambda z: where(z > 0.0, z, 0.0)  # noqa: E731
 
 DELTA, CS, CV, CW = 0.1, 0.17, 0.07, 0.325
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """x64 per TEST, saved and restored -- never at module scope.
+
+    Setting it at import runs for every module in the selection and cannot be undone, which
+    tests/test_x64_isolation.py exists to forbid.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
 EPS = 1e-30
 
 

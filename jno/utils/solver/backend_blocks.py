@@ -255,7 +255,10 @@ class SemidiscreteTimeBlock:
         The defaults above are overridable — this is where ``fem.solve``'s solver slots plug in
         (see ``jno.utils.solver.solver_api.compose_transient_step_solvers``):
 
-        * ``linear_solve(matvec, rhs, x0, diag_fn, scale=…) -> x`` replaces the theta-step linear solve
+        * ``linear_solve(matvec, rhs, x0, diag_fn) -> x`` replaces the theta-step linear solve. A
+          solver that sets ``wants_scale = True`` additionally receives ``scale=`` (the coefficient
+          of A in ``M + scale*A``), which jNO's composed step solver uses to pick the right
+          pre-built operator when a scheme steps at something other than the block's theta*dt.
           (``matvec`` applies ``M + theta dt A``; ``diag_fn()`` is its exact diagonal; ``x0`` the
           previous state as warm start);
         * ``nonlinear_solve(G, u0) -> u`` replaces the per-step Newton solve.
@@ -373,7 +376,13 @@ class SemidiscreteTimeBlock:
             # step that is not the block's own theta*dt -- BDF2 uses 2dt/3, and an adaptive march
             # re-sizes dt every step -- and the composed solver needs it to build the RIGHT operator
             # rather than the block's default one.
-            return linear_solve(step_op, rhs, u, lambda: matrix_diagonal(M) + th * dt * matrix_diagonal(A), scale=th * dt)
+            _diag = lambda: matrix_diagonal(M) + th * dt * matrix_diagonal(A)  # noqa: E731
+            # `scale` is OPT-IN. The documented contract for a caller-supplied `linear_solve` is
+            # `(matvec, rhs, x0, diag_fn)`; only jNO's own composed step solver advertises that it can
+            # also take the step scale, so only it is handed one.
+            if getattr(linear_solve, "wants_scale", False):
+                return linear_solve(step_op, rhs, u, _diag, scale=th * dt)
+            return linear_solve(step_op, rhs, u, _diag)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + th * dt * matrix_diagonal(A)
         inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)

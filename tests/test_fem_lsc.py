@@ -231,34 +231,53 @@ def test_an_unknown_schur_is_refused_by_name():
         jno.precond.saddle(schur="pcd")
 
 
-def test_the_lsc_applier_depends_on_the_operator_it_was_built_for():
-    """LSC reads the OPERATOR, not just the FEM -- the velocity mass lump comes from ``op @ ones``.
+def test_lsc_captures_its_blocks_from_the_fem_not_from_the_outer_operator():
+    """`_capture` slices B, Bᵀ and F out of the FEM's OWN assembled operator
+    (`_fem_concrete_operator(fem)`), and lumps the velocity mass from a mass form it assembles
+    itself. The operator handed to `materialize` is not read for any of them.
 
-    This replaces a test called "a matrix-free operator is refused", which asserted only that the
-    call returned non-None. Two things were wrong with it: `_LSC` contains no refusal at all, so the
-    name described behaviour that does not exist; and `is not None` could not fail whatever the code
-    did. Its own docstring admitted the case it named was never built.
+    That matters: if LSC sliced whatever operator arrived instead, then on a composed or shifted
+    operator -- a Newton tangent, a transient step matrix M + dt A -- it would build the
+    preconditioner for the wrong system and still return plausible numbers.
 
-    What is true, and worth pinning, is that the applier is a function of the operator. If it ever
-    stopped reading the operator, an LSC built for one system would be silently reused for another --
-    a Newton tangent, or a transient step matrix M + dt A -- and would still return plausible numbers.
-    Here an identity stand-in of the same shape yields a demonstrably different applier."""
+    Two earlier versions of this test were wrong in opposite directions. The first asserted only
+    `materialize(...) is not None`, under a name ("a matrix-free operator is refused") describing a
+    refusal it never exercised. The second asserted the applier *depends* on the outer operator, on
+    the strength of two runs that differed numerically -- but the code plainly does not read it, and
+    that difference turned out to be an unstable computation: the same comparison is bit-identical on
+    the CPU backend and differs on GPU. So this pins the structural property, which is stable and is
+    what the code actually implements.
+    """
     fem, _u, pfield, _pp, _qq = _stokes()
-    blk = fem.blocks[fem.block_index(pfield)]
-    rng = np.random.default_rng(0)
-    x = jax.numpy.asarray(rng.standard_normal(blk.stop - blk.start))
+    spec = jno.precond.lsc()
+    spec.prepare(fem)
+    materialize_precond(spec, PrecondContext(LinearOperator(fem.A), fem))
 
-    def _apply(op):
-        spec = jno.precond.lsc()
-        spec.prepare(fem)
-        return np.asarray(materialize_precond(spec, PrecondContext(op, fem))(x))
+    s_u, s_p, _iu, _ip = spec._blocks
+    n_u, n_p = int(s_u.stop - s_u.start), int(s_p.stop - s_p.start)
+    assert spec._F.shape == (n_u, n_u), f"F must be the momentum block, got {spec._F.shape}"
+    assert spec._B.shape == (n_p, n_u), f"B must be the divergence block, got {spec._B.shape}"
+    assert spec._Bt.shape == (n_u, n_p), f"Bt must be its transpose block, got {spec._Bt.shape}"
+    assert spec._minv.shape == (n_u,), "the velocity mass lump is a vector over the momentum block"
+    assert np.isfinite(spec._minv).all() and (spec._minv > 0).all(), "a lumped mass must be positive"
 
-    real = _apply(LinearOperator(fem.A))
-    stand_in = _apply(LinearOperator.from_matvec(lambda v: v, shape=(fem.dofs, fem.dofs)))
 
-    assert np.isfinite(real).all() and np.abs(real).max() > 0, "the real applier must do something"
-    rel = np.abs(real - stand_in).max() / np.abs(real).max()
-    assert rel > 1e-3, f"the applier ignored the operator it was built for (relative change {rel:.2e})"
+def test_lsc_refuses_a_system_whose_blocks_cannot_be_extracted():
+    """The refusal at the heart of `_capture`: no assembled B/Bᵀ/F, no LSC. It names the fix.
+
+    Reached by handing `_capture` an operator with no sliceable blocks, which is what a matrix-free
+    system presents -- the case the original test named but never built."""
+    fem, _u, _p, _pp, _qq = _stokes()
+    spec = jno.precond.lsc()
+    spec.prepare(fem)
+
+    # `_capture` takes the FEM and slices its assembled operator. A matrix-free system presents as
+    # blocks that cannot be sliced out, which is what `_slice_bcoo` returning None means -- so that is
+    # what is injected, rather than hand-rolling a fake FEM that would only test the fake.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("jno.utils.solver.solver_api._slice_bcoo", lambda *a, **k: None)
+        with pytest.raises(NotImplementedError, match="matrix-free"):
+            spec._capture(fem)
 
 
 def test_lsc_never_densifies_the_operator():
