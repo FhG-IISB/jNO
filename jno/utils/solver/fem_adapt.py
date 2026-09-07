@@ -1336,7 +1336,7 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
             # `cell_size` (and a contact gap) are spatial Variables that name no region -- they are
             # geometry symbols from the domain context. Counting them made a criterion using
             # `dom.cell_size` resolve to a region literally called 'cell_size'.
-            if isinstance(tg, str) and (tg == "cell_size" or tg.startswith("gap_")):
+            if isinstance(tg, str) and (tg in ("cell_size", "cell_metric") or tg.startswith("gap_")):
                 continue
             if isinstance(tg, str) and tg not in found:
                 found.append(tg)
@@ -1388,7 +1388,7 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
             if getattr(var, "axis", None) != "spatial" or _var_region(var) != tags[0]:
                 continue
             _tg = getattr(var, "tag", None)
-            if isinstance(_tg, str) and (_tg == "cell_size" or _tg.startswith(("n_", "gap_"))):
+            if isinstance(_tg, str) and (_tg in ("cell_size", "cell_metric") or _tg.startswith(("n_", "gap_"))):
                 continue
             seen_axis.setdefault(int(getattr(var, "dim", [0])[0]), var)
         if len(seen_axis) >= dim:

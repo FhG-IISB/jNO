@@ -197,3 +197,86 @@ def test_shape_hessian_is_deferred_when_no_term_needs_it():
         assert np.all(np.isfinite(np.asarray(K.todense() if hasattr(K, "todense") else K)))
     finally:
         fem_native.identity_pushforward_hess = orig
+
+
+# --------------------------------------------------------------------------------------
+# VECTOR fields — the momentum strong residual of a stabilised flow needs `nu * lap(u)`
+# --------------------------------------------------------------------------------------
+def _vector_laplacian_K(order=2, mesh_size=0.4):
+    """``K_ij = ∫ Δu·Δv`` for a 2-component field, plus its node coords."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    xi, yi, _ = d.variable("interior", split=True)
+    u, phi = d.fem_symbols(value_shape=(2,), order=order)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([inner(laplacian(ui, [xi, yi]), laplacian(vi, [xi, yi]), n_contract=1)])
+    return _dense(fem.A), np.asarray(fem.points)
+
+
+def _interleave(c0, c1):
+    """Node-major, component-interleaved coefficients: dof = node*vec + component."""
+    c = np.zeros(2 * c0.size)
+    c[0::2], c[1::2] = c0, c1
+    return c
+
+
+def test_vector_laplacian_energy_2d():
+    """``cᵀK c = ∫|Δu|²`` for global quadratics: (x²,y²)⇒Δ=(2,2)⇒8, (x²,0)⇒4, (xy,xy)⇒0."""
+    K, pts = _vector_laplacian_K()
+    assert np.allclose(K, K.T, atol=1e-10)
+    x, y = pts[:, 0], pts[:, 1]
+    cases = [
+        (_interleave(x**2, y**2), 8.0, "(x^2, y^2)"),
+        (_interleave(x**2, 0 * y), 4.0, "(x^2, 0)"),
+        (_interleave(x * y, x * y), 0.0, "(xy, xy) null"),
+    ]
+    for c, exp, name in cases:
+        got = float(c @ K @ c)
+        assert abs(got - exp) < 1e-9, f"∫|Δu|² for {name}: got {got:.3e}, expect {exp}"
+
+
+def test_vector_laplacian_is_the_scalar_one_per_component():
+    """The decisive structural check: a vector field's components ride the SAME scalar basis, so the
+    assembled operator must be exactly ``K_scalar ⊗ I₂`` — same value on the matching component, zero
+    across components. A wrong identity expansion or DOF order fails here, not in an energy value."""
+    Kv, _ = _vector_laplacian_K()
+    Ks, _ = _laplacian_K(2, 2, 0.4)
+    n = Ks.shape[0]
+    assert Kv.shape == (2 * n, 2 * n)
+    np.testing.assert_allclose(Kv[0::2, 0::2], Ks, atol=1e-12)
+    np.testing.assert_allclose(Kv[1::2, 1::2], Ks, atol=1e-12)
+    assert float(np.max(np.abs(Kv[0::2, 1::2]))) < 1e-12, "components must not couple"
+
+
+def test_vector_full_hessian_energy_2d():
+    """``inner(hessian(u), hessian(v), n_contract=3)`` ⇒ ``∫ D²u ⋮ D²u``: (xy, x²) ⇒ 2 + 4 = 6."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
+    xi, yi, _ = d.variable("interior", split=True)
+    u, phi = d.fem_symbols(value_shape=(2,), order=2)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([inner(hessian(ui, [xi, yi]), hessian(vi, [xi, yi]), n_contract=3)])
+    K, pts = _dense(fem.A), np.asarray(fem.points)
+    assert np.allclose(K, K.T, atol=1e-10)
+    x, y = pts[:, 0], pts[:, 1]
+    for c0, c1, exp, name in [(x * y, x**2, 6.0, "(xy, x^2)"), (x**2, y**2, 8.0, "(x^2, y^2)")]:
+        got = float(_interleave(c0, c1) @ K @ _interleave(c0, c1))
+        assert abs(got - exp) < 1e-9, f"∫D²u:D²u for {name}: got {got:.3e}, expect {exp}"
+
+
+def test_p1_vector_hessian_is_identically_zero():
+    """A P1 vector Hessian is zero for the same reason the scalar one is — and must assemble, not raise."""
+    K, _ = _vector_laplacian_K(order=1)
+    assert float(np.max(np.abs(K))) < 1e-12
+
+
+@pytest.mark.parametrize("space", ["Hermite", "Argyris", "Morley"])
+def test_a_vector_field_on_a_c1_family_is_refused_by_name(space):
+    """The C1 families tag their shape data ``"Lagrange"`` (their M(cell) transform is baked in), so the
+    nodal-Lagrange guard does NOT exclude them — but their DOFs are scalar. Nothing upstream refuses a
+    vector spelling, so without this check the contraction mis-sizes the block instead of saying so."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.5)
+    xi, yi, _ = d.variable("interior", split=True)
+    u, phi = d.fem_symbols(value_shape=(2,), space=space)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    # The non-nodal path assembles eagerly, so the refusal lands at build -- like `space="N1E", order=2`.
+    with pytest.raises(NotImplementedError, match="hold SCALAR DOFs"):
+        jno.fem([inner(laplacian(ui, [xi, yi]), laplacian(vi, [xi, yi]), n_contract=1)])

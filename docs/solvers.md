@@ -110,9 +110,11 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.form([...terms], inner=…)` | an auxiliary operator assembled from ordinary traced terms | when you can write the preconditioner as a weak form |
 | `jno.precond.block_diag((field, spec), …)` | per-field composition over `fem.blocks` (also `triangular`) | multifield problems |
 | `jno.precond.saddle(mass_weight=…, laplace_weight=…)` | the standard saddle recipe as **one call** | Stokes / Biot — the common case |
+| `jno.precond.lsc()` / `saddle(schur="lsc")` | least-squares commutator — the **convection-aware** Schur factor | Navier–Stokes, where the pressure-mass recipe degrades with Re |
 | `jno.precond.amg(cycles=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `.cached(refresh=…)` | reuse an expensive setup across solves | Newton loops and transients, where the operator barely changes between solves |
+| `M1 + M2` / `M1 @ M2` | **arithmetic on specs** — applied in parallel and summed, or in sequence right-to-left | writing your own Schur approximation instead of asking for one |
 
 Every one of them is passed the same way — `fem.solve(precond=…)`, alongside whichever `linear=`
 solver it is accelerating. Nothing else about the problem changes:
@@ -179,6 +181,153 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
     system: 124 CG iterations for `jacobi`, 98 unpreconditioned, **46** for `nystrom(rank=20)`). **SPD
     only** — the sketch takes a Cholesky, so an indefinite operator gives NaN rather than a quiet wrong
     answer.
+
+### The momentum block: Picard, not Newton
+
+A block preconditioner needs an approximate `F⁻¹` on the momentum block, and which **linearisation**
+you pick decides whether one exists. The full Newton tangent carries the reaction term `(δu·∇)u`,
+which is indefinite — measured on a lid-driven cavity, the smallest eigenvalue of its symmetric part
+goes negative by Re = 100:
+
+| Re = 100 | min eig of sym(F) | AMG on that block |
+|---|---|---|
+| Newton tangent | **−6.4e-04** | rel-resid 1.2e-03, diverges by Re = 400 |
+| **Picard / Oseen** (`jno.lag` on the convecting velocity) | **+8.5e-04** | **6.5e-11** |
+
+Smoothed aggregation assumes a positive diagonal, so on the Newton tangent it builds a degenerate
+hierarchy — `jno.precond.amg()` now refuses that by name rather than returning a V-cycle that
+silently does nothing. Lag the convecting velocity and the block is definite and AMG-friendly. This
+is why the Navier–Stokes preconditioning literature builds on Picard.
+
+### Does it scale?
+
+3-D Stokes, lid-driven cube, `lu(backend="host")` against
+`fgmres + triangular((u, amg()), (p, lsc()))`, one 8 GB card:
+
+| DOFs | direct | iterative | |
+|---|---|---|---|
+| 15,468 | 2.1 s | 2.9 s | direct still wins |
+| 29,114 | 11.5 s | 4.6 s | 2.5× |
+| 49,072 | 53.3 s | 6.5 s | 8.2× |
+| 76,542 | 166.4 s | 11.4 s | **14.6×** |
+| 112,724 | 431.3 s | 52.0 s | 8.3× |
+
+The crossover is around 15–20k DOFs. Note what the direct solve is *not* doing: it does not run out of
+memory — it scales as roughly `O(N³)` in time and simply loses. Below the crossover it is the right
+choice and stays the default.
+
+### When the pressure mass is not enough
+
+`saddle()`'s pressure-mass Schur approximation stands in for the Schur complement of a **viscous**
+operator. Once convection dominates it degrades. Measured on the Newton tangent of a lid-driven
+cavity (812 DOFs, momentum block solved exactly so the count isolates the Schur factor):
+
+| Re | 10 | 50 | 100 | 400 | 1000 |
+|---|---|---|---|---|---|
+| `saddle()` pressure mass | 26 | 38 | 82 | **212** | 105 |
+| `lsc()` | 112 | 108 | 106 | **104** | 284 |
+
+Over Re = 10 → 400 the mass degrades **8×** while LSC is flat. The robustness **ends**: by Re = 1000
+LSC has jumped to 284 and the mass has (non-monotonically) improved, so LSC is no longer ahead. This
+is a result about a range, not an unconditional one. It is built from the system's own blocks —
+`S⁻¹ ≈ (BM⁻¹Bᵀ)⁻¹(BM⁻¹FM⁻¹Bᵀ)(BM⁻¹Bᵀ)⁻¹` — so unlike the `form()`-based approximations it cannot be
+written by the user as weak forms, which is why it ships as a built-in. `B` and `M` do not depend on
+the solution, so `P = BM⁻¹Bᵀ` is assembled **sparsely** and factorised once, for every application
+and every Newton step; only `F` varies, and it is only ever applied.
+
+!!! danger "Measuring this at all needs `args=`"
+    These counts come from `fem._op.jacobian(sol, args={"nu": …})`. If the viscosity is a runtime
+    parameter and you call `jacobian(sol)` **without** `args`, it evaluates at an unset parameter and
+    returns a matrix that is 25 % wrong — silently. The operator then does not change with Reynolds
+    number at all, and every preconditioner looks perfectly robust on it. An earlier version of this
+    table was measured that way and was wrong.
+
+!!! warning "What LSC does not give you"
+    **It is not mesh-independent here.** At fixed Re = 100 on a cavity, iterations grow 36 → 67 as the
+    pressure space grows 30 → 198 (the pressure mass grows 32 → 91 over the same range, so LSC is
+    better but neither is flat). And the Reynolds result above is **resolution-dependent**: at 613
+    DOFs the same sweep reverses the ordering, because that mesh never enters the regime where the
+    mass approximation degrades. Read the table as a resolved-discretisation result, not an
+    unconditional one.
+
+### PCD — and the boundary condition that decides it
+
+**PCD** (Kay, Loghin & Wathen 2002) is the other convection-aware Schur approximation,
+`S⁻¹ ≈ A_p⁻¹ F_p M_p⁻¹`. It ships as `jno.precond.pcd()`:
+
+```python
+xin, yin, _ = d.variable("inlet", split=True)
+fem.solve(linear=jno.solve.fgmres(),
+          precond=jno.precond.triangular((u, jno.precond.amg()),
+                                         (p, jno.precond.pcd(viscosity=nu, inflow=(xin, yin)))))
+```
+
+`inflow` is the **coordinate tuple**, not a region name — `domain.variable(...)` mints a *fresh*
+region on every call (`inlet_3`, `inlet_4`, …), so a name re-resolved inside the spec would point at
+a different region than the one your form constrained and the Dirichlet row would quietly miss the
+boundary. Passing a string is refused by name.
+
+Unlike LSC every factor *is* a weak form, so the supplied spec is a **convenience**, not a
+capability — it is verified equal (to 7e-16) to the same thing written by hand, which is where to go
+for a variant it does not cover:
+
+```python
+w  = wv.bind(x=xi, y=yi).freeze(u_lagged)          # the convecting field, as KNOWN nodal data
+lap_p, conv_p = pp.x*qq.x + pp.y*qq.y, (w[0]*pp.x + w[1]*pp.y)*qq
+
+Ap = jno.precond.form([lap_p,              p(x_in, y_in) - 0.0], inner=host)   # A_p⁻¹
+Fp = jno.precond.form([nu*lap_p + conv_p,  p(x_in, y_in) - 0.0], inner=False)  # F_p, APPLIED
+Mp = jno.precond.form([pp*qq],                                    inner=host)   # M_p⁻¹
+schur = Ap @ Fp @ Mp
+```
+
+**Two conditions decide whether it works at all**, and both are easy to get wrong:
+
+| | |
+|---|---|
+| **Inflow/outflow problem** | On an *enclosed* flow (a lid-driven cavity) PCD fails outright — 400 iterations, the cap, at every Reynolds number, and its eigenvalues straddle zero. The commutator argument leans on boundary behaviour an enclosed flow does not provide. Use `lsc()` there. |
+| **Inflow-Dirichlet on `A_p` and `F_p`** | With Neumann pressure operators PCD also fails (400). With a Dirichlet condition on the *inflow* boundary it takes **77**. Same problem, same mesh, same everything else. |
+
+Channel flow, momentum block exact, per Reynolds number:
+
+| Re | 10 | 50 | 100 | 400 | 1000 |
+|---|---|---|---|---|---|
+| pressure mass | 41 | 184 | 301 | 284 | 318 |
+| `lsc()` | 63 | 158 | 150 | 291 | 263 |
+| **PCD** | **37** | **75** | **77** | 237 | 355 |
+
+PCD is decisively best from Re = 10 to 100 — **4× the mass** at Re = 100 — and loses its edge by
+Re = 400, where everything degrades. Neither method is Reynolds-robust at the top of that range.
+
+### Preconditioners compose like the operators they stand for
+
+A materialized spec **is** a linear map `v ↦ M⁻¹v`, so the classical physics-based Schur
+approximations are arithmetic on specs rather than a menu of built-in names:
+
+```python
+Ap = jno.precond.form([inner(gp, gq, n_contract=2), p_sym.pin()])   # A_p⁻¹  (gauged Laplacian)
+Mp = jno.precond.form([pp * qq])                                    # M_p⁻¹  (pressure mass)
+Fp = jno.precond.form(F_terms, inner=False)                         # F_p    APPLIED, not inverted
+
+schur = Mp + Ap        # Cahouet & Chabard (1988) — which `saddle(laplace_weight=…)` already is
+schur = Ap @ Fp @ Mp   # PCD — Kay, Loghin & Wathen, SIAM J. Sci. Comput. 24 (2002) 237
+
+fem.solve(linear=jno.solve.fgmres(),
+          precond=jno.precond.triangular((u, jno.precond.amg()), (p, schur)))
+```
+
+`inner=False` is the piece that makes a *product* expressible: it applies the assembled form
+(`M v = A v`) instead of inverting it, which is what the middle factor of PCD needs. On its own such a
+factor is not a preconditioner and will make a solve worse — it exists to be composed.
+
+!!! warning "A product is not symmetric"
+    `(AB)ᵀ = BᵀAᵀ`, and a product of two SPD inverses is **not** SPD. Drive a product with
+    `jno.solve.gmres()` / `fgmres()`, never `cg`/`minres` — a short-recurrence method will simply
+    fail to reach the residual gate, loudly. (The transpose applier reverses the factor order for
+    you, which is what keeps the reverse pass of a differentiable solve preconditioned.)
+
+This is why `jno.precond.saddle()` has no `schur=` argument: the approximations that would populate
+such a menu are things you can write.
 
 ??? note "`jno.precond.form([...terms], inner=…)`"
     **preconditioners as weak forms**: assemble an auxiliary
@@ -554,6 +703,25 @@ jax.grad(loss)(theta)
 # preconditioner rather than loosening the tolerance.
 ```
 
+!!! warning "Where the refusal surfaces — dispatch is asynchronous"
+    The gate is evaluated *inside* the traced solve, and reports through a host callback. JAX
+    dispatch is asynchronous, so that callback has typically not run when the solve returns: the
+    refusal appears only once something materialises the result. Measured on the same failing solve,
+    the raise reaches the caller on the CPU backend (callbacks run inline) and is swallowed into a log
+    line on GPU.
+
+    So the failure is **recorded** first and raised at a boundary that is guaranteed to exist:
+
+    | you called | when it raises |
+    |---|---|
+    | `fem.solve(...)` | at the call — the result is materialised and the gate drained before returning |
+    | an eager `jno.solve.cg()(A, b)` | at the call, same way |
+    | your own `jax.jit` / `jax.grad` around a solve | jNO has no post-execution hook there. The failure is recorded, and the raise from the callback is best-effort — it lands on some backends and not others |
+
+    The last row is a real limit, not an oversight: once the solve is inside *your* transform, the
+    library gets no callback after it executes. If you need certainty there, materialise inside the
+    transform-free part and let `fem.solve` do the checking.
+
 !!! measured "Why the adjoint gets its own check"
     The adjoint is the half nothing used to check. `lax.custom_linear_solve`'s `transpose_solve` had
     no convergence test, and the eager test on the forward solve is a no-op under tracers — so the
@@ -568,6 +736,45 @@ jax.grad(loss)(theta)
     small dense GMRES, and no measurable difference on the reverse pass. The `fem.solve()` default
     got *faster* — 1.90 ms against 2.73 ms at 1441 DOFs — because checking from inside the trace
     replaced an eager check that cost its own matvec plus a host sync.
+
+### A transient march judges every step, not just the last one
+
+A nonlinear transient step is a Newton solve, and every one of them runs inside the march's
+`lax.scan` — precisely where the driver's own convergence check disables itself, because it needs a
+concrete residual. So the step carries its residual norms out of the scan and `fem.solve()` tests
+them where they *are* concrete, against the driver's own `rtol`/`atol`:
+
+```python
+fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-6, atol=1e-6))
+# RuntimeError: fem.solve: the transient march did not converge at step 35 of 120 (t=0.00036):
+# residual norm 3.658e+02 against the tolerance atol + rtol*||r(u_prev)|| = 1.011e-02
+# (atol=1e-06, rtol=1e-06). That step is NOT a root, and every later step inherited it as its
+# starting state — the whole trajectory past this point is unreliable. Globalize the per-step solve
+# (jno.solve.newton(line_search=True), or damping<1), take smaller time steps (a finer
+# domain(time=(...)) grid), or raise the driver's max_steps.
+```
+
+This is the same check the [load-path march](fem/formulations.md) already applied, on the same
+numbers; only the label and the advice differ. It covers the default θ march and `jno.solve.bdf2()`.
+
+!!! measured "Why a silent transient failure is worse than it sounds"
+    Two properties make a capped march genuinely hard to spot, both measured on a coupled melt-pool
+    model (laser + phase change + Marangoni convection):
+
+    * **It is not reproducible.** Two runs of the same command reported peak melt velocities of
+      2.98 and 33.5 m/s — an unconverged iterate is whatever the step cap happened to leave.
+    * **A diverged march is *faster* than a healthy one.** Once the residual is NaN the loop
+      condition `||r|| > tol` is False, so Newton exits on its first iteration and every remaining
+      step is nearly free. The usual "it got slow, something is wrong" signal is inverted: the run
+      that finished quickly was the broken one, and it returned 2e+200 K with nothing raised.
+
+    Cost is two residual evaluations per step, and only on a nonlinear block — a linear step is a
+    linear solve with its own gate and is not judged here.
+
+!!! warning "Under a transform the guard is off"
+    Inside `jax.jit`/`grad`/`vmap` of a whole march the norms are themselves traced, so the test
+    cannot concretise and no-ops — the same trade every eager check in jNO makes. There, the
+    driver's `max_steps` is all there is.
 
 !!! note "A preconditioner is exempt — it is inexact on purpose"
     `jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))` asks for two digits deliberately; that
@@ -596,6 +803,29 @@ The same flag exists on `jno.core(...).solve(profile=True)` (see
     the repo's `.gitignore`, so the trace directory will show up as untracked.
 
 ## Transient problems
+
+### Time schemes — `fem.solve(time=…)`
+
+| Scheme | Order | Stability | Use |
+|---|---|---|---|
+| `jno.solve.theta(1.0)` | 1 | L-stable | the default — robust, damps everything |
+| `jno.solve.theta(0.5)` | 2 | A-stable only | smooth problems; **rings** on stiff modes |
+| `jno.solve.bdf2()` | 2 | **L-stable** | stiff / saddle-point systems — flow's workhorse |
+| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks |
+| `…​.adaptive(rtol=…)` | wraps a one-step scheme | — | multi-rate transients |
+
+`bdf2` exists because `theta` cannot be second order *and* L-stable at once. Crank–Nicolson's
+amplification factor tends to `-1` for a stiff mode, so the mode does not decay — it alternates in
+sign. Measured on a heat problem whose initial condition is incompatible with its boundary (8 steps,
+`T = 0.5`, so the exact field is long dead): Crank–Nicolson reaches `min u = -1.00`, the *undecayed*
+initial amplitude with the sign flipped; BDF2 reaches `-0.023`. On a Navier–Stokes saddle system,
+where the pressure has no time derivative at all, that ringing is exactly what you do not want.
+
+The first BDF2 step is plain backward Euler — a multistep method has no second level to start from.
+Refused loudly rather than mis-integrated: a state-dependent mass `c(u)·u_t`, a second-order-in-time
+(`u_tt`) block (assembled at θ=½ *so that* it is not damped), and `.adaptive()` (step doubling sizes
+a one-step method).
+
  The slots configure the *per-step* solves of the default theta-method integrator:
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is
 formed **once** and the preconditioner materialized **once before the time loop** — and `nonlinear` drives
