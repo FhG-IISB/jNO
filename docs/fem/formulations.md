@@ -72,11 +72,16 @@ you writing those terms; nothing in the library implements or verifies them.
 
 The one qualification is **algebraic (zero-equation) LES**, below: a subgrid eddy viscosity is a
 formula of the resolved velocity gradient, so it is written in the term list like any other
-coefficient. Those formulas are unit-verified against a textbook oracle — they are *not* a validated
-LES capability, which would need a turbulent benchmark (channel flow, decaying isotropic turbulence)
-this library has not run.
+coefficient. Those formulas are checked against a textbook oracle in 2-D and 3-D, and run inside a
+Newton solve in the [LES subgrid tutorial](../tutorials/08-fem-and-varpinns/les-subgrid-3d.md) — where
+Vreman and WALE vanish in simple shear (1.1e-6 and 2.0e-19 of `nu`) while Smagorinsky reports 8.0e-2.
+They are still *not* a validated LES capability: that needs a turbulent benchmark against DNS
+(wall-resolved channel, decaying isotropic turbulence), which this library has not run.
 
 #### Subgrid eddy viscosity — a formula, not an API
+
+> Worked end to end, on two flows and with the failure modes measured, in the
+> [LES subgrid tutorial](../tutorials/08-fem-and-varpinns/les-subgrid-3d.md).
 
 An algebraic LES model adds `ν_t(∇u)` to the molecular viscosity. It needs no new API: the filter
 width is `d.cell_size` (or `d.cell_metric` if you want it direction-aware), and the model is
