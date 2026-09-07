@@ -5612,6 +5612,46 @@ def _fem_impl(
             "periodicity in the network instead (a periodic input embedding), or use an FE trial."
         )
     if is_vpinn and getattr(domain, "dimension", None) in (1, 2, 3) and not periodic_ties:
+        # A VPINN's essential condition is a DECLARATION, not an imposition: it says which test
+        # functions vanish on the region, so their irreducible du/dn flux leaves the loss. The value
+        # itself never reaches the residual -- measured, `u(bdry) - 0`, `- 0.5`, `- 7.0` and
+        # `- sin(pi x)` all give a BIT-IDENTICAL residual. A non-zero one therefore reads as a
+        # boundary condition and does nothing, which is the silent kind of wrong refused everywhere
+        # else here. The network satisfies the condition through its ANSATZ; that is where a non-zero
+        # value belongs.
+        #
+        # Checked on `dirichlet_raw`, whose last field is the ORIGINAL value node -- `dirichlet_values`
+        # has already lowered a vector `(0.0, 0.0)` into a coordinate function, indistinguishable there
+        # from a genuinely non-zero profile.
+        def _is_zero_essential_node(node):
+            if node is None:
+                return True
+            if isinstance(node, (int, float)) and not isinstance(node, bool):
+                return float(node) == 0.0
+            if isinstance(node, (tuple, list)):
+                return all(_is_zero_essential_node(e) for e in node)
+            if isinstance(node, dict):
+                return all(_is_zero_essential_node(e) for e in node.values())
+            val = getattr(node, "value", None)  # a Literal carries its array here
+            if val is None:
+                return False  # an expression: not known to be zero
+            try:
+                return bool(np.all(np.asarray(val) == 0))
+            except Exception:
+                return False
+
+        for _rec in dirichlet_raw or ():
+            _tag = _rec[1] if len(_rec) > 1 else "?"
+            if not _is_zero_essential_node(_rec[-1] if len(_rec) > 4 else None):
+                raise NotImplementedError(
+                    f"jno.fem (VPINN): the essential value on region {_tag!r} is not zero, and a "
+                    "network trial's essential condition only DECLARES which test functions vanish -- "
+                    "the value never reaches the residual, so this would be silently ignored. Put it "
+                    "in the ansatz, where the network satisfies it exactly: write the trial as "
+                    "`g + ansatz * net(...)` with `ansatz` vanishing on that region, and keep the "
+                    "declaration `u(region) - 0.0`."
+                )
+
         bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
         if boundary_terms:
             bcs.append(neumann(list(boundary_terms.keys())))

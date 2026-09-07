@@ -478,6 +478,35 @@ keeps falling while the solution degrades.
     expression is not a field view and takes `jno.np.grad(u_net, xi)`. That is the trial object
     differing, not the weak-form language.
 
+### Boundary conditions, and complex forms
+
+| | network trial |
+|---|---|
+| **Dirichlet, homogeneous** | declaration `u(region) - 0.0`; the network satisfies it through its **ansatz** |
+| **Dirichlet, inhomogeneous** | **refused** — put `g` in the ansatz (`g + ansatz * net`), see below |
+| **Neumann flux** | a boundary term; its coefficient must carry a coordinate from that region |
+| **Robin** `a·u·v − g·v` | a boundary term with the network evaluated *on* the face |
+| **Mixed** (Dirichlet + flux on different regions) | works |
+| **Vector**, all components or one (a roller) | works |
+| **Complex coefficient** (a `1j` in the form) | works — the residual stays complex |
+| **`fem_symbols(complex=True)`** | refused: a `ComplexPair` is two coupled real fields, i.e. multi-field. Use one field with `value_shape=(2,)` and a 2-output network for (Re, Im) |
+
+!!! warning "An essential condition DECLARES; it does not impose"
+    For a network trial `u(region) - g` says *which test functions vanish* — the value never reaches
+    the residual. Measured with one fixed network: `- 0.0`, `- 0.5`, `- 7.0` and `- sin(πx)` all give a
+    **bit-identical** residual. A non-zero value therefore looked like a boundary condition and did
+    nothing, so it is now refused by name. Put it where the network can satisfy it exactly:
+
+    ```python
+    u_net = g + ansatz * net(xi, yi)     # ansatz vanishes on the region
+    jno.fem([..., u(region) - 0.0])      # the declaration stays homogeneous
+    ```
+
+!!! warning "A complex form's `.mse` is a complex loss"
+    `pde.mse` on a complex weak form comes back `complex128`, and minimising a complex number is not
+    defined. Build a real objective explicitly — `(r.real**2 + r.imag**2).mean` — the same caveat that
+    applies to a complex FEM inverse problem.
+
 !!! warning "Scope — refused by name"
     * **Steady only.** The lowering test-projects onto a *spatial* FE basis, so a form carrying the
       time coordinate is refused. It used to build and evaluate, and the number meant nothing:

@@ -897,3 +897,99 @@ class TestVpinn3D:
         pde = jno.fem([term, u(*sb) - (0.0, 0.0, 0.0)])
         r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
         assert np.isfinite(r) and r > 0.0
+
+
+class TestVpinnBoundaryAndComplex:
+    """What a network trial does with boundary conditions, and with complex forms."""
+
+    @staticmethod
+    def _form(bc, vec=False, k2=None):
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,) if vec else ())
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        net = jnn.nn.wrap(
+            foundax.mlp(
+                2,
+                output_dim=2 if vec else 1,
+                hidden_dims=8,
+                num_layers=2,
+                activation=jax.nn.tanh,
+                key=jax.random.PRNGKey(0),
+            )
+        )
+        un = net(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        if vec:
+            gu, gv = jnn.jacobian(un, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+            term = jnn.inner(gu, gv, n_contract=2) - jnn.inner(np.array([1.0, 1.0]), vi, n_contract=1)
+        else:
+            term = jnn.grad(un, xi) * jnn.grad(vi, xi) + jnn.grad(un, yi) * jnn.grad(vi, yi) - 1.0 * vi
+            if k2 is not None:
+                term = term - k2 * un * vi
+        return dom, jno.fem([term, bc(u, xb, yb)])
+
+    def _residual(self, *a, **kw):
+        dom, pde = self._form(*a, **kw)
+        return np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(())
+
+    @pytest.mark.parametrize(
+        ("bc", "vec"),
+        [
+            pytest.param(lambda u, xb, yb: u(xb, yb) - 0.0, False, id="zero_scalar"),
+            pytest.param(lambda u, xb, yb: u(xb, yb) - (0.0, 0.0), True, id="zero_vector"),
+            pytest.param(lambda u, xb, yb: u(xb, yb)[0] - 0.0, True, id="one_component_roller"),
+        ],
+    )
+    def test_zero_essential_values_are_accepted(self, bc, vec):
+        """The guard below must not catch a legitimate homogeneous condition -- in any of its
+        spellings. A vector `(0.0, 0.0)` is lowered to a coordinate FUNCTION before it reaches the
+        solver, so the check reads the original value node instead, where the zero is still visible."""
+        r = self._residual(bc, vec=vec)
+        assert np.isfinite(float(np.real(r)))
+
+    @pytest.mark.parametrize(
+        "bc",
+        [
+            pytest.param(lambda u, xb, yb: u(xb, yb) - 0.5, id="constant"),
+            pytest.param(lambda u, xb, yb: u(xb, yb) - jnn.sin(np.pi * xb), id="coordinate"),
+        ],
+    )
+    def test_a_nonzero_essential_value_is_refused(self, bc):
+        """A network trial's essential condition only DECLARES which test functions vanish; the value
+        never reaches the residual. Measured before the guard: `u(bdry) - 0`, `- 0.5`, `- 7.0` and
+        `- sin(pi x)` all gave a BIT-IDENTICAL residual with the same network. Writing a non-zero one
+        therefore looked like a boundary condition and did nothing -- so it is refused, and points at
+        the ansatz, which is where a network satisfies it exactly."""
+        with pytest.raises(NotImplementedError, match=r"essential value.*not zero|ansatz"):
+            self._form(bc)
+
+    def test_a_complex_coefficient_gives_a_genuinely_complex_residual(self):
+        """A `1j` in the form is carried through, not truncated: the residual is complex and its
+        imaginary part responds to the coefficient."""
+        r_real = self._residual(lambda u, xb, yb: u(xb, yb) - 0.0, k2=4.0 + 0.0j)
+        r_cplx = self._residual(lambda u, xb, yb: u(xb, yb) - 0.0, k2=4.0 + 3.0j)
+        assert np.iscomplexobj(r_cplx), "a complex form must not lose its imaginary part"
+        assert abs(np.imag(r_real)) < 1e-14, "a real coefficient must give a real residual"
+        assert abs(np.imag(r_cplx)) > 1e-6, "the imaginary part must respond to the coefficient"
+
+    def test_a_robin_term_lands_on_its_own_region(self):
+        """`a*u*v - g*v` on a face, with the network evaluated ON that face."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xl, yl, _ = dom.variable("left", split=True)
+        xr, yr, _ = dom.variable("right", split=True)
+        net = make_scalar_net()
+        ui, ur = net(xi, yi) * xi, net(xr, yr) * xr
+        vi, vr = phi.bind(x=xi, y=yi), phi.bind(x=xr, y=yr)
+        pde = jno.fem(
+            [
+                jnn.grad(ui, xi) * jnn.grad(vi, xi) + jnn.grad(ui, yi) * jnn.grad(vi, yi),
+                (2.0 + 0.0 * xr) * ur * vr - (1.0 + 0.0 * xr) * vr,
+                u(xl, yl) - 0.0,
+            ]
+        )
+        assert set(pde.boundary_value_exprs) == {"right"}
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
