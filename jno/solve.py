@@ -1546,6 +1546,19 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
             it, and it costs roughly ``1/relax`` times as many rounds when the undamped iteration
             would have converged anyway. Start at ``0.5``.
 
+            **Converging is not the same as converging to the right branch, and this argument cannot
+            tell you which you got.** A search that oscillates may be oscillating *around* the answer
+            or *between* a correct and an incorrect configuration; damping settles it on whichever
+            fixed point it is nearest, and reports success either way. Measured on a 12:20 involute
+            gear pair at two drive angles where the undamped search raised: damped it converged in 17
+            to 30 rounds and returned torque ratios of 0.0155 and 0.676 against an exact 1.667 -- the
+            teeth had come out of engagement -- while the FROZEN reference pairing on the same problem
+            gave 1.05% and 0.62% error. ``relax=0.5`` and ``relax=0.3`` agreed to three significant
+            figures, so the damping was faithful; the fixed point it found was simply the wrong one,
+            and the raise had been the more informative answer. Check a damped result against
+            something independent -- an equilibrium the problem must satisfy, or the same solve with
+            the pairing frozen -- rather than treating convergence as the check.
+
     Scope, stated up front:
 
     * **Either tangent works, and they trade speed against memory.** The matrix-free default re-pairs
