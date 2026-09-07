@@ -63,7 +63,13 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
 and `jno.np.hessian(ui, [xi, yi])` (the full `D²u`) assemble against the element's second shape-function
 derivatives, so a biharmonic / plate / Cahn–Hilliard form is written directly, e.g.
 `jno.np.laplacian(ui, [xi, yi]) * jno.np.laplacian(vi, [xi, yi])` for `∫Δu·Δv`. Needs **`order ≥ 2`**
-(a P1 Hessian is identically zero), scalar Lagrange fields only.
+(a P1 Hessian is identically zero), nodal Lagrange fields.
+
+**Vector fields too.** `laplacian` of a `value_shape=(d,)` field is the vector `Δu` — its components ride
+the same scalar basis, so the assembled operator is exactly the scalar one per component. That is what the
+momentum strong residual of a stabilised flow needs (`nu * lap(u, [xi, yi])`; see
+[Formulations](formulations.md#what-the-fluid-path-is-verified-to-do-and-what-it-is-not)). The **C¹
+families** (Hermite / Argyris / Morley) hold *scalar* DOFs and refuse a vector spelling by name.
 !!! warning "Conformity caveat"
     Standard Lagrange is **C⁰**, so `∫Δu·Δv` over P2 is *non-conforming* and does **not** give a
     convergent biharmonic discretisation. For a convergent solve use a purpose-built biharmonic

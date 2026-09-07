@@ -433,8 +433,31 @@ def expand_dims(x, axis: int) -> FunctionCall:
 
 
 def transpose(x, axes: tuple = None) -> FunctionCall:
-    """Transpose array."""
-    return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [_u(x)])
+    """
+    Transpose a second-order tensor **over its last two axes** — the TENSOR transpose.
+
+    This is the convention its siblings already use: ``sym``/``antisym`` are built on
+    ``jnp.swapaxes(a, -1, -2)``, ``trace`` contracts ``axis1=-2, axis2=-1``, and ``identity`` carries a
+    leading singleton so it broadcasts as a constant tensor. A weak form's operands carry batch axes a
+    kernel prepends — the quadrature axis, and a local-basis axis on a trial/test function — so
+    ``jnp.transpose``'s default of reversing *every* axis transposes those too and the expression dies
+    on a shape mismatch (or, worse, silently means something else). Hence the trailing-axes default::
+
+        sigma_T = transpose(sigma)                  # tensor transpose, batch axes untouched
+        C       = einsum("...ki,...kj->...ij", F, F)  # F^T F, the same convention
+
+    Pass ``axes`` explicitly to get the raw ``jnp.transpose`` behaviour for a genuine axis permutation.
+
+    Args:
+        x:    tensor-valued expression, ``(..., n, n)``.
+        axes: explicit permutation. Omit it for the tensor transpose.
+    """
+    if axes is not None:
+        return _attach_coords(FunctionCall(lambda a, _ax=axes: jnp.transpose(a, axes=_ax), [_u(x)], name="transpose"), [x])
+    return _attach_coords(
+        FunctionCall(lambda a: jnp.swapaxes(a, -1, -2), [_u(x)], name="transpose"),
+        [x],
+    )
 
 
 def trace(x) -> FunctionCall:

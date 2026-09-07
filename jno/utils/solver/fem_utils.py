@@ -1144,6 +1144,38 @@ def _eval_integrand(domain, node, local):
             if node.tag == "fem_gauss":
                 return local["physical_quad_points"][..., dim_start:dim_end]
 
+        if node.tag == "cell_size":
+            arr = local["domain_context"].get("cell_size")
+            # The placeholder is the concrete negative sentinel above; a packed h is a positive traced
+            # array. Concrete-only, so this never inspects a tracer.
+            if arr is None or (isinstance(arr, np.ndarray) and arr.size == 1 and float(arr.reshape(-1)[0]) < 0.0):
+                raise NotImplementedError(
+                    "jno.fem: `dom.cell_size` is resolved on the native 2-D/3-D assembler's VOLUME terms "
+                    "only -- this path (a 1-D form, or a non-nodal element family such as Hermite / "
+                    "Argyris / Morley / RT / N1E) packs no element size. It used to read as a silent "
+                    "h = 1.0 here. Use it in a volume term of a 2-D/3-D nodal-Lagrange form."
+                )
+            return jnp.asarray(arr)
+
+        # A per-quadrature-point TENSOR symbol (`dom.cell_metric`). It needs its own branch: the
+        # generic context fallback below squeezes a leading singleton axis and slices the LAST one,
+        # and both are wrong for a (n_quad, dim, dim) array -- the first would eat the quadrature
+        # axis whenever a cell has one quadrature point.
+        if node.tag == "cell_metric":
+            arr = local["domain_context"].get("cell_metric")
+            # A packed metric is always rank 3, `(n_quad, dim, dim)`; the domain-level placeholder is
+            # rank 2. Anything else means this kernel never packed one.
+            if arr is None or jnp.ndim(arr) != 3:
+                raise NotImplementedError(
+                    "jno.fem: `dom.cell_metric` is resolved on the native 2-D/3-D assembler's VOLUME "
+                    "terms only -- this path (a 1-D form, or a non-nodal element family such as "
+                    "Hermite / Argyris / Morley / RT / N1E) packs no element Jacobian, so there is no "
+                    "metric to read. Use it in a volume term of a 2-D/3-D nodal-Lagrange form; "
+                    "`dom.cell_size` has the same scope. (In a BOUNDARY term it is refused earlier, by "
+                    "the region resolver -- a geometry symbol names no region.)"
+                )
+            return jnp.asarray(arr)
+
         # Temporal variable in assembly:
         # prefer the batched volume_vars arrays (pure JAX / no domain mutation),
         # then fall back to domain.context for the steady-context path.
@@ -1458,8 +1490,20 @@ def _eval_integrand(domain, node, local):
             raise NotImplementedError("The FEM assembler supports Hessians of TrialFunction/TestFunction only.")
         if _field_space(local, node.target) != "Lagrange":
             raise NotImplementedError("Second derivatives are assembled for nodal Lagrange fields only.")
-        if _value_shape_num_components(getattr(node.target, "value_shape", ())) != 1:
-            raise NotImplementedError("Hessian/Laplacian assembly currently supports scalar fields only.")
+        value_shape = getattr(node.target, "value_shape", ())
+        n_comp = _value_shape_num_components(value_shape)
+        _, _, cell_sol = _field_data(local, node.target)
+        # The C1 families (Hermite / Argyris / Morley) present themselves to this evaluator AS Lagrange --
+        # their M(cell) DOF-transform is baked into the shape data, so the guard above does not exclude them
+        # -- but their DOFs are SCALAR (``cell_sol`` is ``(n_dof, 1)``). Contracting a vector field's
+        # components against them would mis-size the block rather than say so, hence the structural check.
+        if cell_sol is not None and n_comp != int(jnp.shape(cell_sol)[1]):
+            raise NotImplementedError(
+                f"jno.fem: a second derivative of a field with {n_comp} components sits on an element whose "
+                f"DOFs carry {int(jnp.shape(cell_sol)[1])}. The C1 families (Hermite / Argyris / Morley) hold "
+                "SCALAR DOFs, so a vector field has no shape Hessian there. Use a scalar field on that "
+                "element, or a nodal Lagrange field (order>=2) for a vector Laplacian/Hessian."
+            )
         hess = _field_hess(local, node.target)  # (n_quad, n_dof, dim, dim) physical shape Hessian
         if hess is None:
             raise NotImplementedError(
@@ -1469,16 +1513,30 @@ def _eval_integrand(domain, node, local):
         da = jnp.asarray(dims)
         hsub = jnp.take(jnp.take(hess, da, axis=2), da, axis=3)  # (n_quad, n_dof, L, L) over requested dirs
         is_test = isinstance(node.target, TestFunction)
+        # A vector field's components ride the SAME scalar basis, selected by an identity -- exactly the
+        # convention the first-derivative branches use (see the ``jnp.eye`` expansion in the Jacobian test
+        # branch above), so the DOF-component axis precedes the value-component axis and the differentiated
+        # directions stay last.
         if node.trace:  # Laplacian = sum over the selected diagonal directions
             lap = jnp.einsum("qnii->qn", hsub)  # (n_quad, n_dof) per-DOF Laplacian
             if is_test:
-                return lap
-            _, _, cell_sol = _field_data(local, node.target)
-            return jnp.sum(lap[:, :, None] * cell_sol[None, :, :], axis=1)  # (n_quad, 1) trial Laplacian
+                if n_comp == 1:
+                    return lap
+                eye = jnp.eye(n_comp, dtype=lap.dtype)
+                return lap[:, :, None, None] * eye[None, None, :, :]  # (n_quad, n_dof, n_comp, n_comp)
+            # ``cell_sol`` is (n_local, vec), so this contracts every component at once: (n_quad, vec).
+            # A scalar field keeps its historical phantom (n_quad, 1); a vector one gets Delta u itself.
+            flat = jnp.sum(lap[:, :, None] * cell_sol[None, :, :], axis=1)
+            return flat if len(value_shape) == 0 else _reshape_components_last(flat, value_shape)
         if is_test:
-            return hsub  # (n_quad, n_dof, L, L) per-DOF Hessian (e.g. inner(hessian(u), hessian(v)))
-        _, _, cell_sol = _field_data(local, node.target)
-        return jnp.einsum("qnij,n->qij", hsub, cell_sol[:, 0])  # (n_quad, L, L) trial Hessian
+            if n_comp == 1:
+                return hsub  # (n_quad, n_dof, L, L) per-DOF Hessian (e.g. inner(hessian(u), hessian(v)))
+            eye = jnp.eye(n_comp, dtype=hsub.dtype)
+            return hsub[:, :, None, None, :, :] * eye[None, None, :, :, None, None]
+        h = jnp.einsum("qnij,nc->qcij", hsub, cell_sol)  # (n_quad, vec, L, L)
+        if len(value_shape) == 0:
+            return h[:, 0]  # (n_quad, L, L) trial Hessian -- scalar carries no component axis
+        return jnp.reshape(h, h.shape[:1] + tuple(value_shape) + h.shape[2:])
 
     if isinstance(node, BinaryOp):
         a = _eval_integrand(domain, node.left, local)

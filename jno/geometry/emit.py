@@ -234,6 +234,24 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
     if callables:
         fns = tuple(callables)
 
+        # Arity, checked HERE rather than inside the callback. gmsh calls a mesh-size function as
+        # f(x, y, z) -- three coordinates in 2-D as well as 3-D -- and `f(x, y)` is the natural thing
+        # to write for a rectangle. Raised from inside gmsh's C callback the TypeError surfaces as
+        # "Wrong mesh element size lc = 0 (lcmin = 0, lcmax = 1e+22)", which names neither the
+        # callable, nor its signature, nor the shape it came from; worse, whether it surfaces at all
+        # depends on gmsh's global state, so the same wrong function can mesh silently in one process
+        # and fail in another. One probe call before registering makes the refusal deterministic.
+        for _f in fns:
+            try:
+                _f(0.0, 0.0, 0.0)
+            except TypeError as _e:
+                raise TypeError(
+                    "jno.Shape(size=...): a mesh-size callable is called as f(x, y, z) -- three "
+                    "coordinates, in 2-D as well as 3-D, where z is 0.0. Write "
+                    "`size=lambda x, y, z: ...` (a 2-D function can simply ignore z). "
+                    f"Calling it with three arguments raised: {_e}"
+                ) from _e
+
         def _size_cb(cdim, ctag, x, y, z, lc, _fns=fns):
             # `np.asarray(...).reshape(-1)[0]` rather than `float(...)`: a size function that returns a
             # 1-element ARRAY -- which any numpy-vectorised one does -- makes bare `float()` raise, and

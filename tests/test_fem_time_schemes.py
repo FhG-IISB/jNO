@@ -270,3 +270,134 @@ def test_time_scheme_rejects_a_steady_problem():
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi])
     with pytest.raises(ValueError, match="transient"):
         fem.solve(time=jno.solve.theta(0.5))
+
+
+# ======================================================================================
+# BDF2 -- second order AND L-stable, which the theta-method cannot be at once
+# ======================================================================================
+def _heat_exact(fem, T=0.03):
+    """The analytic decay of the first eigenmode, sampled at the FE nodes."""
+    pts = np.asarray(fem.points)
+    return np.exp(-2 * PI**2 * T) * np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+
+
+def test_bdf2_is_second_order_in_time():
+    """Halving dt must quarter the time error. Measured against a fine-dt reference on the SAME mesh,
+    so the (fixed) spatial error cancels and only the temporal rate is under test."""
+    ref = _final(_heat(400), time=jno.solve.bdf2())
+    errs = []
+    for n in (10, 20, 40):
+        errs.append(float(np.linalg.norm(_final(_heat(n), time=jno.solve.bdf2()) - ref)))
+    rates = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
+    assert min(rates) > 1.7, f"BDF2 must show ~2nd order, got rates {rates} from errors {errs}"
+
+
+def test_bdf2_beats_backward_euler_at_the_same_cost():
+    """Same number of steps, same per-step work -- the accuracy is the whole difference."""
+    ref = _final(_heat(400), time=jno.solve.bdf2())
+    e_be = float(np.linalg.norm(_final(_heat(16), time=jno.solve.theta(1.0)) - ref))
+    e_b2 = float(np.linalg.norm(_final(_heat(16), time=jno.solve.bdf2()) - ref))
+    assert e_b2 < e_be / 5.0, f"BDF2 {e_b2:.3e} vs backward Euler {e_be:.3e}"
+
+
+def _rough_heat(nsteps, T, h=0.14):
+    """Heat with IC = 1 everywhere against a u = 0 boundary. The incompatibility excites the STIFFEST
+    modes of the discrete operator, which is where a merely A-stable scheme misbehaves."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h, time=(0.0, T, nsteps))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    return jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
+
+
+def test_bdf2_damps_the_stiff_modes_crank_nicolson_rings_on():
+    """**The reason the scheme exists.** Second order and L-stable at once, which the theta-method
+    cannot manage: theta=1 is L-stable but first order, and theta=1/2 (Crank-Nicolson) is second order
+    but only A-stable -- its amplification factor tends to -1 for a stiff mode, so the mode does not
+    decay, it alternates in sign at full amplitude.
+
+    Measured with 8 steps over T = 0.5, an initial condition incompatible with the boundary (so the
+    stiffest modes are excited), and a solution that is physically dead long before the end:
+
+        Crank-Nicolson   min u = -1.00   (the IC amplitude -- undecayed, just inverted)
+        BDF2             min u = -0.023
+
+    A 43x smaller spurious excursion, and the final field is decayed rather than ringing. It is stated
+    as an amplitude and not as "no oscillation": BDF2 is not monotone either, it is *damped*.
+    """
+    n, T = 8, 0.5
+    cn = np.asarray(_rough_heat(n, T).solve(time=jno.solve.theta(0.5)).fn())
+    b2 = np.asarray(_rough_heat(n, T).solve(time=jno.solve.bdf2()).fn())
+
+    assert cn.min() < -0.5, f"Crank-Nicolson must actually ring here ({cn.min():.3f}), or this proves nothing"
+    assert b2.min() > -0.05, f"BDF2 must damp rather than ring ({b2.min():.3f})"
+    assert abs(cn.min()) > 20.0 * abs(b2.min())
+    # and the stiff content is gone by the end, where CN still carries it
+    assert np.abs(b2[-1]).max() < 0.2 * np.abs(cn[-1]).max()
+
+
+def test_bdf2_composes_with_the_solver_slots():
+    """`linear=`/`precond=` reach the per-step solve through BDF2 exactly as through the theta march --
+    it reuses `block.step`, so there is one implementation and it cannot drift."""
+    plain = _final(_heat(12), time=jno.solve.bdf2())
+    for kw in (
+        dict(linear=jno.solve.lu()),
+        dict(linear=jno.solve.gmres(tol=1e-12)),
+        dict(linear=jno.solve.bicgstab(tol=1e-12), precond=jno.precond.jacobi()),
+    ):
+        got = _final(_heat(12), time=jno.solve.bdf2(), **kw)
+        rel = float(np.linalg.norm(got - plain) / np.linalg.norm(plain))
+        assert rel < 1e-8, f"slot {kw} moved the answer by {rel:.2e}"
+
+
+def test_bdf2_marches_a_nonsymmetric_block():
+    """Advection-diffusion: `A` is non-symmetric, which is the case the per-step BiCGStab rescue in
+    `block.step` exists for. BDF2 inherits it rather than re-implementing it."""
+    ref = _final(_advection_diffusion(300), time=jno.solve.bdf2())
+    got = _final(_advection_diffusion(30), time=jno.solve.bdf2())
+    assert np.isfinite(got).all()
+    assert float(np.linalg.norm(got - ref) / np.linalg.norm(ref)) < 5e-2
+
+
+def test_bdf2_refuses_an_adaptive_step():
+    """Step doubling sizes a ONE-step method; BDF2 needs two previous states. Refused by name rather
+    than falling through to the base class's generic message."""
+    with pytest.raises(NotImplementedError, match="two previous states"):
+        jno.solve.bdf2().adaptive(rtol=1e-5)
+
+
+def test_bdf2_refuses_a_steady_problem():
+    """The `time=` slot itself checks this, so BDF2 gets it for free."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    with pytest.raises(ValueError, match="transient"):
+        fem.solve(time=jno.solve.bdf2())
+
+
+def test_the_default_save_grid_returns_the_trajectory_without_resampling(monkeypatch):
+    """`save_ts` defaults to the block's own grid, so the sampling is an identity -- and it must be
+    taken as one. The general path allocates a second copy of the whole trajectory plus the blend
+    workspace, which is what made a 6000-step x 18k-DOF case fail to allocate 5.72 GiB on an 8 GB card.
+
+    Pinned because the check is inside a broad `except`: when this was refactored, a NameError in the
+    comparison silently sent every march down the slow path with nothing said."""
+    import jno.utils.solver.backend_blocks as bb
+
+    orig, fired = bb._resample_trajectory, []
+
+    def spy(traj, grid_ts, save_ts, dtype):
+        out = orig(traj, grid_ts, save_ts, dtype)
+        fired.append(out is traj)
+        return out
+
+    monkeypatch.setattr(bb, "_resample_trajectory", spy)
+    for scheme in (jno.solve.theta(1.0), jno.solve.bdf2()):
+        fired.clear()
+        _heat(6).solve(time=scheme).fn()
+        assert fired == [True], f"{scheme!r}: the identity fast path did not fire ({fired})"

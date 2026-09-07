@@ -62,6 +62,7 @@ __all__ = [
     "diagonal",
     "svd",
     "lstsq",
+    "bdf2",
     "theta",
     "exponential",
     "adaptive",
@@ -1309,6 +1310,32 @@ def theta(theta: float = 1.0):
     from .utils.solver.timeschemes import _ThetaScheme
 
     return _ThetaScheme(theta)
+
+
+def bdf2():
+    """**BDF2** time scheme for ``fem.solve(time=...)``: the second-order backward differentiation
+    formula ``(3u^{n+1} - 4u^n + u^{n-1})/(2 dt)``, and the workhorse for incompressible flow.
+
+    Second-order accurate **and L-stable**, which the theta-method cannot be at once: ``theta=1``
+    (the default) is L-stable but only first order, and ``theta=1/2`` (Crank-Nicolson) is second
+    order but merely A-stable -- its amplification factor tends to ``-1`` as ``dt*lambda -> -inf``,
+    so a stiff mode does not decay, it RINGS. On a saddle-point system (Stokes / Navier-Stokes),
+    where the pressure has no time derivative at all, that ringing is exactly what you do not want.
+
+    Marches the domain's fixed time grid. The first step is plain backward Euler (a multistep method
+    has no second level to start from); its ``O(dt^2)`` local error is what the second-order global
+    rate needs.
+
+    Refused, loudly, rather than silently mis-integrated: a **state-dependent mass** ``c(u)*u_t``
+    (backward Euler only) and a **second-order-in-time** (``u_tt``) block (assembled at ``theta=1/2``
+    so an undamped wave is not damped -- and an L-stable scheme would damp it). ``.adaptive()`` is
+    also refused: the controller sizes a one-step method by step doubling.
+
+    Reference: Curtiss & Hirschfelder, *PNAS* **38** (1952) 235; Hairer & Wanner, *Solving Ordinary
+    Differential Equations II*, 2nd ed., Sec. V.1."""
+    from .utils.solver.timeschemes import _BDF2Scheme
+
+    return _BDF2Scheme()
 
 
 def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):

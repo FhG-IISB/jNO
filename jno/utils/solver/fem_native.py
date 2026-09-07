@@ -845,6 +845,7 @@ def assemble_fem_native(
 
     ctx = dict(getattr(domain, "context", {}) or {})
     ctx.pop("cell_size", None)  # `dom.cell_size` placeholder; the real per-cell h is packed per volume element below
+    ctx.pop("cell_metric", None)  # likewise `dom.cell_metric`: the real per-cell G = J^-T J^-1 is packed below
     # Same for every `u.gap` / `u.slide` placeholder: dropping it means a contact symbol that assembly
     # has not packed raises as an unresolved symbol instead of silently evaluating to the zero
     # placeholder -- which would read as "everywhere exactly in contact, and not sliding" and be believed.
@@ -1752,7 +1753,24 @@ def assemble_fem_native(
             )
             per.append(fd)
 
-        return per, xq, meas
+        return per, xq, meas, J
+
+    def _cell_geometry_symbols(meas, J):
+        """``(h_qp, G_qp)`` for one cell -- the geometry SYMBOLS a stabilized form reads.
+
+        ``h_qp`` is ``|det J|^(1/dim)`` (``dom.cell_size``): an isotropic size, blind to stretch.
+        ``G_qp`` is the covariant metric ``G = J^-T J^-1`` (``dom.cell_metric``), which is not --
+        the SUPG/PSPG tau of Tezduyar & Osawa, CMAME 190 (2000) Sec. 3 is built on it.
+
+        Both are broadcast to a leading quadrature axis so the evaluator sees one value per quadrature
+        point either way: ``meas``/``J`` are per-cell on an affine simplex and per-quadrature-point on
+        a curved / tensor-product cell. Pure geometry -- constant w.r.t. the cell DOFs, so the per-cell
+        Jacobian treats both as constants -- and unused symbols are dead code XLA drops."""
+        n_q = qw_shared.shape[0]
+        h_qp = jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (n_q, 1))
+        K = jnp.linalg.inv(J)  # dxi/dx: (dim, dim) affine, (n_q, dim, dim) curved
+        G_qp = jnp.broadcast_to(jnp.swapaxes(K, -1, -2) @ K, (n_q, dim, dim))
+        return h_qp, G_qp
 
     # Cell-local DOF bookkeeping for per-cell element-Jacobian assembly. ``cell_all_dofs[c]`` lists
     # every global DOF (all fields, node-major) the cell couples, so an element matrix's columns map
@@ -1776,7 +1794,33 @@ def assemble_fem_native(
     # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
     _frozen_gathered: Dict[Any, Any] = {}
     for _fid, _fnode in _frozen_nodes.items():
-        _ffidx = field_index[_fnode.field_key]
+        _fkey = _fnode.field_key
+        if _fkey not in field_index:
+            # A frozen field whose SOURCE is not one of THIS form's unknowns: a KNOWN COEFFICIENT FIELD.
+            # That is the lagged velocity of a PCD auxiliary, a wall distance, an eddy viscosity -- data
+            # computed elsewhere and read here as a coefficient. It has no assembled basis of its own, so
+            # it borrows the nodal basis and connectivity of a live field with the same element, exactly
+            # as a load-path field does below. Without this the kernel raised a bare `KeyError` on the
+            # field id, which says nothing about the cause.
+            _want_order = int(getattr(_fnode, "order", 1) or 1)
+            _want_space = str(getattr(_fnode, "space", "Lagrange") or "Lagrange")
+            _alias = next(
+                (
+                    i
+                    for i, f in enumerate(fields)
+                    if int(f["order"]) == _want_order and str(f.get("space", "Lagrange")) == _want_space
+                ),
+                None,
+            )
+            if _alias is None:
+                raise NotImplementedError(
+                    f"jno.fem: a frozen coefficient field of order {_want_order} ({_want_space}) is not one "
+                    "of this form's unknowns, so it must borrow the nodal basis of a live field with the "
+                    "same element -- and this form has none. Give one of the unknowns that element, or "
+                    "resample the known field onto a space the form already uses."
+                )
+            field_index[_fkey] = _alias  # alias: same nodes, same shape functions, no DOFs of its own
+        _ffidx = field_index[_fkey]
         _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
         _fvals = jnp.asarray(_fnode.values)
         # scalar frozen field (n_nodes,) -> per-cell (n_local, 1); VECTOR (n_nodes, vec) -> (n_local, vec).
@@ -1945,12 +1989,9 @@ def assemble_fem_native(
         per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
         region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh)."""
         cell_sols = _split_cell_local(local_all)
-        per, xq, meas = _cell_fields(c, cell_sols, pts_j if pts is None else pts)
-        # Element size h = |detJ|^(1/dim) at the quad points -> the `dom.cell_size` symbol (SUPG/GLS).
-        # Constant w.r.t. the cell DOFs (geometry only), so the per-cell Jacobian sees it as a constant.
-        h_qp = jnp.broadcast_to(
-            jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (qw_shared.shape[0], 1)
-        )  # meas: scalar (affine) or per-qp (curved)
+        per, xq, meas, _J = _cell_fields(c, cell_sols, pts_j if pts is None else pts)
+        # The `dom.cell_size` / `dom.cell_metric` geometry symbols a stabilized form reads.
+        h_qp, G_qp = _cell_geometry_symbols(meas, _J)
         cell_masks = tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
         loc = {
             "physical_quad_points": xq,
@@ -1958,7 +1999,7 @@ def assemble_fem_native(
             "field_index": field_index,
             "tag": "fem_gauss",
             "surface": False,
-            "domain_context": {**ctx, "cell_size": h_qp},
+            "domain_context": {**ctx, "cell_size": h_qp, "cell_metric": G_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": rnames,
@@ -1997,17 +2038,15 @@ def assemble_fem_native(
         integrated. This is the internal-state update the load-step march applies after each solve.
         Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
         cell_sols = _split_cell_local(local_all)
-        per, xq, meas = _cell_fields(c, cell_sols)
-        h_qp = jnp.broadcast_to(
-            jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (qw_shared.shape[0], 1)
-        )  # meas: scalar (affine) or per-qp (curved)
+        per, xq, meas, _J = _cell_fields(c, cell_sols)
+        h_qp, G_qp = _cell_geometry_symbols(meas, _J)
         loc = {
             "physical_quad_points": xq,
             "fields": per,
             "field_index": field_index,
             "tag": "fem_gauss",
             "surface": False,
-            "domain_context": {**ctx, "cell_size": h_qp},
+            "domain_context": {**ctx, "cell_size": h_qp, "cell_metric": G_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": (),
