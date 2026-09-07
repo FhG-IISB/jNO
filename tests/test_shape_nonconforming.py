@@ -341,7 +341,7 @@ def test_a_region_scoped_tag_resolves_in_the_ASSEMBLY_numbering():
     bn1 = np.unique(np.asarray(d.built_mesh.cells_dict["line"]))
     for tag, sel in got.items():
         n1 = len(np.asarray(_face_nodes(d, p1pts, bn1, tag), dtype=int).reshape(-1))
-        assert len(sel) >= 2 * n1 - 1, f"{tag} kept {len(sel)} of the ~{2*n1-1} nodes its P1 side implies"
+        assert len(sel) >= 2 * n1 - 1, f"{tag} kept {len(sel)} of the ~{2 * n1 - 1} nodes its P1 side implies"
 
 
 def test_tag_region_reaches_the_interface_at_all():

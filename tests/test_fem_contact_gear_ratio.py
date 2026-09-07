@@ -37,15 +37,15 @@ import jno
 # ---- the gear pair -------------------------------------------------------------------------------
 # 25 deg, not the textbook 20 -- see the module docstring. Tooth counts stay 12:20, so the oracle
 # z_B/z_A = 5/3 is unchanged: this fixes the geometry the oracle assumes, not the oracle.
-M, PHI = 0.10, np.radians(25.0)          # module, pressure angle
-ZA, ZB = 12, 20                          # tooth counts -> ratio 5/3
+M, PHI = 0.10, np.radians(25.0)  # module, pressure angle
+ZA, ZB = 12, 20  # tooth counts -> ratio 5/3
 BACKLASH, ADDENDUM = 0.004, 1.00
 EXACT = ZB / ZA
 
 E_Y, NU = 2.0e5, 0.30
 LAM, MU = E_Y * NU / ((1 + NU) * (1 - 2 * NU)), E_Y / (2 * (1 + NU))
-RHA, RHB, CN = 0.36, 0.60, 4.0e6         # hub radii; contact penalty
-R_LO, R_HI = 1.00, 0.97                  # the tagged flank, as fractions of r_base and r_tip
+RHA, RHB, CN = 0.36, 0.60, 4.0e6  # hub radii; contact penalty
+R_LO, R_HI = 1.00, 0.97  # the tagged flank, as fractions of r_base and r_tip
 
 
 def radii(z):
@@ -70,22 +70,27 @@ def _profile(z, centre=(0.0, 0.0), spin=0.0, nf=12, nt=5, nr=5):
     rr = np.linspace(max(rf, rb), ra, nf)
     fl = _inv(np.arccos(np.clip(rb / np.maximum(rr, rb + 1e-12), -1.0, 1.0))) - _inv(PHI)
     aL, aR = -psi + fl, psi - fl[::-1]
-    seg = [np.stack([np.linspace(-half, aL[0], nr, endpoint=False), np.full(nr, rf)], 1),
-           np.stack([aL, rr], 1),
-           np.stack([np.linspace(aL[-1], aR[0], nt + 2)[1:-1], np.full(nt, ra)], 1),
-           np.stack([aR, rr[::-1]], 1),
-           np.stack([np.linspace(aR[-1], half, nr, endpoint=False)[1:], np.full(nr - 1, rf)], 1)]
+    seg = [
+        np.stack([np.linspace(-half, aL[0], nr, endpoint=False), np.full(nr, rf)], 1),
+        np.stack([aL, rr], 1),
+        np.stack([np.linspace(aL[-1], aR[0], nt + 2)[1:-1], np.full(nt, ra)], 1),
+        np.stack([aR, rr[::-1]], 1),
+        np.stack([np.linspace(aR[-1], half, nr, endpoint=False)[1:], np.full(nr - 1, rf)], 1),
+    ]
     t = np.vstack(seg)
-    pts = [np.stack([t[:, 1] * np.cos(t[:, 0] + 2 * np.pi * k / z + spin),
-                     t[:, 1] * np.sin(t[:, 0] + 2 * np.pi * k / z + spin)], 1) for k in range(z)]
+    pts = [
+        np.stack(
+            [t[:, 1] * np.cos(t[:, 0] + 2 * np.pi * k / z + spin), t[:, 1] * np.sin(t[:, 0] + 2 * np.pi * k / z + spin)], 1
+        )
+        for k in range(z)
+    ]
     return np.vstack(pts) + np.asarray(centre)
 
 
 def _pair(theta=0.0):
     """A driven to `theta`; B turns the other way, slower by z_A/z_B, phased so a tooth GAP faces A
     at theta = 0 -- otherwise the two outlines overlap and the booleans cannot produce a mesh."""
-    return (_profile(ZA, (0.0, 0.0), spin=theta),
-            _profile(ZB, (CENTRE, 0.0), spin=np.pi - np.pi / ZB - theta * ZA / ZB))
+    return (_profile(ZA, (0.0, 0.0), spin=theta), _profile(ZB, (CENTRE, 0.0), spin=np.pi - np.pi / ZB - theta * ZA / ZB))
 
 
 # ---- the fast test: is this gear pair even cuttable? ---------------------------------------------
@@ -101,13 +106,17 @@ def test_the_demo_gear_satisfies_the_classical_admissibility_limits():
       where its mate has no involute at all; the limit is ``r_a,max = sqrt(r_b^2 + (C sin phi)^2)``.
     """
     z_min = 2.0 / np.sin(PHI) ** 2
-    assert ZA >= z_min, (f"a {ZA}-tooth pinion undercuts at phi = {np.degrees(PHI):.0f} deg "
-                         f"(needs >= {z_min:.1f} teeth): there is no involute near its base circle")
+    assert ZA >= z_min, (
+        f"a {ZA}-tooth pinion undercuts at phi = {np.degrees(PHI):.0f} deg "
+        f"(needs >= {z_min:.1f} teeth): there is no involute near its base circle"
+    )
 
     for name, r_b, r_a in (("A", RBA, RAA), ("B", RBB, RAB)):
         r_max = np.sqrt(r_b**2 + (CENTRE * np.sin(PHI)) ** 2)
-        assert r_a <= r_max, (f"gear {name}'s tip r_a = {r_a:.4f} passes the interference limit "
-                              f"{r_max:.4f} -- it reaches into its mate's non-involute root")
+        assert r_a <= r_max, (
+            f"gear {name}'s tip r_a = {r_a:.4f} passes the interference limit "
+            f"{r_max:.4f} -- it reaches into its mate's non-involute root"
+        )
 
     # and the tagged contact surface must lie strictly inside the flank, r in (r_base, r_tip): both
     # ends of that OPEN interval are other surfaces (root arc below, tip arc above) whose normals do
@@ -151,17 +160,23 @@ def _solve(theta, drive=9.0e-3, h_rim=0.022, h_hub=0.060, rounds=6, capture=0.06
 
     a, b = _pair(theta)
     hub_a, hub_b = jno.Shape.disk(0, 0, RHA), jno.Shape.disk(CENTRE, 0, RHB)
-    d = jno.Shape.regions(hubA=hub_a.sized(h_hub), rimA=(jno.Shape.polygon(a) - hub_a).sized(h_rim),
-                          hubB=hub_b.sized(h_hub), rimB=(jno.Shape.polygon(b) - hub_b).sized(h_rim),
-                          conforming=True).domain()
+    d = jno.Shape.regions(
+        hubA=hub_a.sized(h_hub),
+        rimA=(jno.Shape.polygon(a) - hub_a).sized(h_rim),
+        hubB=hub_b.sized(h_hub),
+        rimB=(jno.Shape.polygon(b) - hub_b).sized(h_rim),
+        conforming=True,
+    ).domain()
     _ = d.built_mesh
 
     # `region=` is what isolates ONE gear's surface: the predicate alone cannot, because both rims
     # span the same radii about their own centres.
-    d.tag("sA", lambda x, y: (x**2 + y**2 > (R_LO * RBA) ** 2) & (x**2 + y**2 < (R_HI * RAA) ** 2),
-          region="rimA")
-    d.tag("sB", lambda x, y: ((x - CENTRE) ** 2 + y**2 > (R_LO * RBB) ** 2)
-          & ((x - CENTRE) ** 2 + y**2 < (R_HI * RAB) ** 2), region="rimB")
+    d.tag("sA", lambda x, y: (x**2 + y**2 > (R_LO * RBA) ** 2) & (x**2 + y**2 < (R_HI * RAA) ** 2), region="rimA")
+    d.tag(
+        "sB",
+        lambda x, y: ((x - CENTRE) ** 2 + y**2 > (R_LO * RBB) ** 2) & ((x - CENTRE) ** 2 + y**2 < (R_HI * RAB) ** 2),
+        region="rimB",
+    )
 
     u, phi = d.fem_symbols(value_shape=(2,), names=("u", "phi"), order=1)
     R = {k: d.variable(k, split=True) for k in ("hubA", "rimA", "hubB", "rimB")}
@@ -174,11 +189,13 @@ def _solve(theta, drive=9.0e-3, h_rim=0.022, h_hub=0.060, rounds=6, capture=0.06
 
     sa, nA = d.variable("sA", split=True), d.variable("sA", normals=True)
     g = u.gap("sA", "sB", domain=d)
-    p = n.maximum(0.0, -CN * g)                       # g < 0 penetrating -> p > 0 pressure
-    terms = elastic + [p * inner(nA, phi.bind(x=sa[0], y=sa[1]), 1),
-                       u(R["hubA"][0], R["hubA"][1])[0] - (-drive * R["hubA"][1]),
-                       u(R["hubA"][0], R["hubA"][1])[1] - (+drive * R["hubA"][0]),
-                       u(R["hubB"][0], R["hubB"][1]) - 0.0]
+    p = n.maximum(0.0, -CN * g)  # g < 0 penetrating -> p > 0 pressure
+    terms = elastic + [
+        p * inner(nA, phi.bind(x=sa[0], y=sa[1]), 1),
+        u(R["hubA"][0], R["hubA"][1])[0] - (-drive * R["hubA"][1]),
+        u(R["hubA"][0], R["hubA"][1])[1] - (+drive * R["hubA"][0]),
+        u(R["hubB"][0], R["hubB"][1]) - 0.0,
+    ]
 
     fem = jno.fem(terms)
     uu = np.asarray(fem.solve(contact=jno.solve.contact(capture=capture, rounds=rounds))).reshape(-1, 2)
@@ -224,5 +241,7 @@ def test_the_torque_ratio_matches_the_kinematic_oracle(theta, _x64):
 
     ratio = abs(t_b / t_a)
     err = abs(ratio - EXACT) / EXACT
-    assert err < 0.05, (f"theta = {theta}: |T_B/T_A| = {ratio:.4f} is {err:.2%} off the oracle "
-                        f"{EXACT:.4f} (settled in {rounds} search rounds)")
+    assert err < 0.05, (
+        f"theta = {theta}: |T_B/T_A| = {ratio:.4f} is {err:.2%} off the oracle "
+        f"{EXACT:.4f} (settled in {rounds} search rounds)"
+    )

@@ -102,8 +102,7 @@ def test_a_following_normal_rotates_the_traction_by_exactly_the_body_rotation(de
     assert np.linalg.norm(t_ref) > 1e-8, "the traction must actually contribute something"
     got = np.degrees(np.arctan2(t_ref[0] * t_fol[1] - t_ref[1] * t_fol[0], t_ref @ t_fol))
     assert abs(abs(got) - deg) < 0.6, (
-        f"a following normal must rotate the traction by the body rotation: expected {deg}deg, "
-        f"got {abs(got):.2f}deg"
+        f"a following normal must rotate the traction by the body rotation: expected {deg}deg, got {abs(got):.2f}deg"
     )
     rel = abs(np.linalg.norm(t_fol) - np.linalg.norm(t_ref)) / np.linalg.norm(t_ref)
     assert rel < 0.02, f"a rigid rotation must not change the traction's magnitude, moved {rel:.1%}"
@@ -125,7 +124,7 @@ def test_following_needs_an_unambiguous_displacement_field():
     d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).sized(0.4).domain()
     _ = d.built_mesh
     d.tag("top", lambda x, y: y > 1.0 - 1e-9)
-    u, phi = d.fem_symbols(value_shape=())          # a SCALAR field: nothing moves the surface
+    u, phi = d.fem_symbols(value_shape=())  # a SCALAR field: nothing moves the surface
     X = d.variable("interior", split=True)[:2]
     gu = jno.np.grad(u, [X[0], X[1]])
     gp = jno.np.grad(phi, [X[0], X[1]])
@@ -135,6 +134,4 @@ def test_following_needs_an_unambiguous_displacement_field():
     bb = d.variable("bot", split=True)
     # the refusal may surface at build or at solve depending on the route; either is fine, both are loud
     with pytest.raises(ValueError, match="one component per dimension"):
-        jno.fem([jno.np.inner(gu, gp, n_contract=1),
-                 nrm[0] * phi.bind(x=tp[0], y=tp[1]),
-                 u(bb[0], bb[1]) - 0.0]).solve()
+        jno.fem([jno.np.inner(gu, gp, n_contract=1), nrm[0] * phi.bind(x=tp[0], y=tp[1]), u(bb[0], bb[1]) - 0.0]).solve()

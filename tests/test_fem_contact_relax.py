@@ -64,9 +64,7 @@ def test_damping_does_not_move_the_fixed_point():
     _, fem_a = _stacked_bars()
     _, fem_b = _stacked_bars()
     full = np.asarray(fem_a.solve(contact=jno.solve.contact(tol=1e-6, rounds=40))).reshape(-1)
-    half = np.asarray(
-        fem_b.solve(contact=jno.solve.contact(tol=1e-6, rounds=40, relax=0.5))
-    ).reshape(-1)
+    half = np.asarray(fem_b.solve(contact=jno.solve.contact(tol=1e-6, rounds=40, relax=0.5))).reshape(-1)
     scale = max(float(np.abs(full).max()), 1e-30)
     assert np.abs(full - half).max() / scale < 1e-4, (
         f"damping moved the fixed point by {np.abs(full - half).max() / scale:.3e} relative"
@@ -147,7 +145,7 @@ def test_the_damped_iterate_is_the_stated_blend():
     expect, traj = np.zeros(4), []
     for k in range(len(seen) - 1):
         g = A * expect + b
-        expect = g if k == 0 else (1.0 - r) * expect + r * g   # round 1 has nothing to blend against
+        expect = g if k == 0 else (1.0 - r) * expect + r * g  # round 1 has nothing to blend against
         traj.append(expect.copy())
     for k, (got, want) in enumerate(zip(seen[1:], traj)):
         assert np.allclose(got, want, atol=1e-12), f"round {k + 1}: {got[:1]} vs {want[:1]}"

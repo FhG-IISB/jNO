@@ -1094,9 +1094,7 @@ class domain(MeshIOMixin):
 
         return max(1, declared, inferred)
 
-    def _sampling_groups_for_tag(
-        self, tag: str, for_normals: bool = False
-    ) -> List[Tuple[int, Any, Optional[np.ndarray]]]:
+    def _sampling_groups_for_tag(self, tag: str, for_normals: bool = False) -> List[Tuple[int, Any, Optional[np.ndarray]]]:
         """Return per-batch sampling sources for a tag as ``(count, points, normals)``.
 
         ``for_normals`` says the caller will index the points and the normals with the SAME indices,
@@ -1218,11 +1216,19 @@ class domain(MeshIOMixin):
             for tag in other._mesh_pool.keys()
         }
         self_normal_groups = {
-            tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag, for_normals=True) if normals is not None]
+            tag: [
+                (count, normals)
+                for count, _, normals in self._sampling_groups_for_tag(tag, for_normals=True)
+                if normals is not None
+            ]
             for tag in self._mesh_pool.keys()
         }
         other_normal_groups = {
-            tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag, for_normals=True) if normals is not None]
+            tag: [
+                (count, normals)
+                for count, _, normals in other._sampling_groups_for_tag(tag, for_normals=True)
+                if normals is not None
+            ]
             for tag in other._mesh_pool.keys()
         }
 

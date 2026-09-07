@@ -233,6 +233,4 @@ def test_the_form_is_staged_once_across_the_arclength_march():
         counts.append(tr["n"])
 
     assert counts[0] > 0, "the residual was never staged — the counter is not wired to the solve"
-    assert counts[1] <= counts[0], (
-        f"staging scales with the march: {counts[0]} traces for 5 steps, {counts[1]} for 15"
-    )
+    assert counts[1] <= counts[0], f"staging scales with the march: {counts[0]} traces for 5 steps, {counts[1]} for 15"

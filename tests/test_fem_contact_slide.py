@@ -205,10 +205,7 @@ def test_the_transmitted_shear_is_insensitive_to_the_penalty_over_four_decades()
     to widen the tolerance until the unconverged number fits -- that would keep the test green while
     it went on measuring the mesh.
     """
-    vals = [
-        _stack(conforming=False, ct=ct, drive=(SHEAR, 0.0, 0.0), size=_PENALTY_SIZE)[0]
-        for ct in (1e2, 1e4, 1e6)
-    ]
+    vals = [_stack(conforming=False, ct=ct, drive=(SHEAR, 0.0, 0.0), size=_PENALTY_SIZE)[0] for ct in (1e2, 1e4, 1e6)]
     spread = (max(vals) - min(vals)) / abs(np.mean(vals))
     assert spread < 0.01, f"transmitted shear still depends on the penalty: {vals}"
 

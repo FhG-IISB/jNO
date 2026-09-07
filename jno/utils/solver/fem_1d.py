@@ -161,8 +161,8 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     # multi-body mesh, so refusing here made a Dirichlet on such a tag impossible -- `u(top) - g` on
     # `tag("top", ..., region="cyl")` raised "has no location function". Ownership by cell topology is
     # the same answer `_face_nodes` and the tag's own facet selection use.
-    from .fem_utils import _cell_region_mask
     from ...domain.mesh_utils import p1_cells_dict
+    from .fem_utils import _cell_region_mask
 
     mesh = getattr(domain, "mesh", None)
     cd = p1_cells_dict(mesh) if mesh is not None and getattr(mesh, "cells_dict", None) else {}

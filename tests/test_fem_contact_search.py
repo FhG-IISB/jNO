@@ -34,8 +34,9 @@ def _x64():
 
 def _stacked_bars(size=0.4, c=1.0e3):
     """Two boxes meeting at z = 1, the upper one loaded into the lower through a penalised gap."""
-    d = jno.Shape.regions(lower=jno.Shape.box(0, 0, 0, 1, 1, 1),
-                          upper=jno.Shape.box(0, 0, 1, 1, 1, 2.5), conforming=False).domain(size=size)
+    d = jno.Shape.regions(
+        lower=jno.Shape.box(0, 0, 0, 1, 1, 1), upper=jno.Shape.box(0, 0, 1, 1, 1, 2.5), conforming=False
+    ).domain(size=size)
     _ = d.built_mesh
     sec, main = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
     u, v = d.fem_symbols(value_shape=(3,))
@@ -43,8 +44,10 @@ def _stacked_bars(size=0.4, c=1.0e3):
     nrm = d.variable(sec, normals=True)
     gu, gv = jno.np.grad(u, [ci[0], ci[1], ci[2]]), jno.np.grad(v, [ci[0], ci[1], ci[2]])
     g = u.gap(sec, main, domain=d)
-    terms = [jno.np.inner(gu, gv, n_contract=2) - 1.0 * v.bind(x=ci[0], y=ci[1], z=ci[2])[2],
-             (-c * g) * jno.np.inner(nrm, v.bind(x=sb[0], y=sb[1], z=sb[2]), n_contract=1)]
+    terms = [
+        jno.np.inner(gu, gv, n_contract=2) - 1.0 * v.bind(x=ci[0], y=ci[1], z=ci[2])[2],
+        (-c * g) * jno.np.inner(nrm, v.bind(x=sb[0], y=sb[1], z=sb[2]), n_contract=1),
+    ]
     terms += [u(bb[0], bb[1], bb[2])[i] - 0.0 for i in range(3)]
     return d, jno.fem(terms)
 
@@ -123,8 +126,9 @@ def test_contact_refuses_a_form_that_declares_no_gap():
     u, v = d.fem_symbols()
     ci, bb = d.variable("interior", split=True), d.variable("boundary", split=True)
     gu, gv = jno.np.grad(u, [ci[0], ci[1], ci[2]]), jno.np.grad(v, [ci[0], ci[1], ci[2]])
-    fem = jno.fem([jno.np.inner(gu, gv, n_contract=1) - 1.0 * v.bind(x=ci[0], y=ci[1], z=ci[2]),
-                   u(bb[0], bb[1], bb[2]) - 0.0])
+    fem = jno.fem(
+        [jno.np.inner(gu, gv, n_contract=1) - 1.0 * v.bind(x=ci[0], y=ci[1], z=ci[2]), u(bb[0], bb[1], bb[2]) - 0.0]
+    )
     with pytest.raises(ValueError, match="declares no contact pair"):
         fem.solve(contact=jno.solve.contact())
 
@@ -175,13 +179,10 @@ def test_contact_composes_with_the_assembled_tangent():
     _, fem_a = _stacked_bars()
     u_free = np.asarray(fem_a.solve(contact=jno.solve.contact())).reshape(-1)
     _, fem_b = _stacked_bars()
-    u_dir = np.asarray(
-        fem_b.solve(contact=jno.solve.contact(), nonlinear=jno.solve.newton(direct=True))
-    ).reshape(-1)
+    u_dir = np.asarray(fem_b.solve(contact=jno.solve.contact(), nonlinear=jno.solve.newton(direct=True))).reshape(-1)
     scale = max(float(np.abs(u_free).max()), 1e-12)
     assert np.abs(u_free - u_dir).max() < 1e-6 * scale, (
-        f"the two tangents reach different solutions: max diff "
-        f"{np.abs(u_free - u_dir).max():.3e} against |u| {scale:.3e}"
+        f"the two tangents reach different solutions: max diff {np.abs(u_free - u_dir).max():.3e} against |u| {scale:.3e}"
     )
 
 
@@ -196,9 +197,9 @@ def _al_contact_march(nsteps=4, c=1.0e3):
     (``lam.i(-1)`` step history plus a ``domain(tau=...)`` grid), so it is what ``contact=`` has to
     compose with. The bonded oracle is ``-0.01`` -- half the platen's ``-0.02``, by symmetry."""
     inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
-    d = jno.Shape.regions(base=jno.Shape.rect(0, 0, 1, 1, size=0.30),
-                          cap=jno.Shape.rect(0, 1, 1, 2, size=0.16),
-                          conforming=False).domain(tau=(0.0, 1.0, nsteps))
+    d = jno.Shape.regions(
+        base=jno.Shape.rect(0, 0, 1, 1, size=0.30), cap=jno.Shape.rect(0, 1, 1, 2, size=0.16), conforming=False
+    ).domain(tau=(0.0, 1.0, nsteps))
     sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
     secondary = next(t for t in sides if t.endswith(".cap"))
     main = next(t for t in sides if t.endswith(".base"))
@@ -212,13 +213,17 @@ def _al_contact_march(nsteps=4, c=1.0e3):
     p = jno.np.maximum(0.0, lam.i(-1) + c * (-g))
     xb, yb, _ = d.variable("bottom", split=True)
     xt, yt, _ = d.variable("top", split=True)
-    fem = jno.fem([
-        LAM_AL * trace(eu) * trace(ep) + 2 * MU_AL * inner(eu, ep, n_contract=2),
-        p * inner(nrm, phi.bind(x=sv[0], y=sv[1]), n_contract=1),
-        lam.evolves(p),
-        u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0,
-        u(xt, yt)[0] - 0.0, u(xt, yt)[1] - (-0.02),
-    ])
+    fem = jno.fem(
+        [
+            LAM_AL * trace(eu) * trace(ep) + 2 * MU_AL * inner(eu, ep, n_contract=2),
+            p * inner(nrm, phi.bind(x=sv[0], y=sv[1]), n_contract=1),
+            lam.evolves(p),
+            u(xb, yb)[0] - 0.0,
+            u(xb, yb)[1] - 0.0,
+            u(xt, yt)[0] - 0.0,
+            u(xt, yt)[1] - (-0.02),
+        ]
+    )
     return d, fem, main
 
 
@@ -291,8 +296,7 @@ def _block_on_disk(size=0.09):
     deformed gap with nothing left to model.
     """
     blk = jno.Shape.rect(-0.3, Y0, 0.3, Y0 + 0.4)
-    d = jno.Shape.regions(disk=jno.Shape.disk(0, 0, R_DISK).sized(size),
-                          blk=blk.sized(size), conforming=False).domain()
+    d = jno.Shape.regions(disk=jno.Shape.disk(0, 0, R_DISK).sized(size), blk=blk.sized(size), conforming=False).domain()
     _ = d.built_mesh
     eps = 1e-6
     d.tag("s_blk", lambda x, y: y < Y0 + eps, region="blk")
@@ -432,9 +436,7 @@ def test_a_candidate_list_pairs_each_point_with_the_nearest_of_them():
     assert gl.shape == gr.shape == gm.shape
 
     picked_l, picked_r = np.isclose(gm, gl, atol=1e-9), np.isclose(gm, gr, atol=1e-9)
-    assert (picked_l | picked_r).all(), (
-        f"{int((~(picked_l | picked_r)).sum())} point(s) took neither candidate's value"
-    )
+    assert (picked_l | picked_r).all(), f"{int((~(picked_l | picked_r)).sum())} point(s) took neither candidate's value"
     assert picked_l.any() and picked_r.any(), (
         f"the list collapsed to one surface: {int(picked_l.sum())} left, {int(picked_r.sum())} right"
     )
@@ -474,11 +476,13 @@ def _slotted_block(size=0.075):
     sb, nb = d.variable("surf", split=True), d.variable("surf", normals=True)
     cl = d.variable("clamp", split=True)
     g = u.gap("surf", ["surf"], domain=d)
-    return d, jno.fem([
-        jno.np.inner(eu, ev, n_contract=2),
-        jno.np.maximum(0.0, -1.0e3 * g) * jno.np.inner(nb, v.bind(x=sb[0], y=sb[1]), n_contract=1),
-        u(cl[0], cl[1]) - 0.0,
-    ])
+    return d, jno.fem(
+        [
+            jno.np.inner(eu, ev, n_contract=2),
+            jno.np.maximum(0.0, -1.0e3 * g) * jno.np.inner(nb, v.bind(x=sb[0], y=sb[1]), n_contract=1),
+            u(cl[0], cl[1]) - 0.0,
+        ]
+    )
 
 
 def test_a_surface_searching_against_itself_finds_the_slot_and_not_its_own_neighbours():
@@ -538,14 +542,18 @@ def _hertz(press):
     the free internal force ``A u``, and ``a`` is the half-width of the contact patch taken from the
     DEFORMED surface geometry.
     """
+    import jax.numpy as jnp
+
     from jno.utils.solver.contact_search import project_points
     from jno.utils.solver.fem_utils import _cell_region_mask
-    import jax.numpy as jnp
 
     lam, mu = E_H * NU_H / ((1 + NU_H) * (1 - 2 * NU_H)), E_H / (2 * (1 + NU_H))
     gapy = 0.004
-    d = jno.Shape.regions(cyl=jno.Shape.disk(0.0, R_H + gapy, R_H).sized(H_H),
-                          blk=jno.Shape.rect(-1.6, -1.2, 1.6, 0.0).sized(H_H), conforming=False).domain()
+    d = jno.Shape.regions(
+        cyl=jno.Shape.disk(0.0, R_H + gapy, R_H).sized(H_H),
+        blk=jno.Shape.rect(-1.6, -1.2, 1.6, 0.0).sized(H_H),
+        conforming=False,
+    ).domain()
     _ = d.built_mesh
     d.tag("s_cyl", lambda x, y: y < R_H + gapy, region="cyl")
     d.tag("s_blk", lambda x, y: y > -1e-9, region="blk")
@@ -568,7 +576,7 @@ def _hertz(press):
     fem = jno.fem(terms)
     uu = np.asarray(fem.solve(contact=jno.solve.contact(capture=4 * H_H))).reshape(-1, 2)
 
-    saved = d.__dict__.pop("_contact_pairs", None)   # the free form drops the gap; the check is right
+    saved = d.__dict__.pop("_contact_pairs", None)  # the free form drops the gap; the check is right
     try:
         A, b = jno.fem(terms[:2])._op
     finally:
@@ -618,7 +626,7 @@ def test_hertz_half_width_scales_as_the_square_root_of_the_load():
             f"a={a:.4f} against Hertz {a_h:.4f}; a discrete patch UNDER-reports, but not by this much"
         )
     assert abs((a2 / a1) / np.sqrt(P2 / P1) - 1.0) < 0.12, (
-        f"a should scale as sqrt(P): measured ratio {a2/a1:.4f}, Hertz {np.sqrt(P2/P1):.4f}"
+        f"a should scale as sqrt(P): measured ratio {a2 / a1:.4f}, Hertz {np.sqrt(P2 / P1):.4f}"
     )
 
 
@@ -646,8 +654,9 @@ def test_the_search_follows_a_large_slide_in_three_dimensions():
     from jno.utils.solver.fem_utils import _cell_region_mask
 
     blk = jno.Shape.box(-0.35, -0.35, Z0_3D, 0.35, 0.35, Z0_3D + 0.4)
-    d = jno.Shape.regions(ball=jno.Shape.sphere(0, 0, 0, R_BALL).sized(H_3D),
-                          blk=blk.sized(H_3D), conforming=False).domain()
+    d = jno.Shape.regions(
+        ball=jno.Shape.sphere(0, 0, 0, R_BALL).sized(H_3D), blk=blk.sized(H_3D), conforming=False
+    ).domain()
     _ = d.built_mesh
     e = 1e-6
     d.tag("s_blk", lambda x, y, z: z < Z0_3D + e, region="blk")
@@ -718,8 +727,9 @@ def test_the_marched_step_is_compiled_once_not_once_per_round():
             return _b(u, args, t)
 
         op.residual = counted
-        u = np.asarray(fem.solve(contact=jno.solve.contact(rounds=12, tol=1e-4),
-                                 nonlinear=jno.solve.newton(line_search=True)))
+        u = np.asarray(
+            fem.solve(contact=jno.solve.contact(rounds=12, tol=1e-4), nonlinear=jno.solve.newton(line_search=True))
+        )
         assert np.isfinite(u).all()
         counts.append(cnt[0])
 

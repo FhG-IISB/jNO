@@ -1557,9 +1557,7 @@ def assemble_fem_native(
         if exc is not None:  # self-contact: one entry per FLATTENED query, facet-major like `xq`
             exc = [exc[i] for i in range(xq.shape[0]) for _ in range(xq.shape[1])]
             mnrm = _facet_normals_np(pts, g["mfaces"])
-        ids, w, g0 = interface_gap_data(
-            xq, g["mf"], pts, nrm, capture=capture, exclude_nodes=exc, main_normals=mnrm
-        )
+        ids, w, g0 = interface_gap_data(xq, g["mf"], pts, nrm, capture=capture, exclude_nodes=exc, main_normals=mnrm)
         if disp is not None:
             # `g0` is what the residual STARTS from, and it then subtracts `n . D(u)` with `u` measured
             # from the REFERENCE configuration. Taking g0 from the deformed frame would subtract that
@@ -1632,7 +1630,6 @@ def assemble_fem_native(
         return out
 
     if _contact_pairs and conn.n_bfaces > 0:
-
         for _key, (_secondary, _main, _fkey) in _contact_pairs.items():
             _fidx = field_index.get(_fkey)
             if _fidx is not None and face_tables_per_field[_fidx] is None:
@@ -1670,9 +1667,19 @@ def assemble_fem_native(
             # Physical quadrature points of each secondary face, formed exactly as `_surf_elem_res` does.
             _fp_qp = np.asarray(face_tables_per_field[_fidx][2])  # (n_faces_local, n_q, dim)
             _pc, _lk = np.asarray(conn.parent_cell)[_sf], np.asarray(conn.local_face)[_sf]
-            _gap_geom[_key] = {"sf": _sf, "mf": _mf, "mfaces": _mfaces, "fidx": _fidx, "pc": _pc, "lk": _lk,
-                               "fp_qp": _fp_qp, "secondary": _secondary, "main": _main, "mains": _mains,
-                               "exclude": _adjacency_ring(_sf, _mfaces) if _selfc else None}
+            _gap_geom[_key] = {
+                "sf": _sf,
+                "mf": _mf,
+                "mfaces": _mfaces,
+                "fidx": _fidx,
+                "pc": _pc,
+                "lk": _lk,
+                "fp_qp": _fp_qp,
+                "secondary": _secondary,
+                "main": _main,
+                "mains": _mains,
+                "exclude": _adjacency_ring(_sf, _mfaces) if _selfc else None,
+            }
             _ids, _w, _g0 = _pair_at(_key, None)
             _g0_full = np.zeros((conn.n_bfaces, np.asarray(_g0).shape[1]))
             _g0_full[_sf] = np.asarray(_g0)
@@ -2518,7 +2525,7 @@ def assemble_fem_native(
             # traction then rotates with the surface (a follower load) rather than staying put (a dead
             # load). Computed once, alongside, so an unmarked region is bit-identical to before.
             normals_fol = _deformed_normals(pts_dyn, u_flat) if _follow_tags else None
-            _nrm_for = (lambda _r: normals_fol if _r in _follow_tags else normals_dyn)
+            _nrm_for = lambda _r: normals_fol if _r in _follow_tags else normals_dyn
             # Main-side values for every contact gap, gathered ONCE over the whole secondary face: the
             # nodes read live on the other body's cells, so this cannot happen inside the per-face map.
             gap_um = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
@@ -2539,7 +2546,17 @@ def assemble_fem_native(
                     _rk = _gaps_in(bcoeff, region)
                     if _rk:
                         R = _contact_reaction(
-                            R, _rk, fids, lv, gslice, bcoeff, btfi, region, t, args, pts_dyn,
+                            R,
+                            _rk,
+                            fids,
+                            lv,
+                            gslice,
+                            bcoeff,
+                            btfi,
+                            region,
+                            t,
+                            args,
+                            pts_dyn,
                             _nrm_for(region),
                         )
             return R
@@ -2688,8 +2705,7 @@ def assemble_fem_native(
             _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
             _idx_static = (
                 jnp.stack(
-                    [jnp.concatenate(_idx_rows).astype(jnp.int32),
-                     jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
+                    [jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
                 )
                 if _idx_rows
                 else None
@@ -2756,7 +2772,7 @@ def assemble_fem_native(
             # traction then rotates with the surface (a follower load) rather than staying put (a dead
             # load). Computed once, alongside, so an unmarked region is bit-identical to before.
             normals_fol = _deformed_normals(pts_dyn, u_flat) if _follow_tags else None
-            _nrm_for = (lambda _r: normals_fol if _r in _follow_tags else normals_dyn)
+            _nrm_for = lambda _r: normals_fol if _r in _follow_tags else normals_dyn
             # Main-side values for every contact gap -- the residual's own gather, reused so the
             # assembled tangent linearizes the SAME function the residual evaluates.
             gap_um_j = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}

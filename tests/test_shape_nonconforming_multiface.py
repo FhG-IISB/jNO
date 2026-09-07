@@ -39,6 +39,7 @@ def _x64():
     finally:
         jax.config.update("jax_enable_x64", prev)
 
+
 #: Channel, and a beam standing on its floor. The beam's own bottom (y = 0) is part of the channel
 #: floor -- an OUTER face, not an interface -- which is what stops this from being a symmetric case
 #: where a bug in the matching could still look right.
@@ -60,8 +61,7 @@ def _on_wetted_surface(p):
     """The beam's three wetted faces, from the geometry alone. Its bottom is deliberately excluded."""
     x, y = p[..., 0], p[..., 1]  # `...` so this reads both a node array (N,2) and a facet one (M,2,2)
     sides = (np.abs(x - _X0) < 1e-9) | (np.abs(x - _X1) < 1e-9)
-    return ((sides & (y > -1e-9) & (y < _TOP + 1e-9)) |
-            ((np.abs(y - _TOP) < 1e-9) & (x > _X0 - 1e-9) & (x < _X1 + 1e-9)))
+    return (sides & (y > -1e-9) & (y < _TOP + 1e-9)) | ((np.abs(y - _TOP) < 1e-9) & (x > _X0 - 1e-9) & (x < _X1 + 1e-9))
 
 
 def _tag_facets(d, tag):

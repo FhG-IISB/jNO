@@ -1978,9 +1978,7 @@ class FEM:
             # it dispatches with `contact=None` by design, so an unguarded check would refuse the very
             # solve it was asked to run.
             _multi = {
-                k: v[1]
-                for k, v in (getattr(self.domain, "_contact_pairs", {}) or {}).items()
-                if isinstance(v[1], tuple)
+                k: v[1] for k, v in (getattr(self.domain, "_contact_pairs", {}) or {}).items() if isinstance(v[1], tuple)
             }
             if _multi:
                 _s, _m = next(iter(_multi.items()))
@@ -1991,9 +1989,7 @@ class FEM:
                     "one answer to freeze, and picking one silently is exactly the failure this "
                     "mechanism exists to remove. Pass `contact=`, or name a single main surface."
                 )
-        _marches = bool(
-            getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None)
-        )
+        _marches = bool(getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None))
         if contact is not None and not _marches:
             # The contact search owns the sequence of solves the way continuation does: each round is an
             # ordinary solve with the current pairing threaded on ``args``, and the loop re-runs the
@@ -2008,9 +2004,18 @@ class FEM:
             from .utils.solver.contact_search import run_contact_solve
 
             return run_contact_solve(
-                self, contact, solve_fn=solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear,
-                linear=linear, precond=precond, time=time, shard=shard,
-                continuation=continuation, **kwargs,
+                self,
+                contact,
+                solve_fn=solve_fn,
+                adapt=adapt,
+                x0=x0,
+                nonlinear=nonlinear,
+                linear=linear,
+                precond=precond,
+                time=time,
+                shard=shard,
+                continuation=continuation,
+                **kwargs,
             )
         if continuation is not None:
             # Parameter continuation owns the sequence of solves, so it is dispatched before the mode

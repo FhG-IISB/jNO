@@ -40,9 +40,11 @@ NSTEP = 4
 
 
 def _two_regions(tau=True):
-    d = jno.Shape.regions(left=jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34),
-                          right=jno.Shape.rect(1.0, 0.0, 2.0, 1.0, size=0.34),
-                          conforming=False)
+    d = jno.Shape.regions(
+        left=jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34),
+        right=jno.Shape.rect(1.0, 0.0, 2.0, 1.0, size=0.34),
+        conforming=False,
+    )
     d = d.domain(tau=(0.0, 1.0, NSTEP)) if tau else d.domain()
     _ = d.built_mesh
     return d
@@ -129,11 +131,13 @@ def test_an_unknown_region_is_refused_by_name():
     ci, bd = d.variable("interior", split=True), d.variable("boundary", split=True)
     X = [ci[0], ci[1]]
     with pytest.raises((ValueError, KeyError), match="middle"):
-        jno.fem([
-            n.inner(n.grad(u, X), n.grad(phi, X), n_contract=1) - s.i(-1) * phi.bind(x=X[0], y=X[1]),
-            s.evolves(s.i(-1) + 1.0, region="middle"),
-            u(bd[0], bd[1]) - 0.0,
-        ]).solve()
+        jno.fem(
+            [
+                n.inner(n.grad(u, X), n.grad(phi, X), n_contract=1) - s.i(-1) * phi.bind(x=X[0], y=X[1]),
+                s.evolves(s.i(-1) + 1.0, region="middle"),
+                u(bd[0], bd[1]) - 0.0,
+            ]
+        ).solve()
 
 
 # ----------------------------------------------------------------------------------------------
@@ -152,9 +156,9 @@ def test_plasticity_in_one_region_leaves_the_other_region_exactly_frozen():
     from tests.test_fem_history_march import SY, _j2_stress
 
     n = jno.np
-    d = jno.Shape.regions(left=jno.Shape.box(0, 0, 0, 1, 1, 1),
-                          right=jno.Shape.box(1, 0, 0, 2, 1, 1),
-                          conforming=False).domain(tau=(0.0, 1.0, 3))
+    d = jno.Shape.regions(
+        left=jno.Shape.box(0, 0, 0, 1, 1, 1), right=jno.Shape.box(1, 0, 0, 2, 1, 1), conforming=False
+    ).domain(tau=(0.0, 1.0, 3))
     _ = d.built_mesh
     d.tag("lo", lambda x, y, z: x < 1e-9)
     d.tag("hi", lambda x, y, z: x > 2.0 - 1e-9)
@@ -166,15 +170,17 @@ def test_plasticity_in_one_region_leaves_the_other_region_exactly_frozen():
     cl, ch = d.variable("lo", split=True), d.variable("hi", split=True)
     sig, dg, nd = _j2_stress(u, X, ep.i(-1), al.i(-1), sy=SY)
     rt = float(np.sqrt(1.5))
-    fem = jno.fem([
-        n.inner(sig, n.sym(n.grad(phi, X)), n_contract=2),
-        ep.evolves(ep.i(-1) + rt * dg * nd, region="left"),
-        al.evolves(al.i(-1) + rt * dg, region="left"),
-        u(cl[0], cl[1], cl[2])[0] - 0.0,
-        u(cl[0], cl[1], cl[2])[1] - 0.0,
-        u(cl[0], cl[1], cl[2])[2] - 0.0,
-        u(ch[0], ch[1], ch[2])[0] - 0.05,
-    ])
+    fem = jno.fem(
+        [
+            n.inner(sig, n.sym(n.grad(phi, X)), n_contract=2),
+            ep.evolves(ep.i(-1) + rt * dg * nd, region="left"),
+            al.evolves(al.i(-1) + rt * dg, region="left"),
+            u(cl[0], cl[1], cl[2])[0] - 0.0,
+            u(cl[0], cl[1], cl[2])[1] - 0.0,
+            u(cl[0], cl[1], cl[2])[2] - 0.0,
+            u(ch[0], ch[1], ch[2])[0] - 0.05,
+        ]
+    )
     op = fem.operator
     from jno.utils.solver.fem_utils import _cell_region_mask
 
@@ -187,7 +193,7 @@ def test_plasticity_in_one_region_leaves_the_other_region_exactly_frozen():
     out = op.state_readout(uu, 1.0, {"__history__": bufs})
 
     for key, sp in op.history_specs.items():
-        prev0 = np.asarray(bufs[key])[:, :, 0, ...]     # slot 0 IS this state's .i(-1)
+        prev0 = np.asarray(bufs[key])[:, :, 0, ...]  # slot 0 IS this state's .i(-1)
         got = np.asarray(out[key])
         assert np.array_equal(got[~mask], prev0[~mask]), (
             f"state {sp['name']!r} was not frozen outside its region "

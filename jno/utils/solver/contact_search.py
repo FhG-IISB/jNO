@@ -301,15 +301,22 @@ def chain_arclength(facets: np.ndarray, points: np.ndarray):
     order, closed = chain_order(f, pts)
     # walk again to get each facet's traversal ORIENTATION, so `t` runs the same way along the chain
     ends = f[order][:, :2]
-    v = int(ends[0, 0]) if len(order) == 1 else (
-        int(ends[0, 0]) if int(ends[0, 0]) not in ends[1, :2].tolist() else int(ends[0, 1]))
+    v = (
+        int(ends[0, 0])
+        if len(order) == 1
+        else (int(ends[0, 0]) if int(ends[0, 0]) not in ends[1, :2].tolist() else int(ends[0, 1]))
+    )
     a_list, b_list = [], []
     for a, b in ends:
         a, b = int(a), int(b)
         if a == v:
-            a_list.append(a); b_list.append(b); v = b
+            a_list.append(a)
+            b_list.append(b)
+            v = b
         else:
-            a_list.append(b); b_list.append(a); v = a
+            a_list.append(b)
+            b_list.append(a)
+            v = a
     A, B = np.asarray(a_list), np.asarray(b_list)
     lengths = np.linalg.norm(pts[B] - pts[A], axis=1)
     starts = np.concatenate([[0.0], np.cumsum(lengths)[:-1]])
@@ -514,10 +521,7 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
             scale = max(float(np.abs(u).max()), 1e-30)
             # One argument: `PrintFallback.info` (the no-logging-configured path) takes exactly one,
             # so %-style args would raise here and only here -- in the branch nobody runs under pytest.
-            _log.info(
-                f"contact round {rnd + 1}/{rounds}: "
-                f"{moved} slot(s) re-paired, |du| = {du:.3e}"
-            )
+            _log.info(f"contact round {rnd + 1}/{rounds}: {moved} slot(s) re-paired, |du| = {du:.3e}")
             # Settled = the SOLUTION has stopped moving, twice running. Not `moved == 0`: a quadrature
             # point sitting on the seam between two adjacent main facets can flip between them forever,
             # and both describe the same surface, so the gap it sees is the same either way. Measured on
@@ -548,7 +552,7 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
     if _stalled(hist, spec.tol):
         raise RuntimeError(
             f"fem.solve(contact=...): the search is OSCILLATING, not converging -- over {rounds} rounds "
-            f"|du|/|u| cycled between {min(hist):.2e} and {max(hist[len(hist)//2:]):.2e} with no downward "
+            f"|du|/|u| cycled between {min(hist):.2e} and {max(hist[len(hist) // 2 :]):.2e} with no downward "
             f"trend, against a tolerance of {spec.tol:.0e}. More rounds will not help: the pairing is "
             "alternating between a small set of configurations. Damp the iteration with "
             "`jno.solve.contact(relax=0.5)` (lower it further if 0.5 still cycles) -- that is the "

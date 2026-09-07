@@ -95,7 +95,7 @@ def test_points_and_normals_pair_and_point_out_of_their_own_body(two_bodies):
     a normal from the *other* body is worse, because it is silent."""
     d = two_bodies
     for tag in ("sA", "sB"):
-        (_, p, n), = d._sampling_groups_for_tag(tag, for_normals=True)
+        ((_, p, n),) = d._sampling_groups_for_tag(tag, for_normals=True)
         p, n = np.asarray(p)[:, :2], np.asarray(n)[:, :2]
         assert len(p) == len(n), f"{tag}: {len(p)} points against {len(n)} normals"
 
@@ -114,8 +114,8 @@ def test_the_volume_reading_of_the_same_tag_keeps_the_whole_pool(two_bodies):
     for its normals; only the caller that pairs them gets the surface."""
     d = two_bodies
     for tag in ("sA", "sB"):
-        (_, whole, _), = d._sampling_groups_for_tag(tag)
-        (_, surf, _), = d._sampling_groups_for_tag(tag, for_normals=True)
+        ((_, whole, _),) = d._sampling_groups_for_tag(tag)
+        ((_, surf, _),) = d._sampling_groups_for_tag(tag, for_normals=True)
         assert np.asarray(whole).shape[0] == np.asarray(d._mesh_pool[tag]).shape[0]
         assert np.asarray(whole).shape[0] > np.asarray(surf).shape[0], "the pool is interior + boundary"
 
@@ -153,8 +153,9 @@ def test_touching_bodies_keep_their_own_interface_side(hB, label):
     owner is on the tag; the exterior boundary, which carries no owner, falls back to cell topology —
     safe there, because two bodies' exterior faces cannot coincide.
     """
-    d = jno.Shape.regions(A=jno.Shape.rect(0, 0, 1, 1).sized(0.25),
-                          B=jno.Shape.rect(1, 0, 2, 1).sized(hB), conforming=False).domain()
+    d = jno.Shape.regions(
+        A=jno.Shape.rect(0, 0, 1, 1).sized(0.25), B=jno.Shape.rect(1, 0, 2, 1).sized(hB), conforming=False
+    ).domain()
     _ = d.built_mesh
     everywhere = lambda x, y: x**2 >= -1.0  # noqa: E731
     d.tag("sA", everywhere, region="A")
@@ -192,9 +193,11 @@ def test_a_region_scoped_dirichlet_works_at_any_element_order(order):
     Both ``x^2 - y^2`` and ``2xy`` are harmonic and lie in the P2 space, so the discrete solution is the
     exact one and any deviation is a condition that was not imposed.
     """
-    d = jno.Shape.regions(A=jno.Shape.rect(*BOX["A"][:1], 0, BOX["A"][1], 1).sized(0.34),
-                          B=jno.Shape.rect(BOX["B"][0], 0, BOX["B"][1], 1).sized(0.34),
-                          conforming=False).domain()
+    d = jno.Shape.regions(
+        A=jno.Shape.rect(*BOX["A"][:1], 0, BOX["A"][1], 1).sized(0.34),
+        B=jno.Shape.rect(BOX["B"][0], 0, BOX["B"][1], 1).sized(0.34),
+        conforming=False,
+    ).domain()
     _ = d.built_mesh
     everywhere = lambda x, y: x**2 >= -1.0  # noqa: E731
     d.tag("sA", everywhere, region="A")
@@ -204,11 +207,13 @@ def test_a_region_scoped_dirichlet_works_at_any_element_order(order):
     ci = d.variable("interior", split=True)
     a, b = d.variable("sA", split=True), d.variable("sB", split=True)
     gu, gv = jno.np.grad(u, [ci[0], ci[1]]), jno.np.grad(v, [ci[0], ci[1]])
-    fem = jno.fem([
-        jno.np.inner(gu, gv, n_contract=1),
-        u(a[0], a[1]) - (a[0] * a[0] - a[1] * a[1]),   # harmonic, quadratic
-        u(b[0], b[1]) - (2.0 * b[0] * b[1]),           # a DIFFERENT harmonic function
-    ])
+    fem = jno.fem(
+        [
+            jno.np.inner(gu, gv, n_contract=1),
+            u(a[0], a[1]) - (a[0] * a[0] - a[1] * a[1]),  # harmonic, quadratic
+            u(b[0], b[1]) - (2.0 * b[0] * b[1]),  # a DIFFERENT harmonic function
+        ]
+    )
     sol = np.asarray(fem.solve()).reshape(-1)
     pts = np.asarray(fem.field_points[0])
 

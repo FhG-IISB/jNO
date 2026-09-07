@@ -1485,8 +1485,7 @@ def arclength(*, psi: float = 0.0, ds: float | None = None):
     return ArcLengthSpec(psi=float(psi), ds=None if ds is None else float(ds))
 
 
-def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4,
-            relax: float = 1.0):
+def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4, relax: float = 1.0):
     """Let the contact pairing follow the solution — a spec for the ``fem.solve(contact=...)`` slot.
 
     ``u.gap(secondary, main)`` precomputes, for every secondary quadrature point, which main nodes it
@@ -1588,5 +1587,6 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
     """
     from .utils.solver.contact_search import ContactSpec
 
-    return ContactSpec(capture=None if capture is None else float(capture), rounds=int(rounds),
-                       tol=float(tol), relax=float(relax))
+    return ContactSpec(
+        capture=None if capture is None else float(capture), rounds=int(rounds), tol=float(tol), relax=float(relax)
+    )

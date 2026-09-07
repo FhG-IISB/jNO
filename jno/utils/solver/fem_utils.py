@@ -2750,16 +2750,19 @@ def _mortar_rows_3d(
             nrm = np.cross(e1, e2)
             n2 = float(np.linalg.norm(nrm))
             if 0.5 * n2 <= area_tol:  # a sliver: its local frame is ill-conditioned. Skip on the TRUE
-                continue              # 3-D area, never the projected one, which can vanish spuriously.
+                continue  # 3-D area, never the projected one, which can vanish spuriously.
             t1 = e1 / np.linalg.norm(e1)
             t2 = np.cross(nrm / n2, t1)
-            org, F = V3[0], np.stack([t1, t2])            # the secondary facet's OWN plane
+            org, F = V3[0], np.stack([t1, t2])  # the secondary facet's OWN plane
             sv = (V3 - org) @ F.T
-            area_e = abs(_signed_area(sv))                # == the true 3-D area, by construction
+            area_e = abs(_signed_area(sv))  # == the true 3-D area, by construction
             cen = V3.mean(axis=0)
-            near = np.asarray(m_tree.query_ball_point(
-                cen, float(np.linalg.norm(V3 - cen, axis=1).max()) + m_reach + 1e-9 * max(span, 1.0)),
-                dtype=int)
+            near = np.asarray(
+                m_tree.query_ball_point(
+                    cen, float(np.linalg.norm(V3 - cen, axis=1).max()) + m_reach + 1e-9 * max(span, 1.0)
+                ),
+                dtype=int,
+            )
         rows = [s_at[int(v)] for v in s_facets[e]]
         sv_ccw = _as_ccw(sv)
         covered = 0.0
@@ -3408,8 +3411,7 @@ def build_periodic_prolongation(
                 # global path rather than no mortar at all. Without the fall-through a triply-periodic
                 # P2 cube lost its coupling entirely.
                 if _curved3 and _covers_local_3d(s_fc, m_fc, np.asarray(pts)):
-                    mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim,
-                                             pts3=np.asarray(pts))
+                    mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim, pts3=np.asarray(pts))
                 elif _main_covers_secondary_3d(s_fc, m_fc, loc):
                     mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim)
             elif int(np.shape(s_fc)[1]) == 6:

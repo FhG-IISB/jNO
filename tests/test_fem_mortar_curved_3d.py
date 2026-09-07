@@ -53,8 +53,9 @@ def _spheres(h_in, h_out, R=1.0, RO=2.0):
     """A ball in a shell: the interface is a full sphere — curved AND closed, which the 2-D arc-length
     coordinate cannot do at all (it is periodic, so a loop must be cut into arcs first)."""
     ball = jno.Shape.sphere(0, 0, 0, R)
-    return jno.Shape.regions(ball=ball.sized(h_in), shell=(jno.Shape.sphere(0, 0, 0, RO) - ball).sized(h_out),
-                             conforming=False).domain()
+    return jno.Shape.regions(
+        ball=ball.sized(h_in), shell=(jno.Shape.sphere(0, 0, 0, RO) - ball).sized(h_out), conforming=False
+    ).domain()
 
 
 def _patch(d):
@@ -65,11 +66,13 @@ def _patch(d):
     ui, vi = u.bind(x=c[0], y=c[1], z=c[2]), v.bind(x=c[0], y=c[1], z=c[2])
     a, b = (d.variable(t, split=True) for t in sorted(t for t in d.built_mesh.cell_sets if "|" in t))
     ob = d.variable("boundary", split=True)
-    fem = jno.fem([
-        ui.x * vi.x + ui.y * vi.y + ui.z * vi.z,
-        u(a[0], a[1], a[2]) - u(b[0], b[1], b[2]),
-        u(ob[0], ob[1], ob[2]) - (GRAD[0] * ob[0] + GRAD[1] * ob[1] + GRAD[2] * ob[2] + OFF),
-    ])
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y + ui.z * vi.z,
+            u(a[0], a[1], a[2]) - u(b[0], b[1], b[2]),
+            u(ob[0], ob[1], ob[2]) - (GRAD[0] * ob[0] + GRAD[1] * ob[1] + GRAD[2] * ob[2] + OFF),
+        ]
+    )
     sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
     exact = np.asarray(fem.field_points[0]) @ GRAD + OFF
     return fem._periodic.get("coupling"), float(np.abs(sol - exact).max())
@@ -153,4 +156,4 @@ def test_the_patch_error_is_the_faceting_and_nothing_more(h_in, h_out):
     if coupling == "conforming":
         pytest.skip("gmsh produced matching surfaces here; there is no mortar to measure")
     assert coupling == "mortar", f"got {coupling!r}"
-    assert err < 0.8 * h_in**2 / 8.0, f"error {err:.3e} exceeds the faceting scale {h_in**2/8:.3e}"
+    assert err < 0.8 * h_in**2 / 8.0, f"error {err:.3e} exceeds the faceting scale {h_in**2 / 8:.3e}"

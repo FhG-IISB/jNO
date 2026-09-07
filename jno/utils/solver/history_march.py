@@ -227,9 +227,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
         # build-time tables are unbounded, so on a closed body the far side pairs through the body.
         relax = float(getattr(spec, "relax", 1.0))
         if not (0.0 < relax <= 1.0):
-            raise ValueError(
-                f"fem.solve(tau=..., contact=...): relax must lie in (0, 1], got {relax}."
-            )
+            raise ValueError(f"fem.solve(tau=..., contact=...): relax must lie in (0, 1], got {relax}.")
         tables = repair(np.zeros(n_dofs), capture=spec.capture)
         u, bufs, sbufs = u0, buffers0, sbuffers0
         traj = []
@@ -238,15 +236,12 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             path_k = {fid: fr[k] for fid, fr in path_frames.items()}
             u_prev, settled, moved, rel, quiet, hist = None, False, None, float("inf"), 0, []
             for rnd in range(int(spec.rounds)):
-                u_new, nb, nsb = _step_compiled(
-                    u, bufs, sbufs, tau_k, path_k, {**param_args, "__gap_tables__": tables}
-                )
+                u_new, nb, nsb = _step_compiled(u, bufs, sbufs, tau_k, path_k, {**param_args, "__gap_tables__": tables})
                 un_raw = np.asarray(u_new)
                 # UNDER-RELAX before searching, exactly as the steady loop does -- see
                 # `run_contact_solve`. A follower contact normal makes the round map stop contracting,
                 # and a load path is where that bites hardest: every step pays for it.
-                un = (un_raw if u_prev is None or relax == 1.0
-                      else (1.0 - relax) * u_prev + relax * un_raw)
+                un = un_raw if u_prev is None or relax == 1.0 else (1.0 - relax) * u_prev + relax * un_raw
                 new = repair(un, capture=spec.capture)
                 moved = _pairing_moved(tables, new)
                 du = np.inf if u_prev is None else float(np.abs(un - u_prev).max())
@@ -271,7 +266,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
                     f"fem.solve(tau=..., contact=...): load step {k + 1}/{n_steps} (tau = "
                     f"{float(tau_k):.4g}) is OSCILLATING, not converging -- over {int(spec.rounds)} "
                     f"rounds |du|/|u| cycled between {min(hist):.2e} and "
-                    f"{max(hist[len(hist)//2:]):.2e} with no downward trend. More rounds will not help. "
+                    f"{max(hist[len(hist) // 2 :]):.2e} with no downward trend. More rounds will not help. "
                     "Damp the search with `jno.solve.contact(relax=0.5)` -- the direct remedy when the "
                     "pairing feeds back into the solution, as it does with a follower contact normal. "
                     "Otherwise take smaller load steps so each starts nearer its own equilibrium, "
@@ -281,9 +276,12 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
                 raise RuntimeError(
                     f"fem.solve(tau=..., contact=...): load step {k + 1}/{n_steps} (tau = "
                     f"{float(tau_k):.4g}) did not settle in {int(spec.rounds)} round(s) -- "
-                    + (f"{moved} quadrature slot(s) still change which main facet they read"
-                       if moved else f"the pairing is settled but the solution still moves by {rel:.2e} "
-                       f"relative against a tolerance of {spec.tol:.0e}")
+                    + (
+                        f"{moved} quadrature slot(s) still change which main facet they read"
+                        if moved
+                        else f"the pairing is settled but the solution still moves by {rel:.2e} "
+                        f"relative against a tolerance of {spec.tol:.0e}"
+                    )
                     + ". Raise `rounds=`, loosen `tol=`, or take smaller load steps so each one starts "
                     "closer to its own equilibrium."
                 )

@@ -47,8 +47,7 @@ def _x64():
 
 def _two_region(size=0.22):
     return (
-        jno.Shape.rect(0.0, 0.0, L, H).name("fluid").sized(size)
-        + jno.Shape.rect(X0, -T, X1, 0.0).name("solid").sized(size)
+        jno.Shape.rect(0.0, 0.0, L, H).name("fluid").sized(size) + jno.Shape.rect(X0, -T, X1, 0.0).name("solid").sized(size)
     ).domain()
 
 

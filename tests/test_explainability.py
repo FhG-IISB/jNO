@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import pytest
 import numpy as np
+import pytest
 
 from jno.utils.explainability import make_residual_stats_fn
 
@@ -625,9 +625,7 @@ def test_engd_callback_compiles_and_reduces_loss(_engd_x64):
     # Not "a bit lower": ENGD's claim is orders of magnitude (Zeinhofer et al., ICML 2023). Measured
     # here, 2.1e-14 against GD's 2.4e+01. A bare `<` passed for years on a run that was really only
     # marginally better, and would pass again if the preconditioner silently degraded to plain GD.
-    assert loss_engd < loss_gd / 1e6, (
-        f"ENGD loss {loss_engd:.3e} should be orders below GD loss {loss_gd:.3e}"
-    )
+    assert loss_engd < loss_gd / 1e6, f"ENGD loss {loss_engd:.3e} should be orders below GD loss {loss_gd:.3e}"
     # Loss must be finite.
     assert np.isfinite(loss_engd), f"ENGD loss is not finite: {loss_engd}"
 
