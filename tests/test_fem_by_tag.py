@@ -94,9 +94,7 @@ def test_the_mask_selects_exactly_the_dirichlet_facets():
     # preconditioners downstream (see `_apply_dirichlet_symmetric`). The value it pins is unchanged;
     # only the scaling of the equation is, so reading `A[i, i] == 1.0` tests a convention.
     pinned = {
-        i
-        for i in range(A_dir.shape[0])
-        if np.allclose(np.delete(A_dir[i], i), 0.0) and not np.isclose(A_dir[i, i], 0.0)
+        i for i in range(A_dir.shape[0]) if np.allclose(np.delete(A_dir[i], i), 0.0) and not np.isclose(A_dir[i, i], 0.0)
     }
 
     # Nodes touched by a `left`-only surface load.

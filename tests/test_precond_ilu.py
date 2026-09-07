@@ -106,7 +106,7 @@ def test_the_diagonal_shift_ladder_engages_on_a_zero_pivot():
     import jax.numpy as jnp
     from jax.experimental import sparse as jsp
 
-    from jno.precond import PrecondContext, _ILU
+    from jno.precond import _ILU, PrecondContext
     from jno.utils.solver.solver_api import LinearOperator
 
     n = 6
