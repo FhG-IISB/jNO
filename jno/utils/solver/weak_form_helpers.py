@@ -297,9 +297,14 @@ def collect_variational_metas(domain, node, out):
         collect_variational_metas(domain, child, out)
 
 
-def infer_term_bucket(domain, term):
+def infer_term_bucket(domain, term, *, network_trial: bool = False):
     """
     Infer whether a weak-form term belongs to the volume or a boundary region.
+
+    Args:
+        network_trial: set by the VPINN lowering. It alone falls back to the coordinate tags when a
+            term carries no variational meta; every other caller keeps the historic "volume" default
+            (see the comment at that branch).
 
     Returns:
         `(support, region_id)`
@@ -325,6 +330,14 @@ def infer_term_bucket(domain, term):
         return support, region_id
 
     if contains_node_type(term, TrialFunction) or contains_node_type(term, TestFunction):
+        if not network_trial:
+            # The historic default. Only the network-trial lowering consults the coordinate tags
+            # below: this function is shared with the NON-NODAL assembler, where an RT natural
+            # pressure BC reached here and relied on falling through to "volume" -- reclassifying it
+            # as a general boundary term routes it into a path that refuses it ("Robin / general
+            # surface terms are not wired yet"). Widening the rule for everyone broke that; the fix
+            # B1 needed is specific to a bound test on a network-trial form.
+            return "volume", "volume"
         # No variational meta -- which is exactly what a BOUND test function looks like:
         # ``phi.bind(x=xr, y=yr)`` carries its region on the coordinate Variables, not on a registry
         # entry. Falling straight through to ("volume", "volume") filed a Neumann flux term under the

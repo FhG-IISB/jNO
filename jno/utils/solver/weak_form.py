@@ -802,7 +802,10 @@ def lower_weak_form(domain, expr, trial_value=None):
     lowered_terms = []
 
     for sign, term in terms:
-        support, region_id = _infer_term_bucket(domain, term)
+        # `lower_weak_form` IS the network-trial lowering (its only caller is `assemble_weak_form`),
+        # so the coordinate-tag fallback is on here and off at the other `infer_term_bucket` call
+        # sites, which serve the non-nodal assembler.
+        support, region_id = _infer_term_bucket(domain, term, network_trial=True)
 
         term = _bind_statefield_for_vpinn(domain, term, target_support=support, target_region_id=region_id)
 
