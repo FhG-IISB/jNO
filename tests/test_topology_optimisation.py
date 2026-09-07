@@ -216,10 +216,17 @@ class TestP0DensityParameter:
             return np.asarray(jnp.asarray(a.todense()))
 
         k_all = K(np.ones(n_cells))
-        eye = np.eye(k_all.shape[0])
-        # The Dirichlet rows are replaced by the identity in EVERY assembly, so they would
-        # accumulate across the sum below; compare on the free block.
-        dirichlet = np.where(np.all(np.isclose(k_all, eye), axis=1))[0]
+        # The Dirichlet rows are re-imposed in EVERY assembly, so they would accumulate across the sum
+        # below; compare on the free block. A pinned row is found by its STRUCTURE -- every
+        # off-diagonal zero, diagonal non-zero -- not by matching the identity: symmetric elimination
+        # writes `s*u_i = s*g` with `s` the local diagonal magnitude, so the diagonal is not 1.0 (see
+        # `_apply_dirichlet_symmetric`). Matching the identity found NOTHING, put the pinned DOFs in
+        # `free`, and the linearity check then compared rows that are pinned rather than assembled.
+        _off = ~np.eye(k_all.shape[0], dtype=bool)
+        dirichlet = np.where(
+            np.all(np.isclose(np.where(_off, k_all, 0.0), 0.0), axis=1) & ~np.isclose(np.diag(k_all), 0.0)
+        )[0]
+        assert dirichlet.size > 0, "no pinned rows found -- the structural test for one has drifted"
         free = np.setdiff1d(np.arange(k_all.shape[0]), dirichlet)
 
         # 1. Linearity: with a coefficient linear in rho, one-hot designs must sum to the whole.
