@@ -26,7 +26,7 @@ path is unaffected.
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | Plasticity | small-strain, isotropic, linear-hardening, whole-domain | raises |
-| VPINN (network trial) | **steady only**, 1-D / 2-D meshes, single field (scalar or vector), no periodic ties | raises |
+| VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
 | **Curved-boundary geometry** | straight-sided **by default**; `Shape.curved()` is the fix | **silent** |
@@ -131,8 +131,15 @@ path is unaffected.
     needs a decided treatment of time — space-time test functions, or collocation on the declared grid
     with the IC as its own loss — which is a design choice rather than an implementation gap.
 
-    The same projection is built through the **1-D/2-D** native quadrature context, so a 3-D domain
-    raises rather than proceeding. It is also
+    **3-D works.** It used to raise -- first on an internal quadrature-pool tag, then by name -- and
+    the restriction turned out to be a conservative guard rather than a limitation: the native
+    assembler builds the context in 3-D exactly as in 2-D. Measured on the cube: Poisson 4.6e-04, a
+    Neumann flux face 8.4e-04, with the same scalar and vector operator surface as 2-D.
+
+    One spelling is required on a boundary term: its coefficient must carry a coordinate from that
+    region (`(g + 0.0 * xr) * v_r`). A bound test keeps its binding on the view rather than in the
+    expression tree, so a bare constant is indistinguishable from a volume term once the form is
+    flattened, and would be integrated over the volume silently. It is refused instead. It is also
     **single-field**: a vector unknown is fine (one field with `value_shape=(d,)`, and all four source
     spellings lower identically), but a coupled multi-field system is not. **Periodic ties** are
     refused because a tie is an algebraic reduction of FE trial DOFs and a network trial has none —

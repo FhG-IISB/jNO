@@ -420,11 +420,16 @@ def test_vpinn_1d_trains_and_solves_poisson():
 
 
 class TestVpinnScopeRefusals:
-    def test_three_d_vpinn_is_refused_by_name(self):
-        """A 3-D network trial used to die on ``Tag 'fem_gauss' is not in the mesh pool or context``
-        -- an internal tag name, for a scope limit no user can infer from it. The lowering builds its
-        quadrature through the 1-D/2-D native context; say so where the decision is made."""
-        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    def test_a_three_d_network_trial_assembles(self):
+        """3-D died on ``Tag 'fem_gauss' is not in the mesh pool``, then was refused by name -- and
+        the restriction turned out to be a conservative guard rather than a limitation: the native
+        assembler builds the quadrature context in 3-D exactly as in 2-D, so widening the branch was
+        the whole change. Accuracy is measured in ``TestVpinn3D``.
+
+        The mesh must be fine enough to have INTERIOR nodes: the Dirichlet declaration masks every
+        boundary test function, so a cube coarse enough that all its nodes lie on the surface gives an
+        identically-zero residual -- correct, and useless to assert on."""
+        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
         u, phi = dom.fem_symbols()
         si = dom.variable("interior", split=True)
         xi, yi, zi = si[0], si[1], si[2]
@@ -432,16 +437,42 @@ class TestVpinnScopeRefusals:
         net = jnn.nn.wrap(foundax.mlp(3, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
         vi = phi.bind(x=xi, y=yi, z=zi)
         u_net = net(xi, yi, zi) * xi * (1 - xi) * yi * (1 - yi) * zi * (1 - zi)
-        with pytest.raises(NotImplementedError, match=r"VPINN.*1-D and 2-D"):
-            jno.fem(
-                [
-                    jnn.grad(u_net, xi) * jnn.grad(vi, xi)
-                    + jnn.grad(u_net, yi) * jnn.grad(vi, yi)
-                    + jnn.grad(u_net, zi) * jnn.grad(vi, zi)
-                    - 1.0 * vi,
-                    u(*sb) - 0.0,
-                ]
-            )
+        pde = jno.fem(
+            [
+                jnn.grad(u_net, xi) * jnn.grad(vi, xi)
+                + jnn.grad(u_net, yi) * jnn.grad(vi, yi)
+                + jnn.grad(u_net, zi) * jnn.grad(vi, zi)
+                - 1.0 * vi,
+                u(*sb) - 0.0,
+            ]
+        )
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+    def test_a_constant_boundary_coefficient_is_refused_rather_than_mis_filed(self):
+        """A bound test function keeps its binding on the VIEW, not in the expression tree, so once
+        the weak form is flattened ``-1.0 * v_right`` and ``-1.0 * v_interior`` are indistinguishable
+        and both default to volume. A Neumann flux integrated over the volume trains happily and is
+        wrong -- measured 3.9e-01 against 6.8e-04 for the same problem written the other way.
+
+        `_fem_impl` still knows the region at that point, so it refuses there and names the spelling
+        that works. The FEM trial needs none of this: it classifies the raw constraint, where the
+        binding survives, and takes both spellings (9.0e-16 either way)."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        sl = dom.variable("left", split=True)
+        sr = dom.variable("right", split=True)
+        vi, vr = phi.bind(x=xi, y=yi), phi.bind(x=sr[0], y=sr[1])
+        un = make_scalar_net()(xi, yi) * xi
+        vol = jnn.grad(un, xi) * jnn.grad(vi, xi) + jnn.grad(un, yi) * jnn.grad(vi, yi)
+
+        with pytest.raises(NotImplementedError, match=r"carrying no coordinate"):
+            jno.fem([vol, -1.0 * vr, u(sl[0], sl[1]) - 0.0])
+
+        # the spelling the message names does assemble, onto its own region's channel
+        ok = jno.fem([vol, -(1.0 + 0.0 * sr[0]) * vr, u(sl[0], sl[1]) - 0.0])
+        assert set(ok.boundary_value_exprs) == {"right"}
 
 
 class TestVpinnVectorSource:
@@ -807,5 +838,62 @@ class TestVpinnTransientRefusal:
         pde = jno.fem(
             [jnn.grad(un, xi) * jnn.grad(vi, xi) + jnn.grad(un, yi) * jnn.grad(vi, yi) - 1.0 * vi, u(xb, yb) - 0.0]
         )
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+
+class TestVpinn3D:
+    """3-D network trials: the operator surface carries over from 2-D."""
+
+    @staticmethod
+    def _cube(vec=False):
+        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+        u, phi = dom.fem_symbols(value_shape=(3,) if vec else ())
+        si = dom.variable("interior", split=True)
+        xi, yi, zi = si[0], si[1], si[2]
+        sb = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi, z=zi)
+        net = jnn.nn.wrap(
+            foundax.mlp(
+                3,
+                output_dim=3 if vec else 1,
+                hidden_dims=8,
+                num_layers=2,
+                activation=jax.nn.tanh,
+                key=jax.random.PRNGKey(0),
+            )
+        )
+        ans = xi * (1 - xi) * yi * (1 - yi) * zi * (1 - zi)
+        return dom, u, net(xi, yi, zi) * ans, vi, xi, yi, zi, sb
+
+    @pytest.mark.parametrize("case", ["reaction", "nonlinear", "inner_grad"])
+    def test_scalar_operators_lower_in_3d(self, case):
+        dom, u, t, vi, xi, yi, zi, sb = self._cube()
+        lap = jnn.grad(t, xi) * jnn.grad(vi, xi) + jnn.grad(t, yi) * jnn.grad(vi, yi) + jnn.grad(t, zi) * jnn.grad(vi, zi)
+        term = {
+            "reaction": lambda: lap + t * vi - 1.0 * vi,
+            "nonlinear": lambda: lap + t * t * t * vi - 1.0 * vi,
+            "inner_grad": lambda: (
+                jnn.inner(jnn.jacobian(t, [xi, yi, zi]), jnn.jacobian(vi, [xi, yi, zi]), n_contract=1) - 1.0 * vi
+            ),
+        }[case]()
+        pde = jno.fem([term, u(*sb) - 0.0])
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+    @pytest.mark.parametrize("case", ["jac", "symgrad", "graddiv", "component"])
+    def test_vector_operators_lower_in_3d(self, case):
+        dom, u, t, vi, xi, yi, zi, sb = self._cube(vec=True)
+        X = [xi, yi, zi]
+        gu, gv = jnn.jacobian(t, X), jnn.jacobian(vi, X)
+        src = jnn.inner(np.array([1.0, 1.0, 1.0]), vi, n_contract=1)
+        base = jnn.inner(gu, gv, n_contract=2)
+        term = {
+            "jac": lambda: base - src,
+            "symgrad": lambda: jnn.inner(jnn.symgrad(t, X), jnn.symgrad(vi, X), n_contract=2) - src,
+            "graddiv": lambda: base + jnn.trace(gu) * jnn.trace(gv) - src,
+            "component": lambda: base + t[1] * vi[0] - src,
+        }[case]()
+        pde = jno.fem([term, u(*sb) - (0.0, 0.0, 0.0)])
         r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
         assert np.isfinite(r) and r > 0.0

@@ -370,6 +370,8 @@ Without it the loss minimum is *not* the PDE solution.
     | problem | rel L2 |
     |---|---|
     | Poisson, hard-BC ansatz | 4.2e-05 |
+| **3-D** Poisson on the cube | 4.6e-04 |
+| **3-D** Neumann flux face | 8.4e-04 |
     | Neumann flux (`u = x`) | 6.8e-04 |
     | cubic nonlinearity (`+ u³`) | 9.8e-05 |
     | vector Poisson, `u* = (a, 2a)` | 1.3e-04 / 2.8e-04 |
@@ -485,8 +487,13 @@ keeps falling while the solution degrades.
       (`u(initial) - 0` and `u(initial) - 7` also bit-identical). Use an FE trial for a transient weak
       form, or drive a time-dependent network as a **collocation PINN** through `jno.core`, where the
       residual and the initial condition are both explicit losses.
-    * **1-D and 2-D meshes only.** The network-trial lowering builds its quadrature through the
-      1-D/2-D native context; a 3-D domain raises. Use an FE trial, or a collocation PINN.
+    * **A boundary coefficient must carry a coordinate.** A bound test function keeps its binding on
+      the *view*, not in the expression tree, so once the weak form is flattened `-1.0 * v_right` and
+      `-1.0 * v_interior` are indistinguishable and both read as volume. Write
+      `(g + 0.0 * xr) * v_r` against that region's own coordinates; a bare constant is refused rather
+      than integrated over the volume, which trains happily and is wrong (measured 3.9e-01 against
+      6.8e-04 for the same problem). The FEM trial classifies the raw constraint, where the binding
+      survives, and needs no such spelling.
     * **Single field.** The lowering wraps one primary unknown, so two separate fields raise —
       but a coupled system whose fields share a test space **is** one vector field, and that works.
       See below.

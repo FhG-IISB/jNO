@@ -5596,15 +5596,14 @@ def _fem_impl(
             "`jno.core`, where the residual and the initial condition are both explicit losses."
         )
 
-    if is_vpinn and getattr(domain, "dimension", None) not in (1, 2):
+    if is_vpinn and getattr(domain, "dimension", None) not in (1, 2, 3):
         # A 3-D VPINN falls past the branch below and dies further in on `Tag 'fem_gauss' is not in
         # the mesh pool` -- an internal tag name, for a scope limit the user cannot infer from it.
         # Say what is actually unsupported, at the point the decision is made.
         raise NotImplementedError(
-            f"jno.fem: a VPINN (network trial) is supported on 1-D and 2-D meshes only; this domain is "
-            f"{getattr(domain, 'dimension', None)}-D. The network-trial lowering builds its quadrature "
-            "through the 1-D/2-D native context. Use a 3-D FEM trial (`d.fem_symbols()` written against "
-            "the same weak form), or a collocation PINN, which has no such restriction."
+            f"jno.fem: a VPINN (network trial) is supported on 1-D, 2-D and 3-D meshes; this domain "
+            f"reports dimension {getattr(domain, 'dimension', None)!r}. Use an FEM trial "
+            "(`d.fem_symbols()` written against the same weak form), or a collocation PINN."
         )
     if is_vpinn and periodic_ties:
         raise NotImplementedError(
@@ -5612,7 +5611,7 @@ def _fem_impl(
             "by an algebraic reduction of FE trial DOFs, and a network trial has none. Impose the "
             "periodicity in the network instead (a periodic input embedding), or use an FE trial."
         )
-    if is_vpinn and getattr(domain, "dimension", None) in (1, 2) and not periodic_ties:
+    if is_vpinn and getattr(domain, "dimension", None) in (1, 2, 3) and not periodic_ties:
         bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
         if boundary_terms:
             bcs.append(neumann(list(boundary_terms.keys())))
@@ -5636,6 +5635,27 @@ def _fem_impl(
         domain.variable("fem_gauss")
         for region in boundary_terms:
             domain.variable(f"gauss_{region}")
+        # `_fem_impl` has already classified these correctly -- `boundary_terms` is keyed by region.
+        # The lowering below re-derives that classification from the FLATTENED expression, and a term
+        # whose coefficient carries no coordinate has nothing left to classify by: a bound test
+        # function keeps its binding on the VIEW, not in the expression tree, so `-1.0 * v_right`
+        # and `-1.0 * v_interior` are indistinguishable once flattened and both default to volume.
+        #
+        # A boundary flux silently integrated over the volume is a wrong answer that trains happily
+        # (measured: 3.9e-01 against 6.8e-04 for the same problem written the other way), so it is
+        # refused here, where the region IS still known, rather than mis-filed there. The fix is one
+        # spelling away, and the deeper repair is to stop discarding this classification at all.
+        for _region, _region_terms in boundary_terms.items():
+            for _t in _region_terms:
+                if not any(True for _ in _spatial_coord_vars(_bare(_t))):
+                    raise NotImplementedError(
+                        f"jno.fem (VPINN): the boundary term on region {_region!r} has a coefficient "
+                        "carrying no coordinate, and the network-trial lowering cannot recover its "
+                        "region from the flattened weak form -- it would be integrated over the "
+                        "VOLUME instead of the face, silently. Write the coefficient against that "
+                        f"region's coordinates, e.g. `xr, yr, _ = d.variable({_region!r}, split=True)` "
+                        "then `(g + 0.0 * xr) * v_r`. An FEM trial needs no such spelling."
+                    )
         weak = volume_terms[0]
         for t in volume_terms[1:]:
             weak = weak + t
