@@ -206,3 +206,86 @@ def test_the_eddy_viscosity_is_never_negative(name):
         got = _nu_t(MODELS[name], *cse)
         assert got >= -1e-12, f"{name} went negative ({got:.3e}) at g={cse}"
         assert np.isfinite(got), f"{name} non-finite at g={cse}"
+
+
+# --------------------------------------------------------------------------------------------
+# The models INSIDE a solve. The tests above evaluate them on prescribed gradients; these run them
+# in a Newton loop, where two further things can go wrong that arithmetic alone cannot show.
+# --------------------------------------------------------------------------------------------
+def _solved_shear(model):
+    """Solve a stabilised P1/P1 Couette flow with the model active; return (max nu_t, max |u|).
+
+    u = (y, 0) on the boundary is linear and an exact solution, so the interior reproduces it and the
+    interior gradient is SIMPLE SHEAR -- the structure Vreman and WALE are built to vanish on. A
+    scalar block projects nu_t so it can be read; it is present for every model including `none`, so
+    the systems compared have identical structure.
+    """
+    NU = 1e-2
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    d.tag("all", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    d.point_region("ppin", (0.0, 0.0))
+    xi, yi = d.variable("interior", split=True)[:2]
+    xa, ya = d.variable("all", split=True)[:2]
+    xn, yn = d.variable("ppin", split=True)[:2]
+    ax = [xi, yi]
+    u, v = d.fem_symbols(value_shape=(2,), names=("u_s", "v_s"), order=1)
+    p, q = d.fem_symbols(names=("p_s", "q_s"), order=1)
+    nut, w = d.fem_symbols(names=("nut_s", "w_s"), order=1)
+    ub, vv = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    nb, wb = nut.bind(x=xi, y=yi), w.bind(x=xi, y=yi)
+    gu, gv = grad(u, ax), grad(v, ax)
+
+    # LAGGED. nu_t is a square root, so its slope at u = 0 is infinite: unlagged, Newton diverges from
+    # a rest state outright. That this solve converges at all is half of what these tests check.
+    nu_t = jno.lag(0.0 if model is None else model(gu))
+    adv = lambda gw, ww: inner_(gw, ww, n_contract=1)  # noqa: E731
+    mom = inner_(adv(gu, ub), vv, n_contract=1) + (NU + nu_t) * inner_(gu, gv, n_contract=2) - pp * trace(gv)
+    cont = -qq * trace(gu)
+    G = d.cell_metric
+    gG = lambda a: inner_(a, inner_(G, a, n_contract=1), n_contract=1)  # noqa: E731
+    tau = jno.lag((gG(ub) + 36.0 * NU**2 * inner_(G, G, n_contract=2)) ** -0.5)
+    r_m = adv(gu, ub) - NU * jno.np.laplacian(u, ax) + grad(p, ax)
+    mom = mom + tau * inner_(adv(gv, ub), r_m, n_contract=1)
+    cont = cont - tau * inner_(grad(q, ax), r_m, n_contract=1)
+
+    fem = jno.fem(
+        [
+            mom,
+            cont,
+            nb * wb - nu_t * wb,
+            u(xa, ya)[0] - ya,
+            u(xa, ya)[1] - 0.0,
+            p(xn, yn) - 0.0,
+        ]
+    )
+    sol = np.asarray(
+        fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-10, atol=1e-10), linear=jno.solve.lu(backend="host"))
+    )
+    bu, bn = fem.blocks[fem.block_index(u)], fem.blocks[fem.block_index(nut)]
+    return float(np.abs(sol[bn.start : bn.stop]).max()), float(np.abs(sol[bu.start : bu.stop]).max())
+
+
+def test_on_a_solved_shear_flow_the_good_models_vanish_and_smagorinsky_does_not():
+    """The discriminating property, now inside a Newton solve rather than on a prescribed gradient.
+
+    Judged RELATIVE to Smagorinsky: Vreman's invariant is a difference of nearly equal numbers, so
+    where the answer is exactly zero it lands on the cancellation floor rather than on 0.
+    """
+    smag, _ = _solved_shear(smagorinsky)
+    assert smag > 1e-6, f"smagorinsky should be clearly non-zero in shear, got {smag:.3e}"
+    for name, model in (("vreman", vreman), ("wale", lambda g: wale(g, 2))):
+        nut, _u = _solved_shear(model)
+        assert nut < 1e-3 * smag, f"{name} must vanish in a solved shear flow: {nut:.3e} vs smagorinsky {smag:.3e}"
+
+
+def test_a_lagged_eddy_viscosity_converges_and_leaves_the_shear_profile_exact():
+    """Two regressions in one. The solve must CONVERGE (nu_t is a sqrt; unlagged its tangent is
+    singular at rest), and since nu_t is spatially constant in Couette it must not bend the profile --
+    a constant viscosity leaves a linear shear profile alone, whatever its value."""
+    base_nut, base_u = _solved_shear(None)
+    assert base_nut == pytest.approx(0.0, abs=1e-14)
+    for model in (vreman, lambda g: wale(g, 2), smagorinsky):
+        nut, umax = _solved_shear(model)
+        assert np.isfinite(nut) and nut >= 0.0, f"nu_t must be finite and non-negative, got {nut}"
+        assert umax == pytest.approx(base_u, rel=1e-6), f"the shear profile moved: {umax} vs {base_u}"
