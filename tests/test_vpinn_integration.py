@@ -17,6 +17,19 @@ from jno.trace import dump_tree
 # ============================================================
 
 
+def _same_to_precision(_a, b, *, slack=32.0):
+    """Tolerance for "these two spellings lower to the SAME thing", scaled to the working precision.
+
+    The claim is exact agreement, so the bar is floating-point epsilon rather than a fixed number.
+    jNO assembles in float64 under ``jax_enable_x64`` and float32 without it, and a hardcoded 1e-12
+    is an impossible assertion on the single-precision path -- measured, the same spellings agree
+    there to 1.19e-07, which IS identity for float32. Keyed on the x64 flag rather than on the
+    operands' dtype, because the values reach here as Python floats, which are always float64.
+    """
+    eps = float(np.finfo(np.float64 if jax.config.jax_enable_x64 else np.float32).eps)
+    return slack * eps * max(1.0, abs(float(np.real(b))))
+
+
 def make_domain(mesh_size=0.35):
     """Create a small rectangular domain for fast VPINN tests."""
     return jno.Shape.rect(0, 0, 1, 1, size=mesh_size).domain()
@@ -529,7 +542,7 @@ class TestVpinnVectorSource:
 
         dom, pde = self._build_spelling(spelling)
         r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
-        assert abs(r - r_ref) <= 1e-12 * max(1.0, abs(r_ref)), (
+        assert abs(r - r_ref) <= _same_to_precision(r, r_ref), (
             f"spelling {spelling!r} lowered differently: {r:.12e} vs reference {r_ref:.12e}"
         )
 
@@ -596,7 +609,7 @@ class TestVpinnVectorSource:
         r_i = float(np.asarray(jno.core([pde_i.mse], domain=dom_i).eval([pde_i.mse])).reshape(()))
         r_c = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
         assert r_i > 0.0, "a non-trivial residual is needed for the comparison to mean anything"
-        assert abs(r_i - r_c) <= 1e-12 * max(1.0, abs(r_i)), (
+        assert abs(r_i - r_c) <= _same_to_precision(r_i, r_c), (
             f"the two spellings of one source must lower identically: inner={r_i:.12e} component={r_c:.12e}"
         )
 
@@ -727,7 +740,7 @@ class TestVpinnOperatorParity:
         r_c = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
         r_x = float(np.asarray(jno.core([pde_x.mse], domain=dom_x).eval([pde_x.mse])).reshape(()))
         assert r_c > 0.0
-        assert abs(r_c - r_x) <= 1e-12 * max(1.0, abs(r_x)), (
+        assert abs(r_c - r_x) <= _same_to_precision(r_c, r_x), (
             f"a constant source must lower like its coordinate spelling: {r_c:.12e} vs {r_x:.12e}"
         )
 
@@ -786,7 +799,8 @@ class TestVpinnOperatorParity:
 
         a = np.asarray(jno.fem([base + jnn.trace(gu) * jnn.trace(gv), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
         b = np.asarray(jno.fem([base + div_long(ui) * div_long(vi), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
-        assert np.linalg.norm(a - b) <= 1e-10 * max(1.0, np.linalg.norm(b)), "trace(jac) is not div"
+        tol = _same_to_precision(a, np.linalg.norm(b))
+        assert np.linalg.norm(a - b) <= tol, "trace(jac) is not div"
 
 
 class TestVpinnTransientRefusal:
