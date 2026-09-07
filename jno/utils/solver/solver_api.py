@@ -245,26 +245,80 @@ def gate_suspended():
         _GATE_SUSPENDED = prev
 
 
-def _raise_unconverged(rel, who: str, side: str):
-    """Host side of :func:`residual_gate` -- raises so a bad solve cannot be mistaken for a good one."""
-    rel = float(rel)
-    if np.isfinite(rel) and rel <= _GATE_RTOL:
-        return
-    if side == "forward":
-        advice = (
-            "The problem may be singular/ill-posed or need a preconditioner: try jno.solve.lu(), a "
-            "precond= spec, or your own solve_fn."
-        )
-    else:
-        advice = (
+#: Convergence failures seen by a TRACED :func:`residual_gate`, drained by :func:`raise_if_gate_failed`
+#: at the eager boundary. Raising from inside the callback instead is not reliable: measured, the same
+#: refusal propagates on the CPU backend and is SWALLOWED into a log line on GPU, so the residual
+#: firewall was silently off on the platform this library targets for real work. Recording is
+#: platform-independent; the raise happens where a Python exception is guaranteed to land.
+_GATE_FAILURES: list = []
+
+
+def _gate_message(rel: float, who: str, side: str) -> str:
+    advice = (
+        "The problem may be singular/ill-posed or need a preconditioner: try jno.solve.lu(), a "
+        "precond= spec, or your own solve_fn."
+        if side == "forward"
+        else (
             "This is the ADJOINT (transpose) solve, not the forward one -- the solution itself is "
             "fine and only the GRADIENT is affected. A Krylov method can break down on A^T where it "
             "converges on A, so reach for a transposable-robust inner solver (jno.solve.gmres(), "
             "jno.solve.lu()) or a preconditioner rather than loosening the tolerance."
         )
-    raise RuntimeError(
-        f"{who} did not solve the system: relative residual {rel:.1e} against a {_GATE_RTOL:g} gate. {advice}"
     )
+    return f"{who} did not solve the system: relative residual {rel:.1e} against a {_GATE_RTOL:g} gate. {advice}"
+
+
+def _record_unconverged(rel, who: str, side: str):
+    """Callback side of a TRACED gate: record FIRST, then raise.
+
+    Both, because neither alone is enough. Raising from inside a ``jax.debug.callback`` propagates in
+    some configurations and is swallowed into a log line in others -- measured on the very same
+    refusal, it reaches the caller on the CPU backend and does not on GPU, which left the residual
+    firewall silently off on the platform this library targets for real work. So the failure is
+    recorded before the raise is attempted, and :func:`raise_if_gate_failed` drains it at the eager
+    boundary for the cases where the raise is lost.
+
+    Where the raise DOES propagate it is strictly better -- it lands at the failing solve rather than
+    at the end of the enclosing ``fem.solve``, and it is the only signal available under a caller's
+    own ``jax.grad``, where jNO has no post-execution hook to drain from.
+
+    Re-checks the residual on the host rather than trusting the branch it was reached from: ``vmap``
+    turns the ``lax.cond`` below into a ``select`` that runs both branches, so under a batch this is
+    reached on converged solves too, and must record nothing there.
+    """
+    rel = float(rel)
+    if np.isfinite(rel) and rel <= _GATE_RTOL:
+        return
+    msg = _gate_message(rel, who, side)
+    _GATE_FAILURES.append(msg)
+    raise RuntimeError(msg)
+
+
+def clear_gate_failures():
+    """Drop anything recorded by an earlier solve, so a drain cannot report a stale failure."""
+    _GATE_FAILURES.clear()
+
+
+def raise_if_gate_failed():
+    """Raise if a traced solve recorded a convergence failure. Call once the result is CONCRETE.
+
+    The callback fires while the compiled program runs, so the caller must have materialised the
+    result (``jax.block_until_ready``) before draining, or the failure may not have been recorded yet.
+    """
+    if not _GATE_FAILURES:
+        return
+    msgs = list(_GATE_FAILURES)
+    _GATE_FAILURES.clear()
+    extra = f" ({len(msgs)} failures; first shown)" if len(msgs) > 1 else ""
+    raise RuntimeError(msgs[0] + extra)
+
+
+def _raise_unconverged(rel, who: str, side: str):
+    """Host side of an EAGER gate -- raises directly, since a concrete call has a caller to raise to."""
+    rel = float(rel)
+    if np.isfinite(rel) and rel <= _GATE_RTOL:
+        return
+    raise RuntimeError(_gate_message(rel, who, side))
 
 
 def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
@@ -304,7 +358,7 @@ def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
     jax.lax.cond(
         jnp.isfinite(rel) & (rel <= _GATE_RTOL),
         lambda _r: None,
-        lambda r: jax.debug.callback(_raise_unconverged, r, who, side),
+        lambda r: jax.debug.callback(_record_unconverged, r, who, side),
         rel,
     )
     return x
@@ -384,7 +438,19 @@ class LinearSolver:
         # preconditioner that is not the one asked for.
         if M is not None and hasattr(M, "materialize"):
             M = materialize_precond(M, PrecondContext(op, None))
-        return self._fn(op, b, M=M, x0=x0)
+        prior = len(_GATE_FAILURES)
+        x = self._fn(op, b, M=M, x0=x0)
+        # An EAGER call is a boundary where a Python exception has somewhere to land, so drain the
+        # traced gate here. The block is the point: dispatch is asynchronous, so `residual_gate`'s
+        # callback has typically not run yet when this returns, and the refusal it raises surfaces
+        # only once something materialises the result. That is why the same failing solve raised on
+        # the CPU backend (callbacks run inline) and returned a plausible-but-wrong vector on GPU.
+        # Skipped when the result is traced -- nothing has executed and there is nothing to drain.
+        if not _GATE_SUSPENDED and not isinstance(x, jax.core.Tracer):
+            jax.block_until_ready(x)
+            if len(_GATE_FAILURES) > prior:
+                raise_if_gate_failed()
+        return x
 
     def __eq__(self, other):
         if self.key is None or not isinstance(other, LinearSolver) or other.key is None:
@@ -532,7 +598,17 @@ class PrecondContext:
                     "PrecondContext.assemble: a complex auxiliary form with periodic ties is not supported "
                     "(the outer P-reduction is not mirrored onto the preconditioner block)."
                 )
-
+        if aux.is_complex:
+            return LinearOperator(_bcoo(aux.A))  # the fused 2n real-equivalent block IS `.A`
+        # `.A` is DOCUMENTED dense ("use fem.operator for the raw sparse form on large problems"), so
+        # reaching for it here cost n^2 on every auxiliary -- 1.74 GB for a velocity-space mass at
+        # 14,739 dofs, which is a preconditioner running out of memory doing the one thing it exists
+        # to avoid. Take the sparse operator and only fall back to the dense property.
+        raw = getattr(aux, "operator", None)
+        if raw is not None:
+            A_raw = raw.evaluate(None)[0] if hasattr(raw, "evaluate") else (raw[0] if isinstance(raw, tuple) else raw)
+            if hasattr(A_raw, "indices"):  # already a BCOO -- keep it sparse end to end
+                return LinearOperator(A_raw)
         return LinearOperator(_bcoo(aux.A))
 
 
@@ -973,7 +1049,7 @@ def _add_step_operator(M, A, scale):
     return dense(M) + scale * dense(A)
 
 
-def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
+def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None):
     """Compose the slots into per-step solvers for the transient integrator.
 
     Returns ``(linear_step_solve, nonlinear_step_solve)`` (one is ``None``), matching
@@ -1012,19 +1088,39 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
     if precond is not None:
         prepare_precond(precond, fem)
 
-    # constant-operator fast path: one step matrix, one preconditioner, reused by every step
-    static_op = None
-    static_M = None
-    if block.operator_fn is None and block.A is not None and block.dt is not None:
-        theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
-        static_op = LinearOperator(_add_step_operator(block.M, block.A, theta * float(block.dt)))
-        if precond is not None:
-            static_M = materialize_precond(precond, PrecondContext(static_op, fem))
+    # Constant-operator fast path: one step matrix, one preconditioner, reused by every step -- and
+    # keyed by the step SCALE (the coefficient of A), because a scheme need not take the block's own
+    # theta*dt. BDF2 takes 2dt/3 after a full-dt startup step, so it uses two; building the block's
+    # default for both would silently solve the wrong system.
+    _static: dict = {}
+    _constant_operator = block.operator_fn is None and block.A is not None and block.dt is not None
+    _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
-    def step_solve(matvec, rhs, x0, diag_fn):
-        if static_op is not None:
-            op, M = static_op, static_M
-        else:
+    def _build(key):
+        op = LinearOperator(_add_step_operator(block.M, block.A, key))
+        _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
+
+    if _constant_operator:
+        # EAGERLY, outside any trace: an AMG/ILU setup needs a concrete matrix, and `step_solve` runs
+        # inside the march's scan. A scheme that takes a step other than the block's own theta*dt says
+        # so here (BDF2: a full-dt startup step, then 2dt/3), so every operator it will ask for is
+        # built now rather than discovered mid-trace.
+        _scales = getattr(scheme, "step_scales", None)
+        for _k in (_scales(block) if _scales is not None else ()) or (_default_scale,):
+            _build(float(_k))
+
+    def _static_for(scale):
+        if not _constant_operator:
+            return None, None
+        try:
+            key = float(scale) if scale is not None else _default_scale
+        except (TypeError, ValueError):
+            key = _default_scale  # a TRACED step size (an adaptive march): keep the previous behaviour
+        return _static.get(key) or _static.get(_default_scale) or (None, None)
+
+    def step_solve(matvec, rhs, x0, diag_fn, scale=None):
+        op, M = _static_for(scale)
+        if op is None:
             op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
             M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         if getattr(solver, "direct", False):
@@ -1039,6 +1135,12 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
             M = lambda x: inv * x  # noqa: E731
         return solver(op, rhs, M=M, x0=x0)
 
+    # A CAPABILITY FLAG, read with getattr at the call site -- same convention as `wants_jacobian` /
+    # `wants_project` on the nonlinear side. `linear_solve` is a documented extension point whose
+    # contract is `(matvec, rhs, x0, diag_fn) -> x`; passing `scale=` unconditionally broke every
+    # bring-your-own solver that implements exactly that signature (caught by the moving-mesh march,
+    # whose `_step_solve` takes the four documented arguments and nothing else).
+    step_solve.wants_scale = True
     return step_solve, None
 
 
@@ -1188,7 +1290,9 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
 
     seqs = {k: np.asarray(v) for k, v in spec.params.items()}
     lengths = {k: int(s.shape[0]) if s.ndim else -1 for k, s in seqs.items()}
-    if -1 in lengths.values() or len(set(lengths.values())) != 1:
+    # `>= 1` is not decoration: with an EMPTY sequence every length agrees (they are all 0), the march
+    # loop below never runs, and the return hit an unbound local instead of saying what was wrong.
+    if -1 in lengths.values() or len(set(lengths.values())) != 1 or next(iter(lengths.values()), 0) < 1:
         raise ValueError(
             f"jno.solve.continuation(): all parameter sequences must share one length >= 1; got "
             f"{ {k: (int(s.shape[0]) if s.ndim else 'scalar') for k, s in seqs.items()} }."

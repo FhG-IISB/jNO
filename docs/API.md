@@ -200,7 +200,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
-| **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
+| **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
 ### Matrix functions — what `Ax = b` cannot express
 
