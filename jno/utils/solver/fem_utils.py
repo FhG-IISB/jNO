@@ -2764,7 +2764,7 @@ def _covers_local_3d(s_facets: np.ndarray, m_facets: np.ndarray, pts3: np.ndarra
     surfaces pass however they curve; two genuinely mismatched ones still fail, which is what keeps a
     ragged interface on the collocated path.
     """
-    from .contact_search import facet_geometry, project_points
+    from .contact_search import project_points
 
     P = np.asarray(pts3, dtype=float)
     sf = np.asarray(s_facets, dtype=int)
@@ -2774,8 +2774,16 @@ def _covers_local_3d(s_facets: np.ndarray, m_facets: np.ndarray, pts3: np.ndarra
     q = P[np.unique(sf[:, :3])]
     ids, w, _g0, _a = project_points(q, mf, P, np.tile(np.eye(1, P.shape[1], 0), (len(q), 1)))
     proj = np.einsum("qk,qkd->qd", w, P[ids])
-    _V, _c, rad = facet_geometry(mf, P)
-    return bool(np.linalg.norm(proj - q, axis=1).max() <= 0.25 * float(np.median(rad)))
+    # Judge each vertex against the facet it actually landed on, not against the median facet of the
+    # mesh. A chord's distance from the surface it approximates grows with THAT chord, and gmsh
+    # grades a curved surface: here a sphere meshed at 0.4 has a median facet radius of 0.23 and a
+    # largest of 0.54. Two vertices sitting over those big facets were 0.11 away -- 0.22 of their own
+    # facet, comfortably inside the fraction below -- and the median-based bound rejected the whole
+    # interface for it, sending a perfectly coincident pair to collocation.
+    nv = 2 if P.shape[1] == 2 else 3
+    Vq = P[np.asarray(ids, dtype=int)[:, :nv]]
+    local_rad = np.linalg.norm(Vq - Vq.mean(axis=1)[:, None, :], axis=2).max(axis=1)
+    return bool(np.all(np.linalg.norm(proj - q, axis=1) <= 0.25 * local_rad))
 
 
 def _main_covers_secondary_3d(s_facets: np.ndarray, m_facets: np.ndarray, loc: np.ndarray) -> bool:

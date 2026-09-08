@@ -92,8 +92,15 @@ def test_a_following_normal_rotates_the_traction_by_exactly_the_body_rotation(de
         return np.asarray(op.residual(uu, None)).reshape(-1)
 
     r0 = res(fem_none, u)
-    t_ref = (res(fem_ref, u) - r0).reshape(-1, 2).sum(axis=0)
-    t_fol = (res(fem_fol, u) - r0).reshape(-1, 2).sum(axis=0)
+    # Sum the FREE rows only. A clamped row holds no force -- it holds the constraint equation, and
+    # the scale that equation is written at is a convention: the assembled path pins at the local
+    # diagonal magnitude (so the operator stays uniformly scaled for the iterative solvers), the
+    # residual path at one. The two do not cancel in a difference taken across both paths, and what
+    # survives swamps the traction being measured -- it read 175.78deg for a 10deg rotation. The
+    # traction lives on the free DOFs; read it there.
+    free = ~(np.asarray(d0.mesh.points)[:, 1] < 1e-9)
+    t_ref = (res(fem_ref, u) - r0).reshape(-1, 2)[free].sum(axis=0)
+    t_fol = (res(fem_fol, u) - r0).reshape(-1, 2)[free].sum(axis=0)
     assert isinstance(fem_fol._op, tuple) is False, (
         "a following normal depends on the unknown, so the form must route to the residual path -- "
         "assembled-linear would build A and b at u=0, where the two normals coincide"

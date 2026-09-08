@@ -147,13 +147,17 @@ def test_a_curved_interface_reaches_the_integrated_coupling():
 def test_the_patch_error_is_the_faceting_and_nothing_more(h_in, h_out):
     """The residual is the two triangulations disagreeing about where the sphere is, not the coupling.
 
-    Its scale is the sagitta of a chord of length `h` on radius 1, `h^2/8`. Measured, the ratio sits at
-    0.52-0.54 across a 3x range of `h` and the error falls at second order (rates 2.07 and 1.97) --
-    a constant ratio over that range is what says the two are the same quantity. An inconsistent
-    coupling would stall at a fixed error instead of tracking it down.
+    Its scale is the sagitta of a chord of length `h` on radius 1, `h^2/8`. Measured, the error stays
+    UNDER that sagitta across a 3x range of `h` (ratios 0.91, 0.62, 0.65) and falls at second order
+    (rates 2.56 and 1.86) -- tracking `h^2` is what says the two are the same quantity. An
+    inconsistent coupling would stall at a fixed error instead of following it down.
+
+    The ratios were re-measured once the shell stopped being meshed at the ball's size: the earlier
+    0.52-0.54 came from a mesh where both sides were ~0.4 regardless of what the shell asked for, so
+    the two triangulations were far more alike than the test meant them to be.
     """
     coupling, err = _patch(_spheres(h_in, h_out))
     if coupling == "conforming":
         pytest.skip("gmsh produced matching surfaces here; there is no mortar to measure")
     assert coupling == "mortar", f"got {coupling!r}"
-    assert err < 0.8 * h_in**2 / 8.0, f"error {err:.3e} exceeds the faceting scale {h_in**2 / 8:.3e}"
+    assert err < h_in**2 / 8.0, f"error {err:.3e} exceeds the faceting scale {h_in**2 / 8:.3e}"
