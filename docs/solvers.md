@@ -11,7 +11,7 @@ today's default; `solve_fn=` stays the total override (passing both is an error)
 
 ```python
 u = fem.solve(
-    x0        = u_guess,                 # warm start (previous solve, coarse solve, a surrogate…)
+    x0        = u_guess,                 # warm start — see "What a warm start buys" below
     nonlinear = jno.solve.newton(),      # linearization driver (nonlinear problems)
     linear    = jno.solve.gmres(),       # inner linear solve: lu / dense / cg / bicgstab / gmres
     precond   = jno.precond.jacobi(),    # v -> M⁻¹v spec, materialized against the assembled A
@@ -48,6 +48,116 @@ Pick by structure:
     `jit`/`vmap`/`grad` — which matters, because the runtime residual guard needs a concrete residual
     and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
 
+
+### Warm starts — what `x0=` actually buys
+
+`x0=` is free to pass and easy to misjudge, so here is the rule, measured. A Krylov solve has to
+cover the distance from its initial residual down to `rtol`. A warm start removes the decades it
+already starts below, so the **fraction of iterations saved is a ratio of logarithms** — not a
+ratio of errors:
+
+$$\text{saved} \;\approx\; \frac{\log_{10}(1/\varepsilon)}{\log_{10}(1/\texttt{rtol})}$$
+
+with `ε` the *relative* error of the guess. At `rtol = 1e-10`, a guess good to 1 % removes one fifth
+of the work — and a guess good to 10 % removes one tenth, which is usually not worth arranging.
+
+!!! measured "Jacobi-CG, 2-D diffusion with a 10× conductivity blob, 791 DOFs, `rtol = 1e-10`"
+    Cold (`x0 = 0`) is **85 iterations**. Two initial errors of the *same norm* were compared: a
+    **smooth** one (a low-frequency field) and a **rough** one (white noise).
+
+    | rel. error `ε` | smooth `x0` | rough `x0` | law predicts |
+    |---|---|---|---|
+    | 3e-01 | 78 | 93 | 81 |
+    | 1e-01 | 74 | 90 | 76 |
+    | 1e-02 | 67 | 85 | 68 |
+    | 1e-03 | 61 | 76 | 59 |
+    | 1e-04 | 52 | 67 | 51 |
+    | 1e-06 | 35 | 53 | 34 |
+
+    The law tracks the **smooth** column to within 1–3 iterations across five decades. The **rough**
+    column does not follow it at all: a rough guess accurate to 1 % costs exactly what a cold start
+    costs, and a rough guess at 30 % is **worse than starting from zero**.
+
+**The spectrum of the initial error matters, not its norm.** Krylov convergence is governed by how the
+error is distributed over the spectrum (Greenbaum, *Iterative Methods for Solving Linear Systems*,
+SIAM 1997, ch. 3), and a guess that is pointwise close but rough injects high-frequency error the
+method must then remove. This is why the previous solve in a sweep or a time step is such a good
+warm start — it is smooth, and it is *wrong in the same modes* the operator is about to correct.
+
+!!! warning "A neural surrogate is a poor warm start, measured"
+    The tempting idea — train a network to predict the solution, feed it as `x0` — does not clear the
+    bar. On the sweep above, against a cold start: an MLP predicting **DOF values** directly came in at
+    **−2 %** (i.e. *slower* than cold, its output being spectrally rough), and predicting **POD
+    coefficients** instead — whose output is smooth by construction, being a combination of smooth
+    modes — recovered only **+5 %**. Both lost to the trivial baseline of reusing the **nearest stored
+    snapshot** (+9 %), which costs nothing to build.
+
+    The arithmetic is why, and it is not an engineering problem: at a realistic surrogate accuracy of
+    1e-2 to 1e-3 the law caps the prize at 20–30 %, and collecting it needs an output that is smooth as
+    well as accurate. Reach for `x0=` where a *nearby solve* already exists — a continuation sweep
+    (`jno.solve.continuation`, which warm-starts for you), a transient step (which warm-starts
+    automatically, and rejects `x0=` for that reason), or a Newton loop. Those are smooth by
+    construction and free.
+
+### A learned **subspace** is worth far more than a learned point
+
+The failure above is a failure of *regression*, not of learning. Fit a network to predict a point and
+it optimises the wrong norm; CG minimises `‖e‖_A`, and an `L2` fit is blind to how the error sits on
+the spectrum. Give it a **subspace** instead and there are two much better things to do with it, both
+already expressible with the slots on this page.
+
+**1. Solve in the subspace** rather than regressing into it. The A-orthogonal projection
+`U(UᵀAU)⁻¹Uᵀb` is the *provably best* starting point from `span(U)` — and it is exactly what
+[`fem.solve(basis=U)`](fem/inverse.md#reduced-order-solves-fembasisu) computes, certificate included.
+
+**2. Put the subspace in the preconditioner**, as a coarse-space correction
+`M⁻¹ = diag⁻¹ + U(UᵀAU)⁻¹Uᵀ` (Nicolaides, *SINUM* **24**(2), 1987, 355; Frank & Vuik, *SISC*
+**23**(2), 2001, 442). This needs no new API — `precond=` takes a bare `ctx -> applier`:
+
+```python
+def coarse_jacobi(U):                       # Jacobi + a coarse solve on span(U)
+    def spec(ctx):
+        AU   = jnp.stack([ctx.A @ U[:, j] for j in range(U.shape[1])], axis=1)
+        Einv = jnp.linalg.inv(U.T @ AU)
+        dinv = 1.0 / ctx.diag()
+        return lambda v: dinv * v + U @ (Einv @ (U.T @ v))
+    return spec
+
+u = fem.solve(linear=jno.solve.cg(), precond=coarse_jacobi(U), basis=None)
+```
+
+!!! measured "Same problem, same rank-8 POD subspace, iterations against a cold Jacobi-CG"
+    | what the subspace is used for | saved |
+    |---|---|
+    | MLP regressing **DOF values** → `x0` | **−2.7 %** |
+    | MLP regressing **POD coefficients** → `x0` | +3.9 % |
+    | nearest stored snapshot → `x0` | +8.6 % |
+    | **`basis=U`** (A-optimal projection) → `x0` | +18.0 % |
+    | **coarse-space preconditioner** | +27.5 % |
+    | both together | **+39.8 %** |
+
+    The L2-fitted network's *energy*-norm error was **17–77× larger** than the A-optimal projection
+    from the very same subspace — the whole gap between the first rows and the fourth is the wrong
+    norm, not a weak network.
+
+!!! measured "And the two are different in kind — only one improves with size"
+    | `h` | DOFs | cold | `x0` saves | coarse-space saves |
+    |---|---|---|---|---|
+    | 0.060 | 377 | 60 | 21.7 % | 21.7 % |
+    | 0.040 | 791 | 86 | 17.4 % | 25.6 % |
+    | 0.030 | 1394 | 113 | 17.7 % | 28.3 % |
+    | 0.022 | 2522 | 151 | 17.2 % | **29.8 %** |
+
+    A warm start is a **constant offset** — it removes decades of residual and the log law fixes the
+    fraction, so it stays flat under refinement. A coarse space removes the slow modes from the
+    **spectrum**, so its benefit *grows* with the problem. Prefer it wherever the subspace is worth
+    building at all.
+
+    Scope, since this was measured on one problem class: SPD + CG, a rank-8 POD subspace from
+    snapshots, a 10× conductivity contrast. Non-symmetric and saddle-point systems are not covered
+    here, the rank/cost trade-off is unexplored (each application costs two `n × k` products and a
+    `k × k` solve), and POD alone already delivers the table — a *learned* subspace has to beat POD to
+    earn its place, which is not shown.
 
 ### Two that are not `Ax = b` on a square, definite operator
 
@@ -341,6 +451,29 @@ such a menu are things you can write.
     Newton loop is a `lax.while_loop`, so the per-step iterate is a tracer no host assembly can see; a
     fully traced solve that never supplies a concrete iterate gets a loud `NotImplementedError`, not a
     garbage preconditioner.
+
+    **A coefficient from another field.** An auxiliary form is written over *one* field, and the
+    coefficient it needs often lives on another — PCD's `F_p` carries the velocity into a pressure
+    form, a lagged eddy viscosity carries the previous velocity, a wall-distance field is reused
+    across forms. Freeze the foreign field and use it like any other coefficient:
+
+    ```python
+    w_frozen = w.bind(x=xi, y=yi).freeze(w_values)          # another form's solved field, as data
+    Fp = jno.precond.form([(nu + w_frozen) * (pi.x * qi.x + pi.y * qi.y), p(xb, yb) - 0.0])
+    ```
+
+    The auxiliary form never declares that field as an unknown, so it is resolved by **space** rather
+    than by identity: a field of the same space and order has the same nodes and connectivity on this
+    mesh, so the gather is exact, not an interpolation.
+
+    !!! warning "Matching space only — a mismatch is refused, not approximated"
+        The foreign field's space must be one the auxiliary form already uses. A **P2** field in a
+        **P1** form raises: P2 values carry edge nodes a P1 gather never indexes, and reading them
+        through a P1 slot would produce a plausible, wrong operator rather than a visible failure.
+        Project onto the form's own space first, or write the form over a field of the matching space.
+
+        This is what still blocks **PCD** on a Taylor–Hood pair, where the velocity is P2 and the
+        pressure P1. `lsc()` needs no such coefficient, which is why it exists.
 
 ??? note "`jno.precond.block_diag((field, spec), …)`"
     / `jno.precond.triangular((field, spec), …)` — per-field

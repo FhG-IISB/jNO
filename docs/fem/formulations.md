@@ -498,3 +498,191 @@ factor is load control), `newton(direct=True)` (the bordered tangent is not asse
 to a matrix-free Newton-Krylov whose `jax.linearize` builds the border for free), a runtime-parametric
 form, and `freeze_path(frames)`. The trajectory is differentiable; `fem.tau_schedule` is concrete
 observability.
+
+---
+
+## The trial may be a network — VPINN and Deep Ritz
+
+Everything above solves for FE coefficients. The same term list also accepts a **neural trial**: write
+the network where the unknown would go and `jno.fem` detects it, test-projects the weak form onto the
+FE basis, and returns a trainable residual instead of an operator. Nothing else about the authoring
+changes — same domain, same symbols, same `jno.fem([...])`.
+
+```python
+net    = jno.nn(foundax.mlp(2, hidden_dims=32, num_layers=3, activation=jax.nn.tanh, key=key))
+ansatz = xi * (1 - xi) * yi * (1 - yi)          # hard-BC ansatz: vanishes on the boundary
+u_net  = net(xi, yi) * ansatz                   # the trial IS the network
+vi     = phi.bind(x=xi, y=yi)                   # the test function is still the FE basis
+
+pde = jno.fem([grad(u_net, xi) * grad(vi, xi) + grad(u_net, yi) * grad(vi, yi) - f * vi,
+               u(xb, yb) - 0.0])                # declares WHICH test functions vanish
+jno.core([pde.mse], domain=dom).solve(2500)     # train the weights
+```
+
+This is the Petrov–Galerkin variational PINN of Kharazmi, Zhang & Karniadakis (*hp-VPINNs*, **CMAME**
+374 (2021) 113547). The Dirichlet term is not optional decoration: it tells `jno.fem` which test
+functions vanish on the boundary, so their irreducible `∂u/∂n` flux is masked out of the loss.
+Without it the loss minimum is *not* the PDE solution.
+
+!!! measured "What the network trial actually reaches, against analytic solutions"
+    | problem | rel L2 |
+    |---|---|
+    | Poisson, hard-BC ansatz | 4.2e-05 |
+    | **3-D** Poisson on the cube | 4.6e-04 |
+    | **3-D** Neumann flux face | 8.4e-04 |
+    | Neumann flux (`u = x`) | 6.8e-04 |
+    | cubic nonlinearity (`+ u³`) | 9.8e-05 |
+    | vector Poisson, `u* = (a, 2a)` | 1.3e-04 / 2.8e-04 |
+    | Deep Ritz (energy, Gauss quadrature) | 8.8e-04 |
+    | network trial **+ inverse parameter** | `k`: 1.00 → 2.901 (truth 3.00), field 3.4e-02 |
+
+    The last row is the combination worth knowing: a network trial and a `jno.np.parameter` train in
+    the same loss, so the field and an unknown coefficient are recovered together. Note it needs a
+    **data** term — the residual alone is degenerate, since `k·a(u,v) = (f,v)` with `u` free is
+    satisfied by any `k` with `u` rescaled.
+
+### A source on a vector field — one DSL, either trial
+
+A value-channel coefficient is a scalar per quadrature point, or one vector per point — **quadrature
+first, value axis trailing**. A constant carries no quadrature axis at all, so it broadcasts. All of
+these lower **identically**, and are accepted by the FEM trial and the network trial alike:
+
+```python
+g * vi[0] + (2 * g) * vi[1]                          # per component
+jno.np.inner(jnp.array([1.0, 2.0]), vi, 1)           # a CONSTANT vector
+jno.np.inner(g * jnp.array([1.0, 2.0]), vi, 1)
+jno.np.inner(jno.np.stack([g, 2 * g], axis=-1), vi, 1)
+```
+
+!!! warning "`stack` defaults to `axis=0`, which is the wrong axis here"
+    `jno.np.stack([f0, f1])` builds a **component-first** `(vec, Nq)` array, and the value axis is
+    trailing throughout the assemblers. Both lowerings refuse it by name and point at `axis=-1`,
+    rather than transposing it silently — a silent transpose is a guess at intent, and it would make
+    one lowering accept a weak form the other rejects.
+
+Two conventions worth stating once, since they are the only places the layout is not inferable:
+
+* a bare `(k,)` coefficient with `k` equal to the quadrature-point count is read as a per-point
+  **scalar**, that being the ordinary case — so a constant vector of exactly that length needs an
+  explicit quadrature axis, `(1 + 0*x) * jnp.array(...)`;
+* the value axis is **trailing**, everywhere, for both trials.
+
+### A coupled system, as one vector field
+
+Two separate `fem_symbols` calls raise. That is a real boundary — the lowering wraps a single primary
+unknown — but it is rarely the end of the road, because a coupled system whose fields share a test
+space is *the same system* as one vector field. Inter-field coupling becomes a cross-component term:
+
+```python
+u, phi = d.fem_symbols(value_shape=(2,))         # u = (a, b), one field
+net    = jno.nn(foundax.mlp(2, output_dim=2, ...))   # one network, two outputs
+u_net  = net(xi, yi) * ansatz
+vi     = phi.bind(x=xi, y=yi)
+
+#  -Δa = fa + b ,  -Δb = fb
+jno.fem([inner(jac(u_net, X), jac(vi, X), 2)
+         - fa * vi[0] - fb * vi[1]      # per-component sources
+         - u_net[1] * vi[0],            # the coupling: b enters a's equation
+         u(xb, yb) - (0.0, 0.0)])
+```
+
+!!! measured "The rewrite is exact; the training is the limit"
+    Solving that *identical form* with an FEM trial recovers the manufactured `(s, 2s)` to **9.3e-04 /
+    9.2e-04**, so the vector rewrite of the coupled system is correct. The network trial on the same
+    form reaches **6.8e-02** on the coupled component and **5.0e-05** on the uncoupled one, and does
+    not improve with more steps — the two component residuals compete under an equal-weight loss.
+    That is loss balancing, a standard PINN concern, not a formulation error; weight the terms if you
+    need the coupled component tighter.
+
+Fields that genuinely need **different** test spaces — a Taylor–Hood velocity/pressure pair — have no
+route yet, since the lowering builds one test context.
+
+### Deep Ritz — and the quadrature that makes it honest
+
+For an energy-minimising formulation there are no test functions at all: write the functional and
+minimise it.
+
+```python
+energy = (0.5 * (ux**2 + uy**2) - f * uu).integrate(quadrature="gauss")
+jno.core([energy], domain=dom).solve(4000)
+```
+
+E & Yu, *Commun. Math. Stat.* **6**(1) (2018). Use `quadrature="gauss"`: the default nodal rule samples
+the energy only at mesh vertices, and a network expressive enough to develop structure *between* them
+drives the discrete energy below the true minimum — a variational crime in which the reported loss
+keeps falling while the solution degrades.
+
+!!! note "One DSL, either trial — swept operator by operator"
+    A weak form should mean the same thing whichever trial it carries, so the operators were checked
+    side by side: the same form built once with `d.fem_symbols()` and once with a network, comparing
+    what each lowering accepts. `grad·grad`, `inner(grad, grad)`, reaction, `u³`, `exp(u)`,
+    `laplacian(u)·v`, a coefficient `k(x)`, a Neumann boundary term, `inner(jac, jac, 2)`,
+    `symgrad : symgrad`, `div(u)·div(v)` and component terms (`u[0]·v[0]`, `u[1]·v[0]`) all lower on
+    both.
+
+    Two of those did not, until this sweep found them. A **constant scalar source** — `- 1.0 * phi`,
+    the plainest one there is — raised on the network trial, because a constant carries no quadrature
+    axis and the value channel demanded one per point; every shipped VPINN happens to write a
+    *coordinate* source, which does. And **`div`**, which has no node of its own (it is
+    `trace(jacobian(phi, X))`, the way a book writes it), was not recognised by the channel extractor,
+    so grad-div stabilisation and an incompressibility penalty assembled on the FEM path only.
+
+    `div(v)` is `I : grad(v)`, so it lowers to the grad channel with the identity as its coefficient.
+    Checked end to end: a VPINN trained on a grad-div form (`γ = 5`) matches the FEM solve of the
+    identical form to **1.3e-02**, and on the FEM trial `trace(jac(w))` equals the longhand
+    `∂w₀/∂x + ∂w₁/∂y` exactly.
+
+    One asymmetry is inherent rather than a gap: a bound field view offers `ui.x`, while a network
+    expression is not a field view and takes `jno.np.grad(u_net, xi)`. That is the trial object
+    differing, not the weak-form language.
+
+### Boundary conditions, and complex forms
+
+| | network trial |
+|---|---|
+| **Dirichlet, homogeneous** | declaration `u(region) - 0.0`; the network satisfies it through its **ansatz** |
+| **Dirichlet, inhomogeneous** | **refused** — put `g` in the ansatz (`g + ansatz * net`), see below |
+| **Neumann flux** | a boundary term; its coefficient must carry a coordinate from that region |
+| **Robin** `a·u·v − g·v` | a boundary term with the network evaluated *on* the face |
+| **Mixed** (Dirichlet + flux on different regions) | works |
+| **Vector**, all components or one (a roller) | works |
+| **Complex coefficient** (a `1j` in the form) | works — the residual stays complex |
+| **`fem_symbols(complex=True)`** | refused: a `ComplexPair` is two coupled real fields, i.e. multi-field. Use one field with `value_shape=(2,)` and a 2-output network for (Re, Im) |
+
+!!! warning "An essential condition DECLARES; it does not impose"
+    For a network trial `u(region) - g` says *which test functions vanish* — the value never reaches
+    the residual. Measured with one fixed network: `- 0.0`, `- 0.5`, `- 7.0` and `- sin(πx)` all give a
+    **bit-identical** residual. A non-zero value therefore looked like a boundary condition and did
+    nothing, so it is now refused by name. Put it where the network can satisfy it exactly:
+
+    ```python
+    u_net = g + ansatz * net(xi, yi)     # ansatz vanishes on the region
+    jno.fem([..., u(region) - 0.0])      # the declaration stays homogeneous
+    ```
+
+!!! warning "A complex form's `.mse` is a complex loss"
+    `pde.mse` on a complex weak form comes back `complex128`, and minimising a complex number is not
+    defined. Build a real objective explicitly — `(r.real**2 + r.imag**2).mean` — the same caveat that
+    applies to a complex FEM inverse problem.
+
+!!! warning "Scope — refused by name"
+    * **Steady only.** The lowering test-projects onto a *spatial* FE basis, so a form carrying the
+      time coordinate is refused. It used to build and evaluate, and the number meant nothing:
+      measured on a heat form over `domain(time=(0, 0.1, 5))`, the spatial quadrature carried 120
+      points against the time coordinate's 5, the declared grid never reached the residual (5 steps
+      and 17 gave a bit-identical value), and the initial condition was discarded entirely
+      (`u(initial) - 0` and `u(initial) - 7` also bit-identical). Use an FE trial for a transient weak
+      form, or drive a time-dependent network as a **collocation PINN** through `jno.core`, where the
+      residual and the initial condition are both explicit losses.
+    * **A boundary coefficient must carry a coordinate.** A bound test function keeps its binding on
+      the *view*, not in the expression tree, so once the weak form is flattened `-1.0 * v_right` and
+      `-1.0 * v_interior` are indistinguishable and both read as volume. Write
+      `(g + 0.0 * xr) * v_r` against that region's own coordinates; a bare constant is refused rather
+      than integrated over the volume, which trains happily and is wrong (measured 3.9e-01 against
+      6.8e-04 for the same problem). The FEM trial classifies the raw constraint, where the binding
+      survives, and needs no such spelling.
+    * **Single field.** The lowering wraps one primary unknown, so two separate fields raise —
+      but a coupled system whose fields share a test space **is** one vector field, and that works.
+      See below.
+    * **No periodic ties.** A tie is an algebraic reduction of FE trial DOFs, and a network trial has
+      none. Impose periodicity inside the network instead (a periodic input embedding).

@@ -446,3 +446,63 @@ def test_unsupported_modes_fail_loud():
     fem_p = jno.fem([upi.x * vpi.x + upi.y * vpi.y - 1.0 * vpi, up(sp_l[0], sp_l[1]) - up(sp_r[0], sp_r[1])])
     with pytest.raises(NotImplementedError, match="periodic"):
         fem_p.solve(basis=jnp.asarray(np.linalg.qr(np.random.default_rng(0).standard_normal((fem_p.dofs, 3)))[0]))
+
+
+# ---------------------------------------------------------------------------------------------
+# The certificate, generalised: scoring a field this FEM did not produce (`fem.residual`)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_residual_is_available_on_a_linear_problem():
+    """``fem.residual`` used to raise on a steady LINEAR form -- the one mode where the residual is
+    simplest (``A u - b``) and where the only alternative was ``fem.A``, which densifies."""
+    fem = _poisson(0.435)
+    assert fem.is_linear
+    r = fem.residual  # must not raise
+    u = np.asarray(fem.solve()).reshape(-1)
+    b = np.asarray(fem.b)
+
+    at_solution = float(np.linalg.norm(np.asarray(r(u))) / np.linalg.norm(b))
+    assert at_solution < 1e-6, f"the residual at the solve's own answer should vanish, got {at_solution:.2e}"
+
+    # ... and it must actually respond to a field that is NOT the solution
+    at_wrong = float(np.linalg.norm(np.asarray(r(np.zeros_like(u)))) / np.linalg.norm(b))
+    assert at_wrong > 0.9, f"the residual at u=0 is ||b||/||b||=1; got {at_wrong:.2e}"
+
+
+def test_residual_scores_a_field_the_fem_never_produced():
+    """The point of the generalisation: certify a field from ANY source. Here a deliberately
+    under-ranked reduced answer, whose error is known independently, and a corrupted field."""
+    fem = _poisson(0.435)
+    u_full = np.asarray(fem.solve()).reshape(-1)
+    r, b = fem.residual, np.asarray(fem.b)
+    score = lambda v: float(np.linalg.norm(np.asarray(r(v))) / np.linalg.norm(b))
+
+    rng = np.random.default_rng(0)
+    corrupted = u_full * (1.0 + 0.25 * rng.standard_normal(u_full.shape))
+    assert score(corrupted) > 10.0 * score(u_full), "a corrupted field must score far worse than the solution"
+
+    # monotone in how wrong the field is -- the property that makes the number usable as a ranking
+    scores = [
+        score(u_full + eps * np.linalg.norm(u_full) * rng.standard_normal(u_full.shape)) for eps in (1e-3, 1e-2, 1e-1)
+    ]
+    assert scores[0] < scores[1] < scores[2], f"score must grow with the perturbation: {scores}"
+
+
+def test_residual_reproduces_the_basis_certificate_exactly():
+    """ONE formula, one home. ``fem.basis_residual`` is computed inside the reduced solve; scoring the
+    same lifted field through the public ``fem.residual`` must give the SAME number. If these two ever
+    drift apart, the reduced path is certifying itself by a rule nobody else can reproduce -- which is
+    exactly the drift this shared helper exists to prevent.
+    """
+    U = _pod(4)
+    fem = _poisson(0.435)
+    fem.BASIS_RESIDUAL_LIMIT = 1e9  # rank 4 is deliberately coarse, so the number is not ~0
+    u_rom = np.asarray(fem.solve(basis=U)).reshape(-1)
+    internal = fem.basis_residual
+    assert internal is not None and internal > 1e-6, "pick a rank coarse enough that the check is meaningful"
+
+    public = float(np.linalg.norm(np.asarray(fem.residual(u_rom))) / np.linalg.norm(np.asarray(fem.b)))
+    assert abs(public - internal) <= 1e-9 * max(1.0, internal), (
+        f"the public residual ({public:.6e}) and the internal certificate ({internal:.6e}) must agree"
+    )

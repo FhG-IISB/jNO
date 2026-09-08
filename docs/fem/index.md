@@ -31,6 +31,21 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
     hand-rolled experiments (e.g. `u_h = jnp.linalg.solve(fem.A, fem.b)`). `fem.operator` still
     exposes the raw sparse (`BCOO`) operator that `fem.solve()` and the solver slots work on directly.
 
+    **`fem.residual` is the exception that stays sparse**, because it is how you score a field. It is
+    available in every steady and transient mode — on a linear form it is `A u - b`, one `O(nnz)`
+    matvec with no densification — and it accepts a field from *any* source, not just this FEM's own
+    solve:
+
+    ```python
+    rel = jnp.linalg.norm(fem.residual(u_pred)) / jnp.linalg.norm(fem.b)
+    ```
+
+    That is the same number `fem.solve(basis=...)` computes about itself (`fem.basis_residual`), and
+    the two are pinned equal in the suite — so a reduced answer, a coarse-mesh interpolant and a neural
+    operator's prediction are all judged by one rule. It is a **certificate, not a bound**: a small
+    residual does not bound the error without the operator's conditioning. It does reliably catch a
+    field that is not a solution.
+
 ---
 
 ## Domain, symbols, and derivatives

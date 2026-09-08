@@ -898,6 +898,14 @@ cross = _binary(jnp.cross)
 # ============================================================================
 # Differential operators (pino-specific)
 # ============================================================================
+def _broadcasts(s1, s2) -> bool:
+    """Whether two shapes broadcast under numpy rules (right-aligned, 1s stretch)."""
+    for x, y in zip(reversed(s1), reversed(s2)):
+        if x != y and x != 1 and y != 1:
+            return False
+    return True
+
+
 def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
     """
     Generalized inner product / contraction over the last ``n_contract`` axes.
@@ -936,6 +944,21 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
             b = jnp.reshape(b, b.shape[:-_n] + pad + b.shape[-_n:])
 
         axes = tuple(range(-_n, 0))
+        if not _broadcasts(a.shape, b.shape):
+            # Before the raw broadcast error: the usual cause is a COMPONENT-FIRST operand, which is
+            # what `jno.np.stack([f0, f1])` builds (stack defaults to axis=0) while the value axis is
+            # trailing everywhere in the assemblers. Detect it by asking whether swapping the first
+            # two axes would align, and name it -- the same diagnosis the VPINN lowering gives for the
+            # same weak form, so one spelling means one thing on either path.
+            for name, arr, other in (("first", a, b), ("second", b, a)):
+                if arr.ndim >= 2 and _broadcasts(jnp.moveaxis(arr, 0, -1).shape, other.shape):
+                    raise ValueError(
+                        f"inner(...): the {name} operand, shape {tuple(arr.shape)}, is COMPONENT-FIRST "
+                        f"against shape {tuple(other.shape)} -- its first two axes are the wrong way "
+                        "round. That is what `jno.np.stack([f0, f1])` builds, since stack defaults to "
+                        "axis=0, while the value axis is trailing here. Write "
+                        "`jno.np.stack([f0, f1], axis=-1)`."
+                    )
         return jnp.sum(a * b, axis=axes, keepdims=_keep)
 
     return _attach_coords(FunctionCall(_fn, [_u(x), _u(y)], name="inner", reduces_axis=-1), [x, y])

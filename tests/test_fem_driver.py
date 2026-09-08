@@ -162,8 +162,14 @@ def test_empty_constraints_raises():
 def test_fem_accessor_guards():
     _, fem = _poisson_fem(mesh_size=0.3)
     assert fem.is_linear
-    with pytest.raises(AttributeError):
-        _ = fem.residual
+    # `.residual` IS available on a steady-linear form -- it is `A u - b`, and it is how a field this
+    # FEM did not produce (a reduced-basis answer, a coarse-mesh interpolant, a neural operator's
+    # prediction) gets scored against the system, at one sparse matvec. It used to raise here, which
+    # left `fem.A` -- an O(n^2) densification of an O(nnz) operator -- as the only route.
+    r = fem.residual
+    u = jnp.asarray(fem.solve())
+    assert float(jnp.linalg.norm(r(u))) / float(jnp.linalg.norm(fem.b)) < 1e-6
+    # `.jacobian` still raises: a linear system's tangent IS `A`, and `fem.A` is where to get it.
     with pytest.raises(AttributeError):
         _ = fem.jacobian
 
