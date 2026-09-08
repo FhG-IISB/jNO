@@ -555,6 +555,7 @@ def _check_march_converged(r_end, r_start, grid, solve_fn=None, *, what="load-pa
     bound = atol + rtol * np.asarray(r_start, dtype=float)
     bad = ~np.isfinite(r_end) | (r_end > bound)
     if not bad.any():
+        _check_march_moved(r_end, r_start, bound, rtol, atol, what=what)
         return
     k = int(np.argmax(bad))
     tau_k = float(np.asarray(grid)[k]) if np.asarray(grid).size > k else float("nan")
@@ -563,6 +564,45 @@ def _check_march_converged(r_end, r_start, grid, solve_fn=None, *, what="load-pa
         f"residual norm {r_end[k]:.3e} against the tolerance atol + rtol*||r(u_prev)|| = {bound[k]:.3e} "
         f"(atol={atol:g}, rtol={rtol:g}). That step is NOT a root, and every later step inherited "
         "it as its starting state — the whole trajectory past this point is unreliable. " + (advice or _LOADPATH_ADVICE)
+    )
+
+
+def _check_march_moved(r_end, r_start, bound, rtol, atol, *, what="load-path march"):
+    """Raise if no step of the march took a single Newton update — the trajectory IS its initial state.
+
+    ``atol`` is an ABSOLUTE floor, and a weak form carries whatever residual scale its units give it. A
+    melt-pool momentum balance written in SI (rho = 7000, a surface traction of a few Pa over a 20 um
+    edge) has a step residual of ~1e-4, so an ``atol`` a user reasonably calls "loose" sits ABOVE it.
+    Newton's first convergence test then passes at the incoming iterate, the driver returns without
+    updating anything, and every step of the march does the same: the answer comes back finite,
+    plausibly shaped, and exactly equal to the initial condition.
+
+    That is the one failure this net could not see before, because it is not a non-convergence — every
+    step is "converged" by the test it was given. What gives it away is that the residual at the solved
+    state is BIT-IDENTICAL to the one at the incoming state, on every step at once: a solve that moved
+    the iterate cannot reproduce its own starting residual exactly. Measured on a 2-D melt pool driven
+    by a 1 Pa thermocapillary traction at ``atol=1e-2``: 20 steps, ``r_start == r_end == 1.4e-4``
+    throughout, and a reported peak velocity of exactly 0.0 m/s.
+
+    Deliberately requires ALL steps to be untouched. A march that solves anywhere has done real work,
+    and a step that legitimately begins at a root is ordinary (a settled tail, an unloaded interval) —
+    only a march that never moved at all is reporting its input back as an answer.
+    """
+    r_start = np.asarray(r_start, dtype=float)
+    r_end = np.asarray(r_end, dtype=float)
+    if r_start.size == 0 or not (r_end == r_start).all():
+        return
+    peak = float(np.max(r_start))
+    if not (peak > 0.0):  # a genuinely exact root at every step -- nothing was there to solve
+        return
+    raise RuntimeError(
+        f"fem.solve: the {what} returned its INITIAL STATE unchanged — no step took a single Newton "
+        f"update. Every step's residual passed the convergence test at the incoming iterate "
+        f"(largest step residual {peak:.3e}, against atol + rtol*||r(u_prev)|| = {float(np.max(bound)):.3e}), "
+        f"so the driver returned without solving and the trajectory is the initial condition. The "
+        f"tolerance is above this form's residual scale, not the solution: tighten atol well below "
+        f"{peak:.3e} (atol={atol:g}, rtol={rtol:g}), or non-dimensionalise the weak form so its "
+        f"residual is O(1). This is NOT a converged answer."
     )
 
 
