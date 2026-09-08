@@ -19,7 +19,7 @@ import jno.jnp_ops as J
 
 def _views():
     """One live instance of every trace class that defines ``__neg__``, so the two stay in step."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     vec, _ = d.fem_symbols(value_shape=(2,), names=("w", "q"))
@@ -45,7 +45,7 @@ def test_unary_plus_matches_no_operator_numerically():
     """The whole point: a term written with ``+`` must solve identically to the same term without it."""
 
     def build(sign):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
         u, phi = d.fem_symbols()
         xi, yi, _ = d.variable("interior", split=True)
         xb, yb, _ = d.variable("boundary", split=True)
@@ -63,7 +63,7 @@ def test_unary_plus_matches_no_operator_numerically():
 
 def test_signed_source_list_builds():
     """The spelling that motivated this: a stoichiometric source list mixing both signs."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.1, 3))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.1, 3))
     a, pa = d.fem_symbols(names=("a", "pa"))
     b, pb = d.fem_symbols(names=("b", "pb"))
     xi, yi, ti = d.variable("interior", split=True)

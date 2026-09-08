@@ -60,7 +60,7 @@ def _evaluate(expr_of_u):
     ``expr`` must be NONLINEAR in u: `fem.residual` is offered only on a nonlinear or transient
     problem, so a linear probe like ``trace(grad u)`` has to be squared before it can be read here.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     xi, yi = d.variable("interior", split=True)[:2]
     ax = [xi, yi]
     u, v = d.fem_symbols(value_shape=(2,), names=("u_t", "v_t"), order=1)

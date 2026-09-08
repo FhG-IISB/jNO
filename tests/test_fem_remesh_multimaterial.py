@@ -27,9 +27,9 @@ def _tet_volumes(points, tets):
 
 def _two_material_ball_in_box(size=0.34):
     """A sphere embedded in a box: two conforming volume regions with a curved interface."""
-    inner = jno.Shape.sphere(0.5, 0.5, 0.5, 0.28)
-    outer = jno.Shape.box(0, 0, 0, 1, 1, 1)
-    return jno.Shape.regions(ball=inner, block=outer).sized(size).domain()
+    inner = jno.shape.sphere(0.5, 0.5, 0.5, 0.28)
+    outer = jno.shape.box(0, 0, 0, 1, 1, 1)
+    return jno.shape.regions(ball=inner, block=outer).sized(size).domain()
 
 
 def _region_volume(d, name):
@@ -141,7 +141,7 @@ def test_a_tighter_hausdorff_tolerance_tracks_the_surface_more_closely():
 
 def test_a_single_material_mesh_is_unaffected():
     """No named volume region -> the original single-reference path, byte-for-byte behaviour."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
     before = set(d.mesh.cell_sets)
     d.refine(np.full(len(d.mesh.points), 0.25))
     assert len(d.mesh.cells_dict["tetra"]) > 0

@@ -61,7 +61,7 @@ a gmsh mesh-size callback:
 ```python
 # THREE arguments, not two: gmsh calls a size function as f(x, y, z) whatever the dimension.
 h_of = lambda x, y, z: H_FINE + (H_COARSE - H_FINE) * min(1.0, max(0.0, (LY - y) / BAND))
-d = jno.Shape.rect(0.0, 0.0, LX, LY, size=h_of).domain(time=(0.0, T_END, NSTEPS + 1))
+d = jno.shape.rect(0.0, 0.0, LX, LY, size=h_of).domain(time=(0.0, T_END, NSTEPS + 1))
 ```
 
 | mesh | nodes | through the pool depth |

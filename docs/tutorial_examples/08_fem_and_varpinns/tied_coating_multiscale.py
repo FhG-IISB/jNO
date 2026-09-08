@@ -42,18 +42,18 @@ H_SUB, H_FILM = 0.12, 0.0125  # per-region mesh sizes: the coating needs ~4 elem
 
 # Two bodies, each meshed at its OWN size. `conforming=False` skips the fragment, so the shared
 # surface exists twice -- once per body -- and each is meshed independently.
-d = jno.Shape.regions(
-    substrate=jno.Shape.rect(0.0, 0.0, 1.0, L_SUB, size=H_SUB),
-    coating=jno.Shape.rect(0.0, L_SUB, 1.0, L_SUB + L_FILM, size=H_FILM),
+d = jno.shape.regions(
+    substrate=jno.shape.rect(0.0, 0.0, 1.0, L_SUB, size=H_SUB),
+    coating=jno.shape.rect(0.0, L_SUB, 1.0, L_SUB + L_FILM, size=H_FILM),
     conforming=False,
 ).domain()
-# `Shape` already auto-names each body's edges, and with the two bodies stacked the outer `bottom`
+# `shape` already auto-names each body's edges, and with the two bodies stacked the outer `bottom`
 # (y = 0, on the substrate) and `top` (y = 1.05, on the coating) are exactly the two surfaces wanted.
 
 T, phi = d.fem_symbols()
 # One conduction term per material region -- each integrates over that region's cells only. (The
 # `d.by_region({...})` shorthand is for regions declared as geometry parts or `d.tag` predicates; a
-# `Shape.regions` name is not one of those, so with two materials the explicit form is also the
+# `shape.regions` name is not one of those, so with two materials the explicit form is also the
 # clearer one.)
 xs, ys, _ = d.variable("substrate", split=True)
 xc, yc, _ = d.variable("coating", split=True)

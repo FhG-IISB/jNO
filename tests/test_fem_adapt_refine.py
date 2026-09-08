@@ -33,7 +33,7 @@ def x64():
 
 def _peaked_2d(n=8):
     """-Lap u = a narrow Gaussian at the centre: a local feature, so refinement should be local."""
-    d = jno.Shape.rect(0, 0, 1, 1).quad().structured(n=n).domain(compute_mesh_connectivity=False)
+    d = jno.shape.rect(0, 0, 1, 1).quad().structured(n=n).domain(compute_mesh_connectivity=False)
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -43,7 +43,7 @@ def _peaked_2d(n=8):
 
 
 def _peaked_3d(n=4):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=n).quad().domain(compute_mesh_connectivity=False)
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=n).quad().domain(compute_mesh_connectivity=False)
     u, v = d.fem_symbols()
     xi, yi, zi = d.variable("interior", split=True)[:3]
     xb, yb, zb = d.variable("boundary", split=True)[:3]
@@ -158,7 +158,7 @@ def test_the_hex_loop_refines_locally(x64):
 def test_a_simplex_mesh_is_refused_by_name(x64):
     """Splitting a simplex is a different algorithm (and mmg already adapts them locally), so this says
     so rather than silently doing nothing."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(compute_mesh_connectivity=False)
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(compute_mesh_connectivity=False)
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

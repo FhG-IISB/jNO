@@ -85,7 +85,7 @@ assumes. So the choice for a PINO residual is between those two, and AD is simpl
 ```python
 jno.setup(__file__, diff_type="spectral")
 
-d = jno.Shape.rect(0, 0, 1, 1, size=1/24).domain(structured=True)
+d = jno.shape.rect(0, 0, 1, 1, size=1/24).domain(structured=True)
 x, y, _ = d.variable("interior")
 d.variable("_f", forcing)
 _f = d.variable("_f")
@@ -111,7 +111,7 @@ transform for all its terms, halving the transforms against separate per-axis se
     both ends** (Neumann-like). That is narrower than "non-periodic": a ramp has `u' ≠ 0` at the
     ends, so its mirrored extension has a kink and still rings — better by ~44×, but still `O(1)`.
 
-    Both need a **uniform** grid: `jno.Shape.rect(...).domain(structured=True)`, or any domain
+    Both need a **uniform** grid: `jno.shape.rect(...).domain(structured=True)`, or any domain
     carrying `_grid_shape`. Non-uniform spacing and unstructured meshes raise rather than guess.
 
 **Choose the scheme per direction.** `jno.fdm` gets the spectral backend with no wiring, but it is

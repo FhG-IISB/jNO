@@ -40,7 +40,7 @@ def test_heat_flux_through_the_walls_equals_the_source():
     the integrated source. This is the thermal reading of the same operation as a reaction force."""
     grad, inner = jno.np.grad, jno.np.inner
     f_src = 3.0
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
     X = [co[0], co[1]]
@@ -66,7 +66,7 @@ def test_reaction_on_a_loaded_bar_equals_the_applied_body_force():
     operation as the wall flux above."""
     sym, grad, trace, inner = jno.np.sym, jno.np.grad, jno.np.trace, jno.np.inner
     bx, Lx, Ly = 2.5, 2.0, 1.0
-    d = jno.Shape.rect(0.0, 0.0, Lx, Ly, size=0.12).domain()
+    d = jno.shape.rect(0.0, 0.0, Lx, Ly, size=0.12).domain()
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = d.variable("interior", split=True), d.variable("left", split=True)
     X = [co[0], co[1]]
@@ -88,7 +88,7 @@ def test_the_eliminated_system_would_have_returned_zero():
     """The reason this method exists: fem.b (post-elimination) is ZERO on the pinned rows, so the
     naive readout is silently wrong rather than loudly unavailable."""
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
     X = [co[0], co[1]]
@@ -108,7 +108,7 @@ def test_the_eliminated_system_would_have_returned_zero():
 
 def test_eval_refuses_an_expression_with_no_test_function():
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
     X = [co[0], co[1]]
@@ -120,7 +120,7 @@ def test_eval_refuses_an_expression_with_no_test_function():
 
 
 def test_region_dofs_names_an_unknown_region():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
     X = [co[0], co[1]]

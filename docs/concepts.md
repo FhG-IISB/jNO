@@ -48,7 +48,7 @@ import jax.numpy as jnp
 import optax
 import jno
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 u, v = d.fem_symbols()

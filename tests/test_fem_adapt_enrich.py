@@ -61,7 +61,7 @@ def _grad_crit(ui):
 def _poisson(space="cover", size=0.25, rhs=None):
     """``-Δu = rhs`` with ``u = 0`` on the whole boundary of the unit square."""
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     tol = 1e-9
     d.tag("walls", lambda *c: np.logical_or.reduce([(x < tol) | (x > 1 - tol) for x in c]))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
@@ -159,7 +159,7 @@ def test_a_gradient_criterion_finds_the_reentrant_corner():
     from the vertex values cannot see the cover coefficients, so it was removed rather than left as a
     default that reports a number anti-correlated with the error."""
     grad, inner = jno.np.grad, jno.np.inner
-    s = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.14) - jno.Shape.rect(0.5, 0.5, 1.0, 1.0, size=0.14)
+    s = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.14) - jno.shape.rect(0.5, 0.5, 1.0, 1.0, size=0.14)
     d = s.domain()
     d.tag("walls", lambda x, y: np.ones_like(x, dtype=bool))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
@@ -306,7 +306,7 @@ def test_a_vector_field_enriches_and_pins_every_component():
     """Covers on a VECTOR field. The layout is `(node*blk + slot)*vec + comp`, so an unenriched node
     has `vec` pins per cover slot, not one -- pinning by node index alone would leave every component
     but the first free, and the null space would come back with it."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.16).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.16).domain()
     tol = 1e-9
     d.tag("walls", lambda *c: np.logical_or.reduce([(x < tol) | (x > 1 - tol) for x in c]))
     xi, yi, _ = d.variable("interior", split=True)
@@ -406,7 +406,7 @@ def test_a_field_without_covers_is_refused_by_name():
 def test_a_transient_problem_is_refused_by_name():
     """The state transfer that carries a solution across an adapt round is written for a change of
     MESH; a change of SPACE mid-march is not wired, and must say so rather than march on garbage."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.1, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.1, 5))
     u, phi = d.fem_symbols(space="cover")
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _tb = d.variable("boundary", split=True)
@@ -437,7 +437,7 @@ def _poisson_3d(space, size=0.26):
     The manufactured solution vanishes on all six faces, so the homogeneous condition is EXACT and a
     cover field's inhomogeneous-trace limitation stays out of the measurement."""
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size).domain()
     tol = 1e-9
     d.tag("walls", lambda *c: np.logical_or.reduce([(x < tol) | (x > 1 - tol) for x in c]))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)

@@ -29,9 +29,9 @@ def _x64():
 def _poisson(size, dim=2):
     """Structured -Δu = f, u = Π sin(π x_i), homogeneous Dirichlet. Returns (grid, A_mv, b, exact)."""
     shp = (
-        jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size)
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size)
         if dim == 2
-        else jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size)
+        else jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size)
     )
     d = jno.domain(shp.structured())
     grid = d.mesh_connectivity["grid"]

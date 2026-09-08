@@ -44,9 +44,9 @@ def _x64():
 @pytest.fixture(scope="module")
 def two_bodies():
     """Disjoint on purpose: nothing but ``region=`` can tell the two surfaces apart."""
-    d = jno.Shape.regions(
-        A=jno.Shape.rect(*BOX["A"][:1], 0, BOX["A"][1], 1).sized(0.25),
-        B=jno.Shape.rect(BOX["B"][0], 0, BOX["B"][1], 1).sized(0.17),
+    d = jno.shape.regions(
+        A=jno.shape.rect(*BOX["A"][:1], 0, BOX["A"][1], 1).sized(0.25),
+        B=jno.shape.rect(BOX["B"][0], 0, BOX["B"][1], 1).sized(0.17),
         conforming=False,
     ).domain()
     _ = d.built_mesh
@@ -153,8 +153,8 @@ def test_touching_bodies_keep_their_own_interface_side(hB, label):
     owner is on the tag; the exterior boundary, which carries no owner, falls back to cell topology —
     safe there, because two bodies' exterior faces cannot coincide.
     """
-    d = jno.Shape.regions(
-        A=jno.Shape.rect(0, 0, 1, 1).sized(0.25), B=jno.Shape.rect(1, 0, 2, 1).sized(hB), conforming=False
+    d = jno.shape.regions(
+        A=jno.shape.rect(0, 0, 1, 1).sized(0.25), B=jno.shape.rect(1, 0, 2, 1).sized(hB), conforming=False
     ).domain()
     _ = d.built_mesh
     everywhere = lambda x, y: x**2 >= -1.0  # noqa: E731
@@ -193,9 +193,9 @@ def test_a_region_scoped_dirichlet_works_at_any_element_order(order):
     Both ``x^2 - y^2`` and ``2xy`` are harmonic and lie in the P2 space, so the discrete solution is the
     exact one and any deviation is a condition that was not imposed.
     """
-    d = jno.Shape.regions(
-        A=jno.Shape.rect(*BOX["A"][:1], 0, BOX["A"][1], 1).sized(0.34),
-        B=jno.Shape.rect(BOX["B"][0], 0, BOX["B"][1], 1).sized(0.34),
+    d = jno.shape.regions(
+        A=jno.shape.rect(*BOX["A"][:1], 0, BOX["A"][1], 1).sized(0.34),
+        B=jno.shape.rect(BOX["B"][0], 0, BOX["B"][1], 1).sized(0.34),
         conforming=False,
     ).domain()
     _ = d.built_mesh

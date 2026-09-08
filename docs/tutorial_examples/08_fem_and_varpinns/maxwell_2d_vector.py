@@ -42,7 +42,7 @@ k2 = KR + 1j * KI  # the complex coefficient, written as a plain Python complex
 E_r = lambda X, Y: (pi * sin(pi * X) * cos(pi * Y), -pi * cos(pi * X) * sin(pi * Y))  # noqa: E731
 E_i = lambda X, Y: (2 * pi * sin(2 * pi * X) * cos(2 * pi * Y), -2 * pi * cos(2 * pi * X) * sin(2 * pi * Y))  # noqa: E731
 
-d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06).domain()
+d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06).domain()
 E, v = d.fem_symbols(value_shape=(2,), names=("E", "v"), order=2, complex=True)  # a P2 COMPLEX vector field + its test
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

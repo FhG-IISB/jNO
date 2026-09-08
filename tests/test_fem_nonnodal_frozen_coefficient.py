@@ -36,7 +36,7 @@ def _x64():
 
 def _curl_curl_with_coefficient(values_fn, n_extra=0, size=0.6):
     """Curl-curl + mass on N1E, loaded through a frozen P1 scalar coefficient."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     w, _wt = d.fem_symbols(names=("w", "wt"))  # Lagrange -- a coefficient, never a solved unknown
     ci = d.variable("interior", split=True)
@@ -113,7 +113,7 @@ def test_a_p0_cell_field_parameter_is_refused_rather_than_misread():
     ``RegionMask`` (``d.by_region``) is the mechanism that works here — one 0/1 per cell, threaded
     through ``_cell_masks`` — so the guard names it.
     """
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     _p0_trial, p0 = d.fem_symbols(names=("m", "mt"), space="P0")
     k = jno.np.parameter(p0, name="k")

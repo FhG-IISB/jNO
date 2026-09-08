@@ -105,7 +105,7 @@ def test_a_facet_arity_with_no_shape_functions_is_refused():
 
 def _two_hex_blocks(tmp_path, na=4, nb=3):
     """Two hexahedral lattices meeting at x = 1 at DIFFERENT resolutions, with duplicated interface
-    nodes — the configuration `Shape.regions(..., conforming=False)` produces, built directly because
+    nodes — the configuration `shape.regions(..., conforming=False)` produces, built directly because
     that path meshes through gmsh, which cannot hex-mesh."""
 
     def block(x0, x1, n):

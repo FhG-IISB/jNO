@@ -2288,7 +2288,7 @@ class FEM:
                     "carries per-quadrature-point state across every step, so the state would have to be "
                     "transferred onto each new mesh — wired for the transient stepper, not for `tau=`. "
                     "For a fixed graded mesh instead, put the refinement in the geometry: "
-                    "`Shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
+                    "`shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
                 )
             if getattr(adapt, "enrich", False):
                 # p-adaptivity: raise the local order by switching interpolation covers on at the marked
@@ -3725,7 +3725,7 @@ def _build_periodic_reduction(
 
     # Multidirectional periodicity needs each face to carry its shared corners (a corner is a secondary in
     # several directions). A ``domain.tag`` predicate face includes corners by construction. An auto face
-    # (from Shape/emit) does too now that a face chain keeps both endpoints (``_chain_edges_to_loop``) --
+    # (from shape/emit) does too now that a face chain keeps both endpoints (``_chain_edges_to_loop``) --
     # accept it when the mesh confirms corners are shared: every pair of perpendicular periodic faces
     # must share a node. Otherwise (older partitioned tagging) reject rather than silently mis-solve.
     if len(ties) > 1:
@@ -4414,7 +4414,7 @@ def _annotate_reduced_dirichlet(periodic: Any, pairs: list, tv: list) -> Any:
             "jno.fem: a node carrying a TIME-VARYING essential value sits on a non-matching tied/periodic "
             "interface, where the tie reduction destroys the row that holds it. The constant-value "
             "restoration cannot be used, because the held value changes every step. Either make the "
-            "interface conforming (`jno.Shape.regions(..., conforming=True)`), or move the time-varying "
+            "interface conforming (`jno.shape.regions(..., conforming=True)`), or move the time-varying "
             "condition off the tied face."
         )
     return periodic
@@ -4668,7 +4668,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
                 "whose operator or load is rebuilt every step (a runtime-parametric march). The tie "
                 "reduction destroys the row holding the prescribed value and the constant-payload repair "
                 "does not reach a per-step operator. Make the interface conforming "
-                "(`jno.Shape.regions(..., conforming=True)`), or move the condition off the tied face."
+                "(`jno.shape.regions(..., conforming=True)`), or move the condition off the tied face."
             )
         M_red, A_red, c_red = impose_reduced_dirichlet(periodic, A_red, c_red, mass=M_red)
         if f_red is not None:
@@ -5055,10 +5055,10 @@ def fem(
 
 
 def _is_volume_region(domain, name: str) -> bool:
-    """Is ``name`` a ``Shape.regions`` BODY — a cell set carrying volume cells?
+    """Is ``name`` a ``shape.regions`` BODY — a cell set carrying volume cells?
 
     ``_source_regions`` only ever holds the *polygon* domain's regions (``polygon_domain`` writes it);
-    a ``Shape.regions(...)`` domain is built through the gmsh emitter and never appears there. Keying
+    a ``shape.regions(...)`` domain is built through the gmsh emitter and never appears there. Keying
     the sub-region pin on that dict alone therefore rejected ``v(flap) - 0`` on exactly the domains the
     tie machinery exists for, while ``_region_node_ids_from_cells`` was already able to resolve such a
     region's nodes from cell topology -- the resolution existed and the gate would not let it be
@@ -5178,7 +5178,7 @@ def _fem_impl(
 
     # Nédélec (N1E) periodic ties need a CONFORMING periodic mesh — the per-edge DOFs must line up
     # one-to-one across the tied faces, which gmsh's default unstructured mesh does not guarantee. Infer
-    # this from the constraint list: when periodic ties are present on an N1E field, re-mesh the (Shape-
+    # this from the constraint list: when periodic ties are present on an N1E field, re-mesh the (shape-
     # backed) domain once with gmsh setPeriodic on the tied face pairs. No `periodic=` arg — driven purely
     # by the periodic conditions the user already authored. (Nodal fields tie by interpolation and need no
     # re-mesh, so this is gated on N1E.)
@@ -5647,7 +5647,7 @@ def _fem_impl(
                 raise ValueError(
                     "jno.fem: a residual with the trial but no test function must live on a boundary "
                     "region (Dirichlet), the 'initial' region (IC), a named interior sub-region "
-                    "(domain.region(...)), or a Shape.regions body. Got the whole-domain volume — did "
+                    "(domain.region(...)), or a shape.regions body. Got the whole-domain volume — did "
                     "you forget the test function?"
                 )
             comp, value, value_node = _dirichlet_spec(_bare(c))

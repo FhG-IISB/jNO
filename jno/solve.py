@@ -1133,10 +1133,10 @@ def refine(
     or 8 (a hexahedron): local, needs no mesher, works on a mesh loaded from a file, and every existing
     node survives with its value::
 
-        d = jno.Shape.rect(0, 0, 1, 1).quad().structured(n=8).domain()
+        d = jno.shape.rect(0, 0, 1, 1).quad().structured(n=8).domain()
         u = fem.solve(adapt=jno.solve.refine(theta=0.4, max_iters=4))
 
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # hexes
+        d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # hexes
         u = fem.solve(adapt=jno.solve.refine(criterion=jno.np.abs(ui.x)))     # composes with a criterion
 
     **For hexahedra this is the only h-adaptivity there is.** No general all-hex mesher exists -- gmsh's
@@ -1380,7 +1380,7 @@ def enrich(
 
     Example -- a gradient-magnitude criterion, the general-purpose choice::
 
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02).domain()
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02).domain()
         d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
         co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
 

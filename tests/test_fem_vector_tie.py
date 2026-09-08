@@ -47,9 +47,9 @@ def _x64():
 
 def _split_box(size=0.5, conforming=False, zmid=1.0, ztop=2.0):
     return (
-        jno.Shape.regions(
-            lower=jno.Shape.box(0, 0, 0, 1, 1, zmid),
-            upper=jno.Shape.box(0, 0, zmid, 1, 1, ztop),
+        jno.shape.regions(
+            lower=jno.shape.box(0, 0, 0, 1, 1, zmid),
+            upper=jno.shape.box(0, 0, zmid, 1, 1, ztop),
             conforming=conforming,
         )
         .sized(size)
@@ -217,10 +217,10 @@ def test_one_interface_tied_and_another_in_contact_on_the_same_field():
     from "cannot be expressed" to "assembles".
     """
     d = (
-        jno.Shape.regions(
-            a=jno.Shape.box(0, 0, 0, 1, 1, 1),
-            b=jno.Shape.box(0, 0, 1, 1, 1, 2),
-            c=jno.Shape.box(0, 0, 2, 1, 1, 3),
+        jno.shape.regions(
+            a=jno.shape.box(0, 0, 0, 1, 1, 1),
+            b=jno.shape.box(0, 0, 1, 1, 1, 2),
+            c=jno.shape.box(0, 0, 2, 1, 1, 3),
             conforming=False,
         )
         .sized(0.5)
@@ -259,7 +259,7 @@ def test_a_transient_vector_tie_still_refuses_and_names_the_steady_case():
     scalar. The message must point at what DOES work rather than repeating the old blanket refusal."""
     d = _split_box(0.5).domain_like() if False else _split_box(0.5)
     d = (
-        jno.Shape.regions(lower=jno.Shape.box(0, 0, 0, 1, 1, 1), upper=jno.Shape.box(0, 0, 1, 1, 1, 2), conforming=False)
+        jno.shape.regions(lower=jno.shape.box(0, 0, 0, 1, 1, 1), upper=jno.shape.box(0, 0, 1, 1, 1, 2), conforming=False)
         .sized(0.5)
         .domain(time=(0.0, 1.0, 4))
     )

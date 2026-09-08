@@ -52,7 +52,7 @@ V0MAX, V0MIN = 0.75 * h**2, 0.05 * h**2  # element-volume bounds, scaled from ed
 MOVE_BOUND, SPAN, TOL, ITERS = 2.0 * h, 2.0 * h, 1e-6 * L, 400
 PSTAR, BETA, GAMMA, BETA_MIN = 650.0, 2e-4, 0.997, 1e-4  # perimeter target and barrier schedule
 
-d = jno.Shape.rect(0, 0, L, H, size=h).domain()
+d = jno.shape.rect(0, 0, L, H, size=h).domain()
 pts0 = np.asarray(d.mesh.points)[:, :2]
 cells = np.asarray(d._cells_p1())
 
@@ -163,7 +163,7 @@ C = float(np.asarray(crux.eval([compliance])).reshape(-1)[0])
 P = float(np.asarray(crux.eval([perim])).reshape(-1)[0])  # the smoothed perimeter, eq. (38)
 
 # --- the honesty check: re-solve the SAME design on a clean, undistorted mesh -------------------
-d_ref = jno.Shape.rect(0, 0, L, H, size=h / 2).domain()  # fresh, twice as fine, undeformed
+d_ref = jno.shape.rect(0, 0, L, H, size=h / 2).domain()  # fresh, twice as fine, undeformed
 rho_ref = d.transfer_cell_field(rho_f, d_ref, points=pts_f, outside=1e-3)  # `points=` -> deformed source
 u2, phi2 = d_ref.fem_symbols(value_shape=(2,))
 _r2, s2 = d_ref.fem_symbols(space="P0", names=("r2", "s2"))

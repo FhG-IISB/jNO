@@ -40,7 +40,7 @@ def _x64():
 
 
 def _dom(size=0.3, t=(0.0, 0.2, 5)):
-    return jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=t)
+    return jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=t)
 
 
 def test_a_coordinate_time_derivative_is_a_geometry_term():
@@ -167,7 +167,7 @@ def test_prescribed_motion_converges_first_order_to_the_analytic_domain():
     that is the documented scheme, and asserting the *rate* is what would catch it silently changing."""
     T, errs = 0.4, []
     for nt in (9, 17, 33):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, T, nt))
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, T, nt))
         _xb, yb, tb = d.variable("boundary", split=True)
         traj = _heat(d, yb.d(tb) - 0.5 * yb).solve()
         ymax = float(traj.meshes[-1][0][:, 1].max())
@@ -185,7 +185,7 @@ def test_the_velocity_is_re_evaluated_on_the_MOVED_mesh():
     y — exponential growth collapsed to a single Euler step over the whole interval (1.2000 rather than
     1.2184), with no error anywhere. Anything less than compounding growth means the re-sample was lost."""
     T, nt = 0.4, 9
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, T, nt))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, T, nt))
     _xb, yb, tb = d.variable("boundary", split=True)
     ymax = float(_heat(d, yb.d(tb) - 0.5 * yb).solve().meshes[-1][0][:, 1].max())
 
@@ -196,7 +196,7 @@ def test_the_velocity_is_re_evaluated_on_the_MOVED_mesh():
 def test_motion_is_per_axis_and_holds_the_untagged_column():
     """Tagging is literal: a term on ``yb`` moves the y column and leaves x alone. That is the lever for
     sliding a node within a wall instead of pushing it through one."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.3, 7))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.3, 7))
     _xb, yb, tb = d.variable("boundary", split=True)
     traj = _heat(d, yb.d(tb) - 0.4).solve()
     p0, p1 = traj.meshes[0][0], traj.meshes[-1][0]
@@ -208,7 +208,7 @@ def test_motion_is_per_axis_and_holds_the_untagged_column():
 def test_an_interior_region_moves_too():
     """The generality the classifier promises, end to end: a ``where=`` region in the middle of the domain
     is driven, and the mesh around it (including the outer boundary) relaxes harmonically to accommodate."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain(time=(0.0, 0.2, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain(time=(0.0, 0.2, 5))
     xc, _yc, tc = d.variable("core", where=lambda x, y: (x - 0.5) ** 2 + (y - 0.5) ** 2 < 0.05, split=True)
     core_ids = np.asarray(jno.trace.Variable._region_vertex_ids(d, "core", np.asarray(d.mesh.points)), dtype=int)
     assert core_ids.size > 0, "the test needs a non-empty interior region"
@@ -222,7 +222,7 @@ def test_an_interior_region_moves_too():
 def test_the_velocity_may_read_the_solved_field():
     """A state-dependent law: the boundary speed is proportional to the solution's own boundary gradient,
     the shape a Stefan condition takes. The frozen field is re-pinned to the live state each step."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.2, 6))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.2, 6))
     u, _v = d.fem_symbols()
     parts = d.variable("boundary", normals=True, split=True)
     xb, yb, tb, nx, ny = parts[0], parts[1], parts[2], parts[-2], parts[-1]
@@ -237,7 +237,7 @@ def test_the_velocity_may_read_the_solved_field():
 def test_a_geometry_term_needs_a_transient_problem():
     """``coord.d(t) - v`` moves the mesh *in time*. On a steady problem there is no time to move through,
     and the term would be silently inert."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, tb = d.variable("boundary", split=True)
@@ -261,7 +261,7 @@ def test_two_terms_may_not_prescribe_the_same_coordinate():
     """Regions overlap freely — a corner belongs to both edges — so two terms naming the same vertex *and*
     the same axis is easy to write by accident. Scattering in list order would silently let the last one
     win, which is a wrong velocity with no symptom."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.2, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.2, 5))
     _xl, yl, tl = d.variable("lo", where=lambda x, y: y < 0.5, split=True)
     _xa, ya, ta = d.variable("all", where=lambda x, y: np.ones_like(x, dtype=bool), split=True)
     with pytest.raises(ValueError, match="only one velocity"):
@@ -271,7 +271,7 @@ def test_two_terms_may_not_prescribe_the_same_coordinate():
 def test_two_terms_may_drive_different_axes_of_one_region():
     """The complement: x and y of the same region are separate degrees of freedom, so a term each is a
     perfectly well-posed 2-D velocity and must be allowed."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.2, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.2, 5))
     xb, yb, tb = d.variable("boundary", split=True)
     traj = _heat(d, xb.d(tb) - 0.2, yb.d(tb) - 0.3).solve()
     p0, p1 = traj.meshes[0][0], traj.meshes[-1][0]
@@ -287,7 +287,7 @@ def test_a_motion_that_would_tangle_the_mesh_raises():
     Note the velocity has to be *differential*. Driving the whole boundary at one constant speed is a rigid
     translation — the interior follows harmonically and nothing inverts however far it goes. ``-4y`` pulls
     the top edge down while the bottom stays put, which folds the domain through itself."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 1.0, 3))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 1.0, 3))
     _xb, yb, tb = d.variable("boundary", split=True)
     with pytest.raises(ValueError, match="inverts or collapses"):
         _heat(d, yb.d(tb) + 4.0 * yb).solve()
@@ -300,7 +300,7 @@ def test_a_position_independent_region_marches_too():
     is a known defect (see the note in ``run_mesh_motion``); it is not asserted here because pinning the
     current wrong behaviour into a test would make the fix look like a regression.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.4, 6))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.4, 6))
     _xb, yb, tb = d.variable("boundary", split=True)
     traj = _heat(d, yb.d(tb) - 0.5).solve()
     p0, p1 = traj.meshes[0][0], traj.meshes[-1][0]
@@ -318,7 +318,7 @@ def test_the_SOLUTION_stays_finite_while_the_mesh_moves():
     So: assert the field. Finite at every frame, obeying the maximum principle (this is heat with u=0 on
     the boundary and u=1 initially, so nothing may exceed those bounds), and actually decaying.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.4, 9))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.4, 9))
     _xb, yb, tb = d.variable("boundary", split=True)
     traj = _heat(d, yb.d(tb) - 0.5 * yb).solve()
     states = [np.asarray(s) for s in traj.states]
@@ -339,7 +339,7 @@ def test_the_solution_matches_a_fixed_mesh_when_the_mesh_does_not_move():
     any of them shows up as a number rather than as a plausible-looking trajectory."""
 
     def _mk(with_motion):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.3, 7))
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.3, 7))
         _xb, yb, tb = d.variable("boundary", split=True)
         geom = (yb.d(tb) - 0.0,) if with_motion else ()
         return d, _heat(d, *geom)
@@ -363,7 +363,7 @@ def test_the_solution_matches_a_fixed_mesh_when_the_mesh_does_not_move():
 def _bump_march(n_steps, v=0.5, size=0.1):
     """A Gaussian bump on a mesh translating rigidly in y, with kappa ~ 0 and NO Dirichlet BC. The exact
     answer is 'the field never changes at a fixed spatial point', so any change is pure transfer error."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, n_steps + 1))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, n_steps + 1))
     u, vv = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     _xb, yb, tb = d.variable("boundary", split=True)
@@ -412,7 +412,7 @@ def test_the_transfer_conserves_the_integral_better_than_pointwise_sampling():
         _simplex_measure_divisor,
     )
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
     P = jnp.asarray(np.asarray(d.mesh.points)[:, :2])
     C = np.asarray(d.mesh.cells_dict["triangle"]).astype(np.int64)
     n = P.shape[0]
@@ -451,7 +451,7 @@ def test_the_transfer_between_identical_meshes_is_the_identity():
     version contracted the Jacobian on the wrong axis and returned an error of 5.4e-01 here."""
     from jno.utils.solver.fem_adapt import _l2_transfer_jax
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     P = jnp.asarray(np.asarray(d.mesh.points)[:, :2])
     C = np.asarray(d.mesh.cells_dict["triangle"]).astype(np.int64)
     xy = np.asarray(P)
@@ -475,7 +475,7 @@ def test_the_march_can_be_run_twice():
     therefore applies the same increment from wherever it starts.
     """
     V, T = 0.3, 0.2
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, T, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, T, 5))
     _xb, yb, tb = d.variable("boundary", split=True)
     fem = _heat(d, yb.d(tb) - V)
 
@@ -545,7 +545,7 @@ def test_a_velocity_may_depend_explicitly_on_time(law, expected, stale):
     1.46000. No error either way.
 
     Checked against the closed form rather than against the eager oracle, which takes no ``t``."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.4, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.4, 5))
     _xb, yb, tb = d.variable("boundary", split=True)
     v = (1.0 + tb) if law == "affine" else tb
     ymax = float(_heat(d, yb.d(tb) - v).solve().meshes[-1][0][:, 1].max())
@@ -565,7 +565,7 @@ def test_a_velocity_may_read_a_SECOND_regions_coordinates():
     def run(read_twin):
         # A FRESH domain per solve: `solve()` leaves the domain on the final moved mesh, so a second solve
         # here would re-resolve `y > 1 - 1e-6` against vertices that have already moved past it.
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.4, 5))
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.4, 5))
         d.tag("top", lambda x, n, names: x[:, 1] > 1.0 - 1e-6)
         d.tag("twin", lambda x, n, names: x[:, 1] > 1.0 - 1e-6)  # the same vertices, a different name
         _xt, yt, tt = d.variable("top", split=True)
@@ -585,7 +585,7 @@ def test_a_law_reading_a_region_the_driver_cannot_move_fails_loud():
     mesh, so its values would go stale exactly as the second-tag defect did. Refuse instead."""
     from jno.utils.solver.fem_adapt import _geometry_motion_specs, _geometry_velocity_fn
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.2, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.2, 5))
     _xb, yb, tb = d.variable("boundary", split=True)
     fem = _heat(d, yb.d(tb) - 0.5)
     spec = _geometry_motion_specs(fem, d)[0]
@@ -638,7 +638,7 @@ def test_the_field_gradient_flows_through_a_moving_mesh():
 
 def _vel_case(term_fn, size=0.3, state_fn=None):
     """Build a moving-mesh problem and return (spec, domain, state) for a velocity comparison."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, 5))
     u, v = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb, nx, ny = d.variable("boundary", normals=True, split=True)
@@ -723,7 +723,7 @@ def test_the_traced_velocity_is_differentiable_in_the_vertex_positions():
 def _ring_case(size=0.12, disp_scale=0.02, seed=0):
     from jno.utils.solver.fem_adapt import _one_ring_cells, _simplex_cell_key
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     dim = int(d.dimension)
     pts = np.asarray(d.mesh.points)[:, :dim].astype(np.float64)
     cells = np.asarray(d.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64)
@@ -825,7 +825,7 @@ def test_the_transfer_is_differentiable_in_the_vertex_positions():
 
 def _stefan(size=0.25, steps=5):
     """A state-reading law, so the interface position depends on the PDE coefficient."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
     u, v = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb, nx, ny = d.variable("boundary", normals=True, split=True)
@@ -886,7 +886,7 @@ def test_the_interface_position_is_differentiable_in_the_pde_coefficient():
 
 def _law_param_fem(size=0.3, steps=4):
     """``yb.d(tb) - v0*yb`` with the law's rate as an ordinary runtime parameter."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
     u, v = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb = d.variable("boundary", split=True)
@@ -944,7 +944,7 @@ def _init_mesh_fem(size=0.3, steps=4):
 
     Completes the coordinate table: the region is FREE (its start is a design variable) and the boundary
     is DETERMINED (the march moves it). Those two used to be mutually exclusive."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
     u, v = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb = d.variable("boundary", split=True)
@@ -1017,7 +1017,7 @@ def test_the_traced_normals_are_outward_and_agree_with_the_domain_s_own():
     # vertices): on a FLAT tag `n . (facet_centre - tag_centroid)` is zero to round-off (1.1e-16) and
     # carries no sign information at all.
     H = 0.620063
-    d = jno.Shape.rect(0.0, 0.0, 0.35, H, size=0.07).domain(time=(0.0, 0.2, 5))
+    d = jno.shape.rect(0.0, 0.0, 0.35, H, size=0.07).domain(time=(0.0, 0.2, 5))
     d.tag("top", lambda x, n, names: x[:, 1] > H - 1e-6)
     d.tag("bottom", lambda x, n, names: x[:, 1] < 1e-6)
     d.variable("top", normals=True, split=True)
@@ -1047,7 +1047,7 @@ def test_the_normals_are_outward_on_a_CONCAVE_boundary():
     from jno.utils.solver.fem_adapt import _facet_outward_sign, _tag_facet_vertex_ids, _vertex_normals_jax
 
     C = np.array([0.5, 0.5])
-    d = (jno.Shape.disk(0.5, 0.5, 0.4) - jno.Shape.disk(0.5, 0.5, 0.15)).domain(size=0.06)
+    d = (jno.shape.disk(0.5, 0.5, 0.4) - jno.shape.disk(0.5, 0.5, 0.15)).domain(size=0.06)
 
     def radial(p):
         r = np.asarray(p)[:, :2] - C
@@ -1081,7 +1081,7 @@ def test_a_geometry_term_marches_in_3D():
     """Nothing in the driver is 2-D, and nothing tested it: every other motion test is a unit square.
     A box driven on z must translate by exactly ``v*T``, since a uniform boundary velocity is a rigid
     translation the harmonic extension reproduces exactly."""
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
     u, v = d.fem_symbols()
     xi, yi, zi, ti = d.variable("interior", split=True)
     xb, yb, zb, tb = d.variable("boundary", split=True)
@@ -1199,7 +1199,7 @@ def test_the_in_trace_lagrange_basis_matches_basix_and_differentiates_at_zero(di
 
 def _order_march(order=1, shape=(), vel=0.1, size=0.4, nt=4):
     """A moving-mesh heat problem at a chosen element order and value shape."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, nt))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, nt))
     u, v = d.fem_symbols(order=order, value_shape=shape)
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb = d.variable("boundary", split=True)
@@ -1254,7 +1254,7 @@ def test_a_still_mesh_reproduces_the_fixed_mesh_march_at_any_order(order):
     as a plausible-looking trajectory."""
 
     def mk(with_motion):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.3, 7))
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.3, 7))
         u, v = d.fem_symbols(order=order)
         xi, yi, ti = d.variable("interior", split=True)
         xb, yb, tb = d.variable("boundary", split=True)
@@ -1278,7 +1278,7 @@ def test_a_mixed_order_coupled_system_moves_as_one():
     """Two fields of DIFFERENT order in one system — the shape a Taylor-Hood pair takes. Each field's own
     order, connectivity and DOF count drive its own projection; they share the mesh, the quadrature map
     and the point location."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(time=(0.0, 0.2, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(time=(0.0, 0.2, 4))
     a, qa = d.fem_symbols(names=("a", "qa"), order=2)
     b, qb = d.fem_symbols(names=("b", "qb"), order=1)
     xi, yi, ti = d.variable("interior", split=True)
@@ -1321,7 +1321,7 @@ def test_a_non_nodal_family_fails_loud():
     this one."""
     from jno.utils.solver.fem_adapt import _field_layout
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     u, v = d.fem_symbols(space="Morley")
     xi, yi = d.variable("interior", split=True)[:2]
     xb, yb = d.variable("boundary", split=True)[:2]
@@ -1372,7 +1372,7 @@ _MMS_LAMBDA = 2.0 * np.pi**2 * _MMS_KAPPA
 
 
 def _mms(size, nt, c, t_end=0.2, order=1):
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, t_end, nt))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, t_end, nt))
     u, v = d.fem_symbols(order=order)
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb = d.variable("boundary", split=True)

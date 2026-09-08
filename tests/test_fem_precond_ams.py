@@ -39,7 +39,7 @@ def _x64():
 
 def _curlcurl_source(mesh_size, beta):
     """A driven real curl-curl (+ β·mass) N1E problem: inner(curl u, curl v) + β⟨u,v⟩ − ⟨Js, v⟩."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
@@ -53,7 +53,7 @@ def _curlcurl_source(mesh_size, beta):
 def _complex_eddy(mesh_size, freq, eps):
     """A complex eddy operator νK + jω(σ+ε)M with σ nonzero only on a sub-region (copper analog) and a
     small ε mass floor everywhere (the σ=0-in-air ε-gauge), plus a source in the conductor."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
@@ -88,7 +88,7 @@ def test_ams_complex_eddy_extreme_scale_matches_lu():
     solve would raise the residual-check error."""
     mu0 = 4 * np.pi * 1e-7
     nu, sigma, omega = 1.0 / mu0, 5.8e7, 2 * np.pi * 1e4  # ν~8e5, jωσ~3.6e12  ⇒  |A| ~ 1e12
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
@@ -112,7 +112,7 @@ def test_non_native_precond_complex_extreme_scale_does_not_break_down():
     now *converges to a real answer* instead of breaking down. Regression for the sparse-2n-block route."""
     mu0 = 4 * np.pi * 1e-7
     nu, sigma, omega = 1.0 / mu0, 5.8e7, 2 * np.pi * 1e4  # |A| ~ 1e12
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
@@ -249,7 +249,7 @@ def test_ams_needs_the_owning_fem():
 # ------------------------------------------------------------------------------------
 def _driven_maxwell(mesh_size, k0, volume_loss=0.0):
     """curl-curl − k₀²·mass, Silver–Müller impedance ABC on the whole boundary, plane-wave source."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     xi, yi, zi, _ = d.variable("interior", split=True)
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)

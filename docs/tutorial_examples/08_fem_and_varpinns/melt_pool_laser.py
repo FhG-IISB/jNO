@@ -67,7 +67,7 @@ NSTEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
 # Three arguments, not two: gmsh calls a mesh-size function as f(x, y, z) whatever the dimension.
 h_of = lambda x, y, z: H_FINE + (H_COARSE - H_FINE) * min(1.0, max(0.0, (LY - y) / BAND))  # noqa: E731
 
-d = jno.Shape.rect(0.0, 0.0, LX, LY, size=h_of).domain(time=(0.0, T_END, NSTEPS + 1))
+d = jno.shape.rect(0.0, 0.0, LX, LY, size=h_of).domain(time=(0.0, T_END, NSTEPS + 1))
 d.tag("top", lambda x, y: y > LY - 1e-9)
 d.tag("far", lambda x, y: (y < 1e-9) | (x < 1e-9) | (x > LX - 1e-9))
 d.tag("base", lambda x, y: y < 1e-9)

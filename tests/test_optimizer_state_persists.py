@@ -23,7 +23,7 @@ def _fit(chunks, epochs, lr_schedule):
     # A MESHED domain, so `variable("interior")` is the fixed node set. A mesh-free domain draws
     # fresh points on every call, and that alone changes the answer between runs -- which would
     # mask exactly the effect these tests measure.
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
     x, y, _ = d.variable("interior", split=True)
     net = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
     net.optimizer(optax.adam(lr_schedule))
@@ -55,7 +55,7 @@ def test_a_warmup_boundary_is_crossed_by_chunked_training():
     it move. With the state restarted per call, and chunks shorter than the boundary, the release
     never happens and the held parameter stays at its initial value forever.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
     x, y, _ = d.variable("interior", split=True)
     net = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(1)))
     held = jno.np.parameter((1,), key=jax.random.PRNGKey(2), name="held")
@@ -85,7 +85,7 @@ def test_a_fresh_core_starts_the_optimizer_over():
 def test_changing_the_optimizer_reinitialises_rather_than_reusing():
     """A carried state is reused only when it FITS. Swap the optimizer for one with a different
     state and the fresh one is taken, instead of a shape error deep in the update."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
     x, y, _ = d.variable("interior", split=True)
     net = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(3)))
     net.optimizer(optax.adam(1e-3))

@@ -40,7 +40,7 @@ def _x64():
 
 def _disk_vector_poisson(size=0.35):
     """A well-posed vector Poisson on a disk, plus the pieces needed to write ``n·u`` on its boundary."""
-    d = jno.Shape.disk(0.0, 0.0, 1.0, size=size).domain()
+    d = jno.shape.disk(0.0, 0.0, 1.0, size=size).domain()
     u, phi = d.fem_symbols(value_shape=(2,))
     _ = phi
     xi, yi, _ = d.variable("interior", split=True)
@@ -233,7 +233,7 @@ def test_rt_normal_flux_still_routes_to_the_edge_dof_path():
     stolen this route — so we check the solve moves when ``g`` moves, which it cannot do if the
     constraint were dropped. The exact per-DOF values are already asserted in the nonnodal suite.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
     xi, yi, _ = d.variable("interior", split=True)
     cb = d.variable("boundary", normals=True, split=True)
@@ -270,7 +270,7 @@ def _curved_channel_top(zcut, nx=12, ny=3, nz=6, L=2.0, H=1.0, W=1.0, A=0.35):
     h = lambda x: H - 0.5 * A * (1.0 - np.cos(2.0 * np.pi * x / L))  # noqa: E731
     dh = lambda x: -A * (np.pi / L) * np.sin(2.0 * np.pi * x / L)  # noqa: E731
 
-    d = jno.Shape.box(0.0, 0.0, 0.0, L, H, W, size=0.3).structured(n=(nx, ny, nz)).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, L, H, W, size=0.3).structured(n=(nx, ny, nz)).domain()
     P = np.asarray(d.mesh.points).copy()
     P[:, 1] *= h(P[:, 0]) / H  # bend the top; the lattice topology is untouched
     d.mesh.points = P

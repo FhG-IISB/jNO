@@ -1,4 +1,4 @@
-"""Tests for the gmsh-OCC ``Shape`` geometry layer (jno/geometry).
+"""Tests for the gmsh-OCC ``shape`` geometry layer (jno/geometry).
 
 Covers the pure naming/selection algebra (no gmsh), the mesh + ``cell_sets`` contract
 that ``jno.domain`` consumes, per-shape graded sizing, and -- the assertion that drove
@@ -10,16 +10,16 @@ import math
 import numpy as np
 import pytest
 
-from jno.geometry import Path, Shape
+from jno.geometry import Path, shape
 
-gmsh = pytest.importorskip("gmsh", reason="gmsh-OCC required for the Shape mesher")
+gmsh = pytest.importorskip("gmsh", reason="gmsh-OCC required for the shape mesher")
 
 
 # --------------------------------------------------------------------------- pure
 def test_selection_algebra_no_gmsh():
     """edge()/edges_from()/| compose without touching a mesher."""
-    strip = Shape.rect(0, 0, 4, 1)
-    roll = Shape.disk(2, 1, 0.5)
+    strip = shape.rect(0, 0, 4, 1)
+    roll = shape.disk(2, 1, 0.5)
     solid = (strip - roll).extrude(0.7)
 
     # every primitive is reachable; keys are identity-stable through the plan
@@ -34,13 +34,13 @@ def test_selection_algebra_no_gmsh():
 
 def test_extrude_requires_2d():
     with pytest.raises(ValueError):
-        Shape.box(0, 0, 0, 1, 1, 1).extrude(1.0)
+        shape.box(0, 0, 0, 1, 1, 1).extrude(1.0)
 
 
 # --------------------------------------------------------------------------- mesh
 def test_rect_minus_disk_2d_regions():
     """rect - disk: flat 'top' splits into two segments; the dip becomes 'arc'."""
-    mesh, dim, ds = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.5)).build()
+    mesh, dim, ds = (shape.rect(0, 0, 4, 1) - shape.disk(2, 1, 0.5)).build()
     assert dim == 2
     types = {b.type for b in mesh.cells}
     assert types == {"triangle", "line"}
@@ -58,7 +58,7 @@ def test_rect_minus_disk_2d_regions():
 
 def test_extrude_3d_mesh_and_caps():
     """Extrusion yields a tetra volume, one lateral face per base edge, plus front/back caps."""
-    mesh, dim, ds = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.5)).extrude(0.7).build()
+    mesh, dim, ds = (shape.rect(0, 0, 4, 1) - shape.disk(2, 1, 0.5)).extrude(0.7).build()
     assert dim == 3
     assert mesh.cells[0].type == "tetra" and mesh.cells[1].type == "triangle"
 
@@ -83,8 +83,8 @@ def test_extrude_3d_mesh_and_caps():
 
 def test_per_shape_size_grades_mesh():
     """A finer `size` on one shape refines the mesh near its boundary, not globally."""
-    coarse = Shape.rect(0, 0, 4, 1, size=0.2)
-    fine_disk = Shape.disk(2, 1, 0.5, size=0.03)
+    coarse = shape.rect(0, 0, 4, 1, size=0.2)
+    fine_disk = shape.disk(2, 1, 0.5, size=0.03)
     mesh, _dim, ds = (coarse - fine_disk).build()
     pts = mesh.points[:, :2]
     lines = np.asarray(mesh.cells[1].data)
@@ -100,11 +100,11 @@ def test_per_shape_size_grades_mesh():
 
 # ------------------------------------------------------------------- domain bridge
 def test_domain_regions_and_outward_arc_normals():
-    """jno.domain(Shape) exposes every region and gives OUTWARD normals on the concave arc."""
+    """jno.domain(shape) exposes every region and gives OUTWARD normals on the concave arc."""
     import jno
 
     cx, cy, r = 2.0, 1.0, 0.4
-    d = jno.domain((Shape.rect(0, 0, 4, 1, size=0.2) - Shape.disk(cx, cy, r, size=0.08)).extrude(0.6))
+    d = jno.domain((shape.rect(0, 0, 4, 1, size=0.2) - shape.disk(cx, cy, r, size=0.08)).extrude(0.6))
     assert d.dimension == 3
     assert {"interior", "boundary", "arc", "top", "left", "right", "bottom", "front", "back"} <= set(d.avaiable_mesh_tags)
 
@@ -127,7 +127,7 @@ def _sets(mesh):
 
 def test_polygon_edges_auto_named():
     """An L-shaped polygon meshes with one auto-named region per segment (e0..e5)."""
-    mesh, dim, _ds = Shape.polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)]).build()
+    mesh, dim, _ds = shape.polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)]).build()
     assert dim == 2
     s = _sets(mesh)
     edges = [f"e{i}" for i in range(6)]
@@ -137,7 +137,7 @@ def test_polygon_edges_auto_named():
 
 def test_cylinder_arbitrary_axis_faces():
     """A cylinder on the x-axis names lateral 'side' and the two caps 'bottom'/'top'."""
-    mesh, dim, _ds = Shape.cylinder(0, 0, 0, 5, 0, 0, 1.0).build()
+    mesh, dim, _ds = shape.cylinder(0, 0, 0, 5, 0, 0, 1.0).build()
     assert dim == 3 and mesh.cells[0].type == "tetra"
     s = _sets(mesh)
     assert {"side", "top", "bottom"} <= set(s)
@@ -146,7 +146,7 @@ def test_cylinder_arbitrary_axis_faces():
 
 def test_box_minus_cylinder_drilled_hole():
     """A through-hole keeps the six box faces and adds the cylinder wall 'side'."""
-    mesh, dim, _ds = (Shape.box(0, 0, 0, 4, 4, 1) - Shape.cylinder(2, 2, -0.5, 0, 0, 2, 0.5)).build()
+    mesh, dim, _ds = (shape.box(0, 0, 0, 4, 4, 1) - shape.cylinder(2, 2, -0.5, 0, 0, 2, 0.5)).build()
     s = _sets(mesh)
     assert {"left", "right", "front", "back", "top", "bottom", "side"} <= set(s)
     assert s["side"] > 0  # the drilled wall
@@ -157,7 +157,7 @@ def test_sphere_concave_dimple_outward_normals():
     import jno
 
     c = np.array([1.0, 1.0, 2.0])
-    d = jno.domain(Shape.box(0, 0, 0, 2, 2, 2) - Shape.sphere(c[0], c[1], c[2], 0.7, size=0.15))
+    d = jno.domain(shape.box(0, 0, 0, 2, 2, 2) - shape.sphere(c[0], c[1], c[2], 0.7, size=0.15))
     n = np.asarray(d.normals_by_tag["surface"])
     pts = d.points[d.tag_indices["surface"]]
     toward_center = c - pts
@@ -172,7 +172,7 @@ _Y = ((0, 0, 0), (0, 1, 0))  # y-axis through the origin
 
 def test_half_donut_tube_and_caps():
     """A disk revolved 180deg about the y-axis: tube 'arc' + two flat end caps 'back'/'front'."""
-    mesh, dim, _ds = Shape.disk(2.0, 0.0, 0.6, size=0.25).revolve(*_Y, angle=math.pi).build()
+    mesh, dim, _ds = shape.disk(2.0, 0.0, 0.6, size=0.25).revolve(*_Y, angle=math.pi).build()
     assert dim == 3
     s = _sets(mesh)
     assert {"arc", "back", "front"} <= set(s)
@@ -182,7 +182,7 @@ def test_half_donut_tube_and_caps():
 
 def test_full_torus_meshes_via_split_fallback():
     """A full (2pi) detached solid of revolution meshes (two-halves fallback) with no caps."""
-    mesh, dim, _ds = Shape.disk(2.0, 0.0, 0.6).revolve(*_Y, angle=2 * math.pi).build()
+    mesh, dim, _ds = shape.disk(2.0, 0.0, 0.6).revolve(*_Y, angle=2 * math.pi).build()
     assert dim == 3
     s = _sets(mesh)
     assert s["arc"] == s["boundary"]  # closed tube, no end caps
@@ -191,7 +191,7 @@ def test_full_torus_meshes_via_split_fallback():
 
 def test_cone_from_revolved_triangle():
     """A triangle touching the axis revolved 2pi -> a cone (single-sweep, no split needed)."""
-    mesh, dim, _ds = Shape.polygon([(0, 0), (1, 0), (0, 2)]).revolve(*_Y, angle=2 * math.pi).build()
+    mesh, dim, _ds = shape.polygon([(0, 0), (1, 0), (0, 2)]).revolve(*_Y, angle=2 * math.pi).build()
     assert dim == 3
     s = _sets(mesh)
     assert s.get("e0", 0) > 0 and s.get("e1", 0) > 0  # base + slant
@@ -199,9 +199,9 @@ def test_cone_from_revolved_triangle():
 
 def test_revolve_requires_2d_and_supported_axis():
     with pytest.raises(ValueError):
-        Shape.box(0, 0, 0, 1, 1, 1).revolve(*_Y, angle=math.pi)
+        shape.box(0, 0, 0, 1, 1, 1).revolve(*_Y, angle=math.pi)
     with pytest.raises(NotImplementedError):  # z-axis not supported
-        Shape.disk(2, 0, 0.5).revolve((0, 0, 0), (0, 0, 1), math.pi).build()
+        shape.disk(2, 0, 0.5).revolve((0, 0, 0), (0, 0, 1), math.pi).build()
 
 
 # ---------------------------------------------------------------- Path (contours)
@@ -242,7 +242,7 @@ def test_path_revolve_makes_sphere():
 # --------------------------------------------------------- transforms (rotate/translate)
 def test_translate_preserves_names_and_position():
     """A translated box keeps its six face-names; the +x face moves with it."""
-    mesh, dim, _ds = Shape.box(0, 0, 0, 1, 1, 1).translate((5, 0, 0)).build()
+    mesh, dim, _ds = shape.box(0, 0, 0, 1, 1, 1).translate((5, 0, 0)).build()
     s = _sets(mesh)
     assert {"left", "right", "top", "bottom", "front", "back"} <= set(s)
     tri, pts = np.asarray(mesh.cells[1].data), mesh.points
@@ -253,7 +253,7 @@ def test_translate_preserves_names_and_position():
 def test_rotate_preserves_face_names():
     """A 90deg-rotated box is no longer axis-aligned -- names survive only via the
     transform-aware classifier (un-rotating the query point back into the box frame)."""
-    mesh, dim, _ds = Shape.box(0, 0, 0, 2, 1, 1).rotate((0, 0, 0), (0, 0, 1), math.pi / 2).build()
+    mesh, dim, _ds = shape.box(0, 0, 0, 2, 1, 1).rotate((0, 0, 0), (0, 0, 1), math.pi / 2).build()
     s = _sets(mesh)
     assert {"left", "right", "top", "bottom", "front", "back"} <= set(s)
 
@@ -262,7 +262,7 @@ def test_transform_composes_with_boolean_and_normals():
     """Names + outward normals survive a boolean followed by a translate."""
     import jno
 
-    d = jno.domain((Shape.box(0, 0, 0, 4, 4, 1) - Shape.cylinder(2, 2, -1, 0, 0, 3, 0.5)).translate((10, 10, 0)))
+    d = jno.domain((shape.box(0, 0, 0, 4, 4, 1) - shape.cylinder(2, 2, -1, 0, 0, 3, 0.5)).translate((10, 10, 0)))
     assert {"side", "top", "left"} <= set(d.avaiable_mesh_tags)  # hole wall + faces survive the move
     assert np.asarray(d.normals_by_tag["top"]).mean(0)[2] > 0.5  # top face still points +z
 
@@ -270,7 +270,7 @@ def test_transform_composes_with_boolean_and_normals():
 # ---------------------------------------------------------------------- fillet
 def test_fillet_all_edges_keeps_flat_faces():
     """Rounding all edges keeps the six flat faces named; blend faces fall into 'boundary'."""
-    mesh, dim, _ds = Shape.box(0, 0, 0, 2, 2, 1).fillet(0.3).build()
+    mesh, dim, _ds = shape.box(0, 0, 0, 2, 2, 1).fillet(0.3).build()
     assert dim == 3 and mesh.cells[0].data.shape[0] > 0
     s = _sets(mesh)
     flat = sum(s.get(f, 0) for f in ("left", "right", "top", "bottom", "front", "back"))
@@ -281,7 +281,7 @@ def test_fillet_all_edges_keeps_flat_faces():
 def test_fillet_predicate_and_after_boolean():
     """A predicate rounds a subset of edges, and fillet composes after a boolean (mid-build sync)."""
     mesh, dim, _ds = (
-        (Shape.box(0, 0, 0, 4, 4, 1) - Shape.cylinder(2, 2, -1, 0, 0, 3, 0.5))
+        (shape.box(0, 0, 0, 4, 4, 1) - shape.cylinder(2, 2, -1, 0, 0, 3, 0.5))
         .fillet(0.15, where=lambda x, y, z: z > 0.9)
         .build()
     )
@@ -292,21 +292,21 @@ def test_fillet_predicate_and_after_boolean():
 def test_fillet_outward_normals_via_domain():
     import jno
 
-    d = jno.domain(Shape.box(0, 0, 0, 2, 2, 2).fillet(0.4))
+    d = jno.domain(shape.box(0, 0, 0, 2, 2, 2).fillet(0.4))
     assert np.asarray(d.normals_by_tag["top"]).mean(0)[2] > 0.9  # flat top still points +z
 
 
 # ------------------------------------------------------------------------- sweep
 def test_sweep_vertical_line_dispatches_to_extrude():
     """A straight vertical sweep IS an extrude -- it reuses the rich naming (caps + lateral 'arc')."""
-    mesh, dim, _ds = Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3)).build()
+    mesh, dim, _ds = shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3)).build()
     assert dim == 3 and mesh.cells[0].data.shape[0] > 0
     assert {"front", "back", "arc"} <= set(_sets(mesh))  # extrude-quality names, not just boundary
 
 
 def test_sweep_arc_makes_a_bent_pipe():
     """Sweeping along a smooth arc makes a bent pipe (meshes without hanging)."""
-    bent = Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).arc_to(2, 0, 2, through=(0.6, 0, 1.4)))
+    bent = shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).arc_to(2, 0, 2, through=(0.6, 0, 1.4)))
     mesh, dim, _ds = bent.build()
     assert dim == 3 and mesh.cells[0].data.shape[0] > 0
 
@@ -314,13 +314,13 @@ def test_sweep_arc_makes_a_bent_pipe():
 def test_sweep_sharp_corner_is_rejected():
     """A sharp line->line corner self-intersects the swept profile -- reject up front, never hang."""
     with pytest.raises(ValueError):
-        Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3).line_to(3, 0, 3))
+        shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3).line_to(3, 0, 3))
 
 
 # ------------------------------------------------------------------------- array
 def test_array_linear():
     """A linear array fuses n copies spaced by `step` (pure translate/fuse composition)."""
-    mesh, dim, _ds = Shape.disk(0, 0, 0.2).array(3, step=(1, 0, 0)).build()
+    mesh, dim, _ds = shape.disk(0, 0, 0.2).array(3, step=(1, 0, 0)).build()
     assert dim == 2
     tri = np.asarray(mesh.cells[0].data)
     cx = mesh.points[tri].mean(1)[:, 0]
@@ -329,17 +329,17 @@ def test_array_linear():
 
 def test_array_polar_bolt_circle():
     """A polar array makes a ring of holes: plate - disk.array(n, about=axis)."""
-    holes = Shape.disk(3, 0, 0.3).array(6, about=((0, 0, 0), (0, 0, 1)))
-    mesh, dim, _ds = (Shape.rect(-5, -5, 5, 5) - holes).extrude(0.4).build()
+    holes = shape.disk(3, 0, 0.3).array(6, about=((0, 0, 0), (0, 0, 1)))
+    mesh, dim, _ds = (shape.rect(-5, -5, 5, 5) - holes).extrude(0.4).build()
     assert dim == 3 and mesh.cells[0].data.shape[0] > 0
     assert "arc" in _sets(mesh)  # the six hole walls
 
 
 def test_array_requires_one_mode():
     with pytest.raises(ValueError):
-        Shape.disk(0, 0, 0.2).array(3)  # neither step nor about
+        shape.disk(0, 0, 0.2).array(3)  # neither step nor about
     with pytest.raises(ValueError):
-        Shape.disk(0, 0, 0.2).array(3, step=(1, 0, 0), about=((0, 0, 0), (0, 0, 1)))  # both
+        shape.disk(0, 0, 0.2).array(3, step=(1, 0, 0), about=((0, 0, 0), (0, 0, 1)))  # both
 
 
 # ---------------------------------------------- richer d.tag(f(x, n, name)) predicate
@@ -348,7 +348,7 @@ def test_tag_facet_predicate_normal_name_and_backcompat():
     the classic f(x, y, z) predicate is unaffected."""
     import jno
 
-    d = jno.domain(Shape.box(0, 0, 0, 2, 2, 1))
+    d = jno.domain(shape.box(0, 0, 0, 2, 2, 1))
     d.tag("east", lambda x, n, name: n[:, 0] > 0.9)  # by outward normal -> the +x face
     assert "east" in d.avaiable_mesh_tags
     assert np.asarray(d.normals_by_tag["east"]).mean(0)[0] > 0.9  # points +x
@@ -364,7 +364,7 @@ def test_tag_facet_predicate_normal_name_and_backcompat():
 # ---------------------------------------------------------------- mesh-size control
 def test_size_callable_grades_by_position():
     """A callable size f(x,y,z) refines by position (denser where it is smaller)."""
-    graded = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).extrude(0.6).sized(lambda x, y, z: 0.03 + 0.12 * x)
+    graded = (shape.rect(0, 0, 4, 1) - shape.disk(2, 1, 0.4)).extrude(0.6).sized(lambda x, y, z: 0.03 + 0.12 * x)
     mesh, _dim, _ds = graded.build()
     cells = np.asarray(mesh.cells[0].data)
     cx = mesh.points[cells].mean(1)[:, 0]
@@ -377,19 +377,19 @@ def test_size_callable_grades_by_position():
 
 def test_size_scalar_on_composite_caps_globally():
     """.sized(scalar) on a composite sets a global size cap (denser than the default)."""
-    base = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).extrude(0.6)
-    capped = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).sized(0.15).extrude(0.6)
+    base = (shape.rect(0, 0, 4, 1) - shape.disk(2, 1, 0.4)).extrude(0.6)
+    capped = (shape.rect(0, 0, 4, 1) - shape.disk(2, 1, 0.4)).sized(0.15).extrude(0.6)
     n0 = base.build()[0].cells[0].data.shape[0]
     mesh1, _dim, ds = capped.build()
     assert ds == 0.15 and mesh1.cells[0].data.shape[0] > 3 * n0
 
 
-# --------------------------------------------------------------- Shape.domain() one-liner
+# --------------------------------------------------------------- shape.domain() one-liner
 def test_domain_one_liner():
-    """Shape.domain() builds a jno.domain (forwarding kwargs) as a one-liner + composes with batching."""
+    """shape.domain() builds a jno.domain (forwarding kwargs) as a one-liner + composes with batching."""
     import jno
 
-    d = Shape.rect(0, 0, 1, 1, size=0.3).domain()
+    d = shape.rect(0, 0, 1, 1, size=0.3).domain()
     assert type(d).__name__ == "domain"
 
     # a full FEM solve straight off the one-liner
@@ -401,9 +401,9 @@ def test_domain_one_liner():
     assert fem.dofs > 0 and np.asarray(fem.solve()).shape == (fem.dofs,)
 
     # time= forwards to jno.domain (transient -> has an initial slice); batching binds after .domain()
-    dt = Shape.rect(0, 0, 1, 1, size=0.3).domain(time=(0.0, 1.0, 5))
+    dt = shape.rect(0, 0, 1, 1, size=0.3).domain(time=(0.0, 1.0, 5))
     assert dt.variable("initial", split=True) is not None
-    assert type(8 * Shape.rect(0, 0, 1, 1, size=0.3).domain()).__name__ == "domain"
+    assert type(8 * shape.rect(0, 0, 1, 1, size=0.3).domain()).__name__ == "domain"
 
 
 # --------------------------------------------------------------------------- 1-D curve
@@ -463,15 +463,15 @@ def _cells(shape):
         pytest.param(lambda s: s.sized(0.4), id="sized"),
         pytest.param(lambda s: s.translate((1.0, 0.0)), id="translate"),
         pytest.param(lambda s: s.rotate((0, 0, 0), (0, 0, 1), 0.3), id="rotate"),
-        pytest.param(lambda s: s - Shape.disk(0.5, 0.5, 0.2), id="cut"),
+        pytest.param(lambda s: s - shape.disk(0.5, 0.5, 0.2), id="cut"),
     ],
 )
 def test_a_derivation_carries_the_cell_choice(derive):
-    """Every ``Shape`` method returns a copy with one field changed, and a positional constructor has
+    """Every ``shape`` method returns a copy with one field changed, and a positional constructor has
     to re-list every other field to carry it. ``attach`` did not re-list ``_cell``, so
     ``.quad().attach(k=1.0)`` erased the quadrilateral choice outright -- ``cell_choices()`` came back
     EMPTY and the plan meshed as triangles with no word about it. Hence ``dataclasses.replace``."""
-    derived = derive(Shape.rect(0, 0, 1, 1, size=0.4).quad())
+    derived = derive(shape.rect(0, 0, 1, 1, size=0.4).quad())
     assert derived._cell == "quad"
     assert derived.cell_choices() == frozenset({"quad"})
 
@@ -480,7 +480,7 @@ def test_a_regions_group_meshes_with_its_members_cell():
     """The other half: a regions group is a fresh node carrying no cell of its own, so reading the
     TOP shape's ``_cell`` meshed ``a.quad() + b.quad()`` as 52 triangles while ``cell_choices()``
     already answered {"quad"}. The emitter asks the tree walk, which is the single derivation."""
-    group = Shape.rect(0, 0, 1, 1, size=0.4).quad().name("a") + Shape.rect(1, 0, 2, 1, size=0.4).quad().name("b")
+    group = shape.rect(0, 0, 1, 1, size=0.4).quad().name("a") + shape.rect(1, 0, 2, 1, size=0.4).quad().name("b")
     assert group.cell_choices() == frozenset({"quad"})
     cells = _cells(group)
     assert cells.get("quad", 0) > 0 and "triangle" not in cells, cells
@@ -488,4 +488,4 @@ def test_a_regions_group_meshes_with_its_members_cell():
 
 def test_the_cell_choice_still_reaches_the_mesh_through_a_chain():
     """End to end, since the field being carried is only worth anything if the mesher sees it."""
-    assert "triangle" not in _cells(Shape.rect(0, 0, 1, 1, size=0.4).quad().attach(k=1.0).name("a"))
+    assert "triangle" not in _cells(shape.rect(0, 0, 1, 1, size=0.4).quad().attach(k=1.0).name("a"))

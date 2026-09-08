@@ -30,7 +30,7 @@ def _x64():
 
 def _diffusion(k_value=None):
     """``-div((1 + k u^2) grad u) = 1``; ``k`` runtime when ``k_value`` is None, constant otherwise."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain()
     u, v = d.fem_symbols(names=("u", "v"), order=1)
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -136,7 +136,7 @@ def test_the_verdict_survives_the_jit():
 def test_a_partly_supplied_problem_is_refused_by_name():
     """Naming one of two parameters is neither a solve nor a trace node -- say which is missing rather
     than resolving the rest from somewhere else."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=5).domain()
     u, v = d.fem_symbols(names=("u", "v"), order=1)
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -165,7 +165,7 @@ def test_a_parametric_solve_is_differentiable_in_its_parameter():
     which is the entire point of having runtime parameters. Under a trace the verdict is skipped (and
     says so in `stats`), exactly as the in-driver check already does.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     u, v = d.fem_symbols()
     x, y, _t = d.variable("interior", split=True)
     ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)

@@ -26,7 +26,7 @@ def _x64():
 def _heat(nonlinear=False):
     """Transient heat on the unit square, IC sin(pi x) sin(pi y), homogeneous Dirichlet."""
     dom = (
-        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0)
         .structured(n=12)
         .domain(
             time=(0.0, 0.02, 11),
@@ -98,7 +98,7 @@ def test_block_step_periodic_reduced_space(_x64):
 
     n = 12
     dom = (
-        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0)
         .structured(n=n)
         .domain(
             time=(0.0, 0.02, 11),

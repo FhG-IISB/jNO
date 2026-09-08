@@ -73,7 +73,7 @@ def _slab(x, y, z, val):
 
 def _aniso_constraints(exx, eyy, ezz):
     """A uniform diagonal-anisotropic slab diag(exx, eyy, ezz) embedded in vacuum."""
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     (xi, yi, zi), (ui, vi), (cu, cv), bcs = _common(d)
     ex = jno.fn(lambda x, y, z: _slab(x, y, z, exx), [xi, yi, zi])
     ey = jno.fn(lambda x, y, z: _slab(x, y, z, eyy), [xi, yi, zi])
@@ -85,7 +85,7 @@ def _aniso_constraints(exx, eyy, ezz):
 def _tensor_constraints(flat9):
     """A uniform slab with a full 3×3 tensor (row-major ``flat9``): diagonal defaults to 1 outside the slab,
     off-diagonal to 0 (isotropic vacuum ambient). Lets an off-diagonal ε̂ rotate polarization."""
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     (xi, yi, zi), (ui, vi), (cu, cv), bcs = _common(d)
     comps = [
         jno.fn(
@@ -100,7 +100,7 @@ def _tensor_constraints(flat9):
 
 def _scalar_constraints(e):
     """The isotropic reference: the same slab with scalar ε."""
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     (xi, yi, zi), (ui, vi), (cu, cv), bcs = _common(d)
     eps = jno.fn(lambda x, y, z: _slab(x, y, z, e), [xi, yi, zi])
     return [inner(cu, cv) - K0**2 * eps * inner(ui, vi), *bcs]

@@ -184,7 +184,7 @@ a function of the pseudo-time coordinate `tau`, the domain carries a `tau=` load
 **marches** the path with **nothing passed** — triggered by `.i(k)` exactly as `u.t` triggers transient:
 
 ```python
-d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain(tau=(0.0, 1.0, 40))   # pseudo-time load path
+d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain(tau=(0.0, 1.0, 40))   # pseudo-time load path
 x, y, z, tau = d.variable("interior", split=True)            # τ is a coordinate, like t
 dev = lambda A: A - trace(A) / 3 * I3                         # I3 = jno.np.identity(3)
 nrm = lambda A: sqrt(maximum(inner(A, A, 2), 0) + 1e-30)      # safe Frobenius norm

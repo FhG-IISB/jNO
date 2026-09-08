@@ -40,9 +40,9 @@ NSTEP = 4
 
 
 def _two_regions(tau=True):
-    d = jno.Shape.regions(
-        left=jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34),
-        right=jno.Shape.rect(1.0, 0.0, 2.0, 1.0, size=0.34),
+    d = jno.shape.regions(
+        left=jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34),
+        right=jno.shape.rect(1.0, 0.0, 2.0, 1.0, size=0.34),
         conforming=False,
     )
     d = d.domain(tau=(0.0, 1.0, NSTEP)) if tau else d.domain()
@@ -156,8 +156,8 @@ def test_plasticity_in_one_region_leaves_the_other_region_exactly_frozen():
     from tests.test_fem_history_march import SY, _j2_stress
 
     n = jno.np
-    d = jno.Shape.regions(
-        left=jno.Shape.box(0, 0, 0, 1, 1, 1), right=jno.Shape.box(1, 0, 0, 2, 1, 1), conforming=False
+    d = jno.shape.regions(
+        left=jno.shape.box(0, 0, 0, 1, 1, 1), right=jno.shape.box(1, 0, 0, 2, 1, 1), conforming=False
     ).domain(tau=(0.0, 1.0, 3))
     _ = d.built_mesh
     d.tag("lo", lambda x, y, z: x < 1e-9)

@@ -32,9 +32,9 @@ def _x64():
 def _two_body_domain(size=0.4):
     """Two independently meshed blocks, so both sides of the interface are tagged separately."""
     return (
-        jno.Shape.regions(
-            lower=jno.Shape.box(0, 0, 0, 1, 1, 1),
-            upper=jno.Shape.box(0, 0, 1, 1, 1, 2.5),
+        jno.shape.regions(
+            lower=jno.shape.box(0, 0, 0, 1, 1, 1),
+            upper=jno.shape.box(0, 0, 1, 1, 1, 2.5),
             conforming=False,
         )
         .sized(size)
@@ -261,9 +261,9 @@ LAM_, MU_ = E_ * NU_ / (1 - NU_**2), E_ / (2 * (1 + NU_))
 
 def _stacked_blocks(cap_size=0.09, base_size=0.22):
     """Two independently meshed unit squares stacked at y = 1, so the interface is non-matching."""
-    return jno.Shape.regions(
-        base=jno.Shape.rect(0, 0, 1, 1, size=base_size),
-        cap=jno.Shape.rect(0, 1, 1, 2, size=cap_size),
+    return jno.shape.regions(
+        base=jno.shape.rect(0, 0, 1, 1, size=base_size),
+        cap=jno.shape.rect(0, 1, 1, 2, size=cap_size),
         conforming=False,
     ).domain()
 
@@ -633,9 +633,9 @@ def test_augmented_lagrangian_beats_the_penalty_error_at_the_same_c():
     SURFACE state on the secondary face: the machinery is `evolves` + the tau march, no new API."""
     inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
     c, nsteps = 1e3, 8
-    d = jno.Shape.regions(
-        base=jno.Shape.rect(0, 0, 1, 1, size=0.22),
-        cap=jno.Shape.rect(0, 1, 1, 2, size=0.09),
+    d = jno.shape.regions(
+        base=jno.shape.rect(0, 0, 1, 1, size=0.22),
+        cap=jno.shape.rect(0, 1, 1, 2, size=0.09),
         conforming=False,
     ).domain(tau=(0.0, 1.0, nsteps))
     sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)

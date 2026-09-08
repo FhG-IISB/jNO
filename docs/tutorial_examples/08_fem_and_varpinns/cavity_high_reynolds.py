@@ -51,7 +51,7 @@ RE_LADDER = [100.0, 200.0, 400.0, 700.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0]
 
 def cavity(n=N, order=1, stabilised=True):
     """The cavity with `nu` left as a runtime parameter, so continuation can sweep it."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain()
     d.tag("lid", lambda x, y: y > 1 - 1e-9)
     d.tag("wall", lambda x, y: (y < 1e-9) | (x < 1e-9) | (x > 1 - 1e-9))
     d.point_region("ppin", (0.0, 0.0))

@@ -39,7 +39,7 @@ def _odd_saddle_3d(size=0.5):
     Physically this is a Stokes flow with a buoyancy coupling; nothing in the code is allowed to know
     that. The constraint equation is written first in the term list, which -- since block order
     follows TERM order -- puts the constraint field in the MIDDLE of the block stack."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     d.tag("drive", lambda x, y, z: z > 1 - 1e-9)
     d.tag("held", lambda x, y, z: (z < 1e-9) | (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     d.point_region("gauge", (0.0, 0.0, 0.0))

@@ -1,4 +1,4 @@
-"""``Shape.attach`` — material properties declared on the region, read back as ``d.<name>``.
+"""``shape.attach`` — material properties declared on the region, read back as ``d.<name>``.
 
 ``.attach(k=220.0)`` on a named region makes ``d.k`` the per-region coefficient over every region
 that declared a ``k`` — the same object ``d.by_region({...})`` returns, so it drops straight into a
@@ -6,8 +6,8 @@ weak form. A value may be anything the jNO stack treats as a coefficient: a scal
 symbolic expression, a typed view (``ScalarView`` / ``VectorView`` / ``MatrixView``), a trainable
 ``jno.np.parameter``, or a plain function of the coordinates.
 
-Also covers the two prerequisites the feature exposed: ``by_region`` accepting ``Shape.regions``
-sub-region names at all, and ``Shape.regions`` accepting a ``{name: shape}`` dict for names that are
+Also covers the two prerequisites the feature exposed: ``by_region`` accepting ``shape.regions``
+sub-region names at all, and ``shape.regions`` accepting a ``{name: shape}`` dict for names that are
 not valid Python identifiers.
 
 Boundary-tag attachment (``d.attach("wall", h=25.0)`` → ``d.h`` as a per-facet coefficient) lives in
@@ -24,8 +24,8 @@ import jno
 
 def _two_regions(**kw):
     """A 1x1 inclusion inside a 2x1 plate, each carrying whatever `.attach(...)` kwargs are given."""
-    a = jno.Shape.rect(0, 0, 1, 1, size=0.3).name("a").attach(**kw.get("a", {}))
-    b = jno.Shape.rect(0, 0, 2, 1, size=0.3).name("b").attach(**kw.get("b", {}))
+    a = jno.shape.rect(0, 0, 1, 1, size=0.3).name("a").attach(**kw.get("a", {}))
+    b = jno.shape.rect(0, 0, 2, 1, size=0.3).name("b").attach(**kw.get("b", {}))
     return a + b
 
 
@@ -75,25 +75,25 @@ def test_name_colliding_with_a_domain_attribute_raises_at_build(clash):
 
 
 def test_attach_merges_and_last_wins():
-    s = jno.Shape.rect(0, 0, 1, 1).name("a").attach(k=1.0, eta=9.0).attach(k=2.0)
+    s = jno.shape.rect(0, 0, 1, 1).name("a").attach(k=1.0, eta=9.0).attach(k=2.0)
     assert s._attach == {"k": 2.0, "eta": 9.0}
 
 
 def test_attach_survives_name_sized_and_curved():
-    s = jno.Shape.rect(0, 0, 1, 1).attach(k=1.0).name("a").sized(0.1).curved()
+    s = jno.shape.rect(0, 0, 1, 1).attach(k=1.0).name("a").sized(0.1).curved()
     assert s._attach == {"k": 1.0}
     assert s._region_name == "a"
 
 
 def test_attach_survives_boolean_and_transform_ops():
-    s = (jno.Shape.rect(0, 0, 2, 2).attach(k=1.0) - jno.Shape.rect(0, 0, 1, 1)).translate((1.0, 0.0))
+    s = (jno.shape.rect(0, 0, 2, 2).attach(k=1.0) - jno.shape.rect(0, 0, 1, 1)).translate((1.0, 0.0))
     assert s._attach == {"k": 1.0}
 
 
 def test_attach_does_not_affect_geometric_equality_or_hashing():
     """`_attach` is compare=False: two geometrically identical shapes stay equal (and hashable)
     however they are materialled."""
-    plain = jno.Shape.rect(0, 0, 1, 1)
+    plain = jno.shape.rect(0, 0, 1, 1)
     assert plain == plain.attach(k=1.0)
     assert len({plain, plain.attach(k=1.0)}) == 1
 
@@ -120,20 +120,20 @@ def test_attached_value_may_be_a_jax_array():
 
 
 # --------------------------------------------------------------------------------------
-# attach through the Shape.regions dict form (names that are not Python identifiers)
+# attach through the shape.regions dict form (names that are not Python identifiers)
 # --------------------------------------------------------------------------------------
 def test_attach_through_the_regions_dict_form():
-    d = jno.Shape.regions(
+    d = jno.shape.regions(
         {
-            "Quartz.1": jno.Shape.rect(0, 0, 1, 1, size=0.3).attach(k=1.0),
-            "Quartz.2": jno.Shape.rect(0, 0, 2, 1, size=0.3).attach(k=2.0),
+            "Quartz.1": jno.shape.rect(0, 0, 1, 1, size=0.3).attach(k=1.0),
+            "Quartz.2": jno.shape.rect(0, 0, 2, 1, size=0.3).attach(k=2.0),
         }
     ).domain()
     assert str(d.k) == str(d.by_region({"Quartz.1": 1.0, "Quartz.2": 2.0}))
 
 
 # --------------------------------------------------------------------------------------
-# a Shape-built domain must reach the same machinery a polygon-built one does
+# a shape-built domain must reach the same machinery a polygon-built one does
 # --------------------------------------------------------------------------------------
 def test_region_masks_partition_when_a_background_region_encloses_everything():
     """`by_region` sums RegionMask*value, so the masks have to be a PARTITION. Declaring a bounding
@@ -143,8 +143,8 @@ def test_region_masks_partition_when_a_background_region_encloses_everything():
     k = 0.5 and pulled the solution 780 K cold."""
     from jno.utils.solver.fem_utils import _cell_region_mask
 
-    inner = jno.Shape.rect(2, 2, 4, 4, size=0.5).name("inner")
-    background = jno.Shape.rect(0, 0, 6, 6, size=0.5).name("background")  # encloses `inner`
+    inner = jno.shape.rect(2, 2, 4, 4, size=0.5).name("inner")
+    background = jno.shape.rect(0, 0, 6, 6, size=0.5).name("background")  # encloses `inner`
     d = (inner + background).domain()
 
     masks = np.array([_cell_region_mask(d, nm) for nm in d._shape_regions])
@@ -176,7 +176,7 @@ def test_a_single_named_region_round_trips_its_attachment():
     """`domain.__init__` gated on the `("regions", ...)` node, which a lone named shape is not -- so
     its attachment was collected from nowhere and `d.k` reported a bare "no attribute 'k'". Nothing
     told the user the declaration had been ignored."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).name("a").attach(k=2.0).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).name("a").attach(k=2.0).domain()
     assert str(d.k) == str(d.by_region({"a": 2.0}))
     assert d.attached("k") == {"a": 2.0}
 
@@ -184,12 +184,12 @@ def test_a_single_named_region_round_trips_its_attachment():
 def test_attach_without_a_name_raises_at_build():
     """The other half of the same hole: with no region name there is nothing to attach to."""
     with pytest.raises(ValueError, match="no region name"):
-        jno.Shape.rect(0, 0, 1, 1, size=0.4).attach(k=2.0).domain()
+        jno.shape.rect(0, 0, 1, 1, size=0.4).attach(k=2.0).domain()
 
 
 def test_a_single_named_region_still_masks_every_cell():
     """The lone region owns the whole mesh, so its coefficient must not restrict anything away."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).name("a").attach(k=3.0).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).name("a").attach(k=3.0).domain()
     np.testing.assert_allclose(_poisson(d, d.k), _poisson(d, 3.0), rtol=1e-5, atol=1e-5)
 
 
@@ -309,8 +309,8 @@ def test_jax_array_attachment_assembles():
 
 def test_attachment_in_3d():
     d = (
-        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).name("a").attach(k=1.0)
-        + jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5).name("b").attach(k=9.0)
+        jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).name("a").attach(k=1.0)
+        + jno.shape.box(0, 0, 0, 2, 1, 1, size=0.5).name("b").attach(k=9.0)
     ).domain()
     assert d.attached("k") == {"a": 1.0, "b": 9.0}
     assert "RegionMask(a)" in str(d.k) and "RegionMask(b)" in str(d.k)
@@ -320,7 +320,7 @@ def test_many_regions_all_contribute():
     """Five regions, five different values -- the sum must carry every one of them."""
     shapes = None
     for i in range(5):
-        s = jno.Shape.rect(0, 0, 1 + i, 1, size=0.4).name(f"r{i}").attach(k=float(i))
+        s = jno.shape.rect(0, 0, 1 + i, 1, size=0.4).name(f"r{i}").attach(k=float(i))
         shapes = s if shapes is None else shapes + s
     d = shapes.domain()
     assert d.attached("k") == {f"r{i}": float(i) for i in range(5)}

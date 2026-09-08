@@ -53,7 +53,7 @@ def _bratu(nsteps, *, hi=12.0, size=0.08):
     grid); it is deliberately multiplied by zero so it cannot influence the answer — the same device
     `tests/test_fem_adaptive_load_path.py` uses.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.1, size=size).domain(tau=(0.0, hi, nsteps))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.1, size=size).domain(tau=(0.0, hi, nsteps))
     u, phi = d.fem_symbols()
     s, _sp = d.fem_symbols()
     co = d.variable("interior", split=True)
@@ -74,7 +74,7 @@ def _bratu(nsteps, *, hi=12.0, size=0.08):
 
 def _linear_march(nsteps, *, hi=1.0, size=0.25):
     """A LINEAR load path: ``-Delta u = tau`` with the same inert-state march trigger."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(tau=(0.0, hi, nsteps))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(tau=(0.0, hi, nsteps))
     u, phi = d.fem_symbols()
     s, _sp = d.fem_symbols()
     co = d.variable("interior", split=True)

@@ -43,7 +43,7 @@ def _solve_laplace_2d(d, gfun):
 
 
 def test_frozen_value_readout_is_affine_exact():
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.06).domain()
     sol, u = _solve_laplace_2d(d, lambda x, y: 3.0 * x - 2.0 * y)
     xb, yb, _ = d.variable("boundary", split=True)
     Tf = u.bind(x=xb, y=yb).freeze(sol)
@@ -53,7 +53,7 @@ def test_frozen_value_readout_is_affine_exact():
 
 
 def test_frozen_gradient_readout_is_affine_exact():
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.06).domain()
     sol, u = _solve_laplace_2d(d, lambda x, y: 3.0 * x - 2.0 * y)  # ∇T = (3, −2)
     xb, yb, _ = d.variable("boundary", split=True)
     Tf = u.bind(x=xb, y=yb).freeze(sol)
@@ -64,7 +64,7 @@ def test_frozen_gradient_readout_is_affine_exact():
 
 def test_boundary_normal_flux_readout_affine_exact():
     """The headline: ∇T·n written as Tf.x*nx + Tf.y*ny, evaluated, vs analytic (affine ⇒ exact)."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
     sol, u = _solve_laplace_2d(d, lambda x, y: 3.0 * x - 2.0 * y)
     x, y, t, nx, ny = d.variable("boundary", normals=True, split=True)
     Tf = u.bind(x=x, y=y).freeze(sol)
@@ -76,7 +76,7 @@ def test_boundary_normal_flux_readout_affine_exact():
 
 def test_boundary_normal_flux_readout_harmonic_first_order():
     """On a real harmonic solve T=x²−y² (∇T=(2x,−2y)), ∇T·n is first-order accurate (O(h))."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.045).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.045).domain()
     sol, u = _solve_laplace_2d(d, lambda x, y: x**2 - y**2)
     x, y, t, nx, ny = d.variable("boundary", normals=True, split=True)
     Tf = u.bind(x=x, y=y).freeze(sol)
@@ -90,7 +90,7 @@ def test_boundary_normal_flux_readout_harmonic_first_order():
 
 def test_frozen_gradient_readout_3d_affine_exact():
     """3-D: freeze an affine field on a box, read ∇T·n on the boundary (last `dim` split parts = normals)."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
     u, phi = d.fem_symbols()
     ci = d.variable("interior", split=True)
     cb = d.variable("boundary", split=True)
@@ -118,7 +118,7 @@ def test_frozen_readout_on_transient_domain_is_correct_and_differentiable():
     """The normals fix: on a TRANSIENT domain the normal tags are time-tiled (like the coords), so the
     boundary-flux readout evaluates correctly — the normals no longer collapse to one point — and it is
     differentiable in the field values (a Stefan velocity feeding back into the solve trains cleanly)."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 11))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 11))
     u, _ = d.fem_symbols()
     pts = np.asarray(d.mesh.points)[:, :2]
     sol = 3.0 * pts[:, 0] - 2.0 * pts[:, 1]  # ∇T = (3, -2)
@@ -143,7 +143,7 @@ def test_frozen_readout_without_domain_fails_loud():
     raise a clear error, not return garbage."""
     from jno.trace import FrozenField
 
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
     u, _ = d.fem_symbols()
     n = len(np.asarray(d.mesh.points))
     bare = FrozenField(u.scalar._expr, jnp.zeros(n))  # no domain / coord_tag
@@ -157,7 +157,7 @@ def test_substitute_refreeze_swaps_state_in_a_static_readout():
     the new state. This is the mechanism that lets a moving-boundary velocity be passed *as a trace*."""
     from jno.trace import frozen_fields_in, refreeze, substitute
 
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.15).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.15).domain()
     u, _ = d.fem_symbols()
     pts = np.asarray(d.mesh.points)[:, :2]
     xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
@@ -184,7 +184,7 @@ def test_vector_frozen_field_as_coefficient_matches_analytic():
     a coefficient in a jno.fem form: the assembler gathers each cell's per-node vec-vectors and interpolates
     them. A LINEAR field is P1-exact, so a frozen vector *source* must equal the same source written
     analytically (to machine precision) -- e.g. a precomputed velocity / prior displacement field."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     u, phi = d.fem_symbols(value_shape=(2,), names=("u", "phi"))
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -210,7 +210,7 @@ def test_vector_frozen_field_as_coefficient_matches_analytic():
 def test_vector_frozen_field_standalone_eval_fails_loud():
     """A standalone ``.eval()`` readout of a VECTOR frozen field is not wired (its values are (n_nodes, vec));
     it must fail loud rather than silently reshape-flatten. (Assembly as a coefficient is supported above.)"""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     u, _ = d.fem_symbols(value_shape=(2,), names=("u", "phi"))
     xb, yb, _ = d.variable("boundary", split=True)
     nvv = int(np.asarray(d.built_mesh.points).shape[0])

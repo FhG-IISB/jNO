@@ -598,7 +598,7 @@ per-order objective can be optimised straight through the modal solve.
 
 ## Geometry
 
-::: jno.geometry.shape.Shape
+::: jno.geometry.shape.shape
 
 ::: jno.geometry.path.Path
 

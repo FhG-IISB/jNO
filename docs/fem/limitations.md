@@ -11,7 +11,7 @@ path is unaffected.
 
     - **Affine geometry on a curved boundary** — by **default** the mesh is straight-sided, so the
       domain is approximated to O(h²), which caps every element order above it. The solve is simply
-      suboptimal. `Shape.curved()` fixes it (order 2, simplices) — see
+      suboptimal. `shape.curved()` fixes it (order 2, simplices) — see
       [Curved geometry](geometry.md#curved-isoparametric-geometry-shapecurved).
     - **The `2πr` measure on an axisymmetric *vector* form** — exact for scalars, wrong for vectors.
 
@@ -31,7 +31,7 @@ path is unaffected.
 | `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
-| **Curved-boundary geometry** | straight-sided **by default**; `Shape.curved()` is the fix | **silent** |
+| **Curved-boundary geometry** | straight-sided **by default**; `shape.curved()` is the fix | **silent** |
 | **Axisymmetric vector forms** | the `2πr` measure is wrong for vectors | **silent** |
 
 ### The detail
@@ -124,7 +124,7 @@ path is unaffected.
 
     On a **polygonal** domain the advertised rates hold exactly (the suite measures P2/P3 there).
 
-    The fix on a curved one is `Shape.curved()`, which places the midside nodes on the true surface
+    The fix on a curved one is `shape.curved()`, which places the midside nodes on the true surface
     and recovers P2's own third order — **570× more accurate** at the finest resolution in the same
     study. It is order 2 and simplices only, and non-nodal families keep affine geometry, so where it
     does not apply the advice above still stands: prefer `h`-refinement (or the adaptive loop) over

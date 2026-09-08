@@ -66,7 +66,7 @@ def j2_weak(u, phi, coords, *, sy=SY, H=H, hist=None):
 
 
 def _box(size=0.34):
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size).domain()
     d.tag("bdry", lambda x, y, z: (x < 1e-6) | (x > 1 - 1e-6) | (y < 1e-6) | (y > 1 - 1e-6) | (z < 1e-6) | (z > 1 - 1e-6))
     return d
 
@@ -111,7 +111,7 @@ def test_plasticity_caps_stress_below_elastic_peak():
     """Genuine BVP (bottom fixed, top sheared past yield, sides free): the plastic peak von Mises is
     bounded by the yield surface, strictly below the (unbounded) elastic peak — yielding limited it."""
     shear = 5.0 * SY / (2 * np.sqrt(3) * MU)
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.4).domain()
     d.tag("bot", lambda x, y, z: z < 1e-6)
     d.tag("top", lambda x, y, z: z > 1 - 1e-6)
     u, phi = d.fem_symbols(value_shape=(3,))
@@ -158,7 +158,7 @@ def test_plasticity_caps_stress_below_elastic_peak():
 def test_gradient_flows_to_material_parameter_through_solve():
     """Inverse-problem readiness: d(response)/d(sigma_y) through the plastic Newton solve matches FD."""
     shear = 4.0 * SY / (2 * np.sqrt(3) * MU)
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.5).domain()
     d.tag("bot", lambda x, y, z: z < 1e-6)
     d.tag("top", lambda x, y, z: z > 1 - 1e-6)
     u, phi = d.fem_symbols(value_shape=(3,))

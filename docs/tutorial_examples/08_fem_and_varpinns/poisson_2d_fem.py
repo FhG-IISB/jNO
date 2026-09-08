@@ -19,7 +19,7 @@ import jno
 
 exact = lambda x, y: x * (1 - x) * y * (1 - y)  # noqa: E731
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.18).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.18).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -47,7 +47,7 @@ plt.rcParams.update(
 
 def solve_at(size):
     """Rebuild + solve the whole problem on a fresh mesh of the given element size (real re-solve)."""
-    dd = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    dd = jno.shape.rect(0, 0, 1, 1, size=size).domain()
     uu, pp = dd.fem_symbols()
     x_i, y_i, _ = dd.variable("interior", split=True)
     x_b, y_b, _ = dd.variable("boundary", split=True)

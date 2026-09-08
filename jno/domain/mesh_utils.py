@@ -79,7 +79,7 @@ def base_cell_type(name):
 
 def curved_block_of(mesh):
     """The curved volume/facet block names present on ``mesh``, or ``()``. Non-empty means the mesh
-    came from :meth:`jno.Shape.curved` and carries geometry a straight-sided path must not silently
+    came from :meth:`jno.shape.curved` and carries geometry a straight-sided path must not silently
     reinterpret."""
     return tuple(k for k in _CURVED_BLOCKS if k in mesh.cells_dict)
 
@@ -89,14 +89,14 @@ def refuse_curved(mesh, what: str):
 
     Deliberately a refusal rather than a fallback. Reading a curved mesh through
     :func:`p1_cells_dict` would make these paths *appear* to work while quietly reinstating the O(h²)
-    straight-sided geometry error that ``Shape.curved()`` exists to remove -- the answer would look
+    straight-sided geometry error that ``shape.curved()`` exists to remove -- the answer would look
     plausible and be wrong, which is the failure mode this codebase keeps paying for.
     """
     blocks = curved_block_of(mesh)
     if blocks:
         raise NotImplementedError(
             f"{what} does not support curved (isoparametric) geometry; this mesh carries {blocks[0]!r} "
-            "cells from Shape.curved(). Drop .curved() for this path -- reading it as straight-sided "
+            "cells from shape.curved(). Drop .curved() for this path -- reading it as straight-sided "
             "would silently restore the O(h^2) geometry error that curving removes."
         )
 
@@ -130,7 +130,7 @@ def mc_cells(mesh_connectivity):
 def p1_cells_dict(mesh):
     """``mesh.cells_dict`` with the P1 blocks filled in from any curved ones.
 
-    A mesh from ``Shape.curved()`` stores ``triangle6`` / ``tetra10`` / ``line3``, and the first
+    A mesh from ``shape.curved()`` stores ``triangle6`` / ``tetra10`` / ``line3``, and the first
     ``dim+1`` columns of such a cell are its vertices. Everything that works on mesh *topology* —
     boundary extraction, apex orientation, nodal volumes, the FD connectivity — wants those vertices
     and is unchanged by the curving, so it reads through here instead of each site learning the

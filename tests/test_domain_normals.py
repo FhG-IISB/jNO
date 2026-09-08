@@ -126,7 +126,7 @@ def test_boundary_face_normals_match_the_per_face_loop(with_apex):
     """A real tet mesh, with and without the apex orientation (the concave-safe path)."""
     from jno.utils.solver.fem_facets import _LOCAL_FACES_TET, _boundary_faces
 
-    mesh = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain().built_mesh
+    mesh = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain().built_mesh
     pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict["tetra"], dtype=np.int64)
     flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TET, 3)
     faces = flat[sel]
@@ -167,7 +167,7 @@ def test_coordinate_tag_gets_per_point_normals_like_a_facet_tag():
     of that dict saw a *silently missing* entry rather than an error. This is what broke RCWA's
     superstrate/substrate detection once a tag was re-derived from a predicate (a remesh, or
     ``_domain_from_arrays``) instead of coming from the mesh's cell sets."""
-    d = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 2.0, size=0.5).domain())
+    d = jno.domain(jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 2.0, size=0.5).domain())
     e = 1e-6
     d.tag("zbot", lambda x, y, z: z < e)
     d.tag("ztop", lambda x, y, z: z > 2.0 - e)
@@ -187,7 +187,7 @@ def test_coordinate_tag_normals_survive_a_rebuild_from_arrays():
     they previously did not, which is how a face became invisible to anything reading them."""
     from jno.utils.solver.fem_adapt import _domain_from_arrays
 
-    src = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 2.0, size=0.5).domain())
+    src = jno.domain(jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 2.0, size=0.5).domain())
     pts = np.asarray(src.mesh.points)
     tets = np.asarray(src.mesh.cells_dict["tetra"])
     faces = np.concatenate([tets[:, [0, 1, 2]], tets[:, [0, 1, 3]], tets[:, [0, 2, 3]], tets[:, [1, 2, 3]]])

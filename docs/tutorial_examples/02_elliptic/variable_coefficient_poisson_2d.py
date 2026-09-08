@@ -1,5 +1,5 @@
 # --8<-- [start:code]
-"""02 — 2-D variable-coefficient Poisson  (Shape domain + named partials + tracker)"""
+"""02 — 2-D variable-coefficient Poisson  (shape domain + named partials + tracker)"""
 
 from pathlib import Path
 
@@ -12,7 +12,7 @@ import jno
 π = jno.np.pi
 
 # --8<-- [start:setup]
-domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+domain = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y, _ = domain.variable("interior")
 
 κ = 1 + x + y

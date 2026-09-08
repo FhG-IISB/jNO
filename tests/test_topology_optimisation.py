@@ -44,7 +44,7 @@ def _cantilever(size=0.16, move=0.15):
     """Clamped left edge, downward traction on the right. Returns (crux, rho, n_nodes)."""
     inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
 
-    d = jno.Shape.rect(0, 0, 2, 1, size=size).domain()
+    d = jno.shape.rect(0, 0, 2, 1, size=size).domain()
     u, phi = d.fem_symbols(value_shape=(2,))
     _r, s = d.fem_symbols(names=("r", "s"))
     xi, yi, _ = d.variable("interior", split=True)
@@ -128,7 +128,7 @@ class TestComplianceMinimisation:
         results = {}
         for budget in (0.25, 0.5):
             inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
-            d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
+            d = jno.shape.rect(0, 0, 2, 1, size=0.2).domain()
             u, phi = d.fem_symbols(value_shape=(2,))
             _r, s = d.fem_symbols(names=("r", "s"))
             xi, yi, _ = d.variable("interior", split=True)
@@ -177,7 +177,7 @@ class TestP0DensityParameter:
     @staticmethod
     def _build(size=0.5):
         inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
-        d = jno.Shape.rect(0, 0, 2, 1, size=size).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=size).domain()
         u, phi = d.fem_symbols(value_shape=(2,))
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         xi, yi, _ = d.variable("interior", split=True)
@@ -196,7 +196,7 @@ class TestP0DensityParameter:
         return d, np.asarray(d._cells_p1()), fem
 
     def test_the_parameter_is_sized_by_cells_not_nodes(self):
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.5).domain()
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         n_cells = int(np.asarray(d._cells_p1()).shape[0])
         n_nodes = int(np.asarray(d.built_mesh.points).shape[0])
@@ -248,7 +248,7 @@ class TestP0DensityParameter:
         inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
 
         def assemble(space):
-            d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
+            d = jno.shape.rect(0, 0, 2, 1, size=0.5).domain()
             u, phi = d.fem_symbols(value_shape=(2,))
             _r, s = d.fem_symbols(names=("r", "s")) if space == "P1" else d.fem_symbols(space="P0", names=("r", "s"))
             xi, yi, _ = d.variable("interior", split=True)
@@ -310,7 +310,7 @@ class TestPatchFilter:
         assert f(1.0, [1, 1], False) == pytest.approx(1.0)
 
     def test_the_vectorised_filter_matches_the_literal_formula(self):
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.25).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.25).domain()
         topo = d.patch_topology()
         n_cells = int(d._cells_p1().shape[0])
         assert topo["size"].max() >= 5, "the mesh must contain patches big enough to exercise eq. (18)"
@@ -347,7 +347,7 @@ class TestPatchFilter:
         The sharpest single check that the walk and the padding are right: any mis-indexed
         neighbour would read a padded zero and pull the product below one.
         """
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.2).domain()
         n_cells = int(d._cells_p1().shape[0])
         out = np.asarray(d.patch_filter()(jnp.ones(n_cells, dtype=jnp.float64)))
         np.testing.assert_allclose(out, 1.0, atol=1e-12)
@@ -361,7 +361,7 @@ class TestPatchFilter:
         **SIMP finishes the job**, since the stiffness carries ``rho_bar ** penal`` and 0.18 cubed
         is under 1 % of solid, which is why the paper also raises ``penal`` as it converges.
         """
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.2).domain()
         topo = d.patch_topology()
         n_cells = int(d._cells_p1().shape[0])
         # Pick an element all of whose patches are interior, so no vertex takes the boundary rule.
@@ -376,7 +376,7 @@ class TestPatchFilter:
         assert np.abs(np.delete(out, k) - np.delete(r, k)).max() < 1e-3
 
     def test_the_node_and_the_filter_agree_and_the_node_carries_a_gradient(self):
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.25).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.25).domain()
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(s, name="rho_patch")
         n_cells = int(d._cells_p1().shape[0])
@@ -388,7 +388,7 @@ class TestPatchFilter:
 
     def test_a_nodal_density_is_refused(self):
         """The reference element of a patch is an ELEMENT; a nodal field has none."""
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.4).domain()
         _r, s = d.fem_symbols(names=("r", "s"))
         with pytest.raises(TypeError, match="P0"):
             jno.np.parameter(s, name="rho_nodal").patch()
@@ -399,7 +399,7 @@ class TestPerimeter:
 
     @staticmethod
     def _setup(size=2.0):
-        d = jno.Shape.rect(0, 0, 60, 30, size=size).domain()
+        d = jno.shape.rect(0, 0, 60, 30, size=size).domain()
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(s, name="rho_perim")
         cells = np.asarray(d._cells_p1())
@@ -441,7 +441,7 @@ class TestPerimeter:
             assert f(1.0) == pytest.approx(1.0, abs=1e-12)
 
     def test_a_nodal_density_is_refused(self):
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.4).domain()
         _r, s = d.fem_symbols(names=("r", "s"))
         with pytest.raises(TypeError, match="P0"):
             jno.np.parameter(s, name="rho_nodal_p").perimeter()
@@ -457,8 +457,8 @@ class TestCrossMeshTransfer:
     """
 
     def test_a_constant_field_survives_transfer(self):
-        coarse = jno.Shape.rect(0, 0, 60, 30, size=4.0).domain()
-        fine = jno.Shape.rect(0, 0, 60, 30, size=1.5).domain()
+        coarse = jno.shape.rect(0, 0, 60, 30, size=4.0).domain()
+        fine = jno.shape.rect(0, 0, 60, 30, size=1.5).domain()
         vals = np.full(int(coarse._cells_p1().shape[0]), 0.7)
         out = coarse.transfer_cell_field(vals, fine)
         assert out.shape == (int(fine._cells_p1().shape[0]),)
@@ -466,8 +466,8 @@ class TestCrossMeshTransfer:
 
     def test_a_region_lands_in_the_right_place(self):
         """A bar transfers to a bar: the geometry, not just the values, must survive."""
-        coarse = jno.Shape.rect(0, 0, 60, 30, size=2.0).domain()
-        fine = jno.Shape.rect(0, 0, 60, 30, size=1.0).domain()
+        coarse = jno.shape.rect(0, 0, 60, 30, size=2.0).domain()
+        fine = jno.shape.rect(0, 0, 60, 30, size=1.0).domain()
         c_cen = np.asarray(coarse.mesh.points)[:, :2][coarse._cells_p1()].mean(axis=1)
         bar = np.where(np.abs(c_cen[:, 1] - 15.0) < 6.0, 1.0, 0.0)
 
@@ -484,8 +484,8 @@ class TestCrossMeshTransfer:
         """The source domain still holds the positions it was BUILT with, so a mesh moved by
         `.trainable()` has to pass its deformed coordinates explicitly — otherwise the transfer
         reads the design off the wrong geometry and silently reports the wrong answer."""
-        coarse = jno.Shape.rect(0, 0, 60, 30, size=3.0).domain()
-        fine = jno.Shape.rect(0, 0, 60, 30, size=1.5).domain()
+        coarse = jno.shape.rect(0, 0, 60, 30, size=3.0).domain()
+        fine = jno.shape.rect(0, 0, 60, 30, size=1.5).domain()
         pts = np.asarray(coarse.mesh.points)[:, :2]
         cells = coarse._cells_p1()
         bar = np.where(np.abs(pts[cells].mean(axis=1)[:, 1] - 15.0) < 4.0, 1.0, 0.0)
@@ -502,8 +502,8 @@ class TestCrossMeshTransfer:
         assert moved.sum() == pytest.approx(same.sum(), rel=0.25)
 
     def test_a_mis_sized_field_is_refused(self):
-        coarse = jno.Shape.rect(0, 0, 60, 30, size=4.0).domain()
-        fine = jno.Shape.rect(0, 0, 60, 30, size=2.0).domain()
+        coarse = jno.shape.rect(0, 0, 60, 30, size=4.0).domain()
+        fine = jno.shape.rect(0, 0, 60, 30, size=2.0).domain()
         with pytest.raises(ValueError, match="entries but this mesh has"):
             coarse.transfer_cell_field(np.ones(3), fine)
 
@@ -525,7 +525,7 @@ class TestFacetTractionTotal:
     @staticmethod
     def _resultant(size, pad, span=2.0, L=60.0, H=30.0):
         tol = 1e-6 * L
-        d = jno.Shape.rect(0, 0, L, H, size=size).domain()
+        d = jno.shape.rect(0, 0, L, H, size=size).domain()
         u, phi = d.fem_symbols(value_shape=(2,))
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         xi, yi, _ = d.variable("interior", split=True)

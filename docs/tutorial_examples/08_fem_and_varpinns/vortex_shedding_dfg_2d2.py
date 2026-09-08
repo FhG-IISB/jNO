@@ -51,7 +51,7 @@ EPS, C_I = 1e-9, 36.0
 MS, T_END, NSTEPS = 0.022, 6.0, 1200  # ~90 s; the refinement table is in the tutorial page
 ST_REF = 0.30  # Schäfer & Turek (1996), benchmark 2D-2
 
-shape = jno.Shape.rect(0, 0, L, H, size=MS) - jno.Shape.disk(CX, CY, RR, size=MS / 5)
+shape = jno.shape.rect(0, 0, L, H, size=MS) - jno.shape.disk(CX, CY, RR, size=MS / 5)
 d = shape.domain(time=(0.0, T_END, NSTEPS + 1))
 d.tag("inlet", lambda x, y: x < EPS)
 d.tag("walls", lambda x, y: (y < EPS) | (y > H - EPS))

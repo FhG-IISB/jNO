@@ -718,7 +718,7 @@ def test_engd_line_search_reduces_loss():
     )
     bdy_pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64)
 
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
     x, y, _ = dom.variable("interior")
     dom.context["interior"] = int_pts[np.newaxis, np.newaxis]
     xb, yb, _ = dom.variable("boundary")
@@ -812,7 +812,7 @@ def _fem_compliance_crux():
     e0, emin, nu, penal = 1.0, 1e-6, 0.3, 3.0
     lam, mu = e0 * nu / (1 - nu**2), e0 / (2 * (1 + nu))
 
-    d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+    d = jno.shape.rect(0, 0, 2, 1, size=0.4).domain()
     u, phi = d.fem_symbols(value_shape=(2,))
     _r, s = d.fem_symbols(names=("r", "s"))
     xi, yi, _ = d.variable("interior", split=True)

@@ -77,7 +77,7 @@ class TestGaussQuadratureIntegrals:
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+        return jno.shape.rect(0, 0, 1, 1, size=0.1).domain()
 
     def test_gauss_constant_recovers_area(self, dom):
         x, y, _ = dom.variable("interior", split=True)
@@ -133,7 +133,7 @@ class TestJitCompatibleIntegrals:
 
     @pytest.fixture(scope="class")
     def dom_2d(self):
-        return jno.Shape.rect(0, 0, 1, 1, size=0.04).domain()
+        return jno.shape.rect(0, 0, 1, 1, size=0.04).domain()
 
     @pytest.fixture(scope="class")
     def dom_1d(self):
@@ -273,7 +273,7 @@ class TestGradientThroughIntegralLoss:
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.Shape.rect(0, 0, 1, 1, size=0.04).domain()
+        return jno.shape.rect(0, 0, 1, 1, size=0.04).domain()
 
     @pytest.fixture(scope="class")
     def setup(self, dom):
@@ -384,7 +384,7 @@ Covers:
 
 
 def _make_2d_rect_domain(mesh_size=0.05):
-    return jno.Shape.rect(0, 0, 1, 1, size=mesh_size).domain()
+    return jno.shape.rect(0, 0, 1, 1, size=mesh_size).domain()
 
 
 def _eval_integral_expr(expr, domain):

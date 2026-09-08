@@ -59,7 +59,7 @@ ORDERS = 40
 
 def grating(period, orders=ORDERS):
     """Solve one binary grating and return its order-resolved efficiencies."""
-    d = jno.Shape.box(0, 0, 0, period, PY, 1.0, size=0.25).domain()  # coarse: ε is analytic
+    d = jno.shape.box(0, 0, 0, period, PY, 1.0, size=0.25).domain()  # coarse: ε is analytic
     e = 1e-6
     d.tag("bottom", lambda x, y, z: z < e)
     d.tag("top", lambda x, y, z: z > 1.0 - e)

@@ -9,7 +9,7 @@ gmsh mesh-size callback and composes with every other size control by `min`, so 
 ```python
 # THREE arguments, in 2-D as well as 3-D: gmsh calls a size function as f(x, y, z).
 h_of = lambda x, y, z: H_FINE + (H_COARSE - H_FINE) * min(1.0, max(0.0, (LY - y) / BAND))
-d = jno.Shape.rect(0.0, 0.0, LX, LY, size=h_of).domain()
+d = jno.shape.rect(0.0, 0.0, LX, LY, size=h_of).domain()
 ```
 
 This is what makes a thin feature affordable. Measured on a 1.2 × 0.4 mm rectangle graded from 4 µm at
@@ -38,7 +38,7 @@ the 16 µm mesh that resolved nothing.
     `.domain()` does not build a mesh; the first thing that asks for one does. So a size callable is
     not called — and a wrong one not diagnosed — until then.
 
-## Curved (isoparametric) geometry — `Shape.curved()`
+## Curved (isoparametric) geometry — `shape.curved()`
 
 By default jNO meshes straight-sided and *synthesises* higher-order nodes at the straight-edge
 midpoints, so the domain stays a polygon however high the element order goes. That approximation
@@ -47,7 +47,7 @@ round boundary, no matter how good the basis is. `curved()` asks the CAD kernel 
 the true surface instead:
 
 ```python
-d = jno.Shape.disk(0, 0, 1, size=0.1).curved().domain()
+d = jno.shape.disk(0, 0, 1, size=0.1).curved().domain()
 u, v = d.fem_symbols(order=2)          # the basis order must MATCH the geometry order
 ```
 

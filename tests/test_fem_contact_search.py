@@ -36,8 +36,8 @@ def _x64():
 
 def _stacked_bars(size=0.4, c=1.0e3):
     """Two boxes meeting at z = 1, the upper one loaded into the lower through a penalised gap."""
-    d = jno.Shape.regions(
-        lower=jno.Shape.box(0, 0, 0, 1, 1, 1), upper=jno.Shape.box(0, 0, 1, 1, 1, 2.5), conforming=False
+    d = jno.shape.regions(
+        lower=jno.shape.box(0, 0, 0, 1, 1, 1), upper=jno.shape.box(0, 0, 1, 1, 1, 2.5), conforming=False
     ).domain(size=size)
     _ = d.built_mesh
     sec, main = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
@@ -124,7 +124,7 @@ def test_rounds_must_be_at_least_one():
 # What it refuses, and why — each by name
 # ----------------------------------------------------------------------------------------------
 def test_contact_refuses_a_form_that_declares_no_gap():
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1).domain(size=0.5)
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).domain(size=0.5)
     u, v = d.fem_symbols()
     ci, bb = d.variable("interior", split=True), d.variable("boundary", split=True)
     gu, gv = jno.np.grad(u, [ci[0], ci[1], ci[2]]), jno.np.grad(v, [ci[0], ci[1], ci[2]])
@@ -199,8 +199,8 @@ def _al_contact_march(nsteps=4, c=1.0e3):
     (``lam.i(-1)`` step history plus a ``domain(tau=...)`` grid), so it is what ``contact=`` has to
     compose with. The bonded oracle is ``-0.01`` -- half the platen's ``-0.02``, by symmetry."""
     inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
-    d = jno.Shape.regions(
-        base=jno.Shape.rect(0, 0, 1, 1, size=0.30), cap=jno.Shape.rect(0, 1, 1, 2, size=0.16), conforming=False
+    d = jno.shape.regions(
+        base=jno.shape.rect(0, 0, 1, 1, size=0.30), cap=jno.shape.rect(0, 1, 1, 2, size=0.16), conforming=False
     ).domain(tau=(0.0, 1.0, nsteps))
     sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
     secondary = next(t for t in sides if t.endswith(".cap"))
@@ -297,8 +297,8 @@ def _block_on_disk(size=0.09):
     is a purely horizontal RIGID translation, ``n . D`` vanishes, so the re-paired ``g0`` *is* the
     deformed gap with nothing left to model.
     """
-    blk = jno.Shape.rect(-0.3, Y0, 0.3, Y0 + 0.4)
-    d = jno.Shape.regions(disk=jno.Shape.disk(0, 0, R_DISK).sized(size), blk=blk.sized(size), conforming=False).domain()
+    blk = jno.shape.rect(-0.3, Y0, 0.3, Y0 + 0.4)
+    d = jno.shape.regions(disk=jno.shape.disk(0, 0, R_DISK).sized(size), blk=blk.sized(size), conforming=False).domain()
     _ = d.built_mesh
     eps = 1e-6
     d.tag("s_blk", lambda x, y: y < Y0 + eps, region="blk")
@@ -388,10 +388,10 @@ def test_the_search_follows_a_slide_of_many_facet_widths():
 # ----------------------------------------------------------------------------------------------
 def _plates_domain(size=0.14):
     """Geometry and tags only — no ``u.gap``, so a caller can exercise the registration itself."""
-    d = jno.Shape.regions(
-        left=jno.Shape.rect(-1.5, 0.0, -0.1, 1.0).sized(size),
-        right=jno.Shape.rect(0.1, 0.0, 1.5, 0.8).sized(size),
-        blk=jno.Shape.rect(-0.6, 1.1, 0.6, 1.5).sized(size),
+    d = jno.shape.regions(
+        left=jno.shape.rect(-1.5, 0.0, -0.1, 1.0).sized(size),
+        right=jno.shape.rect(0.1, 0.0, 1.5, 0.8).sized(size),
+        blk=jno.shape.rect(-0.6, 1.1, 0.6, 1.5).sized(size),
         conforming=False,
     ).domain()
     _ = d.built_mesh
@@ -465,7 +465,7 @@ def test_self_contact_must_be_asked_for_as_a_list():
 def _slotted_block(size=0.075):
     """A C: a 2x1 bar with a 0.2-wide slot cut in from the right. The two slot faces look at each other
     across 0.2 and are the only part of the boundary that does."""
-    body = jno.Shape.rect(0, 0, 2.0, 1.0) - jno.Shape.rect(0.6, 0.4, 2.1, 0.6)
+    body = jno.shape.rect(0, 0, 2.0, 1.0) - jno.shape.rect(0.6, 0.4, 2.1, 0.6)
     d = body.sized(size).domain()
     _ = d.built_mesh
     d.tag("surf", lambda x, y: x**2 >= -1.0)  # one body: its boundary IS the whole boundary
@@ -556,9 +556,9 @@ def _hertz(press):
 
     lam, mu = E_H * NU_H / ((1 + NU_H) * (1 - 2 * NU_H)), E_H / (2 * (1 + NU_H))
     gapy = 0.004
-    d = jno.Shape.regions(
-        cyl=jno.Shape.disk(0.0, R_H + gapy, R_H).sized(H_H),
-        blk=jno.Shape.rect(-1.6, -1.2, 1.6, 0.0).sized(H_H),
+    d = jno.shape.regions(
+        cyl=jno.shape.disk(0.0, R_H + gapy, R_H).sized(H_H),
+        blk=jno.shape.rect(-1.6, -1.2, 1.6, 0.0).sized(H_H),
         conforming=False,
     ).domain()
     _ = d.built_mesh
@@ -660,9 +660,9 @@ def test_the_search_follows_a_large_slide_in_three_dimensions():
     from jno.utils.solver.contact_search import OPEN_GAP
     from jno.utils.solver.fem_utils import _cell_region_mask
 
-    blk = jno.Shape.box(-0.35, -0.35, Z0_3D, 0.35, 0.35, Z0_3D + 0.4)
-    d = jno.Shape.regions(
-        ball=jno.Shape.sphere(0, 0, 0, R_BALL).sized(H_3D), blk=blk.sized(H_3D), conforming=False
+    blk = jno.shape.box(-0.35, -0.35, Z0_3D, 0.35, 0.35, Z0_3D + 0.4)
+    d = jno.shape.regions(
+        ball=jno.shape.sphere(0, 0, 0, R_BALL).sized(H_3D), blk=blk.sized(H_3D), conforming=False
     ).domain()
     _ = d.built_mesh
     e = 1e-6

@@ -1224,7 +1224,7 @@ class TestCruxEvalAcceptsViews:
         import foundax
 
         net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=4, num_layers=2, key=jax.random.PRNGKey(0)))
-        dom = jno.Shape.rect(0, 0, 1, 1, size=0.5).domain()
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.5).domain()
         x, y, _ = dom.variable("interior")
         u = net(x, y)
         crux = jno.core([u.mse])
@@ -1415,7 +1415,7 @@ def lshape():
 @pytest.fixture(scope="module")
 def cube3d():
     """3-D unit cube on a tetrahedral mesh — built once."""
-    dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain(compute_mesh_connectivity=True)
+    dom = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain(compute_mesh_connectivity=True)
     v = dom.variable("interior")
     x, y, z = v[0], v[1], v[2]
     pts = np.asarray(dom.mesh_connectivity["points"])

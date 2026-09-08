@@ -40,7 +40,7 @@ P, LZ = 1.1, 3.2
 
 def _slab_cons():
     """A uniform a-Si slab (no lateral structure -> converges at tiny truncation, fast)."""
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     e = 1e-6
     for nm, f in [
         ("left", lambda x, y, z: x < e),

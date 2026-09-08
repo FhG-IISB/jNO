@@ -29,7 +29,7 @@ def ctx():
     """A 2-D vector Poisson -- the smallest form with components to sum over. x64: FEM is float64."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=1)
     xi, yi = d.variable("interior", split=True)[:2]
     xb, yb = d.variable("boundary", split=True)[:2]

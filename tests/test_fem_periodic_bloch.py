@@ -32,7 +32,7 @@ def _bloch_strip(kx, *, size=0.1, source="complex", extra_coeff=1.0):
     With ``f = (kx² + π² + 1)·e^{i kx x}·sin(π y)`` the exact solution is the Bloch mode
     ``u* = e^{i kx x}·sin(π y)`` (it satisfies the tie exactly: ``u*(0,y) = e^{-i kx}·u*(1,y)``).
     ``source="real"`` keeps every coefficient real (``f = Re(λ u*)``) — the *real-form* Bloch case."""
-    d = jno.domain(jno.Shape.rect(0, 0, 1.0, 1.0, size=size))
+    d = jno.domain(jno.shape.rect(0, 0, 1.0, 1.0, size=size))
     e = 1e-6
     d.tag("left", lambda x, y: (x < e) & (y > e) & (y < 1 - e))
     d.tag("right", lambda x, y: (x > 1 - e) & (y > e) & (y < 1 - e))
@@ -144,7 +144,7 @@ def test_bloch_complex_transient_marches_the_plane_wave():
     kx = PI / 2
 
     def build(amp):
-        d = jno.domain(jno.Shape.rect(0, 0, 1.0, 1.0, size=0.15), time=(0.0, 0.02, 21))
+        d = jno.domain(jno.shape.rect(0, 0, 1.0, 1.0, size=0.15), time=(0.0, 0.02, 21))
         e = 1e-6
         d.tag("left", lambda x, y: (x < e) & (y > e) & (y < 1 - e))
         d.tag("right", lambda x, y: (x > 1 - e) & (y > e) & (y < 1 - e))
@@ -182,7 +182,7 @@ def test_bloch_complex_transient_marches_the_plane_wave():
 def test_bloch_on_a_real_march_fails_loud():
     """A Bloch phase forces a complex field; a REAL transient (heat) march cannot carry it and must
     say so at build time — it used to surface as a bare while_loop dtype crash at evaluation."""
-    d = jno.domain(jno.Shape.rect(0, 0, 1.0, 1.0, size=0.2), time=(0.0, 0.1, 9))
+    d = jno.domain(jno.shape.rect(0, 0, 1.0, 1.0, size=0.2), time=(0.0, 0.1, 9))
     e = 1e-6
     d.tag("left", lambda x, y: (x < e) & (y > e) & (y < 1 - e))
     d.tag("right", lambda x, y: (x > 1 - e) & (y > e) & (y < 1 - e))
@@ -205,7 +205,7 @@ def test_bloch_on_a_real_march_fails_loud():
 
 def test_bloch_on_a_nonlinear_form_fails_loud():
     """Nonlinear + Bloch: the promotion cannot linearize the form, so it must refuse by name."""
-    d = jno.domain(jno.Shape.rect(0, 0, 1.0, 1.0, size=0.2))
+    d = jno.domain(jno.shape.rect(0, 0, 1.0, 1.0, size=0.2))
     e = 1e-6
     d.tag("left", lambda x, y: (x < e) & (y > e) & (y < 1 - e))
     d.tag("right", lambda x, y: (x > 1 - e) & (y > e) & (y < 1 - e))
@@ -225,7 +225,7 @@ def test_bloch_on_a_nonlinear_form_fails_loud():
 
 def test_bloch_scaled_by_nonconstant_rejected():
     """A tie may be scaled only by a constant scalar; a coordinate-dependent factor is not a Bloch phase."""
-    d = jno.domain(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5))
+    d = jno.domain(jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5))
     e = 1e-6
     d.tag("left", lambda x, y, z: x < e)
     d.tag("right", lambda x, y, z: x > 1 - e)
@@ -258,7 +258,7 @@ def test_bloch_empty_cell_transmits_at_oblique():
         for deg in (0.0, 20.0, 35.0):
             kx = float(K0 * np.sin(np.deg2rad(deg)))
             kz = float(np.sqrt(K0**2 - kx**2))
-            d = jno.domain(jno.Shape.box(0, 0, 0, P0, P0, Lz, size=0.12))
+            d = jno.domain(jno.shape.box(0, 0, 0, P0, P0, Lz, size=0.12))
             e = 1e-6
             for nm, f in [
                 ("left", lambda x, y, z: x < e),

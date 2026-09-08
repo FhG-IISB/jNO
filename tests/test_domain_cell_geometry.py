@@ -30,7 +30,7 @@ def _x64():
 
 
 def _rect(size=0.4):
-    return jno.Shape.rect(0, 0, 2, 1, size=size).domain()
+    return jno.shape.rect(0, 0, 2, 1, size=size).domain()
 
 
 class TestClosedForms:
@@ -63,7 +63,7 @@ class TestClosedForms:
         assert vol[0] == pytest.approx(np.sqrt(3) / 4, abs=1e-10)
 
     def test_cell_angles_is_two_dimensional_only(self):
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
         with pytest.raises(NotImplementedError, match="triangles only"):
             d.cell_angles()
 
@@ -85,7 +85,7 @@ class TestDifferentiableInTheMesh:
 
     @staticmethod
     def _moving_rect(size=0.5):
-        d = jno.Shape.rect(0, 0, 2, 1, size=size).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=size).domain()
         xm, ym, _ = d.variable("design", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
         xm.trainable(name="mx")
         ym.trainable(name="my")
@@ -224,7 +224,7 @@ class TestNormalisedPnorm:
         assert int(np.sum(np.abs(np.asarray(g_norm)) > 1e-12)) > 1, "must not collapse to one-hot"
 
     def test_it_reaches_the_trace_through_a_node(self):
-        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
         got = float(np.asarray(d.cell_volume().pnorm(50.0, normalize=True).eval()).reshape(-1)[0])
         assert got == pytest.approx(float(np.asarray(d.cell_volume().eval()).max()), rel=1e-9)
 
@@ -280,12 +280,12 @@ class TestLogBarrier:
             assert np.isfinite(float(self._f(x, b))) and np.isfinite(float(jax.grad(lambda z: self._f(z, b))(x)))
 
     def test_it_reaches_the_trace_through_a_node(self):
-        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
         total = d.cell_volume().sum  # the domain area, 2.0
         got = float(np.asarray(total.log_barrier(10.0).eval()).reshape(-1)[0])
         assert got == pytest.approx(float(-10.0 * np.log(10.0 - 2.0)), rel=1e-6)
 
     def test_a_non_positive_tau_is_refused(self):
-        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
         with pytest.raises(ValueError, match="tau must be positive"):
             d.cell_volume().sum.log_barrier(10.0, tau=0.0)

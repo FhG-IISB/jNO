@@ -516,7 +516,7 @@ class PrecondContext:
     @property
     def grid(self):
         """Structured-grid descriptor ``{shape, spacing, origin}`` when the operator lives on a regular
-        grid (``jno.Shape.rect(...).structured().domain()``), else ``None`` — needed by geometric multigrid
+        grid (``jno.shape.rect(...).structured().domain()``), else ``None`` — needed by geometric multigrid
         (:func:`jno.precond.gmg`). An explicit override if given, else derived from the owning FEM's
         domain (``ctx.fem.domain.mesh_connectivity["grid"]``)."""
         if self._grid is not None:

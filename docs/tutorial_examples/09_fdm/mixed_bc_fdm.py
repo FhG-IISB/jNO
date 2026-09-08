@@ -23,7 +23,7 @@ import numpy as np  # noqa: E402
 
 import jno  # noqa: E402
 
-d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).domain()
+d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).domain()
 x, y, _ = d.variable("interior", split=True)
 xbo, ybo, _ = d.variable("bottom", split=True)
 xl, yl, _ = d.variable("left", split=True)
@@ -78,7 +78,7 @@ plt.rcParams.update(
 
 def _solve_mixed(size):
     """Re-run the mixed-BC solve at a given mesh size; return (h, rel_L2) against u* = y^2."""
-    dm = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    dm = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     xx, yy, _ = dm.variable("interior", split=True)
     xbo2, ybo2, _ = dm.variable("bottom", split=True)
     xl2, yl2, _ = dm.variable("left", split=True)

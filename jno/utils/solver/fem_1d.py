@@ -157,7 +157,7 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
     if mask is not None:
         return list(np.where(mask)[0])
-    # No predicate: a `Shape.regions` BODY, which is defined by which cells it owns rather than by a
+    # No predicate: a `shape.regions` BODY, which is defined by which cells it owns rather than by a
     # location function. That is the only kind of region `domain.tag(..., region=...)` names on a
     # multi-body mesh, so refusing here made a Dirichlet on such a tag impossible -- `u(top) - g` on
     # `tag("top", ..., region="cyl")` raised "has no location function". Ownership by cell topology is
@@ -174,7 +174,7 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
             return list(np.unique(np.asarray(vol)[m > 0]))
     raise ValueError(
         f"jno.fem: region {region!r} has neither a location predicate nor cells on this mesh, so its "
-        "nodes cannot be determined. Name a `domain.tag` region or a `Shape.regions` body."
+        "nodes cannot be determined. Name a `domain.tag` region or a `shape.regions` body."
     )
 
 
@@ -448,7 +448,7 @@ def _hermite_element_1d(cells, n_vert: int, gp) -> _LineElement:
     fourth-order operator (``EI w'''' = q``) has a well-defined ``\int w'' v''`` weak form on it —
     the 1D counterpart of Argyris/Morley on triangles.
 
-    Shape functions on ``xi in [0,1]`` with ``x = x0 + h*xi`` (Hermite 1877; standard beam element,
+    shape functions on ``xi in [0,1]`` with ``x = x0 + h*xi`` (Hermite 1877; standard beam element,
     e.g. Hughes, *The Finite Element Method*, §1.16)::
 
         N1 = 1 - 3xi^2 + 2xi^3        N2 = h (xi - 2xi^2 + xi^3)

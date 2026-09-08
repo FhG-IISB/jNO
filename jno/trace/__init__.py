@@ -955,7 +955,7 @@ class Placeholder:
         *named* update, not an operator (``==`` is reserved for identity, ``<`` for comparison).
 
         Args:
-            region: restrict the update to one region — a ``domain.tag`` name, a ``Shape.regions()``
+            region: restrict the update to one region — a ``domain.tag`` name, a ``shape.regions()``
                 sub-region, or a geometry part. ``None`` (default) advances the state on every cell, and
                 is what the update did before this argument existed. Outside the region the state is
                 **frozen**: its next value is the value it already has. That is what makes an ordinary
@@ -1626,7 +1626,7 @@ class Variable(Placeholder):
            named boundaries with a location function.
         3. The mesh's own tag, ``domain.tag_indices[tag]``.
 
-        Route 3 is what makes the built-in ``"interior"`` work. On a gmsh / ``jno.Shape`` domain it is
+        Route 3 is what makes the built-in ``"interior"`` work. On a gmsh / ``jno.shape`` domain it is
         a **volume** tag: it lives in ``tag_indices`` and never in ``_boundary_regions``, and it has no
         location function, so routes 1 and 2 both have nothing to say about it and this used to raise --
         even though ``domain.variable("interior").trainable()`` is the r-adaptivity API's own example.
@@ -4178,7 +4178,7 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
             if tag not in breg:
                 raise ValueError(
                     f"{who}: {tag!r} is not a boundary region on this domain. Known: {sorted(breg)}. "
-                    "Tag each side of the interface first -- a non-conforming Shape.regions names them "
+                    "Tag each side of the interface first -- a non-conforming shape.regions names them "
                     "'a|b.a' / 'a|b.b' automatically."
                 )
         if secondary in mains and not listed:

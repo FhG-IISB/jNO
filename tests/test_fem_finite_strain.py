@@ -30,7 +30,7 @@ def _x64():
 
 
 def _box(size=0.4):
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size).domain()
     d.tag("bdry", lambda x, y, z: (x < 1e-6) | (x > 1 - 1e-6) | (y < 1e-6) | (y > 1 - 1e-6) | (z < 1e-6) | (z > 1 - 1e-6))
     return d
 
@@ -89,7 +89,7 @@ def test_finite_strain_large_stretch_patch_test():
 def test_finite_strain_reduces_to_linear_elasticity_at_small_strain():
     """A cantilever sheared a TINY amount: finite strain and linear elasticity must agree to O(strain²)."""
     shear = 2e-4  # small
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.5).domain()
     d.tag("bot", lambda x, y, z: z < 1e-6)
     d.tag("top", lambda x, y, z: z > 1 - 1e-6)
     u, phi = d.fem_symbols(value_shape=(3,))

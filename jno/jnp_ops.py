@@ -660,7 +660,7 @@ def cellwise(x) -> Cellwise:
 
     **It is quadrature-weighted, not a plain mean over quadrature points.** The two coincide only when
     the rule's weights are equal — false for higher-degree simplex rules, and false on curved
-    (``Shape.curved()``) or tensor-product cells, where the measure varies inside the cell. The weighted
+    (``shape.curved()``) or tensor-product cells, where the measure varies inside the cell. The weighted
     form is the actual L2 projection, so it is the actual B-bar.
 
     **Where it does and does not help, measured.** B-bar cures locking only where the strain is not

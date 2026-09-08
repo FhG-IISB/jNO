@@ -30,7 +30,7 @@ def _x64():
 
 
 def _rect(size=0.5):
-    return jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    return jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
 
 
 def _trivial():

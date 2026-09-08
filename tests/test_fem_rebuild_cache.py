@@ -34,7 +34,7 @@ def _delta(before):
 
 
 def _poisson2d(size=0.28, k=1.0, f=1.0):
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -86,7 +86,7 @@ def test_zero_and_negative_coefficients_key_distinctly():
 
 def test_3d_rebuild_hits():
     def build():
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.35).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.35).domain()
         u, v = d.fem_symbols()
         xi, yi, zi, _ = d.variable("interior", split=True)
         xb, yb, zb, _ = d.variable("boundary", split=True)
@@ -109,7 +109,7 @@ def test_parametric_rebuild_hits_and_solves_per_args():
     import jax
 
     def build():
-        d = jno.Shape.rect(0, 0, 1, 1, size=0.28).domain()
+        d = jno.shape.rect(0, 0, 1, 1, size=0.28).domain()
         u, v = d.fem_symbols()
         xi, yi, _ = d.variable("interior", split=True)
         xb, yb, _ = d.variable("boundary", split=True)

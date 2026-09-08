@@ -14,7 +14,7 @@ escape hatch — see the [weak-form vocabulary](../weak_form_vocabulary.md).
 import jax.numpy as jnp
 import jno
 
-d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1))
+d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1))
 u, phi = d.fem_symbols()                                   # trial / test functions
 xi, yi, _ = d.variable("interior", split=True)            # volume quadrature coords
 xb, yb, _ = d.variable("boundary", split=True)            # boundary coords
@@ -50,7 +50,7 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
 
 ## Domain, symbols, and derivatives
 
-* **Domain** — any jNO domain works (a `jno.Shape`, `jno.domain.cube`, a CSG/`gmsh` constructor).
+* **Domain** — any jNO domain works (a `jno.shape`, `jno.domain.cube`, a CSG/`gmsh` constructor).
   Add `time=(t0, t1, n_steps)` to make it transient.
 * **Symbols** — `u, phi = d.fem_symbols(value_shape=(), names=("u", "phi"), order=1)`.
   Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=k` for degree-`k`
@@ -60,7 +60,7 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   limitations* for the measured rates before paying for P3 there.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
-  `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);
+  `shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);
   `"boundary"` is the whole boundary and `"initial"` the `t = t0` slice. To define a custom region
   and fetch its coordinates in one call, pass a predicate: `d.variable("port", where=lambda x, y: x < 1e-6)`
   tags `"port"` (exactly as `d.tag` would) and returns its split coordinates.
@@ -274,7 +274,7 @@ the `"initial"`-slice coordinates *and time*, `u.bind(x=xi0, y=yi0, t=ti0).t`; a
 defaults to zero).
 
 ```python
-d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1), time=(0.0, 2.0, 200))
+d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1), time=(0.0, 2.0, 200))
 u, phi = d.fem_symbols()
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

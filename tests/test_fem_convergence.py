@@ -252,7 +252,7 @@ def study_poisson_3d():
     g = lambda co: sin(PI * co[0]) * sin(PI * co[1]) * sin(PI * co[2])  # noqa: E731
 
     def solve(ms):
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
         u, w = d.fem_symbols()
         xi, yi, zi = d.variable("interior", split=True)[:3]
         ui, vi = u.bind(x=xi, y=yi, z=zi), w.bind(x=xi, y=yi, z=zi)
@@ -594,7 +594,7 @@ def study_stokes_3d():
     pex = lambda co: sin(co[0]) * sin(co[1]) * sin(co[2]) - C  # noqa: E731
 
     def solve(ms):
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
         u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
         p, q = d.fem_symbols(names=("p", "q"), order=1)
         xi, yi, zi = d.variable("interior", split=True)[:3]
@@ -647,7 +647,7 @@ def study_navier_stokes_3d():
     pex = lambda co: sin(co[0]) * sin(co[1]) * sin(co[2]) - C  # noqa: E731
 
     def solve(ms):
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
         u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
         p, q = d.fem_symbols(names=("p", "q"), order=1)
         xi, yi, zi = d.variable("interior", split=True)[:3]

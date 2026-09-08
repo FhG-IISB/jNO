@@ -1,7 +1,7 @@
 """Local refinement of a **hexahedral** mesh, and the two kinds of hanging node it creates.
 
 The 3-D half of hanging-node adaptivity, and the only h-adaptivity a hex mesh can have: mmg adapts
-simplices, and rebuilding a ``Shape`` plan at a finer size field needs a mesher to rebuild *with* --
+simplices, and rebuilding a ``shape`` plan at a finer size field needs a mesher to rebuild *with* --
 gmsh's ``Recombine3DAll`` on a plain box returns tetrahedra and no hexahedra, so there is nothing to
 remesh to. Splitting a hex into 8 needs neither.
 
@@ -232,7 +232,7 @@ def _surface_area(pts, faces):
 
 
 def _box(n):
-    return jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=n).quad().domain(compute_mesh_connectivity=False)
+    return jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=n).quad().domain(compute_mesh_connectivity=False)
 
 
 def _poisson(dom):

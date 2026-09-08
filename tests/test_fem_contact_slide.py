@@ -43,9 +43,9 @@ def _x64():
 def _two_body(size=0.5, conforming=False):
     """Two blocks stacked in z. ``conforming=True`` fuses them into one body — the bonded reference."""
     return (
-        jno.Shape.regions(
-            lower=jno.Shape.box(0, 0, 0, 1, 1, 1),
-            upper=jno.Shape.box(0, 0, 1, 1, 1, 2.0),
+        jno.shape.regions(
+            lower=jno.shape.box(0, 0, 0, 1, 1, 1),
+            upper=jno.shape.box(0, 0, 1, 1, 1, 2.0),
             conforming=conforming,
         )
         .sized(size)

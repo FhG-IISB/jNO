@@ -114,7 +114,7 @@ The two things worth checking first, because neither can raise:
   will not reach its tolerance without it. `jax.config.update("jax_enable_x64", True)` **before**
   building any domain, array or model — the flag affects only what is created after it.
 - **The geometry is straight-sided.** By default a curved boundary is approximated to O(h²), which
-  caps every element order above it. `Shape.curved()` fixes it. This and the axisymmetric-vector
+  caps every element order above it. `shape.curved()` fixes it. This and the axisymmetric-vector
   measure are the only two limits in `jno.fem` that are silent; every other one raises. See
   [Limits](fem/limitations.md).
 

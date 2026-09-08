@@ -362,7 +362,7 @@ def test_triply_periodic_3d_cube():
 
     pi = np.pi
     e = 1e-6
-    dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.13).domain()
+    dom = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.13).domain()
     faces = {
         "xlo": lambda x, y, z: x < e,
         "xhi": lambda x, y, z: x > 1 - e,
@@ -425,7 +425,7 @@ def test_triply_periodic_3d_cube_p2():
 
     pi = np.pi
     e = 1e-6
-    dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.28).domain()
+    dom = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.28).domain()
     for nm, p in {
         "xlo": lambda x, y, z: x < e,
         "xhi": lambda x, y, z: x > 1 - e,
@@ -598,13 +598,13 @@ def test_multidirection_on_auto_faces_shares_corners():
 
 
 def test_doubly_periodic_on_shape_rect():
-    """The same doubly-periodic cell on a ``jno.Shape.rect`` domain (gmsh mesh, auto left/right/top/
+    """The same doubly-periodic cell on a ``jno.shape.rect`` domain (gmsh mesh, auto left/right/top/
     bottom): its face tags share corners, so multidirectional periodicity solves. Manufactured
     ``u = cos(2πx) cos(2πy)``."""
     import jno
 
     pi = np.pi
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.07).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.07).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)

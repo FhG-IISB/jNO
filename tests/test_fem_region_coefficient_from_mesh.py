@@ -2,7 +2,7 @@
 
 ``domain.by_region({"steel": 16.0, "air": 0.026})`` is the per-region material primitive, and it
 resolved a region only from a shapely geometry part, a ``domain.tag`` predicate, or a
-``Shape.regions`` sub-region. A mesh loaded from a ``.msh`` keeps its gmsh physical volumes in
+``shape.regions`` sub-region. A mesh loaded from a ``.msh`` keeps its gmsh physical volumes in
 ``mesh.cell_sets``, which none of those cover -- so the one kind of domain that has materials
 declared *in the file* was the one kind that could not name them in a weak form.
 
@@ -170,7 +170,7 @@ def test_the_volume_term_guard_still_refuses_domain_variable(tmp_path):
 
 def test_attach_works_on_a_mesh_file_region(tmp_path):
     """`domain.attach` documents itself as the way to give properties to a mesh-file domain, "which
-    has no Shape to declare them on" -- but its target classifier enumerated the same three sources,
+    has no shape to declare them on" -- but its target classifier enumerated the same three sources,
     so it raised `unknown target` on exactly that case. A mesh region owns cells by definition and is
     classified `volume` directly: routing it through the facets-vs-cells test would call the outer
     region of any real device ambiguous, since it reaches the boundary."""

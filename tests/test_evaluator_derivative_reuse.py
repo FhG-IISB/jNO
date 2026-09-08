@@ -41,7 +41,7 @@ def _network_dispatches(build_residual, monkeypatch):
 
     monkeypatch.setattr(TraceEvaluator, "_eval_flax_module_call", counting)
 
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     x, y, _ = dom.variable("interior")
     net = jno.nn(foundax.mlp(in_features=2, output_dim=1, hidden_dims=4, num_layers=2, key=KEY))
     net.optimizer(optax.adam(1e-3))
@@ -68,7 +68,7 @@ def test_fd_laplacian_and_partial_share_one_mesh_evaluation(monkeypatch):
 
 def test_fd_derivatives_are_unchanged_by_the_sharing():
     """Reuse must not move the numbers: FD partials of a linear field are exact."""
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
     x, y, _ = dom.variable("interior")
     field = 3.0 * x + 5.0 * y
 
@@ -85,7 +85,7 @@ def test_fd_derivatives_are_unchanged_by_the_sharing():
 
 def _windowed_laplacian(n_points, n_time=2):
     """Drive ``_eval_hessian`` with a 3-D ``(T, N, D)`` point context."""
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     x, y, _ = dom.variable("interior")
     net = jno.nn(foundax.mlp(in_features=2, output_dim=1, hidden_dims=8, num_layers=2, key=KEY))
     lap = jno.np.laplacian(net(x, y), [x, y])
@@ -135,7 +135,7 @@ def test_windowed_laplacian_matches_jax_hessian():
 
 def test_positional_coordinates_raise_a_clear_error():
     """``laplacian(u, x, y)`` puts ``y`` in the ``scheme`` slot."""
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     x, y, _ = dom.variable("interior")
     net = jno.nn(foundax.mlp(in_features=2, output_dim=1, hidden_dims=4, num_layers=2, key=KEY))
     u = net(x, y)
@@ -148,7 +148,7 @@ def test_positional_coordinates_raise_a_clear_error():
 
 
 def test_the_list_form_and_the_method_form_still_work():
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     x, y, _ = dom.variable("interior")
     net = jno.nn(foundax.mlp(in_features=2, output_dim=1, hidden_dims=4, num_layers=2, key=KEY))
     u = net(x, y)

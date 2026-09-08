@@ -11,8 +11,8 @@ import jno
 ε = 0.1
 T_end = 1.0
 
-# Time-dependent unit square: the Shape one-liner forwards ``time=`` to the domain.
-domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, T_end, 4))
+# Time-dependent unit square: the shape one-liner forwards ``time=`` to the domain.
+domain = jno.shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, T_end, 4))
 x, y, t = domain.variable("interior")
 
 S = jno.np.sin(π * x) * jno.np.sin(π * y)
@@ -79,7 +79,7 @@ plt.rcParams.update(
 # Re-evaluate the trained model on a finer time grid (the network is continuous
 # in t, so this is still its own output) for a smooth animation.
 n_frames = 16
-_dg = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, T_end, n_frames))
+_dg = jno.shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, T_end, n_frames))
 _uf, _uef, _xf, _yf, _tf = crux.eval([u, u_exact, x, y, t], domain=_dg, min_consecutive=n_frames)
 uf = np.asarray(_uf)[0, :, :, 0]  # (frame, node)
 uef = np.asarray(_uef)[0, :, :, 0]

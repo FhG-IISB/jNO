@@ -21,7 +21,7 @@ import optax  # noqa: E402
 import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 
-d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
+d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
 x, y, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 f_base = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)

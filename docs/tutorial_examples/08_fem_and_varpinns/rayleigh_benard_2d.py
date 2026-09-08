@@ -42,7 +42,7 @@ Lx, Ly = 2.0, 1.0  # a wide-ish pot -> a pair of counter-rotating rolls
 dt, nsteps, nframes = 0.009, 26, 13  # integration step / count -> fem.solve() reads dt from the domain
 #                                      time grid below (stop ~when the rolls establish, no static tail)
 
-d = jno.Shape.rect(0, 0, Lx, Ly, size=0.11).domain(time=(0.0, nsteps * dt, nsteps + 1))
+d = jno.shape.rect(0, 0, Lx, Ly, size=0.11).domain(time=(0.0, nsteps * dt, nsteps + 1))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 T, sT = d.fem_symbols(names=("T", "sT"), order=1)  # P1 temperature

@@ -30,7 +30,7 @@ def _x64():
 
 def _stokes(size=0.4):
     """Taylor-Hood channel: fields are [u (vector, P2), p (scalar, P1)] -- p is NOT field 0."""
-    d = jno.Shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
     p, q = d.fem_symbols(names=("p", "q"), order=1)
     x, y, _ = d.variable("interior", split=True)
@@ -82,7 +82,7 @@ def test_a_criterion_on_a_non_first_field_is_not_silently_zero():
 def test_cell_size_is_usable_in_a_criterion():
     """`dom.cell_size` is a geometry symbol resolved from the domain context, not a region. The
     criterion's region resolver counted its tag as a region and looked for one called 'cell_size'."""
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
     u, phi = d.fem_symbols()
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -95,7 +95,7 @@ def test_cell_size_is_usable_in_a_criterion():
 
 def test_a_single_field_problem_still_refines_on_the_zz_estimator():
     """The vertex view is now taken lazily; the estimator path must be untouched by that."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     u, phi = d.fem_symbols()
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

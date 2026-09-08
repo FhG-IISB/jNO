@@ -25,7 +25,7 @@ boundary — written twice. Only the *form* changes; the language does not.
 ```python
 import jno
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 
@@ -91,7 +91,7 @@ Maturity is stated per capability; each link goes to the page that documents it.
 | **Time integration** | [stable](fdm.md) | θ-method (backward-Euler / Crank–Nicolson), exponential integrators, adaptive step size — the same slot for `jno.fem` and `jno.fdm` |
 | **Adaptive & moving meshes** | [beta](fem/geometry.md) | Hessian-metric remeshing (AFEM), r-adaptivity, moving meshes stated in the term list |
 | **Differentiable inverse / PDE-constrained** | [stable](inverse-problems.md) | Recover a scalar, a field `k(x)`, the geometry, or a **neural coefficient** through any solve — the gradient flows through the whole march |
-| **Geometry** — `jno.Shape` / `jno.Path` | [stable](Domain-and-Geometry.md) | CSG via gmsh-OCC; conforming multi-material regions |
+| **Geometry** — `jno.shape` / `jno.Path` | [stable](Domain-and-Geometry.md) | CSG via gmsh-OCC; conforming multi-material regions |
 
 ### Pillar 2 — Scientific machine learning
 

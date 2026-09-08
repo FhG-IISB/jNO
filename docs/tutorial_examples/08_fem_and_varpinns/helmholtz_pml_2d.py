@@ -30,7 +30,7 @@ relu = lambda z: jno.np.maximum(z, 0.0)  # noqa: E731
 
 def solve_pml(sigma0):
     """Complex PML Helmholtz at absorber strength sigma0 (sigma0 = 0 -> no PML, u=0 cavity)."""
-    d = jno.Shape.rect(0.0, 0.0, L, L, size=0.022).domain()
+    d = jno.shape.rect(0.0, 0.0, L, L, size=0.022).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

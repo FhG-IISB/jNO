@@ -156,7 +156,7 @@ def test_gradients_match_finite_differences_on_a_non_symmetric_system():
 @requires_cudss
 def test_composes_as_a_fem_linear_slot():
     """It must be a drop-in for the `linear=` slot, not a standalone function."""
-    d = jno.Shape.rectangle(1.0, 1.0).domain(resolution=8)
+    d = jno.shape.rectangle(1.0, 1.0).domain(resolution=8)
     u, phi = d.fem_symbols()
     fem = jno.fem([jno.np.inner(jno.np.grad(u, d.coords), jno.np.grad(phi, d.coords)) - phi, u("boundary")])
     sol = fem.solve(linear=jno.solve.lu(backend="cudss"))

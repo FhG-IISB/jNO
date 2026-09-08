@@ -27,7 +27,7 @@ def annulus():
 
 @pytest.fixture(scope="module")
 def cube():
-    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain().mesh_connectivity
+    return jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain().mesh_connectivity
 
 
 @pytest.fixture(scope="module")

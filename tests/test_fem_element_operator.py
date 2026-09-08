@@ -136,7 +136,7 @@ def test_assembled_operator_carries_no_duplicate_triplets():
     pytest.importorskip("shapely", reason="shapely required for the box domain")
     import jno
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain()
     u, phi = d.fem_symbols()
     c = d.variable("interior", split=True)
     cb = d.variable("boundary", split=True)

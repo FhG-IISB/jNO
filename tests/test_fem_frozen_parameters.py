@@ -202,7 +202,7 @@ def test_frozen_jax_initializer_raises():
 
 def _laplace(order, names, size=0.25):
     """``-Δu = 1``, ``u = 0`` on the boundary, at a chosen element order."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
     u, phi = d.fem_symbols(order=order, names=names)
     si, sb = d.variable("interior", split=True), d.variable("boundary", split=True)
     xi, yi, xb, yb = si[0], si[1], sb[0], sb[1]

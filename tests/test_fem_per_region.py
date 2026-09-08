@@ -354,7 +354,7 @@ def test_region_in_transient_form():
 
 def test_region_in_3d():
     """Per-region integration works in 3D (centroid-in-predicate over tetrahedra)."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.18).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.18).domain()
     assert d.dimension == 3
     ball = lambda x, y, z: (x - 0.5) ** 2 + (y - 0.5) ** 2 + (z - 0.5) ** 2 < 0.25**2  # noqa: E731
     d.tag("ball", ball)
@@ -448,7 +448,7 @@ def _n1e_nested_box(mesh_size=0.16):
     on it as a (face-less) surface term -- a pre-existing property of `jno.fem`, unrelated to N1E."""
     c0 = (0.5, 0.5, 0.5)
     r2 = lambda x, y, z: (x - c0[0]) ** 2 + (y - c0[1]) ** 2 + (z - c0[2]) ** 2  # noqa: E731
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     d.tag("core", lambda x, y, z: r2(x, y, z) < 0.22**2)
     d.tag("shell", lambda x, y, z: (r2(x, y, z) >= 0.22**2) & (r2(x, y, z) < 0.36**2))
     d.tag("both", lambda x, y, z: r2(x, y, z) < 0.36**2)
@@ -487,7 +487,7 @@ def test_per_region_n1e_nested_regions_are_exactly_additive():
     inner3 = jno.np.inner
     c0 = (0.5, 0.5, 0.5)
     r2 = lambda x, y, z: (x - c0[0]) ** 2 + (y - c0[1]) ** 2 + (z - c0[2]) ** 2  # noqa: E731
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.16).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.16).domain()
     d.tag("core", lambda x, y, z: r2(x, y, z) < 0.22**2)
     d.tag("shell", lambda x, y, z: (r2(x, y, z) >= 0.22**2) & (r2(x, y, z) < 0.36**2))
     d.tag("both", lambda x, y, z: r2(x, y, z) < 0.36**2)

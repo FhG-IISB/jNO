@@ -43,7 +43,7 @@ def x64():
 
 
 def _grid(n=4):
-    return jno.Shape.rect(0, 0, 1, 1).quad().structured(n=n).domain(compute_mesh_connectivity=False)
+    return jno.shape.rect(0, 0, 1, 1).quad().structured(n=n).domain(compute_mesh_connectivity=False)
 
 
 def _mark_near(dom, centre, radius):
@@ -237,7 +237,7 @@ def test_a_hanging_node_on_a_tied_interface_is_refused_by_name():
 
 
 def test_local_refinement_of_a_non_quadrilateral_mesh_is_refused_by_name():
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain(compute_mesh_connectivity=False)
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain(compute_mesh_connectivity=False)
     with pytest.raises(NotImplementedError, match="quadrilateral"):
         refine_domain(d, [0])
 
@@ -350,7 +350,7 @@ def test_order_2_is_constrained_correctly_and_beats_the_mesh_it_refined(x64):
 def test_order_2_on_a_refined_HEX_mesh_is_refused_by_name(x64):
     """A hex's 2:1 interface also constrains DOFs lying on a FACE, which needs that face's order-2
     (9-node) basis rather than the edge basis. Refused rather than left partly constrained."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=2).quad().domain(compute_mesh_connectivity=False)
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=2).quad().domain(compute_mesh_connectivity=False)
     d = refine_domain(d, [0])
     u, v = d.fem_symbols(order=2)
     xi, yi, zi = d.variable("interior", split=True)[:3]
@@ -442,7 +442,7 @@ def test_a_complex_field_constrains_both_its_real_and_imaginary_parts(x64):
 def test_a_3d_vector_field_is_constrained_on_a_refined_hex_mesh(x64):
     """vec = 3 on hexes: the Kronecker expansion again, in the dimension where both hanging kinds
     (edge midpoints and face centres) occur at once."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain(compute_mesh_connectivity=False)
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain(compute_mesh_connectivity=False)
     p = np.asarray(d.mesh.points)[:, :3]
     h = np.asarray(d.mesh.cells_dict["hexahedron"])
     d = refine_domain(d, np.where(np.linalg.norm(p[h].mean(axis=1) - 0.5, axis=1) < 0.3)[0])

@@ -87,7 +87,7 @@ def _tiny_pdeformer():
 
 def _heat_problem(mesh_size=0.25, T_end=0.1, N_t=2):
     """A reusable 2-D heat problem fixture."""
-    domain = jno.Shape.rect(0, 0, 1, 1, size=mesh_size).domain(
+    domain = jno.shape.rect(0, 0, 1, 1, size=mesh_size).domain(
         time=(0, T_end, N_t),
     )
     x, y, t = domain.variable("interior")
@@ -341,7 +341,7 @@ class TestBuildTensors:
 
 class TestPDETraceWalker:
     def _setup(self, n_inr=1, n_branches=4):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.5).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.5).domain(
             time=(0, 0.1, 2),
         )
         x, y, t = domain.variable("interior")
@@ -496,7 +496,7 @@ class TestICExtraction:
 
     def test_sign_for_f_minus_u(self):
         """`ini = f - u0` → sign should be +1."""
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(
             time=(0, 0.1, 2),
         )
         x0, y0, t0 = domain.variable("initial")
@@ -517,7 +517,7 @@ class TestICExtraction:
         assert float(val) == pytest.approx(5.0)
 
     def test_pure_eval_substitutes_variable(self):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.4).domain(
             time=(0, 0.1, 2),
         )
         x0, *_ = domain.variable("initial")
@@ -610,7 +610,7 @@ class TestArgLayout:
         assert _model_call_arg_layout(mc) == (2, 0, 1)
 
     def test_missing_temporal_raises(self):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
         x, y = domain.variable("interior")[:2]
         net = jno.nn.wrap(_tiny_pdeformer())
         mc = net(x, y)
@@ -625,7 +625,7 @@ class TestArgLayout:
 
 class TestHelpers:
     def test_unwrap_loss_strips_mse(self):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
         x, y = domain.variable("interior")[:2]
         expr = (x - y).mse
         assert isinstance(expr, FunctionCall) and getattr(expr, "_name", None) == "mse"
@@ -633,7 +633,7 @@ class TestHelpers:
         assert getattr(inner, "_name", None) != "mse"
 
     def test_unwrap_loss_passthrough(self):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
         x, y = domain.variable("interior")[:2]
         e = x - y
         assert _unwrap_loss(e) is e
@@ -669,7 +669,7 @@ class TestAutoAttach:
         assert isinstance(net.module, PDEformer2Wrapper)
 
     def test_arg_order_baked_into_wrapper(self):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(
             time=(0, 0.1, 2),
         )
         x, y, t = domain.variable("interior")
@@ -699,7 +699,7 @@ class TestAutoAttach:
 
     def test_mixed_pdeformer_and_mlp_models(self):
         """An MLP combined with a PDEformer should leave the MLP untouched."""
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(
             time=(0, 0.1, 2),
         )
         x, y, t = domain.variable("interior")
@@ -725,7 +725,7 @@ class TestAutoAttach:
 
 class TestErrorPaths:
     def test_unsupported_op_in_pde(self):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(
             time=(0, 0.1, 2),
         )
         x, y, t = domain.variable("interior")
@@ -741,7 +741,7 @@ class TestErrorPaths:
 
     def test_no_pde_term_raises(self):
         """If the user only supplies an IC, the bridge should complain."""
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(
             time=(0, 0.1, 2),
         )
         x, y, t = domain.variable("interior")
@@ -765,7 +765,7 @@ class TestBoundaryConditions:
     by the DAG builder but still be trained as normal soft losses."""
 
     def _problem_with_bc(self):
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(
             time=(0, 0.1, 2),
         )
         x, y, t = domain.variable("interior")
@@ -892,7 +892,7 @@ def _dag_view(builder: PDEGraphBuilder, *, include_function_branches: bool = Tru
 
 def _heat_walker_setup(n_inr=2, n_branches=4):
     """Returns (walker, builder, net, (x, y, t, x0, y0, t0))."""
-    domain = jno.Shape.rect(0, 0, 1, 1, size=0.5).domain(
+    domain = jno.shape.rect(0, 0, 1, 1, size=0.5).domain(
         time=(0, 0.1, 2),
     )
     x, y, t = domain.variable("interior")
@@ -1121,7 +1121,7 @@ class TestDAGStructuralCorrectness:
 
     def test_ic_handles_reversed_sign(self):
         """If user writes `ini = f - u0`, IC values still match +f (not -f)."""
-        domain = jno.Shape.rect(0, 0, 1, 1, size=0.5).domain(
+        domain = jno.shape.rect(0, 0, 1, 1, size=0.5).domain(
             time=(0, 0.1, 2),
         )
         x, y, t = domain.variable("interior")

@@ -27,7 +27,7 @@ def _x64():
 
 
 def _domain():
-    return jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.6).domain()
+    return jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.6).domain()
 
 
 def test_i_builds_history_ref_carrying_base_shape_and_offset():

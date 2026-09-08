@@ -53,7 +53,7 @@ lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
 Gc, ell, eta = 2.0e-3, 0.08, 1e-3
 h = 0.04
 
-d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h).domain()
+d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).domain()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("bottom", split=True)
 xt, yt, _ = d.variable("top", split=True)

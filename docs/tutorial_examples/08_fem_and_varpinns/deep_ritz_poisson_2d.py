@@ -47,7 +47,7 @@ import jno.jnp_ops as jnn  # noqa: E402
 jax.config.update("jax_enable_x64", True)  # the mesh integral accumulates in float64
 
 # ---- domain, network trial, energy functional ----------------------------------------------
-dom = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+dom = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 xi, yi, _ = dom.variable("interior", split=True)  # .integrate() re-evaluates at the quadrature points
 
 # a capable network — the Gauss quadrature below keeps its energy honest (see the consistency note)
@@ -67,7 +67,7 @@ crux = jno.core([energy], domain=dom)  # the *signed* energy is the loss (it con
 crux.solve(4000)
 
 # ---- verify the trained network against the analytic solution (on a fresh grid) ------------
-test_dom = jno.Shape.rect(0, 0, 1, 1, size=0.035).domain()
+test_dom = jno.shape.rect(0, 0, 1, 1, size=0.035).domain()
 xt, yt, _ = test_dom.variable("interior", split=True)
 exact_expr = xt * (1 - xt) * yt * (1 - yt)
 pred = np.asarray(crux.eval([net(xt, yt) * exact_expr], domain=test_dom)).reshape(-1)

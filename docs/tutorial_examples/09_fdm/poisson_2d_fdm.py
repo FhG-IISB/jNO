@@ -21,7 +21,7 @@ import numpy as np  # noqa: E402
 import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 
-d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06).domain()
+d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06).domain()
 x, y, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 u = d.unknown()  # valued P1 nodal field (strong-form counterpart of fem_symbols())
@@ -64,7 +64,7 @@ plt.rcParams.update(
 
 def _solve_poisson(size):
     """Re-run the identical strong-form solve at a given mesh size; return (h, rel_L2)."""
-    dm = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    dm = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     xx, yy, _ = dm.variable("interior", split=True)
     xxb, yyb, _ = dm.variable("boundary", split=True)
     uu = dm.unknown()

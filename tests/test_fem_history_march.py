@@ -78,7 +78,7 @@ def _plastic_march_fem(nstep, peak, *, unload=True, size=0.5, sy=SY):
     """A clamped-base unit cube under a +z body load that ramps with τ (triangular if ``unload`` else
     monotonic 0→peak). Returns the assembled ``jno.fem`` (a pseudo-time march)."""
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain(tau=(0.0, 1.0, nstep))
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain(tau=(0.0, 1.0, nstep))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)
@@ -121,7 +121,7 @@ def test_elastic_control_returns_to_zero():
     """Same load path with NO plasticity (linear elasticity) returns to zero at τ=1 — isolating that the
     permanent set above is the plastic contribution, not a marching artefact."""
     sym, grad, trace, inner, _sqrt, _max, identity = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain(tau=(0.0, 1.0, 21))
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain(tau=(0.0, 1.0, 21))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)
@@ -159,7 +159,7 @@ def test_first_increment_matches_deformation_theory():
 
     # Deformation-theory reference: the same BVP with ep=0 baked (no history, plain steady solve).
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)
@@ -239,7 +239,7 @@ def test_bdf2_primary_unknown_history_marches_to_static():
         eps = lambda w: sym(grad(w, X))
         return K * trace(eps(u)) * I3 + 2 * MU * (eps(u) - trace(eps(u)) / 3 * I3)
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain(tau=(0.0, T, nstep))
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain(tau=(0.0, T, nstep))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)
@@ -258,7 +258,7 @@ def test_bdf2_primary_unknown_history_marches_to_static():
     traj = np.asarray(fem.solve())  # nothing passed; u.i(-1)/u.i(-2) auto-buffered from the solved u
 
     # Static reference: c·du/dt → 0, the plain elastic BVP under the same load.
-    dS = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
+    dS = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
     dS.tag("bot", lambda x, y, z: z < 1e-6)
     co = dS.variable("interior", split=True)
     cb = dS.variable("bot", split=True)
@@ -288,7 +288,7 @@ def test_surface_qp_history_accumulates_over_the_march():
     # by ∝ k: the per-step peak grows linearly, proving read + evolve + roll all work on face QPs.
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N = 6
-    d = jno.Shape.box(0, 0, 0, 3, 3, 2, size=0.9).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.box(0, 0, 0, 3, 3, 2, size=0.9).domain(tau=(0.0, 1.0, N))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     d.tag("top", lambda x, y, z: z > 2 - 1e-6)
     co = d.variable("interior", split=True)
@@ -336,7 +336,7 @@ def test_stick_slip_friction_caps_at_the_cone():
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     P0, MUF, k_t, D, N = 4.0, 0.3, 400.0, 0.06, 25  # normal pressure, friction coeff, tangential stiffness, drag, steps
     Lz, G = 2.0, MU  # MU (module constant) is the elastic shear modulus; MUF is the friction coefficient
-    d = jno.Shape.box(0, 0, 0, 3, 3, Lz, size=0.9).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.box(0, 0, 0, 3, 3, Lz, size=0.9).domain(tau=(0.0, 1.0, N))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     d.tag("top", lambda x, y, z: z > Lz - 1e-6)
     co = d.variable("interior", split=True)
@@ -390,7 +390,7 @@ def test_multifield_march_leaves_each_block_at_its_own_oracle():
     nstep, peak, size = 6, 5.0, 0.5
 
     def _mesh(**kw):
-        m = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain(**kw)
+        m = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain(**kw)
         m.tag("bot", lambda x, y, z: z < 1e-6)
         return m
 
@@ -454,7 +454,7 @@ def test_multifield_march_leaves_each_block_at_its_own_oracle():
 def _coupled_damage_march(*, irreversible, nstep=7, load=1.5, ell=0.4, gc=1.0, floor=0.3):
     """``(fem, damage_trajectory)`` for one leg of the A/B. ``irreversible`` selects the running max."""
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, nstep))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, nstep))
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = d.variable("interior", split=True), d.variable("left", split=True)
     X, tau = [co[0], co[1]], co[-1]
@@ -517,7 +517,7 @@ def test_gradient_flows_through_a_coupled_march_to_a_material_parameter():
     from jno.utils.solver.newton_krylov import newton_krylov
 
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 4))
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X, tau = [co[0], co[1]], co[-1]
@@ -577,7 +577,7 @@ def test_gradient_flows_through_a_coupled_march_to_a_material_parameter():
 def test_linear_form_with_step_history_marches_by_exact_superposition(coupled):
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N = 5
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -601,7 +601,7 @@ def test_linear_form_with_step_history_marches_by_exact_superposition(coupled):
         assert rel < 1e-9, f"superposition broke: the march is not linear in the state, rel {rel:.2e}"
 
     # And step 0 (virgin state, s = 0) is the plain steady solve of the same BVP.
-    dS = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    dS = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     dS.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = dS.variable("interior", split=True), dS.variable("bdry", split=True)
     XS = [co[0], co[1]]
@@ -618,7 +618,7 @@ def test_history_form_on_non_tau_domain_fails_loud():
     # The plastic physics reads `.i(-1)`, but on a plain (no-`tau`) domain `fem.solve()` has no load path
     # to march over — expect a clear error naming the fix (`domain(tau=...)`).
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()  # NO tau grid
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()  # NO tau grid
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)
@@ -645,7 +645,7 @@ def test_coupled_transient_with_evolves_fails_loud():
     # Lifting the single-field restriction exposed a new route: a COUPLED form reaches the multifield
     # assembler before the single-field transient check, so the `u.t` rejection has to exist there too.
     # Without it the evolution terms would be silently dropped on a coupled transient.
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(time=(0.0, 0.1, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(time=(0.0, 0.1, 4))
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _tb = d.variable("boundary", split=True)
     ci = d.variable("initial", split=True)
@@ -672,7 +672,7 @@ def test_internal_state_without_evolves_fails_loud():
     # Reads ep.i(-1) in the weak form but declares NO ep.evolves — the buffer would stay frozen at zero
     # (a silently wrong deformation-theory result). Must be a hard build error.
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain(tau=(0.0, 1.0, 4))
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain(tau=(0.0, 1.0, 4))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)
@@ -704,7 +704,7 @@ def test_internal_state_without_evolves_fails_loud():
 def test_scalar_state_reading_the_bare_trial_keeps_its_rank():
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N = 4
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(tau=(0.0, 1.0, N))
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X, tau = [co[0], co[1]], co[-1]
@@ -747,7 +747,7 @@ def test_scalar_state_reading_the_bare_trial_keeps_its_rank():
 def test_scalar_gradient_energy_readout_matches_the_closed_form_p1_gradient():
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N = 3
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, N))
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X, tau = [co[0], co[1]], co[-1]
@@ -796,7 +796,7 @@ def test_scalar_gradient_energy_readout_matches_the_closed_form_p1_gradient():
 def test_tau_dependent_dirichlet_drives_the_march():
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N, DELTA, LY = 5, 0.02, 1.0
-    d = jno.Shape.rect(0.0, 0.0, 0.5, LY, size=0.15).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.rect(0.0, 0.0, 0.5, LY, size=0.15).domain(tau=(0.0, 1.0, N))
     d.tag("bot", lambda x, y: y < 1e-9)
     d.tag("top", lambda x, y: y > LY - 1e-9)
     co, cb, ct = (d.variable(r, split=True) for r in ("interior", "bot", "top"))
@@ -841,7 +841,7 @@ def test_tau_dependent_dirichlet_drives_the_march():
 def test_tau_dependent_dirichlet_off_the_march_fails_loud():
     """A path that cannot thread the ramp must say so — dropping it returns a plausible u = 0."""
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 4))
     d.tag("bot", lambda x, y: y < 1e-9)
     d.tag("top", lambda x, y: y > 1 - 1e-9)
     co, cb, ct = (d.variable(r, split=True) for r in ("interior", "bot", "top"))
@@ -878,7 +878,7 @@ def _yeoh_march(*, order_u, line_search, n_steps=4, load=0.4):
     kb = 2 * (2 * c10) * (1 + nu) / (3 * (1 - 2 * nu))
     W = 4.0
 
-    d = jno.Shape.box(0, 0, 0, W, W, 0.4, size=W / 2).domain(tau=(0.0, 1.0, n_steps))
+    d = jno.shape.box(0, 0, 0, W, W, 0.4, size=W / 2).domain(tau=(0.0, 1.0, n_steps))
     d.tag("bot", lambda x, y, z: y < 1e-9)
     d.tag("top", lambda x, y, z: y > W - 1e-9)
     d.tag("bk", lambda x, y, z: z < 1e-9)
@@ -950,7 +950,7 @@ def test_march_guard_scores_the_min_map_not_the_bare_residual():
     """
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N = 4
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, N))
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = (d.variable(r, split=True) for r in ("interior", "left"))
     X = [co[0], co[1]]
@@ -992,7 +992,7 @@ def test_direct_driver_reaches_the_march():
     solve inside a `tau=` path. The answer must be unchanged, and the tangent must actually arrive."""
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N = 4
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = (d.variable(r, split=True) for r in ("interior", "left"))
     X = [co[0], co[1]]
@@ -1031,7 +1031,7 @@ def test_direct_staggered_marches_a_coupled_load_path():
     factorization instead of unpreconditioned Krylov — including through the `bounds` min-map."""
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
     N = 4
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = (d.variable(r, split=True) for r in ("interior", "left"))
     X = [co[0], co[1]]
@@ -1065,7 +1065,7 @@ def test_adapt_on_a_march_fails_loud():
     Remeshing cannot compose with the march because the per-quadrature-point state would have to be
     transferred onto each new mesh; that is wired for the transient stepper, not for `tau=`."""
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 4))
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = d.variable("interior", split=True), d.variable("left", split=True)
     X = [co[0], co[1]]

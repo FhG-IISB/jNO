@@ -409,13 +409,13 @@ def test_a_high_aspect_ratio_mesh_still_converges():
     assert np.abs(sol - exact).max() < 1e-8
 
 
-# ------------------------------------------------------------------- Shape.quad() (recombination)
+# ------------------------------------------------------------------- shape.quad() (recombination)
 
 
 def test_shape_quad_recombines_arbitrary_geometry():
     """gmsh meshes triangles and recombines them, which is not restricted to boxes: a DISK comes
     back as pure quadrilaterals, with no triangle left behind."""
-    for shape in (jno.Shape.rect(0, 0, 1, 1, size=0.25), jno.Shape.disk(0, 0, 1, size=0.3)):
+    for shape in (jno.shape.rect(0, 0, 1, 1, size=0.25), jno.shape.disk(0, 0, 1, size=0.3)):
         blocks = {c.type: len(c.data) for c in shape.quad().build()[0].cells}
         assert "triangle" not in blocks, f"recombination left triangles: {blocks}"
         assert blocks.get("quad", 0) > 0
@@ -424,7 +424,7 @@ def test_shape_quad_recombines_arbitrary_geometry():
 
 def test_shape_quad_solves_and_converges():
     def err(h):
-        d = jno.Shape.rect(0, 0, 1, 1, size=h).quad().domain()
+        d = jno.shape.rect(0, 0, 1, 1, size=h).quad().domain()
         u, v = d.fem_symbols()
         xi, yi, _ = d.variable("interior", split=True)
         xb, yb, _ = d.variable("boundary", split=True)
@@ -448,7 +448,7 @@ def test_shape_quad_solves_and_converges():
 def test_patch_test_on_a_recombined_disk():
     """The strongest geometric case available: unstructured quads on a curved boundary, where cell
     shapes are irregular by construction. A linear field is still reproduced to machine precision."""
-    d = jno.Shape.disk(0, 0, 1, size=0.15).quad().domain()
+    d = jno.shape.disk(0, 0, 1, size=0.15).quad().domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -467,15 +467,15 @@ def test_shape_quad_refuses_an_unstructured_3d_plan_and_a_curved_one():
     answer depends on whether ``.structured()`` is anywhere in the plan, and requiring it to come
     first would make the chain order-dependent."""
     with pytest.raises(NotImplementedError, match=r"\.structured\(\)"):
-        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad().build()
+        jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad().build()
     with pytest.raises(NotImplementedError, match="curved"):
-        jno.Shape.rect(0, 0, 1, 1, size=0.5).quad().curved().build()
+        jno.shape.rect(0, 0, 1, 1, size=0.5).quad().curved().build()
 
 
 def test_shape_quad_survives_the_other_modifiers():
     """`quad()` is a meshing property like `sized()`, so it must propagate through the plan
     operators rather than being dropped by the next transformation."""
-    s = (jno.Shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.Shape.disk(1.0, 0.5, 0.25)).sized(0.25)
+    s = (jno.shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.shape.disk(1.0, 0.5, 0.25)).sized(0.25)
     blocks = {c.type: len(c.data) for c in s.build()[0].cells}
     assert "triangle" not in blocks and blocks.get("quad", 0) > 0
 
@@ -485,9 +485,9 @@ def test_shape_quad_survives_the_other_modifiers():
 
 def test_tri_is_the_explicit_opposite_of_quad():
     """`.tri()` cancels a `.quad()` a shape inherited, and simplices remain the default."""
-    plain = {c.type for c in jno.Shape.rect(0, 0, 1, 1, size=0.4).build()[0].cells}
-    quad = {c.type for c in jno.Shape.rect(0, 0, 1, 1, size=0.4).quad().build()[0].cells}
-    back = {c.type for c in jno.Shape.rect(0, 0, 1, 1, size=0.4).quad().tri().build()[0].cells}
+    plain = {c.type for c in jno.shape.rect(0, 0, 1, 1, size=0.4).build()[0].cells}
+    quad = {c.type for c in jno.shape.rect(0, 0, 1, 1, size=0.4).quad().build()[0].cells}
+    back = {c.type for c in jno.shape.rect(0, 0, 1, 1, size=0.4).quad().tri().build()[0].cells}
     assert "triangle" in plain and "quad" not in plain
     assert "quad" in quad and "triangle" not in quad
     assert back == plain, ".tri() must undo .quad()"
@@ -498,9 +498,9 @@ def test_a_mixed_cell_plan_refuses_rather_than_picking_one():
     is per-surface and the regions conform along a shared edge in 2-D — but the assembler carries
     one element table, so it would build and fail to assemble. Refuse at the mesher, and say what to
     do instead (independent meshes + a mortar tie)."""
-    mixed = jno.Shape.regions(
-        left=jno.Shape.rect(0, 0, 1, 1, size=0.3).quad(),
-        right=jno.Shape.rect(1, 0, 2, 1, size=0.3).tri(),
+    mixed = jno.shape.regions(
+        left=jno.shape.rect(0, 0, 1, 1, size=0.3).quad(),
+        right=jno.shape.rect(1, 0, 2, 1, size=0.3).tri(),
     )
     assert mixed.cell_choices() == frozenset({"quad", "simplex"})
     with pytest.raises(NotImplementedError, match="more than one cell type"):
@@ -509,7 +509,7 @@ def test_a_mixed_cell_plan_refuses_rather_than_picking_one():
 
 def test_one_cell_choice_through_a_plan_is_not_mixed():
     """A single choice, however deep in the plan, must still mesh."""
-    s = (jno.Shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.Shape.disk(1.0, 0.5, 0.25)).sized(0.3)
+    s = (jno.shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.shape.disk(1.0, 0.5, 0.25)).sized(0.3)
     assert s.cell_choices() == frozenset({"quad"})
     assert "quad" in {c.type for c in s.build()[0].cells}
 
@@ -583,9 +583,9 @@ def _quad_poisson():
 
 
 def test_h_adaptivity_on_a_quad_mesh_needs_a_geometry_to_rebuild_from():
-    """There is no mmg for quads, so the remesh stage rebuilds the `Shape` plan at the marked size
+    """There is no mmg for quads, so the remesh stage rebuilds the `shape` plan at the marked size
     field instead — and this domain is built from a raw `Geometries` constructor, so it has no plan.
-    That is the honest refusal for it; a Shape-built quad mesh DOES adapt
+    That is the honest refusal for it; a shape-built quad mesh DOES adapt
     (`tests/test_fem_adapt_quad.py`).
 
     Two rounds, because a single round is solve + estimate and never reaches a remesh at all."""

@@ -45,7 +45,7 @@ TOL = 1e-6 * L
 
 def build(size, trainable=False):
     """The SAME weak form as the optimisation run: clamped left, unit traction on the right."""
-    d = jno.Shape.rect(0, 0, L, H, size=size).domain()
+    d = jno.shape.rect(0, 0, L, H, size=size).domain()
     if trainable:
         xm, ym, _ = d.variable("mv", where=lambda x, y: (x > TOL) & (x < L - TOL) & (y > TOL) & (y < H - TOL), split=True)
         xm.trainable(name="mesh_x"), ym.trainable(name="mesh_y")

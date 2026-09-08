@@ -40,7 +40,7 @@ def _x64():
 def _mixed_many_terms(size=0.35):
     """A mixed N1E x Lagrange form with SEVERAL additive volume terms -- the shape that multiplied
     the old path's triplet storage."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     p, q = d.fem_symbols(names=("p", "q"), space="Lagrange")
     ci = d.variable("interior", split=True)

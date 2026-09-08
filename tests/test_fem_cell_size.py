@@ -25,7 +25,7 @@ def _x64():
 
 
 def _square(n):
-    return jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain(compute_mesh_connectivity=False)
+    return jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain(compute_mesh_connectivity=False)
 
 
 def test_cell_size_resolves_to_mesh_size(_x64):

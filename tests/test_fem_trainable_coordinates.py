@@ -56,7 +56,7 @@ def _fd_grad(Jf, X0, eps=1e-6):
 
 
 def test_coordinate_gradient_matches_fd_2d():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
     xi, _, _ = d.variable("mv", where=lambda x, y: (x > 0.25) & (x < 0.75) & (y > 0.25) & (y < 0.75), split=True)
     xi.trainable(name="cx")
     op = d._trainable_coords[0]
@@ -77,7 +77,7 @@ def test_coordinate_gradient_matches_fd_2d():
 
 
 def test_coordinate_gradient_matches_fd_3d():
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.34).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.34).domain()
     xi, _, _, _ = d.variable(
         "mv", where=lambda x, y, z: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8) & (z > 0.2) & (z < 0.8), split=True
     )
@@ -102,7 +102,7 @@ def test_coordinate_gradient_matches_fd_3d():
 
 def test_only_promoted_region_is_trainable():
     """The design variable is exactly the promoted region's vertices — literal, per-component."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
     pts = np.asarray(d.mesh.points)
     in_box = (pts[:, 0] > 0.25) & (pts[:, 0] < 0.75) & (pts[:, 1] > 0.25) & (pts[:, 1] < 0.75)
     xi, _, _ = d.variable("mv", where=lambda x, y: (x > 0.25) & (x < 0.75) & (y > 0.25) & (y < 0.75), split=True)
@@ -114,7 +114,7 @@ def test_only_promoted_region_is_trainable():
 
 def test_relocation_descent_reduces_objective():
     """The coordinate gradient is usable: descending ∂J/∂X lowers J without tangling the mesh."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     xi, yi, _ = d.variable("mv", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
     xi.trainable(name="cx")
     spec = d._trainable_coords[0]
@@ -138,7 +138,7 @@ def test_crux_trains_the_coordinate_parameter():
     """Integration: jno.core discovers the coordinate parameter and moves it (the training path)."""
     import optax
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     xi, _, _ = d.variable("mv", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
     cx = xi.trainable(name="cx")
     cx.optimizer(optax.adam(1e-2))
@@ -157,7 +157,7 @@ def test_crux_trains_the_coordinate_parameter():
 def test_coordinate_with_surface_term_builds():
     """Feature 3: trainable coordinates + a Neumann surface term now assemble (the earlier guard is gone;
     the facet normals are JAX — see test_fem_trainable_normals.py for the full FD-vs-autodiff proof)."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
     u, phi = d.fem_symbols()
     xin, yin, _ = d.variable("interior", split=True)
     xb, yb, _tb, nxb, nyb = d.variable("boundary", split=True, normals=True)
@@ -181,7 +181,7 @@ def test_transient_assembly_is_coordinate_parametric():
     The mass matters as much as the operator here: ``M = ∫φᵢφⱼ dx ∝ |K|``, so a static mass on a moving mesh
     keeps the element volumes of the mesh you started from, at O(1/dt).
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -206,7 +206,7 @@ def test_transient_coordinate_gradient_matches_fd():
     """
     from jno.utils.solver.fem_adapt import _transient_march_fn
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -240,7 +240,7 @@ def test_transient_coordinate_gradient_matches_fd():
 def test_a_volume_tag_is_promotable_without_a_where_predicate():
     """``domain.variable("interior").trainable()`` — the r-adaptivity API's own example.
 
-    On a gmsh / ``jno.Shape`` domain ``"interior"`` is a VOLUME tag: it lives in ``tag_indices``
+    On a gmsh / ``jno.shape`` domain ``"interior"`` is a VOLUME tag: it lives in ``tag_indices``
     and never in ``_boundary_regions``, and it carries no location function, so both the predicate
     route and the assembler's region resolver had nothing to say about it and this raised
     ``region 'interior' has no location function``. A ``where=`` predicate was the only way in.
@@ -248,7 +248,7 @@ def test_a_volume_tag_is_promotable_without_a_where_predicate():
     A volume tag names every vertex of that volume, the boundary ones included — that is what the
     tag means, and it is what the mesh-motion driver wants. Pass ``where=`` for a strict subset.
     """
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
     n_nodes = int(np.asarray(d.mesh.points).shape[0])
 
     xi, yi, _ = d.variable("interior", split=True)
@@ -265,7 +265,7 @@ def test_a_named_boundary_still_resolves_through_the_existing_route():
     that answer — not the mesh tag's node list — stays authoritative."""
     from jno.utils.solver.fem_native import _region_node_ids_from_pts
 
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
     pts = np.asarray(d.mesh.points)
     expected = sorted(int(i) for i in _region_node_ids_from_pts(d, "left", pts))
 
@@ -274,6 +274,6 @@ def test_a_named_boundary_still_resolves_through_the_existing_route():
 
 
 def test_an_unknown_tag_still_fails_loud():
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
     with pytest.raises(ValueError):
         d.variable("no_such_region", split=True)[0].trainable(name="q")

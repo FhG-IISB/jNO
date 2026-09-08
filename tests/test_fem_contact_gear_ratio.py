@@ -159,12 +159,12 @@ def _solve(theta, drive=9.0e-3, h_rim=0.022, h_hub=0.060, rounds=6, capture=0.06
     sym, tr, inner = n.symgrad, n.trace, n.inner
 
     a, b = _pair(theta)
-    hub_a, hub_b = jno.Shape.disk(0, 0, RHA), jno.Shape.disk(CENTRE, 0, RHB)
-    d = jno.Shape.regions(
+    hub_a, hub_b = jno.shape.disk(0, 0, RHA), jno.shape.disk(CENTRE, 0, RHB)
+    d = jno.shape.regions(
         hubA=hub_a.sized(h_hub),
-        rimA=(jno.Shape.polygon(a) - hub_a).sized(h_rim),
+        rimA=(jno.shape.polygon(a) - hub_a).sized(h_rim),
         hubB=hub_b.sized(h_hub),
-        rimB=(jno.Shape.polygon(b) - hub_b).sized(h_rim),
+        rimB=(jno.shape.polygon(b) - hub_b).sized(h_rim),
         conforming=True,
     ).domain()
     _ = d.built_mesh

@@ -62,7 +62,7 @@ def _poisson(g=0.35, size=0.2):
     """Scalar nonlinear Poisson with an INHOMOGENEOUS Dirichlet value (g != 0 is what exercises the
     lift: with g = 0 the projection is the identity and the test would be vacuous)."""
     inner, grad, _s, _t, _i = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -75,7 +75,7 @@ def _elasticity(size=0.5):
     energy's Hessian and is symmetric by construction. (A nonlinear form that is not the gradient of a
     potential has no reason to give a symmetric tangent — that is a property of the physics.)"""
     inner, grad, sym, trace, ident = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co, cb = d.variable("interior", split=True), d.variable("bot", split=True)
     X = [co[0], co[1], co[2]]
@@ -92,7 +92,7 @@ def _elasticity(size=0.5):
 def _advection(b=1.0, size=0.25):
     """A genuinely NON-symmetric operator — the control."""
     inner, grad, _s, _t, _i = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -198,7 +198,7 @@ def test_the_constrained_solution_is_unchanged_and_correct():
     test and not the linear assembly."""
     inner, grad, _s, _t, _i = _aliases()
     g = 0.4
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]

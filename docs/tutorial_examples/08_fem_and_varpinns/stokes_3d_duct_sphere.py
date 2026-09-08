@@ -37,7 +37,7 @@ CX, CY, CZ, R = 0.35, 0.2, 0.2, 0.1  # sphere centre and radius
 U0 = 1.0  # peak inflow speed
 EPS = 1e-9
 
-duct = jno.Shape.box(0, 0, 0, L, H, H) - jno.Shape.sphere(CX, CY, CZ, R)
+duct = jno.shape.box(0, 0, 0, L, H, H) - jno.shape.sphere(CX, CY, CZ, R)
 d = duct.size(0.06).domain()
 
 # Boundary regions. The downstream face is deliberately left untagged -> natural (do-nothing).

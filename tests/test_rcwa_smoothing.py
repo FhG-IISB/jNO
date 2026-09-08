@@ -75,7 +75,7 @@ def _pillar_cons(d, hw=0.22, eps_val=1.5):
 
 
 def _dom():
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     e = 1e-6  # explicit face predicates -> multidirectional (x AND y) periodicity needs tagged faces
     d.tag("left", lambda x, y, z: x < e)
     d.tag("right", lambda x, y, z: x > P - e)

@@ -526,7 +526,7 @@ def test_periodic_poisson():
     Dirichlet u=0 in y ⇒ u = sin(2πx)sin(πy). The tie holds to machine precision."""
     import jno.jnp_ops as jnn
 
-    d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).structured())
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).structured())
     p = _nodes(d)
     x, y, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)
@@ -629,8 +629,8 @@ def _nodes3(d):
 
 
 def _cube(mesh_size):
-    """Unit cube meshed by jno.Shape (gmsh tets) — no shapely."""
-    return jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=mesh_size).domain()
+    """Unit cube meshed by jno.shape (gmsh tets) — no shapely."""
+    return jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=mesh_size).domain()
 
 
 def _poisson3d(mesh_size, method="cotangent"):
@@ -839,8 +839,8 @@ def test_constraint_list_poisson_3d():
 
 
 def test_mesh_nodes_in_3d_shape_box():
-    """Keystone 3-D containment: `jno.fdm._mesh_nodes_in` resolves a `jno.Shape.box` sub-region to the
-    exact tetrahedral-mesh node subset via the analytic 3-D `Shape.contains` — the production path both
+    """Keystone 3-D containment: `jno.fdm._mesh_nodes_in` resolves a `jno.shape.box` sub-region to the
+    exact tetrahedral-mesh node subset via the analytic 3-D `shape.contains` — the production path both
     `_TraceFDM._region_nodes` and `jno.dd._region_mask` route through to turn a geometric sub-region into
     a node set. This is what shapely could never do (it is 2-D only). (Wiring such a region into a *3-D
     coupled solve* additionally needs region-tag support on the base 3-D domain — a separate feature.)"""
@@ -848,7 +848,7 @@ def test_mesh_nodes_in_3d_shape_box():
 
     d = _cube(0.12)
     p = _nodes3(d)
-    core = jno.Shape.box(0.3, 0.3, 0.3, 0.7, 0.7, 0.7)
+    core = jno.shape.box(0.3, 0.3, 0.3, 0.7, 0.7, 0.7)
     idx = _mesh_nodes_in(p, core)
     # resolves exactly the analytic 3-D containment ...
     assert np.array_equal(np.sort(idx), np.sort(np.nonzero(core.contains(p))[0]))

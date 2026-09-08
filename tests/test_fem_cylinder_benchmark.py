@@ -63,7 +63,7 @@ def _x64():
 
 def _solve(h_far, h_cyl):
     """Steady NS past the cylinder; returns (cD, cL, dP, probe_offset, fem, classification)."""
-    shape = jno.Shape.rect(0, 0, L, H, size=h_far) - jno.Shape.disk(CX, CY, RR, size=h_cyl)
+    shape = jno.shape.rect(0, 0, L, H, size=h_far) - jno.shape.disk(CX, CY, RR, size=h_cyl)
     d = shape.domain()
     d.tag("inlet", lambda x, y: x < EPS)
     d.tag("walls", lambda x, y: (y < EPS) | (y > H - EPS))

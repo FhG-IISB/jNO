@@ -56,7 +56,7 @@ def _convex_pair(size=0.12):
 
     Linear and coercive, so it has one solution and both drivers must find it."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -105,7 +105,7 @@ def test_sweep_order_does_not_change_the_solution():
 # --------------------------------------------------------------------------------------------------
 def _phase_field(load=2.0, ell=0.4, gc=1.0, eta=1e-4, size=0.34):
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = d.variable("interior", split=True), d.variable("left", split=True)
     X = [co[0], co[1]]
@@ -157,7 +157,7 @@ def test_staggered_solves_the_non_convex_energy_that_monolithic_cannot():
 # --------------------------------------------------------------------------------------------------
 def test_gradient_flows_through_the_sweep():
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -209,7 +209,7 @@ def test_a_repeated_field_fails_loud():
 
 def test_a_single_field_problem_fails_loud():
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -299,7 +299,7 @@ def test_direct_staggered_gradient_matches_finite_differences():
     """Differentiability is a requirement, not a nice-to-have. The direct route hangs `custom_root` off
     the root it found and solves the tangent (and its TRANSPOSE, for reverse mode) directly."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -391,7 +391,7 @@ def test_over_relax_keeps_a_box_constrained_field_feasible():
     extrapolation need not be, so the driver asks the `bounds` wrapper for its projector. Without that
     the damage would leave [0, 1] mid-iteration."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = d.variable("interior", split=True), d.variable("left", split=True)
     X = [co[0], co[1]]
@@ -456,7 +456,7 @@ def test_over_relax_on_a_ramped_dirichlet_march_matches_the_unrelaxed_answer():
     (the case that exposed this — g changes every load step, so `g - u_prev` is large at sweep 1) is
     held exactly and the over-relaxed march lands on the same trajectory."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 4))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 4))
     d.tag("bot", lambda x, y: y < 1e-9)
     d.tag("top", lambda x, y: y > 1 - 1e-9)
     co, cb, ct = (d.variable(r, split=True) for r in ("interior", "bot", "top"))

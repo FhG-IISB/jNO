@@ -46,9 +46,9 @@ Two bodies, each meshed at its own size; `conforming=False` skips the fragment, 
 exists twice — once per body — and each is meshed independently.
 
 ```python
-d = jno.Shape.regions(
-    substrate=jno.Shape.rect(0.0, 0.0, 1.0, L_SUB, size=H_SUB),
-    coating=jno.Shape.rect(0.0, L_SUB, 1.0, L_SUB + L_FILM, size=H_FILM),
+d = jno.shape.regions(
+    substrate=jno.shape.rect(0.0, 0.0, 1.0, L_SUB, size=H_SUB),
+    coating=jno.shape.rect(0.0, L_SUB, 1.0, L_SUB + L_FILM, size=H_FILM),
     conforming=False,
 ).domain()
 

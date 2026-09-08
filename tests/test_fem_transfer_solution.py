@@ -30,11 +30,11 @@ def _x64():
 
 
 def _rect(size, x0=0.0, y0=0.0, x1=1.0, y1=1.0):
-    return jno.Shape.rect(x0, y0, x1, y1, size=size).domain()
+    return jno.shape.rect(x0, y0, x1, y1, size=size).domain()
 
 
 def _box(size):
-    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    return jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
 
 
 def _verts(d):

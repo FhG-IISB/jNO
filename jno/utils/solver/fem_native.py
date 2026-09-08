@@ -196,7 +196,7 @@ def _basix_ordered(cells: np.ndarray, cell_type: str) -> np.ndarray:
 
 
 def _refuse_nonconforming_promotion(domain, order: int) -> None:
-    """Refuse order > 1 on a ``Shape.regions(..., conforming=False)`` domain.
+    """Refuse order > 1 on a ``shape.regions(..., conforming=False)`` domain.
 
     `_promote_to_degree` dedups synthesised nodes by physical COORDINATE, which is the right
     conformity test for one body and the wrong one for two: a non-conforming interface is coincident
@@ -218,7 +218,7 @@ def _refuse_nonconforming_promotion(domain, order: int) -> None:
     ):
         raise NotImplementedError(
             f"order-{order} elements on a mesh that is BOTH locally refined (hanging nodes) and has "
-            "a Shape.regions(..., conforming=False) interface: the higher-order promotion must MERGE "
+            "a shape.regions(..., conforming=False) interface: the higher-order promotion must MERGE "
             "coincident nodes across a 2:1 refinement and must NOT merge them across two coincident "
             "bodies, and those cannot both hold on one mesh. Use order-1, or drop one of the two."
         )
@@ -266,7 +266,7 @@ def _get_mesh(domain, dim: int, order: int):
     pts_all = np.asarray(domain.mesh.points)[:, :dim]
 
     if curved_key in cd:
-        # CURVED (isoparametric) mesh from `Shape.curved()`: gmsh already placed the higher-order nodes
+        # CURVED (isoparametric) mesh from `shape.curved()`: gmsh already placed the higher-order nodes
         # on the CAD surface, so they must be USED, never re-synthesised. The first dim+1 columns of a
         # curved cell are its vertices, giving the P1 sub-mesh the facet/region machinery wants -- kept
         # in the SAME id space as the curved mesh so a node id means one thing everywhere (the promoted
@@ -278,7 +278,7 @@ def _get_mesh(domain, dim: int, order: int):
             # the midside DOF coordinates (on the arc) and the geometric map (from the chord) in
             # disagreement -- an inconsistent discretisation, not merely a coarse one.
             raise ValueError(
-                f"Shape.curved() gives order-2 geometry but this field is P{order}. Isoparametric "
+                f"shape.curved() gives order-2 geometry but this field is P{order}. Isoparametric "
                 f"geometry needs a matching basis: pass element_type='{'TRI6' if dim == 2 else 'TET10'}' "
                 "(or order=2) to jno.fem, or drop .curved() to mesh straight-sided."
             )
@@ -1587,7 +1587,7 @@ def assemble_fem_native(
                 raise ValueError(
                     f"tag({region!r}, region={_owner!r}): {_owner!r} has no nodes on this mesh, so the "
                     "two sides of the interface cannot be told apart. `region=` must name a body "
-                    f"(a Shape.regions name). Known: {sorted(getattr(domain, 'tag_indices', {}) or {})}."
+                    f"(a shape.regions name). Known: {sorted(getattr(domain, 'tag_indices', {}) or {})}."
                 )
             _rnodes &= {int(n) for n in np.asarray(_own).reshape(-1)}
         _mask = np.array(
@@ -3165,7 +3165,7 @@ def assemble_fem_native(
     def _drop_interface_only_nodes(bf: np.ndarray, bnodes: np.ndarray, pts_all: np.ndarray) -> np.ndarray:
         """Remove nodes that sit **only** on a non-conforming interface from the catch-all boundary.
 
-        ``Shape.regions(conforming=False)`` meshes each body independently, so the two sides of an
+        ``shape.regions(conforming=False)`` meshes each body independently, so the two sides of an
         interface are each a facet of exactly one cell -- topologically boundary, and correctly so.
         Semantically they are internal: a tie glues them. Without this filter a plain
         ``u(boundary) - g`` pins the interface, which silently solves two disconnected bodies. Measured

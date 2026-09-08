@@ -70,15 +70,15 @@ which you want when the region is not a named tag or you want the convergence re
 ```python
 from jno.dd import couple
 
-sA, sB = jno.Shape.rect(0.0, 0.0, 0.6, 1.0), jno.Shape.rect(0.4, 0.0, 1.0, 1.0)
+sA, sB = jno.shape.rect(0.0, 0.0, 0.6, 1.0), jno.shape.rect(0.4, 0.0, 1.0, 1.0)
 sol, info = couple([(a, sA), (b, sB)]).solve(tol=1e-7, max_iter=60, return_info=True)
 
 info    # {'mode': 'overlap-Schwarz', 'iterations': 11, 'overlap_jump': 3.59e-08,
         #  'interfaces': {'count': 0, 'flux': 0, 'value': 0}}
 ```
 
-The region is a `jno.Shape`, resolved to a node subset by the analytic, shapely-free
-[`Shape.contains`](Domain-and-Geometry.md) — 2-D **and** 3-D.
+The region is a `jno.shape`, resolved to a node subset by the analytic, shapely-free
+[`shape.contains`](Domain-and-Geometry.md) — 2-D **and** 3-D.
 
 ## Two coupling modes, chosen by the geometry
 

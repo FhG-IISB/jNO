@@ -388,7 +388,7 @@ def _refuse_curved_hessian(J: jnp.ndarray) -> None:
             "A 4th-order weak form (Argyris / Morley / Hermite, phase-field, plates) needs the physical "
             "Hessian, whose transform assumes an AFFINE cell -- on curved geometry it gains a curvature "
             "term this does not carry, and the result would be wrong with nothing to flag it. Drop "
-            "Shape.curved() for a 4th-order form, or use a straight-sided domain."
+            "shape.curved() for a 4th-order form, or use a straight-sided domain."
         )
 
 

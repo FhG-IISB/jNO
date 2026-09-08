@@ -55,7 +55,7 @@ def test_a_regular_simplex_reads_exactly_one_in_2d():
     """The normalisation is the whole point of the measure: 1.0 is 'as good as a triangle gets'."""
     pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2], [2.0, 0.0], [3.0, 0.0], [2.5, 0.05]])
     cells = np.array([[0, 1, 2], [3, 4, 5]])
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     d._apply_mesh(
         meshio.Mesh(
             np.c_[pts, np.zeros(len(pts))],
@@ -89,7 +89,7 @@ def test_it_matches_a_direct_reference_in_3d():
 def test_the_gradient_in_the_vertices_matches_finite_differences():
     """It is a mesh-motion quantity, so the gradient is the half that has to be right -- and a
     nonzero gradient is not evidence, a wrong one is also nonzero."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
     _xm, ym, _ = d.variable("mov", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
     ym.trainable(name="iy")
     node = d.cell_aspect()

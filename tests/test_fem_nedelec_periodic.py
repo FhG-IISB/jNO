@@ -31,7 +31,7 @@ def _x64():
 
 
 def _periodic_box(size=0.3):
-    d = jno.domain(jno.Shape.box(0, 0, 0, 0.6, 0.6, 1.0, size=size))
+    d = jno.domain(jno.shape.box(0, 0, 0, 0.6, 0.6, 1.0, size=size))
     e = 1e-6
     d.tag("left", lambda x, y, z: x < e)
     d.tag("right", lambda x, y, z: x > 0.6 - e)
@@ -128,7 +128,7 @@ def test_edges_on_tag_matches_on_a_real_mesh():
     from jno._fem import _edges_on_tag
     from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
     cells = np.asarray(d.built_mesh.cells_dict["tetra"])
     ev = build_edge_topology(cells, BASIX_TET_EDGES).edge_vertices
     pts = np.asarray(d.built_mesh.points)

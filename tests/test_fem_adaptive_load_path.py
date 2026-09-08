@@ -66,7 +66,7 @@ def _burst_march(nstep, *, power=8.0, peak=14.0, size=0.25):
     An inert state field carries no physics; it is there because ``.i(k)`` is what triggers the march.
     """
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(tau=(0.0, 1.0, nstep))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(tau=(0.0, 1.0, nstep))
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X, tau = [co[0], co[1]], co[-1]
@@ -182,7 +182,7 @@ def test_replay_over_the_frozen_schedule_reproduces_the_pilot():
 # --------------------------------------------------------------------------------------------------
 def _parametric_burst(nstep=5, size=0.3):
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(tau=(0.0, 1.0, nstep))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(tau=(0.0, 1.0, nstep))
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X, tau = [co[0], co[1]], co[-1]
@@ -247,7 +247,7 @@ def test_adaptive_without_a_limit_fails_loud():
 
 def test_limit_in_the_time_slot_fails_loud():
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(time=(0.0, 0.1, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(time=(0.0, 0.1, 5))
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     ci = d.variable("initial", split=True)
@@ -260,7 +260,7 @@ def test_limit_in_the_time_slot_fails_loud():
 
 def test_tau_slot_without_a_march_fails_loud():
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
     X = [co[0], co[1]]
@@ -326,7 +326,7 @@ def test_the_pilot_scores_the_min_map_on_a_bounded_march():
     cannot finish at all unless it scores the right function.
     """
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 5))
     d.tag("left", lambda x, y: x < 1e-9)
     co, cl = d.variable("interior", split=True), d.variable("left", split=True)
     X, tau = [co[0], co[1]], co[-1]

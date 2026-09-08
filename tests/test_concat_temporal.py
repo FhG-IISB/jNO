@@ -30,7 +30,7 @@ def _x64():
 
 def test_bare_temporal_matches_manual_broadcast():
     """`concat([x, y, t])` == `concat([x, y, t + 0*x])` — the alignment is what users hand-wrote."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(time=(0.0, 1.0, 3))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(time=(0.0, 1.0, 3))
     x, y, t = d.variable("interior")
 
     bare = jno.np.concat([x, y, t], axis=-1)
@@ -45,7 +45,7 @@ def test_bare_temporal_matches_manual_broadcast():
 
 def test_bare_temporal_trunk_compiles_promptly():
     """The regression: a 2D spatiotemporal trunk with a bare `t` used to hang forever."""
-    d = jno.Shape.rect(0.0, 0.0, 100.0, 100.0, size=25.0).domain(time=(0.0, 45.0, 4))
+    d = jno.shape.rect(0.0, 0.0, 100.0, 100.0, size=25.0).domain(time=(0.0, 45.0, 4))
     x, y, t = d.variable("interior")
 
     net = jno.nn(foundax.mlp(in_features=3, output_dim=1, hidden_dims=16, num_layers=2, key=jax.random.PRNGKey(0)))
@@ -60,7 +60,7 @@ def test_bare_temporal_trunk_compiles_promptly():
 
 
 def test_spatial_only_concat_unaffected():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     x, y, _ = d.variable("interior")
     out = jno.core([], domain=d).eval(jno.np.concat([x, y], axis=-1))
     assert jnp.asarray(out).shape[-1] == 2
