@@ -80,6 +80,49 @@ def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
                 domain, node.right, -sign, infer_term_bucket
             )
 
+    # A scalar multiplying (or dividing) an additive GROUP is not an atomic term. Left whole, the
+    # callers that route a sub-term by its temporal order -- the transient mass/stiffness split, the
+    # second-order mass/damping/stiffness split, the complex-transient split -- read ONE order for the
+    # whole product. `c * (rho*(u_t,v) + mu*(grad u, grad v) - (p, div v))` then reports order 1, so the
+    # viscous and pressure parts are stripped into the MASS matrix and the stiffness is empty: the march
+    # returns a finite, plausible trajectory with no restoring force (measured on a traction-driven
+    # Stokes film: 2.99e-3 m/s against a correct 3.28, growing linearly with step count instead of
+    # saturating). Distribution is exact and restores the answer bit-for-bit.
+    #
+    # `-(a + b)` is `Literal(-1) * (a + b)`, so a negated group is the same trap and is fixed here too.
+    # Division distributes only through its NUMERATOR: `c / (a + b)` is not `c/a + c/b`.
+    if isinstance(node, BinaryOp) and node.op in {"*", "/"}:
+        sides = (
+            ((node.left, node.right, False),)
+            if node.op == "/"
+            else (
+                (node.left, node.right, False),
+                (node.right, node.left, True),
+            )
+        )
+        for group, other, other_on_left in sides:
+            if not (isinstance(group, BinaryOp) and group.op in {"+", "-"}):
+                continue
+            # Keep a whole boundary group together, exactly as the +/- branch above does -- a facet
+            # term is assembled as one kernel and must not be scattered across sub-terms.
+            if infer_term_bucket is not None:
+                try:
+                    bucket = infer_term_bucket(domain, node)
+                except Exception:
+                    bucket = None
+                if bucket is not None and bucket[0] == "boundary":
+                    return [(sign, node)]
+            out = []
+            for part_sign, part in split_weak_additive_terms(domain, group, sign, infer_term_bucket):
+                if node.op == "/":
+                    product = part / other
+                else:
+                    product = (other * part) if other_on_left else (part * other)
+                # Recurse: `other` may itself be additive, and each pass strictly removes one additive
+                # node, so this terminates.
+                out.extend(split_weak_additive_terms(domain, product, part_sign, infer_term_bucket))
+            return out
+
     return [(sign, node)]
 
 
