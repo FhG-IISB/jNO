@@ -528,8 +528,8 @@ Without it the loss minimum is *not* the PDE solution.
     | problem | rel L2 |
     |---|---|
     | Poisson, hard-BC ansatz | 4.2e-05 |
-| **3-D** Poisson on the cube | 4.6e-04 |
-| **3-D** Neumann flux face | 8.4e-04 |
+    | **3-D** Poisson on the cube | 4.6e-04 |
+    | **3-D** Neumann flux face | 8.4e-04 |
     | Neumann flux (`u = x`) | 6.8e-04 |
     | cubic nonlinearity (`+ u³`) | 9.8e-05 |
     | vector Poisson, `u* = (a, 2a)` | 1.3e-04 / 2.8e-04 |
