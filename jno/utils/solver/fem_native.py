@@ -3652,6 +3652,10 @@ def assemble_fem_native(
         sub_signed = [
             _apply_sign(domain, sign, sub) for bare in volume_terms for sign, sub in _split_additive_terms(domain, bare)
         ]
+        from .weak_form_helpers import refuse_mixed_temporal_group
+
+        for _t in sub_signed:
+            refuse_mixed_temporal_group(_t, where="jno.fem")
         temporal = [t for t in sub_signed if _contains_temporal_derivative(t)]
         spatial = [t for t in sub_signed if not _contains_temporal_derivative(t)]
         if not temporal:

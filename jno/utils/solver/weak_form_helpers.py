@@ -126,6 +126,45 @@ def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
     return [(sign, node)]
 
 
+def refuse_mixed_temporal_group(node, where="jno.fem"):
+    """Raise if an additive group inside ``node`` mixes temporal orders.
+
+    The callers that route a sub-term by its temporal order -- the transient mass/stiffness split, the
+    second-order mass/damping/stiffness split, the complex-transient split -- read ONE order per
+    sub-term. `split_weak_additive_terms` distributes a scalar over an additive group so the usual
+    spellings separate, but a group it cannot reach stays atomic: an argument to an operator, as in
+    `inner(u_t + (u.grad)u, v)`, where distributing would mean asserting that the operator is linear in
+    that slot.
+
+    Left alone the whole sub-term is read as order 1 and its spatial part is stripped into the MASS
+    matrix, so the march returns a finite, plausible trajectory with no restoring force. Measured on a
+    transient Stokes film with a linear drag: `inner(u_t, v) + K inner(u, v)` gives a final peak
+    velocity of 2.118, and `rho inner(u_t + (K/rho) u, v)` -- the same equation -- gives 0.177619.
+
+    So it is refused by name. Splitting the term by hand is always available and is what every jNO
+    tutorial already does.
+    """
+    from .solver_helper import iter_children
+    from .solver_helper import max_temporal_derivative_order as _mto
+
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, BinaryOp) and n.op in {"+", "-"}:
+            ol, orr = _mto(n.left), _mto(n.right)
+            if ol != orr:
+                raise ValueError(
+                    f"{where}: a weak term adds a temporal-derivative expression (order {max(ol, orr)}) "
+                    f"to a non-temporal one (order {min(ol, orr)}) inside a sub-expression this "
+                    "assembler cannot split -- typically an operator argument such as "
+                    "`inner(u.t + (u.grad)u, v)`. The whole group would be routed by ONE temporal "
+                    "order, stripping the spatial part into the mass matrix and silently returning a "
+                    "march with no restoring force. Write the `u.t` part as its own term: "
+                    "`inner(u.t, v) + inner((u.grad)u, v)`."
+                )
+        stack.extend(iter_children(n) or ())
+
+
 # ---------------------------------------------------------------------------
 # Function/test-symbol helpers
 # ---------------------------------------------------------------------------

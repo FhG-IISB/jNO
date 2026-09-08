@@ -5,7 +5,10 @@ classify each sub-term by its temporal order, so `c * (u_t-term + spatial-term)`
 for the whole product: the spatial part was stripped into the MASS matrix and the stiffness came out
 empty. The march then returned a finite, plausible trajectory with no restoring force.
 
-`-(a + b)` is `Literal(-1) * (a + b)`, so a negated group was the same trap.
+`-(a + b)` is `Literal(-1) * (a + b)`, so a negated group was the same trap. The group also sits at
+any DEPTH in a product chain: `rho * c * (u_t + u.grad u) * phi` parses as
+`((rho*c) * (u_t + u.grad u)) * phi`, so neither operand of the outermost node is additive and a fix
+that only inspects immediate children misses it. That spelling is the common one in practice.
 
 The oracle is the bare spelling: scaling an equation by 1 cannot move its solution, and distributing
 a scalar over a sum is exact, so every spelling below must agree to round-off.
@@ -55,14 +58,21 @@ def _solve(spelling):
 
     mass = RHO * inner(ui.t, vi, n_contract=1)  # temporal order 1
     stiff = MU * inner(gu, gv, n_contract=2) - pp * trace(gv)  # temporal order 0
+    KDRAG = 1.0e5  # a linear Darcy drag, so the nested case stays linear and has an exact oracle
+    drag = KDRAG * inner(ui, vi, n_contract=1)  # temporal order 0
     con = -qq * trace(gu)
     mom = {
         "bare": lambda: mass + stiff,
+        "bare_with_drag": lambda: mass + RHO * drag + stiff,
         "wrapped": lambda: 1.0 * (mass + stiff),  # the defect
         "distributed": lambda: 1.0 * mass + 1.0 * stiff,
         "negated": lambda: -(-mass - stiff),  # Literal(-1) * (a + b), twice
         "divided": lambda: (mass + stiff) / 1.0,
         "scaled2": lambda: 2.0 * (mass + stiff),
+        # the mixed-order group buried in a PRODUCT CHAIN, the melt pool's spelling:
+        # `rho * (u_t-part + order-0-part)` parses as a product whose additive factor is not an
+        # operand of the outermost node.
+        "nested": lambda: RHO * (inner(ui.t, vi, n_contract=1) + drag) + stiff,
     }[spelling]()
     if spelling == "scaled2":
         con = 2.0 * con
@@ -85,10 +95,12 @@ def _solve(spelling):
     return np.linalg.norm(U, axis=-1).max(axis=1)
 
 
-@pytest.mark.parametrize("spelling", ["wrapped", "distributed", "negated", "divided"])
+@pytest.mark.parametrize("spelling", ["wrapped", "distributed", "negated", "divided", "nested"])
 def test_a_scalar_on_a_mixed_order_term_does_not_change_the_solution(spelling):
-    """The whole point: `1.0 * (mass + stiff)` must equal `mass + stiff`."""
-    ref, got = _solve("bare"), _solve(spelling)
+    """The whole point: `1.0 * (mass + stiff)` must equal `mass + stiff`, and so must the same group
+    buried inside a product chain."""
+    ref = _solve("bare_with_drag") if spelling == "nested" else _solve("bare")
+    got = _solve(spelling)
     assert np.allclose(got, ref, rtol=1e-10, atol=0.0), (
         f"{spelling}: final |u| {got[-1]:.6e} against the bare spelling's {ref[-1]:.6e}"
     )
@@ -115,3 +127,51 @@ def test_scaling_the_equation_scales_the_answer_the_way_the_math_says():
     assert np.allclose(got, 0.5 * ref, rtol=1e-8, atol=0.0), (
         f"scaled: {got[-1]:.6e} against the expected {0.5 * ref[-1]:.6e}"
     )
+
+
+def test_a_group_the_splitter_cannot_reach_is_refused_by_name():
+    """The other shape: an additive group that is an OPERATOR ARGUMENT, not a product factor.
+
+    `inner(u.t + K*u, v)` cannot be distributed without asserting that `inner` is linear in that slot,
+    so it stays atomic, is read as ONE temporal order, and its spatial part is stripped into the mass
+    matrix. Measured before this refusal: 0.177619 against a correct 2.118092 -- a factor of 12,
+    silently. It is refused instead, naming the fix.
+    """
+    d = jno.Shape.rect(0.0, 0.0, LX, LY, size=6e-5).domain(time=(0.0, DT * N, N + 1))
+    d.tag("wall", lambda x, y: (y < 1e-9) | (x < 1e-9) | (x > LX - 1e-9))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xw, yw, _ = d.variable("wall", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ax = [xi, yi]
+    # u.t and K*u added INSIDE inner(...) -- the shape distribution cannot reach
+    mom = RHO * inner(ui.t + 1.0e5 / RHO * ui, vi, n_contract=1) + MU * inner(grad(u, ax), grad(v, ax), n_contract=2)
+    with pytest.raises(ValueError, match="temporal-derivative expression"):
+        jno.fem([mom, u(xw, yw)[0] - 0.0, u(xw, yw)[1] - 0.0, u(*ci)[0] - 0.0, u(*ci)[1] - 0.0]).solve(
+            linear=jno.solve.lu(backend="host")
+        ).fn()
+
+
+def test_the_split_spelling_of_that_same_equation_is_accepted():
+    """The control: written as two terms it must go through, so the refusal is about the SHAPE and not
+    about the physics."""
+    d = jno.Shape.rect(0.0, 0.0, LX, LY, size=6e-5).domain(time=(0.0, DT * N, N + 1))
+    d.tag("wall", lambda x, y: (y < 1e-9) | (x < 1e-9) | (x > LX - 1e-9))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xw, yw, _ = d.variable("wall", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ax = [xi, yi]
+    mom = (
+        RHO * inner(ui.t, vi, n_contract=1)
+        + 1.0e5 * inner(ui, vi, n_contract=1)
+        + MU * inner(grad(u, ax), grad(v, ax), n_contract=2)
+    )
+    traj = np.asarray(
+        jno.fem([mom, u(xw, yw)[0] - 0.0, u(xw, yw)[1] - 0.0, u(*ci)[0] - 0.0, u(*ci)[1] - 0.0])
+        .solve(linear=jno.solve.lu(backend="host"))
+        .fn()
+    )
+    assert np.isfinite(traj).all()

@@ -1035,6 +1035,10 @@ def _assemble_1d_transient(
     sub_terms = [
         _apply_sign(domain, sign, sub) for bare in volume_terms for sign, sub in _split_additive_terms(domain, bare)
     ]
+    from .weak_form_helpers import refuse_mixed_temporal_group
+
+    for _t in sub_terms:
+        refuse_mixed_temporal_group(_t, where="jno.fem (1-D)")
     temporal_terms = [t for t in sub_terms if _contains_temporal_derivative(t)]
     spatial_terms = [t for t in sub_terms if not _contains_temporal_derivative(t)]
     if not temporal_terms:
