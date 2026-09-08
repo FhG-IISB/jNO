@@ -205,14 +205,26 @@ def _refuse_nonconforming_promotion(domain, order: int) -> None:
     fix (key on the topological entity instead); refused until then. Shared by the simplex and
     tensor-product promotion paths, since the dedup they run is the same one.
     """
-    if any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {})):
+    # Lifted: `_promote_to_degree(entity_keys=True)` keys on the topological entity, so two
+    # coincident bodies no longer weld. The one combination still refused is a non-conforming
+    # interface on a HANGING-NODE mesh: those need opposite dedup rules (see `_promote_to_degree`)
+    # and one mesh cannot have both.
+    if (
+        order > 1
+        and getattr(domain, "_fem_hanging_nodes", None)
+        and any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {}))
+    ):
         raise NotImplementedError(
-            f"order-{order} elements on a Shape.regions(..., conforming=False) domain: the higher-order "
-            "node promotion deduplicates by coordinate, so it would silently WELD the two bodies at "
-            "every interface node it adds -- which a contact gap could then never open. Use order-1 "
-            "elements for a non-conforming interface, or Shape.curved() (which reads gmsh's nodes "
-            "instead of synthesising them, and is unaffected)."
+            f"order-{order} elements on a mesh that is BOTH locally refined (hanging nodes) and has "
+            "a Shape.regions(..., conforming=False) interface: the higher-order promotion must MERGE "
+            "coincident nodes across a 2:1 refinement and must NOT merge them across two coincident "
+            "bodies, and those cannot both hold on one mesh. Use order-1, or drop one of the two."
         )
+
+
+def _ek(domain) -> bool:
+    """Key the higher-order promotion on entities? Only when two bodies are coincident ON PURPOSE."""
+    return any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {}))
 
 
 def _get_mesh(domain, dim: int, order: int):
@@ -235,7 +247,9 @@ def _get_mesh(domain, dim: int, order: int):
         if order == 1:
             return pts_all, cells_p1, pts_all, cells_b
         _refuse_nonconforming_promotion(domain, order)
-        pts_f, cells_f = _promote_to_degree(pts_all, cells_b, lagrange_interp_points(dim, order, cell_type), cell_type)
+        pts_f, cells_f = _promote_to_degree(
+            pts_all, cells_b, lagrange_interp_points(dim, order, cell_type), cell_type, entity_keys=_ek(domain)
+        )
         # Both arrays share one id space, as on the curved path: `_promote_to_degree` keeps the
         # original vertices at ids 0..nv-1, so the P1 connectivity still indexes `pts_f` correctly.
         # That matters because the geometry gather reads the ASSEMBLY connectivity against `pts_p1`
@@ -284,7 +298,7 @@ def _get_mesh(domain, dim: int, order: int):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
     # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
     # cell and dedup by coordinate. One code path for P2 and P3+ (the P2 midpoints are the k=2 case).
-    pts_f, cells_f = _promote_to_degree(pts_p1, cells_p1, lagrange_interp_points(dim, order))
+    pts_f, cells_f = _promote_to_degree(pts_p1, cells_p1, lagrange_interp_points(dim, order), entity_keys=_ek(domain))
     return pts_p1, cells_p1, pts_f, cells_f
 
 
@@ -328,6 +342,47 @@ def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
     # Returned UNCHANGED (not cast): each call site keeps its own conversion, so this guard adds a check
     # and changes nothing else — a real value still takes exactly the path it always did.
     return gs
+
+
+def _region_node_ids_from_cells(domain, region: str, cells: np.ndarray) -> Any:
+    """Node ids of a **volume sub-region** or an internal **interface**, from mesh topology.
+
+    ``None`` when ``region`` is neither, so the caller falls through to the boundary-facet path.
+
+    Both cases have no boundary facets of their own, and resolving them through the boundary path (or
+    through a proximity test against a region's sampled points) drops most of the node set **silently**
+    — an essential condition that stops being imposed. Measured on a two-region channel:
+    ``v("fluid|solid") - 0`` pinned **4 of 21** interface nodes (only the two endpoints that happen to
+    lie on the outer boundary), and a pin on a volume sub-region reached **32 of 33**.
+
+    Resolved instead from the cells the assembler actually integrates over, through the same
+    :func:`fem_utils._cell_region_mask` the region masking uses (a cell is in a region iff its centroid
+    is), so this cannot disagree with what was assembled. ``cells`` is the FIELD's connectivity, so a P2
+    edge midpoint on the interface is included: it belongs to a cell on each side, and the intersection
+    below keeps exactly the nodes both sides share.
+    """
+    src = set(getattr(domain, "_source_regions", None) or {}) | set(getattr(domain, "_shape_regions", None) or {})
+    if not src:
+        return None
+    cells = np.asarray(cells)
+
+    def _nodes(r):
+        m = np.asarray(_cell_region_mask(domain, r)).reshape(-1)
+        return np.unique(cells[m > 0]) if m.shape[0] == cells.shape[0] else None
+
+    if region in src:
+        return _nodes(region)
+    # The CONFORMING interface tag `A|B` — shared nodes, so the intersection of the two cell node sets.
+    # The non-conforming side tags (`A|B.A`) are deliberately not handled here: those faces are
+    # duplicated rather than shared, the tie machinery owns them, and a Dirichlet on one is the
+    # tie-overlap case that is refused elsewhere.
+    if region.count("|") == 1 and "." not in region:
+        a, b = region.split("|")
+        if a in src and b in src:
+            na, nb = _nodes(a), _nodes(b)
+            if na is not None and nb is not None:
+                return np.intersect1d(na, nb)
+    return None
 
 
 def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[int]:
@@ -858,10 +913,15 @@ def assemble_fem_native(
     ctx = dict(getattr(domain, "context", {}) or {})
     ctx.pop("cell_size", None)  # `dom.cell_size` placeholder; the real per-cell h is packed per volume element below
     ctx.pop("cell_metric", None)  # likewise `dom.cell_metric`: the real per-cell G = J^-T J^-1 is packed below
-    # Same for every `u.gap(secondary, main)` placeholder: dropping it means a gap that assembly has not
-    # packed raises as an unresolved symbol instead of silently evaluating to the zero placeholder --
-    # which would read as "everywhere exactly in contact" and be believed.
-    for _k in [k for k in ctx if str(k).startswith("gap_")]:
+    # Same for every `u.gap` / `u.slide` placeholder: dropping it means a contact symbol that assembly
+    # has not packed raises as an unresolved symbol instead of silently evaluating to the zero
+    # placeholder -- which would read as "everywhere exactly in contact, and not sliding" and be believed.
+    # Record which SLIDE symbols the user actually declared, before dropping the placeholders. The
+    # packer writes the tangential entry only for these: an extra `domain_context` entry on every contact
+    # form is not inert (the same lesson as `quad_weights` -- it perturbs the assembled numerics), so a
+    # form that only asks for the gap must pack exactly what it packed before.
+    _declared_slides = {str(k) for k in ctx if str(k).startswith("slide_")}
+    for _k in [k for k in ctx if str(k).startswith(("gap_", "slide_"))]:
         ctx.pop(_k, None)
 
     # -------------------------------------------------------------------------
@@ -996,6 +1056,13 @@ def assemble_fem_native(
         )
 
     region_mask_names: Tuple[str, ...] = _collect_masks(volume_terms)
+    # Does any volume term read `jno.np.cellwise`? The per-cell quadrature weights are threaded into
+    # the element kernel only when something consumes them: adding an extra traced array to every
+    # kernel's `loc` is not inert (it perturbed a plain load-path march into a NaN), so a form that
+    # never projects must assemble exactly as it did before.
+    from ...trace import contains_cellwise as _contains_cellwise
+
+    _uses_cellwise = any(_contains_cellwise(_b) for _b in volume_terms)
     region_mask_arrays = [
         jnp.asarray(_cell_region_mask(domain, r), dtype=qw_shared.dtype).reshape(-1) for r in region_mask_names
     ]
@@ -1169,10 +1236,19 @@ def assemble_fem_native(
     _is_march = bool(getattr(domain, "_is_pseudo_time", False))
     history_roles: Dict[Any, str] = {}
     readout_formulas: Dict[Any, Any] = {}
+    # Per-key cell mask for a REGION-restricted update (``state.evolves(f, region=...)``). Built once,
+    # on the host, in the assembly mesh's own cell order -- the same order the readout vmaps over -- so
+    # the mask lines up with the cells it gates. ``None`` means whole-domain, the historical behaviour.
+    readout_masks: Dict[Any, Any] = {}
     for key, (base, _depth) in _history_raw.items():
         if key in _evolution:
             history_roles[key] = "internal"
             readout_formulas[key] = _lower_statefield_to_trial(_evolution[key].formula, {})
+            _rg = getattr(_evolution[key], "region", None)
+            if _rg is not None:
+                # `_cell_region_mask` raises a named ValueError for an unknown region, which is the
+                # error the caller should see -- do not soften it into a whole-domain fallback.
+                readout_masks[key] = np.asarray(_cell_region_mask(domain, _rg)).reshape(-1) > 0
         elif getattr(base, "field_key", None) in _solved_field_keys:
             history_roles[key] = "primary"  # auto-buffered from the solved unknown (the bare field at QPs)
             readout_formulas[key] = _lower_statefield_to_trial(base, {})
@@ -1496,10 +1572,157 @@ def assemble_fem_native(
     # separation (`g0`). At solve time the moving part is a plain gather, so the gap is differentiable
     # in the DOFs; the pairing itself is frozen, which is what limits this to SMALL SLIDING.
     _gap_tables: Dict[str, dict] = {}
+    _gap_geom: Dict[str, dict] = {}  # per-pair inputs a re-pairing needs; see `_pair_at`
     _contact_pairs = dict(getattr(domain, "_contact_pairs", {}) or {})
-    if _contact_pairs and conn.n_bfaces > 0:
+
+    from .contact_search import OPEN_GAP
+
+    def _adjacency_ring(sf, mfaces):
+        """For each secondary facet, the node ids it may NOT pair against — its own, and its neighbours'.
+
+        Self-contact only. Without this every facet contacts the facet next to it: they share a node, so
+        the separation between them is exactly zero and the search reports the surface in contact with
+        itself everywhere. One ring is the smallest exclusion that removes that and still lets a fold
+        close, because the two sides of a fold are many facets apart along the surface.
+        """
+        fn = np.asarray(conn.face_nodes, dtype=np.int64)
+        mfn = fn[mfaces]
+        touch: Dict[int, list] = {}
+        for j, row in enumerate(mfn):
+            for nd in row:
+                touch.setdefault(int(nd), []).append(j)
+        out = []
+        for row in fn[sf]:
+            ex = {int(x) for x in row}
+            for nd in row:
+                for j in touch.get(int(nd), ()):
+                    ex.update(int(x) for x in mfn[j])
+            out.append(np.fromiter(sorted(ex), dtype=np.int64))
+        return out
+
+    def _facet_normals_np(pts, faces):
+        """Unit outward facet normals from a (possibly deformed) point set, oriented like the reference.
+
+        The reference orientation is the arbiter of sign: a facet's own cross product flips with node
+        order, and a normal that flips mid-solve turns a gap into a penetration without any error.
+        """
+        fn = np.asarray(conn.face_nodes)[faces]
+        if dim == 2:
+            e = pts[fn[:, 1]] - pts[fn[:, 0]]
+            n = np.stack([e[:, 1], -e[:, 0]], axis=-1)
+        else:
+            n = np.cross(pts[fn[:, 1]] - pts[fn[:, 0]], pts[fn[:, 2]] - pts[fn[:, 0]])
+        n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-300)
+        ref = np.asarray(normals_np)[faces][:, :dim]
+        return n * np.sign(np.sum(n * ref, axis=1, keepdims=True) + 1e-300)
+
+    def _pair_at(_key, disp, capture=None):  # noqa: C901
+        """``(ids, w, g0)`` for one contact pair at a configuration: ``None`` = reference, else ``x+u``.
+
+        This is the whole of the contact search. Everything else about a gap -- which facets are
+        secondary, which field it reads -- is fixed by the declaration; re-pairing means calling this
+        again with the current displacement, which is what ``fem.solve(contact=...)`` does between
+        rounds. Frozen at the reference configuration it is valid only while displacements are far
+        below the element size.
+        """
         from .fem_utils import interface_gap_data
 
+        g = _gap_geom[_key]
+
+        def _qp(pp):
+            """Physical quadrature points of each secondary face, formed exactly as `_surf_elem_res` does."""
+            verts = pp[np.asarray(cells_f_all[g["fidx"]])[g["pc"]][:, : dim + 1]]
+            J = np.stack([verts[:, i + 1] - verts[:, 0] for i in range(dim)], axis=-1)  # (n_s, dim, dim)
+            return verts[:, 0][:, None, :] + np.einsum("fqd,fDd->fqD", g["fp_qp"][g["lk"]], J)
+
+        ref = np.asarray(pts_f_all[g["fidx"]], dtype=float)
+        pts = ref
+        if disp is not None:
+            pts = ref.copy()
+            pts[:, :dim] += np.asarray(disp)[:, :dim]
+        xq = _qp(pts)
+        # The secondary normals move with the body, so a re-pairing that kept the REFERENCE normals
+        # would measure the gap along a direction the surface no longer has -- the error grows exactly
+        # where the search matters, at large rotation.
+        nrm = _facet_normals_np(pts, g["sf"]) if disp is not None else np.asarray(normals_np)[g["sf"]][:, :dim]
+        nrm = np.broadcast_to(nrm[:, None, :], xq[..., : nrm.shape[-1]].shape)
+        exc, mnrm = g["exclude"], None
+        if exc is not None:  # self-contact: one entry per FLATTENED query, facet-major like `xq`
+            exc = [exc[i] for i in range(xq.shape[0]) for _ in range(xq.shape[1])]
+            mnrm = _facet_normals_np(pts, g["mfaces"])
+        ids, w, g0 = interface_gap_data(xq, g["mf"], pts, nrm, capture=capture, exclude_nodes=exc, main_normals=mnrm)
+        if disp is not None:
+            # `g0` is what the residual STARTS from, and it then subtracts `n . D(u)` with `u` measured
+            # from the REFERENCE configuration. Taking g0 from the deformed frame would subtract that
+            # displacement a second time, so the gap would read roughly double and contact would never
+            # close. Re-evaluate the SAME definition, `g0 = n . (Phi(x_s) - x_s)`, on reference
+            # coordinates using the pairing and the normal just found in the deformed one: then
+            # `g0 - n . D(u*)` reproduces the measured deformed gap exactly, and stays right as u moves.
+            xq_ref = _qp(ref)
+            phi_ref = np.einsum("sqk,sqkd->sqd", w, ref[ids][..., :dim])
+            g0_ref = np.einsum("sqd,sqd->sq", nrm, phi_ref - xq_ref[..., :dim])
+            # An INACTIVE slot (nothing within `capture`) carries `w = 0`, so `phi_ref` collapses to the
+            # ORIGIN and the formula above would return `-n . x_q` -- a fabricated penetration the size
+            # of the body, which a penalty reads as an enormous contact force. Keep such a slot open.
+            g0 = np.where(w.sum(axis=-1) > 0.0, g0_ref, OPEN_GAP)
+        return ids, w, g0
+
+    def _capture_default(_key):
+        """A search radius from the LOCAL facet size, because a literal is wrong at every scale but one.
+
+        Three times the mean secondary facet diameter: wide enough that a point still finds the facet it
+        is about to touch after a step, narrow enough that it cannot pair with the far side of the body.
+        A caller who knows the closing distance passes ``capture=`` instead.
+        """
+        g = _gap_geom[_key]
+        V = np.asarray(pts_f_all[g["fidx"]], dtype=float)[np.asarray(conn.face_nodes)[g["sf"]]]
+        return 3.0 * float(np.mean(np.linalg.norm(V.max(axis=1) - V.min(axis=1), axis=-1)))
+
+    def _repair_contact(u_flat, capture=None):
+        """Re-pair every declared gap from the deformed configuration ``x + u``.
+
+        Returns the ``args["__gap_tables__"]`` payload -- only the entries a pairing owns, so the shapes
+        never move. This is the host-side search that ``fem.solve(contact=...)`` runs between rounds.
+        ``capture=None`` derives the search radius per pair from the local facet size.
+        """
+        out = {}
+        for _key, g in _gap_geom.items():
+            fidx = g["fidx"]
+            vt, n_nodes = vecs[fidx], int(np.asarray(pts_f_all[fidx]).shape[0])
+            un = np.asarray(u_flat).reshape(-1)[offs[fidx] : offs[fidx] + n_nodes * vt].reshape(n_nodes, vt)
+            disp = np.zeros((n_nodes, dim))
+            disp[:, : min(vt, dim)] = un[:, : min(vt, dim)]
+            cap = float(capture) if capture is not None else _capture_default(_key)
+            ids, w, g0 = _pair_at(_key, disp, capture=cap)
+            if not int(np.sum(np.asarray(g0) < 0.5 * OPEN_GAP)):
+                raise ValueError(
+                    "fem.solve(contact=...): re-pairing u.gap({!r}, {!r}) left every one of {} secondary "
+                    "quadrature points outside the search radius {:.4g}, so the surfaces would read as "
+                    "open everywhere and the contact term would contribute nothing. The bodies are "
+                    "further apart than the search looks -- pass an explicit `capture=` covering the "
+                    "closing distance.".format(g["secondary"], g["main"], np.asarray(g0).size, cap)
+                )
+            sf = g["sf"]
+            ids_full = np.zeros((conn.n_bfaces,) + np.asarray(ids).shape[1:], dtype=np.int64)
+            w_full = np.zeros((conn.n_bfaces,) + np.asarray(w).shape[1:])
+            g0_full = np.zeros((conn.n_bfaces, np.asarray(g0).shape[1]))
+            ids_full[sf], w_full[sf], g0_full[sf] = ids, w, g0
+            out[_key] = {
+                "ids": jnp.asarray(ids, dtype=jnp.int32),
+                "w": jnp.asarray(w),
+                "ids_full": jnp.asarray(ids_full, dtype=jnp.int32),
+                "w_full": jnp.asarray(w_full),
+                "g0_full": jnp.asarray(g0_full),
+                # The `_full` arrays are scattered up to ALL boundary faces and are ZERO off the
+                # secondary ones, so a caller reading a gap out of them would count padding as perfect
+                # contact. `g0` and `faces` carry the same numbers on the secondary faces alone, which
+                # is what an inspecting caller (and the driver's own reporting) should read.
+                "g0": jnp.asarray(g0),
+                "faces": jnp.asarray(sf, dtype=jnp.int32),
+            }
+        return out
+
+    if _contact_pairs and conn.n_bfaces > 0:
         for _key, (_secondary, _main, _fkey) in _contact_pairs.items():
             _fidx = field_index.get(_fkey)
             if _fidx is not None and face_tables_per_field[_fidx] is None:
@@ -1513,15 +1736,17 @@ def assemble_fem_native(
                 )
             if _fidx is None:  # the gap's field is not in this system -> nothing to pack
                 continue
+            _mains = _main if isinstance(_main, tuple) else (_main,)
+            _selfc = _secondary in _mains  # self-contact: a surface searching against itself
             _sf = np.asarray(_region_faces(_secondary), dtype=np.int32)
-            _mfaces = np.asarray(_region_faces(_main), dtype=np.int32)
+            _mfaces = np.unique(np.concatenate([np.asarray(_region_faces(m), dtype=np.int32) for m in _mains]))
             _mf = np.asarray(conn.face_nodes, dtype=np.int64)[_mfaces]
             if _sf.size == 0 or _mf.size == 0:
                 raise ValueError(
                     f"u.gap({_secondary!r}, {_main!r}): found {_sf.size} secondary and {len(_mf)} main boundary "
                     "facets. Both faces must select whole boundary facets -- check the tag predicates."
                 )
-            if np.intersect1d(_sf, _mfaces).size:
+            if not _selfc and np.intersect1d(_sf, _mfaces).size:
                 # The two sides must be DISJOINT facet sets. They are not when a tag resolves through a
                 # coordinate predicate, because the two sides of a non-conforming interface are
                 # coincident -- the gap would then project the secondary face onto itself and read g0 == 0
@@ -1535,11 +1760,20 @@ def assemble_fem_native(
             # Physical quadrature points of each secondary face, formed exactly as `_surf_elem_res` does.
             _fp_qp = np.asarray(face_tables_per_field[_fidx][2])  # (n_faces_local, n_q, dim)
             _pc, _lk = np.asarray(conn.parent_cell)[_sf], np.asarray(conn.local_face)[_sf]
-            _verts = np.asarray(pts_f_all[_fidx])[np.asarray(cells_f_all[_fidx])[_pc][:, : dim + 1]]
-            _J = np.stack([_verts[:, i + 1] - _verts[:, 0] for i in range(dim)], axis=-1)  # (n_s, dim, dim)
-            _xq = _verts[:, 0][:, None, :] + np.einsum("fqd,fDd->fqD", _fp_qp[_lk], _J)
-            _nrm = np.broadcast_to(np.asarray(normals_np)[_sf][:, None, :], _xq.shape)
-            _ids, _w, _g0 = interface_gap_data(_xq, _mf, np.asarray(pts_f_all[_fidx]), _nrm)
+            _gap_geom[_key] = {
+                "sf": _sf,
+                "mf": _mf,
+                "mfaces": _mfaces,
+                "fidx": _fidx,
+                "pc": _pc,
+                "lk": _lk,
+                "fp_qp": _fp_qp,
+                "secondary": _secondary,
+                "main": _main,
+                "mains": _mains,
+                "exclude": _adjacency_ring(_sf, _mfaces) if _selfc else None,
+            }
+            _ids, _w, _g0 = _pair_at(_key, None)
             _g0_full = np.zeros((conn.n_bfaces, np.asarray(_g0).shape[1]))
             _g0_full[_sf] = np.asarray(_g0)
             # Scattered up to ALL boundary faces for the same reason ``_gap_gather`` does it: a term's
@@ -1784,6 +2018,43 @@ def assemble_fem_native(
             return normals_j
         return _face_normals_jax(pts, _facet_verts_j, _facet_sign_j)
 
+    _follow_tags = set(getattr(domain, "_follow_normals", ()) or ())
+
+    def _follow_field_index():
+        """Which field carries the displacement that moves the surface.
+
+        A follower normal is the normal of ``x = X + u``, so it needs to know which field ``u`` is.
+        Exactly one field with one component per spatial dimension is unambiguous; anything else is
+        refused rather than guessed, because guessing wrong here rotates every traction on that surface.
+        """
+        cand = [i for i in range(len(fields)) if int(vecs[i]) == dim]
+        if len(cand) != 1:
+            raise ValueError(
+                "domain.variable(..., follow_normals=True) needs exactly one field with one component "
+                f"per dimension to say which displacement moves the surface; this form has {len(cand)} "
+                f"({[fields[i]['name'] for i in cand]}). Drop follow_normals=, or split the solve."
+            )
+        return cand[0]
+
+    def _deformed_normals(pts, u_flat):
+        """Facet normals of the DEFORMED surface ``x = X + u`` -- a FOLLOWER normal.
+
+        The reference normal is right for a dead load (gravity still points down after the body tips);
+        a follower normal is right for pressure and for contact, whose force is normal to the surfaces
+        that are actually touching. The two agree to O(theta) and diverge as the surface rotates.
+
+        **This belongs with finite-strain kinematics.** ``sym(grad u)`` is not rotation invariant -- a
+        pure rotation by theta manufactures ``cos(theta) - 1`` of strain -- so following the normal in a
+        small-strain form buys a better force direction on a materially wrong stress. Measured on a
+        sheet-forming march at 38 degrees: 0.300 of spurious strain against a Green-Lagrange strain of
+        1.9e-17. Use this with ``F = I + grad u`` and a PK stress, not with ``sym(grad u)``.
+        """
+        fidx = _follow_field_index()
+        n_geom = int(pts.shape[0])  # the GEOMETRY points the facets index, not the boundary subset
+        vt = vecs[fidx]
+        un = jax.lax.dynamic_slice(u_flat, (offs[fidx],), (n_geom * vt,)).reshape(n_geom, vt)
+        return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
+
     def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None):
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
@@ -1810,6 +2081,9 @@ def assemble_fem_native(
             "trial_value_shape": fields[tfi]["value_shape"],
             "trial_vec": vecs[tfi],
         }
+        if _uses_cellwise:
+            # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
+            loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
             # The field parameter's nodal slice is interpolated to the quad points with its field's shape
             # functions (field 0 single-field; the resolved field for a coupled problem).
@@ -1854,6 +2128,9 @@ def assemble_fem_native(
             "trial_value_shape": fields[0]["value_shape"],
             "trial_vec": vecs[0],
         }
+        if _uses_cellwise:
+            # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
+            loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
             loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
         _nt = neural_local_table(_neural, args)
@@ -1873,8 +2150,13 @@ def assemble_fem_native(
         quadrature points, given the just-solved ``u_flat`` and the current history buffers (on
         ``args['__history__']``). Returns ``{history_key: (n_cells, n_quad, *value_shape)}`` — the value
         that becomes each state's ``.i(-1)`` at the NEXT step. The load-step march rolls these into the
-        depth buffers. Whole-domain: the readout runs on every cell (sub-region-restricted plasticity is
-        not wired — a future masked readout)."""
+        depth buffers.
+
+        A state declared ``state.evolves(f, region=...)`` is advanced only on that region's cells; on the
+        rest its next value is the value it already has, read straight back out of slot 0 of the incoming
+        buffer. Freezing rather than zeroing is what lets a zero-initialised plastic strain leave the
+        unrestricted region elastic without a second constitutive branch, and it keeps the formula from
+        ever being evaluated on cells carrying another material's constants."""
         local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
         out: Dict[Any, Any] = {}
         for key, formula in readout_formulas.items():
@@ -1886,14 +2168,40 @@ def assemble_fem_native(
             # runs inside the march's differentiated scan, so those intermediates are retained for the
             # backward pass. One test-DOF's worth of cost per cell is the honest proxy: the readout carries
             # no test function, so there is no element block -- only the per-quadrature-point value.
-            out[key] = _elem_map(
+            nxt = _elem_map(
                 lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args),
                 (jnp.arange(n_cells), local_all),
                 _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
             )
+            _mask = readout_masks.get(key)
+            if _mask is not None:
+                hb = (args or {}).get("__history__") if isinstance(args, dict) else None
+                prev = None if hb is None else hb.get(key)
+                if prev is not None:
+                    # slot 0 IS this state's `.i(-1)` (see `_roll_buffer`), so writing it back leaves the
+                    # cell exactly where it was -- bit-identical, not merely close.
+                    keep = jnp.asarray(prev)[:, :, 0, ...]
+                    m = jnp.asarray(_mask).reshape((-1,) + (1,) * (nxt.ndim - 1))
+                    nxt = jnp.where(m, nxt, keep)
+            out[key] = nxt
         return out
 
-    def _gap_gather(u_flat, key):
+    # Which entries of a gap table a re-pairing may replace. `faces` (which facets are secondary),
+    # `field` and `secondary` are properties of the DECLARATION and never move; everything else is the
+    # pairing itself -- which main nodes each quadrature point reads, with what weights, at what initial
+    # separation -- and that is exactly what `fem.solve(contact=...)` recomputes from the deformed
+    # configuration. Threading the values (rather than rebuilding the operator) keeps the shapes fixed,
+    # so a re-paired round reuses the compiled residual instead of retracing it.
+    _GAP_REPAIRED = ("ids", "w", "ids_full", "w_full", "g0_full")
+
+    def _gap_tb(key, args=None):
+        """A gap's tables, with any re-paired values from ``args["__gap_tables__"]`` taking precedence."""
+        tb = _gap_tables[key]
+        live = args.get("__gap_tables__") if isinstance(args, dict) else None
+        upd = (live or {}).get(key)
+        return {**tb, **upd} if upd else tb
+
+    def _gap_gather(u_flat, key, args=None):
         """``u_m . Phi`` at every secondary-face quadrature point: ``(n_secondary_faces, n_q, vec)``.
 
         Done GLOBALLY, outside the per-face vmap, because the main nodes live on the other body's
@@ -1902,7 +2210,7 @@ def assemble_fem_native(
         with no assembled Jacobian block needed. (The ASSEMBLED tangent builds its own explicit
         nonlocal blocks from these same tables -- see the gap emission in `_make_jacobian`.)
         """
-        tb = _gap_tables[key]
+        tb = _gap_tb(key, args)
         fidx, vt = tb["field"], vecs[tb["field"]]
         dofs = offs[fidx] + tb["ids"][..., None] * vt + jnp.arange(vt)  # (n_s, n_q, k, vec)
         um = jnp.einsum("sqk,sqkv->sqv", tb["w"], u_flat[dofs])
@@ -1925,7 +2233,13 @@ def assemble_fem_native(
                 return True
             return any(_refs(c, tag) for c in iter_children(node) or ())
 
-        return [k for k, tb in _gap_tables.items() if tb["secondary"] == region and _refs(expr, k)]
+        # A form may read the interface through the gap, the slide, or both -- all three must engage
+        # the same table, so match either symbol's tag.
+        return [
+            k
+            for k, tb in _gap_tables.items()
+            if tb["secondary"] == region and (_refs(expr, k) or _refs(expr, "slide_" + tb["secondary"]))
+        ]
 
     def _contact_reaction(R, keys, fids, lv, gslice, bcoeff, btfi, region, t, args, pts_dyn, normals_dyn):
         """Add the equal-and-opposite interface traction to the MAIN body's DOFs.
@@ -1949,7 +2263,7 @@ def assemble_fem_native(
             _cell_chunk(int(fids.shape[0]), n_q * vecs[btfi], cell_all_dofs.shape[1]),
         )
         for k in keys:
-            tb = _gap_tables[k]
+            tb = _gap_tb(k, args)
             fidx, vt = tb["field"], vecs[tb["field"]]
             if fidx != btfi:
                 raise NotImplementedError(
@@ -1963,10 +2277,10 @@ def assemble_fem_native(
             R = R.at[dofs.reshape(-1)].add(-jnp.einsum("fqk,fqv->fqkv", w_f, tau_f).reshape(-1))
         return R
 
-    def _gap_slices(region, fids, gap_um):
+    def _gap_slices(region, fids, gap_um, args=None):
         """``{key: (g0, u_m)}`` for every gap whose SECONDARY face is this region, aligned with ``fids``."""
         return {
-            k: (_gap_tables[k]["g0_full"][fids], gap_um[k][fids])
+            k: (_gap_tb(k, args)["g0_full"][fids], gap_um[k][fids])
             for k in _gap_tables
             if _gap_tables[k]["secondary"] == region
         } or None
@@ -1974,10 +2288,15 @@ def assemble_fem_native(
     def _pack_gaps(loc, per_f, n_vec, gaps):
         """Write each contact gap's per-quadrature-point value into ``loc["domain_context"]``.
 
-        ``g = g0 - n . (u_s - u_m . Phi)``. Shared by the residual and by the surface-state readout, so
-        an augmented-Lagrangian update ``lam.evolves(max(0, lam.i(-1) - c*g))`` sees exactly the gap the
-        traction term saw -- if the two drifted apart the multiplier would converge to the wrong
-        pressure, and nothing would report it.
+        Two symbols, ONE packed relative displacement ``D = u_s - u_m . Phi``:
+        ``u.gap`` -> ``g = g0 - n . D`` (scalar), ``u.slide`` -> ``s = D - (n . D) n`` (vector, global
+        frame). Splitting the computation would let the normal and tangential reads disagree about the
+        geometry; sharing it makes that impossible.
+
+        Shared by the residual and by the surface-state readout, so an augmented-Lagrangian update
+        ``lam.evolves(max(0, lam.i(-1) - c*g))`` -- or a friction slip update -- sees exactly the values
+        the traction term saw. If the two drifted apart the state would converge to the wrong traction,
+        and nothing would report it.
         """
         for _k, (_g0_f, _um_f) in (gaps or {}).items():
             _gfi = _gap_tables[_k]["field"]
@@ -1994,7 +2313,15 @@ def assemble_fem_native(
                 )
             # `n_vec` is (dim,) on a straight facet and (n_q, dim) on a curved one; `atleast_2d`
             # makes both broadcast against `_jump` (n_q, vec) without a shape branch.
-            loc["domain_context"][_k] = _g0_f - (_jump * jnp.atleast_2d(n_vec)).sum(axis=1)
+            _nrm2 = jnp.atleast_2d(n_vec)
+            _jn = (_jump * _nrm2).sum(axis=1)  # n . D, the normal component of the relative displacement
+            loc["domain_context"][_k] = _g0_f - _jn
+            # `u.slide` is the SAME relative displacement read tangentially -- one packed quantity, two
+            # reads, so the normal and tangential parts cannot disagree about the geometry. Only for a
+            # slide the form actually declared: see `_declared_slides` above for why not unconditionally.
+            _sk = "slide_" + _gap_tables[_k]["secondary"]
+            if _sk in _declared_slides:
+                loc["domain_context"][_sk] = _jump - _jn[:, None] * _nrm2
 
     def _facet_geometry(c, k, pts_src):
         """``(J, K, xq)`` for facet ``k`` of cell ``c`` -- one per quadrature point when the cell's
@@ -2169,7 +2496,7 @@ def assemble_fem_native(
             lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face_R, n_local_all)
             # An augmented-Lagrangian update `lam.evolves(max(0, lam.i(-1) - c*g))` reads the gap here,
             # so the same main-side gather the residual uses has to reach the readout.
-            gsl = _gap_slices(region, fids, {k: _gap_gather(u_flat, k) for k in _gap_tables})
+            gsl = _gap_slices(region, fids, {k: _gap_gather(u_flat, k, args) for k in _gap_tables}, args)
             vals = jax.vmap(lambda fi, la, gp, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args, gp))(
                 fids, lv, gsl if gsl else {}
             )
@@ -2307,18 +2634,23 @@ def assemble_fem_native(
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
+            # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
+            # traction then rotates with the surface (a follower load) rather than staying put (a dead
+            # load). Computed once, alongside, so an unmarked region is bit-identical to before.
+            normals_fol = _deformed_normals(pts_dyn, u_flat) if _follow_tags else None
+            _nrm_for = lambda _r: normals_fol if _r in _follow_tags else normals_dyn
             # Main-side values for every contact gap, gathered ONCE over the whole secondary face: the
             # nodes read live on the other body's cells, so this cannot happen inside the per-face map.
-            gap_um = {k: _gap_gather(u_flat, k) for k in _gap_tables}
+            gap_um = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
-                gslice = _gap_slices(region, fids, gap_um)  # {key: (g0, u_m)} for THIS region's faces
+                gslice = _gap_slices(region, fids, gap_um, args)  # {key: (g0, u_m)} for THIS region's faces
                 for bcoeff, btfi in btyped:
                     contribs = _elem_map(
                         lambda fi, la, gp, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
-                            fi, la, _e, _t, _r, t, args, pts_dyn, normals_dyn, gp
+                            fi, la, _e, _t, _r, t, args, pts_dyn, _nrm_for(_r), gp
                         ),
                         (fids, lv, gslice),
                         _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
@@ -2326,7 +2658,20 @@ def assemble_fem_native(
                     R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
                     _rk = _gaps_in(bcoeff, region)
                     if _rk:
-                        R = _contact_reaction(R, _rk, fids, lv, gslice, bcoeff, btfi, region, t, args, pts_dyn, normals_dyn)
+                        R = _contact_reaction(
+                            R,
+                            _rk,
+                            fids,
+                            lv,
+                            gslice,
+                            bcoeff,
+                            btfi,
+                            region,
+                            t,
+                            args,
+                            pts_dyn,
+                            _nrm_for(region),
+                        )
             return R
 
         return residual
@@ -2358,22 +2703,42 @@ def assemble_fem_native(
             return ks[0] if ks else None
 
         _gap_static_cache: Dict[Any, Any] = {}
+        _gap_static_for = [None]  # the `__gap_tables__` payload `_gap_static_cache` was built from
 
-        def _gap_static(region, face_ids, btfi):
-            """Concrete index/weight geometry of a region's gap blocks — computed ONCE from the frozen
-            pairing tables and shared by the pattern hoist and the traced assembly, so the two cannot
-            drift. The three nonlocal blocks, flat index arrays in emission order:
+        def _pairing_of(args):
+            """The pairing payload in ``args``, or ``None`` for the build-time (frozen) pairing.
+
+            Used as a cache TAG by identity: ``fem.solve(contact=...)`` hands down one payload object
+            per round and reuses it for every residual/Jacobian evaluation within that round, so
+            identity is exactly "the pairing this evaluation belongs to". Comparing by ``is`` also
+            avoids hashing arrays.
+            """
+            return args.get("__gap_tables__") if isinstance(args, dict) else None
+
+        def _gap_static(region, face_ids, btfi, args=None):
+            """Concrete index/weight geometry of a region's gap blocks, for the pairing in ``args`` —
+            shared by the pattern hoist and the traced assembly so the two cannot drift. The three
+            nonlocal blocks, flat index arrays in emission order:
 
             * ``(s,m)``: secondary test rows x main columns (one column per (q, mortar-node, comp));
             * ``(m,s)``: reaction rows (main dofs, one per (q, mortar-node, comp)) x parent-local cols;
             * ``(m,m)``: reaction rows x main columns.
+
+            Re-pairing changes WHICH main node each quadrature point reads, so these indices move with
+            it. Their SHAPES do not: ``(n_face, n_q, K)`` is fixed by the declaration, so the block's
+            entry count is invariant and only the values differ — which is what lets the compressed
+            pattern be rebuilt per pairing instead of the whole path being refused.
             """
+            live = _pairing_of(args)
+            if _gap_static_for[0] is not live:
+                _gap_static_cache.clear()
+                _gap_static_for[0] = live
             k = _gap_key_of(region)
             cache_key = (region, int(btfi))
             hit = _gap_static_cache.get(cache_key)
             if hit is not None:
                 return hit
-            tb = _gap_tables[k]
+            tb = _gap_tb(k, args)
             fidx_m, vt = tb["field"], vecs[tb["field"]]
             fids_np = np.asarray(face_ids, dtype=np.int64)
             ids_f = np.asarray(tb["ids_full"])[fids_np]  # (n_face, n_q, K)
@@ -2412,43 +2777,63 @@ def assemble_fem_native(
             _gap_static_cache[cache_key] = out
             return out
 
-        _idx_rows, _idx_cols = [], []
-        for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
-            _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-            _idx_rows.append(jnp.broadcast_to(cdofs[_tfi_s][:, :, None], _sh).reshape(-1))
-            _idx_cols.append(jnp.broadcast_to(cell_all_dofs[:, None, :], _sh).reshape(-1))
-        for _region_s, _face_ids_s, _btyped_s in surface_work:
-            _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
-            _fcols = cell_all_dofs[_pc]
-            for _bcoeff_s, _btfi_s in _btyped_s:
-                _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
-                _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
-                # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
-                # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
-                # also drives the main-side reaction. The indices come from the frozen pairing
-                # tables, so the pattern stays static; inactive contact contributes zeros in DATA.
-                if _gap_key_of(_region_s) is not None:
-                    _gs = _gap_static(_region_s, _face_ids_s, _btfi_s)
-                    _idx_rows.append(_gs["rows_sm"])
-                    _idx_cols.append(_gs["cols_sm"])
-                    if _gaps_in(_bcoeff_s, _region_s):
-                        _idx_rows.append(_gs["rows_ms"])
-                        _idx_cols.append(_gs["cols_ms"])
-                        _idx_rows.append(_gs["rows_mm"])
-                        _idx_cols.append(_gs["cols_mm"])
-        _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
-        _idx_static = (
-            jnp.stack([jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1)
-            if _idx_rows
-            else None
-        )
-        try:
-            _plan = compress_plan(_idx_static) if _idx_static is not None else None
-        except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
-            _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
+        _pattern_cache: Dict[str, Any] = {"tag": object(), "val": None}
+
+        def _pattern(args=None):
+            """``(idx_static, plan, blk_sizes)`` for the pairing in ``args``.
+
+            The sparsity pattern is derived from the pairing's concrete node ids, so it moves when the
+            pairing does. It is rebuilt once per pairing rather than per evaluation -- the driver hands
+            down one payload object per round, so the tag below changes exactly when the pattern must.
+            Sizes are invariant across pairings (see ``_gap_static``), so the compressed plan keeps its
+            static ``nse`` and the traced assembly is unaffected.
+            """
+            live = _pairing_of(args)
+            if _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
+                return _pattern_cache["val"]
+            _idx_rows, _idx_cols = [], []
+            for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
+                _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
+                _idx_rows.append(jnp.broadcast_to(cdofs[_tfi_s][:, :, None], _sh).reshape(-1))
+                _idx_cols.append(jnp.broadcast_to(cell_all_dofs[:, None, :], _sh).reshape(-1))
+            for _region_s, _face_ids_s, _btyped_s in surface_work:
+                _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
+                _fcols = cell_all_dofs[_pc]
+                for _bcoeff_s, _btfi_s in _btyped_s:
+                    _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
+                    _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
+                    _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+                    # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
+                    # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
+                    # also drives the main-side reaction. Inactive contact contributes zeros in DATA.
+                    if _gap_key_of(_region_s) is not None:
+                        _gs = _gap_static(_region_s, _face_ids_s, _btfi_s, args)
+                        _idx_rows.append(_gs["rows_sm"])
+                        _idx_cols.append(_gs["cols_sm"])
+                        if _gaps_in(_bcoeff_s, _region_s):
+                            _idx_rows.append(_gs["rows_ms"])
+                            _idx_cols.append(_gs["cols_ms"])
+                            _idx_rows.append(_gs["rows_mm"])
+                            _idx_cols.append(_gs["cols_mm"])
+            _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
+            _idx_static = (
+                jnp.stack(
+                    [jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
+                )
+                if _idx_rows
+                else None
+            )
+            try:
+                _plan = compress_plan(_idx_static) if _idx_static is not None else None
+            except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
+                _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
+            _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
+            return _pattern_cache["val"]
 
         def jacobian(u_flat, t=0.0, args=None):
+            # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
+            # between rounds and the contact block's indices move with it.
+            _idx_static, _plan, _blk_sizes = _pattern(args)
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
@@ -2496,18 +2881,24 @@ def assemble_fem_native(
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
+            # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
+            # traction then rotates with the surface (a follower load) rather than staying put (a dead
+            # load). Computed once, alongside, so an unmarked region is bit-identical to before.
+            normals_fol = _deformed_normals(pts_dyn, u_flat) if _follow_tags else None
+            _nrm_for = lambda _r: normals_fol if _r in _follow_tags else normals_dyn
             # Main-side values for every contact gap -- the residual's own gather, reused so the
             # assembled tangent linearizes the SAME function the residual evaluates.
-            gap_um_j = {k: _gap_gather(u_flat, k) for k in _gap_tables}
+            gap_um_j = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 fcols = cell_all_dofs[pcells]  # (n_face, n_local_all)
-                gslice = _gap_slices(region, fids, gap_um_j)  # {key: (g0, u_m)} or None
+                gslice = _gap_slices(region, fids, gap_um_j, args)  # {key: (g0, u_m)} or None
                 for bcoeff, btfi in btyped:
 
-                    def _kef(fi, la, gp=None, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
+                    def _kef(fi, la, gp=None, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=None):
+                        _n = _nrm_for(_r) if _n is None else _n
                         # gaps PACKED: the local block then carries d(traction)/du_s THROUGH the gap,
                         # exactly as `jax.linearize` of the residual would.
                         return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n, gp))(la)
@@ -2534,14 +2925,15 @@ def assemble_fem_native(
 
                     if gslice:
                         # ---- the gap's NONLOCAL blocks (same append order as the pattern hoist) ----
-                        gs = _gap_static(region, face_ids, btfi)
+                        gs = _gap_static(region, face_ids, btfi, args)
                         n_q, vt, gk = gs["n_q"], gs["vt"], gs["key"]
                         w_f = gs["w_f"]
                         g0_sl, um_sl = gslice[gk]
 
                         # (s,m): jacfwd of the SAME face residual w.r.t. the gathered main values,
                         # chained through the frozen mortar weights to global main columns.
-                        def _kem(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn, _k=gk):
+                        def _kem(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=None, _k=gk):
+                            _n = _nrm_for(_r) if _n is None else _n
                             return jax.jacfwd(
                                 lambda um: _surf_elem_res(fi, la, _e, _t, _r, t, args, _p, _n, {_k: (g0f, um)})
                             )(umf)
@@ -2619,7 +3011,17 @@ def assemble_fem_native(
         # in force, not the raw one it was derived from. Publishing the raw pattern here silently
         # mismatched the wrapper's `inverse` against the compressed data length: the recurring shape
         # of bug in this repo is a representation changing while one of its readers does not move.
-        jacobian._jno_static_idx = _plan[0] if _plan is not None else _idx_static  # type: ignore[attr-defined]
+        def _static_idx_for(args=None):
+            """The assembled pattern's published index array, for the pairing in ``args``.
+
+            Consumed by :func:`_dirichlet_jac_rows` to plan the compression of the Dirichlet-augmented
+            matrix. It has to follow the pairing for the same reason the pattern does.
+            """
+            _is, _pl, _ = _pattern(args)
+            return _pl[0] if _pl is not None else _is
+
+        jacobian._jno_static_idx_for = _static_idx_for  # type: ignore[attr-defined]
+        jacobian._jno_static_idx = _static_idx_for()  # type: ignore[attr-defined]  -- frozen pairing
         return jacobian
 
     def _dirichlet_jac_rows(jac_fn, pairs):
@@ -2643,7 +3045,15 @@ def assemble_fem_native(
         _dir_plan = None
         if _inner_idx is not None:
             try:
-                _d_np = np.asarray(dofs, dtype=np.int64).reshape(-1)
+                # From `pairs` -- Python ints -- NOT from `dofs`. Which DOFs are constrained is
+                # structural, decided host-side before anything is traced, but `dirichlet_projection`
+                # hands it back as a jnp array, and when this wrapper is built INSIDE a trace (which is
+                # where it is built since the jacobian became a per-call wrapper) that array is a
+                # tracer. `np.asarray` on it raised, the except below swallowed it, `_dir_plan` came out
+                # None, and every Dirichlet duplicate survived -- 648 triplets for 616 unique pairs on
+                # the 2-D fixture, exactly the 32 constrained DOFs. Eager assembly was unaffected, so
+                # only the traced path silently lost its compression.
+                _d_np = np.asarray([int(_p[0]) for _p in pairs], dtype=np.int64).reshape(-1)
                 _dir_plan = compress_plan(
                     np.concatenate([np.asarray(_inner_idx), np.stack([_d_np, _d_np], axis=1)], axis=0)
                 )
@@ -2733,6 +3143,11 @@ def assemble_fem_native(
         ptags = getattr(domain, "_polygon_tags", {})
         if region in (getattr(domain, "_source_regions", {}) or {}) and ptags.get(region, (None,))[0] == "interior":
             return list(_region_node_ids_from_pts(domain, region, pts_all))
+        # A volume sub-region or an internal interface has no boundary facets, so the facet path below
+        # would resolve it to almost nothing. Take it from topology instead.
+        _topo = _region_node_ids_from_cells(domain, region, np.asarray(cells_f_all[fidx]))
+        if _topo is not None:
+            return [int(i) for i in _topo]
         bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"], _cell_type)
         if bf is None:
             return list(_region_node_ids_from_pts(domain, region, pts_all))
@@ -2767,15 +3182,18 @@ def assemble_fem_native(
         # ownership is the only thing that separates them, and it lives in the node ids.
         _owner = (getattr(domain, "_tag_regions", {}) or {}).get(region)
         if _owner is not None and bnodes.size:
-            own = np.asarray(_region_node_ids(domain, _owner), dtype=np.int64)
+            # Ownership comes from the cells the assembler integrates over, expressed in THIS FIELD's
+            # connectivity -- so it is order-agnostic. Resolving it against the P1 numbering instead
+            # (which is what this did) cannot place a P2 edge midpoint at all: those nodes do not exist
+            # in P1, so the intersection dropped every one of them and a region-scoped tag on a P2 field
+            # had to be refused outright. `cells_f_all[fidx]` carries the midpoints, and a midpoint
+            # belongs to the body whose cell it sits on, which is the same rule the vertices follow.
+            own = _region_node_ids_from_cells(domain, _owner, np.asarray(cells_f_all[fidx]))
+            if own is None:
+                own = np.asarray(_region_node_ids(domain, _owner), dtype=np.int64)
+            own = np.asarray(own, dtype=np.int64)
             if own.size == 0:
                 raise ValueError(f"tag region {_owner!r} has no nodes on this mesh; cannot restrict {region!r}.")
-            if int(fields[fidx]["order"]) != 1:
-                raise NotImplementedError(
-                    f"tag({region!r}, region={_owner!r}) is resolved against the P1 node numbering, but "
-                    f"this field is P{fields[fidx]['order']}. Use order-1 elements for a region-restricted "
-                    "tag, or tag the two sides by their auto names from domain.interface_tags()."
-                )
             bnodes = np.intersect1d(bnodes, own)
             if bnodes.size == 0:
                 raise ValueError(
@@ -3462,6 +3880,8 @@ def assemble_fem_native(
             _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP VOLUME state}; march driver
             _op.surface_state_readout = surface_state_readout  # (u, t, args) -> {key: next per-FACE state}
             _op.path_specs = path_specs  # {fid: {frames (n_steps, n_nodes), ...}} — per-step load-path fields
+            _op.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
+            _op.contact_pairs = dict(_contact_pairs)
             return (_op, "nonlinear", offs)
 
         def _assemble_at(args):
@@ -3511,17 +3931,27 @@ def assemble_fem_native(
 
     # nonlinear (non-parametric)
     if nonlinear:
-        res_bc = _apply_dirichlet_projected(residual, dirichlet_pairs)
-        jac = _dirichlet_jac_rows(jacobian, dirichlet_pairs)
-        return (
-            FemResidualOperator(
-                lambda u, args=None: res_bc(jnp.asarray(u)),
-                lambda u, args=None: jac(jnp.asarray(u)),
-                total,
-            ),
-            "nonlinear",
-            offs,
-        )
+        # Wrapped PER CALL rather than once, so `args` reaches the free residual: `fem.solve(contact=...)`
+        # hands the re-paired tables down that way, and a wrapper built once would drop them silently and
+        # keep solving against the frozen pairing. (`_apply_dirichlet_projected` takes a one-argument
+        # residual by design -- forwarding a second positional would bind it to `t`.)
+        def _res_np(u, args=None):
+            return _apply_dirichlet_projected(lambda uu: residual(uu, 0.0, args), dirichlet_pairs)(jnp.asarray(u))
+
+        def _jac_np(u, args=None):
+            # Carry the pattern across the wrapper. `_dirichlet_jac_rows` plans its compression from
+            # `_jno_static_idx`, and a bare lambda has no such attribute -- so without this the
+            # Dirichlet duplicates were left uncompressed on every non-parametric solve, silently.
+            _f = lambda uu: jacobian(uu, 0.0, args)  # noqa: E731
+            _idx_for = getattr(jacobian, "_jno_static_idx_for", None)
+            if _idx_for is not None:
+                _f._jno_static_idx = _idx_for(args)
+            return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
+
+        _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
+        _op_np.contact_pairs = dict(_contact_pairs)
+        return (_op_np, "nonlinear", offs)
 
     # linear (non-parametric)
     A = jacobian(zeros)

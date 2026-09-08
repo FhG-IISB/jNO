@@ -6,6 +6,7 @@ from ...trace import (
     Assembly,
     BinaryOp,
     BoundConstraint,
+    Cellwise,
     Diff,
     DiffSlot,
     FunctionCall,
@@ -104,6 +105,13 @@ def iter_children(node: Any):
 
     if isinstance(node, DiffSlot):
         # Leaf: a value injected at evaluation time, wraps no traced sub-expression.
+        return
+
+    if isinstance(node, Cellwise):
+        # The projected expression is an ordinary traced child — a B-bar strain depends on the trial
+        # through it — so trial/field detection and the nonlinearity classifier must see through the
+        # projection exactly as they see through a `Diff`.
+        yield node.target
         return
 
     if isinstance(node, BoundConstraint):

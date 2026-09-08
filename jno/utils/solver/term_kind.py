@@ -4,9 +4,10 @@ Every weak-form term is described by a few independent structural axes: where it
 (support), its temporal-derivative order, whether the trial/test fields appear under a
 *spatial* gradient (the channel), and whether it is linear in the unknown. In particular
 this detects whether a term is **local** — spatially pointwise, i.e. no spatial gradient on
-either trial or test — which is a per-node reaction/mass contribution (diagonal under
-lumping) rather than a neighbour-coupling global one. Operator-splitting / IMEX drivers use
-``is_local`` to decide which terms to peel into a node ODE.
+either trial or test and no per-cell ``jno.np.cellwise`` projection — which is a per-node
+reaction/mass contribution (diagonal under lumping) rather than a neighbour-coupling global
+one. Operator-splitting / IMEX drivers use ``is_local`` to decide which terms to peel into a
+node ODE.
 
 Representation note: front-end terms from ``dom.fem_symbols()`` are ``ScalarView`` wrappers
 over the underlying ``Placeholder`` IR (reachable via ``term.expr``); classification runs on
@@ -57,6 +58,8 @@ class TermKind:
         under a spatial gradient). A field appearing both ways is labelled ``"grad"``
         (conservative — correct for the ``is_local`` decision).
     linear: linear in the unknown (negated ``_is_obviously_nonlinear_in_unknown``).
+    cell_coupled: the term contains a ``jno.np.cellwise`` per-cell projection, so its value at one
+        quadrature point depends on the whole cell. Carries no spatial gradient, yet is not pointwise.
     """
 
     support: str
@@ -65,11 +68,22 @@ class TermKind:
     trial_channel: str
     test_channel: str
     linear: bool
+    cell_coupled: bool = False
 
     @property
     def is_local(self) -> bool:
-        """A volume term with no spatial gradient on trial or test → spatially pointwise."""
-        return self.support == "volume" and self.trial_channel != "grad" and self.test_channel != "grad"
+        """A volume term with no spatial gradient on trial or test → spatially pointwise.
+
+        A ``jno.np.cellwise`` projection also disqualifies it: the term's value at one quadrature point
+        then depends on every point in the cell, which is exactly what "pointwise" denies — even though
+        no spatial gradient appears anywhere in the term.
+        """
+        return (
+            self.support == "volume"
+            and self.trial_channel != "grad"
+            and self.test_channel != "grad"
+            and not self.cell_coupled
+        )
 
 
 def _has_spatial_grad_over(node: Any, field_classes) -> bool:
@@ -91,7 +105,7 @@ def _spatial_channel(ir: Any, field_classes) -> str:
 
 def classify_term(domain, term) -> TermKind:
     """Classify a single weak-form term (front-end ``ScalarView`` or raw IR) into a ``TermKind``."""
-    from ...trace import TestFunction
+    from ...trace import TestFunction, contains_cellwise
 
     ir = getattr(term, "expr", term)  # unwrap ScalarView -> Placeholder IR
 
@@ -113,4 +127,5 @@ def classify_term(domain, term) -> TermKind:
         trial_channel=_spatial_channel(ir, _trial_classes()),
         test_channel=_spatial_channel(ir, _test_classes()),
         linear=not bool(_is_obviously_nonlinear_in_unknown(domain, ir)),
+        cell_coupled=bool(contains_cellwise(ir)),
     )

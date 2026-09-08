@@ -24,6 +24,7 @@ from jax.flatten_util import ravel_pytree
 
 from ...trace import (
     BinaryOp,
+    Cellwise,
     Constant,
     Diff,
     DiffSlot,
@@ -1340,6 +1341,31 @@ def _eval_integrand(domain, node, local):
 
         return jax.grad(_scalar_of)(wrt_val)
 
+    if isinstance(node, Cellwise):
+        # Per-cell L2 projection onto P0: the quadrature-WEIGHTED mean over this cell, broadcast back to
+        # its quadrature points. `weights` is `qw_shared * meas`, so `sum(weights)` is |K| exactly and the
+        # ratio is `(∫_K x)/(∫_K 1)`. An unweighted `jnp.mean` would agree only for an equal-weight rule on
+        # an affine cell — wrong for P2/P3 rules and wrong wherever `meas` varies within the cell.
+        #
+        # This reduces over the quadrature axis of ONE cell: the element kernel is a closure over a single
+        # cell index, so it cannot reach another cell's points. The element-local `jacfwd` is unaffected —
+        # its assumption is about the DOF axis, not this one.
+        weights = local.get("quad_weights")
+        if weights is None:
+            raise NotImplementedError(
+                "jno.fem: `jno.np.cellwise(...)` has no per-cell quadrature weights on this assembly path. "
+                "The per-cell projection is wired on the real native-Lagrange VOLUME path (2-D/3-D, single "
+                "field or coupled). Not carried by: 1-D, non-nodal (Argyris/Morley/RT/N1E) elements, "
+                "boundary/surface terms, or a VPINN/collocation residual — averaging over those points "
+                "would not be a per-cell mean. Write the term on the volume with Lagrange elements, or "
+                "drop the projection."
+            )
+        val = _eval_integrand(domain, node.target, local)
+        wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
+        w = weights.reshape(wshape)
+        mean = jnp.sum(val * w, axis=0, keepdims=True) / jnp.sum(weights)
+        return jnp.broadcast_to(mean, val.shape)
+
     if isinstance(node, HistoryRef):
         # STEP-history read ``v.i(k)``: the driver threads this cell's per-quadrature-point buffer slice
         # (shape (n_quad, depth, *value_shape)) as a per-cell constant. We just pick the offset's slot —
@@ -2138,7 +2164,7 @@ def _promote_to_quadratic(points, cells_p1, edge_local):
     return pts, cells_p2
 
 
-def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None):
+def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None, *, entity_keys=False):
     """Promote a linear mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k} / Q1 -> Q{k}, any ``k``).
 
     ``cell_type`` names the cell for a tensor-product mesh (``"quad"`` / ``"hexahedron"``), whose
@@ -2184,22 +2210,66 @@ def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None):
     extent = float(np.max(points.max(axis=0) - points.min(axis=0))) if points.shape[0] else 1.0
     tol = 1e-7 * (extent or 1.0)
 
-    def _key(p):
-        return tuple(np.round(np.asarray(p) / tol).astype(np.int64))
+    # Dedup on the TOPOLOGICAL ENTITY, not the physical coordinate. A reference point's non-zero
+    # weights name exactly the P1 vertices whose entity it lies on (one -> a vertex, two -> an edge,
+    # three -> a face), so `(sorted global vertex ids, the weights in that same order)` identifies the
+    # entity independently of either cell's local orientation -- and distinguishes two entities that
+    # merely COINCIDE in space.
+    #
+    # Coordinate keying was the right conformity test for one body and the wrong one for two. On a
+    # `Shape.regions(..., conforming=False)` mesh the interface is coincident *on purpose*: the seeding
+    # loop below used to collapse the two bodies' duplicated vertices into one map entry (last writer
+    # wins), and every midpoint synthesised there then resolved to a single node -- welding the bodies,
+    # silently. Measured on a two-body bar: 37 nodes referenced by BOTH bodies, all on the interface.
+    # Harmless for a tie, wrong for contact, where those DOFs could never separate.
+    #
+    # For a CONFORMING mesh this is the same partition as before: a shared entity carries the same
+    # global vertex ids from either side, so it still collapses to one node.
+    # `entity_keys` picks WHICH non-conformity this mesh has, because the two want opposite
+    # answers:
+    #
+    #   two independently meshed BODIES -- coincident on purpose, so merging WELDS them.
+    #                                      -> key on the entity
+    #   a 2:1 HANGING-NODE refinement    -- a coarse edge's node coincides with the fine edges'
+    #                                      shared vertex, and merging them is exactly what makes
+    #                                      the constrained refinement continuous.
+    #                                      -> key on the coordinate
+    #
+    # Measured, keying the refined case on entities: order-3 on a refined mesh came out 1.8e-02
+    # off against a 1e-5 gate. So this is not a better key, it is a different question, and the
+    # caller -- which knows whether the domain carries a non-conforming interface -- must say which.
+    _wtol = 1e-9
+    _wround = 1e-6
 
-    coord_to_gid: dict = {}
+    def _coord_key(c, d):
+        return tuple(np.round(np.asarray(phys[c, d]) / tol).astype(np.int64))
+
+    def _entity_key(c, d):
+        w = weights[d]
+        nz = np.flatnonzero(np.abs(w) > _wtol)
+        vids = np.asarray(cells_p1[c])[nz]
+        order = np.argsort(vids, kind="stable")
+        return (tuple(int(v) for v in vids[order]), tuple(np.round(w[nz][order] / _wround).astype(np.int64)))
+
+    _key = _entity_key if entity_keys else _coord_key
+    ent_to_gid: dict = {}
     out_pts: List[Any] = []
     for vid in range(points.shape[0]):  # seed with the original vertices so they keep ids 0..nv-1
-        coord_to_gid[_key(points[vid])] = vid
+        _seed = (
+            ((vid,), (int(round(1.0 / _wround)),))
+            if entity_keys
+            else tuple(np.round(np.asarray(points[vid]) / tol).astype(np.int64))
+        )
+        ent_to_gid[_seed] = vid
         out_pts.append(points[vid])
     cells_k = np.zeros((ncell, ndof), dtype=np.int64)
     nid = points.shape[0]
     for c in range(ncell):
         for d in range(ndof):
-            k = _key(phys[c, d])
-            gid = coord_to_gid.get(k)
+            k = _key(c, d)
+            gid = ent_to_gid.get(k)
             if gid is None:
-                gid, coord_to_gid[k] = nid, nid
+                gid, ent_to_gid[k] = nid, nid
                 out_pts.append(phys[c, d])
                 nid += 1
             cells_k[c, d] = gid
@@ -2576,6 +2646,34 @@ def _tri_dual_available(k: int) -> bool:
     return bool(d.min() > 1.0e-12 * float(d.max()))
 
 
+def _covers_local_3d(s_facets: np.ndarray, m_facets: np.ndarray, pts3: np.ndarray) -> bool:
+    """Does the main surface actually lie under the secondary one, measured IN SPACE?
+
+    The global-frame test below asks whether each secondary vertex falls inside some main triangle
+    after both are flattened onto one plane. On a curved interface that flattening folds, the
+    containment fails for reasons that have nothing to do with the surfaces, and the tie degrades to
+    collocation without a word -- measured on nested spheres, `coupling='collocated'` and a
+    constant-gradient patch-test error of 9.8e-01.
+
+    Here the question is asked directly: every secondary vertex must sit on the main surface, i.e. its
+    closest point on the main facets must be nearer than a fraction of a facet radius. Two coincident
+    surfaces pass however they curve; two genuinely mismatched ones still fail, which is what keeps a
+    ragged interface on the collocated path.
+    """
+    from .contact_search import facet_geometry, project_points
+
+    P = np.asarray(pts3, dtype=float)
+    sf = np.asarray(s_facets, dtype=int)
+    mf = np.asarray(m_facets, dtype=int)
+    if sf.size == 0 or mf.size == 0:
+        return False
+    q = P[np.unique(sf[:, :3])]
+    ids, w, _g0, _a = project_points(q, mf, P, np.tile(np.eye(1, P.shape[1], 0), (len(q), 1)))
+    proj = np.einsum("qk,qkd->qd", w, P[ids])
+    _V, _c, rad = facet_geometry(mf, P)
+    return bool(np.linalg.norm(proj - q, axis=1).max() <= 0.25 * float(np.median(rad)))
+
+
 def _main_covers_secondary_3d(s_facets: np.ndarray, m_facets: np.ndarray, loc: np.ndarray) -> bool:
     """Does every secondary facet vertex lie inside some main triangle? The 3-D counterpart of
     :func:`_faces_span_the_same_extent`.
@@ -2599,12 +2697,114 @@ def _main_covers_secondary_3d(s_facets: np.ndarray, m_facets: np.ndarray, loc: n
     return bool(np.all(best >= -1.0e-9))
 
 
+def _facet_rim_nodes(facets: np.ndarray, *, edges: bool) -> np.ndarray:
+    """Global ids of the nodes on the **topological boundary** of a facet patch.
+
+    A sub-facet used by exactly one facet of the patch is on its rim; the nodes of those sub-facets are
+    the rim nodes. Written here in numpy rather than reusing ``MeshUtils.extract_boundary_edges`` to keep
+    the solver free of a domain-layer import, and because the 2-D case needs a rule that helper does not
+    have -- see below.
+
+    ``edges=True`` for a 1-D interface (edge facets, a chain): a rim node is a vertex used by one edge.
+    **Columns 0 and 1 only.** A P2 midside node lies in exactly one edge by construction and is interior
+    to it, so counting every column would mark every midside node as rim and leave almost nothing tied.
+    The column convention is the file's own (see ``_mortar_rows_2d``: "Columns 0, 1 are the edge endpoints
+    at every order").
+    """
+    f = np.asarray(facets)
+    if f.ndim != 2 or f.size == 0:
+        return np.empty(0, dtype=np.int64)
+    if edges:
+        ids, counts = np.unique(f[:, :2].reshape(-1), return_counts=True)
+        return ids[counts == 1].astype(np.int64)
+    tri = f[:, :3]
+    e = np.sort(np.stack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]], axis=1).reshape(-1, 2), axis=1)
+    uniq, counts = np.unique(e, axis=0, return_counts=True)
+    return np.unique(uniq[counts == 1]).astype(np.int64) if uniq.size else np.empty(0, dtype=np.int64)
+
+
+def _rim_redistribution(facets: np.ndarray, s_at: Dict[int, int], n_s: int, *, edges: bool, rim_nodes: Any = None):
+    """``(is_rim, C)`` — which local secondary indices are on the rim, and how each rim multiplier's
+    weight is redistributed onto interior ones.
+
+    The multiplier of an interior node ``i`` becomes ``psi_i + sum_p C[i,p] psi_p`` over rim nodes ``p``.
+    Adding a rim dual to an interior one leaves ``int psi_i N_j = d_i delta_ij`` untouched for every
+    eliminated ``j``, so ``D`` stays diagonal on the eliminated columns and the tie stays an elimination
+    rather than becoming a constrained solve. The one condition consistency needs is a **column** sum::
+
+        sum_{i interior} C[i, p] == 1     for every rim node p
+
+    which is ``sum psi~ == 1`` restated -- the property the patch test rests on, and exactly what dropping
+    the rim multipliers without redistributing would destroy.
+
+    The rule is an equal split over the rim node's interior neighbours in the patch. In 2-D P1 that is a
+    single neighbour, so it reduces to Wohlmuth's ``c = 1`` (Lamichhane, *Higher Order Mortar Finite
+    Elements with Dual Lagrange Multiplier Spaces*, PhD thesis 2006, §2.3 Thm 2.8 at p=1; the
+    general-order form of Wohlmuth, SIAM J. Numer. Anal. 38(3):989-1012, 2000, §3). One rule for both
+    dimensions rather than a per-case table.
+    """
+    is_rim = np.zeros(n_s, dtype=bool)
+    C = np.zeros((n_s, n_s))
+    rim_global = (
+        _facet_rim_nodes(facets, edges=edges) if rim_nodes is None else np.asarray(sorted(rim_nodes), dtype=np.int64)
+    )
+    rim_local = np.array([s_at[int(g)] for g in rim_global if int(g) in s_at], dtype=int)
+    if rim_local.size == 0:
+        return is_rim, C  # closed patch: no rim, the transform is the identity
+    is_rim[rim_local] = True
+
+    cols = np.asarray(facets)[:, :2] if edges else np.asarray(facets)[:, :3]
+    adj: Dict[int, set] = {i: set() for i in range(n_s)}
+    for row in cols:
+        ids = [s_at[int(x)] for x in row if int(x) in s_at]
+        for a in ids:
+            adj[a].update(i for i in ids if i != a)
+
+    for p in rim_local:
+        # nearest interior nodes, widening through the patch if the 1-ring is all rim (a narrow strip)
+        seen, frontier = {int(p)}, set(adj[int(p)])
+        targets: List[int] = []
+        while frontier and not targets:
+            targets = sorted(i for i in frontier if not is_rim[i])
+            if targets:
+                break
+            seen |= frontier
+            frontier = {j for i in frontier for j in adj[i]} - seen
+        if not targets:
+            continue  # every node of this patch is rim; caller falls back to collocation
+        C[np.asarray(targets, dtype=int), int(p)] = 1.0 / len(targets)
+    return is_rim, C
+
+
+def _apply_rim_modification(diag, cross, s_nodes, m_nodes, is_rim, C):
+    """``{secondary node: [(node, weight)]}`` from the assembled ``D``/``M`` under the modified space.
+
+    Interior rows gain the redistributed rim contributions; rim nodes get **no row at all**, which is
+    what keeps them out of ``secondary_set`` and therefore kept DOFs -- no exclusion machinery needed.
+    The rim entries are negative and point at nodes on the *secondary* side; ``prolongation_from_ties``
+    resolves those to themselves because they are kept.
+    """
+    interior = np.flatnonzero(~is_rim)
+    if interior.size == 0:
+        return {}  # nothing to eliminate; the caller falls back to collocation
+    tc = cross + C @ cross  # (T M)_i = M_i + sum_p C[i,p] M_p
+    rows_out: Dict[int, List[Tuple[int, float]]] = {}
+    for i in interior:
+        w_main = tc[i] / diag[i]
+        row = [(int(s_nodes[j]), -float(C[i, j] * diag[j] / diag[i])) for j in np.flatnonzero(C[i])]
+        row += [(int(m_nodes[j]), float(w_main[j])) for j in np.flatnonzero(np.abs(w_main) > 1.0e-14)]
+        rows_out[int(s_nodes[i])] = row
+    return rows_out
+
+
 def _mortar_rows_3d(
     s_facets: np.ndarray,
     m_facets: np.ndarray,
     loc: np.ndarray,
     *,
     span: float,
+    rim_nodes: Any = None,
+    pts3: Any = None,
 ) -> Dict[int, List[Tuple[int, float]]]:
     """Dual-mortar prolongation rows for a **3-D** interface, whose facets are triangles.
 
@@ -2618,9 +2818,20 @@ def _mortar_rows_3d(
     projection on a surface, so it fails the constant-stress patch test in 3-D where the 2-D edge case
     happens to pass it.
 
-    **Areas are measured in the interface frame**, so the interface must be (near-)planar -- the same
-    assumption :func:`_interface_frame` already makes. A curved tied surface is projected, and its
-    segment areas are the projected ones.
+    ``pts3`` switches the geometry into a frame built **per secondary facet** from that facet's own
+    vertices, rather than one plane fitted to the whole interface. That is what a curved interface
+    needs: with a single global frame the areas are PROJECTED areas, and on a sphere the projection
+    folds -- measured, a secondary facet of area 0.0189193 came back covered 0.0378387, exactly twice,
+    and at a coarser mesh the containment gate failed instead and the tie degraded silently to
+    collocation with a constant-gradient patch-test error of 9.8e-01.
+
+    Projecting each candidate main triangle into the secondary facet's own plane is the standard
+    mortar projection and is second-order accurate in the facet size for any smooth surface. Nothing
+    else changes: the clipping, the fan triangulation, the quadrature and the dual basis never knew
+    where their coordinates came from.
+
+    Without ``pts3`` the old global-frame path is used unchanged, which keeps a planar interface
+    bit-identical.
     """
     s_facets = np.asarray(s_facets, dtype=int)
     m_facets = np.asarray(m_facets, dtype=int)
@@ -2639,21 +2850,52 @@ def _mortar_rows_3d(
 
     # Bounding boxes make the facet pairing O(n_s + n_m) per secondary in practice instead of a full
     # O(n_s * n_m) Python double loop, which a face of a few thousand triangles would not survive.
-    m_v = xy[m_facets[:, :3]]  # (n_m, 3, 2)
-    m_lo, m_hi = m_v.min(axis=1), m_v.max(axis=1)
+    P3 = None if pts3 is None else np.asarray(pts3, dtype=float)
+    if P3 is None:
+        m_v = xy[m_facets[:, :3]]  # (n_m, 3, 2)
+        m_lo, m_hi = m_v.min(axis=1), m_v.max(axis=1)
+    else:
+        # A box overlap in the flattened coordinate is meaningless once the surface curves, so pair by
+        # PROXIMITY in space instead -- the same centroid/radius + KD-tree the contact pairing uses.
+        from scipy.spatial import cKDTree
+
+        from .contact_search import facet_geometry
+
+        _mV, m_cent, m_rad = facet_geometry(m_facets, P3)
+        m_tree, m_reach = cKDTree(m_cent), float(m_rad.max())
 
     for e in range(s_facets.shape[0]):
-        sv = xy[s_facets[e, :3]]
-        area_e = abs(_signed_area(sv))
-        if area_e <= area_tol:
-            continue
-        s_lo, s_hi = sv.min(axis=0), sv.max(axis=0)
-        near = np.flatnonzero(np.all(m_lo <= s_hi, axis=1) & np.all(m_hi >= s_lo, axis=1))
+        if P3 is None:
+            sv = xy[s_facets[e, :3]]
+            area_e = abs(_signed_area(sv))
+            if area_e <= area_tol:
+                continue
+            s_lo, s_hi = sv.min(axis=0), sv.max(axis=0)
+            near = np.flatnonzero(np.all(m_lo <= s_hi, axis=1) & np.all(m_hi >= s_lo, axis=1))
+        else:
+            V3 = P3[s_facets[e, :3]]
+            e1, e2 = V3[1] - V3[0], V3[2] - V3[0]
+            nrm = np.cross(e1, e2)
+            n2 = float(np.linalg.norm(nrm))
+            if 0.5 * n2 <= area_tol:  # a sliver: its local frame is ill-conditioned. Skip on the TRUE
+                continue  # 3-D area, never the projected one, which can vanish spuriously.
+            t1 = e1 / np.linalg.norm(e1)
+            t2 = np.cross(nrm / n2, t1)
+            org, F = V3[0], np.stack([t1, t2])  # the secondary facet's OWN plane
+            sv = (V3 - org) @ F.T
+            area_e = abs(_signed_area(sv))  # == the true 3-D area, by construction
+            cen = V3.mean(axis=0)
+            near = np.asarray(
+                m_tree.query_ball_point(
+                    cen, float(np.linalg.norm(V3 - cen, axis=1).max()) + m_reach + 1e-9 * max(span, 1.0)
+                ),
+                dtype=int,
+            )
         rows = [s_at[int(v)] for v in s_facets[e]]
         sv_ccw = _as_ccw(sv)
         covered = 0.0
         for f in near:
-            mv = xy[m_facets[f, :3]]
+            mv = xy[m_facets[f, :3]] if P3 is None else (P3[m_facets[f, :3]] - org) @ F.T
             poly = _clip_convex(sv_ccw, _as_ccw(mv))
             if poly.shape[0] < 3:
                 continue
@@ -2685,12 +2927,13 @@ def _mortar_rows_3d(
             "Mortar coupling produced a singular secondary mass diagonal; a tied secondary node carries no "
             "facet area. Check the secondary tag selects whole boundary facets, not isolated nodes."
         )
-    rows_out: Dict[int, List[Tuple[int, float]]] = {}
-    for node, i in s_at.items():
-        w_row = cross[i] / diag[i]
-        nz = np.flatnonzero(np.abs(w_row) > 1.0e-14)
-        rows_out[node] = [(int(m_nodes[j]), float(w_row[j])) for j in nz]
-    return rows_out
+    # Boundary-modified multiplier space: the multipliers of rim nodes are redistributed onto their
+    # interior neighbours and the rim nodes get no row, so they stay kept DOFs. Without this the rim
+    # multipliers enforce an averaged continuity where their support leaves the interface, dragging
+    # outer-boundary flux into interior interface equations (measured: the tangential modes at 1.07e-02
+    # and 8.4e-03 while the constant and normal ones were at round-off).
+    _is_rim, _C = _rim_redistribution(s_facets, s_at, len(s_nodes), edges=False, rim_nodes=rim_nodes)
+    return _apply_rim_modification(diag, cross, s_nodes, m_nodes, _is_rim, _C)
 
 
 def _faces_span_the_same_extent(s_facets: np.ndarray, m_facets: np.ndarray, loc: np.ndarray, *, span: float) -> bool:
@@ -2720,6 +2963,7 @@ def _mortar_rows_2d(
     loc: np.ndarray,
     *,
     span: float,
+    rim_nodes: Any = None,
 ) -> Dict[int, List[Tuple[int, float]]]:
     """Dual-mortar prolongation rows for a **2-D** interface, whose facets are edges.
 
@@ -2787,10 +3031,27 @@ def _mortar_rows_2d(
             diag[rows] += np.einsum("qi,qi,q->i", psi, n_s, w)
             cross[np.ix_(rows, cols)] += np.einsum("qi,qj,q->ij", psi, n_m, w)
 
-        if abs(covered - (e_hi - e_lo)) > 1.0e-8 * max(e_hi - e_lo, seg_tol):
+        _len = e_hi - e_lo
+        if abs(covered - _len) > 1.0e-8 * max(_len, seg_tol):
+            # OVER-coverage and UNDER-coverage have opposite causes, and calling both a "hole" sent
+            # the reader looking for a gap that was not there. Covering a facet more than once means
+            # the interface FOLDS onto itself under the single tangent-plane projection this method
+            # parametrises by (see `_interface_frame`): a beam standing in a channel touches the fluid
+            # on three faces, and its two parallel sides land on the same interval, so every secondary
+            # edge finds main edges on the far face too. Measured there: 0.1059 covered of a 0.0529
+            # facet -- exactly twice.
+            if covered > _len:
+                raise ValueError(
+                    f"Mortar segmentation covered {covered:.6g} of a secondary facet of length "
+                    f"{_len:.6g} -- {covered / _len:.2f}x, so the main face overlaps ITSELF once "
+                    "projected onto the interface. The mortar parametrises an interface by a single "
+                    "tangent plane, so it needs a (near-)flat one; this interface turns a corner "
+                    "(e.g. a body embedded in another, touching it on several faces) and folds. Tie "
+                    "each flat face as its own interface, or use a conforming mesh there."
+                )
             raise ValueError(
                 f"Mortar segmentation covered {covered:.6g} of a secondary facet of length "
-                f"{e_hi - e_lo:.6g}. The two faces span the same extent, so this is a HOLE in the "
+                f"{_len:.6g}. The two faces span the same extent, so this is a HOLE in the "
                 "main face -- its facets do not tile it. Check the main tag selects a connected "
                 "set of whole boundary facets."
             )
@@ -2800,12 +3061,13 @@ def _mortar_rows_2d(
             "Mortar coupling produced a singular secondary mass diagonal; a tied secondary node carries no "
             "facet area. Check the secondary tag selects whole boundary facets, not isolated nodes."
         )
-    rows_out: Dict[int, List[Tuple[int, float]]] = {}
-    for node, i in s_at.items():
-        w_row = cross[i] / diag[i]
-        nz = np.flatnonzero(np.abs(w_row) > 1.0e-14)
-        rows_out[node] = [(int(m_nodes[j]), float(w_row[j])) for j in nz]
-    return rows_out
+    # Boundary-modified multiplier space: the multipliers of rim nodes are redistributed onto their
+    # interior neighbours and the rim nodes get no row, so they stay kept DOFs. Without this the rim
+    # multipliers enforce an averaged continuity where their support leaves the interface, dragging
+    # outer-boundary flux into interior interface equations (measured: the tangential modes at 1.07e-02
+    # and 8.4e-03 while the constant and normal ones were at round-off).
+    _is_rim, _C = _rim_redistribution(s_facets, s_at, len(s_nodes), edges=True, rim_nodes=rim_nodes)
+    return _apply_rim_modification(diag, cross, s_nodes, m_nodes, _is_rim, _C)
 
 
 def main_trace_weights(
@@ -2878,57 +3140,67 @@ def interface_gap_data(
     points: np.ndarray,
     secondary_normals: np.ndarray,
     *,
-    frame: np.ndarray | None = None,
-    origin: np.ndarray | None = None,
+    capture: float | None = None,
+    exclude_nodes=None,
+    main_normals=None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Everything a signed contact gap needs, precomputed on the host: ``(ids, w, g0)``.
 
     The gap between two surfaces is ``g = g0 - n . (u_s - u_m . Phi)``, split into a part fixed by the
     geometry and a part that moves with the solution:
 
-    * ``g0 = n . (Phi(x_s) - x_s)`` — the **initial** separation at each secondary quadrature point, i.e.
+    * ``g0 = n . (Phi(x_s) - x_s)`` -- the **initial** separation at each secondary quadrature point, i.e.
       how far it stands off the main surface along the normal. Positive = a gap, negative = initial
       penetration. Zero for two coincident (tied) faces.
-    * ``(ids, w)`` — the :func:`main_trace_weights` gather, so ``u_m . Phi`` at those points is a
-      plain weighted sum of main DOFs and therefore differentiable in the solution.
+    * ``(ids, w)`` -- the gather, so ``u_m . Phi`` at those points is a plain weighted sum of main DOFs
+      and therefore differentiable in the solution.
 
-    **Orientation — the one thing to get right.** ``n`` is the **secondary face's outward normal**, which on
+    **Orientation -- the one thing to get right.** ``n`` is the **secondary face's outward normal**, which on
     a contacting pair points *toward* the main body. Secondary motion along ``n`` therefore *closes* the
     gap, which is where the minus sign on the displacement term comes from. Handed the opposite normal
     this returns ``-g``, and every downstream sign follows it: a penetrating body reads as open, and
-    ``max(0, -c*g)`` never activates, so free interpenetration is an exact root of the residual and
+    ``max(0, .)`` never activates, so free interpenetration is an exact root of the residual and
     Newton converges to it without complaint. The parameter is named ``secondary_normals`` rather than
     ``normals`` because there is nothing in the arrays themselves that distinguishes the two cases.
 
     The convention that follows is ``g > 0`` separated, ``g < 0`` interpenetrating, contact pressure
-    ``p = max(0, -c*g) >= 0``, and a traction term ``+p * inner(n, phi)`` — the sign that adds a
+    ``p = max(0, -c*g) >= 0``, and a traction term ``+p * inner(n, phi)`` -- the sign that adds a
     *positive*-definite ``+c (n.du)(n.phi)`` to the tangent, since ``dg/du_s = -n``.
 
-    ``secondary_qp`` is ``(..., dim)`` physical quadrature points on the secondary face; ``secondary_normals`` is the
-    matching outward unit normal per point (or one per face, broadcast by the caller). ``frame`` /
-    ``origin`` default to a fit of the **main** facets' own tangent plane (:func:`_interface_frame`),
-    which is what makes this work for coincident faces where no separating axis exists.
+    The pairing is :func:`~.contact_search.project_points`: each query point is matched with the facet
+    **nearest to it in space**. It used to be matched in a coordinate obtained by flattening the whole
+    main face onto one fitted tangent plane, which is exact for a flat interface and wrong in
+    proportion to curvature -- on two concentric arcs of true separation 0.3 it reported 0.43, and
+    since it over-reports separation the resulting free interpenetration is silent. The ``frame`` /
+    ``origin`` arguments that supplied that plane are gone with it: there is no single frame in a local
+    projection, and accepting them while ignoring them would be worse than removing them. A flat
+    interface is unaffected -- the trace agrees to 1.4e-15 and ``g0`` bit-exactly.
 
-    Host/NumPy: locating each point on the main face is a discrete search, frozen at build time. So
-    the gap is differentiable in the DOF values but **not** in the mesh coordinates -- shape-optimising
-    through a contact gap would need the projection re-derived in JAX. It also assumes **small
-    sliding**: the pairing is fixed, so a caller that slides must rebuild it per load step.
+    ``capture`` and ``exclude_nodes`` pass straight to :func:`~.contact_search.project_points`:
+    a finite ``capture`` makes a far-away query **inactive** (slot kept, ``w = 0``, ``g0 = OPEN_GAP``)
+    instead of clamping it to the nearest facet however distant, and ``exclude_nodes`` keeps a facet
+    from pairing with its own neighbours. Both are what a re-running search needs and neither changes
+    the build-time defaults, which stay unbounded and unfiltered.
+
+    Host/NumPy: locating each point on the main face is a discrete search. So the gap is differentiable
+    in the DOF values but **not** in the mesh coordinates -- shape-optimising through a contact gap
+    would need the projection re-derived in JAX. Called once at build time the pairing is **frozen**,
+    which assumes **small sliding**; ``fem.solve(contact=...)`` calls it again per round from the
+    deformed configuration, which is what lifts that assumption.
     """
-    q = np.asarray(secondary_qp, dtype=float)
-    pts = np.asarray(points, dtype=float)
-    m_facets = np.asarray(m_facets, dtype=int)
-    flat = q.reshape(-1, q.shape[-1])
-    if frame is None or origin is None:
-        m_pts = pts[np.unique(m_facets)]
-        frame, origin = _interface_frame(m_pts, flat if flat.size else m_pts)
+    from .contact_search import project_points  # deferred: contact_search imports this module's shapes
 
-    ids, w = main_trace_weights((flat - origin) @ np.asarray(frame).T, m_facets, (pts - origin) @ np.asarray(frame).T)
-    proj = np.einsum("qk,qkd->qd", w, pts[ids])  # Phi(x_s): the main-surface point under each query
-    n = np.asarray(secondary_normals, dtype=float).reshape(-1, q.shape[-1])
-    # Measured from the secondary TOWARD the main (``proj - x_s``), because ``n`` points that way -- see
-    # the orientation paragraph above, which is the whole reason this line is not the other way round.
-    g0 = np.einsum("qd,qd->q", n, proj - flat)
+    q = np.asarray(secondary_qp, dtype=float)
     lead = q.shape[:-1]
+    ids, w, g0, _active = project_points(
+        q.reshape(-1, q.shape[-1]),
+        m_facets,
+        points,
+        np.asarray(secondary_normals, dtype=float).reshape(-1, q.shape[-1]),
+        capture=capture,
+        exclude_nodes=exclude_nodes,
+        main_normals=main_normals,
+    )
     return ids.reshape(*lead, -1), w.reshape(*lead, -1), g0.reshape(*lead)
 
 
@@ -3049,6 +3321,7 @@ def build_periodic_prolongation(
     tol: float | None = None,
     facets: Dict[str, np.ndarray] | None = None,
     phases: Sequence[complex] | None = None,
+    exclude_dofs: Any = None,
 ) -> Dict[str, object]:
     """Build the node-level periodic prolongation matrix ``P``.
 
@@ -3126,7 +3399,12 @@ def build_periodic_prolongation(
     secondary_to_main: Dict[int, int] = {}
     secondary_phase: Dict[int, complex] = {}
     secondary_interp: Dict[int, List[Tuple[int, float]]] = {}
-    n_mortar = n_collocated = 0  # how each non-matching secondary was tied -> reported in ``coupling``
+    # How each secondary was tied -> reported in ``coupling``. `n_exact` counts the node-to-node branch,
+    # which USED to go uncounted: an interface where most secondaries happen to coincide with a main node
+    # then reported "mortar" while most of its rows were plain collocation. That is not cosmetic --
+    # mixing weight-1 collocation rows into a dual-mortar operator destroys the biorthogonality the
+    # method's consistency rests on, and the report is how a caller would ever find out.
+    n_exact = n_mortar = n_collocated = 0
 
     for (main_tag, secondary_tag), ph in zip(pairs, phases):
         if main_tag not in tag_indices or secondary_tag not in tag_indices:
@@ -3177,6 +3455,35 @@ def build_periodic_prolongation(
         # (tied) -- the axis-dropping this replaces could only express the former. See _interface_frame.
         frame, origin = _interface_frame(m_pts, s_pts)
         loc = (pts - origin) @ frame.T  # (n_nodes, dim-1) in-interface coordinates
+
+        # A CURVED 2-D interface is parametrised by ARC LENGTH along its own chain instead. Projecting
+        # onto one fitted tangent plane is a coordinate only while the interface is flat: a corner
+        # folds its two arms onto the same interval, so every secondary edge finds main edges on the
+        # far arm and each is covered twice -- measured 2.00x on a beam standing in a channel, which is
+        # why that interface had to be hand-decomposed into three flat ties. Arc length is monotone
+        # along the interface by construction and cannot fold.
+        #
+        # Flat interfaces keep the projected coordinate BIT-FOR-BIT: the switch is gated on the main
+        # facets' own normals disagreeing, so every existing conforming and periodic tie is untouched.
+        _mfc0 = facets.get(main_tag)
+        if loc.shape[1] == 1 and _mfc0 is not None and len(np.asarray(_mfc0)) > 1:
+            _e = np.asarray(pts)[np.asarray(_mfc0, dtype=int)[:, 1]] - np.asarray(pts)[np.asarray(_mfc0, dtype=int)[:, 0]]
+            _n = _e[:, ::-1] * np.array([1.0, -1.0])  # the 2-D normal of each edge
+            _n = _n / np.maximum(np.linalg.norm(_n, axis=1, keepdims=True), 1e-300)
+            _spread = float(np.abs(np.abs(_n @ _n.mean(axis=0)) / max(np.linalg.norm(_n.mean(axis=0)), 1e-300) - 1.0).max())
+            if _spread > 1.0e-3:  # ~2.6 degrees of normal variation: not one tangent plane
+                from .contact_search import arclength_of
+
+                _s_all, _tot, _closed = arclength_of(np.asarray(pts), _mfc0, np.asarray(pts))
+                if _closed:
+                    raise NotImplementedError(
+                        f"tie ({main_tag!r}, {secondary_tag!r}): the interface is a CLOSED loop (an "
+                        "annular air gap, say). Its arc-length coordinate is periodic, and the "
+                        "segmentation below clips in an open interval, so a facet straddling the seam "
+                        "would be miscounted. Split the loop into two or more arcs and tie each -- "
+                        "each arc may be curved, which is what this parametrisation buys."
+                    )
+                loc = _s_all[:, None]
         m_loc, s_loc = loc[m_ids], loc[s_ids]
 
         # Nearest in-interface main node for every secondary node.
@@ -3184,31 +3491,98 @@ def build_periodic_prolongation(
         nn = np.argmin(d2, axis=1) if m_ids.size else np.zeros(len(s_ids), dtype=int)
         dist = np.sqrt(d2[np.arange(len(s_ids)), nn]) if m_ids.size and len(s_ids) else np.zeros(len(s_ids))
 
+        # Rim nodes carry no multiplier under the boundary-modified space, so they get no row and stay
+        # KEPT. Computed once, here, and handed to the row builder so the two cannot drift.
+        s_fc, m_fc = facets.get(secondary_tag), facets.get(main_tag)
+        _rim: set = set()
+        if s_fc is not None and loc.shape[1] in (1, 2):
+            _rim = {int(n) for n in _facet_rim_nodes(s_fc, edges=(loc.shape[1] == 1))}
+            # A topological rim is only a REAL one where the interface actually ends. On a periodic cell
+            # it does not: a face's rim runs into the perpendicular periodic faces, and those nodes are
+            # tied by the other pairs -- leaving them untied splits the cube corners into two groups
+            # instead of identifying all eight. So drop any node another pair also owns.
+            _elsewhere: set = set()
+            for _pair in pairs:
+                _mt, _st = str(_pair[0]), str(_pair[1])
+                if (_mt, _st) == (main_tag, secondary_tag):
+                    continue
+                for _t in (_mt, _st):
+                    _elsewhere.update(int(v) for v in np.asarray(tag_indices.get(_t, ())).reshape(-1))
+            _rim -= _elsewhere
+
         # A non-matching secondary is tied by a MORTAR coupling when the interface is 2-D (edge facets) and
         # both faces carry facet connectivity -- an integrated constraint that passes the patch test.
         # Without secondary facets (native 1-D chains, a tag that selects nodes but no whole facet) there is
         # nothing to integrate over, so those nodes keep the collocated node-to-segment weights. Which
         # one each tie used is reported back in ``coupling`` rather than left to guesswork.
         mortar: Dict[int, List[Tuple[int, float]]] = {}
-        s_fc, m_fc = facets.get(secondary_tag), facets.get(main_tag)
         if s_fc is not None and m_fc is not None and loc.shape[1] in (1, 2):
             span = float(np.ptp(loc)) if loc.size else 1.0
             if loc.shape[1] == 1:  # 2-D interface: edge facets, clipping is an interval intersection
                 if _faces_span_the_same_extent(s_fc, m_fc, loc, span=span):
-                    mortar = _mortar_rows_2d(s_fc, m_fc, loc, span=span)
+                    mortar = _mortar_rows_2d(s_fc, m_fc, loc, span=span, rim_nodes=_rim)
             # 3-D: triangle facets, polygon clipping. P2 triangles have no dual basis of this form
             # (their vertex functions integrate to zero) -- see _tri_dual_available.
-            elif _tri_dual_available(int(np.shape(s_fc)[1])) and _main_covers_secondary_3d(s_fc, m_fc, loc):
-                mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span)
+            elif _tri_dual_available(int(np.shape(s_fc)[1])):
+                # Is the interface CURVED? Compare the main facets' own normals. A planar interface
+                # keeps the global-frame path bit-for-bit; only a curved one takes the local frames.
+                _mv3 = np.asarray(pts)[np.asarray(m_fc, dtype=int)[:, :3]]
+                _n3 = np.cross(_mv3[:, 1] - _mv3[:, 0], _mv3[:, 2] - _mv3[:, 0])
+                _n3 = _n3 / np.maximum(np.linalg.norm(_n3, axis=1, keepdims=True), 1e-300)
+                _mu = _n3.mean(axis=0)
+                _mu = _mu / max(float(np.linalg.norm(_mu)), 1e-300)
+                _curved3 = bool((1.0 - np.abs(_n3 @ _mu)).max() > 1.0e-3)
+                # The local path needs the two faces to be COINCIDENT, which a tie is and a PERIODIC
+                # pair is not: periodic faces sit a lattice vector apart, and removing that offset is
+                # exactly what `_interface_frame` is for. `_covers_local_3d` measures in space, so it
+                # says no for a translated pair -- and the `and` here makes that a fall-through to the
+                # global path rather than no mortar at all. Without the fall-through a triply-periodic
+                # P2 cube lost its coupling entirely.
+                if _curved3 and _covers_local_3d(s_fc, m_fc, np.asarray(pts)):
+                    mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim, pts3=np.asarray(pts))
+                elif _main_covers_secondary_3d(s_fc, m_fc, loc):
+                    mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim)
+            elif int(np.shape(s_fc)[1]) == 6:
+                # A P2 TRIANGLE has no dual basis of this form and never will -- Lamichhane, thesis
+                # 2006, Lemma 3.4 -- so this interface silently becomes collocated, which ties but does
+                # NOT pass the patch test. Say so: the alternative is discovering it from a wrong answer.
+                _log.warning(
+                    f"tie ({main_tag!r}, {secondary_tag!r}): order-2 triangular facets have no "
+                    "biorthogonal dual basis in 3-D (Lamichhane 2006, Lemma 3.4 -- the P2 vertex "
+                    "functions integrate to zero), so this interface uses the COLLOCATED coupling, "
+                    "which does not pass the constant-stress patch test. Use order-1 tetrahedra for a "
+                    "variationally consistent 3-D tie."
+                )
+
+        # ONE formula for the whole interface, decided HERE and applied to every secondary below.
+        # Choosing per node is what broke the patch test: a weight-1 collocation row sitting inside a
+        # dual-mortar operator destroys the biorthogonality the method's consistency rests on. On a
+        # stacked-block interface the two bodies share their outer edges, so most secondaries coincide
+        # with a main node and took the shortcut -- measured 8 of 12 -- while the rest were integrated.
+        #
+        # The exact node-to-node path is NOT an optimisation and must not be dropped: it is the only
+        # tie mechanism for a 1-D interface (the frame has zero columns, so there is nothing to
+        # integrate over), for Morley's value block (delegated with no facets at all), for quad/hex
+        # facets, and for 3-D P2 tets -- the last two have no dual basis of this form at all.
+        _exact_ok = bool(m_ids.size) and len(s_ids) > 0 and bool(np.all(dist <= tol))
+        # Mortar only if every NON-RIM secondary has a row; a tag selecting nodes but not whole facets
+        # leaves some without one, and filling those from collocation is the mixing this removes.
+        _mortar_ok = bool(mortar) and all(int(sid) in mortar for sid in s_ids if int(sid) not in _rim)
+        _mode = "conforming" if _exact_ok else ("mortar" if _mortar_ok else "collocated")
 
         for k, sid in enumerate(s_ids):
-            if m_ids.size and dist[k] <= tol:  # conforming: exact node-to-node (corners land here too)
+            if _mode == "mortar" and int(sid) in _rim:
+                # An explicit branch, never an omission: a rim node that fell through would land in
+                # collocation and reintroduce exactly the traction spreading the modification removes.
+                continue
+            if _mode == "conforming":
                 secondary_to_main[int(sid)] = int(m_ids[nn[k]])
                 secondary_phase[int(sid)] = complex(ph)
+                n_exact += 1
                 continue
-            # non-matching: mortar rows when available, else collocated node-to-segment interpolation
+            # non-matching: the interface's own coupling, applied to every node of it
             # (either way the weights are scaled by the Bloch phase)
-            w = mortar.get(int(sid))
+            w = mortar.get(int(sid)) if _mode == "mortar" else None
             if w is not None:
                 n_mortar += 1
             else:
@@ -3230,6 +3604,7 @@ def build_periodic_prolongation(
         vec=vec,
         secondary_phase=secondary_phase,
         is_bloch=is_bloch,
+        exclude_dofs=exclude_dofs,
         coupling=(
             "conforming"
             if not (n_mortar or n_collocated)
@@ -3239,7 +3614,78 @@ def build_periodic_prolongation(
             if not n_mortar
             else "mixed"
         ),
+        tie_counts=(n_exact, n_mortar, n_collocated),
     )
+
+
+def _prolongation_dof_level(n_nodes, vec, secondary_set, raw, exclude, *, is_bloch, coupling, tie_counts=None):
+    """Per-DOF elimination, for when some prescribed DOFs must be kept out of a node-level tie.
+
+    Returns the **DOF-level shape** (``vec = 1``, ``kept_nodes`` holding DOF indices) that
+    :func:`build_slip_prolongation` already emits, so every downstream consumer works unchanged; a
+    node/DOF hybrid would break ``restrict_state``, which gathers via ``kept_nodes * vec + arange(vec)``.
+    The transitive resolution is redone per component, because a chain may be excluded at one component
+    and live at another.
+    """
+    import jax.experimental.sparse as jsparse
+
+    sec_dofs = {(s, c) for s in secondary_set for c in range(vec) if (s * vec + c) not in exclude}
+    resolved: Dict[Any, Dict[Any, float]] = {}
+
+    def _expand_dof(node: int, c: int, stack: frozenset) -> Dict[Any, float]:
+        if (node, c) not in sec_dofs:
+            return {(node, c): 1.0}
+        if (node, c) in resolved:
+            return resolved[(node, c)]
+        if (node, c) in stack:
+            raise ValueError(f"Periodic identification is cyclic at node {node} (component {c}).")
+        down = stack | {(node, c)}
+        out: Dict[Any, float] = {}
+        for n2, w in raw[node]:
+            for kd, wk in _expand_dof(n2, c, down).items():
+                out[kd] = out.get(kd, 0.0) + w * wk
+        resolved[(node, c)] = out
+        return out
+
+    kept_dofs = [i * vec + c for i in range(n_nodes) for c in range(vec) if (i, c) not in sec_dofs]
+    red_index = {d: r for r, d in enumerate(kept_dofs)}
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[complex] = []
+    for i in range(n_nodes):
+        for c in range(vec):
+            dof = i * vec + c
+            if (i, c) in sec_dofs:
+                for (kn, kc), w in _expand_dof(i, c, frozenset()).items():
+                    rows.append(dof)
+                    cols.append(red_index[kn * vec + kc])
+                    data.append(w if is_bloch else float(np.real(w)))
+            else:
+                rows.append(dof)
+                cols.append(red_index[dof])
+                data.append(1.0)
+
+    n_full, n_red = int(n_nodes * vec), len(kept_dofs)
+    P = jsparse.BCOO(
+        (
+            jnp.asarray(np.asarray(data, dtype=np.complex128 if is_bloch else np.float64)),
+            jnp.asarray(np.stack([np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)], axis=1)),
+        ),
+        shape=(n_full, n_red),
+    )
+    return {
+        "P": P,
+        "P_node": P,
+        "kept_nodes": np.asarray(kept_dofs, dtype=np.int64),  # DOF level, hence vec == 1
+        "secondary_to_main": {},
+        "n_full": n_full,
+        "n_red": n_red,
+        "vec": 1,
+        "is_selection": _is_selection(P),
+        "is_bloch": bool(is_bloch),
+        "coupling": coupling,
+        "tie_counts": tuple(int(c) for c in (tie_counts or (0, 0, 0))),
+    }
 
 
 def prolongation_from_ties(
@@ -3251,6 +3697,8 @@ def prolongation_from_ties(
     secondary_phase: Dict[int, complex] | None = None,
     is_bloch: bool = False,
     coupling: str = "conforming",
+    exclude_dofs: Any = None,
+    tie_counts: Any = None,
 ) -> Dict[str, object]:
     """Turn ``constrained node -> weights on other nodes`` into the prolongation ``P``.
 
@@ -3294,6 +3742,19 @@ def prolongation_from_ties(
                 out[kept_node] = out.get(kept_node, 0.0) + w * wk
         resolved[node] = out
         return out
+
+    # A DOF whose value is ALREADY PRESCRIBED must not be eliminated: it needs a row of its own for the
+    # Dirichlet condition to be imposed into after the reduction (an eliminated one would need the
+    # multipoint constraint `sum w_j x_j = g`, which is not a unit row). Decided per DOF, not per node,
+    # because Dirichlet can be per-component -- a roller prescribes one component of a tied node.
+    #
+    # Done BEFORE the transitive resolution, not by post-processing P: a chain s1 -> s2 -> k bakes
+    # `w(s1,s2)*w(s2,k)` into s1's row, and promoting s2 afterwards cannot un-bake it.
+    _excl = {int(d) for d in (exclude_dofs or ())}
+    if _excl and any((d // vec) in secondary_set for d in _excl):
+        return _prolongation_dof_level(
+            n_nodes, vec, secondary_set, raw, _excl, is_bloch=is_bloch, coupling=coupling, tie_counts=tie_counts
+        )
 
     kept_nodes: List[int] = [i for i in range(n_nodes) if i not in secondary_set]
     reduced_index = {node: r for r, node in enumerate(kept_nodes)}
@@ -3351,6 +3812,13 @@ def prolongation_from_ties(
         # passes the patch test), "collocated" (node-to-segment; no secondary facets to integrate over),
         # "mixed", or "hanging". Reported rather than inferred, so a caller never has to guess.
         "coupling": coupling,
+        # (exact node-to-node, mortar, collocated) secondary counts. `coupling` names how the
+        # NON-MATCHING secondaries were tied and says nothing about how many were exact -- and an
+        # interface that is mostly exact with a few mortar rows does not inherit the mortar method's
+        # consistency, because mixing weight-1 rows into a dual-mortar operator breaks the
+        # biorthogonality that consistency rests on. Reported so a caller can tell; see
+        # `tests/test_fem_tie_dirichlet_conflict.py` for a measured case where it matters.
+        "tie_counts": tuple(int(c) for c in (tie_counts or (0, 0, 0))),
     }
 
 
@@ -3925,6 +4393,11 @@ def _expr_digest(node, seen=None):
         )
     elif isinstance(node, (Jacobian, Hessian)):
         head = ("d", str(getattr(node, "scheme", "")))
+    elif isinstance(node, Cellwise):
+        # Carries no data of its own — the projection is fully determined by its child, which
+        # `child_digests` below already covers. Without this the digest would `content_bail` and every
+        # B-bar form would silently lose the compiled-kernel cache.
+        head = ("cellwise",)
     elif isinstance(node, BinaryOp):
         head = ("op", node.op)
     elif isinstance(node, FunctionCall):
@@ -4368,7 +4841,13 @@ def compress_plan(indices):
     idx = np.stack([uniq // stride, uniq % stride], axis=1).astype(np.int32)
     # int32 inverse: it is one entry per RAW triplet, so on a large 3-D operator it is the biggest
     # array the plan holds -- halving it against numpy's int64 default is worth the cast.
-    plan = jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
+    # NUMPY, not jnp. This plan is pure host data -- it comes from mesh connectivity -- and it is kept
+    # in a module-level cache. Building it with `jnp.asarray` while inside a trace produced trace-bound
+    # arrays, cached them, and handed them back to a later trace: JAX raised UnexpectedTracerError from
+    # a staggered sweep, which builds its Jacobian wrapper inside a `while_body`. `apply_compress_plan`
+    # feeds these straight to `segment_sum` and the BCOO constructor, both of which take numpy, so
+    # nothing downstream needs the conversion -- it only ever created the hazard.
+    plan = idx, inverse.reshape(-1).astype(np.int32), int(uniq.shape[0])
     _PLAN_CACHE[key] = plan
     while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
         _PLAN_CACHE.popitem(last=False)
@@ -4773,6 +5252,124 @@ def _blockdiag_bcoo(Ps, off_f, off_r):
         (jnp.asarray(v), jnp.asarray(np.stack([r, c], axis=1))),
         shape=(int(off_f[-1]), int(off_r[-1])),
     )
+
+
+def impose_reduced_dirichlet(periodic, A, b, *, mass=None):
+    """Re-impose, in the REDUCED space, the prescribed rows the congruence ``P^T A P`` destroyed.
+
+    Dirichlet is imposed at assembly, before the tie reduction, and ``P^T`` sums an eliminated DOF's
+    equation into every row it ties to -- so a prescribed DOF that is a tie *target* loses the unit row
+    holding its value, and ``P^T b`` loses ``b[d] = g`` with it. :func:`reduced_dirichlet_pairs` decides
+    which rows those are (stored on the dict as ``dirichlet_reduced``); this puts them back.
+
+    Every reduced-space solve site goes through here, so the repair cannot drift between paths -- the
+    complex and transient paths were each silently wrong for exactly as long as they had their own copy
+    of this logic, or none (measured on the mortar patch test: 5.8e-04 complex, 4.2e-04 transient,
+    against 7e-18 conforming).
+
+    ``mass`` present selects the semidiscrete form ``M u' + A u = b`` and returns ``(M, A, b)``: ``A``/``b``
+    get the same symmetric elimination, and ``M``'s constrained rows and columns are zeroed so the DOF
+    carries no time derivative. Absent, the steady form ``A u = b`` returns ``(A, b)``.
+
+    Re-imposing symmetrically is not a double lift: the full-space pass already zeroed column ``d``, so
+    the only coupling reaching the reduced row runs through eliminated DOFs, which that pass never saw.
+    Restoring the row alone would leave the reduced column populated -- an O(1) asymmetry that silently
+    downgrades LDL^T to general LU and puts cg/minres out of reach.
+    """
+    pairs = (periodic or {}).get("dirichlet_reduced")
+    if not pairs:
+        return (A, b) if mass is None else (mass, A, b)
+    from .fem_1d import _apply_dirichlet_symmetric, _apply_dirichlet_transient
+
+    if mass is None:
+        return _apply_dirichlet_symmetric(A, b, pairs)
+    return _apply_dirichlet_transient(mass, A, b, pairs)
+
+
+def wrap_reduced_dirichlet(periodic, residual_fn=None, jacobian_fn=None):
+    """``(residual_fn, jacobian_fn)`` carrying the reduced-space Dirichlet rows, for a RESIDUAL form.
+
+    The matrix-form companion of :func:`impose_reduced_dirichlet`, for the paths that never assemble a
+    reduced ``(A, b)`` -- steady nonlinear and the continuation march. Same pairs, same reason; the
+    projected form is used rather than row replacement because ``_apply_dirichlet_projected`` substitutes
+    the prescribed value into the iterate before evaluating, which is what keeps ``P^T J P`` symmetric.
+
+    Either callable may be ``None`` (a matrix-free Newton has no tangent to wrap; the continuation march
+    wraps its two closures separately, because each binds the load parameter per call).
+    """
+    pairs = (periodic or {}).get("dirichlet_reduced")
+    if not pairs:
+        return residual_fn, jacobian_fn
+    import jax.numpy as _jnp
+
+    from .fem_1d import _apply_dirichlet_projected
+
+    dofs = _jnp.asarray([int(d) for d, _v in pairs], dtype=_jnp.int32)
+    r_bc = None if residual_fn is None else _apply_dirichlet_projected(residual_fn, pairs)
+    if jacobian_fn is None:
+        return r_bc, None
+
+    def _jac_bc(*a, **k):
+        return bcoo_eliminate_dirichlet(jacobian_fn(*a, **k), dofs)
+
+    return r_bc, _jac_bc
+
+
+def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False):
+    """``[(reduced_dof, value)]`` for the prescribed DOFs whose reduced row the congruence pollutes.
+
+    A tie is imposed as ``u = P x`` and the system reduced as ``P^T A P``. ``P^T`` SUMS each eliminated
+    DOF's equation into the rows it ties to, so a prescribed DOF that is a tie *target* loses the unit
+    row holding its value -- and ``reduce_vector`` does the same to ``b[d] = g``. Those rows have to be
+    re-imposed in the reduced space; this returns which ones, and at what value.
+
+    ``all_rows=True`` returns EVERY prescribed DOF, for the deferred path where the assembler handed back
+    the free system and the reduced space is where Dirichlet gets imposed for the first time. Left False,
+    only genuinely polluted rows are returned (a reduced column carrying more than its own identity
+    entry), so a tie with no Dirichlet overlap yields ``[]``.
+
+    Requires every prescribed DOF to be KEPT, which ``prolongation_from_ties(exclude_dofs=...)``
+    guarantees; a prescribed DOF that was eliminated has no reduced row to write into and is skipped
+    here rather than silently mapped to the wrong one.
+    """
+    if not dirichlet_pairs:
+        return []
+    blocks, off_full, off_red = _periodic_blocks(periodic)
+
+    # reduced columns carrying more than their own identity entry == the rows P^T pollutes
+    polluted = set()
+    full_to_red = {}
+    for bi, blk in enumerate(blocks):
+        P = blk["P"]
+        vec = int(blk.get("vec", 1) or 1)
+        kept = blk.get("kept")
+        if kept is None:  # a Galerkin basis (fem.solve(basis=...)), not a main/secondary selection
+            return []
+        kept = np.asarray(kept, dtype=np.int64)
+        idx = np.asarray(P.indices) if hasattr(P, "indices") else None
+        if idx is None:
+            return []
+        counts = np.bincount(idx[:, 1], minlength=int(P.shape[1]))
+        for r in np.flatnonzero(counts > 1):
+            polluted.add(int(off_red[bi]) + int(r))
+        rank = {int(n): r for r, n in enumerate(kept)}
+        for n, r in rank.items():
+            for c in range(vec):
+                full_to_red[int(off_full[bi]) + n * vec + c] = int(off_red[bi]) + r * vec + c
+
+    out = []
+    for d, g in dirichlet_pairs:
+        r = full_to_red.get(int(d))
+        if r is None:
+            raise RuntimeError(
+                f"jno.fem: prescribed DOF {int(d)} was eliminated by a tie, so it has no reduced row to "
+                "impose its value into. It should have been excluded from the elimination "
+                "(`prolongation_from_ties(exclude_dofs=...)`); dropping it here would lose a boundary "
+                "condition in silence."
+            )
+        if all_rows or r in polluted:
+            out.append((r, g))
+    return out
 
 
 def reduce_matrix_periodic(periodic, mat, conj=False):

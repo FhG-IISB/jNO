@@ -450,6 +450,29 @@ and flux integrals included.
     point: it holds to **machine precision (≈3e-16)** on deliberately warped meshes with non-planar
     faces, and a single per-facet normal cannot pass it there.
 
+### Higher order on independently meshed bodies
+
+`Shape.regions(..., conforming=False)` meshes each body on its own, so a shared face carries **two**
+coincident node sets — that duplication is the point, and it is what a contact gap opens. Promoting
+such a mesh to P2/P3 has to synthesise new nodes on that face, and the question is when two of them
+are the same node.
+
+Keying on the physical **coordinate** is the right conformity test for one body and the wrong one for
+two: every synthesised node at a coincident interface was merged, welding the bodies (measured on a
+two-body bar: 37 nodes referenced by cells of *both*). It is now keyed on the topological **entity** —
+the P1 vertices spanned by a reference point's non-zero weights — which separates entities that merely
+coincide in space while still collapsing one that is genuinely shared.
+
+The practical consequence is that mixed-order spaces work across independently meshed bodies:
+Taylor–Hood (`order=2` velocity with `order=1` pressure) on a `conforming=False` domain, which
+previously had to be refused.
+
+Two non-conformities want opposite answers here, so one combination is still refused by name: a mesh
+that is **both** locally refined (hanging nodes) **and** carries a `conforming=False` interface. A 2:1
+refinement needs its coincident nodes *merged* — the coarse edge's node is the fine edges' shared
+vertex, and merging is what keeps the constrained refinement continuous — while two bodies need theirs
+kept apart. One mesh cannot have both; use `order=1`, or drop one of the two.
+
 ### Mesh resolution for wave problems
 
 Because N1E is **lowest order only** (`order=` is refused, above), the mesh is your *only* accuracy

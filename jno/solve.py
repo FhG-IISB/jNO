@@ -66,6 +66,7 @@ __all__ = [
     "theta",
     "exponential",
     "adaptive",
+    "arclength",
     "remesh",
     "refine",
     "relocate",
@@ -649,9 +650,23 @@ def staggered(
     free upgrade, and it is not the default.
 
     Scope: composes through ``fem.solve(nonlinear=...)`` on a multifield problem, which is where the
-    block layout comes from; it has no meaning on a single field and says so. Each field is solved on
-    its own — solving a GROUP of fields together (a Stokes velocity/pressure pair inside one sweep) is
-    not wired.
+    block layout comes from; it has no meaning on a single field and says so.
+
+    **Groups.** An entry of ``fields`` may be a LIST of trial symbols, which are then solved *together*
+    inside one sweep rather than alternated against each other::
+
+        fem.solve(nonlinear=jno.solve.staggered([[v, p], [T]], direct=True))
+
+    That is not a convenience. A velocity/pressure pair **cannot** be swept apart: the pressure block is
+    the constraint block (no diagonal — the one :func:`jno.precond.saddle` finds structurally), so
+    solving ``p`` with ``v`` frozen is not a well-posed sub-problem. Any flow staggered against a solid
+    or a temperature therefore has to group its Stokes pair. A bare symbol among lists is its own group,
+    so ``[[v, p], T]`` is legal and ``[u, dm]`` keeps meaning exactly what it did — one field per sweep.
+
+    A group holding a constraint field is **indefinite**, so it wants ``direct=True``: the matrix-free
+    default puts *unpreconditioned* BiCGStab on a saddle block, for the reason given above — a sub-solve
+    is a restriction closure and a ``precond=`` spec has no operator to materialize against. This is
+    documented rather than enforced; ``fem.solve``'s own saddle warning already fires on that shape.
     """
     resolved: dict = {"blocks": None, "names": None, "constrained": None}
 
@@ -662,19 +677,37 @@ def staggered(
                 "jno.solve.staggered: this problem has a single field block, so there is nothing to "
                 "alternate between. Use jno.solve.newton() (or picard) instead."
             )
-        want = list(fields)
-        idxs = [fem.block_index(f) for f in want]
-        if len(set(idxs)) != len(idxs):
-            raise ValueError(f"jno.solve.staggered: a field is listed twice (resolved block indices {idxs}).")
-        if set(idxs) != set(range(len(blocks))):
-            missing = sorted(set(range(len(blocks))) - set(idxs))
+        # A group is a list of symbols swept together; a bare symbol is a group of one. `[u, dm]` is
+        # therefore unchanged, and `[[v, p], [T]]` groups the Stokes pair.
+        groups = [list(g) if isinstance(g, (list, tuple)) else [g] for g in fields]
+        for gi, g in enumerate(groups):
+            if not g:
+                raise ValueError(
+                    f"jno.solve.staggered: group {gi} is empty. A group is the set of fields solved "
+                    "together in one sweep; an empty one has nothing to solve."
+                )
+        gidx = [[fem.block_index(f) for f in g] for g in groups]
+        flat = [i for g in gidx for i in g]
+        if len(set(flat)) != len(flat):
+            raise ValueError(
+                f"jno.solve.staggered: a field is listed twice (resolved block indices {gidx}). "
+                "Each block must belong to exactly one group."
+            )
+        if set(flat) != set(range(len(blocks))):
+            missing = sorted(set(range(len(blocks))) - set(flat))
             raise ValueError(
                 f"jno.solve.staggered: every field block must be swept, but blocks {missing} were not "
-                f"listed (got {idxs} of {len(blocks)}). An unlisted field's equations would never be "
+                f"listed (got {gidx} of {len(blocks)}). An unlisted field's equations would never be "
                 "solved — list all of them, in the order you want them swept."
             )
-        resolved["blocks"] = [_np.arange(int(blocks[i].start), int(blocks[i].stop), dtype=_np.int32) for i in idxs]
-        resolved["names"] = idxs
+        # One index array per GROUP. `staggered_newton` consumes these as plain index arrays (`u[b]`,
+        # `u.at[b].set`, `setdiff1d`) and its direct path zeroes the COMPLEMENT rather than slicing a
+        # submatrix out, so a group spanning non-adjacent DOF ranges needs nothing special there.
+        resolved["blocks"] = [
+            _np.concatenate([_np.arange(int(blocks[i].start), int(blocks[i].stop), dtype=_np.int32) for i in g])
+            for g in gidx
+        ]
+        resolved["names"] = gidx
         # Essential-condition dofs, so over-relaxation can leave them alone (see staggered_newton).
         _dd = getattr(getattr(fem, "_op", None), "dirichlet_dofs", None)
         resolved["constrained"] = None if _dd is None else _np.asarray(_dd, dtype=_np.int64)
@@ -1412,3 +1445,180 @@ def adaptive(
     from .utils.solver.timeschemes import _AdaptiveScheme
 
     return _AdaptiveScheme(None, rtol, atol, max_steps, dt0, limit=limit, shrink=shrink, grow=grow)
+
+
+def arclength(*, psi: float = 0.0, ds: float | None = None):
+    """Arc-length continuation for the load path — a spec for the ``fem.solve(tau=...)`` slot.
+
+    Load control cannot pass a limit point: past the peak there is no equilibrium at a higher load, so
+    no amount of step cutting finds one, and :func:`adaptive` says exactly that when it hits its floor.
+    Arc-length advances **along the equilibrium path** instead of along the load, so the path may turn
+    around — snap-through and snap-back, post-buckling, a softening damage or plasticity branch.
+
+    Nothing in the term list changes. The load is still written as a formula in ``tau``; what changes is
+    that ``tau`` becomes an **unknown** solved alongside ``u``, subject to Crisfield's constraint on the
+    increment from the last converged point (Crisfield, *Computers & Structures* 13 (1981) 55-62;
+    *Non-linear FEA of Solids and Structures* Vol. 1 §9.3.2)::
+
+        Du . Du + psi^2 Dlam^2 = ds^2
+
+    Because ``tau`` reaches the residual as a plain argument rather than as a DOF, this adds no unknown
+    to the operator — the border rides a residual wrapper, the way ``field.bounds(lo, hi)`` does.
+
+    Args:
+        psi: weight on the load term. ``0.0`` (default) is the **cylindrical** constraint, i.e. a pure
+            displacement measure, which Crisfield §9.3.2 reports works well in practice; a positive
+            value is the spherical one. NOTE the deviation from the textbook: Crisfield weights this by
+            the reference load vector ``qᵀq``, which jNO does not have (the load is an arbitrary formula
+            in ``tau``, and a ``tau``-dependent Dirichlet is not a load vector at all). ``psi`` is
+            therefore a plain weight carrying units of displacement per unit load factor; nothing is
+            silently substituted for ``qᵀq``.
+        ds: the arc length per step. ``None`` (default) calibrates it from the declared path — the
+            march takes one load-controlled step of ``(end - start)/(n - 1)`` and measures the arc it
+            covered. That first step also fixes the traversal **direction**, which is why a zero-width
+            declared span is refused even when ``ds`` is given explicitly. A consequence worth knowing: on a **linear** problem this reproduces the declared
+            uniform grid exactly, so ``arclength()`` degrades gracefully to the march it replaces.
+            With ``psi=0`` (the default) ``ds`` is a pure displacement, i.e. the same quantity
+            :func:`adaptive`'s ``limit=`` bounds (in the 2-norm here, the max-norm there).
+
+    The declared ``domain(tau=(start, end, n))`` is **reinterpreted**, and this is a real change of
+    meaning: ``start`` is the first (load-controlled) solve, ``n`` is the number of output rows, and
+    ``end`` sets the traversal direction and the default ``ds``. It is not a target — the march takes
+    ``n`` steps and stops wherever the path has reached, which is the point, since where the path goes
+    is the answer. So ``n`` buys **resolution, not reach**: to follow the path further, widen ``end``;
+    adding steps at a fixed ``end`` re-resolves the same total arc more finely.
+
+    The load factors actually reached are recorded on ``fem.tau_schedule`` — that, against a reaction
+    read with ``fem.eval``, is the force-displacement curve::
+
+        sol = fem.solve(tau=jno.solve.arclength(ds=1e-3))
+        load = fem.tau_schedule                       # non-monotone across a snap-back, by design
+        force = [fem.eval(momentum, sol[k])[grip].sum() for k in range(len(load))]
+
+    Scope, stated up front:
+
+    * **Matrix-free drivers only.** The bordered system goes to an unchanged Newton-Krylov, whose
+      ``jax.linearize`` builds the bordered JVP for free. ``jno.solve.newton(direct=True)`` and
+      ``jno.solve.staggered(...)`` are refused by name — the latter because freezing the load factor
+      while sweeping a block IS load control, which has no equilibrium past the fold.
+    * **The trajectory is differentiable; the load factors are not.** ``fem.tau_schedule`` is concrete,
+      for plotting and for reading the curve. A runtime-parametric form is refused for the same reason.
+    * Same assembly scope as the rest of the load-path march: real, steady, native Lagrange.
+    * Adaptive ``ds`` is not implemented — it would reintroduce step rejection, which is what the
+      pilot/freeze/replay split exists to keep out of a differentiable scan.
+    """
+    from .utils.solver.arclength import ArcLengthSpec
+
+    return ArcLengthSpec(psi=float(psi), ds=None if ds is None else float(ds))
+
+
+def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4, relax: float = 1.0):
+    """Let the contact pairing follow the solution — a spec for the ``fem.solve(contact=...)`` slot.
+
+    ``u.gap(secondary, main)`` precomputes, for every secondary quadrature point, which main nodes it
+    reads and how far it stands off them. That pairing is built **once**, from the reference
+    configuration, and is correct only while displacements stay far below the element size. Past that
+    a point is still tied to the facet it faced before anything moved::
+
+        u = fem.solve(contact=jno.solve.contact())     # re-pair from x + u until it settles
+
+    **Why this is not a refinement detail.** Nothing reports a stale pairing. The solve converges
+    perfectly well; it just converges for a contact configuration that is not the one being solved, and
+    only a check like a kinematic oracle exposes it — the animation looks right throughout. On a 12:20
+    involute gear pair, against ``|T_B/T_A| = z_B/z_A`` — which holds because the line of action is
+    common, so each moment arm is that gear's base radius — as the rim mesh went 0.050 -> 0.018
+    (6856 -> 16418 DOF)::
+
+        frozen pairing   0.84%   0.85%   0.85%   0.85%
+        re-paired        0.64%   0.64%   0.65%   0.64%
+
+    Both are flat, and the search buys about 0.2 points: on a rolling contact that barely slides this
+    is an accuracy refinement rather than a rescue. (The ~0.6% the two share is NOT the pairing — it is
+    flat in h across a 2.4x DOF range and non-monotone in the penalty, 0.57/0.64/0.73/0.20% over
+    ``C_N = 4e4..4e7``, so it is neither discretisation nor contact compliance.)
+
+    Where the pairing does go stale the error is gross rather than subtle: a flat-bottomed block slid
+    0.9 across a disk of radius 1 keeps reporting the 0.05 separation it had at its starting position,
+    where the truth is 0.182 — nearly four times larger, and silent.
+
+    Each round solves the ordinary system, then re-runs the search at ``x + u``. It stops when the
+    pairing is unchanged *and* the solution has stopped moving; exhausting ``rounds`` **raises** and
+    names how many slots are still oscillating.
+
+    Args:
+        capture: search radius. ``None`` (default) derives one per pair from the local facet size
+            (3x the mean secondary facet diameter) — a literal is wrong at every scale but one. Beyond
+            it a point is **inactive**: it keeps its slot with zero weight, so the tables never change
+            shape. Widen it when bodies must close a distance larger than a few elements before
+            touching; the driver raises rather than silently reporting every point open.
+        rounds: maximum solve/re-pair rounds. Reaching it without settling raises, and says which of
+            the two conditions failed. The default is generous because a round that settles returns
+            immediately, so the only cost of a high ceiling is paid by a problem that was going to
+            raise anyway — whereas a ceiling set just at the edge turns a converging solve into an
+            error. Measured on the gear pair: the whole loop settles in 3 to 4 rounds, the pairing
+            freezing a round before the displacement reaches ``tol``.
+        tol: tolerance on ``|u_k - u_{k-1}|_inf / |u_k|_inf`` — "the solution stopped moving",
+            **relative to the solution's own size**. Once the pairing stops changing this is an
+            ordinary fixed point and contracts by roughly 0.2-0.3 per round, so a tolerance an order
+            tighter costs two or three more rounds.
+        relax: damping on the round-to-round update, ``u <- (1-relax)*u_prev + relax*u_new``. The
+            default ``1.0`` is the undamped iteration and is bit-identical to not passing it. Lower it
+            when the search **oscillates**: the round map is only a contraction while the pairing
+            barely feeds back into the solution, and a follower contact normal
+            (``variable(..., follow_normals=True)``) closes that loop, because the normal is a
+            function of ``u`` and the traction it carries moves ``u``. Measured on a sheet drawn over
+            a die radius, undamped: the pairing settled — 0 slots re-paired for four rounds running —
+            while ``|du|/|u|`` sat at 5.0e-3, 1.2e-2, 7.0e-3, 8.2e-3 with no downward trend, so more
+            rounds could not have helped. Damping does **not** move the fixed point (at convergence
+            ``G(u) = u``, so the blend is the identity); it only changes whether the iteration reaches
+            it, and it costs roughly ``1/relax`` times as many rounds when the undamped iteration
+            would have converged anyway. Start at ``0.5``.
+
+            **Converging is not the same as converging to the right branch, and this argument cannot
+            tell you which you got.** A search that oscillates may be oscillating *around* the answer
+            or *between* a correct and an incorrect configuration; damping settles it on whichever
+            fixed point it is nearest, and reports success either way. Measured on a 12:20 involute
+            gear pair at two drive angles where the undamped search raised: damped it converged in 17
+            to 30 rounds and returned torque ratios of 0.0155 and 0.676 against an exact 1.667 -- the
+            teeth had come out of engagement -- while the FROZEN reference pairing on the same problem
+            gave 1.05% and 0.62% error. ``relax=0.5`` and ``relax=0.3`` agreed to three significant
+            figures, so the damping was faithful; the fixed point it found was simply the wrong one,
+            and the raise had been the more informative answer. Check a damped result against
+            something independent -- an equilibrium the problem must satisfy, or the same solve with
+            the pairing frozen -- rather than treating convergence as the check.
+
+    Scope, stated up front:
+
+    * **Either tangent works, and the assembled one is faster here.** The matrix-free default re-pairs
+      for free (its tangent is ``jax.linearize`` of the residual). ``nonlinear=jno.solve.newton(direct=
+      True)`` assembles the tangent instead and rebuilds the contact block's sparsity pattern per
+      round — sound because the block's SIZE is fixed by the declaration, so only the index values
+      move. Measured on a 12:20 gear pair, 11 682 DOF, 5 rounds, median of three::
+
+          matrix-free (default)      44.2 s     1848 MB
+          newton(direct=True)        14.7 s     1894 MB     <- 3.0x faster, same memory
+
+      Peak RSS is comparable at this size rather than a trade: the assembled contact block is small
+      next to the ~1.8 GB the JAX/XLA runtime already holds, so its cost does not surface. Expect that
+      to change as the interface grows — the time gap is the robust part (matrix-free spanned
+      42.7-48.6 s across runs, direct 14.5-15.1 s). Neither is the right default for every problem,
+      which is why this stays on the ``nonlinear=`` slot that already owns the choice.
+    * **The search is host-side and not differentiable in the mesh coordinates.** As with the frozen
+      pairing, the gap is differentiable in the DOF *values*; ``d(pairing)/d(x)`` does not exist.
+      Each round is its own solve, so a gradient through the *loop* is not provided either.
+    * **A load path re-pairs per STEP, and is not differentiable.** On a form that marches (step
+      history plus a ``domain(tau=...)`` grid) the march owns the loop and runs the search at every
+      load step — because the pairing that is right at the end of the path is not the one that was
+      right in the middle of it. That march is a host loop rather than a ``lax.scan``, so it gives up
+      the load path's reverse-mode differentiability; the scanned march keeps it, at a frozen pairing.
+      ``tau=jno.solve.adaptive(...)`` and ``tau=jno.solve.arclength(...)`` are refused by name: both
+      replay or root-find under a scan, where a host-side search cannot run.
+    * The pairing is closest-point; there is no smoothing (no NTS-to-mortar blending, no C1 surface),
+      so a secondary point crossing a main facet edge moves discontinuously. That is what ``rounds``
+      iterates on and what the raise reports when it oscillates.
+    """
+    from .utils.solver.contact_search import ContactSpec
+
+    return ContactSpec(
+        capture=None if capture is None else float(capture), rounds=int(rounds), tol=float(tol), relax=float(relax)
+    )
