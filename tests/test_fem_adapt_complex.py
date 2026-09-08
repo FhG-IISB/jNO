@@ -40,6 +40,7 @@ def _imag_layer_fem(d, eps=0.05):
 
 
 def test_anisotropic_adaptation_runs_on_a_complex_field():
+    pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
     n0 = len(d.mesh.points)
     _imag_layer_fem(d).solve(adapt=jno.solve.remesh(anisotropic=True, max_iters=4, refine_factor=1.6, max_dofs=2500))
@@ -50,6 +51,7 @@ def test_the_metric_follows_the_imaginary_feature():
     """The layer is at x + y = 1 and exists only in Im(u). If the reduction dropped the imaginary
     part the field would be flat and refinement would spread out, so this is what makes the test
     about the reduction rather than about adaptation running."""
+    pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
     _imag_layer_fem(d).solve(adapt=jno.solve.remesh(anisotropic=True, max_iters=4, refine_factor=1.6, max_dofs=2500))
 

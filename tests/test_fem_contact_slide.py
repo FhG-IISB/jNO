@@ -154,8 +154,10 @@ def test_a_second_main_face_for_one_secondary_is_refused():
     sec, main = _sides(d)
     u, _phi = d.fem_symbols(value_shape=(3,))
     u.gap(sec, main, domain=d)
+    # `"lower"` is the lower BODY, a volume region; `u.slide` refuses it as a main face before it
+    # ever reaches the conflict this test is about. Use a real boundary face instead.
     with pytest.raises(ValueError, match="already the secondary face"):
-        u.slide(sec, "lower", domain=d)
+        u.slide(sec, "top", domain=d)
 
 
 # ----------------------------------------------------------------------------------------------
