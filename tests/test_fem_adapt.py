@@ -214,6 +214,29 @@ def test_fem_solve_adapt_drives_loop_and_rebinds():
     assert hist[0]["points"].shape == (dofs[0], 2) and hist[0]["cells"].shape[1] == 3
 
 
+def test_solving_again_after_an_adapt_run_uses_the_adapted_operator():
+    """Rebinding the caller's FEM has to survive ``FEM.solve`` returning.
+
+    The loop ends by rebinding ``fem`` to the final adapted state, but ``solve`` snapshotted
+    ``self._op`` on entry and restored it in a ``finally`` -- bookkeeping that only ``basis=`` needs,
+    applied unconditionally. So ``fem.A`` was the adapted matrix while ``fem.solve()`` dispatched on
+    the operator of the mesh the caller STARTED from: a second solve silently answered a different
+    problem, and on a coarse start the difference is the whole point of having adapted.
+
+    The oracle is a shape, which is unambiguous: the original mesh's operator cannot produce a vector
+    as long as the refined mesh's solution.
+    """
+    d = _l_shape_domain(mesh_size=0.2)
+    fem = jno.fem(_build_singular_laplace(d))
+    n0 = len(d.mesh.points)
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.6))).reshape(-1)
+    assert len(d.mesh.points) > n0, "nothing was refined — the test cannot distinguish the two operators"
+
+    again = np.asarray(fem.solve()).reshape(-1)
+    assert again.shape == sol.shape, f"re-solve returned {again.shape[0]} DOFs, adapted mesh has {sol.shape[0]}"
+    assert np.abs(again - sol).max() < 1e-8, "fem.solve() after the loop is not the adapted problem"
+
+
 def _poisson_on(d, alpha):
     """Parametric Poisson ``-alpha*lap u = f`` (exact ``u = x(1-x)y(1-y)`` at alpha=1)."""
     u, phi = d.fem_symbols()
