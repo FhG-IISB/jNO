@@ -25,8 +25,8 @@ path is unaffected.
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
-| Plasticity | small-strain, isotropic, linear-hardening, whole-domain | raises |
-| Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only | raises |
+| Plasticity | small-strain, isotropic, linear-hardening | raises |
+| Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
 | `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
@@ -98,8 +98,13 @@ path is unaffected.
     **single-field or coupled** — not transient / complex / 1-D / non-nodal / periodic, each rejected
     with a clear error.
 
-    The internal-state readout runs on every cell; sub-region-restricted plasticity is not wired.
-    Kinematic / nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
+    An internal state advances on every cell by default; `state.evolves(formula, region="strip")`
+    restricts it to one region, and outside it the state is **frozen** at the value it already has —
+    so a zero-initialised plastic strain leaves the rest of the body elastic without a second
+    constitutive branch, and the return map is never evaluated on cells carrying another material's
+    constants. That is what makes a plastic part bearing on an elastic one expressible.
+
+    Kinematic / nonlinear (Voce) hardening are separate formulas, not built.
 
 ??? measured "Curved boundaries: P3 buys nothing over P2"
     With the **default straight-sided** mesh the domain itself is approximated to O(h²), and that

@@ -444,7 +444,15 @@ def _to_meshio(
         pair = "|".join(sorted(sides))
         for region, chunks in sides.items():
             idx = np.concatenate(chunks)
-            cell_sets[f"{pair}.{region}"] = [empty.copy(), idx]
+            # ACCUMULATE. One interface generally spans SEVERAL geometric faces -- a beam embedded in a
+            # channel touches the fluid on its two sides and its top -- and each has its own bounding
+            # box, so this loop reaches the same `pair.region` tag once per face. Assigning here kept
+            # only the last face and dropped the rest, silently: measured on that beam, the fluid side
+            # of the tag held 17 of its 37 facets, so a tie transmitted nothing across the top and a
+            # no-slip left 39 of 73 wall nodes free -- the flow simply ran through the solid.
+            key = f"{pair}.{region}"
+            prev = cell_sets.get(key)
+            cell_sets[key] = [empty.copy(), np.union1d(prev[1], idx) if prev is not None else idx]
             nonconf_iface.append(idx)
 
     # These faces are INTERNAL to the assembly even though each is topologically its own body's outer

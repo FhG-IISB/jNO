@@ -40,6 +40,7 @@ fem = jno.fem([ui.t*vi + D*(ui.x*vi.x + ui.y*vi.y) + react - f*vi, ...])
 | **conditional / piecewise** | `where(cond, a, b)`, `maximum(a, b)`, `minimum(a, b)`, comparisons `u > 0` |
 | vector / tensor | `inner(a, b, n_contract=)`, `dot cross outer trace sym`; vector `.norm() .dot() .cross()` |
 | matrix / Voigt / complex | `MatrixView` (`.det .inv .eigvals .sym`), `VoigtView` (`.von_mises .deviatoric .invariants`), `ComplexView` (`.real .imag .conj`) |
+| constitutive | `diff(psi, F)` — stress from a stored energy, by AD; `cellwise(expr)` — the per-cell L2 projection onto P0 (B-bar / F-bar) |
 
 Ordinary Python arithmetic over components composes too, so a vector source can be written either
 way — `inner` when the whole vector is to hand, a plain sum when the components are:
@@ -53,6 +54,35 @@ Both assemble to the same operator (to assembly round-off — the products reduc
 order). The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
 dropped. Every *other* additive piece of a form must carry exactly one test field, since the test
 field is what selects the block: a source term is `-f * vi`, never `-f`.
+
+### Locking-free strains — `cellwise`
+
+`cellwise(expr)` is the quadrature-weighted mean of an expression over each cell, `(∫_K expr)/(∫_K 1)`,
+broadcast back to that cell's quadrature points. It is what B-bar and F-bar are written with, and it is
+a **one-line edit** to a form you already have — project the volumetric strain and nothing else:
+
+```python
+eu, ev   = eps(ui), eps(vi)
+tru, trv = trace(eu), trace(ev)
+cu, cv   = cellwise(tru), cellwise(trv)          # <- drop these two calls to get the standard form
+dev_uv   = inner(eu, ev, 2) - tru * trv / dim    # dev(eu) : dev(ev)
+mech     = lam * cu * cv + 2 * mu * (dev_uv + cu * cv / dim)
+```
+
+!!! measured "It is the difference between an answer and a locked one"
+    Plane-strain Q1 cantilever at `nu = 0.4999`, 16x4 cells: standard `2.68e-02`, B-bar `3.03e-01` —
+    **11.3x**. B-bar is converged there (it moves 0.7% out to 128x32); the standard element is still
+    **2.3x too stiff at 128x32**. Refinement does not cure locking. At `nu = 0.3`, where there is
+    nothing to cure, the two differ by 5.6%.
+
+!!! warning "It does nothing on P1 triangles and tets"
+    Their strain is already constant over the cell, so this projection is the identity there. B-bar is
+    for quadrilateral/hexahedral cells and higher-order simplices; for P1 volumetric locking, use Q1/hex
+    cells, raise the order, or write a mixed u-p formulation.
+
+Scope: native-Lagrange **volume** terms. 1-D, non-nodal (Argyris/Morley/RT/N1E), surface terms and
+VPINN/collocation residuals raise rather than average over the wrong set of points. It may not appear
+inside a `diff` target — write `cellwise(diff(...))`, or put the projection inside `wrt` as F-bar does.
 
 ## Integrals (local **and** non-local)
 

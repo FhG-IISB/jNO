@@ -1869,7 +1869,7 @@ class callbacks:
         gram_terms: list,
         gram_interval: int = 1,
         rcond: Optional[float] = None,
-        line_search: bool = False,
+        line_search: bool = True,
     ) -> "ENGDCallback":
         """Create an :class:`ENGDCallback` for Energy Natural Gradient Descent.
 
@@ -1882,7 +1882,19 @@ class callbacks:
         Requires ``inner_steps=1``, no Bayesian models, and **float64**
         (``jax.config.update("jax_enable_x64", True)``) for full accuracy.
         Use ``model.optimizer(optax.sgd(1.0))`` — the natural gradient
-        direction already encodes the correct step scale.
+        direction already encodes the correct step scale. That advice holds
+        **because ``line_search`` defaults to True**: the direction sets the
+        scale, but nothing guarantees the full step decreases the loss, and
+        without the search ``sgd(1.0)`` diverged on 1-D Poisson (loss 24 → 34
+        → 154 over 20 steps). With it, the same run reaches 2.1e-14 against
+        2.4e+01 for plain GD. The default used to be False here while
+        :func:`jno.optimizers.engd` defaulted it to True, so the two spellings
+        of the same method behaved differently and only one matched this
+        paragraph.
+
+        In float32 the Gram solve is ill-conditioned enough to diverge on its
+        own, whatever the step: the float64 requirement above is not a
+        precision nicety.
 
         Args:
             gram_terms: List of ``(NetworkGradient_expr, weight)`` pairs.

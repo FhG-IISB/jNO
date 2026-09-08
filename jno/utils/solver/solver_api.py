@@ -1337,12 +1337,18 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 return jnp.asarray(op.residual(uu, vals)).reshape(-1)
 
         else:
-            from .fem_utils import prolong_periodic, reduce_vector_periodic
+            from .fem_utils import prolong_periodic, reduce_vector_periodic, wrap_reduced_dirichlet
 
             def _residual_at(vals, ur):
-                # reduced system: solve on the constraint manifold, u = P u~
-                full = op.residual(prolong_periodic(periodic, ur), vals)
-                return reduce_vector_periodic(periodic, jnp.asarray(full).reshape(-1))
+                # reduced system: solve on the constraint manifold, u = P u~. `Pᵀ` sums an eliminated
+                # DOF's equation into the rows it ties to, so a prescribed DOF that is a tie target
+                # loses the row holding its value -- re-imposed here, per load step, because the
+                # closure binds `vals` and the wrap has to happen inside it.
+                def _free(uu):
+                    full = op.residual(prolong_periodic(periodic, uu), vals)
+                    return reduce_vector_periodic(periodic, jnp.asarray(full).reshape(-1))
+
+                return wrap_reduced_dirichlet(periodic, _free)[0](ur)
 
         # A sparse-direct Newton (`newton(direct=True)`, or any direct `linear=` slot, which selects it)
         # flags `wants_jacobian` and factorizes the ASSEMBLED tangent. The march used to hand its driver a
@@ -1360,11 +1366,13 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                     return op.jacobian(uu, vals)
 
             else:
-                from .fem_utils import reduce_matrix_periodic
+                from .fem_utils import reduce_matrix_periodic, wrap_reduced_dirichlet
 
                 def _jac_at(vals, ur):
-                    full = op.jacobian(prolong_periodic(periodic, ur), vals)
-                    return reduce_matrix_periodic(periodic, full)
+                    def _free(uu):
+                        return reduce_matrix_periodic(periodic, op.jacobian(prolong_periodic(periodic, uu), vals))
+
+                    return wrap_reduced_dirichlet(periodic, None, _free)[1](ur)
 
         if _jac_at is None:
             _step = jax.jit(lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev))
