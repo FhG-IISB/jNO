@@ -2456,6 +2456,72 @@ class TraceEvaluator:
         eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
         return shape_vals[:, :, None, None] * eye[None, None, :, :]
 
+    @staticmethod
+    def _normalize_value_coeff(coeff, n_q_total):
+        """Put a value-channel coefficient into the layout assembly expects: ``(Nq,)`` for a scalar
+        test function, ``(Nq, vec)`` for a vector one -- quadrature first, component second.
+
+        One spelling a user reasonably writes does not arrive that way and used to die on a raw shape
+        error naming internal arrays: a **constant vector** coefficient,
+        ``inner(jnp.array([1.0, 2.0]), phi)`` -- shape ``(vec,)``, with no quadrature axis at all,
+        because a constant does not vary over the points. It has exactly one sensible reading, so it
+        broadcasts rather than being refused.
+
+        A **component-first** array is NOT rewritten. ``jnp.stack([f0, f1])`` builds ``(vec, Nq)``
+        because ``stack`` defaults to ``axis=0``, and the value axis is trailing everywhere in this
+        stack -- so that spelling really is the wrong one, and ``stack([...], axis=-1)`` is the right
+        one. Transposing it silently would be guessing at intent, and would make this path accept
+        something the FEM assembler rejects. It is named instead, on both paths, so one weak form
+        means one thing.
+
+        One corner is genuinely ambiguous and is resolved by precedence, not by a guess: a bare
+        ``(k,)`` with ``k == Nq`` is read as a per-point **scalar**, because that is the ordinary
+        scalar-test case and by far the common one. The consequence is that a constant vector
+        coefficient whose length happens to equal the quadrature-point count cannot be spelled this
+        way -- give it a quadrature axis (``(1.0 + 0.0*x) * jnp.array([...])``) if you ever hit it.
+        """
+        coeff = jnp.asarray(coeff)
+
+        while coeff.ndim > 2 and coeff.shape[-1] == 1:
+            coeff = coeff[..., 0]
+        if coeff.ndim == 2 and coeff.shape[0] != n_q_total and coeff.shape[1] == n_q_total:
+            raise ValueError(
+                f"value-channel coefficient of shape {tuple(coeff.shape)} is COMPONENT-FIRST: the "
+                f"{n_q_total} quadrature points are on its second axis, not its first. That is what "
+                "`jno.np.stack([f0, f1])` builds, since stack defaults to axis=0. The value axis is "
+                "trailing here, so write `jno.np.stack([f0, f1], axis=-1)` -- the FEM assembler takes "
+                "that spelling too."
+            )
+
+        if coeff.ndim == 0:
+            # a CONSTANT scalar -- `- 1.0 * phi`, the plainest source there is. It has no quadrature
+            # axis because it does not vary over the points, so it broadcasts. This used to become
+            # `(1,)` and then fail the per-point length check against Nq.
+            return jnp.broadcast_to(coeff, (n_q_total,))
+        if coeff.ndim == 1:
+            if coeff.shape[0] == n_q_total:
+                return coeff  # per-quadrature-point scalar, the ordinary case
+            if coeff.shape[0] == 1:
+                return jnp.broadcast_to(coeff[0], (n_q_total,))  # a constant scalar, written (1,)
+            # a constant VECTOR coefficient: no quadrature axis, broadcast it over the points
+            return jnp.broadcast_to(coeff[None, :], (n_q_total, coeff.shape[0]))
+        if coeff.ndim == 2:
+            if coeff.shape[1] == 1:
+                return coeff[:, 0]
+            if coeff.shape[0] == n_q_total:
+                return coeff
+            raise ValueError(
+                f"value-channel coefficient of shape {tuple(coeff.shape)} does not match the "
+                f"{n_q_total} quadrature points on either axis, so neither axis can be the "
+                "quadrature one. Write the coefficient as a per-point expression (a constant times a "
+                "coordinate, e.g. `(1.0 + 0.0*x) * jnp.array([...])`) or as a constant vector."
+            )
+        raise ValueError(
+            f"Unsupported coeff rank {coeff.ndim} for value assembly; got shape {tuple(coeff.shape)}. "
+            "A value-channel coefficient is a scalar per quadrature point, or one vector per "
+            "quadrature point."
+        )
+
     def _assemble_value_basis_integrand(self, coeff, shape_vals_flat, weights, flat_entity_nodes, num_total_nodes):
         coeff = jnp.asarray(coeff)
         shape_vals_flat = jnp.asarray(shape_vals_flat)
@@ -2466,17 +2532,11 @@ class TraceEvaluator:
         while coeff.ndim > 2 and coeff.shape[0] == 1:
             coeff = jnp.squeeze(coeff, axis=0)
 
-        if coeff.ndim == 0:
-            coeff = coeff[None]
-        elif coeff.ndim == 2 and coeff.shape[1] == 1:
-            coeff = coeff[:, 0]
-        elif coeff.ndim > 2:
-            raise ValueError(f"Unsupported coeff rank {coeff.ndim} for value assembly; got shape {coeff.shape}")
-
         if shape_vals_flat.ndim != 2:
             raise ValueError(f"Expected shape_vals_flat.ndim == 2, got shape {shape_vals_flat.shape}")
 
         n_q_total, n_loc = shape_vals_flat.shape
+        coeff = self._normalize_value_coeff(coeff, n_q_total)
         n_cell_times_nloc = flat_entity_nodes.shape[0]
 
         if n_cell_times_nloc % n_loc != 0:

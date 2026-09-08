@@ -6,6 +6,7 @@ pytest.importorskip("foundax", reason="foundax required for neural VPINN tests")
 
 import foundax
 import jax
+import numpy as np
 
 import jno
 import jno.jnp_ops as jnn
@@ -14,6 +15,19 @@ from jno.trace import dump_tree
 # ============================================================
 # Helpers
 # ============================================================
+
+
+def _same_to_precision(_a, b, *, slack=32.0):
+    """Tolerance for "these two spellings lower to the SAME thing", scaled to the working precision.
+
+    The claim is exact agreement, so the bar is floating-point epsilon rather than a fixed number.
+    jNO assembles in float64 under ``jax_enable_x64`` and float32 without it, and a hardcoded 1e-12
+    is an impossible assertion on the single-precision path -- measured, the same spellings agree
+    there to 1.19e-07, which IS identity for float32. Keyed on the x64 flag rather than on the
+    operands' dtype, because the values reach here as Python floats, which are always float64.
+    """
+    eps = float(np.finfo(np.float64 if jax.config.jax_enable_x64 else np.float32).eps)
+    return slack * eps * max(1.0, abs(float(np.real(b))))
 
 
 def make_domain(mesh_size=0.35):
@@ -150,17 +164,15 @@ class TestVpinnScalarAssembly:
 
 
 class TestVpinnBoundaryAssembly:
-    @pytest.mark.xfail(
-        reason=(
-            "jno.fem VPINN does not yet lower a Neumann *flux* boundary term: a bound-test boundary "
-            "value term's region is not propagated into the VPINN channel bucketing. The FEM path "
-            "classifies it via _region_and_support, but the VPINN path buckets on Variable.fem_meta, "
-            "which a bound test does not carry -- so the flux is filed under the volume channel. This "
-            "is a pre-existing jno.fem VPINN-lowering gap, orthogonal to the native fem_context."
-        ),
-        strict=True,
-    )
     def test_volume_plus_boundary_weak_form_assembles(self):
+        """A Neumann (boundary-test) flux term must reach its OWN region's channel.
+
+        It used to land in the volume channel and be silently dropped: a bound test function
+        ``phi.bind(x=xr, y=yr)`` carries its region on the coordinate Variables, not in the
+        variational-sampling registry that ``infer_term_bucket`` consulted, so the term fell through
+        that function's ``("volume", "volume")`` default. The bucketing now defers to the FEM path's
+        ``_region_and_support`` -- one classifier, read from the coordinate tags.
+        """
         dom = make_domain()
         u, phi = dom.fem_symbols()
         xi, yi, _ = dom.variable("interior", split=True)
@@ -175,7 +187,34 @@ class TestVpinnBoundaryAssembly:
         pde = jno.fem([vol, surf, u(xb, yb) - 0.0])
 
         assert hasattr(pde, "mse")
-        assert "right" in pde.boundary_value_exprs  # <-- the gap: lands in the volume channel instead
+        assert "right" in pde.boundary_value_exprs, "the flux must reach its own region's channel"
+        assert set(pde.boundary_value_exprs) == {"right"}, "and no other region's"
+
+    def test_a_boundary_flux_does_not_pollute_the_volume_channel(self):
+        """The other half of the bug: when the flux was mis-filed it was ADDED to the volume channel.
+
+        Oracle: assembling with and without the surface term must leave the volume channels
+        untouched, since the flux belongs to neither of them. Comparing against the same form
+        without the term is what distinguishes "routed correctly" from "routed anywhere else".
+        """
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        xr, yr, _ = dom.variable("right", split=True)
+        vi, vr = phi.bind(x=xi, y=yi), phi.bind(x=xr, y=yr)
+        u_net = make_scalar_net()(xi, yi)
+
+        vol = jnn.grad(u_net, xi) * jnn.grad(vi, xi) + jnn.grad(u_net, yi) * jnn.grad(vi, yi)
+        without = jno.fem([vol, u(xb, yb) - 0.0])
+        with_flux = jno.fem([vol, (1.0 + 0.0 * xr) * vr, u(xb, yb) - 0.0])
+
+        assert not without.boundary_value_exprs, "the control carries no boundary term"
+        assert set(with_flux.boundary_value_exprs) == {"right"}
+        # the volume channels must be structurally the same: a pure boundary term changes neither
+        for chan in ("volume_value_expr", "volume_grad_expr"):
+            a, b = getattr(without, chan), getattr(with_flux, chan)
+            assert (a is None) == (b is None), f"{chan} gained/lost content from a pure BOUNDARY term"
 
 
 # ============================================================
@@ -386,3 +425,585 @@ def test_vpinn_1d_trains_and_solves_poisson():
     exact = np.asarray(crux.eval([xt * (1 - xt)], domain=test_dom)).reshape(-1)
     rel = float(np.linalg.norm(pred - exact) / np.linalg.norm(exact))
     assert rel < 1e-2, f"1D VPINN did not solve Poisson: rel-L2={rel:.3e}"
+
+
+# ============================================================
+# VPINN scope — refused by name, not by an internal tag error
+# ============================================================
+
+
+class TestVpinnScopeRefusals:
+    def test_a_three_d_network_trial_assembles(self):
+        """3-D died on ``Tag 'fem_gauss' is not in the mesh pool``, then was refused by name -- and
+        the restriction turned out to be a conservative guard rather than a limitation: the native
+        assembler builds the quadrature context in 3-D exactly as in 2-D, so widening the branch was
+        the whole change. Accuracy is measured in ``TestVpinn3D``.
+
+        The mesh must be fine enough to have INTERIOR nodes: the Dirichlet declaration masks every
+        boundary test function, so a cube coarse enough that all its nodes lie on the surface gives an
+        identically-zero residual -- correct, and useless to assert on."""
+        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+        u, phi = dom.fem_symbols()
+        si = dom.variable("interior", split=True)
+        xi, yi, zi = si[0], si[1], si[2]
+        sb = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(foundax.mlp(3, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+        vi = phi.bind(x=xi, y=yi, z=zi)
+        u_net = net(xi, yi, zi) * xi * (1 - xi) * yi * (1 - yi) * zi * (1 - zi)
+        pde = jno.fem(
+            [
+                jnn.grad(u_net, xi) * jnn.grad(vi, xi)
+                + jnn.grad(u_net, yi) * jnn.grad(vi, yi)
+                + jnn.grad(u_net, zi) * jnn.grad(vi, zi)
+                - 1.0 * vi,
+                u(*sb) - 0.0,
+            ]
+        )
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+    def test_a_constant_boundary_coefficient_is_refused_rather_than_mis_filed(self):
+        """A bound test function keeps its binding on the VIEW, not in the expression tree, so once
+        the weak form is flattened ``-1.0 * v_right`` and ``-1.0 * v_interior`` are indistinguishable
+        and both default to volume. A Neumann flux integrated over the volume trains happily and is
+        wrong -- measured 3.9e-01 against 6.8e-04 for the same problem written the other way.
+
+        `_fem_impl` still knows the region at that point, so it refuses there and names the spelling
+        that works. The FEM trial needs none of this: it classifies the raw constraint, where the
+        binding survives, and takes both spellings (9.0e-16 either way)."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        sl = dom.variable("left", split=True)
+        sr = dom.variable("right", split=True)
+        vi, vr = phi.bind(x=xi, y=yi), phi.bind(x=sr[0], y=sr[1])
+        un = make_scalar_net()(xi, yi) * xi
+        vol = jnn.grad(un, xi) * jnn.grad(vi, xi) + jnn.grad(un, yi) * jnn.grad(vi, yi)
+
+        with pytest.raises(NotImplementedError, match=r"carrying no coordinate"):
+            jno.fem([vol, -1.0 * vr, u(sl[0], sl[1]) - 0.0])
+
+        # the spelling the message names does assemble, onto its own region's channel
+        ok = jno.fem([vol, -(1.0 + 0.0 * sr[0]) * vr, u(sl[0], sl[1]) - 0.0])
+        assert set(ok.boundary_value_exprs) == {"right"}
+
+
+class TestVpinnVectorSource:
+    """A load term on a VECTOR VPINN, written either way, must lower to the same residual."""
+
+    def _build(self, spelling):
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        vi = phi.bind(x=xi, y=yi)
+        u_net = net(xi, yi)
+        gu, gv = jnn.jacobian(u_net, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        g = 1.0 + 0.0 * xi  # a coordinate-carried constant, so the source is a real traced expression
+        src = (
+            jnn.inner(g * np.array([1.0, 2.0]), vi, n_contract=1) if spelling == "inner" else g * vi[0] + (2.0 * g) * vi[1]
+        )
+        return dom, jno.fem([jnn.inner(gu, gv, n_contract=2) - src, u(xb, yb) - (0.0, 0.0)])
+
+    def _build_spelling(self, spelling):
+        """The same vector source, written four ways. All four must lower identically."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        vi = phi.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(net(xi, yi), [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        g = 1.0 + 0.0 * xi
+        src = {
+            "component": lambda: g * vi[0] + (2.0 * g) * vi[1],
+            "const_array": lambda: jnn.inner(np.array([1.0, 2.0]), vi, n_contract=1),
+            "scaled_array": lambda: jnn.inner(g * np.array([1.0, 2.0]), vi, n_contract=1),
+            "stacked": lambda: jnn.inner(jnn.stack([g, 2.0 * g], axis=-1), vi, n_contract=1),
+        }[spelling]()
+        return dom, jno.fem([jnn.inner(gu, gv, n_contract=2) - src, u(xb, yb) - (0.0, 0.0)])
+
+    @pytest.mark.parametrize("spelling", ["component", "const_array", "scaled_array", "stacked"])
+    def test_every_vector_source_spelling_lowers_identically(self, spelling):
+        """A value-channel coefficient may arrive as a per-point vector, a bare CONSTANT vector (no
+        quadrature axis -- a constant does not vary over the points), or component-first from
+        ``stack(..., axis=-1)``. Only the per-point form used to assemble; the others died on raw
+        shape errors naming internal arrays. The oracle is that all four give the SAME residual --
+        and, in the parity test below, the same acceptance as the FEM trial.
+        """
+        dom_ref, pde_ref = self._build_spelling("scaled_array")
+        r_ref = float(np.asarray(jno.core([pde_ref.mse], domain=dom_ref).eval([pde_ref.mse])).reshape(()))
+        assert r_ref > 0.0, "a non-trivial residual is needed for the comparison to mean anything"
+
+        dom, pde = self._build_spelling(spelling)
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert abs(r - r_ref) <= _same_to_precision(r, r_ref), (
+            f"spelling {spelling!r} lowered differently: {r:.12e} vs reference {r_ref:.12e}"
+        )
+
+    def test_a_component_first_stack_is_refused_on_both_lowerings(self):
+        """``stack`` defaults to ``axis=0``, which builds a component-FIRST array while the value
+        axis is trailing everywhere in the assemblers. Neither lowering rewrites it -- transposing
+        silently would be guessing at intent -- and both name the fix, so one spelling means one
+        thing whichever trial is used."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        g = 1.0 + 0.0 * xi
+        bad = jnn.inner(jnn.stack([g, 2.0 * g]), vi, n_contract=1)
+
+        # FEM trial
+        ui = u.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(ui, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        with pytest.raises(ValueError, match=r"axis=-1"):
+            jno.fem([jnn.inner(gu, gv, n_contract=2) - bad, u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu())
+
+        # network trial -- same weak form, same refusal
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        gn = jnn.jacobian(net(xi, yi), [xi, yi])
+        with pytest.raises(ValueError, match=r"axis=-1"):
+            pde = jno.fem([jnn.inner(gn, gv, n_contract=2) - bad, u(xb, yb) - (0.0, 0.0)])
+            jno.core([pde.mse], domain=dom).eval([pde.mse])
+
+    @pytest.mark.parametrize("spelling", ["component", "const_array", "scaled_array", "stacked"])
+    def test_the_fem_trial_accepts_the_same_spellings(self, spelling):
+        """One DSL: whatever the network trial takes, the FEM trial must take too. Before this the
+        two lowerings accepted different subsets -- the VPINN path a strict superset -- so a weak
+        form was not portable between them."""
+        dom, _ = self._build_spelling(spelling)  # network trial: must not raise
+        d2 = make_domain()
+        u, phi = d2.fem_symbols(value_shape=(2,))
+        xi, yi, _ = d2.variable("interior", split=True)
+        xb, yb, _ = d2.variable("boundary", split=True)
+        vi, ui = phi.bind(x=xi, y=yi), u.bind(x=xi, y=yi)
+        g = 1.0 + 0.0 * xi
+        src = {
+            "component": lambda: g * vi[0] + (2.0 * g) * vi[1],
+            "const_array": lambda: jnn.inner(np.array([1.0, 2.0]), vi, n_contract=1),
+            "scaled_array": lambda: jnn.inner(g * np.array([1.0, 2.0]), vi, n_contract=1),
+            "stacked": lambda: jnn.inner(jnn.stack([g, 2.0 * g], axis=-1), vi, n_contract=1),
+        }[spelling]()
+        gu, gv = jnn.jacobian(ui, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        sol = np.asarray(
+            jno.fem([jnn.inner(gu, gv, n_contract=2) - src, u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu())
+        )
+        assert np.all(np.isfinite(sol)) and np.linalg.norm(sol) > 0.0
+
+    def test_component_source_lowers_like_the_inner_spelling(self):
+        """``c * phi[k]`` used to raise "could not extract a canonical test channel" on the VPINN
+        path while assembling fine on the FEM path -- the same weak form accepted by one and refused
+        by the other. It now lowers to the vector channel that already worked, ``inner(c*e_k, phi)``,
+        and the oracle is that both spellings give the SAME residual, not merely that both build.
+        """
+        dom_i, pde_i = self._build("inner")
+        dom_c, pde_c = self._build("component")
+        r_i = float(np.asarray(jno.core([pde_i.mse], domain=dom_i).eval([pde_i.mse])).reshape(()))
+        r_c = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
+        assert r_i > 0.0, "a non-trivial residual is needed for the comparison to mean anything"
+        assert abs(r_i - r_c) <= _same_to_precision(r_i, r_c), (
+            f"the two spellings of one source must lower identically: inner={r_i:.12e} component={r_c:.12e}"
+        )
+
+    def test_a_component_source_actually_enters_the_residual(self):
+        """Guard against the lowering quietly producing a zero coefficient (which would also make the
+        two spellings 'agree'): dropping the source must change the residual."""
+        dom_c, pde_c = self._build("component")
+        r_with = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
+
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        vi = phi.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(net(xi, yi), [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        pde0 = jno.fem([jnn.inner(gu, gv, n_contract=2), u(xb, yb) - (0.0, 0.0)])
+        r_without = float(np.asarray(jno.core([pde0.mse], domain=dom).eval([pde0.mse])).reshape(()))
+        assert abs(r_with - r_without) > 1e-9, "the component source is not reaching the residual at all"
+
+
+class TestVpinnCoupledAsVector:
+    """A coupled system whose fields share a test space IS one vector field -- the route the
+    single-field refusal points at, pinned so the message cannot rot into a false promise.
+
+    System:  -Lap a = fa + b,  -Lap b = fb,  a = b = 0 on the boundary,
+    manufactured with a* = s, b* = 2s for s = x(1-x)y(1-y), so fa = lap_s - 2s and fb = 2*lap_s.
+    The inter-field coupling ``- b*va`` is a cross-component term ``u[1]*v[0]``.
+    """
+
+    @staticmethod
+    def _terms(dom, u, phi, trial, xi, yi):
+        vi = phi.bind(x=xi, y=yi)
+        s = xi * (1 - xi) * yi * (1 - yi)
+        lap = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+        gu, gv = jnn.jacobian(trial, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        return [
+            jnn.inner(gu, gv, n_contract=2)
+            - (lap - 2.0 * s) * vi[0]  # fa
+            - (2.0 * lap) * vi[1]  # fb
+            - trial[1] * vi[0]  # the coupling: b enters a's equation
+        ]
+
+    def test_the_coupled_system_is_expressible_and_correct_as_a_vector_field(self):
+        """Oracle: solve the SAME form with an FEM trial. If FEM recovers (s, 2s), the vector
+        rewrite of the coupled system is right -- which is what the refusal message asserts."""
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        ui = u.bind(x=xi, y=yi)
+
+        fem = jno.fem(self._terms(dom, u, phi, ui, xi, yi) + [u(xb, yb) - (0.0, 0.0)])
+        sol = np.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 2)
+        pts = np.asarray(fem.points)
+        ex = pts[:, 0] * (1 - pts[:, 0]) * pts[:, 1] * (1 - pts[:, 1])
+        for i, scale in enumerate((1.0, 2.0)):
+            rel = float(np.linalg.norm(sol[:, i] - scale * ex) / np.linalg.norm(scale * ex))
+            assert rel < 5e-3, f"component {i} of the coupled system is wrong: rel-L2 {rel:.2e}"
+
+    def test_a_network_trial_assembles_on_that_same_coupled_form(self):
+        """And the network-trial version of the identical form builds a trainable residual, so the
+        route the refusal names is actually open (training quality is a separate, documented matter --
+        the two component residuals compete under an equal-weight loss)."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        s = xi * (1 - xi) * yi * (1 - yi)
+        pde = jno.fem(self._terms(dom, u, phi, net(xi, yi) * s, xi, yi) + [u(xb, yb) - (0.0, 0.0)])
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0, "the coupled-as-vector VPINN residual must be finite and non-trivial"
+
+    def test_two_separate_fields_are_refused_with_the_route_named(self):
+        """The refusal must point somewhere, not just say no."""
+        dom = make_domain()
+        a, ta = dom.fem_symbols(names=("a", "ta"))
+        b, tb = dom.fem_symbols(names=("b", "tb"))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        n1, n2 = make_scalar_net(), make_scalar_net()
+        tai, tbi = ta.bind(x=xi, y=yi), tb.bind(x=xi, y=yi)
+        s = xi * (1 - xi) * yi * (1 - yi)
+        with pytest.raises(NotImplementedError, match=r"value_shape"):
+            jno.fem(
+                [
+                    jnn.grad(n1(xi, yi) * s, xi) * jnn.grad(tai, xi) - 1.0 * tai,
+                    jnn.grad(n2(xi, yi) * s, xi) * jnn.grad(tbi, xi) - 1.0 * tbi,
+                    a(xb, yb) - 0.0,
+                    b(xb, yb) - 0.0,
+                ]
+            )
+
+
+class TestVpinnOperatorParity:
+    """The weak-form DSL is one language: an operator the FEM trial accepts, the network trial must
+    accept too. Each case here was a divergence found by sweeping the operators side by side."""
+
+    @staticmethod
+    def _scalar(source, trial_is_net):
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        if trial_is_net:
+            trial = make_scalar_net()(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        else:
+            trial = u.bind(x=xi, y=yi)
+        term = jnn.grad(trial, xi) * jnn.grad(vi, xi) + jnn.grad(trial, yi) * jnn.grad(vi, yi)
+        return dom, jno.fem([term - source(vi, xi), u(xb, yb) - 0.0])
+
+    def test_a_constant_scalar_source_is_accepted_on_the_network_trial(self):
+        """``- 1.0 * phi``, the plainest source there is, used to raise ``coeff shape (1,)
+        incompatible with shape_vals_flat``: a constant has no quadrature axis, and the value channel
+        demanded one per point. It went unnoticed because every shipped VPINN writes a *coordinate*
+        source, which does carry that axis.
+
+        Oracle: it must equal the same constant written as a (constant-valued) coordinate expression.
+        """
+        dom_c, pde_c = self._scalar(lambda vi, xi: 1.0 * vi, trial_is_net=True)
+        dom_x, pde_x = self._scalar(lambda vi, xi: (1.0 + 0.0 * xi) * vi, trial_is_net=True)
+        r_c = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
+        r_x = float(np.asarray(jno.core([pde_x.mse], domain=dom_x).eval([pde_x.mse])).reshape(()))
+        assert r_c > 0.0
+        assert abs(r_c - r_x) <= _same_to_precision(r_c, r_x), (
+            f"a constant source must lower like its coordinate spelling: {r_c:.12e} vs {r_x:.12e}"
+        )
+
+    def test_the_fem_trial_takes_that_source_too(self):
+        _dom, fem = self._scalar(lambda vi, xi: 1.0 * vi, trial_is_net=False)
+        sol = np.asarray(fem.solve(linear=jno.solve.lu()))
+        assert np.all(np.isfinite(sol)) and np.linalg.norm(sol) > 0.0
+
+    @staticmethod
+    def _graddiv(trial_is_net):
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        if trial_is_net:
+            net = jnn.nn.wrap(
+                foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+            )
+            trial = net(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        else:
+            trial = u.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(trial, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        term = (
+            jnn.inner(gu, gv, n_contract=2)
+            + jnn.trace(gu) * jnn.trace(gv)  # div(u) * div(v)
+            - jnn.inner(np.array([1.0, 1.0]), vi, n_contract=1)
+        )
+        return dom, jno.fem([term, u(xb, yb) - (0.0, 0.0)])
+
+    def test_grad_div_is_accepted_on_both_trials(self):
+        """``div`` has no node of its own -- it is ``trace(jacobian(phi, X))``, the way a book writes
+        it -- and the VPINN channel extractor did not recognise the composition. So grad-div
+        stabilisation and an incompressibility penalty assembled on the FEM path and raised on the
+        network one. ``div(v)`` is ``I : grad(v)``, so it lowers to the grad channel with the identity
+        as its coefficient."""
+        _d1, fem = self._graddiv(trial_is_net=False)
+        sol = np.asarray(fem.solve(linear=jno.solve.lu()))
+        assert np.all(np.isfinite(sol)) and np.linalg.norm(sol) > 0.0
+
+        dom, pde = self._graddiv(trial_is_net=True)
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+    def test_trace_of_the_jacobian_really_is_the_divergence(self):
+        """Guard the lowering's premise: ``trace(jac(w))`` must equal the longhand
+        ``dw0/dx + dw1/dy``. Checked on the FEM trial, where both spellings assemble."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi, ui = phi.bind(x=xi, y=yi), u.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(ui, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        base = jnn.inner(gu, gv, n_contract=2) - jnn.inner(np.array([1.0, 2.0]), vi, n_contract=1)
+        div_long = lambda w: jnn.grad(w[0], xi) + jnn.grad(w[1], yi)
+
+        a = np.asarray(jno.fem([base + jnn.trace(gu) * jnn.trace(gv), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
+        b = np.asarray(jno.fem([base + div_long(ui) * div_long(vi), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
+        tol = _same_to_precision(a, np.linalg.norm(b))
+        assert np.linalg.norm(a - b) <= tol, "trace(jac) is not div"
+
+
+class TestVpinnTransientRefusal:
+    """A transient network trial used to BUILD and EVALUATE, and the number meant nothing."""
+
+    @staticmethod
+    def _heat(with_ic, ic_value=0.0, nsteps=5):
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0.0, 0.1, nsteps))
+        u, phi = dom.fem_symbols()
+        si = dom.variable("interior", split=True)
+        xi, yi, ti = si[0], si[1], si[2]
+        sb = dom.variable("boundary", split=True)
+        ci = dom.variable("initial", split=True)
+        vi = phi.bind(x=xi, y=yi, t=ti)
+        net = jnn.nn.wrap(foundax.mlp(3, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+        un = net(xi, yi, ti) * (xi * (1 - xi) * yi * (1 - yi))
+        term = jnn.grad(un, ti) * vi + jnn.grad(un, xi) * jnn.grad(vi, xi) - 1.0 * vi
+        cons = [term, u(sb[0], sb[1]) - 0.0]
+        if with_ic:
+            cons.append(u(*ci) - ic_value)
+        return dom, cons
+
+    def test_a_transient_network_trial_is_refused_by_name(self):
+        """It is refused because the residual it produced was not the problem the user wrote: the
+        lowering test-projects onto a SPATIAL basis, so the declared time grid never entered it and
+        the initial condition was discarded. Training on that converges to something confidently
+        wrong, which is the one outcome this stack does not return."""
+        _dom, cons = self._heat(with_ic=True)
+        with pytest.raises(NotImplementedError, match=r"VPINN.*steady only"):
+            jno.fem(cons)
+
+    def test_the_refusal_names_both_escape_routes(self):
+        _dom, cons = self._heat(with_ic=True)
+        with pytest.raises(NotImplementedError) as ei:
+            jno.fem(cons)
+        msg = str(ei.value)
+        assert "u.t" in msg, "must point at the FE-trial transient path"
+        assert "jno.core" in msg, "must point at the collocation-PINN path"
+
+    def test_a_steady_vpinn_on_a_plain_domain_still_builds(self):
+        """The refusal keys on the TIME COORDINATE appearing in the form, not on the network trial,
+        so ordinary steady VPINNs are untouched."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        un = make_scalar_net()(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        pde = jno.fem(
+            [jnn.grad(un, xi) * jnn.grad(vi, xi) + jnn.grad(un, yi) * jnn.grad(vi, yi) - 1.0 * vi, u(xb, yb) - 0.0]
+        )
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+
+class TestVpinn3D:
+    """3-D network trials: the operator surface carries over from 2-D."""
+
+    @staticmethod
+    def _cube(vec=False):
+        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+        u, phi = dom.fem_symbols(value_shape=(3,) if vec else ())
+        si = dom.variable("interior", split=True)
+        xi, yi, zi = si[0], si[1], si[2]
+        sb = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi, z=zi)
+        net = jnn.nn.wrap(
+            foundax.mlp(
+                3,
+                output_dim=3 if vec else 1,
+                hidden_dims=8,
+                num_layers=2,
+                activation=jax.nn.tanh,
+                key=jax.random.PRNGKey(0),
+            )
+        )
+        ans = xi * (1 - xi) * yi * (1 - yi) * zi * (1 - zi)
+        return dom, u, net(xi, yi, zi) * ans, vi, xi, yi, zi, sb
+
+    @pytest.mark.parametrize("case", ["reaction", "nonlinear", "inner_grad"])
+    def test_scalar_operators_lower_in_3d(self, case):
+        dom, u, t, vi, xi, yi, zi, sb = self._cube()
+        lap = jnn.grad(t, xi) * jnn.grad(vi, xi) + jnn.grad(t, yi) * jnn.grad(vi, yi) + jnn.grad(t, zi) * jnn.grad(vi, zi)
+        term = {
+            "reaction": lambda: lap + t * vi - 1.0 * vi,
+            "nonlinear": lambda: lap + t * t * t * vi - 1.0 * vi,
+            "inner_grad": lambda: (
+                jnn.inner(jnn.jacobian(t, [xi, yi, zi]), jnn.jacobian(vi, [xi, yi, zi]), n_contract=1) - 1.0 * vi
+            ),
+        }[case]()
+        pde = jno.fem([term, u(*sb) - 0.0])
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+    @pytest.mark.parametrize("case", ["jac", "symgrad", "graddiv", "component"])
+    def test_vector_operators_lower_in_3d(self, case):
+        dom, u, t, vi, xi, yi, zi, sb = self._cube(vec=True)
+        X = [xi, yi, zi]
+        gu, gv = jnn.jacobian(t, X), jnn.jacobian(vi, X)
+        src = jnn.inner(np.array([1.0, 1.0, 1.0]), vi, n_contract=1)
+        base = jnn.inner(gu, gv, n_contract=2)
+        term = {
+            "jac": lambda: base - src,
+            "symgrad": lambda: jnn.inner(jnn.symgrad(t, X), jnn.symgrad(vi, X), n_contract=2) - src,
+            "graddiv": lambda: base + jnn.trace(gu) * jnn.trace(gv) - src,
+            "component": lambda: base + t[1] * vi[0] - src,
+        }[case]()
+        pde = jno.fem([term, u(*sb) - (0.0, 0.0, 0.0)])
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+
+class TestVpinnBoundaryAndComplex:
+    """What a network trial does with boundary conditions, and with complex forms."""
+
+    @staticmethod
+    def _form(bc, vec=False, k2=None):
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,) if vec else ())
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        net = jnn.nn.wrap(
+            foundax.mlp(
+                2,
+                output_dim=2 if vec else 1,
+                hidden_dims=8,
+                num_layers=2,
+                activation=jax.nn.tanh,
+                key=jax.random.PRNGKey(0),
+            )
+        )
+        un = net(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        if vec:
+            gu, gv = jnn.jacobian(un, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+            term = jnn.inner(gu, gv, n_contract=2) - jnn.inner(np.array([1.0, 1.0]), vi, n_contract=1)
+        else:
+            term = jnn.grad(un, xi) * jnn.grad(vi, xi) + jnn.grad(un, yi) * jnn.grad(vi, yi) - 1.0 * vi
+            if k2 is not None:
+                term = term - k2 * un * vi
+        return dom, jno.fem([term, bc(u, xb, yb)])
+
+    def _residual(self, *a, **kw):
+        dom, pde = self._form(*a, **kw)
+        return np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(())
+
+    @pytest.mark.parametrize(
+        ("bc", "vec"),
+        [
+            pytest.param(lambda u, xb, yb: u(xb, yb) - 0.0, False, id="zero_scalar"),
+            pytest.param(lambda u, xb, yb: u(xb, yb) - (0.0, 0.0), True, id="zero_vector"),
+            pytest.param(lambda u, xb, yb: u(xb, yb)[0] - 0.0, True, id="one_component_roller"),
+        ],
+    )
+    def test_zero_essential_values_are_accepted(self, bc, vec):
+        """The guard below must not catch a legitimate homogeneous condition -- in any of its
+        spellings. A vector `(0.0, 0.0)` is lowered to a coordinate FUNCTION before it reaches the
+        solver, so the check reads the original value node instead, where the zero is still visible."""
+        r = self._residual(bc, vec=vec)
+        assert np.isfinite(float(np.real(r)))
+
+    @pytest.mark.parametrize(
+        "bc",
+        [
+            pytest.param(lambda u, xb, yb: u(xb, yb) - 0.5, id="constant"),
+            pytest.param(lambda u, xb, yb: u(xb, yb) - jnn.sin(np.pi * xb), id="coordinate"),
+        ],
+    )
+    def test_a_nonzero_essential_value_is_refused(self, bc):
+        """A network trial's essential condition only DECLARES which test functions vanish; the value
+        never reaches the residual. Measured before the guard: `u(bdry) - 0`, `- 0.5`, `- 7.0` and
+        `- sin(pi x)` all gave a BIT-IDENTICAL residual with the same network. Writing a non-zero one
+        therefore looked like a boundary condition and did nothing -- so it is refused, and points at
+        the ansatz, which is where a network satisfies it exactly."""
+        with pytest.raises(NotImplementedError, match=r"essential value.*not zero|ansatz"):
+            self._form(bc)
+
+    def test_a_complex_coefficient_gives_a_genuinely_complex_residual(self):
+        """A `1j` in the form is carried through, not truncated: the residual is complex and its
+        imaginary part responds to the coefficient."""
+        r_real = self._residual(lambda u, xb, yb: u(xb, yb) - 0.0, k2=4.0 + 0.0j)
+        r_cplx = self._residual(lambda u, xb, yb: u(xb, yb) - 0.0, k2=4.0 + 3.0j)
+        assert np.iscomplexobj(r_cplx), "a complex form must not lose its imaginary part"
+        assert abs(np.imag(r_real)) < 1e-14, "a real coefficient must give a real residual"
+        assert abs(np.imag(r_cplx)) > 1e-6, "the imaginary part must respond to the coefficient"
+
+    def test_a_robin_term_lands_on_its_own_region(self):
+        """`a*u*v - g*v` on a face, with the network evaluated ON that face."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xl, yl, _ = dom.variable("left", split=True)
+        xr, yr, _ = dom.variable("right", split=True)
+        net = make_scalar_net()
+        ui, ur = net(xi, yi) * xi, net(xr, yr) * xr
+        vi, vr = phi.bind(x=xi, y=yi), phi.bind(x=xr, y=yr)
+        pde = jno.fem(
+            [
+                jnn.grad(ui, xi) * jnn.grad(vi, xi) + jnn.grad(ui, yi) * jnn.grad(vi, yi),
+                (2.0 + 0.0 * xr) * ur * vr - (1.0 + 0.0 * xr) * vr,
+                u(xl, yl) - 0.0,
+            ]
+        )
+        assert set(pde.boundary_value_exprs) == {"right"}
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0

@@ -88,6 +88,25 @@ def _as_flat(x):
 _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
 
 
+def _relative_residual(A, b, u):
+    """``||A u - b|| / ||b||`` -- the one definition, for every path that certifies a linear answer.
+
+    Returns ``None`` when any input is a tracer: the value is only meaningful concretely, and every
+    caller is an eager-only guard that must step aside under ``jit``/``vmap``/``grad`` rather than
+    force a device->host sync it cannot perform. Accepts a sparse ``A`` (BCOO) and never densifies --
+    one matvec, ``O(nnz)``.
+
+    This existed three times over before it lived here, and the copies had already drifted (see the
+    note in :func:`_residual_check`). A number that decides whether an answer is returned or refused
+    should have exactly one spelling.
+    """
+    if any(isinstance(v, jax.core.Tracer) for v in (u, b)):
+        return None
+    matvec = (lambda v: A @ v) if hasattr(A, "__matmul__") else (lambda v: jnp.asarray(A) @ v)
+    b = _as_flat(b)
+    return float(jnp.linalg.norm(b - matvec(_as_flat(u))) / (jnp.linalg.norm(b) + 1e-30))
+
+
 def _residual_check(A, b, u, who):
     """Raise (eagerly) if ``A u = b`` is not solved -- a hard fail beats silently returning garbage.
 
@@ -96,10 +115,9 @@ def _residual_check(A, b, u, who):
     ``jax.jit(fem.solve)`` raised ``ConcretizationTypeError`` from the ``float()`` below rather than
     simply skipping the check. Mirrors ``solver_api._maybe_residual_check``, which already does this;
     the two had drifted apart. There the solver's own iteration cap is the guard."""
-    if any(isinstance(v, jax.core.Tracer) for v in (u, b)):
+    rel = _relative_residual(A, b, u)
+    if rel is None:
         return u
-    matvec = (lambda v: A @ v) if hasattr(A, "__matmul__") else (lambda v: jnp.asarray(A) @ v)
-    rel = float(jnp.linalg.norm(b - matvec(u)) / (jnp.linalg.norm(b) + 1e-30))
     if not np.isfinite(rel) or rel > 1e-4:
         raise RuntimeError(
             f"fem.solve default ({who}) did not solve the system (relative residual {rel:.1e}); the "
@@ -2107,10 +2125,9 @@ class FEM:
         if uc is None:
             return  # traced (jax.grad/jit through the basis) — nothing to check yet
         A, b = self._op
-        b = jnp.asarray(b).reshape(-1)
-        r = _concrete(jnp.asarray(A @ jnp.asarray(uc, b.dtype)).reshape(-1) - b)
-        nb = float(np.linalg.norm(np.asarray(b)))
-        rel = float(np.linalg.norm(r)) / (nb if nb > 0 else 1.0)
+        rel = _relative_residual(A, b, jnp.asarray(uc, jnp.asarray(b).dtype))
+        if rel is None:
+            return
         self.basis_residual = rel
         if not np.isfinite(rel) or rel > self.BASIS_RESIDUAL_LIMIT:
             k = int(np.asarray(reduction["P"]).shape[1])
@@ -2901,15 +2918,38 @@ class FEM:
     def residual(self):
         """Residual callable for a custom solver, returning a flat ``(n_dofs,)`` JAX array.
 
-        Steady nonlinear: ``residual(u)``. Transient: ``residual(u, t)`` — the per-step
-        semidiscrete residual (pass ``args=`` only for a runtime-parametric solve). Use
-        ``fem.operator`` for the raw (unflattened) form."""
+        Steady linear: ``residual(u)`` is ``A u - b`` (pass ``args=`` for a runtime-parametric form).
+        Steady nonlinear: ``residual(u)``. Transient: ``residual(u, t)`` — the per-step semidiscrete
+        residual (pass ``args=`` only for a runtime-parametric solve). Use ``fem.operator`` for the raw
+        (unflattened) form.
+
+        **Scoring a field this FEM did not produce.** The residual is the only thing that can say
+        whether a field *not* obtained from ``fem.solve()`` — a reduced-basis answer, a coarse-mesh
+        interpolant, a neural operator's prediction — actually satisfies this system, and it costs one
+        sparse matvec against the ``O(N^3)`` of the solve it would certify::
+
+            rel = jnp.linalg.norm(fem.residual(u_pred)) / jnp.linalg.norm(fem.b)
+
+        That is exactly the check ``fem.solve(basis=...)`` already runs on itself (``fem.basis_residual``).
+        It is a **certificate, not a bound**: a small residual does not bound the error without the
+        operator's conditioning, and on an ill-conditioned system a plausible-looking residual can still
+        hide a large error. It does reliably catch a field that is simply not a solution.
+
+        The linear branch never densifies — ``A`` stays the assembled BCOO, so this is ``O(nnz)``.
+        """
+        if self._mode == "linear":
+
+            def _linear_residual(u, args=None):
+                A, b = self._op.evaluate(args) if isinstance(self._op, FemLinearSystem) else self._op
+                return _as_flat(A @ _as_flat(u)) - _as_flat(b)
+
+            return _linear_residual
         if self._mode == "nonlinear":
             r = self._op.residual
             return lambda u: _as_flat(r(u))
         if self._mode == "transient":
             return lambda u, t, args=None: _as_flat(self._op.residual(u, t, args or {}))
-        raise AttributeError(f"FEM is {self._mode}; .residual is for a steady-nonlinear or transient problem.")
+        raise AttributeError(f"FEM is {self._mode}; .residual is for a steady (linear or nonlinear) or transient problem.")
 
     def eval(self, term, u, *, args=None):
         """Assemble one **weak term** at the solution ``u`` — the free ``(n_dofs,)`` vector, with **no**
@@ -5618,7 +5658,24 @@ def _fem_impl(
     classification.extend(f"slip@{spec[1]}" for spec in slip_bcs)
 
     if is_vpinn and multifield:
-        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field only.")
+        # Single-field is a real boundary, not a guard: the network-trial lowering wraps ONE primary
+        # unknown (`detect_primary_state_field` / `wrap_primary_state`), and carrying several would
+        # mean threading a field identity through that wrapping. The IR already reserves the slot for
+        # it -- `LoweredChannelTerm.variable_id`, filterable in `select`/`sum_coeffs` -- but the
+        # extractor assigns 0 everywhere and the consumer only reads field 0.
+        #
+        # Say what to do instead, because there IS a route: a coupled system whose fields share a test
+        # space IS one vector field, and a vector VPINN works. Verified on
+        # `-Lap a = fa + b, -Lap b = fb`: written as `u = (a, b)` it trains, against an FEM solve of
+        # the identical form (tests/test_vpinn_integration.py::TestVpinnCoupledAsVector).
+        raise NotImplementedError(
+            "jno.fem: a VPINN (network trial) is single-field -- the lowering wraps one primary "
+            "unknown. Write the coupled system as ONE VECTOR field instead: `d.fem_symbols("
+            "value_shape=(n,))` with an n-output network, inter-field coupling as component terms "
+            "(`u[1] * v[0]`) and per-component sources (`f0 * v[0] + f1 * v[1]`). That is the same "
+            "system and it trains. Fields needing DIFFERENT test spaces (a Taylor-Hood pair, say) "
+            "have no route yet."
+        )
 
     # ---- second-order in time (`u_tt`): reduce to a first-order augmented (u, v=u_t) block ----
     # A weak term carrying a SECOND temporal derivative is lowered to the equivalent first-order
@@ -6318,7 +6375,85 @@ def _fem_impl(
     # It builds the native fem_context (init_fem_native) and test-projects the weak form. Every
     # standard single-field FEM problem has already returned natively above; anything else is rejected
     # explicitly below (fail loud -- never silently mis-assemble). ----
-    if is_vpinn and getattr(domain, "dimension", None) in (1, 2) and not periodic_ties:
+    if is_vpinn and any(_is_temporal_value_node(_bare(c)) for c in constraints):
+        # A transient network trial BUILDS and EVALUATES today, and the number it produces is
+        # meaningless. Measured on a heat form over `domain(time=(0, 0.1, 5))`:
+        #   * the spatial quadrature carries 120 points while the temporal coordinate carries 5 --
+        #     different lengths, so nothing aligns into a space-time residual;
+        #   * the declared time grid does not reach it at all (5 steps and 17 steps give a
+        #     bit-identical residual);
+        #   * the initial condition is silently discarded (`u(initial) - 0` and `u(initial) - 7`
+        #     give a bit-identical residual), so the problem the network trains on has no initial
+        #     state and is not the one that was written.
+        #
+        # Refuse it. The lowering test-projects onto a SPATIAL FE basis; making this real needs a
+        # decided treatment of time -- space-time test functions, or collocation on the declared grid
+        # with the IC as its own loss term -- and that is a design choice, not an implementation gap.
+        raise NotImplementedError(
+            "jno.fem: a VPINN (network trial) is steady only -- this form carries the time coordinate. "
+            "The lowering test-projects onto a spatial FE basis, so the time grid never enters the "
+            "residual and an initial condition is discarded: it would train, on a problem that is not "
+            "the one you wrote. Use an FE trial for a transient weak form (`u.t` with "
+            "`d.fem_symbols()`), or drive a time-dependent network as a collocation PINN through "
+            "`jno.core`, where the residual and the initial condition are both explicit losses."
+        )
+
+    if is_vpinn and getattr(domain, "dimension", None) not in (1, 2, 3):
+        # A 3-D VPINN falls past the branch below and dies further in on `Tag 'fem_gauss' is not in
+        # the mesh pool` -- an internal tag name, for a scope limit the user cannot infer from it.
+        # Say what is actually unsupported, at the point the decision is made.
+        raise NotImplementedError(
+            f"jno.fem: a VPINN (network trial) is supported on 1-D, 2-D and 3-D meshes; this domain "
+            f"reports dimension {getattr(domain, 'dimension', None)!r}. Use an FEM trial "
+            "(`d.fem_symbols()` written against the same weak form), or a collocation PINN."
+        )
+    if is_vpinn and periodic_ties:
+        raise NotImplementedError(
+            "jno.fem: a VPINN (network trial) does not compose with periodic ties -- the tie is imposed "
+            "by an algebraic reduction of FE trial DOFs, and a network trial has none. Impose the "
+            "periodicity in the network instead (a periodic input embedding), or use an FE trial."
+        )
+    if is_vpinn and getattr(domain, "dimension", None) in (1, 2, 3) and not periodic_ties:
+        # A VPINN's essential condition is a DECLARATION, not an imposition: it says which test
+        # functions vanish on the region, so their irreducible du/dn flux leaves the loss. The value
+        # itself never reaches the residual -- measured, `u(bdry) - 0`, `- 0.5`, `- 7.0` and
+        # `- sin(pi x)` all give a BIT-IDENTICAL residual. A non-zero one therefore reads as a
+        # boundary condition and does nothing, which is the silent kind of wrong refused everywhere
+        # else here. The network satisfies the condition through its ANSATZ; that is where a non-zero
+        # value belongs.
+        #
+        # Checked on `dirichlet_raw`, whose last field is the ORIGINAL value node -- `dirichlet_values`
+        # has already lowered a vector `(0.0, 0.0)` into a coordinate function, indistinguishable there
+        # from a genuinely non-zero profile.
+        def _is_zero_essential_node(node):
+            if node is None:
+                return True
+            if isinstance(node, (int, float)) and not isinstance(node, bool):
+                return float(node) == 0.0
+            if isinstance(node, (tuple, list)):
+                return all(_is_zero_essential_node(e) for e in node)
+            if isinstance(node, dict):
+                return all(_is_zero_essential_node(e) for e in node.values())
+            val = getattr(node, "value", None)  # a Literal carries its array here
+            if val is None:
+                return False  # an expression: not known to be zero
+            try:
+                return bool(np.all(np.asarray(val) == 0))
+            except Exception:
+                return False
+
+        for _rec in dirichlet_raw or ():
+            _tag = _rec[1] if len(_rec) > 1 else "?"
+            if not _is_zero_essential_node(_rec[-1] if len(_rec) > 4 else None):
+                raise NotImplementedError(
+                    f"jno.fem (VPINN): the essential value on region {_tag!r} is not zero, and a "
+                    "network trial's essential condition only DECLARES which test functions vanish -- "
+                    "the value never reaches the residual, so this would be silently ignored. Put it "
+                    "in the ansatz, where the network satisfies it exactly: write the trial as "
+                    "`g + ansatz * net(...)` with `ansatz` vanishing on that region, and keep the "
+                    "declaration `u(region) - 0.0`."
+                )
+
         bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
         if boundary_terms:
             bcs.append(neumann(list(boundary_terms.keys())))
@@ -6342,6 +6477,27 @@ def _fem_impl(
         domain.variable("fem_gauss")
         for region in boundary_terms:
             domain.variable(f"gauss_{region}")
+        # `_fem_impl` has already classified these correctly -- `boundary_terms` is keyed by region.
+        # The lowering below re-derives that classification from the FLATTENED expression, and a term
+        # whose coefficient carries no coordinate has nothing left to classify by: a bound test
+        # function keeps its binding on the VIEW, not in the expression tree, so `-1.0 * v_right`
+        # and `-1.0 * v_interior` are indistinguishable once flattened and both default to volume.
+        #
+        # A boundary flux silently integrated over the volume is a wrong answer that trains happily
+        # (measured: 3.9e-01 against 6.8e-04 for the same problem written the other way), so it is
+        # refused here, where the region IS still known, rather than mis-filed there. The fix is one
+        # spelling away, and the deeper repair is to stop discarding this classification at all.
+        for _region, _region_terms in boundary_terms.items():
+            for _t in _region_terms:
+                if not any(True for _ in _spatial_coord_vars(_bare(_t))):
+                    raise NotImplementedError(
+                        f"jno.fem (VPINN): the boundary term on region {_region!r} has a coefficient "
+                        "carrying no coordinate, and the network-trial lowering cannot recover its "
+                        "region from the flattened weak form -- it would be integrated over the "
+                        "VOLUME instead of the face, silently. Write the coefficient against that "
+                        f"region's coordinates, e.g. `xr, yr, _ = d.variable({_region!r}, split=True)` "
+                        "then `(g + 0.0 * xr) * v_r`. An FEM trial needs no such spelling."
+                    )
         weak = volume_terms[0]
         for t in volume_terms[1:]:
             weak = weak + t

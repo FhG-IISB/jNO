@@ -873,6 +873,14 @@ def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
 # --------------------------------
 
 
+def _broadcast_ok(s1, s2) -> bool:
+    """Whether two shapes broadcast under numpy rules (right-aligned, 1s stretch)."""
+    for x, y in zip(reversed(s1), reversed(s2)):
+        if x != y and x != 1 and y != 1:
+            return False
+    return True
+
+
 def _prefix_align(a, b):
     """Broadcast-align two kernel quantities for an elementwise op.
 
@@ -894,13 +902,109 @@ def _prefix_align(a, b):
     b = jnp.asarray(b)
     if a.ndim == b.ndim or a.ndim == 0 or b.ndim == 0:
         return a, b
-    if a.ndim < b.ndim:
-        pad = (1,) * (b.ndim - a.ndim)
-        a = jnp.reshape(a, a.shape[:1] + pad + a.shape[1:])
-    else:
-        pad = (1,) * (a.ndim - b.ndim)
-        b = jnp.reshape(b, b.shape[:1] + pad + b.shape[1:])
-    return a, b
+
+    lo, hi = (a, b) if a.ndim < b.ndim else (b, a)
+    pad = (1,) * (hi.ndim - lo.ndim)
+
+    # The usual reading: the low-rank operand shares the quadrature axis, so the singletons go
+    # AFTER it and its own trailing axes stay value axes.
+    quad_first = jnp.reshape(lo, lo.shape[:1] + pad + lo.shape[1:])
+    if _broadcast_ok(quad_first.shape, hi.shape):
+        return (quad_first, b) if a.ndim < b.ndim else (a, quad_first)
+
+    # ... but a CONSTANT does not vary over the quadrature points, so it carries no quadrature axis
+    # at all: every axis it has is a value axis. `jnp.array([1.0, 2.0])` against a per-point scalar is
+    # the ordinary case -- a constant vector coefficient. Padding that on the left instead makes its
+    # axes trailing, which is what they are.
+    #
+    # Reached ONLY when the reading above does not broadcast, i.e. only where this used to raise
+    # `mul got incompatible shapes`. No expression that already evaluated can change value here.
+    value_only = jnp.reshape(lo, pad + lo.shape)
+    if _broadcast_ok(value_only.shape, hi.shape):
+        return (value_only, b) if a.ndim < b.ndim else (a, value_only)
+
+    # Neither reading works. If SWAPPING the low operand's first two axes would, it is component-first
+    # -- what `jno.np.stack([f0, f1])` builds, since stack defaults to axis=0 while the value axis is
+    # trailing everywhere here. Say that, rather than letting the raw broadcast error surface: it is
+    # the same diagnosis the VPINN lowering gives for the same weak form, so one spelling means one
+    # thing on both paths.
+    if lo.ndim >= 2:
+        moved = jnp.moveaxis(lo, 0, -1)
+        cand = jnp.reshape(moved, moved.shape[:1] + pad + moved.shape[1:])
+        if _broadcast_ok(cand.shape, hi.shape) or _broadcast_ok(moved.shape, hi.shape):
+            raise ValueError(
+                f"weak-form coefficient of shape {tuple(lo.shape)} is COMPONENT-FIRST against a "
+                f"quantity of shape {tuple(hi.shape)}: its first two axes are the wrong way round. "
+                "That is what `jno.np.stack([f0, f1])` builds, since stack defaults to axis=0. The "
+                "value axis is trailing here, so write `jno.np.stack([f0, f1], axis=-1)`."
+            )
+
+    # Genuinely unalignable: fall through to the original alignment so the error is the one the
+    # kernel has always raised, naming the real shapes.
+    return (quad_first, b) if a.ndim < b.ndim else (a, quad_first)
+
+
+def _field_slot_or_none(local, node):
+    """Index into ``local["fields"]`` supplying ``node``'s basis, or ``None`` if no field supplies it.
+
+    Its own key first; failing that, any field on the SAME space and order -- identical nodes,
+    connectivity and shape functions on this mesh, so borrowing that slot is exact rather than an
+    approximation. See :func:`_resolve_field_slot` for why a foreign key occurs at all.
+    """
+    idx = local["field_index"].get(getattr(node, "field_key", getattr(node, "op_id", None)))
+    if idx is not None:
+        return idx
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    want_order = int(getattr(node, "order", 1))
+    for i, f in enumerate(local["fields"]):
+        if int(f.get("order", 1)) == want_order and (str(f.get("space", "Lagrange")) or "Lagrange") == want_space:
+            return i
+    return None
+
+
+def _slotless_p1_coefficient_or_raise(local, node):
+    """Guard the one case that may read the top-level P1 shape data instead of a field-table slot.
+
+    A frozen P1 coefficient in a form whose fields are all non-nodal -- an N1E problem whose source
+    was computed elsewhere -- has no slot to borrow, since no field here is P1. The assembler still
+    supplies P1 shape data at the top level for exactly this, so it is read from there.
+
+    Everything else that lands slotless is refused. A frozen coefficient declaring a HIGHER space
+    gets :func:`_resolve_field_slot`'s message, because answering it with P1 data would gather the
+    wrong nodes -- a P2 field has edge nodes a P1 basis never sees. A node that is not frozen at all
+    is an assembler bug, and gets the field-table message.
+    """
+    _coefficient_only_or_raise(local, node, getattr(node, "field_key", getattr(node, "op_id", None)))
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    if want_space != "Lagrange" or int(getattr(node, "order", 1)) != 1:
+        _resolve_field_slot(local, node)  # raises: names the space, and what to do about it
+
+
+def _resolve_field_slot(local, node):
+    """Index into ``local["fields"]`` supplying ``node``'s basis, resolving a FOREIGN field by space.
+
+    Normally a node's ``field_key`` is one of this form's unknowns and resolves directly. A frozen
+    coefficient carrying another form's solved values (``jno.precond.form`` over one field, with a
+    second field's values as data) has a key this form never registered. It declares its own
+    ``space``/``order``, and any field here with the same pair has identical nodes, connectivity and
+    shape functions on this mesh -- so borrowing that slot is exact.
+
+    Raises rather than guessing when no such field exists: gathering P2 values through a P1 slot
+    would read the wrong nodes and return a plausible, wrong operator. The companion check in
+    ``fem_native._frozen_field_basis_index`` refuses the same case at gather time with the fuller
+    message; this is the kernel-side guard for the paths that reach here first.
+    """
+    idx = _field_slot_or_none(local, node)
+    if idx is not None:
+        return idx
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    want_order = int(getattr(node, "order", 1))
+    raise NotImplementedError(
+        f"jno.fem: a field on a {want_space} order-{want_order} space is used in a form whose own "
+        "fields do not include that space, so there is no basis to evaluate it on. This is usually a "
+        "frozen coefficient (ui.freeze(values)) from a different space than the auxiliary form's "
+        "unknown -- project it onto the form's space first, or write the form over a matching field."
+    )
 
 
 def _coefficient_only_or_raise(local, node, key):
@@ -931,15 +1035,14 @@ def _field_data(local, node):
     fields = local.get("fields")
     if fields is None:
         return local["shape_vals"], local.get("shape_grads"), local.get("cell_sol")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    idx = local["field_index"].get(key)
+    idx = _field_slot_or_none(local, node)
     if idx is None:
-        # A COEFFICIENT-ONLY field: a FrozenField on the P1 vertex space that is not among this
-        # problem's solved unknowns (an N1E form whose source was computed elsewhere). It has no
-        # entry in the field table, so fall back to the top-level P1 shape data the assembler
-        # supplies for field coefficients. `cell_sol` is None — a frozen field carries its own
-        # values via ``local["frozen_fields"]``, never the live state.
-        _coefficient_only_or_raise(local, node, key)
+        # A COEFFICIENT-ONLY field: a FrozenField whose source is not among this problem's solved
+        # unknowns, and whose space no field here supplies (an N1E form reading a P1 source computed
+        # elsewhere). It borrows the top-level P1 shape data the assembler supplies for coefficients.
+        # `cell_sol` is None -- a frozen field carries its values via ``local["frozen_fields"]``,
+        # never the live state.
+        _slotless_p1_coefficient_or_raise(local, node)
         return local["shape_vals"], local.get("shape_grads"), None
     fd = fields[idx]
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
@@ -967,11 +1070,10 @@ def _field_hess(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("shape_hess")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    idx = local["field_index"].get(key)
-    # Coefficient-only field: no field-table entry, and P1 tabulates no second derivative anyway.
+    idx = _field_slot_or_none(local, node)
     if idx is None:
-        _coefficient_only_or_raise(local, node, key)
+        # Coefficient-only field: no slot to borrow, and P1 tabulates no second derivative anyway.
+        _slotless_p1_coefficient_or_raise(local, node)
         return None
     return fields[idx].get("shape_hess")
 
@@ -986,13 +1088,11 @@ def _field_space(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("space", "Lagrange")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    idx = local["field_index"].get(key)
-    # A COEFFICIENT-ONLY field (a FrozenField on the P1 vertex space, not among this problem's
-    # solved unknowns) has no field-table entry. It IS nodal Lagrange — which is also the default,
-    # so the value branches downstream take the same path they would for any P1 coefficient.
+    idx = _field_slot_or_none(local, node)
     if idx is None:
-        _coefficient_only_or_raise(local, node, key)
+        # A COEFFICIENT-ONLY field with no slot to borrow IS nodal Lagrange -- which is also the
+        # default, so the value branches downstream take the same path as any P1 coefficient.
+        _slotless_p1_coefficient_or_raise(local, node)
         return "Lagrange"
     return fields[idx].get("space", "Lagrange")
 
