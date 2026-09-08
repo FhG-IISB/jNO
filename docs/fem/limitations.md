@@ -27,6 +27,7 @@ path is unaffected.
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | Plasticity | small-strain, isotropic, linear-hardening | raises |
 | Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
+| VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
 | `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
@@ -144,6 +145,36 @@ path is unaffected.
     is written for a change of mesh, not of space. A transient problem is refused by name, as is
     `order=` (the cover supplies the extra order) and a non-simplex cell (the cover gradient assumes an
     affine map). See [Interpolation covers](elements.md#interpolation-covers-the-missing-p-spacecover).
+
+??? note "VPINN (network trial) — where the lowering stops"
+    A network trial is test-projected onto the FE basis, and that projection is **spatial** — so a
+    form carrying the time coordinate is refused. It used to build and evaluate on a meaningless
+    number: the time grid never reached the residual and the initial condition was silently dropped
+    (measured: `u(initial) - 0` and `u(initial) - 7` gave bit-identical residuals). Making it real
+    needs a decided treatment of time — space-time test functions, or collocation on the declared grid
+    with the IC as its own loss — which is a design choice rather than an implementation gap.
+
+    **3-D works.** It used to raise -- first on an internal quadrature-pool tag, then by name -- and
+    the restriction turned out to be a conservative guard rather than a limitation: the native
+    assembler builds the context in 3-D exactly as in 2-D. Measured on the cube: Poisson 4.6e-04, a
+    Neumann flux face 8.4e-04, with the same scalar and vector operator surface as 2-D.
+
+    One spelling is required on a boundary term: its coefficient must carry a coordinate from that
+    region (`(g + 0.0 * xr) * v_r`). A bound test keeps its binding on the view rather than in the
+    expression tree, so a bare constant is indistinguishable from a volume term once the form is
+    flattened, and would be integrated over the volume silently. It is refused instead. It is also
+    **single-field**: a vector unknown is fine (one field with `value_shape=(d,)`, and all four source
+    spellings lower identically), but a coupled multi-field system is not. **Periodic ties** are
+    refused because a tie is an algebraic reduction of FE trial DOFs and a network trial has none —
+    impose periodicity inside the network instead.
+
+    Each of the three refuses by name at the point the decision is made. They used to surface further
+    in: a 3-D VPINN died on `Tag 'fem_gauss' is not in the mesh pool or context`, an internal
+    quadrature-pool name for a scope limit nobody could infer from it.
+
+    What *does* compose is on
+    [Formulations](formulations.md#the-trial-may-be-a-network-vpinn-and-deep-ritz), measured against
+    analytic solutions — including a network trial co-trained with a `jno.np.parameter`.
 
 ??? note "Element order on a non-nodal family — refused, not applied"
     RT / N1E / P0 / Hermite / Argyris / Morley each have one intrinsic order. `space="N1E", order=2`

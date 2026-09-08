@@ -154,6 +154,51 @@ def value_shape_num_components(value_shape) -> int:
     return n
 
 
+def test_component_index(node):
+    """Component index ``k`` if ``node`` is ``phi[k]`` on a VECTOR test function, else ``None``.
+
+    A component view lowers to ``FunctionCall(getitem, [TestFunction])`` whose index lives in the
+    accessor's own closure rather than in ``args`` -- the FEM kernel never needs it (it evaluates the
+    accessor numerically, ``node.fn(*args)``), so nothing ever put it on the node. The VPINN path
+    does need it, because it extracts the test channel *symbolically* before any values exist.
+
+    Recovered by applying the accessor to ``arange(dim)``, which returns the index it selects. That
+    reads the closure through its own public behaviour instead of poking at ``__closure__``, and it
+    stays correct if the accessor is ever rebuilt differently.
+    """
+    if not isinstance(node, FunctionCall) or function_name(node) != "getitem":
+        return None
+    if len(node.args) != 1 or not isinstance(node.args[0], TestFunction):
+        return None
+    shape = tuple(getattr(node.args[0], "value_shape", ()) or ())
+    if len(shape) != 1 or shape[0] < 1:
+        return None  # not a plain vector test function
+    try:
+        import numpy as _np
+
+        probe = node.fn(_np.arange(int(shape[0])))
+        k = int(_np.asarray(probe).reshape(()))
+    except Exception:
+        return None
+    return k if 0 <= k < shape[0] else None
+
+
+def is_div_test(node) -> bool:
+    """Whether ``node`` is ``div(phi)`` written as ``trace(grad(phi))`` on a vector test function.
+
+    ``div`` has no node of its own in the trace -- it is spelled ``trace(jacobian(phi, X))``, the way
+    a book writes it. The VPINN channel extractor therefore has to recognise the composition, which
+    it did not: ``div(u)*div(v)`` (grad-div stabilisation, an incompressibility penalty) assembled on
+    the FEM path and raised "could not extract a canonical test channel" on the network-trial path.
+    """
+    if not isinstance(node, FunctionCall) or function_name(node) != "trace":
+        return False
+    if len(node.args) != 1:
+        return False
+    inner_node = node.args[0]
+    return isinstance(inner_node, Jacobian) and isinstance(inner_node.target, TestFunction)
+
+
 def is_test_value(node):
     return isinstance(node, TestFunction)
 
@@ -252,9 +297,14 @@ def collect_variational_metas(domain, node, out):
         collect_variational_metas(domain, child, out)
 
 
-def infer_term_bucket(domain, term):
+def infer_term_bucket(domain, term, *, network_trial: bool = False):
     """
     Infer whether a weak-form term belongs to the volume or a boundary region.
+
+    Args:
+        network_trial: set by the VPINN lowering. It alone falls back to the coordinate tags when a
+            term carries no variational meta; every other caller keeps the historic "volume" default
+            (see the comment at that branch).
 
     Returns:
         `(support, region_id)`
@@ -280,7 +330,26 @@ def infer_term_bucket(domain, term):
         return support, region_id
 
     if contains_node_type(term, TrialFunction) or contains_node_type(term, TestFunction):
-        return "volume", "volume"
+        if not network_trial:
+            # The historic default. Only the network-trial lowering consults the coordinate tags
+            # below: this function is shared with the NON-NODAL assembler, where an RT natural
+            # pressure BC reached here and relied on falling through to "volume" -- reclassifying it
+            # as a general boundary term routes it into a path that refuses it ("Robin / general
+            # surface terms are not wired yet"). Widening the rule for everyone broke that; the fix
+            # B1 needed is specific to a bound test on a network-trial form.
+            return "volume", "volume"
+        # No variational meta -- which is exactly what a BOUND test function looks like:
+        # ``phi.bind(x=xr, y=yr)`` carries its region on the coordinate Variables, not on a registry
+        # entry. Falling straight through to ("volume", "volume") filed a Neumann flux term under the
+        # VOLUME channel, where the boundary assembler never saw it and the flux was silently dropped.
+        #
+        # The FEM path already classifies this correctly, from the coordinate tags rather than the
+        # registry, so ask it rather than growing a second rule here (they had already drifted -- this
+        # bug IS that drift). Deferred import: jno._fem imports this module.
+        from ..._fem import _region_and_support
+
+        support, region_id = _region_and_support(term, domain)
+        return support, region_id
 
     raise ValueError(
         "Could not infer weak-form support for term. "

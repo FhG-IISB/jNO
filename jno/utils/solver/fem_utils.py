@@ -838,6 +838,14 @@ def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
 # --------------------------------
 
 
+def _broadcast_ok(s1, s2) -> bool:
+    """Whether two shapes broadcast under numpy rules (right-aligned, 1s stretch)."""
+    for x, y in zip(reversed(s1), reversed(s2)):
+        if x != y and x != 1 and y != 1:
+            return False
+    return True
+
+
 def _prefix_align(a, b):
     """Broadcast-align two kernel quantities for an elementwise op.
 
@@ -859,13 +867,78 @@ def _prefix_align(a, b):
     b = jnp.asarray(b)
     if a.ndim == b.ndim or a.ndim == 0 or b.ndim == 0:
         return a, b
-    if a.ndim < b.ndim:
-        pad = (1,) * (b.ndim - a.ndim)
-        a = jnp.reshape(a, a.shape[:1] + pad + a.shape[1:])
-    else:
-        pad = (1,) * (a.ndim - b.ndim)
-        b = jnp.reshape(b, b.shape[:1] + pad + b.shape[1:])
-    return a, b
+
+    lo, hi = (a, b) if a.ndim < b.ndim else (b, a)
+    pad = (1,) * (hi.ndim - lo.ndim)
+
+    # The usual reading: the low-rank operand shares the quadrature axis, so the singletons go
+    # AFTER it and its own trailing axes stay value axes.
+    quad_first = jnp.reshape(lo, lo.shape[:1] + pad + lo.shape[1:])
+    if _broadcast_ok(quad_first.shape, hi.shape):
+        return (quad_first, b) if a.ndim < b.ndim else (a, quad_first)
+
+    # ... but a CONSTANT does not vary over the quadrature points, so it carries no quadrature axis
+    # at all: every axis it has is a value axis. `jnp.array([1.0, 2.0])` against a per-point scalar is
+    # the ordinary case -- a constant vector coefficient. Padding that on the left instead makes its
+    # axes trailing, which is what they are.
+    #
+    # Reached ONLY when the reading above does not broadcast, i.e. only where this used to raise
+    # `mul got incompatible shapes`. No expression that already evaluated can change value here.
+    value_only = jnp.reshape(lo, pad + lo.shape)
+    if _broadcast_ok(value_only.shape, hi.shape):
+        return (value_only, b) if a.ndim < b.ndim else (a, value_only)
+
+    # Neither reading works. If SWAPPING the low operand's first two axes would, it is component-first
+    # -- what `jno.np.stack([f0, f1])` builds, since stack defaults to axis=0 while the value axis is
+    # trailing everywhere here. Say that, rather than letting the raw broadcast error surface: it is
+    # the same diagnosis the VPINN lowering gives for the same weak form, so one spelling means one
+    # thing on both paths.
+    if lo.ndim >= 2:
+        moved = jnp.moveaxis(lo, 0, -1)
+        cand = jnp.reshape(moved, moved.shape[:1] + pad + moved.shape[1:])
+        if _broadcast_ok(cand.shape, hi.shape) or _broadcast_ok(moved.shape, hi.shape):
+            raise ValueError(
+                f"weak-form coefficient of shape {tuple(lo.shape)} is COMPONENT-FIRST against a "
+                f"quantity of shape {tuple(hi.shape)}: its first two axes are the wrong way round. "
+                "That is what `jno.np.stack([f0, f1])` builds, since stack defaults to axis=0. The "
+                "value axis is trailing here, so write `jno.np.stack([f0, f1], axis=-1)`."
+            )
+
+    # Genuinely unalignable: fall through to the original alignment so the error is the one the
+    # kernel has always raised, naming the real shapes.
+    return (quad_first, b) if a.ndim < b.ndim else (a, quad_first)
+
+
+def _resolve_field_slot(local, node):
+    """Index into ``local["fields"]`` supplying ``node``'s basis, resolving a FOREIGN field by space.
+
+    Normally a node's ``field_key`` is one of this form's unknowns and resolves directly. A frozen
+    coefficient carrying another form's solved values (``jno.precond.form`` over one field, with a
+    second field's values as data) has a key this form never registered. It declares its own
+    ``space``/``order``, and any field here with the same pair has identical nodes, connectivity and
+    shape functions on this mesh -- so borrowing that slot is exact.
+
+    Raises rather than guessing when no such field exists: gathering P2 values through a P1 slot
+    would read the wrong nodes and return a plausible, wrong operator. The companion check in
+    ``fem_native._frozen_field_basis_index`` refuses the same case at gather time with the fuller
+    message; this is the kernel-side guard for the paths that reach here first.
+    """
+    fields = local["fields"]
+    key = getattr(node, "field_key", getattr(node, "op_id", None))
+    idx = local["field_index"].get(key)
+    if idx is not None:
+        return idx
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    want_order = int(getattr(node, "order", 1))
+    for i, f in enumerate(fields):
+        if int(f.get("order", 1)) == want_order and (str(f.get("space", "Lagrange")) or "Lagrange") == want_space:
+            return i
+    raise NotImplementedError(
+        f"jno.fem: a field on a {want_space} order-{want_order} space is used in a form whose own "
+        "fields do not include that space, so there is no basis to evaluate it on. This is usually a "
+        "frozen coefficient (ui.freeze(values)) from a different space than the auxiliary form's "
+        "unknown -- project it onto the form's space first, or write the form over a matching field."
+    )
 
 
 def _field_data(local, node):
@@ -878,8 +951,7 @@ def _field_data(local, node):
     fields = local.get("fields")
     if fields is None:
         return local["shape_vals"], local.get("shape_grads"), local.get("cell_sol")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    fd = fields[local["field_index"][key]]
+    fd = fields[_resolve_field_slot(local, node)]
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
@@ -905,8 +977,7 @@ def _field_hess(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("shape_hess")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    return fields[local["field_index"][key]].get("shape_hess")
+    return fields[_resolve_field_slot(local, node)].get("shape_hess")
 
 
 def _field_space(local, node):
@@ -919,8 +990,7 @@ def _field_space(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("space", "Lagrange")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    return fields[local["field_index"][key]].get("space", "Lagrange")
+    return fields[_resolve_field_slot(local, node)].get("space", "Lagrange")
 
 
 def _eval_frozen_coefficient(domain, model, local):

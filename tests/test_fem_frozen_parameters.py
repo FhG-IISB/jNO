@@ -193,3 +193,107 @@ def test_frozen_jax_initializer_raises():
     k = jno.np.parameter(phi, name="k").initialize(jax.nn.initializers.constant(0.8)).freeze()
     with pytest.raises(ValueError, match="JAX initializer|scalar|coordinate function"):
         jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+
+
+# =================================================================================================
+# A frozen field as a coefficient in an AUXILIARY form (jno.precond.form) — a foreign field's space
+# =================================================================================================
+
+
+def _laplace(order, names, size=0.25):
+    """``-Δu = 1``, ``u = 0`` on the boundary, at a chosen element order."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    u, phi = d.fem_symbols(order=order, names=names)
+    si, sb = d.variable("interior", split=True), d.variable("boundary", split=True)
+    xi, yi, xb, yb = si[0], si[1], sb[0], sb[1]
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    return d, u, phi, (xi, yi, xb, yb), fem
+
+
+def test_frozen_field_from_another_form_as_an_auxiliary_coefficient():
+    """A ``jno.precond.form`` over ONE field, carrying ANOTHER field's solved values as data.
+
+    This is the shape every physics-based Schur approximation needs (PCD's ``F_p`` carries the
+    velocity; a lagged eddy viscosity carries the previous velocity; a wall-distance field is reused
+    across forms). The auxiliary form never declares the foreign field as an unknown, so its
+    ``field_key`` is absent from that form's registry -- which used to surface as a bare
+    ``KeyError: <n>`` naming an index the user never chose.
+
+    Resolved by SPACE instead: a field of the same space and order has the same nodes and
+    connectivity on this mesh, so the gather is exact rather than an approximation.
+    """
+    d, w, _chi, (xi, yi, xb, yb), wfem = _laplace(1, ("w", "chi"))
+    w_val = np.asarray(wfem.solve()).reshape(-1)
+    assert w_val.max() > 0.0
+
+    p, q = d.fem_symbols(order=1, names=("p", "q"))
+    pi, qi = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    main = jno.fem([pi.x * qi.x + pi.y * qi.y - 1.0 * qi, p(xb, yb) - 0.0])
+    ref = np.asarray(main.solve(linear=jno.solve.lu())).reshape(-1)
+
+    w_frozen = w.bind(x=xi, y=yi).freeze(w_val)  # the FOREIGN field, as known data
+    aux = jno.precond.form([(1.0 + w_frozen) * (pi.x * qi.x + pi.y * qi.y), p(xb, yb) - 0.0])
+
+    got = np.asarray(main.solve(linear=jno.solve.fgmres(), precond=aux)).reshape(-1)
+    rel = float(np.linalg.norm(got - ref) / np.linalg.norm(ref))
+    assert rel < 1e-8, f"a preconditioner may not change the answer; drifted by {rel:.2e}"
+
+
+def test_a_frozen_field_on_a_space_the_form_lacks_is_refused_by_name():
+    """The case that CANNOT be resolved by borrowing: P2 values have edge nodes a P1 gather never
+    indexes, so reading them through a P1 slot would return a plausible, wrong operator. It must
+    raise -- and say which spaces are involved and what to do."""
+    d, v2, _ph2, (xi, yi, xb, yb), v2fem = _laplace(2, ("v2", "ph2"))
+    v2_val = np.asarray(v2fem.solve()).reshape(-1)
+
+    p, q = d.fem_symbols(order=1, names=("p", "q"))
+    pi, qi = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    main = jno.fem([pi.x * qi.x + pi.y * qi.y - 1.0 * qi, p(xb, yb) - 0.0])
+    v2_frozen = v2.bind(x=xi, y=yi).freeze(v2_val)
+
+    with pytest.raises(NotImplementedError, match=r"order-2"):
+        aux = jno.precond.form([(1.0 + v2_frozen) * (pi.x * qi.x + pi.y * qi.y), p(xb, yb) - 0.0])
+        main.solve(linear=jno.solve.fgmres(), precond=aux)
+
+
+# =================================================================================================
+# A multi-component BARE parameter is refused, not silently truncated
+# =================================================================================================
+
+
+def test_multicomponent_bare_parameter_is_refused_by_name():
+    """A bare (non-field) parameter reaches the kernel as ONE scalar (``flat[:1]``), so a
+    multi-component one had every entry past the first silently discarded.
+
+    Measured before the guard: ``parameter((2,))`` initialised to ``[2.0, 999.0]`` and to
+    ``[2.0, 0.001]`` assembled **bit-identical** operators. Indexing it -- ``k[1] * ui.y * vi.y``,
+    the natural spelling for an anisotropic coefficient -- instead died inside the trace layer on a
+    bare ``IndexError: array is 0-dimensional``, naming nothing the user wrote. Both are now one
+    build-time refusal that names the parameter, its size, and the spelling that works.
+    """
+    d, u, phi, xi, yi, xb, yb, ui, vi = _setup()
+    k = jno.np.parameter((2,), name="k")
+    k.initialize(lambda key, s, dtype=jnp.float64: jnp.asarray([2.0, 999.0], dtype).reshape(s))
+    with pytest.raises(NotImplementedError, match=r"2 components"):
+        jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+
+    # the indexed spelling is the same refusal, not an IndexError from three layers down
+    k2 = jno.np.parameter((2,), name="k2")
+    k2.initialize(lambda key, s, dtype=jnp.float64: jnp.full(s, 1.0, dtype))
+    with pytest.raises(NotImplementedError, match=r"2 components"):
+        jno.fem([k2[0] * ui.x * vi.x + k2[1] * ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+
+
+def test_the_guard_does_not_fire_on_scalar_or_field_parameters():
+    """No false refusals: a scalar parameter is size 1, and a nodal FIELD parameter is many-valued
+    by construction with its own per-cell gather. Both must still assemble."""
+    d, u, phi, xi, yi, xb, yb, ui, vi = _setup()
+
+    s = jno.np.parameter((1,), name="s").initialize(lambda key, sh, dtype=jnp.float64: jnp.full(sh, 2.0, dtype))
+    fem_s = jno.fem([s * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+    assert isinstance(fem_s._op, FemLinearSystem) and fem_s._op.is_parametric
+
+    fld = jno.np.parameter(phi, name="fld").initialize(lambda key, sh, dtype=jnp.float64: jnp.full(sh, 2.0, dtype))
+    fem_f = jno.fem([fld * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+    assert isinstance(fem_f._op, FemLinearSystem) and fem_f._op.is_parametric

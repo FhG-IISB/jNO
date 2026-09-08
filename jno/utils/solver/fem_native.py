@@ -811,6 +811,73 @@ class _CellFieldData(dict):
             return default
 
 
+def _frozen_field_basis_index(node, fields, field_index):
+    """Which of this form's fields supplies the basis a frozen field is gathered on.
+
+    Normally the frozen field IS one of this form's unknowns and its ``field_key`` resolves directly.
+    It need not be: a frozen field is *known data*, and the natural way to write an auxiliary operator
+    -- ``jno.precond.form`` for a Schur approximation, a lagged coefficient -- is a form over ONE
+    field that carries another field's solved values as a coefficient. That form never declares the
+    foreign field as an unknown, so its key is absent and the lookup used to die on a bare
+    ``KeyError: <n>`` naming an index the user never chose.
+
+    A frozen field carries its own ``space``/``order``/``value_shape``, so the basis is resolvable
+    without the key: any field here with the SAME space and order has the same nodes, the same
+    connectivity and the same shape functions on this mesh, so gathering the foreign values on it is
+    exact, not an approximation. That is the same borrowing ``freeze_path`` already does below, with
+    "a P1 Lagrange field" generalised to "a field of the matching space".
+
+    A foreign field whose space is NOT present is refused by name: gathering P2 values on P1
+    connectivity would silently read the wrong entries (a P2 field has edge nodes a P1 gather never
+    indexes), and it is exactly the plausible-but-wrong answer this stack does not return.
+    """
+    key = getattr(node, "field_key", None)
+    if key in field_index:
+        return field_index[key]
+
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    want_order = int(getattr(node, "order", 1))
+    for i, f in enumerate(fields):
+        if int(f["order"]) == want_order and (str(f.get("space", "Lagrange")) or "Lagrange") == want_space:
+            return i
+
+    have = ", ".join(sorted({f"{f.get('space', 'Lagrange') or 'Lagrange'} order {int(f['order'])}" for f in fields}))
+    raise NotImplementedError(
+        f"jno.fem: this form carries a frozen field ({node.name}) on a {want_space} order-{want_order} "
+        f"space, but no field in the form uses that space (it has: {have}). A frozen field is gathered "
+        "on its own space's connectivity, and gathering it on a different one would read the wrong "
+        "nodes -- a P2 field has edge nodes a P1 gather never gets to. This is the usual shape of an "
+        "auxiliary operator (jno.precond.form) whose coefficient comes from a different space than its "
+        "unknown -- a P2 velocity in a P1 pressure form, say. Project the field onto the form's own "
+        "space first and freeze that, or write the auxiliary form over a field of the matching space."
+    )
+
+
+def _declared_parameter_size(expr):
+    """Number of components a runtime parameter was declared with, or ``None`` if unreadable.
+
+    ``None`` means "cannot tell", and every caller must then leave behaviour unchanged -- guessing
+    would turn a working form into a false refusal. Read from the parameter module's own leaves, which
+    is where ``jno.np.parameter(shape)`` records what the user asked for.
+    """
+    model = getattr(expr, "model", None)
+    module = getattr(model, "module", None)
+    if module is None:
+        return None
+    try:
+        import jax as _jax
+
+        leaves = [lf for lf in _jax.tree_util.tree_leaves(module) if hasattr(lf, "shape")]
+    except Exception:
+        return None
+    if len(leaves) != 1:
+        return None  # not the single-array parameter this guard is about
+    try:
+        return int(np.prod(leaves[0].shape))
+    except Exception:
+        return None
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1108,6 +1175,31 @@ def assemble_fem_native(
     from .parametric_helpers import _fem_field_kind
 
     _cell_field_names: set = {n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"}
+
+    # A BARE (non-field) runtime parameter is packed as a single scalar -- ``flat[:1]`` in
+    # ``_runtime_vals`` below -- and read back as one. A multi-component one therefore had every entry
+    # past the first SILENTLY DISCARDED: `parameter((2,))` initialised to [2.0, 999.0] and to
+    # [2.0, 0.001] assembled bit-identical operators. Indexing it (`k[1] * ...`, the natural spelling
+    # for an anisotropic coefficient) instead died deep in the trace layer on a bare
+    # ``IndexError: array is 0-dimensional``, naming nothing the user wrote.
+    #
+    # Refuse it here, where the declared shape is still visible. Only when the size is *known* to
+    # exceed one: a shape this cannot read stays on the existing path rather than becoming a false
+    # refusal. Field (nodal) and cell (P0) parameters are exempt -- they are many-valued by
+    # construction and have their own gather.
+    for _pname in runtime_parameter_tags:
+        if _pname in _field_param_names or _pname in _cell_field_names:
+            continue
+        _psize = _declared_parameter_size(_rt_param_exprs.get(_pname))
+        if _psize is not None and _psize > 1:
+            raise NotImplementedError(
+                f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components, but a "
+                "bare (non-field) parameter reaches the element kernel as a single scalar -- the "
+                "remaining components would be silently dropped, and indexing it (k[1]) fails inside the "
+                "trace layer. Use one scalar parameter per component (`kx = jno.np.parameter((1,)); ky = "
+                "jno.np.parameter((1,))`, then `kx * ui.x * vi.x + ky * ui.y * vi.y`), or a FIELD "
+                "parameter `jno.np.parameter(<P1 symbol>)` for one value per node."
+            )
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
     # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is
@@ -1885,33 +1977,15 @@ def assemble_fem_native(
     # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
     _frozen_gathered: Dict[Any, Any] = {}
     for _fid, _fnode in _frozen_nodes.items():
-        _fkey = _fnode.field_key
-        if _fkey not in field_index:
-            # A frozen field whose SOURCE is not one of THIS form's unknowns: a KNOWN COEFFICIENT FIELD.
-            # That is the lagged velocity of a PCD auxiliary, a wall distance, an eddy viscosity -- data
-            # computed elsewhere and read here as a coefficient. It has no assembled basis of its own, so
-            # it borrows the nodal basis and connectivity of a live field with the same element, exactly
-            # as a load-path field does below. Without this the kernel raised a bare `KeyError` on the
-            # field id, which says nothing about the cause.
-            _want_order = int(getattr(_fnode, "order", 1) or 1)
-            _want_space = str(getattr(_fnode, "space", "Lagrange") or "Lagrange")
-            _alias = next(
-                (
-                    i
-                    for i, f in enumerate(fields)
-                    if int(f["order"]) == _want_order and str(f.get("space", "Lagrange")) == _want_space
-                ),
-                None,
-            )
-            if _alias is None:
-                raise NotImplementedError(
-                    f"jno.fem: a frozen coefficient field of order {_want_order} ({_want_space}) is not one "
-                    "of this form's unknowns, so it must borrow the nodal basis of a live field with the "
-                    "same element -- and this form has none. Give one of the unknowns that element, or "
-                    "resample the known field onto a space the form already uses."
-                )
-            field_index[_fkey] = _alias  # alias: same nodes, same shape functions, no DOFs of its own
-        _ffidx = field_index[_fkey]
+        _ffidx = _frozen_field_basis_index(_fnode, fields, field_index)
+        # A frozen field whose SOURCE is not one of THIS form's unknowns is a KNOWN COEFFICIENT FIELD --
+        # the lagged velocity of a PCD auxiliary, a wall distance, an eddy viscosity. It has no assembled
+        # basis of its own, so the helper resolved it to a live field with the same space. Register that
+        # alias under its own key as well, exactly as a load-path field does below: the kernel resolves a
+        # foreign field by space too, but its plain ``field_index`` lookups would otherwise miss the key.
+        _fkey = getattr(_fnode, "field_key", None)
+        if _fkey is not None and _fkey not in field_index:
+            field_index[_fkey] = _ffidx  # alias: same nodes, same shape functions, no DOFs of its own
         _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
         _fvals = jnp.asarray(_fnode.values)
         # scalar frozen field (n_nodes,) -> per-cell (n_local, 1); VECTOR (n_nodes, vec) -> (n_local, vec).
