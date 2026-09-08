@@ -360,7 +360,7 @@ def _chord_test_setup(geoms, union, r, z):
     return sdf, 2.0 * cell
 
 
-def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 0, occluders=None):
+def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, occluders=None):
     r"""Point-to-point visibility **per azimuth** for the true 3-D ray between axisymmetric rings.
 
     ``P`` is an ``(M, 2)`` array of ``(r, z)`` points -- pass the kernel's own quadrature points
@@ -394,8 +394,6 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 
 
     Visibility is EVEN in ``phi`` (the chord depends on the azimuth only through ``cos phi`` and, in
     ``rho``, ``sin^2 phi``), so only the half-grid is computed and the rest mirrored.
-
-    ``n_seg`` is accepted and ignored; it is a vestige of the fixed-stride implementation.
 
     ``occluders`` is the OPAQUE-SOLID model the chords are traced against:
 
@@ -796,7 +794,6 @@ def _refine_near_pairs(
     n_gl_phi=6,
     k_azim=3.0,
     k_merid=3.0,
-    n_seg=256,
     chunk=96,
     log=None,
     occluders=None,

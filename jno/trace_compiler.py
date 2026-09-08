@@ -46,7 +46,6 @@ from .trace import (
     Placeholder,
     TunableModule,
     TunableModuleCall,
-    Variable,
     collect_tags,
 )
 
@@ -409,64 +408,6 @@ class TraceCompiler:
 
         visit(expr)
         return layers
-
-    # ------------------------------------------------------------------
-    # Shape inference (legacy — kept for offline tools)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _infer_arg_shapes(call_args: List, tensor_dims: Dict[str, tuple], existing_params: Dict) -> List[tuple]:
-        """Infer the *normalised* argument shapes for a ModelCall."""
-        TraceEvaluator = _get_evaluator_class()
-        abstract_ctx = {
-            tag: jax.ShapeDtypeStruct(tuple(shape), _default_float_dtype()) for tag, shape in tensor_dims.items()
-        }
-
-        def eval_and_normalize(context):
-            evaluator = TraceEvaluator(existing_params)
-            ctx = evaluator._EvalCtx(context, {}, jax.random.PRNGKey(0))
-
-            arg_values = []
-            arg_sources = []
-            for arg in call_args:
-                val = evaluator._dispatch(arg, ctx)
-                arg_values.append(val)
-                is_spatial = isinstance(arg, Variable) and arg.tag in context
-                arg_sources.append(is_spatial)
-
-            N = 1
-            for val, is_spatial in zip(arg_values, arg_sources):
-                if is_spatial:
-                    val = jnp.asarray(val)
-                    if val.ndim >= 1:
-                        N = max(N, val.shape[0])
-
-            def normalize_arg(val, is_spatial):
-                val = jnp.asarray(val)
-                if is_spatial:
-                    if val.ndim == 0:
-                        return jnp.full((N, 1), val)
-                    elif val.ndim == 1:
-                        return val[:, jnp.newaxis]
-                    else:
-                        return val
-                else:
-                    if val.ndim == 0:
-                        return val[jnp.newaxis]
-                    else:
-                        return val
-
-            normalized = tuple(normalize_arg(v, s) for v, s in zip(arg_values, arg_sources))
-
-            # Keep shape inference consistent with TraceEvaluator._eval_flax_module_call.
-            _model = None
-            # In this function you only have call_args, not the model object.
-            # So either pass model into _infer_arg_shapes later, or leave this alone
-            # if this function is no longer used for Equinox-foundax initialization.
-            return normalized
-
-        abstract_results = jax.eval_shape(eval_and_normalize, abstract_ctx)
-        return [r.shape for r in abstract_results]
 
     # ------------------------------------------------------------------
     # Weight utilities
