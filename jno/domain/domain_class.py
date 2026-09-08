@@ -518,6 +518,18 @@ class domain(MeshIOMixin):
         keep_orphan_nodes: bool = False,
         **_ignored_kwargs,
     ):
+        if "mesh_size" in _ignored_kwargs:
+            raise ValueError(
+                "jno.domain(<Shape or callable>, mesh_size=...) does not read `mesh_size`. It is only "
+                "honoured on the POLYGON path -- `domain.__new__` routes there for a constructor that "
+                "is not callable, and a `jno.Shape` defines `__call__`, so a Shape goes to the generic "
+                "domain instead and the size lands in **_ignored_kwargs. Measured on a unit box: "
+                "mesh_size=0.5, 0.3, 0.18 and 0.1 ALL returned the same 340-node mesh, with nothing "
+                "reported -- a refinement study that never refined. Put the size on the shape, which is "
+                "where it belongs: `jno.Shape.box(0, 0, 0, 1, 1, 1).sized(h).domain()`, or "
+                "`jno.Shape.rect(0, 0, 1, 1, size=h).domain()`. Passing raw polygon points instead of a "
+                "Shape keeps `mesh_size=` working, because that is the path it was written for."
+            )
         if "structured" in _ignored_kwargs:
             raise ValueError(
                 "jno.domain(..., structured=True) was replaced by Shape.structured() and is no longer "
@@ -1085,8 +1097,12 @@ class domain(MeshIOMixin):
 
         return max(1, declared, inferred)
 
-    def _sampling_groups_for_tag(self, tag: str) -> List[Tuple[int, Any, Optional[np.ndarray]]]:
-        """Return per-batch sampling sources for a tag as ``(count, points, normals)``."""
+    def _sampling_groups_for_tag(self, tag: str, for_normals: bool = False) -> List[Tuple[int, Any, Optional[np.ndarray]]]:
+        """Return per-batch sampling sources for a tag as ``(count, points, normals)``.
+
+        ``for_normals`` says the caller will index the points and the normals with the SAME indices,
+        so the two must describe the same set. Left false, the point pool is returned whole.
+        """
         point_groups = self._mesh_pool_groups.get(tag)
         normal_groups = self._normal_pool_groups.get(tag)
 
@@ -1101,6 +1117,29 @@ class domain(MeshIOMixin):
 
         points = self._mesh_pool[tag]
         normals = self.normals_by_tag.get(tag)
+        if for_normals and normals is not None:
+            # A tag's point pool is interior + boundary (see `_populate_mesh_pool_for_tag`) while its
+            # normals are one per BOUNDARY point -- different sets, and the sampler draws indices from
+            # the first to index the second. On a two-body mesh that was a pool of 89 against 16
+            # normals, and `sample` raised IndexError.
+            #
+            # BOTH readings are legitimate: the same tag may be a volume region for one term and a
+            # surface for its normals. So the pool is NOT narrowed in general -- only for a caller that
+            # has said it will index the two together, which is the one place they must agree.
+            #
+            # A PSEUDO-TIME / transient pool is `(T, N, D)` and the normals stay `(N_boundary, D)`: the
+            # sampler indexes the spatial axis of one with indices drawn from the other, so the two must
+            # agree on that axis alone. Skipping the 3-D case (which this did) let the same IndexError
+            # straight back in on any `domain(tau=...)` form -- found on a forming march, where a
+            # region-scoped surface tag met a load path.
+            reg = (getattr(self, "_boundary_regions", {}) or {}).get(tag)
+            rp = None if reg is None else getattr(reg, "points", None)
+            if rp is not None:
+                _p = np.asarray(points)
+                _rp = np.asarray(rp)
+                _axis = 1 if _p.ndim >= 3 else 0  # the SPATIAL axis, whichever layout the pool is in
+                if len(np.asarray(normals)) != _p.shape[_axis]:
+                    points = np.broadcast_to(_rp, (_p.shape[0],) + _rp.shape) if _p.ndim >= 3 else _rp
         count = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1))) if self.same_domain else 1
         return [(max(1, count), points, normals)]
 
@@ -1140,7 +1179,7 @@ class domain(MeshIOMixin):
 
         if tag not in self._mesh_pool:
             return None, None
-        groups = self._sampling_groups_for_tag(tag)
+        groups = self._sampling_groups_for_tag(tag, for_normals=True)
         all_pts, all_nrm = [], []
         has_normals = False
         for _, grp_pts, grp_nrm in groups:
@@ -1180,11 +1219,19 @@ class domain(MeshIOMixin):
             for tag in other._mesh_pool.keys()
         }
         self_normal_groups = {
-            tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag) if normals is not None]
+            tag: [
+                (count, normals)
+                for count, _, normals in self._sampling_groups_for_tag(tag, for_normals=True)
+                if normals is not None
+            ]
             for tag in self._mesh_pool.keys()
         }
         other_normal_groups = {
-            tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag) if normals is not None]
+            tag: [
+                (count, normals)
+                for count, _, normals in other._sampling_groups_for_tag(tag, for_normals=True)
+                if normals is not None
+            ]
             for tag in other._mesh_pool.keys()
         }
 
@@ -2437,6 +2484,39 @@ class domain(MeshIOMixin):
         coords = self.variable("interior", split=True)
         return value(*coords[: self.dimension])
 
+    def _facets_owned_by(self, ents: np.ndarray, region: str, dim: int) -> np.ndarray:
+        """Which facets have ALL their vertices among ``region``'s own cells' nodes?
+
+        Ownership is decided from CELL TOPOLOGY -- the same ``_cell_region_mask`` the assembler uses to
+        decide which cells a region's terms integrate over -- so a tag's facets cannot disagree with
+        the region its equations were written on. ``ents`` carries coordinates rather than node ids, so
+        the membership test is a rounded coordinate key at 1e-9 of the mesh extent.
+        """
+        mesh = getattr(self, "mesh", None)
+        if mesh is None:
+            return np.ones(len(ents), dtype=bool)  # no mesh yet: nothing to own anything by
+        from ..utils.solver.fem_utils import _cell_region_mask
+        from .mesh_utils import p1_cells_dict
+
+        cd = p1_cells_dict(mesh) if getattr(mesh, "cells_dict", None) else {}
+        vol = next((cd[k] for k in ("tetra", "hexahedron", "triangle", "quad", "line") if k in cd), None)
+        if vol is None:
+            return np.ones(len(ents), dtype=bool)
+        vol = np.asarray(vol)
+        m = np.asarray(_cell_region_mask(self, region)).reshape(-1)
+        if m.shape[0] != vol.shape[0]:
+            return np.ones(len(ents), dtype=bool)  # a tag, not a mesh region: nothing to restrict by
+        pts = np.asarray(mesh.points)
+        scale = max(float(np.max(pts[:, :dim].max(axis=0) - pts[:, :dim].min(axis=0))), 1.0)
+        q = 1.0e-9 * scale
+
+        def key(a):
+            return np.round(np.asarray(a)[..., :dim] / q).astype(np.int64)
+
+        own = {tuple(r) for r in key(pts[np.unique(vol[m > 0])]).reshape(-1, dim)}
+        ek = key(ents)
+        return np.array([all(tuple(v) in own for v in f) for f in ek], dtype=bool)
+
     def _register_tag_boundary_region(self, name, where, region=None):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
         so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
@@ -2472,19 +2552,46 @@ class domain(MeshIOMixin):
             if _bn is not None and len(np.asarray(_bn)) == len(_bp):
                 self.normals_by_tag[name] = np.asarray(_bn).reshape(len(_bp), -1)[_keep]
             return
-        blocks = [full.facets]
+        # Each block is carried with the region that OWNS it, where that is known. An interface block
+        # is named `"a|b.a"` by `geometry.emit`, so its owner is written on the tag -- and that is the
+        # only thing that can separate the two sides, because their facets are COINCIDENT. Deciding
+        # them by coordinate silently gave each side both: on two touching squares meshed at the same
+        # size, `sA` came back with 20 facets where the body has 16, having absorbed B's 4 seam facets.
+        blocks, owners = [full.facets], [None]
         if region is not None:
-            blocks += [r.facets for t, r in self._boundary_regions.items() if "|" in t and r.facets is not None]
-        blocks = [np.asarray(b) for b in blocks if b is not None and len(b)]
+            for _t, _r in self._boundary_regions.items():
+                if "|" in _t and _r.facets is not None:
+                    blocks.append(_r.facets)
+                    owners.append(_t.rsplit(".", 1)[-1] if "." in _t else None)
+        _bo = [(np.asarray(b), o) for b, o in zip(blocks, owners) if b is not None and len(b)]
+        blocks, owners = [b for b, _ in _bo], [o for _, o in _bo]
         # Every block must be the same kind of facet to stack: they are, on the single-cell-type mesh
         # jNO assembles on, but drop any that is not rather than raising out of numpy.
-        blocks = [b for b in blocks if b.shape[1:] == blocks[0].shape[1:]] if blocks else blocks
+        if blocks:
+            _ok = [i for i, b in enumerate(blocks) if b.shape[1:] == blocks[0].shape[1:]]
+            blocks, owners = [blocks[i] for i in _ok], [owners[i] for i in _ok]
         ents = np.concatenate(blocks, axis=0) if blocks else None
         if ents is None or len(ents) == 0:
             return
         ents = np.asarray(ents)  # (E, k, dim)
         mid = ents.mean(axis=1)  # facet centroids (E, dim)
         keep = np.asarray(where(*[mid[:, i] for i in range(dim)])).reshape(-1).astype(bool)
+        if region is not None:
+            # `region=` names which BODY owns the face, and it has to bite here, not only later. The
+            # predicate alone cannot separate two bodies that interleave or coincide -- on two disjoint
+            # squares a predicate true everywhere gave `sA` and `sB` the SAME 40 facets, the whole
+            # boundary, of which only 16 and 24 respectively were their own. A tag naming one body's
+            # surface is what `u.gap` needs to say which side of a contact it means.
+            own = np.zeros(len(ents), dtype=bool)
+            _i = 0
+            for _b, _o in zip(blocks, owners):
+                _n = len(_b)
+                # A named block (an interface side) is decided by its NAME, which is exact even where
+                # the two sides' facets coincide. The exterior boundary carries no owner, so it falls
+                # back to cell topology -- safe there, since two bodies' exterior faces cannot coincide.
+                own[_i : _i + _n] = (_o == region) if _o is not None else self._facets_owned_by(_b, region, dim)
+                _i += _n
+            keep &= own
         if not keep.any():
             return
         sub = ents[keep]
@@ -3392,6 +3499,7 @@ class domain(MeshIOMixin):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
@@ -3409,6 +3517,7 @@ class domain(MeshIOMixin):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
@@ -3867,6 +3976,7 @@ class domain(MeshIOMixin):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
@@ -3904,6 +4014,25 @@ class domain(MeshIOMixin):
             resampling_strategy: Optional ResamplingStrategy for adaptive point selection
             normals: If True, also compute and return normal vectors for this tag
             reverse_normals: If True, flip the sign of the normal vectors
+            follow_normals: If True, the normal is the **deformed** surface's normal, recomputed from
+                ``x = X + u`` each time the residual is evaluated, instead of the reference surface's.
+                That is the difference between a **dead** load and a **follower** load: gravity still
+                points down after a body tips over (reference), while pressure stays perpendicular to
+                the skin however the skin moves (deformed). Contact belongs with pressure — the contact
+                force is normal to the surfaces that are actually touching.
+
+                **Use it with finite-strain kinematics, not with** ``sym(grad u)``. The reference and
+                deformed normals differ by ``O(theta)`` for a surface rotation ``theta``, and that is
+                exactly the regime where the small-strain measure also fails: ``sym(grad u)`` is not
+                rotation invariant, so a pure rotation manufactures ``cos(theta) - 1`` of strain out of
+                nothing. Measured on a sheet-forming march at 38 degrees, ``||sym(grad u)|| = 0.300``
+                against a Green-Lagrange strain of ``1.9e-17``. Following the normal there buys a better
+                force *direction* applied to a materially wrong *stress*, which is worse than either
+                mistake alone because it looks more correct. Write ``F = I + grad u``,
+                ``E = (F^T F - I)/2`` and a PK stress, and then follow the normal.
+
+                It makes the form **nonlinear**: the traction direction now depends on the solution, so
+                a form that assembles as ``linear`` without it needs a Newton solve with it.
             return_indices: Wether or not to return the indices of the sampled points
 
         Returns:
@@ -4120,6 +4249,10 @@ class domain(MeshIOMixin):
                 )
             if reverse_normals:
                 self.context[f"n_{tag}"] = -self.context[f"n_{tag}"]
+            if follow_normals:
+                # Recorded on the DOMAIN, not on the returned symbol: the assembler binds `n_{region}`
+                # per boundary facet when it walks the surface terms, so this is where it has to look.
+                self.__dict__.setdefault("_follow_normals", set()).add(tag)
             # ``split`` controls the *shape* of the normal (mirroring the tensor-tag path): ``split=True``
             # appends the normal's scalar components to the flat ``(x, y, [z], t, nx, ny, [nz])`` tuple;
             # ``split=False`` (the default) returns the boundary normal as a **single vector** so it drops
@@ -4981,7 +5114,7 @@ class domain(MeshIOMixin):
                 available = list(self._mesh_pool.keys())
                 self.log.error(f"Tag '{tag}' not found. Available: {available}")
 
-            sampling_groups = self._sampling_groups_for_tag(source_tag)
+            sampling_groups = self._sampling_groups_for_tag(source_tag, for_normals=bool(normals))
             normals_available = normals and any(group_normals is not None for _, _, group_normals in sampling_groups)
 
             available_points = sampling_groups[0][1]

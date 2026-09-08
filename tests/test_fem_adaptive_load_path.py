@@ -345,3 +345,38 @@ def test_the_pilot_scores_the_min_map_on_a_bounded_march():
     assert abs(sched[-1] - 1.0) < 1e-9, "the pilot never reached the end of the path"
     assert traj.max() <= 1.0 + 1e-9, "the upper bound must hold"
     assert traj.max() > 1.0 - 1e-6, "the bound must actually be ACTIVE, or this tests nothing"
+
+
+def test_the_form_is_staged_once_across_the_adaptive_pilot():
+    """The adaptive pilot marches EAGERLY with rejection, so like every other host-side stepper it can
+    re-stage the form per step. It does not — this pins that, because two siblings did: `continuation`
+    before its step was jitted, and the contact march (22-26 XLA compilations per round, each retained,
+    pinning that round's tables). The cost is invisible in the answer and shows up only as time and
+    memory, which is why it wants a test rather than a benchmark.
+
+    Compares two grid sizes rather than a magic number, so it survives changes to how many times the
+    Newton body stages internally.
+    """
+    counts = []
+    for nstep in (6, 14):
+        fem = _burst_march(nstep)
+        op = fem._op
+        real = op.residual
+        tr = {"n": 0}
+
+        def counting(u, *a, _r=real, _t=tr, **kw):
+            if isinstance(u, jax.core.Tracer):
+                _t["n"] += 1
+            return _r(u, *a, **kw)
+
+        op.residual = counting
+        try:
+            fem.solve(tau=jno.solve.adaptive(limit=0.35))
+        finally:
+            op.residual = real
+        counts.append(tr["n"])
+
+    assert counts[0] > 0, "the residual was never staged — the counter is not wired to the solve"
+    assert counts[1] <= counts[0], (
+        f"staging scales with the pilot: {counts[0]} traces for 6 grid points, {counts[1]} for 14"
+    )

@@ -179,8 +179,8 @@ def test_each_region_is_meshed_at_its_own_resolution():
     assert hi > 2 * lo, f"a 3x size ratio must give genuinely different node counts, got {lo} vs {hi}"
 
 
-def _poisson_2d(d):
-    u, v = d.fem_symbols()
+def _poisson_2d(d, order=1):
+    u, v = d.fem_symbols(order=order)
     s, m = _interface_tags(d)
     c = d.variable("interior", split=True)
     b = d.variable("boundary", split=True)
@@ -209,6 +209,56 @@ def test_a_graded_interface_uses_the_mortar_coupling():
     finally:
         fu.build_periodic_prolongation = orig
     assert abs(graded - same) / same < 0.05, f"graded {graded:.6f} vs uniform {same:.6f}"
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        2,
+        pytest.param(
+            3,
+            marks=pytest.mark.xfail(
+                raises=ValueError,
+                strict=True,
+                reason="A cubic edge carries 4 nodes and `_facet_dual_coeffs` derives the biorthogonal "
+                "dual basis for 2 (P1) and 3 (P2) only -- a separate gap, and it says so rather than "
+                "quietly using the wrong basis. Kept as a parameter so it stays visible.",
+            ),
+        ),
+    ],
+)
+def test_the_mortar_ties_a_graded_interface_above_order_one(order):
+    """A mortar between independently meshed bodies was unreachable above P1.
+
+    A facet belongs to a tag by its **vertices**. The tie resolved one through ``tag_indices``, a P1
+    node list, then asked whether ALL of a facet's nodes were in it -- so at P2 every facet was
+    rejected on its absent midside node, ``facets[tag]`` came out empty, and the tie died with "no
+    main facet connectivity was supplied for interpolation". Taylor-Hood over two independently meshed
+    bodies needs exactly this, so it was the standing blocker on two-body flow.
+
+    Order 3 is carried as an xfail: it has TWO nodes per edge, so it would catch a fix that merely
+    allowed one extra node per facet -- but it stops earlier, on a dual basis that exists for P1 and
+    P2 edges only. Selecting the facet and integrating over it are different gaps; this pins the
+    first and names the second."""
+    import jno.utils.solver.fem_utils as fu
+
+    seen = {}
+    orig = fu.build_periodic_prolongation
+    fu.build_periodic_prolongation = lambda *a, **k: (lambda r: (seen.__setitem__("coupling", r["coupling"]), r)[1])(
+        orig(*a, **k)
+    )
+    try:
+        got = _poisson_2d(_stack(0.25, 0.08), order=order)
+    finally:
+        fu.build_periodic_prolongation = orig
+    assert seen["coupling"] == "mortar", "a graded interface must reach the integrated coupling"
+    ref = _poisson_2d(_stack(0.25, 0.25), order=1)
+    assert abs(got - ref) / ref < 0.05, f"order-{order} mortar {got:.6f} vs conforming {ref:.6f}"
+
+
+def _lap2(u, phi, r):
+    a, b = u.bind(x=r[0], y=r[1]), phi.bind(x=r[0], y=r[1])
+    return a.x * b.x + a.y * b.y
 
 
 def _graded_stack():
@@ -240,6 +290,58 @@ def test_tag_region_separates_two_coincident_faces():
     b = _face_nodes(d, pts[:, :2], bn, "base_face")
     assert len(set(f.tolist()) & set(b.tolist())) == 0, "the two sides must not share nodes"
     assert len(f) != len(b), "a graded interface should give the two sides different node counts"
+
+
+def test_a_region_scoped_tag_resolves_in_the_ASSEMBLY_numbering():
+    """The same tag, but resolved the way the TIE resolves it -- against the assembly mesh.
+
+    The test above hands `_face_nodes` the P1 mesh, where node ids happen to agree with the ones
+    `tag_indices` is keyed on. The tie does not: it passes the ASSEMBLY mesh, which at order 2 has its
+    own numbering and roughly twice the nodes. Ownership was applied by intersecting with
+    ``tag_indices[region]`` -- an EXCLUSIVE partition of the *P1* mesh -- so P2 ids were intersected
+    against P1 ids and the survivors were whichever collided by accident.
+
+    Exclusivity is the second half of it: a node lying on both bodies is handed to one of them, so
+    intersecting drops it from the other side's tag and the facet using it fails the subset test. On
+    an annular tie split into arcs that punched a one-facet hole and the arc arrived as two chains.
+
+    Owning by cell topology fixes both: the numbering is the assembly's, and a shared node belongs to
+    every region whose cells contain it.
+    """
+    d = _graded_stack()
+    on = lambda x, y: np.abs(y - 1.0) < 1e-9  # noqa: E731
+    d.tag("film_face", on, region="film")
+    d.tag("base_face", on, region="base")
+
+    u, v = d.fem_symbols(order=2)
+    c = d.variable("interior", split=True)
+    jno.fem([_lap2(u, v, c)])  # force the order-2 assembly mesh into existence
+
+    from jno._fem import _boundary_facets, _face_nodes
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    pts = np.asarray(d._fem_native_dof_points_all[0])
+    cells = np.asarray(d._fem_native_assembly_cells_all[0])
+    assert len(pts) > len(np.asarray(d.built_mesh.points)), "order 2 must add nodes to resolve against"
+    bn = np.unique(_boundary_facets(pts, cells, 2, 2, "triangle"))
+
+    got = {}
+    for tag, region in (("film_face", "film"), ("base_face", "base")):
+        sel = np.asarray(_face_nodes(d, pts, bn, tag, cells), dtype=int).reshape(-1)
+        own = np.unique(cells[np.asarray(_cell_region_mask(d, region)).reshape(-1) > 0])
+        assert len(sel) > 0, f"{tag} resolved to nothing in the assembly numbering"
+        assert set(sel.tolist()) <= set(own.tolist()), f"{tag} reached outside {region}'s own cells"
+        got[tag] = sel
+
+    assert not (set(got["film_face"].tolist()) & set(got["base_face"].tolist())), "sides must stay apart"
+    # and neither side may be truncated. Compare each side against ITS OWN P1 count -- the seam holds
+    # two coincident node sets, so the combined count is not the bar. Order 2 adds a midpoint per edge,
+    # so a side with `n` P1 nodes must come back with about `2n - 1`.
+    p1pts = np.asarray(d.built_mesh.points)[:, :2]
+    bn1 = np.unique(np.asarray(d.built_mesh.cells_dict["line"]))
+    for tag, sel in got.items():
+        n1 = len(np.asarray(_face_nodes(d, p1pts, bn1, tag), dtype=int).reshape(-1))
+        assert len(sel) >= 2 * n1 - 1, f"{tag} kept {len(sel)} of the ~{2 * n1 - 1} nodes its P1 side implies"
 
 
 def test_tag_region_reaches_the_interface_at_all():
@@ -283,14 +385,18 @@ def test_a_coarse_secondary_is_reordered_rather_than_left_wrong():
             assert abs(got - ref) / ref < 1e-3, f"both orderings must agree: {got:.6f} vs {ref:.6f}"
 
 
-def test_p2_on_a_nonconforming_domain_is_refused():
-    """``_promote_to_degree`` deduplicates synthesised nodes by physical COORDINATE — the right
-    conformity test for one body, the wrong one for two. A ``conforming=False`` interface is coincident
-    *on purpose*, so every P2 node added there is merged across the bodies and welds them: measured on
-    a two-body bar, 37 nodes were referenced by cells of BOTH bodies, all at the interface. Benign for a
-    tie, wrong for contact (those DOFs can then never separate), and silent either way — so it is
-    refused until the promotion keys on topological entities instead. See
-    ``plans/p2-promotion-entity-keys.md``."""
+def test_p2_on_a_nonconforming_domain_keeps_the_bodies_apart():
+    """``_promote_to_degree`` used to deduplicate synthesised nodes by physical COORDINATE -- the right
+    conformity test for one body and the wrong one for two. A ``conforming=False`` interface is
+    coincident *on purpose*, so every P2 node added there was merged across the bodies and welded them:
+    measured on this two-body bar, **37 nodes were referenced by cells of BOTH bodies**, all at the
+    interface. Benign for a tie, wrong for contact (those DOFs could then never separate), and silent
+    either way -- so it was refused outright, which also put Taylor-Hood (P2 velocity / P1 pressure)
+    out of reach on independently meshed bodies.
+
+    The promotion now keys on the topological ENTITY (the P1 vertices its reference point's non-zero
+    weights span), which separates entities that merely coincide in space while still collapsing a
+    genuinely shared one from either neighbouring cell."""
 
     def build(conforming, order):
         d = _bar(conforming, 0.6)
@@ -298,12 +404,18 @@ def test_p2_on_a_nonconforming_domain_is_refused():
         c = d.variable("interior", split=True)
         b = d.variable("boundary", split=True)
         ui, vi = u.bind(x=c[0], y=c[1], z=c[2]), v.bind(x=c[0], y=c[1], z=c[2])
-        return jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(b[0], b[1], b[2]) - 0.0])
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(b[0], b[1], b[2]) - 0.0])
+        return d, fem
 
-    with pytest.raises(NotImplementedError, match="would silently WELD"):
-        build(False, 2)
-    assert build(True, 2) is not None  # a conforming interface shares its surface anyway — unaffected
-    assert build(False, 1) is not None  # P1 duplicates the interface nodes correctly
+    d, fem = build(False, 2)  # previously raised
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    cells = np.asarray(d._fem_native_assembly_cells_all[0])
+    na, nb = (np.unique(cells[np.asarray(_cell_region_mask(d, n)).reshape(-1) > 0]) for n in ("lower", "upper"))
+    assert len(np.intersect1d(na, nb)) == 0, "the two bodies must not share a node -- that is the weld"
+
+    assert build(True, 2)[1] is not None  # a conforming interface shares its surface anyway
+    assert build(False, 1)[1] is not None  # P1 duplicated the interface nodes correctly all along
 
 
 def test_conforming_is_a_reserved_region_name():

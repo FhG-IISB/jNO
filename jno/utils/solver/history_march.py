@@ -16,8 +16,9 @@ Scope (stated up front): real, steady native-Lagrange forms, **single-field or c
 solved to equilibrium at each τ with the previous state frozen (a fully implicit return map when the
 constitutive stress embeds it), then the state advances. Nothing here is per-field: ``n_dofs`` is the whole
 block vector and the buffers are indexed by cell, so a state written by one field and read by another (a
-phase-field history coupling damage to displacement) marches identically. Whole-domain state only (the
-readout runs on every cell; sub-region-restricted plasticity is not wired yet).
+phase-field history coupling damage to displacement) marches identically. A state advances on every cell
+unless its update names a region -- ``state.evolves(formula, region=...)`` masks the readout, freezing the
+state outside that region at the value it already has.
 """
 
 from typing import Any, Dict
@@ -28,7 +29,17 @@ import numpy as np
 from jax import lax
 
 
-def run_history_march(fem, solve_fn=None, path=None, **kwargs):
+def _roll_buffer(buf, nv):
+    """Push the just-computed state ``nv`` (n_cell, n_quad, *shape) into slot 0 — the next step's
+    ``.i(-1)`` — and drop the oldest slot, keeping the buffer exactly ``depth`` deep. Depth 1 simply
+    replaces; depth >= 2 (e.g. a BDF2 ``u.i(-2)``) shifts the tail back one.
+
+    Module level so the arc-length march (:mod:`jno.utils.solver.arclength`) advances state by exactly
+    the same operation as the fixed-grid one — a second copy is how the two would silently diverge."""
+    return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
+
+
+def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
     """March ``fem`` over its domain's pseudo-time grid and return the ``(n_steps, n_dofs)`` trajectory.
 
     ``solve_fn`` (if given) is a nonlinear solver ``(residual_fn, u0) -> u`` — e.g. the one composed from
@@ -37,6 +48,11 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     ``path`` (``fem.solve(tau=jno.solve.adaptive(limit=...))``) sizes the steps adaptively instead of
     taking the domain's uniform grid — see :func:`_pilot_schedule`. The output is resampled back
     onto the domain's grid either way, so the returned shape does not depend on the step sizes taken.
+
+    ``contact`` (``fem.solve(tau=..., contact=jno.solve.contact())``) re-runs the contact search at
+    **every load step** — see :func:`_march_eager_contact`. That march is a host loop rather than a
+    ``lax.scan``, which costs the load path its reverse-mode differentiability; the alternative would
+    be to march with one frozen pairing, which is the wrong answer rather than a slower one.
     """
     op = fem._op
     domain = fem.domain
@@ -96,10 +112,7 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
         return prep(res, u_prev) if prep is not None else (res, u_prev)
 
     def _roll(buf, nv):
-        """Push the just-computed state ``nv`` (n_cell, n_quad, *shape) into slot 0 — the next step's
-        ``.i(-1)`` — and drop the oldest slot, keeping the buffer exactly ``depth`` deep. Depth 1 simply
-        replaces; depth ≥ 2 (e.g. a BDF2 ``u.i(-2)``) shifts the tail back one."""
-        return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
+        return _roll_buffer(buf, nv)
 
     def _step_once(u_prev, buffers, sbuffers, tau_k, path_k, param_args):
         """One accepted load step: equilibrium at ``tau_k``, then advance every buffered state.
@@ -165,6 +178,176 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     # The schedule is a PIECEWISE-CONSTANT function of the parameters (perturb one infinitesimally and
     # the same steps are accepted), so the gradient over a frozen schedule is the true derivative almost
     # everywhere -- the same contract `adapt=` already makes for a frozen mesh sequence.
+    def _march_eager_contact(spec, param_args):
+        """The load path with a contact search PER LOAD STEP.
+
+        Why per step, and not per march: the pairing that is right at the end of the path is not the one
+        that was right in the middle of it. Wrapping the whole march in the steady re-pairing loop would
+        re-solve the entire path with the FINAL configuration's pairing applied to every step — a
+        plausible-looking trajectory for a contact history that never happened.
+
+        Why eager: the search is a host-side closest-point projection and cannot run inside ``lax.scan``.
+        The cost is stated rather than hidden — this march is **not** reverse-mode differentiable, where
+        the scanned one is.
+
+        Each step iterates to the same two conditions the steady driver uses: the pairing stops moving
+        AND the solution stops moving. The pairing carries over from the previous step, so a step whose
+        contact configuration is unchanged usually settles in the minimum two rounds.
+        """
+        from .contact_search import _pairing_moved, _stalled
+        from .fem_utils import _log
+
+        repair = getattr(op, "repair_contact", None)
+        if repair is None or not getattr(op, "contact_pairs", None):
+            raise ValueError(
+                "fem.solve(tau=..., contact=...) but this form declares no contact pair. `contact=` "
+                "re-runs the search behind `u.gap(secondary, main)`; without one there is nothing to "
+                "re-pair. Add the gap to the term list, or drop `contact=`."
+            )
+        n_steps = int(tau_grid.shape[0])
+        # Compile the step ONCE. `_step_once` builds a fresh `args` dict and fresh residual/jacobian
+        # lambdas on every call, so handing those straight to the solver gave JAX a new function object
+        # each round and it retraced: measured on a load-path contact march, 22 new XLA compilations per
+        # round with the assembled tangent and 26 matrix-free, forever. Each retained executable pins
+        # that round's gap tables as constants, which is the memory growth (~65 MB per load step) and a
+        # large part of the slowdown, one cause. Wrapping the step in a single `jax.jit` makes the tables
+        # traced ARGUMENTS of a cached executable, which is what threading them on `args` was for; their
+        # shapes are fixed by the declaration, so only values change between rounds. The scanned march
+        # already traces this same function inside `lax.scan`, so it is known to be traceable.
+        #
+        # NOT with the assembled tangent. `newton(direct=True)` hoists the contact block's sparsity
+        # pattern from the pairing's CONCRETE node ids, so the tables have to be real arrays there, and
+        # under `jit` they arrive as tracers (`TracerArrayConversionError` on the ids). That path keeps
+        # the per-round retrace it always had; the trade it already documents -- faster per solve, more
+        # memory -- now also includes this. Measured on a 10-step load-path march, matrix-free:
+        # 583 compilations / 18.0 s before, 127 / 1.4 s after, with a BIT-IDENTICAL trajectory.
+        _wants_jac = bool(getattr(solve_fn, "wants_jacobian", False))
+        _step_compiled = _step_once if _wants_jac else jax.jit(_step_once)
+        # The search applies from the FIRST step, for the same reason it does in the steady driver: the
+        # build-time tables are unbounded, so on a closed body the far side pairs through the body.
+        relax = float(getattr(spec, "relax", 1.0))
+        if not (0.0 < relax <= 1.0):
+            raise ValueError(f"fem.solve(tau=..., contact=...): relax must lie in (0, 1], got {relax}.")
+        tables = repair(np.zeros(n_dofs), capture=spec.capture)
+        u, bufs, sbufs = u0, buffers0, sbuffers0
+        traj = []
+        for k in range(n_steps):
+            tau_k = tau_grid[k]
+            path_k = {fid: fr[k] for fid, fr in path_frames.items()}
+            u_prev, settled, moved, rel, quiet, hist = None, False, None, float("inf"), 0, []
+            for rnd in range(int(spec.rounds)):
+                u_new, nb, nsb = _step_compiled(u, bufs, sbufs, tau_k, path_k, {**param_args, "__gap_tables__": tables})
+                un_raw = np.asarray(u_new)
+                # UNDER-RELAX before searching, exactly as the steady loop does -- see
+                # `run_contact_solve`. A follower contact normal makes the round map stop contracting,
+                # and a load path is where that bites hardest: every step pays for it.
+                un = un_raw if u_prev is None or relax == 1.0 else (1.0 - relax) * u_prev + relax * un_raw
+                new = repair(un, capture=spec.capture)
+                moved = _pairing_moved(tables, new)
+                du = np.inf if u_prev is None else float(np.abs(un - u_prev).max())
+                scale = max(float(np.abs(un).max()), 1e-30)
+                tables, u_prev, rel = new, un, du / scale
+                if np.isfinite(du):
+                    hist.append(du / scale)
+                _log.info(
+                    f"contact march step {k + 1}/{n_steps} (tau={float(tau_k):.4g}) "
+                    f"round {rnd + 1}/{int(spec.rounds)}: {moved} slot(s) re-paired, "
+                    f"|du|/|u| = {du / scale:.3e}"
+                )
+                # See `run_contact_solve`: a slot on the seam between two adjacent main facets can
+                # flip forever without changing the surface it describes, so the test is that the
+                # SOLUTION has gone quiet twice running, not that every facet label agrees.
+                quiet = quiet + 1 if du <= spec.tol * scale else 0
+                if quiet >= 2 or (moved == 0 and du <= spec.tol * scale):
+                    settled = True
+                    break
+            if not settled and _stalled(hist, spec.tol):
+                raise RuntimeError(
+                    f"fem.solve(tau=..., contact=...): load step {k + 1}/{n_steps} (tau = "
+                    f"{float(tau_k):.4g}) is OSCILLATING, not converging -- over {int(spec.rounds)} "
+                    f"rounds |du|/|u| cycled between {min(hist):.2e} and "
+                    f"{max(hist[len(hist) // 2 :]):.2e} with no downward trend. More rounds will not help. "
+                    "Damp the search with `jno.solve.contact(relax=0.5)` -- the direct remedy when the "
+                    "pairing feeds back into the solution, as it does with a follower contact normal. "
+                    "Otherwise take smaller load steps so each starts nearer its own equilibrium, "
+                    "refine the contacting surface, or loosen `tol=`."
+                )
+            if not settled:
+                raise RuntimeError(
+                    f"fem.solve(tau=..., contact=...): load step {k + 1}/{n_steps} (tau = "
+                    f"{float(tau_k):.4g}) did not settle in {int(spec.rounds)} round(s) -- "
+                    + (
+                        f"{moved} quadrature slot(s) still change which main facet they read"
+                        if moved
+                        else f"the pairing is settled but the solution still moves by {rel:.2e} "
+                        f"relative against a tolerance of {spec.tol:.0e}"
+                    )
+                    + ". Raise `rounds=`, loosen `tol=`, or take smaller load steps so each one starts "
+                    "closer to its own equilibrium."
+                )
+            # advance on the iterate the final tables were built from, so the state carried into the
+            # next load step and the pairing that produced it describe the same configuration
+            u, bufs, sbufs = (u_new if relax == 1.0 else jnp.asarray(u_prev).reshape(-1)), nb, nsb
+            traj.append(u)
+        return jnp.stack(traj)
+
+    if contact is not None:
+        if _is_arclength(path):
+            raise NotImplementedError(
+                "fem.solve(tau=jno.solve.arclength(...), contact=...) is not wired: arc-length solves "
+                "for the load factor alongside u on a bordered system, and the contact search would "
+                "have to re-pair inside that root-find rather than between load steps. Use the fixed "
+                "`domain(tau=...)` march with `contact=`."
+            )
+        if path is not None and not _is_explicit_schedule(path):
+            raise NotImplementedError(
+                "fem.solve(tau=jno.solve.adaptive(...), contact=...) is not wired: the adaptive path "
+                "pilots a step schedule and then REPLAYS it under a scan, and the replay cannot run a "
+                "host-side search. Pilot the schedule first without contact, then replay it explicitly "
+                "with `tau=fem.tau_schedule, contact=...`."
+            )
+        if _is_explicit_schedule(path):
+            raise NotImplementedError(
+                "fem.solve(tau=<schedule>, contact=...) is not wired yet: the contact march walks the "
+                "domain's declared `domain(tau=...)` grid. Declare the grid you want and march it."
+            )
+        if getattr(op, "runtime_parameter_exprs", {}):
+            raise NotImplementedError(
+                "fem.solve(tau=..., contact=...) on a form carrying a runtime parameter is not wired: "
+                "the search needs a concrete displacement to project, and a differentiable solve hands "
+                "it tracers. Run the march forward at the values you want."
+            )
+        return _march_eager_contact(contact, {})
+
+    if _is_arclength(path):
+        if path_frames:
+            raise NotImplementedError(
+                "jno.fem: `tau=jno.solve.arclength(...)` does not compose with a per-load-step field "
+                "(`freeze_path(frames)`) — those frames are indexed by the DECLARED load step, and under "
+                "arc-length the load factor is solved for, not prescribed, so there is no step to index "
+                "them by. Use the fixed `domain(tau=...)` march for a path that carries prescribed data."
+            )
+        if getattr(op, "runtime_parameter_exprs", {}):
+            raise NotImplementedError(
+                "jno.fem: `tau=jno.solve.arclength(...)` on a form carrying a runtime parameter is not "
+                "wired yet — the load factor recorded on `fem.tau_schedule` is a concrete array, and a "
+                "parametric solve has only tracers. Run the study forward at the values you want."
+            )
+        from .arclength import march_arclength
+
+        return march_arclength(
+            fem,
+            path,
+            solve_fn=solve_fn,
+            op=op,
+            readout=readout,
+            surf_readout=surf_readout,
+            buffers0=buffers0,
+            sbuffers0=sbuffers0,
+            u0=u0,
+            tau_pts=tau_pts,
+            dtype=dtype,
+        )
     if path is not None:
         if _is_explicit_schedule(path):
             # `tau=<array>`: replay a schedule the caller already has — from an earlier pilot
@@ -250,9 +433,17 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     return FunctionCall(lambda *values: _march(dict(zip(names, values))), params, name="fem_history_march")
 
 
+def _is_arclength(path):
+    """Is ``tau=`` an arc-length spec? Checked BEFORE :func:`_is_explicit_schedule`, which keys on the
+    absence of ``.limit`` and would otherwise try to read the spec as an array of tau values."""
+    from .arclength import ArcLengthSpec
+
+    return isinstance(path, ArcLengthSpec)
+
+
 def _is_explicit_schedule(path):
     """Is ``tau=`` a recorded schedule to replay rather than a spec to discover one with?"""
-    return path is not None and not hasattr(path, "limit")
+    return path is not None and not _is_arclength(path) and not hasattr(path, "limit")
 
 
 def _as_schedule(path, tau_pts):
@@ -499,6 +690,9 @@ def _pilot_schedule(
                 f"(overshoot x{ratio:.3g}). That is the signature of an UNSTABLE branch, not of a step "
                 "that is merely too big: under load control a snap-back has no nearby equilibrium, so no "
                 "amount of load-step refinement finds one. Loosen `limit` to accept the jump, or drive "
-                "the path by a displacement/arc-length measure instead of the load."
+                "the path by arc length instead of by the load: fem.solve(tau=jno.solve.arclength(ds=...)), "
+                "which solves for the load factor and can turn around. Note arc-length does not yet "
+                "compose with nonlinear=jno.solve.staggered(...) -- an alternate-minimization energy "
+                "(phase-field fracture) still has no instrument here."
             )
     return np.asarray(schedule, dtype=float), states

@@ -155,9 +155,27 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     was dropped in silence -- see that method for the worked case.
     """
     mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
-    if mask is None:
-        raise ValueError(f"jno.fem (1D): boundary region {region!r} has no location function.")
-    return list(np.where(mask)[0])
+    if mask is not None:
+        return list(np.where(mask)[0])
+    # No predicate: a `Shape.regions` BODY, which is defined by which cells it owns rather than by a
+    # location function. That is the only kind of region `domain.tag(..., region=...)` names on a
+    # multi-body mesh, so refusing here made a Dirichlet on such a tag impossible -- `u(top) - g` on
+    # `tag("top", ..., region="cyl")` raised "has no location function". Ownership by cell topology is
+    # the same answer `_face_nodes` and the tag's own facet selection use.
+    from ...domain.mesh_utils import p1_cells_dict
+    from .fem_utils import _cell_region_mask
+
+    mesh = getattr(domain, "mesh", None)
+    cd = p1_cells_dict(mesh) if mesh is not None and getattr(mesh, "cells_dict", None) else {}
+    vol = next((cd[k] for k in ("tetra", "hexahedron", "triangle", "quad", "line") if k in cd), None)
+    if vol is not None:
+        m = np.asarray(_cell_region_mask(domain, region)).reshape(-1)
+        if m.shape[0] == np.asarray(vol).shape[0]:
+            return list(np.unique(np.asarray(vol)[m > 0]))
+    raise ValueError(
+        f"jno.fem: region {region!r} has neither a location predicate nor cells on this mesh, so its "
+        "nodes cannot be determined. Name a `domain.tag` region or a `Shape.regions` body."
+    )
 
 
 def hermite_dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], rotation_bcs: Any) -> List[Tuple[int, float]]:

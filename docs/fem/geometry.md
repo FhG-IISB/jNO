@@ -350,6 +350,32 @@ an arbitrary-predicate interface). Region integration is a scalar mask on the in
 steady-linear, nonlinear, transient, coupled, and 3-D forms. A `jno.np.parameter` that multiplies a
 sub-region term is recovered **per sub-domain** through `crux`.
 
+!!! warning "Every field still spans the whole mesh"
+    `fem_symbols` has no region argument, so a field restricted *in its terms* still carries DOFs
+    everywhere. If **every** term touching a field is region-restricted, that field's DOFs on the rest of
+    the mesh appear in no equation at all and the system is structurally singular — the case that shows
+    up the moment you write different physics per region (Navier–Stokes on `fluid`, elasticity on
+    `solid`).
+
+    `jno.fem` refuses that at build time, naming the field, the count and the region:
+
+    ```
+    jno.fem: these DOFs appear in no term and carry no prescribed value, so the system is
+    structurally singular:
+      field 'u' (block 0): 87 DOFs, every term reaching it is restricted to 'lower'
+    ```
+
+    The fix is to give the field a term over the region it is missing from; where it carries no physics
+    there, a cheap `1e-8 * u * phi` on that region is enough. A **Dirichlet pin on the region is not a
+    reliable substitute**: an essential condition resolves its nodes through `domain.tag_node_mask`,
+    which for a *volume* region is a proximity test against sampled points rather than a containment
+    test, and can miss interior nodes (measured: it reached 32 of the 33 ungoverned DOFs on a two-block
+    domain). Reach itself is measured by cell centroid — the assembler's own resolution — so the check
+    cannot disagree with what was assembled.
+
+    Scope: this finds a DOF that appears in **no term**. It is not a rank test, and does not detect a
+    missing pressure gauge or an unrestrained rigid-body mode.
+
 ### `domain.by_region` — many materials as one equation
 
 For *many* regions, writing one term per region is noisy. `domain.by_region({region: value})` returns a
