@@ -34,7 +34,7 @@ def _aspect(dom):
 
 
 def _poisson(skew=0.0, size=0.35):
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=size).domain()
     if skew:
         p = np.asarray(d.mesh.points)
         p[:, 1] = p[:, 1] * (1.0 - skew * p[:, 0] / 2.0 * p[:, 1])  # stretch the elements

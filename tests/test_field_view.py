@@ -61,7 +61,7 @@ class TestFieldViewNodeConstruction:
 
     @pytest.fixture
     def setup(self):
-        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
+        domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
         a = np.zeros((1, 4, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, y_var, t_var = domain.variable("interior")
@@ -137,7 +137,7 @@ class TestTemporalTargetCollection:
 
     @pytest.fixture
     def fv(self):
-        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
+        domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
         a = np.zeros((1, 4, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, _, t_var = domain.variable("interior")
@@ -171,7 +171,7 @@ class TestTemporalTargetCollection:
 
 class TestCoordinateValidation:
     def _setup(self):
-        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain()
+        domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain()
         a = np.zeros((1, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, y_var, _ = domain.variable("interior")
@@ -225,7 +225,7 @@ def _make_spatial_setup(field_values: np.ndarray):
     H, W = field.shape[:2]
     if field.ndim == 2:
         field = field[..., None]
-    domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain()
+    domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain()
     a_var = domain.variable("a", field[None])  # add batch dim
     x_var, y_var, _ = domain.variable("interior")
     mesh_pts = jnp.asarray(domain.mesh_connectivity["points"])
@@ -303,7 +303,7 @@ def _make_spatiotemporal_setup(field_values: np.ndarray, t_vals: np.ndarray):
     if field.ndim == 3:
         field = field[..., None]
     t0, t1 = float(t_vals[0]), float(t_vals[-1])
-    domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain(time=(t0, t1, T))
+    domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain(time=(t0, t1, T))
     field_b = field[None]  # (1, T, H, W, C)
     a_var = domain.variable("a", field_b)
     x_var, y_var, t_var = domain.variable("interior")
@@ -514,7 +514,7 @@ class TestNonSquareDomain:
         ys = np.linspace(0.0, 1.0, W, dtype=np.float32)
         xx, yy = np.meshgrid(xs, ys, indexing="ij")
         field = (yy**2)[..., None]  # (H, W, 1); ∂²/∂y² = 2
-        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain()
+        domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain()
         a_var = domain.variable("a", field[None])
         x_var, y_var, _ = domain.variable("interior")
         mesh_pts = jnp.asarray(domain.mesh_connectivity["points"])
@@ -598,7 +598,7 @@ class TestMinConsecutiveGuard:
 class TestHigherOrderChainNodes:
     @pytest.fixture
     def fv_xt(self):
-        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
+        domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
         a = np.zeros((1, 4, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, y_var, t_var = domain.variable("interior")

@@ -430,7 +430,7 @@ class domain(MeshIOMixin):
         """Instantiate a Shapely-backed polygon CSG domain.
 
         ``domain.poly(...)`` returns the lazy CSG domain class (no mesh until
-        sampled). For a meshed polygon, build one with ``jno.Shape.polygon(...)``
+        sampled). For a meshed polygon, build one with ``jno.shape.polygon(...)``
         and realize it via ``.domain()``.
         """
         from .polygon_domain import PolygonDomain
@@ -520,23 +520,23 @@ class domain(MeshIOMixin):
     ):
         if "mesh_size" in _ignored_kwargs:
             raise ValueError(
-                "jno.domain(<Shape or callable>, mesh_size=...) does not read `mesh_size`. It is only "
+                "jno.domain(<shape or callable>, mesh_size=...) does not read `mesh_size`. It is only "
                 "honoured on the POLYGON path -- `domain.__new__` routes there for a constructor that "
-                "is not callable, and a `jno.Shape` defines `__call__`, so a Shape goes to the generic "
+                "is not callable, and a `jno.shape` defines `__call__`, so a shape goes to the generic "
                 "domain instead and the size lands in **_ignored_kwargs. Measured on a unit box: "
                 "mesh_size=0.5, 0.3, 0.18 and 0.1 ALL returned the same 340-node mesh, with nothing "
                 "reported -- a refinement study that never refined. Put the size on the shape, which is "
-                "where it belongs: `jno.Shape.box(0, 0, 0, 1, 1, 1).sized(h).domain()`, or "
-                "`jno.Shape.rect(0, 0, 1, 1, size=h).domain()`. Passing raw polygon points instead of a "
-                "Shape keeps `mesh_size=` working, because that is the path it was written for."
+                "where it belongs: `jno.shape.box(0, 0, 0, 1, 1, 1).sized(h).domain()`, or "
+                "`jno.shape.rect(0, 0, 1, 1, size=h).domain()`. Passing raw polygon points instead of a "
+                "shape keeps `mesh_size=` working, because that is the path it was written for."
             )
         if "structured" in _ignored_kwargs:
             raise ValueError(
-                "jno.domain(..., structured=True) was replaced by Shape.structured() and is no longer "
+                "jno.domain(..., structured=True) was replaced by shape.structured() and is no longer "
                 "read. It was being swallowed by **_ignored_kwargs, so the domain came back WITHOUT a "
                 "grid descriptor and the failure surfaced far away (scheme='spectral' refusing a "
                 "domain the caller believed was structured). Spell it "
-                "jno.Shape.rect(0, 0, 1, 1, size=h).structured().domain() instead."
+                "jno.shape.rect(0, 0, 1, 1, size=h).structured().domain() instead."
             )
         """
         Initialize the domain.
@@ -552,7 +552,7 @@ class domain(MeshIOMixin):
                 (e.g. an elasto-plastic load→unload cycle). Pass ``time`` **or** ``tau``, not both.
             mesh_connectivity: Wether or not to compute the some hyperparameters about the mesh (needed for finite_difference methods)
 
-        A geometry built with :meth:`jno.Shape.structured` is meshed as a regular lattice rather than
+        A geometry built with :meth:`jno.shape.structured` is meshed as a regular lattice rather than
         by gmsh, and records its grid descriptor on :attr:`grid` / ``mesh_connectivity["grid"]``.
         """
         # `tau=` is a pseudo-time (load-path) alias of `time=`: reuse the whole grid/coordinate/tiling
@@ -634,7 +634,7 @@ class domain(MeshIOMixin):
         # assembled operator). Off by default via keep_orphan_nodes=True. Applied in _apply_mesh.
         self._keep_orphan_nodes = keep_orphan_nodes
 
-        # A `Shape.structured()` plan is meshed as a regular lattice instead of by gmsh: swap in the
+        # A `shape.structured()` plan is meshed as a regular lattice instead of by gmsh: swap in the
         # lattice constructor and remember the grid descriptor to stamp on mesh_connectivity below.
         # `_plan` keeps the ORIGINAL shape, because the region-name/attachment collection further down
         # reads it off the constructor -- and the swapped-in closure carries neither, so a
@@ -654,11 +654,11 @@ class domain(MeshIOMixin):
                 self._load_mesh(constructor)
                 self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
         elif callable(constructor):
-            # A `jno.Shape` whose membership and extent are closed-form does NOT get meshed here.
+            # A `jno.shape` whose membership and extent are closed-form does NOT get meshed here.
             # It can be tagged and sampled from the geometry, which is everything a PINN needs, and
             # the mesh is built only if something later actually reads `.mesh` (see that property).
             # A structured plan is excluded: it has already been swapped for its lattice closure,
-            # which is not a Shape and carries no analytic membership.
+            # which is not a shape and carries no analytic membership.
             # A NAMED or multi-region plan also stays eager: its `interior_<name>` and
             # `interface_<a>_<b>` tags are the mesher's conforming sub-bodies and shared facets,
             # which no amount of point sampling reconstructs. Supporting those mesh-free is a
@@ -698,7 +698,7 @@ class domain(MeshIOMixin):
                     self.log.info(f"This plan cannot be sampled mesh-free ({_why_eager}); meshing it.")
                 self._generate_mesh(constructor, algorithm)
                 self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
-            # A Shape.regions() plan carries named sub-region shapes; remember them so jno.fem
+            # A shape.regions() plan carries named sub-region shapes; remember them so jno.fem
             # per-region integration can restrict a term to a region's cells (centroid membership
             # via the region shape's ``contains`` — see ``_cell_region_mask``).
             #
@@ -720,7 +720,7 @@ class domain(MeshIOMixin):
                 # The other half of the same hole: properties attached to a shape that was never
                 # named have no region to belong to, and would be silently discarded here.
                 raise ValueError(
-                    f"Shape.attach({', '.join(sorted(map(str, _shape._attach)))}): this shape has no "
+                    f"shape.attach({', '.join(sorted(map(str, _shape._attach)))}): this shape has no "
                     "region name, so the attached propert"
                     f"{'ies have' if len(_shape._attach) > 1 else 'y has'} nothing to attach to. "
                     "Name the region first -- `shape.name('steel').attach(...)`."
@@ -846,7 +846,7 @@ class domain(MeshIOMixin):
         self.reference_solutions: List[Callable] = []
         self.sample_dict: List = []
 
-        # Meshio mesh. `_lazy_plan` holds the Shape a deferred build would mesh; while it is set,
+        # Meshio mesh. `_lazy_plan` holds the shape a deferred build would mesh; while it is set,
         # `.mesh` is a promise rather than an absence (see the `mesh` property).
         self._lazy_plan = None
         self._algorithm = algorithm
@@ -1301,7 +1301,7 @@ class domain(MeshIOMixin):
     def mesh(self):
         """The meshio mesh, or ``None`` if this domain has none and never will.
 
-        A domain built from an analytic :class:`jno.Shape` plan starts **mesh-free**: it can be
+        A domain built from an analytic :class:`jno.shape` plan starts **mesh-free**: it can be
         tagged and sampled from the geometry itself, which is all a PINN needs, and gmsh is never
         run. Reading this property is what *asks* for a mesh, so the first read builds it and says
         so in one ``INFO`` line naming what asked. Code inside ``jno.domain`` that only wants to
@@ -1429,14 +1429,14 @@ class domain(MeshIOMixin):
 
     @property
     def grid(self):
-        """The regular-lattice descriptor of a :meth:`jno.Shape.structured` domain, else ``None``.
+        """The regular-lattice descriptor of a :meth:`jno.shape.structured` domain, else ``None``.
 
         ``{"shape": (Nx, Ny[, Nz]), "spacing": (hx, hy[, hz]), "origin": (x0, y0[, z0])}`` with
         ``shape`` in **nodes** (one more per axis than the cell count passed to ``structured(n=...)``).
         Nodes are stored in C order — ``idx = ((i·Ny + j)·Nz + k)`` — so a nodal field reshapes
         straight to ``grid["shape"]``::
 
-            d = jno.Shape.rect(0, 0, 1, 1).structured(n=63).domain()
+            d = jno.shape.rect(0, 0, 1, 1).structured(n=63).domain()
             u.reshape(d.grid["shape"])          # (64, 64)
 
         This is also the key ``jno.fdm`` reads to take its assembly-free stencil path.
@@ -1465,7 +1465,7 @@ class domain(MeshIOMixin):
         return sorted(self._boundary_registry.keys())
 
     def interface_tags(self, *regions: str):
-        """Internal material-interface tags from a :meth:`Shape.regions` domain.
+        """Internal material-interface tags from a :meth:`shape.regions` domain.
 
         With no arguments, every interface tag (``"a|b"``) — facet regions between two materials, on
         which you can impose a coupling or flux condition. They are deliberately *not* part of
@@ -1508,7 +1508,7 @@ class domain(MeshIOMixin):
                 raise ValueError(
                     f"domain.interface_tags({regions[0]!r}, {regions[1]!r}): this is a CONFORMING "
                     f"interface, so the two regions share one surface ({pair!r}) and there are no "
-                    "separate sides to tie. Build the domain with Shape.regions(..., conforming=False) "
+                    "separate sides to tie. Build the domain with shape.regions(..., conforming=False) "
                     "to mesh each body independently."
                 )
             known = sorted({t.rpartition(".")[0] or t for t in registry})
@@ -2059,7 +2059,7 @@ class domain(MeshIOMixin):
         """Define a named region from a **spatial** predicate ``where(x, y[, z]) -> bool``.
 
         ``region=`` restricts the predicate to **one body's** nodes. It exists because a spatial
-        predicate cannot always separate what you mean: a ``Shape.regions(..., conforming=False)``
+        predicate cannot always separate what you mean: a ``shape.regions(..., conforming=False)``
         domain meshes each body independently, so the shared surface exists *twice* -- two coincident
         sets of nodes at identical coordinates. No function of ``(x, y, z)`` can tell them apart.
         Naming which body owns the facet supplies the missing discriminator::
@@ -2115,7 +2115,7 @@ class domain(MeshIOMixin):
             if str(region) not in known:
                 raise ValueError(
                     f"tag({name!r}, region={region!r}): unknown region. Known: {sorted(known)}. "
-                    "`region=` names the BODY that owns the facets (a Shape.regions name), which is "
+                    "`region=` names the BODY that owns the facets (a shape.regions name), which is "
                     "what tells two coincident interface surfaces apart."
                 )
             self._tag_regions = getattr(self, "_tag_regions", {})
@@ -2128,7 +2128,7 @@ class domain(MeshIOMixin):
         geom = getattr(self, "_active_geometry", None)
         if poly_tags is not None and geom is not None and name not in poly_tags:
             poly_tags[name] = ("interior", geom)
-        # The same idea for an analytic Shape plan, in any dimension: the predicate is the region,
+        # The same idea for an analytic shape plan, in any dimension: the predicate is the region,
         # and it is applied to a fresh draw each step. Whether it carves the interior or a slice of
         # the boundary is measured (see `_classify_predicate_region`) rather than assumed, because a
         # boundary predicate applied to an interior draw matches nothing and would look like an
@@ -2225,10 +2225,10 @@ class domain(MeshIOMixin):
         and an unknown region name raises. Desugars to ``sum_r RegionMask(r) * values[r]`` -- the proven
         per-region integration path (``tests/test_fem_per_region.py``); ``jno.fem`` logs the expansion.
         """
-        # ``_shape_regions`` are the named sub-regions of a ``Shape.regions`` / ``a.name(..) + b.name(..)``
+        # ``_shape_regions`` are the named sub-regions of a ``shape.regions`` / ``a.name(..) + b.name(..)``
         # plan. They belong here for the same reason geometry parts do -- ``RegionMask`` resolves them
         # through the same centroid-membership path (``_cell_region_mask``). Without them a
-        # Shape-built multi-material domain could not use ``by_region`` at all.
+        # shape-built multi-material domain could not use ``by_region`` at all.
         # A mesh file declares its materials as gmsh physical volumes, which land in
         # ``mesh.cell_sets``. They are a fourth source of regions, resolved LAST everywhere so a
         # same-named tag predicate keeps winning.
@@ -2243,7 +2243,7 @@ class domain(MeshIOMixin):
         if unknown:
             raise ValueError(
                 f"domain.by_region: unknown region(s) {sorted(unknown)}; each key must be a geometry part, "
-                f"a Shape.regions sub-region, a domain.tag predicate, or a named volume region of the mesh "
+                f"a shape.regions sub-region, a domain.tag predicate, or a named volume region of the mesh "
                 f"file. Known regions: {sorted(valid)}."
             )
         # ``by_region`` is ``sum_r RegionMask(r) * values[r]``, so two keys covering the same cell ADD
@@ -2253,7 +2253,7 @@ class domain(MeshIOMixin):
         # declaration order cannot resolve it: the user writing the enclosing group first would get
         # the opposite of the intent. Refuse, and name the pair.
         #
-        # Only checked for MESH regions: shapely / Shape.regions masks are disjoint by construction
+        # Only checked for MESH regions: shapely / shape.regions masks are disjoint by construction
         # (the priority subtraction in `_cell_region_mask`), and evaluating those masks here would
         # turn a symbolic O(1) call into a geometry query on every `d.<attr>` in a weak form.
         _mr = [r for r in values if r in mesh_regions]
@@ -2309,21 +2309,21 @@ class domain(MeshIOMixin):
         return expr
 
     def _collect_region_attachments(self, items):
-        """Index ``Shape.attach(...)`` properties as ``{property: {region: value}}`` for ``__getattr__``."""
+        """Index ``shape.attach(...)`` properties as ``{property: {region: value}}`` for ``__getattr__``."""
         attached: dict = {}
         kinds: dict = {}
         for name, sub in items:
             for prop, value in (getattr(sub, "_attach", None) or {}).items():
                 attached.setdefault(str(prop), {})[str(name)] = value
-                kinds[str(name)] = "volume"  # a Shape region is a body: always per-cell
+                kinds[str(name)] = "volume"  # a shape region is a body: always per-cell
         self._region_attachments = attached
         self._attachment_kind = kinds
 
     def attach(self, target: str, **props):
         """Declare material properties on an existing **region or boundary tag**, after the domain is built.
 
-        The runtime counterpart of :meth:`Shape.attach`, and the only way to attach to a
-        ``domain.tag`` — or to a mesh-file domain, which has no ``Shape`` to declare them on::
+        The runtime counterpart of :meth:`shape.attach`, and the only way to attach to a
+        ``domain.tag`` — or to a mesh-file domain, which has no ``shape`` to declare them on::
 
             d.tag("wall", lambda x, y: x < 1e-9)
             d.tag("lid",  lambda x, y: y > 1 - 1e-9)
@@ -2416,7 +2416,7 @@ class domain(MeshIOMixin):
             )
 
     def __getattr__(self, name):
-        """Resolve ``d.<prop>`` for a property attached via :meth:`Shape.attach`.
+        """Resolve ``d.<prop>`` for a property attached via :meth:`shape.attach`.
 
         Only reached when normal attribute lookup fails, so it can never shadow a real method; the
         build-time check in ``_check_attachment_clashes`` covers the reverse direction.
@@ -2454,7 +2454,7 @@ class domain(MeshIOMixin):
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def attached(self, name: str) -> dict:
-        """The raw ``{region: value}`` mapping for a property declared with :meth:`Shape.attach`.
+        """The raw ``{region: value}`` mapping for a property declared with :meth:`shape.attach`.
 
         ``d.<name>`` gives the per-region *coefficient*, ready for a weak form. This gives the values
         themselves, for the consumers that need a mapping rather than an expression -- most notably
@@ -2474,7 +2474,7 @@ class domain(MeshIOMixin):
         """A plain function attached as a property value is called here with this domain's spatial
         variables, so ``.attach(k=lambda r, z: 2.0 + 0.5*z)`` becomes a symbolic coefficient.
 
-        It cannot be resolved at ``Shape.attach`` time: a spatially varying value has to be built from
+        It cannot be resolved at ``shape.attach`` time: a spatially varying value has to be built from
         ``d.variable(...)``, and the domain does not exist while the geometry plan is being written.
         ``isroutine`` rather than ``callable`` on purpose -- symbolic expressions define ``__call__``
         (that is how ``u(x, y)`` binds), so ``callable`` would try to invoke them as size functions.
@@ -2607,7 +2607,7 @@ class domain(MeshIOMixin):
 
     # ----- mesh-free geometry sampling -------------------------------------------------------
     #
-    # A domain built from an analytic `jno.Shape` draws its collocation points from the geometry
+    # A domain built from an analytic `jno.shape` draws its collocation points from the geometry
     # instead of from mesh nodes. The tag vocabulary is identical -- `interior`, `boundary`, the
     # primitives' auto-names, and anything `tag(name, where)` adds -- so nothing above this layer
     # has to know which source it got. What changes is that the points are continuous: there is no
@@ -2803,7 +2803,7 @@ class domain(MeshIOMixin):
 
     # Generators
     def _structured_grid_setup(self, shape):
-        """Resolve a :meth:`jno.Shape.structured` plan into a lattice constructor.
+        """Resolve a :meth:`jno.shape.structured` plan into a lattice constructor.
 
         Returns ``(constructor, grid_meta)`` where ``constructor(geo) -> (meshio.Mesh, dim, ds)`` builds
         the regular grid over the rectangle (:meth:`Geometries.equi_distant_rect`) or box
@@ -2814,7 +2814,7 @@ class domain(MeshIOMixin):
         ``jno.fdm``'s kernels read to take the assembly-free 5-/7-point-stencil path (node order
         ``idx = ((i·Ny + j)·Nz + k)``).
 
-        The cell comes from the plan's own :meth:`jno.Shape.quad` choice: a lattice is the one 3-D plan
+        The cell comes from the plan's own :meth:`jno.shape.quad` choice: a lattice is the one 3-D plan
         that CAN be hex-meshed, so ``.structured().quad()`` is how a hexahedral mesh is spelled.
 
         Refuses by name rather than falling back to gmsh — a caller who then reads ``domain.grid`` or
@@ -2831,20 +2831,20 @@ class domain(MeshIOMixin):
                 else ("no plan at all" if node is None else f"a {node[0]!r} plan")
             )
             raise NotImplementedError(
-                f"Shape.structured() needs a single axis-aligned rect/box; this is {_what}. Mesh it "
+                f"shape.structured() needs a single axis-aligned rect/box; this is {_what}. Mesh it "
                 "unstructured (drop .structured()), or decompose it into mapped blocks. Cut-cell and "
                 "transfinite/swept structured meshing are planned."
             )
         if int(getattr(shape, "_mesh_order", 1)) > 1:
             raise NotImplementedError(
-                "Shape.structured().curved() is not supported: a curved lattice cell is a 9-/27-node "
+                "shape.structured().curved() is not supported: a curved lattice cell is a 9-/27-node "
                 "block the lattice builder does not emit. Use .curved() on an unstructured plan, or "
                 "raise the BASIS order instead (jno.fem(..., order=2) on a straight mesh)."
             )
         cells = shape.cell_choices()
         if len(cells) > 1:
             raise NotImplementedError(
-                f"Shape.structured(): this plan asks for more than one cell type ({', '.join(sorted(cells))})."
+                f"shape.structured(): this plan asks for more than one cell type ({', '.join(sorted(cells))})."
             )
         tensor = "quad" in cells
 
@@ -2853,13 +2853,13 @@ class domain(MeshIOMixin):
         if not counts:
             if callable(size):
                 raise NotImplementedError(
-                    "Shape.structured() derives its cell counts from the shape's size=, and a spatially "
+                    "shape.structured() derives its cell counts from the shape's size=, and a spatially "
                     "varying size=<callable> (a graded mesh) has no single count. Pass explicit counts "
                     "-- .structured(n=32) or .structured(n=(32, 16)) -- or drop .structured()."
                 )
             h = float(size) if isinstance(size, (int, float)) and size > 0 else 0.1
             if not (isinstance(size, (int, float)) and size > 0):
-                self.log.info(f"Shape.structured(): no scalar size= on the shape; defaulting to spacing h={h}.")
+                self.log.info(f"shape.structured(): no scalar size= on the shape; defaulting to spacing h={h}.")
         else:
             h = None
 
@@ -3066,23 +3066,23 @@ class domain(MeshIOMixin):
         return self
 
     def _remesh_periodic(self, pairs) -> bool:
-        """Re-mesh IN PLACE from the stored ``jno.Shape`` geometry, making the named opposite-face ``pairs``
+        """Re-mesh IN PLACE from the stored ``jno.shape`` geometry, making the named opposite-face ``pairs``
         (``[(main, secondary), ...]``) conforming via gmsh ``setPeriodic`` — so a Nédélec (edge) field's
         per-edge DOFs line up one-to-one across the periodic faces. Inferred from the constraint list (the
         periodic ties), never requested explicitly. Idempotent: returns ``False`` (a no-op) when the domain
-        is not ``Shape``-backed (a user-supplied conforming mesh is used as-is) or the pairs are already
+        is not ``shape``-backed (a user-supplied conforming mesh is used as-is) or the pairs are already
         applied; ``True`` after a re-mesh."""
-        from ..geometry.shape import Shape
+        from ..geometry.shape import shape as _shape
 
-        shape = getattr(self, "_constructor_source", None)
-        if not isinstance(shape, Shape):
+        src = getattr(self, "_constructor_source", None)
+        if not isinstance(src, _shape):
             return False  # no geometry to re-mesh; rely on the mesh as given (fails loudly if non-conforming)
         want = frozenset(frozenset(p) for p in pairs)
         if want <= getattr(self, "_periodic_meshed", frozenset()):
             return False  # already conforming for these face pairs
         from ..geometry.emit import build as _emit_build
 
-        mesh, _dim, ds = _emit_build(shape, periodic=list(pairs))
+        mesh, _dim, ds = _emit_build(src, periodic=list(pairs))
         self.mesh, self.ds = mesh, ds
         if hasattr(self, "_reset_custom_tag_state"):
             self._reset_custom_tag_state()
@@ -3425,7 +3425,7 @@ class domain(MeshIOMixin):
                             tol=tol,
                         )
 
-                        # An internal material interface (auto-named "a|b" by Shape.regions) is a facet
+                        # An internal material interface (auto-named "a|b" by shape.regions) is a facet
                         # region you can impose a coupling/flux condition on, but it is NOT the outer
                         # boundary -- keep it out of boundary_tags() so `dirichlet(boundary_tags())`
                         # never pins it. It stays queryable via d.variable("a|b") / interface_tags().
@@ -4129,7 +4129,7 @@ class domain(MeshIOMixin):
                         f"count. Say which you want:\n"
                         f"  - continuous collocation points:  variable({tag!r}, sample=(n, None))\n"
                         f"  - a mesh's nodes:                 give the shape a size, e.g. "
-                        f"Shape.rect(..., size=0.05), or read d.mesh first\n"
+                        f"shape.rect(..., size=0.05), or read d.mesh first\n"
                         f"Mesh-free sampling is opt-in precisely so that neither is chosen for you."
                     )
                 self._build_deferred_mesh()  # a declared resolution: hand back that mesh's nodes
@@ -5098,7 +5098,7 @@ class domain(MeshIOMixin):
                     source_tag = "interior"
 
             if self._is_geometry_tag(source_tag):
-                # Mesh-free: draw from the Shape itself. No node pool, so no cap on `n_samples`
+                # Mesh-free: draw from the shape itself. No node pool, so no cap on `n_samples`
                 # and no two draws alike.
                 ii, og_tag = 0, tag
                 while tag in self.context and tag not in self._param_tags:

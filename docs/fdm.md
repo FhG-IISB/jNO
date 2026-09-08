@@ -118,8 +118,8 @@ For an axis-aligned **rectangle** or **box**, build a **regular grid** instead o
 asking the shape for a regular lattice with `.structured()`:
 
 ```python
-d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02).structured().domain()           # 2-D
-d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.05).structured().domain()   # 3-D
+d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02).structured().domain()           # 2-D
+d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.05).structured().domain()   # 3-D
 ```
 
 This meshes the rectangle as a uniform right-triangulation — or, in 3-D, the box as a Kuhn
@@ -153,7 +153,7 @@ field rather than silently dropping the imaginary part, matching the unstructure
     `fem.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())` on a structured domain. Override the
     inner solver with `.solve(nonlinear=…)` as usual.
 
-    Supported: **2-D axis-aligned rectangles** (`Shape.rect`) and **3-D boxes** (`Shape.box`). A
+    Supported: **2-D axis-aligned rectangles** (`shape.rect`) and **3-D boxes** (`shape.box`). A
     composite/CSG shape or a spatially varying `size=` raises; composite / cut-cell geometry is planned.
 
 ---
@@ -304,11 +304,11 @@ array eagerly, as in every section above.
 ## 3-D tetrahedral meshes
 
 Everything above dispatches on `domain.dimension`: give `jno.fdm` a **3-D tetrahedral** domain and the
-same constraint list solves in 3-D. Build the mesh with [`jno.Shape`](Domain-and-Geometry.md) — a box, sphere,
+same constraint list solves in 3-D. Build the mesh with [`jno.shape`](Domain-and-Geometry.md) — a box, sphere,
 cylinder, or any boolean combination — and add the third coordinate:
 
 ```python
-d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain()
+d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain()
 x, y, z, _   = d.variable("interior", split=True)          # note the z coordinate
 xb, yb, zb, _ = d.variable("boundary", split=True)
 u  = d.unknown()
@@ -321,7 +321,7 @@ sol = jno.fdm([
 ]).solve()
 ```
 
-A cube from `jno.Shape.box` auto-names its six faces `left/right/front/back/bottom/top`, so **flux**
+A cube from `jno.shape.box` auto-names its six faces `left/right/front/back/bottom/top`, so **flux**
 conditions work per face exactly as in 2-D — bind to the face and take the normal derivative
 (`nr = d.variable("right", normals=True)`, then `ui.d(nr) - h` or `ur.d(nr) + alpha*(ur - u_inf)`).
 
@@ -373,7 +373,7 @@ A periodic tie `u(left) - u(right)` (opposite faces) wraps that axis on a
 **Planned:** periodic on unstructured meshes and periodic geometric multigrid (a periodic structured solve
 is currently un-preconditioned, so it is slow on fine grids); composite / cut-cell structured geometry
 (axis-aligned rectangles and boxes are supported, above); 1-D meshes; transient / flux BCs on coupled
-multi-field systems. Authoring a `jno.Shape` sub-region
+multi-field systems. Authoring a `jno.shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive

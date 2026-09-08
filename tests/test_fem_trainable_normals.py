@@ -41,7 +41,7 @@ def _frozen_sign(pts, conn, normals_np, dim):
 
 
 def test_face_normals_jax_matches_numpy_2d():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     pts = np.asarray(d.mesh.points)[:, :2]  # the assembler builds geometry from dim-sliced points
     cells = np.asarray(d.mesh.cells_dict["triangle"])
     conn = build_facet_connectivity(cells, "triangle")
@@ -53,7 +53,7 @@ def test_face_normals_jax_matches_numpy_2d():
 
 
 def test_face_normals_jax_matches_numpy_3d():
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.5).domain()
     pts = np.asarray(d.mesh.points)[:, :3]
     cells = np.asarray(d.mesh.cells_dict["tetra"])
     conn = build_facet_connectivity(cells, "tetrahedron")
@@ -66,7 +66,7 @@ def test_face_normals_jax_matches_numpy_3d():
 
 def test_normal_is_differentiable_in_vertices():
     """The JAX normal has a finite, nonzero derivative w.r.t. the facet vertices (numpy normals do not)."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     pts = jnp.asarray(np.asarray(d.mesh.points)[:, :2])
     cells = np.asarray(d.mesh.cells_dict["triangle"])
     conn = build_facet_connectivity(cells, "triangle")
@@ -81,7 +81,7 @@ def test_normal_is_differentiable_in_vertices():
 def test_surface_normal_functional_gradient_matches_fd():
     """End-to-end: a normal-dependent Neumann flux makes a surface functional differentiable in a moving
     boundary coordinate, matching finite differences (the JAX normals flow gradients through the solve)."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
     u, phi = d.fem_symbols()
     xin, yin, _ = d.variable("interior", split=True)
     xb, yb, _tb, nxb, nyb = d.variable("boundary", split=True, normals=True)

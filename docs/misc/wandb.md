@@ -113,7 +113,7 @@ from jno.utils.config import get_wandb_run, wandb_log, wandb_log_model
 
 run = jno.setup(__file__, wandb=True)          # False (default) disables; a dict is passed to wandb.init
 
-dom = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+dom = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y, _ = dom.variable("interior")
 
 net = jno.nn(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))

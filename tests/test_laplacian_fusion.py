@@ -258,7 +258,7 @@ def test_temporal_derivative_does_not_fuse():
 
 def test_weak_form_tree_is_left_alone():
     """FEM trees are lowered by pattern in the variational route; the pass skips them."""
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     u, phi = dom.fem_symbols("u")
     x, y, _ = dom.variable("interior")
     weak = jno.np.inner(u.d(x), phi.d(x)) + jno.np.inner(u.d(y), phi.d(y))
@@ -272,7 +272,7 @@ def test_weak_form_tree_is_left_alone():
 
 
 def _loss_for(build_lap):
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
     x, y, _ = dom.variable("interior")
     net = jno.nn(foundax.mlp(in_features=2, output_dim=1, hidden_dims=8, num_layers=2, key=KEY))
     net.optimizer(optax.adam(1e-9))  # effectively frozen: epoch-0 loss is the pre-update value
@@ -282,7 +282,7 @@ def _loss_for(build_lap):
 
 
 def _reference_laplacian_mse():
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
     pts = jnp.asarray(dom.mesh_connectivity["points"])[:, :2]
     net = foundax.mlp(in_features=2, output_dim=1, hidden_dims=8, num_layers=2, key=KEY)
     H = jax.vmap(jax.hessian(lambda p: net(p[None, :])[0, 0]))(pts)
@@ -305,7 +305,7 @@ def test_every_spelling_matches_the_analytic_laplacian(spelling):
 
 def test_non_laplacian_sums_keep_their_own_meaning():
     """The guard cases must still compute what the user wrote, not a Laplacian."""
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
     pts = jnp.asarray(dom.mesh_connectivity["points"])[:, :2]
     net = foundax.mlp(in_features=2, output_dim=1, hidden_dims=8, num_layers=2, key=KEY)
     H = jax.vmap(jax.hessian(lambda p: net(p[None, :])[0, 0]))(pts)
@@ -324,7 +324,7 @@ def test_non_laplacian_sums_keep_their_own_meaning():
 
 def _compiled_derivative_nodes(build_lap):
     """Derivative-node counts in the constraint tree ``core`` actually compiles."""
-    dom = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     x, y, _ = dom.variable("interior")
     net = jno.nn(foundax.mlp(in_features=2, output_dim=1, hidden_dims=4, num_layers=2, key=KEY))
     net.optimizer(optax.adam(1e-3))

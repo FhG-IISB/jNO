@@ -42,7 +42,7 @@ EPS = 1e-9
 CD_REF, CL_REF, DP_REF = 5.57953523384, 0.010618948146, 0.11752016697
 
 # CSG, with a finer size on the disk: drag accuracy lives on the boundary layer around the cylinder.
-shape = jno.Shape.rect(0, 0, L, H, size=0.035) - jno.Shape.disk(CX, CY, RR, size=0.006)
+shape = jno.shape.rect(0, 0, L, H, size=0.035) - jno.shape.disk(CX, CY, RR, size=0.006)
 d = shape.domain()
 d.tag("inlet", lambda x, y: x < EPS)
 d.tag("walls", lambda x, y: (y < EPS) | (y > H - EPS))

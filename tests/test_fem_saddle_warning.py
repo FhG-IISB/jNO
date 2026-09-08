@@ -38,7 +38,7 @@ def _x64():
 
 def _stokes(size=0.4):
     """Taylor-Hood P2/P1: the canonical saddle system."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
     p, q = d.fem_symbols(names=("p", "q"), order=1)
     xi, yi = d.variable("interior", split=True)[:2]
@@ -63,7 +63,7 @@ def _two_coupled_scalars():
     The discriminating case: coupling alone is not a saddle, and a detector that only looked for
     off-diagonal terms would cry wolf on every multiphysics problem in the suite.
     """
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     s1, t1 = d.fem_symbols(names=("s1", "t1"), order=1)
     s2, t2 = d.fem_symbols(names=("s2", "t2"), order=1)
     xi, yi = d.variable("interior", split=True)[:2]
@@ -113,7 +113,7 @@ def test_choosing_a_solver_silences_it(slot):
 
 
 def test_a_problem_with_no_saddle_block_is_silent():
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     a, b = d.fem_symbols(names=("a", "b"), order=1)
     xi, yi = d.variable("interior", split=True)[:2]
     xb, yb = d.variable("boundary", split=True)[:2]

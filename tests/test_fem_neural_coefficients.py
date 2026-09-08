@@ -280,7 +280,7 @@ def test_net_in_robin_boundary_term():
     surface-kernel threading; constant net equals the scalar Robin reference."""
     from jno.jnp_ops import grad, inner
 
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.25).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.25).domain()
     u, w = d.fem_symbols(names=("u", "w"))
     xi, yi = d.variable("interior", split=True)[:2]
     vv = w.bind(x=xi, y=yi)

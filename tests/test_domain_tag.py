@@ -196,7 +196,7 @@ def test_variable_where_registers_tag_and_returns_coords_3d():
     """``variable("xlo", where=pred)`` on a 3D box tags the region (predicate lands in
     ``_tag_predicates``) and returns the split coordinate tuple ``(x, y, z, t)`` -- one call for what
     used to be ``tag`` + ``variable``."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     ret = d.variable("xlo", where=lambda x, y, z: x < 1e-6)
     assert isinstance(ret, tuple) and len(ret) == 4, "3D coordinate tag must return (x, y, z, t)"
     assert "xlo" in d._tag_predicates, "where= must register the tag exactly like tag()"
@@ -340,7 +340,7 @@ def test_a_facet_predicate_tag_is_readable_on_a_time_dependent_domain():
     which made a facet-selected boundary unusable for anything time-dependent (a moving front, say).
     """
     for time in ((0.0, 0.2, 5), None):
-        d = jno.Shape.rect(0.0, 0.0, 0.3, 0.5, size=0.08).domain(**({"time": time} if time else {}))
+        d = jno.shape.rect(0.0, 0.0, 0.3, 0.5, size=0.08).domain(**({"time": time} if time else {}))
         d.tag("top", lambda x, n, names: x[:, 1] > 0.5 - 1e-6)
 
         parts = d.variable("top", normals=True, split=True)

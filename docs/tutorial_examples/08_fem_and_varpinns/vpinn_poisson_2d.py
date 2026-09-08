@@ -22,7 +22,7 @@ import jno.jnp_ops as jnn
 jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 # ---- domain, network trial, weak form -------------------------------------------------------
-dom = jno.Shape.rect(0, 0, 1, 1, size=0.07).domain()
+dom = jno.shape.rect(0, 0, 1, 1, size=0.07).domain()
 u, phi = dom.fem_symbols()
 xi, yi, _ = dom.variable("interior", split=True)
 xb, yb, _ = dom.variable("boundary", split=True)
@@ -43,7 +43,7 @@ crux = jno.core([pde.mse], domain=dom)
 crux.solve(2500)
 
 # ---- verify the trained network against the analytic solution (on a fresh grid) ------------
-test_dom = jno.Shape.rect(0, 0, 1, 1, size=0.04).domain()
+test_dom = jno.shape.rect(0, 0, 1, 1, size=0.04).domain()
 xt, yt, _ = test_dom.variable("interior", split=True)
 exact_expr = xt * (1 - xt) * yt * (1 - yt)
 pred = np.asarray(crux.eval([net(xt, yt) * exact_expr], domain=test_dom)).reshape(-1)

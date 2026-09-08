@@ -29,7 +29,7 @@ returns the coordinates of a named region (`"interior"`, `"boundary"`, …); a d
 (effectively infinite) collocation points for a PINN.
 
 ```python
-dom = jno.Shape.rect(0, 0, 1, 1, size=0.04).domain()
+dom = jno.shape.rect(0, 0, 1, 1, size=0.04).domain()
 x, y, _ = dom.variable("interior")     # interior collocation coordinates
 ```
 
@@ -83,7 +83,7 @@ Epoch  1000/10000 | L: 1.2345e-03 | C0: 1.2345e-03
 [Evaluate](training/evaluation.md) the trained model on its own output — on a finer mesh if you like:
 
 ```python
-pred, xt, yt = crux.eval([u, x, y], domain=jno.Shape.rect(0, 0, 1, 1, size=0.01).domain())
+pred, xt, yt = crux.eval([u, x, y], domain=jno.shape.rect(0, 0, 1, 1, size=0.01).domain())
 print(pred.shape)                       # the learned field, sampled on the fine mesh
 ```
 

@@ -65,7 +65,7 @@ def _j2_stress(u, X, theta, ep_hist):
 def _march(theta_of_Xtau, nstep):
     """Build & solve a clamped-base J2 plasticity march driven by ``theta_of_Xtau(X, tau)``."""
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain(tau=(0.0, 1.0, nstep))
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain(tau=(0.0, 1.0, nstep))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)
@@ -110,7 +110,7 @@ def test_load_path_field_matches_analytic_in_tau():
 
 def test_load_path_field_on_plain_domain_fails_loud():
     sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()  # NO tau grid, no history
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()  # NO tau grid, no history
     co = d.variable("interior", split=True)
     cb_all = d.variable("boundary", split=True)
     X = [co[0], co[1], co[2]]
@@ -125,7 +125,7 @@ def test_load_path_field_on_plain_domain_fails_loud():
 
 
 def test_frame_count_mismatch_fails_loud():
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain(tau=(0.0, 1.0, 5))
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain(tau=(0.0, 1.0, 5))
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co = d.variable("interior", split=True)
     cb = d.variable("bot", split=True)

@@ -51,7 +51,7 @@ def _x64():
 
 
 def _build(size, nu, kind, quad_degree=6):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
     p, q = d.fem_symbols(names=("p", "q"), order=1)
     xi, yi, zi = d.variable("interior", split=True)[:3]

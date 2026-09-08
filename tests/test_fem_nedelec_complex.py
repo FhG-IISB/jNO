@@ -32,7 +32,7 @@ def _x64():
 
 
 def _n1e_cube(mesh_size=0.5):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]

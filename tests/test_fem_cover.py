@@ -218,7 +218,7 @@ def _poisson(space, size, dim=2, rhs=None, bc=0.0):
     import jno
 
     grad, inner = jno.np.grad, jno.np.inner
-    shp = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size) if dim == 2 else jno.Shape.box(0, 0, 0, 1, 1, 1, size=size)
+    shp = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size) if dim == 2 else jno.shape.box(0, 0, 0, 1, 1, 1, size=size)
     d = shp.domain()
     tol = 1e-9
     d.tag("walls", lambda *c: np.logical_or.reduce([(x < tol) | (x > 1 - tol) for x in c]))
@@ -331,7 +331,7 @@ def test_the_null_modes_are_gauged_away_without_changing_the_field():
     grad, inner = jno.np.grad, jno.np.inner
     vals = {}
     for space in ("Lagrange", "cover"):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
         d.tag("west", lambda x, y: x < 1e-9)
         co, cw = d.variable("interior", split=True), d.variable("west", split=True)
         X = [co[0], co[1]]
@@ -349,7 +349,7 @@ def test_an_order_above_one_is_refused_by_name():
     import jno
 
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
     X = [co[0], co[1]]
@@ -441,7 +441,7 @@ def test_the_element_is_exact_on_a_distorted_mesh():
 
     grad, inner = jno.np.grad, jno.np.inner
     rng = np.random.default_rng(7)
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     pts = np.asarray(d.mesh.points)
     tol = 1e-9
     inside = (pts[:, 0] > tol) & (pts[:, 0] < 1 - tol) & (pts[:, 1] > tol) & (pts[:, 1] < 1 - tol)
@@ -503,7 +503,7 @@ def test_the_coordinate_gradient_through_a_cover_solve_matches_finite_difference
 
     rel = {}
     for space in ("Lagrange", "cover"):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
         mv, _, _ = d.variable("mv", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
         mv.trainable(name="cx")
         op = d._trainable_coords[0]
@@ -541,7 +541,7 @@ def _heat_cover(space, size=0.12, kappa=0.1, t_end=0.3, nt=21):
 
     import jno
 
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain(time=(0.0, t_end, nt))
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain(time=(0.0, t_end, nt))
     u, phi = d.fem_symbols(space=space)
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

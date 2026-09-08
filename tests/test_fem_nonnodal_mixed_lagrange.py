@@ -48,7 +48,7 @@ def _tgrad(s):  # scalar gradient, TEST side -> (n_quad, n_dof, 3), the rank an 
 def _av(size=0.3, g=None, dirichlet_on_edge_field=False):
     """The A-V operator with jw -> 1: a curl-curl + mass block on N1E, a Laplacian on Lagrange, and
     the grad-V / A coupling that makes it genuinely mixed rather than two independent problems."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     p, q = d.fem_symbols(names=("p", "q"), space="Lagrange")
     ci = d.variable("interior", split=True)
@@ -143,7 +143,7 @@ def test_block_composition_inherits_complex_native():
 
 def _curl_curl(pins=None, size=0.6):
     """Curl-curl + mass on N1E, optionally with caller-supplied ``(dof, value)`` pins."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     ci = d.variable("interior", split=True)
     x, y, z = ci[0], ci[1], ci[2]

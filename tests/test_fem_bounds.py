@@ -85,7 +85,7 @@ def _obstacle_fem(*, bounded, ny=0.25, nx=0.05):
     Returns ``(fem, domain, equilibrium_term)`` — the term is handed back so a readout can assemble
     the very same expression the solve used (a fresh ``fem_symbols()`` would be a different field)."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, ny, size=nx).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, ny, size=nx).domain()
     d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
     co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
     X = [co[0], co[1]]
@@ -176,7 +176,7 @@ def test_kkt_complementarity_holds_at_the_solution():
 # --------------------------------------------------------------------------------------------------
 def test_a_bound_on_one_block_of_a_coupled_system():
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
     d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
     co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
     X = [co[0], co[1]]
@@ -221,7 +221,7 @@ def test_a_bound_on_one_block_of_a_coupled_system():
 # --------------------------------------------------------------------------------------------------
 def _ratchet_march(*, bounded, nstep=9):
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.08).domain(tau=(0.0, 1.0, nstep))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.08).domain(tau=(0.0, 1.0, nstep))
     d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
     co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
     X, tau = [co[0], co[1]], co[-1]
@@ -257,7 +257,7 @@ def test_bound_constrained_irreversibility_on_a_march():
 def test_a_history_bound_needs_a_load_path():
     """`u.i(-1)` means *the previous load step*, so on a plain domain it refers to nothing."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()  # NO tau grid
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()  # NO tau grid
     d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
     co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
     X = [co[0], co[1]]
@@ -286,7 +286,7 @@ def test_a_slack_bound_changes_nothing():
     """A box far outside the solution range must reproduce the unconstrained answer exactly — the
     min-map has to be the identity wherever no constraint is active."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
     d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
     co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
     X = [co[0], co[1]]
@@ -301,7 +301,7 @@ def test_a_fully_active_bound_pins_the_whole_field():
     """The degenerate extreme: a lower bound above the unconstrained solution everywhere. Every DOF is
     active, so the answer is the bound itself (the Dirichlet ends excepted)."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
     d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
     co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
     X = [co[0], co[1]]
@@ -318,7 +318,7 @@ def test_a_coordinate_expression_bound_matches_its_constant_equivalent():
     grad, inner = _aliases()
 
     def run(spatial):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
+        d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
         d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
         co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
         X = [co[0], co[1]]
@@ -338,7 +338,7 @@ def test_a_tilted_obstacle_shifts_the_contact_set():
     on the right (``-1.5C``), so it obstructs the membrane more there and the contact set shifts left.
     Checks feasibility pointwise against the *expression's own* values, not a single number."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.05).domain()
     d.tag("ends", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
     co, ce = d.variable("interior", split=True), d.variable("ends", split=True)
     X = [co[0], co[1]]
@@ -359,7 +359,7 @@ def test_a_tilted_obstacle_shifts_the_contact_set():
 
 
 def test_a_bound_may_not_depend_on_the_live_unknown():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
     u, _phi = d.fem_symbols()
     v, _chi = d.fem_symbols()
     with pytest.raises(ValueError, match="complementarity|live unknown"):
@@ -369,7 +369,7 @@ def test_a_bound_may_not_depend_on_the_live_unknown():
 
 
 def test_bounds_on_something_that_is_not_a_field_fails_loud():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
     co = d.variable("interior", split=True)
     u, _phi = d.fem_symbols()
     with pytest.raises(TypeError, match="fem_symbols|field"):
@@ -380,7 +380,7 @@ def test_bounds_on_something_that_is_not_a_field_fails_loud():
 
 def test_contradictory_box_fails_loud():
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
     co = d.variable("interior", split=True)
     X = [co[0], co[1]]
     u, phi = d.fem_symbols()
@@ -389,7 +389,7 @@ def test_contradictory_box_fails_loud():
 
 
 def test_bounds_needs_at_least_one_side():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.25, size=0.1).domain()
     u, _phi = d.fem_symbols()
     with pytest.raises(ValueError, match="lo|hi|at least"):
         u.bounds(None, None)
@@ -407,7 +407,7 @@ def test_a_coordinate_bound_on_a_vector_field_binds_per_node():
     sym, trace, inner = jno.np.symgrad, jno.np.trace, jno.np.inner
     lam, mu = 1.0, 1.0
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
     co = d.variable("interior", split=True)
     X = [co[0], co[1]]
     u, phi = d.fem_symbols(value_shape=(2,))
@@ -439,7 +439,7 @@ def test_a_coordinate_bound_must_be_one_value_per_node():
     """A bound expression that does not reduce to one value per DOF node is refused by name, rather
     than broadcast into a shape that happens to fit."""
     grad, inner = _aliases()
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     co = d.variable("interior", split=True)
     X = [co[0], co[1]]
     u, phi = d.fem_symbols(value_shape=(2,))

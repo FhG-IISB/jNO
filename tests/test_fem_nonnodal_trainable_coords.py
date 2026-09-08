@@ -39,7 +39,7 @@ def _curl_curl(size=0.5, trainable_axis=None):
     below is well defined. With ``trainable_axis`` set, that axis of every mesh vertex becomes a
     design variable.
     """
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     pts = np.asarray(d.mesh.points)
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     ci = d.variable("interior", split=True)

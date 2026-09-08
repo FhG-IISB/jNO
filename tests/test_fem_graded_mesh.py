@@ -1,4 +1,4 @@
-"""A graded mesh: ``Shape(..., size=f(x, y, z))`` -> a gmsh ``setSizeCallback``.
+"""A graded mesh: ``shape(..., size=f(x, y, z))`` -> a gmsh ``setSizeCallback``.
 
 ``Size = Union[float, Callable, None]`` (``jno/geometry/shape.py``), and a callable becomes a
 per-position mesh-size callback that composes with every other size control via ``min``
@@ -43,7 +43,7 @@ def _element_sizes(d):
 def test_a_graded_size_callable_actually_grades_the_mesh():
     """The oracle is the callable itself: element size near an edge must track ``f`` there, not some
     average. Without this, `size=` could be silently ignored and the mesh would still look fine."""
-    size, yc, _n = _element_sizes(jno.Shape.rect(0.0, 0.0, LX, LY, size=_graded).domain())
+    size, yc, _n = _element_sizes(jno.shape.rect(0.0, 0.0, LX, LY, size=_graded).domain())
     top = size[yc > LY - 0.25 * BAND].mean()
     bot = size[yc < 0.25 * BAND].mean()
     assert top == pytest.approx(H_FINE, rel=0.5), f"top band should be near {H_FINE * 1e6:.0f} um, got {top * 1e6:.2f}"
@@ -54,8 +54,8 @@ def test_a_graded_size_callable_actually_grades_the_mesh():
 def test_grading_buys_the_resolution_far_cheaper_than_a_uniform_mesh():
     """The whole point. Same size at the fine edge, a fraction of the nodes -- this is what makes a
     thin feature (a melt pool 48 um deep in a 400 um domain) affordable at all."""
-    _s, _y, n_graded = _element_sizes(jno.Shape.rect(0.0, 0.0, LX, LY, size=_graded).domain())
-    _s2, _y2, n_uniform = _element_sizes(jno.Shape.rect(0.0, 0.0, LX, LY, size=H_FINE).domain())
+    _s, _y, n_graded = _element_sizes(jno.shape.rect(0.0, 0.0, LX, LY, size=_graded).domain())
+    _s2, _y2, n_uniform = _element_sizes(jno.shape.rect(0.0, 0.0, LX, LY, size=H_FINE).domain())
     assert n_graded < n_uniform / 5, f"graded {n_graded} vs uniform {n_uniform} -- grading bought little"
 
 
@@ -72,13 +72,13 @@ def test_a_size_callable_of_the_wrong_arity_is_refused_by_name():
     with pytest.raises(TypeError, match=r"f\(x, y, z\)"):
         # `.mesh` forces the build: meshing is LAZY, so `.domain()` alone never reaches the callback
         # and the wrong signature would sail through until something first asked for a mesh.
-        jno.Shape.rect(0.0, 0.0, LX, LY, size=two_arg).domain().mesh
+        jno.shape.rect(0.0, 0.0, LX, LY, size=two_arg).domain().mesh
 
 
 def test_a_graded_mesh_composes_with_a_time_grid():
     """Grading is geometry and the time grid is not, but they meet on the domain -- and a melt-pool
     model needs both at once."""
-    d = jno.Shape.rect(0.0, 0.0, LX, LY, size=_graded).domain(time=(0.0, 1.0e-3, 5))
+    d = jno.shape.rect(0.0, 0.0, LX, LY, size=_graded).domain(time=(0.0, 1.0e-3, 5))
     size, yc, n = _element_sizes(d)
     assert n > 0 and np.isfinite(size).all()
     assert size[yc < 0.25 * BAND].mean() > 3.0 * size[yc > LY - 0.25 * BAND].mean()

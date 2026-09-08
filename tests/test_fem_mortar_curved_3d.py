@@ -52,9 +52,9 @@ def _x64():
 def _spheres(h_in, h_out, R=1.0, RO=2.0):
     """A ball in a shell: the interface is a full sphere — curved AND closed, which the 2-D arc-length
     coordinate cannot do at all (it is periodic, so a loop must be cut into arcs first)."""
-    ball = jno.Shape.sphere(0, 0, 0, R)
-    return jno.Shape.regions(
-        ball=ball.sized(h_in), shell=(jno.Shape.sphere(0, 0, 0, RO) - ball).sized(h_out), conforming=False
+    ball = jno.shape.sphere(0, 0, 0, R)
+    return jno.shape.regions(
+        ball=ball.sized(h_in), shell=(jno.shape.sphere(0, 0, 0, RO) - ball).sized(h_out), conforming=False
     ).domain()
 
 

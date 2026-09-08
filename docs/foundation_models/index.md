@@ -53,6 +53,6 @@ For Poseidon-style structured 2D workflows, build the grid on the unit square. `
 so a 128x128 *pixel* grid — the resolution these models expect — is `n=127`:
 
 ```python
-domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=127).domain()
+domain = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=127).domain()
 domain.grid["shape"]     # (128, 128) — nodes; a nodal field reshapes straight to it
 ```

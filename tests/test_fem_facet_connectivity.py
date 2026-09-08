@@ -65,7 +65,7 @@ def test_boundary_closes_on_a_real_mesh(cell_type):
         mesh = jno.domain(box(0, 0, 1, 1), mesh_size=0.15).built_mesh
         cells = np.asarray(mesh.cells_dict["triangle"])
     else:
-        mesh = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain().built_mesh
+        mesh = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain().built_mesh
         cells = np.asarray(mesh.cells_dict["tetra"])
     conn = build_facet_connectivity(cells, cell_type)
     assert conn.n_bfaces > 0
@@ -119,7 +119,7 @@ def test_shared_boundary_set_matches_the_independent_implementation(cells, cell_
 def test_shared_boundary_set_matches_on_a_real_mesh():
     from jno.domain.mesh_utils import MeshUtils
 
-    cells = np.asarray(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
+    cells = np.asarray(jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
     assert np.array_equal(
         MeshUtils._get_boundary_elements(cells, "tetra"),
         MeshUtils._get_boundary_elements_reference(cells, "tetra"),
@@ -131,7 +131,7 @@ def test_the_face_computation_is_shared_between_equal_but_distinct_arrays():
     connectivity, so an identity-keyed cache scored 0% and both paid. Content keying is the fix."""
     from jno.utils.solver import fem_facets
 
-    cells = np.asarray(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
+    cells = np.asarray(jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
     fem_facets._FACET_CACHE.clear()
     fem_facets.boundary_face_set(cells, "tetra")
     fem_facets.build_facet_connectivity(cells.copy(), "tetrahedron")  # a DIFFERENT object
@@ -171,7 +171,7 @@ def test_boundary_facets_match_the_row_wise_unique(cells, dim, order):
             mesh = jno.domain(box(0, 0, 1, 1), mesh_size=0.15).built_mesh
             pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict["triangle"])
         else:
-            mesh = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh
+            mesh = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh
             pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict["tetra"])
         if order >= 2:  # P2 connectivity: vertices first, then one midpoint per edge
             e = np.sort(np.concatenate([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]), axis=1)
@@ -235,8 +235,8 @@ def _face_normals_reference(points, conn, cells, cell_type):
 @pytest.mark.parametrize(
     "shape,cell_key,cell_type",
     [
-        (jno.Shape.rect(0, 0, 1, 1, size=0.12), "triangle", "triangle"),
-        (jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3), "tetra", "tetrahedron"),
+        (jno.shape.rect(0, 0, 1, 1, size=0.12), "triangle", "triangle"),
+        (jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3), "tetra", "tetrahedron"),
     ],
 )
 def test_face_normals_match_the_per_face_loop(shape, cell_key, cell_type):

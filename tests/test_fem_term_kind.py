@@ -18,7 +18,7 @@ def ctx():
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     dom = (
-        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0)
         .structured(n=8)
         .domain(
             time=(0.0, 1.0, 3),
@@ -120,7 +120,7 @@ def test_term_kinds_accessor_breaks_down_a_transient_pde():
     jax.config.update("jax_enable_x64", True)
     try:
         dom = (
-            jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+            jno.shape.rect(0.0, 0.0, 1.0, 1.0)
             .structured(n=8)
             .domain(
                 time=(0.0, 0.1, 3),

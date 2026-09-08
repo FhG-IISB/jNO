@@ -52,7 +52,7 @@ def _x64():
 
 def _ridge_problem(cell="simplex", size=0.09):
     """-Delta u = a thin diagonal ridge source. Returns the pieces a criterion is written from."""
-    s = jno.Shape.rect(0, 0, 1, 1, size=size)
+    s = jno.shape.rect(0, 0, 1, 1, size=size)
     d = (s.quad() if cell == "tensor" else s).domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
@@ -79,7 +79,7 @@ def _size_on_and_off_ridge(dom, halfwidth=0.10):
 def test_a_coordinate_criterion_refines_where_it_peaks(cell):
     """The headline. A criterion peaked on the ridge must put the small cells there — and the ridge is
     NOT where the ZZ estimator would refine, since the solution of this problem is smooth."""
-    if cell == "simplex":  # the tensor path rebuilds its Shape plan; only the simplex one calls mmg
+    if cell == "simplex":  # the tensor path rebuilds its shape plan; only the simplex one calls mmg
         pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     d, fem, _ui, _vi, xi, yi = _ridge_problem(cell)
     crit = jno.np.exp(-(((xi + yi - 1.0) / 0.06) ** 2))
@@ -196,7 +196,7 @@ def _vector_ridge_problem(size=0.09):
     Written the way a vector form is always written -- componentwise, `t[0].x` and `t[1]`, never a bare
     `t` -- because that is exactly what the assembler supports and what makes the criterion's own test
     binding the odd one out."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(2,))
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

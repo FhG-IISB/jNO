@@ -30,7 +30,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
 def _domain(cell, n, dim=2):
-    s = (jno.Shape.rect(0, 0, 1, 1) if dim == 2 else jno.Shape.box(0, 0, 0, 1, 1, 1)).structured(n=n)
+    s = (jno.shape.rect(0, 0, 1, 1) if dim == 2 else jno.shape.box(0, 0, 0, 1, 1, 1)).structured(n=n)
     return (s.quad() if cell == "tensor" else s).domain()
 
 
@@ -207,7 +207,7 @@ def test_a_structured_quad_plan_refuses_rather_than_silently_doing_nothing():
     """A `.structured()` lattice's resolution is its cell COUNTS, not a size field — so rebuilding it
     against a marked size field returns the very same mesh. That is a silent no-op: the loop runs,
     reports rounds, and refines nothing. Refuse it and say which knob actually controls resolution."""
-    fem = _quad_fem()  # Shape.rect(...).structured(n=6).quad()
+    fem = _quad_fem()  # shape.rect(...).structured(n=6).quad()
     with pytest.raises(NotImplementedError, match="cell COUNTS"):
         fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=2))
 
@@ -229,7 +229,7 @@ L_SHAPE = [(0, 0), (1, 0), (1, 0.5), (0.5, 0.5), (0.5, 1), (0, 1)]
 
 
 def _l_shape(cell, size=0.12):
-    s = jno.Shape.polygon(L_SHAPE, size=size)
+    s = jno.shape.polygon(L_SHAPE, size=size)
     d = (s.quad() if cell == "tensor" else s).domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
@@ -258,7 +258,7 @@ def _ritz_energy(d, sol):
 
 @pytest.mark.slow
 def test_the_quad_loop_refines_and_stays_all_quad():
-    """The loop end to end. mmg cannot adapt a quad mesh, so the remesh stage rebuilds the `Shape`
+    """The loop end to end. mmg cannot adapt a quad mesh, so the remesh stage rebuilds the `shape`
     plan at the marked size field — which means the result has to be checked for purity, not assumed:
     a leftover triangle would be a mixed mesh the assembler refuses less clearly."""
     d, fem = _l_shape("tensor")

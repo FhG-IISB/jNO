@@ -87,7 +87,7 @@ def cavity3d(model="none", n=N, nu=NU_MOL):
     The projection block is present in every variant, `none` included, so the systems being compared
     have identical structure and the difference between them is the model and nothing else.
     """
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=n).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=n).domain()
     d.tag("lid", lambda x, y, z: z > 1 - 1e-9)
     d.tag("wall", lambda x, y, z: (z < 1e-9) | (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     d.point_region("ppin", (0.0, 0.0, 0.0))
@@ -151,7 +151,7 @@ def couette3d(model="none", n=N, nu=NU_MOL):
     which Vreman and WALE are constructed to vanish. Note the flow itself cannot discriminate: nu_t is
     spatially constant here, and a constant viscosity leaves a Couette profile unchanged. The
     discriminating quantity IS nu_t, which is why it is projected and read out."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=n).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=n).domain()
     d.tag("all", lambda x, y, z: (z < 1e-9) | (z > 1 - 1e-9) | (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     d.point_region("ppin", (0.0, 0.0, 0.0))
 

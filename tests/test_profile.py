@@ -34,7 +34,7 @@ pytest.importorskip("pygmsh", reason="pygmsh required for meshing")
 def test_fem_solve_profile(tmp_path, monkeypatch, capsys):
     """fem.solve(profile=True) profiles the linear solve: returns the field, prints a summary, writes a trace."""
     monkeypatch.chdir(tmp_path)
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -50,7 +50,7 @@ def test_fem_solve_profile(tmp_path, monkeypatch, capsys):
 def test_fdm_solve_profile(tmp_path, monkeypatch, capsys):
     """fdm.solve(profile=True) profiles the strong-form Newton solve — same summary + trace contract."""
     monkeypatch.chdir(tmp_path)
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).domain()
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     u = d.unknown()

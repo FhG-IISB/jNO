@@ -47,7 +47,7 @@ def _x64():
 
 def _two_region(size=0.22):
     return (
-        jno.Shape.rect(0.0, 0.0, L, H).name("fluid").sized(size) + jno.Shape.rect(X0, -T, X1, 0.0).name("solid").sized(size)
+        jno.shape.rect(0.0, 0.0, L, H).name("fluid").sized(size) + jno.shape.rect(X0, -T, X1, 0.0).name("solid").sized(size)
     ).domain()
 
 
@@ -100,7 +100,7 @@ def test_a_volume_region_dirichlet_works_on_independently_meshed_bodies():
 
     ``_two_region`` above composes with ``+``, which builds through the polygon domain and populates
     ``domain._source_regions``. The classifier gated the volumetric pin on exactly that dict. But
-    ``Shape.regions(..., conforming=False)`` is built by the gmsh emitter, which never writes it, so
+    ``shape.regions(..., conforming=False)`` is built by the gmsh emitter, which never writes it, so
     the pin raised "did you forget the test function?" on precisely the domains the tie machinery
     exists for -- while ``_region_node_ids_from_cells`` was already able to resolve the region's nodes
     from cell topology. The resolution existed; the gate would not let it be reached.
@@ -109,9 +109,9 @@ def test_a_volume_region_dirichlet_works_on_independently_meshed_bodies():
     in the second. Gating on that keeps the guard that matters -- a whole-domain trial-only term really
     is a forgotten test function -- which the last assertion pins.
     """
-    d = jno.Shape.regions(
-        fluid=jno.Shape.rect(0.0, 0.0, L, H).sized(0.22),
-        solid=jno.Shape.rect(X0, -T, X1, 0.0).sized(0.22),
+    d = jno.shape.regions(
+        fluid=jno.shape.rect(0.0, 0.0, L, H).sized(0.22),
+        solid=jno.shape.rect(X0, -T, X1, 0.0).sized(0.22),
         conforming=False,
     ).domain()
     v, psi = d.fem_symbols(value_shape=(2,), names=("v", "psi"), order=2)

@@ -130,7 +130,7 @@ def test_a_parameter_composes_with_a_complex_pair():
     (jnp.asarray(ComplexPair)), so Python never consulted the pair's reflected op. It now
     distributes over (re, im). The parametric complex-pair ASSEMBLY remains its own explicit
     NotImplementedError one layer down -- this pins the algebra, which every spelling needs first."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     u, _v = d.fem_symbols(complex=True)
     xi, yi = d.variable("interior", split=True)[:2]
     ui = u.bind(x=xi, y=yi)
@@ -150,7 +150,7 @@ def test_plain_symbol_2d_parametric_complex_solves():
     import jno.jnp_ops as J
     from jno.utils.solver.linear import sparse_lu_solve
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     u, v = d.fem_symbols()
     xi, yi = d.variable("interior", split=True)[:2]
     xb, yb = d.variable("boundary", split=True)[:2]

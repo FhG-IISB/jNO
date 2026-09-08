@@ -39,8 +39,8 @@ def _x64():
 
 def _two_region(size=0.5):
     return (
-        jno.Shape.box(0, 0, 0, 1, 1, 1).name("lower").sized(size)
-        + jno.Shape.box(0, 0, 1, 1, 1, 2).name("upper").sized(size)
+        jno.shape.box(0, 0, 0, 1, 1, 1).name("lower").sized(size)
+        + jno.shape.box(0, 0, 1, 1, 1, 2).name("upper").sized(size)
     ).domain()
 
 
@@ -113,7 +113,7 @@ def test_a_volume_region_pin_covers_the_whole_region():
 
     This test previously asserted the DEFECT (``n_dead == 33 and n_pin == 32``) and read the pin
     through ``tag_node_mask("upper", ...)``. That returns ``None`` for anything that is not a
-    ``domain.tag`` -- and "upper" is a ``Shape.name`` region -- so it raised ``TypeError`` from the
+    ``domain.tag`` -- and "upper" is a ``shape.name`` region -- so it raised ``TypeError`` from the
     commit that introduced it and never once ran its assertions. The behaviour it was guarding was
     then fixed, leaving it wrong twice over.
     """
@@ -134,7 +134,7 @@ def test_a_volume_region_pin_covers_the_whole_region():
     assert dead <= ids, f"the pin misses {len(dead - ids)} of the {len(dead)} ungoverned DOFs"
 
     assert d.tag_node_mask("upper", pts) is None, (
-        "tag_node_mask now resolves a Shape-region name; this test's premise -- that a volume-region "
+        "tag_node_mask now resolves a shape-region name; this test's premise -- that a volume-region "
         "pin must NOT be resolved through it -- needs rechecking"
     )
 

@@ -63,7 +63,7 @@ def _sbox(dx=0.07, ny=5):
     tets = np.asarray(tets)
     F = np.concatenate([tets[:, [0, 1, 2]], tets[:, [0, 1, 3]], tets[:, [0, 2, 3]], tets[:, [1, 2, 3]]])
     uq, cnt = np.unique(np.sort(F, 1), axis=0, return_counts=True)
-    d = _domain_from_arrays(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2).domain(), Pt, tets, uq[cnt == 1], copy=True)
+    d = _domain_from_arrays(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2).domain(), Pt, tets, uq[cnt == 1], copy=True)
     e = 1e-6
     for nm, f in [
         ("bottom", lambda x, y, z: z < e),
@@ -453,7 +453,7 @@ class _FakeExposure:  # a stub exposure carrying a prescribed bulk image, for te
 
 
 def test_caresist_3d_develops_exposed_stripe():
-    """The 3-D CAResist (a jno.Shape box, periodic in x,y, species diffusing in x,y AND z) develops a printed
+    """The 3-D CAResist (a jno.shape box, periodic in x,y, species diffusing in x,y AND z) develops a printed
     pattern that TRACKS the exposure: seeded from a bulk image with a bright exposed stripe in x, the exposed
     region deprotects and clears while the dark edges stay -- a strong positive correlation with the stripe
     (the periodic-tie prolongation must be right for the developed volume to follow the seed; the pre-fix
@@ -480,7 +480,7 @@ def test_caresist_3d_develops_exposed_stripe():
 @needs_fmmax
 def test_caresist_3d_end_to_end():
     """The 3-D PEB wires end to end through the real optics: exp.develop(CAResist(film=...)) reads the
-    standing-wave bulk image, solves the 3-D reaction-diffusion PEB on a jno.Shape box (periodic x,y via a
+    standing-wave bulk image, solves the 3-D reaction-diffusion PEB on a jno.shape box (periodic x,y via a
     conforming remesh), and returns a finite developed (n, n, nz) volume in [0, 1]."""
     exp = jno.rcwa(_cons(_line), orders=40, grid=40).solve().expose(NA=0.6, source=0.4)
     film = jno.litho.Film(n_resist=1.6, thickness=0.6, n_substrate=4.0, nz=6)
@@ -494,7 +494,7 @@ def test_caresist_3d_end_to_end():
 def test_caresist_3d_is_differentiable_ilt():
     """ILT through the 3-D PEB: jax.grad of a developed-volume loss w.r.t. the mask permittivity matches
     finite difference through the WHOLE chain — RCWA solve → standing-wave bulk image → 3-D reaction-diffusion
-    PEB on a jno.Shape box → developed volume. The rigorous depth-resolved resist stays fully differentiable."""
+    PEB on a jno.shape box → developed volume. The rigorous depth-resolved resist stays fully differentiable."""
     cons, ep = _ilt_cons()
     film = jno.litho.Film(n_resist=1.6, thickness=0.6, n_substrate=4.0, nz=4)
     # Sized to fit an 8 GB GPU. The periodic transient prolongs its whole trajectory back to the full

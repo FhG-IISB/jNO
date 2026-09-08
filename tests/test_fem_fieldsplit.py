@@ -20,7 +20,7 @@ import jno
 
 def _nonlinear_diffusion(size=0.2):
     """-div((1+u^2) grad u) = f — the smallest problem with a genuinely solution-dependent operator."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

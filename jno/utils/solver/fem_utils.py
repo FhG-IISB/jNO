@@ -649,8 +649,8 @@ def _cell_region_mask(domain, region):
     elif region in preds:
         m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
     elif region in shape_regions:
-        # A Shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D),
-        # MINUS every higher-priority region, because Shape.regions lets regions overlap and resolves
+        # A shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D),
+        # MINUS every higher-priority region, because shape.regions lets regions overlap and resolves
         # them by declaration order -- a cell belongs to the FIRST region containing it, which is how
         # the mesh itself is labelled (`emit._to_meshio`).
         #
@@ -686,7 +686,7 @@ def _cell_region_mask(domain, region):
         if region not in membership:
             raise ValueError(
                 f"jno.fem per-region integration: unknown region {region!r}. Define it with "
-                f"domain.tag(name, predicate), a Shape.regions() sub-region, or a geometry part, "
+                f"domain.tag(name, predicate), a shape.regions() sub-region, or a geometry part, "
                 f"or name a volume region of the mesh file. Mesh volume regions here: "
                 f"{sorted(membership)}."
             )
@@ -2321,7 +2321,7 @@ def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None, *, entity_keys
     # merely COINCIDE in space.
     #
     # Coordinate keying was the right conformity test for one body and the wrong one for two. On a
-    # `Shape.regions(..., conforming=False)` mesh the interface is coincident *on purpose*: the seeding
+    # `shape.regions(..., conforming=False)` mesh the interface is coincident *on purpose*: the seeding
     # loop below used to collapse the two bodies' duplicated vertices into one map entry (last writer
     # wins), and every midpoint synthesised there then resolved to a single node -- welding the bodies,
     # silently. Measured on a two-body bar: 37 nodes referenced by BOTH bodies, all on the interface.
@@ -4730,7 +4730,7 @@ def elem_map(fn, xs, chunk):
 
     **What this costs.** Rebuilding an identical problem from scratch allocates fresh mesh arrays, so
     the key legitimately misses and that path pays a trace plus a compile where the old eager route
-    hit JAX's per-op cache (which keys on shapes): 283 -> 710 ms. Shape-keying instead would be faster
+    hit JAX's per-op cache (which keys on shapes): 283 -> 710 ms. shape-keying instead would be faster
     and WRONG -- it would hand a compilation baked with one mesh's coordinates to a different mesh of
     the same size. The honest fix for that case is to stop baking the geometry in at all and pass it
     as an argument, a restructure of how ``fem_native`` builds these closures. Until then the trade is

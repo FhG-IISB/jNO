@@ -1,4 +1,4 @@
-"""``jno.Shape`` mesh-free sampling — the analytic geometry a PINN draws collocation points from.
+"""``jno.shape`` mesh-free sampling — the analytic geometry a PINN draws collocation points from.
 
 Three things have to hold for this to replace mesh nodes as the collocation source:
 
@@ -17,7 +17,7 @@ import math
 import numpy as np
 import pytest
 
-from jno.geometry import Shape
+from jno.geometry import shape
 
 pytestmark = pytest.mark.filterwarnings("ignore")
 
@@ -37,14 +37,14 @@ def _mc_volume(shape, n=200_000, seed=0):
 
 
 def test_bounds_are_exact_for_primitives():
-    assert Shape.rect(0.0, 0.0, 2.0, 1.0).bounds() == ((0.0, 0.0, 0.0), (2.0, 1.0, 0.0))
-    assert Shape.box(0.0, 0.0, 0.0, 2.0, 1.0, 3.0).bounds() == ((0.0, 0.0, 0.0), (2.0, 1.0, 3.0))
-    lo, hi = Shape.disk(1.0, 2.0, 0.5).bounds()
+    assert shape.rect(0.0, 0.0, 2.0, 1.0).bounds() == ((0.0, 0.0, 0.0), (2.0, 1.0, 0.0))
+    assert shape.box(0.0, 0.0, 0.0, 2.0, 1.0, 3.0).bounds() == ((0.0, 0.0, 0.0), (2.0, 1.0, 3.0))
+    lo, hi = shape.disk(1.0, 2.0, 0.5).bounds()
     assert np.allclose(lo, (0.5, 1.5, 0.0)) and np.allclose(hi, (1.5, 2.5, 0.0))
-    lo, hi = Shape.sphere(1.0, 1.0, 1.0, 2.0).bounds()
+    lo, hi = shape.sphere(1.0, 1.0, 1.0, 2.0).bounds()
     assert np.allclose(lo, (-1.0, -1.0, -1.0)) and np.allclose(hi, (3.0, 3.0, 3.0))
     # a cylinder's box is the caps' centres widened by the disc projected on each axis
-    lo, hi = Shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0).bounds()
+    lo, hi = shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0).bounds()
     assert np.allclose(lo, (-1.0, -1.0, 0.0)) and np.allclose(hi, (1.0, 1.0, 4.0))
 
 
@@ -52,17 +52,17 @@ def test_bounds_bound_the_shape_under_csg_and_transforms():
     """A box that is not a superset silently truncates the sampler, so assert containment
     directly: every point of the shape must lie inside the reported box."""
     shapes = [
-        Shape.rect(0.0, 0.0, 1.0, 1.0) - Shape.disk(0.5, 0.5, 0.25),
-        Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0) - Shape.sphere(0.5, 0.5, 0.5, 0.3),
-        Shape.rect(0.0, 0.0, 2.0, 1.0) | Shape.disk(3.0, 0.0, 1.0),
-        Shape.rect(0.0, 0.0, 2.0, 1.0).translate((5.0, 7.0, 0.0)),
-        Shape.rect(0.0, 0.0, 2.0, 1.0).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 6),
-        Shape.disk(0.0, 0.0, 1.0).extrude(3.0),
-        Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi),
+        shape.rect(0.0, 0.0, 1.0, 1.0) - shape.disk(0.5, 0.5, 0.25),
+        shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0) - shape.sphere(0.5, 0.5, 0.5, 0.3),
+        shape.rect(0.0, 0.0, 2.0, 1.0) | shape.disk(3.0, 0.0, 1.0),
+        shape.rect(0.0, 0.0, 2.0, 1.0).translate((5.0, 7.0, 0.0)),
+        shape.rect(0.0, 0.0, 2.0, 1.0).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 6),
+        shape.disk(0.0, 0.0, 1.0).extrude(3.0),
+        shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi),
     ]
-    for shape in shapes:
-        lo, hi = (np.asarray(v, dtype=float) for v in shape.bounds())
-        pts = shape.sample_interior(4000, np.random.default_rng(0))
+    for shp in shapes:
+        lo, hi = (np.asarray(v, dtype=float) for v in shp.bounds())
+        pts = shp.sample_interior(4000, np.random.default_rng(0))
         assert (pts >= lo - 1e-9).all() and (pts <= hi + 1e-9).all()
 
 
@@ -72,7 +72,7 @@ def test_bounds_come_from_the_tessellation_without_a_closed_form():
     Rounding the edges of the unit cube removes material only near them, so the extent is unchanged
     -- which is what makes this a check on the answer and not just on the plumbing.
     """
-    solid = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0).fillet(0.05).size(0.2)
+    solid = shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0).fillet(0.05).size(0.2)
     assert not solid.is_analytic()
     lo, hi = solid.bounds()
     assert np.allclose(lo, (0.0, 0.0, 0.0), atol=1e-9)
@@ -85,17 +85,17 @@ def test_bounds_come_from_the_tessellation_without_a_closed_form():
 @pytest.mark.parametrize(
     "shape",
     [
-        Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2),
-        (Shape.rect(0.0, 0.0, 1.0, 1.0) - Shape.disk(0.5, 0.5, 0.25)).sized(0.06),
-        Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.3),
-        (Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0) - Shape.sphere(0.5, 0.5, 0.5, 0.3)).sized(0.15),
-        Shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0, size=0.5),
-        Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).translate((5.0, 7.0, 0.0)),
-        Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 6),
-        Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).extrude(2.0),
-        Shape.disk(0.0, 0.0, 1.0, size=0.3).extrude(3.0),
-        Shape.rect(1.0, 0.0, 2.0, 1.0, size=0.25).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi),
-        Shape.rect(1.0, 0.0, 2.0, 1.0, size=0.25).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), math.pi),
+        shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2),
+        (shape.rect(0.0, 0.0, 1.0, 1.0) - shape.disk(0.5, 0.5, 0.25)).sized(0.06),
+        shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.3),
+        (shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0) - shape.sphere(0.5, 0.5, 0.5, 0.3)).sized(0.15),
+        shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0, size=0.5),
+        shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).translate((5.0, 7.0, 0.0)),
+        shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 6),
+        shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).extrude(2.0),
+        shape.disk(0.0, 0.0, 1.0, size=0.3).extrude(3.0),
+        shape.rect(1.0, 0.0, 2.0, 1.0, size=0.25).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi),
+        shape.rect(1.0, 0.0, 2.0, 1.0, size=0.25).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), math.pi),
     ],
     ids=[
         "rect",
@@ -126,15 +126,15 @@ def test_contains_accepts_every_node_of_the_mesh_it_describes(shape):
 @pytest.mark.parametrize(
     "shape, volume",
     [
-        (Shape.rect(0.0, 0.0, 2.0, 1.0), 2.0),
-        (Shape.rect(0.0, 0.0, 1.0, 1.0) - Shape.disk(0.5, 0.5, 0.25), 1.0 - math.pi / 16),
-        (Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0), 1.0),
-        (Shape.sphere(0.0, 0.0, 0.0, 1.0), 4.0 / 3.0 * math.pi),
-        (Shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0), 4.0 * math.pi),
-        (Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(2.0), 2.0),
-        (Shape.disk(0.0, 0.0, 1.0).extrude(3.0), 3.0 * math.pi),
+        (shape.rect(0.0, 0.0, 2.0, 1.0), 2.0),
+        (shape.rect(0.0, 0.0, 1.0, 1.0) - shape.disk(0.5, 0.5, 0.25), 1.0 - math.pi / 16),
+        (shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0), 1.0),
+        (shape.sphere(0.0, 0.0, 0.0, 1.0), 4.0 / 3.0 * math.pi),
+        (shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0), 4.0 * math.pi),
+        (shape.rect(0.0, 0.0, 1.0, 1.0).extrude(2.0), 2.0),
+        (shape.disk(0.0, 0.0, 1.0).extrude(3.0), 3.0 * math.pi),
         # profile x in [1,2] swept about +y: the ring pi*(2^2 - 1^2) * height 1
-        (Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi), 3.0 * math.pi),
+        (shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi), 3.0 * math.pi),
     ],
     ids=["rect", "rect-disk", "box", "sphere", "cylinder", "extrude", "disk-extrude", "revolve"],
 )
@@ -143,10 +143,10 @@ def test_membership_reproduces_the_analytic_volume(shape, volume):
 
 
 def test_sampled_points_are_inside_and_fill_the_shape():
-    shape = Shape.rect(0.0, 0.0, 1.0, 1.0) - Shape.disk(0.5, 0.5, 0.25)
-    pts = shape.sample_interior(20_000, np.random.default_rng(0))
+    geom = shape.rect(0.0, 0.0, 1.0, 1.0) - shape.disk(0.5, 0.5, 0.25)
+    pts = geom.sample_interior(20_000, np.random.default_rng(0))
     assert pts.shape == (20_000, 3)
-    assert shape.contains(pts, tol=0.0).all()
+    assert geom.contains(pts, tol=0.0).all()
     # and they cover it: on a 10x10 grid the only cells left empty are the ones the hole swallows
     # whole, so the coverage gap IS the hole rather than a blind spot of the sampler.
     hist, xe, ye = np.histogram2d(pts[:, 0], pts[:, 1], bins=10, range=[[0, 1], [0, 1]])
@@ -159,18 +159,18 @@ def test_sampled_points_are_inside_and_fill_the_shape():
 def test_draws_are_continuous_not_a_fixed_point_set():
     """The whole point of mesh-free sampling: successive draws are different points, and the
     count is not capped by any node set."""
-    shape = Shape.disk(0.0, 0.0, 1.0)
+    geom = shape.disk(0.0, 0.0, 1.0)
     rng = np.random.default_rng(0)
-    a = shape.sample_interior(500, rng)
-    b = shape.sample_interior(500, rng)
+    a = geom.sample_interior(500, rng)
+    b = geom.sample_interior(500, rng)
     assert not np.allclose(np.sort(a, axis=0), np.sort(b, axis=0))
-    # far more points than a mesh of this shape would ever have nodes, with no cap and no warning
-    many = shape.sample_interior(200_000, rng)
+    # far more points than a mesh of this geom would ever have nodes, with no cap and no warning
+    many = geom.sample_interior(200_000, rng)
     assert len(many) == 200_000 and len(np.unique(many, axis=0)) == 200_000
 
 
 def test_a_vanishing_shape_raises_instead_of_returning_short():
-    empty = Shape.disk(0.0, 0.0, 1.0) & Shape.disk(10.0, 0.0, 1.0)  # disjoint -> empty intersection
+    empty = shape.disk(0.0, 0.0, 1.0) & shape.disk(10.0, 0.0, 1.0)  # disjoint -> empty intersection
     with pytest.raises(RuntimeError, match="vanishing|empty"):
         empty.sample_interior(10, np.random.default_rng(0), max_rounds=3)
 
@@ -181,20 +181,20 @@ def test_a_vanishing_shape_raises_instead_of_returning_short():
 @pytest.mark.parametrize(
     "shape",
     [
-        Shape.rect(0.0, 0.0, 2.0, 1.0),
-        Shape.disk(1.0, 2.0, 0.5),
-        Shape.box(0.0, 0.0, 0.0, 2.0, 1.0, 3.0),
-        Shape.sphere(0.0, 0.0, 0.0, 1.0),
-        Shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0),
-        Shape.rect(0.0, 0.0, 1.0, 1.0) - Shape.disk(0.5, 0.5, 0.25),
-        Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0) - Shape.sphere(0.5, 0.5, 0.5, 0.3),
-        Shape.rect(0.0, 0.0, 2.0, 1.0).translate((5.0, 7.0, 0.0)),
-        Shape.rect(0.0, 0.0, 2.0, 1.0).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 6),
-        Shape.disk(0.0, 0.0, 1.0).extrude(3.0),
+        shape.rect(0.0, 0.0, 2.0, 1.0),
+        shape.disk(1.0, 2.0, 0.5),
+        shape.box(0.0, 0.0, 0.0, 2.0, 1.0, 3.0),
+        shape.sphere(0.0, 0.0, 0.0, 1.0),
+        shape.cylinder(0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 1.0),
+        shape.rect(0.0, 0.0, 1.0, 1.0) - shape.disk(0.5, 0.5, 0.25),
+        shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0) - shape.sphere(0.5, 0.5, 0.5, 0.3),
+        shape.rect(0.0, 0.0, 2.0, 1.0).translate((5.0, 7.0, 0.0)),
+        shape.rect(0.0, 0.0, 2.0, 1.0).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 6),
+        shape.disk(0.0, 0.0, 1.0).extrude(3.0),
         # a ring swept about +y, and the half sweep whose flat end caps must also come out outward
-        Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi),
-        Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), math.pi),
-        Shape.rect(0.0, 0.0, 3.0, 1.0).revolve((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 2 * math.pi),
+        shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi),
+        shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), math.pi),
+        shape.rect(0.0, 0.0, 3.0, 1.0).revolve((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 2 * math.pi),
     ],
     ids=[
         "rect",
@@ -227,7 +227,7 @@ def test_boundary_points_are_on_the_surface_with_outward_unit_normals(shape):
 def test_boundary_points_are_exact_not_faceted():
     """A circle's samples lie on the circle to machine precision and the normal is exactly radial
     — the property a tessellation cannot provide (its points sit on chords)."""
-    disk = Shape.disk(1.0, 2.0, 0.5)
+    disk = shape.disk(1.0, 2.0, 0.5)
     pts, nrm = disk.sample_boundary(5000, np.random.default_rng(0))
     radial = pts[:, :2] - np.array([1.0, 2.0])
     assert np.allclose(np.linalg.norm(radial, axis=1), 0.5, atol=1e-14)
@@ -236,7 +236,7 @@ def test_boundary_points_are_exact_not_faceted():
 
 def test_boundary_draw_is_uniform_by_measure():
     """A 2x1 rectangle: each edge should receive its own length's share of the draws."""
-    pts, _ = Shape.rect(0.0, 0.0, 2.0, 1.0).sample_boundary(80_000, np.random.default_rng(0))
+    pts, _ = shape.rect(0.0, 0.0, 2.0, 1.0).sample_boundary(80_000, np.random.default_rng(0))
     on = {
         "bottom": np.isclose(pts[:, 1], 0.0),
         "top": np.isclose(pts[:, 1], 1.0),
@@ -251,8 +251,8 @@ def test_boundary_draw_is_uniform_by_measure():
 def test_a_cut_away_surface_contributes_no_boundary_points():
     """Half of the disk's circle lies outside the rectangle after the cut; no sample may land
     there, or the boundary draw would include a surface the solid does not have."""
-    shape = Shape.rect(0.0, 0.0, 1.0, 1.0) - Shape.disk(0.0, 0.5, 0.25)  # bite out of the left edge
-    pts, _ = shape.sample_boundary(20_000, np.random.default_rng(0))
+    geom = shape.rect(0.0, 0.0, 1.0, 1.0) - shape.disk(0.0, 0.5, 0.25)  # bite out of the left edge
+    pts, _ = geom.sample_boundary(20_000, np.random.default_rng(0))
     assert (pts[:, 0] >= -1e-12).all()  # nothing on the half-circle at x < 0
 
 

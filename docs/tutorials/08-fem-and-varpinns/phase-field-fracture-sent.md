@@ -36,12 +36,12 @@ hand-derived stress anywhere. Irreversibility comes from the history field $H=\m
 crack cannot heal (Miehe, Welschinger & Hofacker, *IJNME* **83** (2010) 1273–1311), and the damage
 equation is the standard AT2 form $(G_c/\ell)\,d - G_c\ell\,\Delta d = 2(1-d)H$.
 
-The notch is **cut**, not painted on: a real slit removed from the geometry with `jno.Shape`, so the
+The notch is **cut**, not painted on: a real slit removed from the geometry with `jno.shape`, so the
 stress concentration at its tip is the mesh's own and the damage field needs no seeding.
 
 ```python
-plate = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h)
-slit  = jno.Shape.rect(-0.01, 0.5 - w_slit, 0.5, 0.5 + w_slit, size=h)
+plate = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h)
+slit  = jno.shape.rect(-0.01, 0.5 - w_slit, 0.5, 0.5 + w_slit, size=h)
 dom   = (plate - slit).domain(tau=(0.0, 1.0, NOUT))     # tau: the pseudo-time LOAD path
 ```
 

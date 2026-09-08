@@ -29,14 +29,14 @@ import numpy as np
 
 def _region_mask(pts, geom):
     """Boolean mask of points ``pts`` inside a region ``geom`` (nodes or element centroids). A
-    ``jno.Shape`` is tested by the analytic, shapely-free :meth:`Shape.contains` (2-D and 3-D alike — the
+    ``jno.shape`` is tested by the analytic, shapely-free :meth:`shape.contains` (2-D and 3-D alike — the
     primary, 3-D-capable path). A shapely geometry falls back to shapely containment; that path survives
     only for 2-D regions whose mesh is conformed to the region in ``polygon_domain`` (interface /
     partition tags), which stays shapely by scope."""
-    from jno.geometry import Shape
+    from jno.geometry import shape
 
     p = np.asarray(pts)
-    if isinstance(geom, Shape):
+    if isinstance(geom, shape):
         return np.asarray(geom.contains(p[:, : geom.dim]))
     import shapely
 
@@ -618,7 +618,7 @@ def couple(subdomains, interface_conditions=None):
 
     ``subdomains``: a list of ``(problem, region)`` pairs, where ``problem`` is a subdomain solve
     (``jno.fdm([...])`` / ``jno.fem([...])``) authored with its PDE + outer boundary conditions, and
-    ``region`` is the ``jno.Shape`` it owns (resolved to a node subset by ``Shape.contains``, no shapely).
+    ``region`` is the ``jno.shape`` it owns (resolved to a node subset by ``shape.contains``, no shapely).
     ``interface_conditions``: optional residuals declaring the
     coupling in jNO syntax (value ``uA(iface)-uB(iface)`` / flux ``k*uA.d(n)-...`` on an ``interface_*``
     tag). The interface is inferred from the regions: a single line (partitioning tags) is coupled by

@@ -1,4 +1,4 @@
-"""Analytic primitives for the gmsh-OCC :class:`~jno.geometry.shape.Shape` layer.
+"""Analytic primitives for the gmsh-OCC :class:`~jno.geometry.shape.shape` layer.
 
 Each primitive knows two things:
 

@@ -32,7 +32,7 @@ def _x64():
 
 def _complex_eddy(size=0.34, w=1.0e4):
     """curl-curl + j*w*mass on N1E: complex symmetric, with the mass term making it non-singular."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     ci = d.variable("interior", split=True)
     x, y, z = ci[0], ci[1], ci[2]

@@ -149,7 +149,7 @@ N1E tet curl-curl form). After binding, the no-arg `u.div()` / `u.curl()` reuse 
 
 For the RT mixed-Poisson saddle, a Dirichlet condition on the scalar `p` is *natural* — add the weak
 term `p_D * (v[0]*nx + v[1]*ny)`, no essential constraint on the flux. A BC may target a sub-region
-(a `Shape.rect` edge tag or any `d.tag(...)` boundary subset; sub-region normals are computed from the
+(a `shape.rect` edge tag or any `d.tag(...)` boundary subset; sub-region normals are computed from the
 geometry).
 
 Tutorials: `mixed_poisson_rt_2d.py` (H(div)), `maxwell_nedelec_2d.py` (H(curl): magnetostatics + eddy
@@ -165,12 +165,12 @@ available two ways, and which one you can use is decided by what a mesher can ac
 
 ```python
 # 2-D quadrilaterals on ARBITRARY geometry, via gmsh recombination
-d = jno.Shape.disk(0, 0, 1, size=0.1).quad().domain()
+d = jno.shape.disk(0, 0, 1, size=0.1).quad().domain()
 u, v = d.fem_symbols(order=2)          # Q2 / Q3 work exactly as P2 / P3 do
 
 # structured grids, no mesher involved — a rectangle of quads, a box of hexes
-d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=40).quad().domain()
-d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0).structured(n=16).quad().domain()
+d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=40).quad().domain()
+d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0).structured(n=16).quad().domain()
 ```
 
 Nothing else in the term list changes — the weak form, the boundary conditions and the solve are
@@ -184,7 +184,7 @@ better conditioned and far cheaper per node than tetrahedra.
 
 **Why 3-D is structured-only.** gmsh cannot hexahedral-mesh general geometry. Measured here,
 `Recombine3DAll` on a plain box returns **944 tetrahedra and zero hexahedra**; hexes come only from
-sweeping/extruding or transfinite meshing. `Shape.quad()` therefore refuses a 3-D shape by name
+sweeping/extruding or transfinite meshing. `shape.quad()` therefore refuses a 3-D shape by name
 rather than quietly handing back tetrahedra. 2-D recombination has no such limit — a disk
 recombines to pure quadrilaterals just as a rectangle does.
 
@@ -194,7 +194,7 @@ recombines to pure quadrilaterals just as a rectangle does.
 |---|---|---|
 | structured quads, Q1 | 1.87, 1.92, 1.96 | same error as the triangulation of the same grid, from half the cells |
 | structured hexes, Q1 | 1.79, 1.86 | same error as the tetrahedralisation, from a sixth the cells |
-| recombined quads (`Shape.quad()`), Q1 | 1.83, 1.91 | ~5× the L2 error of triangles at equal node count on this smooth problem |
+| recombined quads (`shape.quad()`), Q1 | 1.83, 1.91 | ~5× the L2 error of triangles at equal node count on this smooth problem |
 | structured quads, **Q2** | 3.94, 3.96 | ~8× *lower* error than P2 triangles at the same node count |
 | structured quads, **Q3** | 3.87, 3.95 | ~5× lower than P3 triangles at the same node count |
 | structured hexes, **Q2** | 4.27, 4.29 | ~10× lower than P2 tetrahedra at the same node count |
@@ -211,7 +211,7 @@ The tensor-product advantage is in bending and near-incompressibility, not here.
 
 The geometry map is formed **per quadrature point**, because a bilinear quad or trilinear hex has a
 Jacobian that varies within the cell even when the cell looks straight-sided — the same machinery
-`Shape.curved()` introduced. The quadrature degree is raised by 2 for the same reason it is on curved
+`shape.curved()` introduced. The quadrature degree is raised by 2 for the same reason it is on curved
 cells: the map makes the integrand rational, so no rule is exact.
 
 **Scope — what is not supported yet**, each refusing by name rather than approximating:
@@ -231,7 +231,7 @@ onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 | **r-adaptivity** (`relocate=`) on quad/hex | the monitor, the cell measures and the validity check are all barycentric; a bilinear cell's validity is the sign of the sampled `det J`, not one determinant |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
-| `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
+| `shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
 
 The **recovery error estimator** runs on both cell families. On a simplex the P1 gradient is constant
 per cell, so inverting the edge matrix is the answer; on a bilinear cell the gradient varies, and the
@@ -281,10 +281,10 @@ order 1 it would evaluate to nothing.
 **h-adaptivity on quadrilaterals** works, by a different mechanism than on simplices. mmg adapts
 triangles and tets by local edge split/collapse/swap and has no quad analogue — but a quad mesh in
 jNO *is* a triangulation gmsh recombined, and the size field driving it is already part of the
-`Shape` plan. So the remesh stage **rebuilds the plan** at the marked size field:
+`shape` plan. So the remesh stage **rebuilds the plan** at the marked size field:
 
 ```python
-d = jno.Shape.polygon(L_SHAPE, size=0.12).quad().domain()
+d = jno.shape.polygon(L_SHAPE, size=0.12).quad().domain()
 u = fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4))     # refines at the corner, stays all-quad
 ```
 
@@ -315,7 +315,7 @@ weights are linearly complete and are what a hex tie — and a hanging node — 
 
 ### Local refinement with hanging nodes (quadrilaterals and hexahedra)
 
-`adapt=jno.solve.remesh()` refines a quad mesh by rebuilding its `Shape` plan at a finer size field,
+`adapt=jno.solve.remesh()` refines a quad mesh by rebuilding its `shape` plan at a finer size field,
 which is global and needs a geometry to rebuild from. Splitting marked cells into four needs neither —
 it works on a mesh loaded from a file, every old node survives, and it is the mechanism 3-D hexes will
 use, since no all-hex mesher exists to remesh *to*.
@@ -369,7 +369,7 @@ The same call refines a hex mesh, splitting each marked cell into 8. This is the
 a hex mesh has, for the reason in the scope table above: there is no all-hex mesher to remesh to.
 
 ```python
-d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # .quad() on a 3-D lattice = hexes
+d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # .quad() on a 3-D lattice = hexes
 ...
 u = fem.solve(adapt=jno.solve.refine(theta=0.4, max_iters=3))         # the same slot, in 3-D
 ```
@@ -452,7 +452,7 @@ and flux integrals included.
 
 ### Higher order on independently meshed bodies
 
-`Shape.regions(..., conforming=False)` meshes each body on its own, so a shared face carries **two**
+`shape.regions(..., conforming=False)` meshes each body on its own, so a shared face carries **two**
 coincident node sets — that duplication is the point, and it is what a contact gap opens. Promoting
 such a mesh to P2/P3 has to synthesise new nodes on that face, and the question is when two of them
 are the same node.

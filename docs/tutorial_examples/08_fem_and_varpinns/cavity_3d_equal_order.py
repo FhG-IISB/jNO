@@ -47,7 +47,7 @@ RE_LADDER = [5.0, 10.0, 25.0, 50.0, 100.0]
 
 
 def cavity3d(n=N, order=1, stabilised=True):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=n).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=n).domain()
     d.tag("lid", lambda x, y, z: z > 1 - 1e-9)
     d.tag("wall", lambda x, y, z: (z < 1e-9) | (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     d.point_region("ppin", (0.0, 0.0, 0.0))

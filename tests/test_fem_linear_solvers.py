@@ -384,7 +384,7 @@ def test_a_vector_fem_tangent_now_qualifies_as_symmetric():
     """The case this exists for — a 3-D elasticity tangent, which no bitwise test accepts."""
     nn = jno.np
     inner, grad, symg, trace, ident = nn.inner, nn.grad, nn.sym, nn.trace, nn.identity
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co, cb = d.variable("interior", split=True), d.variable("bot", split=True)
     X, I3 = [co[0], co[1], co[2]], ident(3)
@@ -410,7 +410,7 @@ def test_pardiso_agrees_with_the_iterative_default_on_a_symmetric_tangent():
         pytest.skip("pypardiso present but without the private phase hooks this backend drives")
     nn = jno.np
     inner, grad, symg, trace, ident = nn.inner, nn.grad, nn.sym, nn.trace, nn.identity
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.45).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.45).domain()
     d.tag("bot", lambda x, y, z: z < 1e-6)
     co, cb = d.variable("interior", split=True), d.variable("bot", split=True)
     X, I3 = [co[0], co[1], co[2]], ident(3)

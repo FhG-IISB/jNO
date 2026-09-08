@@ -409,7 +409,7 @@ def test_couple_driver_reproduces_monolithic():
 
     b1, b2 = box(0.0, 0.0, 0.6, 1.0), box(0.4, 0.0, 1.0, 1.0)
     d = jno.domain(b1.union(b2), mesh_size=0.06)
-    sA, sB = jno.Shape.rect(0.0, 0.0, 0.6, 1.0), jno.Shape.rect(0.4, 0.0, 1.0, 1.0)
+    sA, sB = jno.shape.rect(0.0, 0.0, 0.6, 1.0), jno.shape.rect(0.4, 0.0, 1.0, 1.0)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
     x, y, _ = d.variable("interior", split=True)
@@ -584,7 +584,7 @@ def test_material_interface_via_overlap_and_kx():
     a, b = 2 * kR / (kL + kR), 2 * kL / (kL + kR)  # analytic slopes: u = 1-a·x (left), u = b·(1-x) (right)
     boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)  # FEM covers the jump; overlap [0.5,0.6] uniform kR
     d = jno.domain(boxA.union(boxB), mesh_size=0.05)
-    sA, sB = jno.Shape.rect(0.0, 0.0, 0.6, 1.0), jno.Shape.rect(0.5, 0.0, 1.0, 1.0)
+    sA, sB = jno.shape.rect(0.0, 0.0, 0.6, 1.0), jno.shape.rect(0.5, 0.0, 1.0, 1.0)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
     on = np.abs(p[:, 0] - 0.5) < 1e-6
 
@@ -629,7 +629,7 @@ def test_overlap_coupled_solve_differentiable_in_fem_coefficient():
     kR, fsrc = 3.0, 10.0
     boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)  # overlap x∈[0.5,0.6]
     d = jno.domain(boxA.union(boxB), mesh_size=0.08)
-    sA, sB = jno.Shape.rect(0.0, 0.0, 0.6, 1.0), jno.Shape.rect(0.5, 0.0, 1.0, 1.0)
+    sA, sB = jno.shape.rect(0.0, 0.0, 0.6, 1.0), jno.shape.rect(0.5, 0.0, 1.0, 1.0)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
     in_a, in_b = _region_mask(p, boxA), _region_mask(p, boxB)
     overlap = jnp.asarray(in_a & in_b)

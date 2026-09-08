@@ -198,9 +198,9 @@ def _trivial_domain():
     collocation machinery. Built once and reused (read-only)."""
     global _TRIVIAL_DOMAIN
     if _TRIVIAL_DOMAIN is None:
-        from .geometry.shape import Shape
+        from .geometry.shape import shape
 
-        _TRIVIAL_DOMAIN = Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+        _TRIVIAL_DOMAIN = shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     return _TRIVIAL_DOMAIN
 
 

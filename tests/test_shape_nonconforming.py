@@ -1,6 +1,6 @@
-"""Non-conforming multi-body meshes — ``Shape.regions(..., conforming=False)``.
+"""Non-conforming multi-body meshes — ``shape.regions(..., conforming=False)``.
 
-``Shape.regions`` fragments its pieces so a shared interface meshes conforming (one set of nodes, no
+``shape.regions`` fragments its pieces so a shared interface meshes conforming (one set of nodes, no
 tie needed). ``conforming=False`` skips the fragment: each piece is meshed independently, so two
 touching regions end up with two **coincident but non-matching** surfaces and duplicated nodes. Gluing
 those with ``u(A) - u(B)`` in ``jno.fem`` is what lets two bodies meshed at different resolutions be
@@ -33,9 +33,9 @@ _LOWER_TOP, _UPPER_TOP = 1.0, 2.5
 def _bar(conforming, size):
     """A 1x1x2.5 bar as two stacked blocks, either fragmented or independently meshed."""
     return (
-        jno.Shape.regions(
-            lower=jno.Shape.box(0, 0, 0, 1, 1, _LOWER_TOP),
-            upper=jno.Shape.box(0, 0, _LOWER_TOP, 1, 1, _UPPER_TOP),
+        jno.shape.regions(
+            lower=jno.shape.box(0, 0, 0, 1, 1, _LOWER_TOP),
+            upper=jno.shape.box(0, 0, _LOWER_TOP, 1, 1, _UPPER_TOP),
             conforming=conforming,
         )
         .sized(size)
@@ -157,9 +157,9 @@ def test_the_tie_is_what_makes_the_field_continuous():
 
 def _stack(base_size, film_size):
     """Two stacked blocks sharing a full face, meshed independently at their own resolutions."""
-    return jno.Shape.regions(
-        base=jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=base_size),
-        film=jno.Shape.rect(0.0, 1.0, 2.0, 1.4, size=film_size),
+    return jno.shape.regions(
+        base=jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=base_size),
+        film=jno.shape.rect(0.0, 1.0, 2.0, 1.4, size=film_size),
         conforming=False,
     ).domain()
 
@@ -263,9 +263,9 @@ def _lap2(u, phi, r):
 
 def _graded_stack():
     """Coarse base under a finer film, meshed independently — a genuinely non-matching interface."""
-    return jno.Shape.regions(
-        base=jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25),
-        film=jno.Shape.rect(0.0, 1.0, 2.0, 1.4, size=0.08),
+    return jno.shape.regions(
+        base=jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25),
+        film=jno.shape.rect(0.0, 1.0, 2.0, 1.4, size=0.08),
         conforming=False,
     ).domain()
 
@@ -420,4 +420,4 @@ def test_p2_on_a_nonconforming_domain_keeps_the_bodies_apart():
 
 def test_conforming_is_a_reserved_region_name():
     with pytest.raises(TypeError, match="must be a bool"):
-        jno.Shape.regions(a=jno.Shape.box(0, 0, 0, 1, 1, 1), b=jno.Shape.box(0, 0, 1, 1, 1, 2), conforming="no")
+        jno.shape.regions(a=jno.shape.box(0, 0, 0, 1, 1, 1), b=jno.shape.box(0, 0, 1, 1, 1, 2), conforming="no")

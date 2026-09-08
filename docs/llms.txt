@@ -16,7 +16,7 @@ end-to-end examples — is one file:
 - [Installation](https://fhg-iisb.github.io/jNO/Installation/): pip / extras / pixi / Docker; CPU by default, GPU via the [cuda] extra
 - [Getting started](https://fhg-iisb.github.io/jNO/Getting-Started/): first end-to-end problem
 - [Concepts](https://fhg-iisb.github.io/jNO/concepts/): the trace, constraints, crux, models
-- [Domain and geometry](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/): jno.Shape / jno.Path CSG, tags, sampling
+- [Domain and geometry](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/): jno.shape / jno.Path CSG, tags, sampling
 - [FEM](https://fhg-iisb.github.io/jNO/fem/): weak forms as term lists, solver slots, eigenproblems, contact
 - [FDM](https://fhg-iisb.github.io/jNO/fdm/): strong-form collocation from the same term lists
 - [RCWA](https://fhg-iisb.github.io/jNO/rcwa/): periodic-layered electromagnetics

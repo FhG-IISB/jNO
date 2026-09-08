@@ -34,11 +34,11 @@ def _x64():
 
 
 def _rect(size, x0=0.0, y0=0.0, x1=1.0, y1=1.0):
-    return jno.Shape.rect(x0, y0, x1, y1, size=size).domain()
+    return jno.shape.rect(x0, y0, x1, y1, size=size).domain()
 
 
 def _box(size):
-    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    return jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
 
 
 def _verts(d):
@@ -181,7 +181,7 @@ def test_p1_stiffness_matvec_matches_the_energy_gradient_oracle():
 
     from jno.utils.solver.fem_adapt import _dirichlet_energy_jax, _mesh_cells, _p1_stiffness_jax
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
     cells, dim = _mesh_cells(d)
     pts = jnp.asarray(np.asarray(d.mesh.points)[:, :dim])
     matvec, diag = _p1_stiffness_jax(pts, cells, dim)
@@ -205,7 +205,7 @@ def test_harmonic_extension_is_differentiable_in_the_prescribed_motion():
 
     from jno.utils.solver.fem_adapt import _harmonic_extension_jax, _mesh_cells
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     cells, dim = _mesh_cells(d)
     pts = jnp.asarray(np.asarray(d.mesh.points)[:, :dim])
     x = np.asarray(pts)
@@ -231,7 +231,7 @@ def test_harmonic_extension_is_differentiable_in_the_vertex_positions():
 
     from jno.utils.solver.fem_adapt import _harmonic_extension_jax, _mesh_cells
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     cells, dim = _mesh_cells(d)
     x = np.asarray(d.mesh.points)[:, :dim]
     is_b = (x[:, 0] < 1e-9) | (x[:, 0] > 1 - 1e-9) | (x[:, 1] < 1e-9) | (x[:, 1] > 1 - 1e-9)

@@ -64,8 +64,8 @@ DELTA, NOUT = 1.4e-2, 8  # peak grip displacement, reported load levels
 
 # The notch is CUT, not painted on: a real slit in the geometry, so the stress concentration at its tip
 # is the mesh's own and no seeding of the damage field is needed.
-plate = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h)
-slit = jno.Shape.rect(-0.01, 0.5 - w_slit, 0.5, 0.5 + w_slit, size=h)
+plate = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h)
+slit = jno.shape.rect(-0.01, 0.5 - w_slit, 0.5, 0.5 + w_slit, size=h)
 dom = (plate - slit).domain(tau=(0.0, 1.0, NOUT))  # tau: the pseudo-time LOAD path
 dom.tag("bot", lambda x, y: y < 1e-9)
 dom.tag("top", lambda x, y: y > 1 - 1e-9)

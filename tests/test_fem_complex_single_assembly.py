@@ -73,7 +73,7 @@ def _coo(A):
 
 
 def test_complex_volume_form_assembles_once(monkeypatch):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     calls = _count_assemblies(monkeypatch)
     fem = jno.fem(_terms(d))
     assert len(calls) == 1, f"the steady complex volume form ran {len(calls)} assemblies; one pass suffices"
@@ -85,12 +85,12 @@ def test_single_pass_matches_the_two_leg_reference(monkeypatch):
     The reference comes from the split itself, via the module escape hatch."""
     import jno._fem as F
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     fem = jno.fem(_terms(d))
     (Ar, br), (Ai, bi) = fem._complex_legs
 
     monkeypatch.setattr(F, "_COMPLEX_SINGLE_ASSEMBLY", False)
-    d2 = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d2 = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     ref = jno.fem(_terms(d2))
     (Rr, rr), (Ri, ri) = ref._complex_legs
 
@@ -115,7 +115,7 @@ def test_single_pass_matches_the_two_leg_reference(monkeypatch):
 def test_the_solve_is_right(monkeypatch):
     import scipy.sparse.linalg as spla
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     fem = jno.fem(_terms(d))
     (Ar, br), (Ai, bi) = fem._complex_legs
     ref = spla.spsolve((_coo(Ar) + 1j * _coo(Ai)).tocsc(), np.asarray(br) + 1j * np.asarray(bi))
@@ -125,7 +125,7 @@ def test_the_solve_is_right(monkeypatch):
 
 def test_parametric_complex_keeps_the_leg_split(monkeypatch):
     """A runtime parameter rides the parametric legs (tested elsewhere); the gate must not claim it."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     calls = _count_assemblies(monkeypatch)
     eps = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="eps_r")
     fem = jno.fem(_terms(d, extra_coeff=(1e-3 + 0.5j) * (1.0 + eps)))
@@ -140,7 +140,7 @@ def test_a_half_cast_operator_is_refused(monkeypatch):
 
     from jno.utils.solver import fem_nonnodal
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     orig = fem_nonnodal.assemble_fem_nonnodal
 
     def _cast_away(*a, **k):

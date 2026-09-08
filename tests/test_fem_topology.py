@@ -129,7 +129,7 @@ def test_edge_numbering_is_first_encounter_order(cells, edges):
 def test_edge_numbering_matches_the_loop_on_a_real_tet_mesh():
     import jno
 
-    cells = np.asarray(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
+    cells = np.asarray(jno.shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
     top = build_edge_topology(cells, BASIX_TET_EDGES)
     ref_ids, ref_signs, ref_verts = _first_encounter_reference(cells, BASIX_TET_EDGES)
     np.testing.assert_array_equal(top.cell_edges, ref_ids)

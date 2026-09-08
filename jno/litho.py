@@ -119,7 +119,7 @@ class CAResist:
         ``"positive"`` (default) returns the developed/soluble fraction ``1 − M``; ``"negative"`` returns ``M``.
     film:
         ``None`` (default) → **2-D** PEB driven by the aerial image (matching the dos Santos 2-D model),
-        returning a ``(n, n)`` pattern. A :class:`Film` → **3-D** ``(x, y, z)`` PEB on a ``jno.Shape`` box:
+        returning a ``(n, n)`` pattern. A :class:`Film` → **3-D** ``(x, y, z)`` PEB on a ``jno.shape`` box:
         the acid is seeded from the depth-resolved standing-wave bulk image (:meth:`_Exposure.bulk`), the
         species diffuse in x, y *and* z, and a developed ``(n, n, film.nz)`` volume is returned.
     """
@@ -198,7 +198,7 @@ def _peb_develop(img, period, r):
     d_a, d_b = r.rho_a**2 / (2.0 * r.t_peb), r.rho_b**2 / (2.0 * r.t_peb)
 
     dom = (
-        jno.Shape.rect(0.0, 0.0, Px, Py)
+        jno.shape.rect(0.0, 0.0, Px, Py)
         .structured(n=n)
         .domain(
             time=(0.0, r.t_peb, r.steps),
@@ -308,7 +308,7 @@ def _regrid3d(vals, coords, n, nz, period, thickness):
 
 
 def _peb_develop_3d(vol, period, film, r):
-    """3-D reaction-diffusion PEB on a ``jno.Shape`` box (periodic in x, y; free in z), seeded by the Dill
+    """3-D reaction-diffusion PEB on a ``jno.shape`` box (periodic in x, y; free in z), seeded by the Dill
     latent acid from the standing-wave bulk image ``vol`` (``(G, G, nz)``). The species diffuse in x, y and z;
     returns the developed ``(n, n, film.nz)`` volume. ``jno`` is imported lazily (no package import cycle)."""
     import jno
@@ -344,7 +344,7 @@ def _peb_develop_3d(vol, period, film, r):
             stacklevel=2,
         )
 
-    dom = jno.Shape.box(0.0, 0.0, 0.0, Px, Py, d, size=size).domain(
+    dom = jno.shape.box(0.0, 0.0, 0.0, Px, Py, d, size=size).domain(
         time=(0.0, r.t_peb, r.steps), compute_mesh_connectivity=False
     )
     ex, ey = 1e-6 * Px, 1e-6 * Py

@@ -73,7 +73,7 @@ def make_periodic_domain():
     """Structured (periodic-compatible) rectangular domain on [0,1]^2, with each face named via
     ``domain.tag`` -- required for multi-direction periodicity so the shared corners are recovered."""
     dom = (
-        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0)
         .structured(n=N_GRID)
         .domain(
             time=(0.0, T_END, N_TIME),
@@ -288,7 +288,7 @@ class TestPeriodicMeshGuard:
         instead of rejecting it. The full numeric solve on auto faces is verified in
         test_fem_periodic_unstructured.py; this locks in the accept path and the shared-corner mesh
         invariant that unlocks it. The guard still rejects genuinely corner-partitioned tags."""
-        dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(  # auto-generated left/right/... tags (no predicate)
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(  # auto-generated left/right/... tags (no predicate)
             time=(0.0, T_END, N_TIME),
             compute_mesh_connectivity=False,
         )

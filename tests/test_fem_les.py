@@ -119,7 +119,7 @@ def _nu_t(model, a, b, c, e):
     residual ``-nu_t * integral(w)``; P1 test functions are a partition of unity, so summing that
     block over the unit square returns ``-nu_t`` for a spatially constant nu_t.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     xi, yi = d.variable("interior", split=True)[:2]
     ax = [xi, yi]
     u, v = d.fem_symbols(value_shape=(2,), names=("u_l", "v_l"), order=1)
@@ -172,7 +172,7 @@ def test_each_model_matches_a_textbook_numpy_oracle(name):
 
 def _nu_t_3d(model, G):
     """Same reading, in 3-D: u_i = G_ij x_j on a unit cube, so grad(u) = G exactly on every tet."""
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.7).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.7).domain()
     co = d.variable("interior", split=True)
     ax = [co[0], co[1], co[2]]
     u, v = d.fem_symbols(value_shape=(3,), names=("u3", "v3"), order=1)
@@ -236,7 +236,7 @@ def _solved_shear(model):
     the systems compared have identical structure.
     """
     NU = 1e-2
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     d.tag("all", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     d.point_region("ppin", (0.0, 0.0))
     xi, yi = d.variable("interior", split=True)[:2]

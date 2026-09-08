@@ -21,7 +21,7 @@ def _x64():
 
 def _heat(coef, size=0.4, steps=3):
     """Transient heat problem; `coef` may be a float or a jno parameter."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     ci = d.variable("initial", split=True)
@@ -82,11 +82,11 @@ def test_eval_allows_frozen_parameter():
 
 def test_eval_domain_override_resamples_expression():
     """`domain=` re-samples a Variable expression on another domain."""
-    coarse = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    coarse = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     x, y, _ = coarse.variable("interior", split=True)
     expr = x * y
 
-    fine = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    fine = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     fine.variable("interior", split=True)  # register the tag on the new domain
 
     n_coarse = np.asarray(expr.eval()).size
@@ -97,7 +97,7 @@ def test_eval_domain_override_resamples_expression():
 def test_eval_domain_override_rejected_on_solve_node():
     """A solve node owns its mesh; a domain= override would silently return the old solve."""
     _, fem = _heat(1.0, size=0.5)
-    other = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain(time=(0.0, 0.2, 3))
+    other = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain(time=(0.0, 0.2, 3))
     with pytest.raises(ValueError, match="owns the mesh"):
         fem.solve().eval(domain=other)
 
@@ -123,7 +123,7 @@ def test_field_parameter_keeps_channel_axis():
     ``network * f(field_param)`` in :mod:`jno.rcwa` -- an ``N**2`` boolean-index crash downstream. The two
     tests pin the two halves of the convention: bare parameters keep ``(N,)``, field parameters keep the
     channel axis."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     _, phi = d.fem_symbols()
     n = len(d.mesh.points)
     rho = jno.np.parameter(phi, name="rho")  # one trainable value per mesh node

@@ -18,7 +18,7 @@ core of the inflow profile is blocked.](/jNO/assets/stokes_3d_duct_sphere.png)
 The obstacle needs no bespoke mesh — subtract it:
 
 ```python
-duct = jno.Shape.box(0, 0, 0, L, H, H) - jno.Shape.sphere(CX, CY, CZ, R)
+duct = jno.shape.box(0, 0, 0, L, H, H) - jno.shape.sphere(CX, CY, CZ, R)
 d = duct.size(0.06).domain()
 ```
 

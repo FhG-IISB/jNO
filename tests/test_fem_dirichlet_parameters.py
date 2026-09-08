@@ -23,7 +23,7 @@ import jno
 
 
 def _poisson_pieces(size=0.3, time=None):
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain(**({"time": time} if time else {}))
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain(**({"time": time} if time else {}))
     u, v = d.fem_symbols()
     if time:
         xi, yi, ti = d.variable("interior", split=True)
@@ -198,7 +198,7 @@ def test_recover_boundary_value_linear_transient():
 # breadth: vector per-component; the data-field branch must still work
 # --------------------------------------------------------------------------------------
 def test_vector_field_per_component_parametric_value():
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
     u, v = d.fem_symbols(value_shape=(2,))
     inner, grad = jno.np.inner, jno.np.grad
     xi, yi, _ = d.variable("interior", split=True)
@@ -214,7 +214,7 @@ def test_vector_field_per_component_parametric_value():
 def test_parametric_times_temporal_value_refuses_loudly():
     """`u(top) - g*tau`: the parametric branch would un-ramp the load, the temporal branch would
     un-train the parameter — both silently wrong, so the combination must refuse at build."""
-    d = jno.Shape.rect(0, 0, 0.5, 1, size=0.3).domain(tau=(0.0, 1.0, 4))
+    d = jno.shape.rect(0, 0, 0.5, 1, size=0.3).domain(tau=(0.0, 1.0, 4))
     u, v = d.fem_symbols(value_shape=(2,))
     inner, grad = jno.np.inner, jno.np.grad
     xi, yi, _ = d.variable("interior", split=True)

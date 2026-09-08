@@ -2,7 +2,7 @@
 
 `_promote_to_degree` synthesises a P{k} node mesh from a P1 one and has to decide when two synthesised
 nodes are the same node. Keying on the coordinate is the right conformity test for ONE body and the
-wrong one for two: a `Shape.regions(..., conforming=False)` interface is coincident *on purpose*, so
+wrong one for two: a `shape.regions(..., conforming=False)` interface is coincident *on purpose*, so
 every node the promotion added there was merged across the bodies and welded them -- silently. It was
 refused outright rather than allowed to be wrong, which is why P2 was unavailable on a non-conforming
 domain, and with it Taylor-Hood (P2 velocity / P1 pressure) on independently meshed bodies.
@@ -60,7 +60,7 @@ def test_a_conforming_p2_mesh_has_exactly_vertices_plus_edges():
 
     On a simplex mesh a P2 node sits on every vertex and every edge, and nowhere else -- so the promoted
     count is fixed by the topology alone, independent of how dedup is keyed."""
-    d = _build(jno.Shape.rect(0.0, 0.0, 2.0, 1.0).sized(0.3).domain())
+    d = _build(jno.shape.rect(0.0, 0.0, 2.0, 1.0).sized(0.3).domain())
     p1 = np.asarray(d.built_mesh.points)
     tri = np.asarray(d.built_mesh.cells_dict["triangle"])
     edges = {frozenset((int(a), int(b))) for t in tri for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))}
@@ -72,9 +72,9 @@ def test_two_independently_meshed_bodies_are_not_welded_at_p2():
     """The defect. Before entity keying this reported 37 shared nodes, all on the interface -- harmless
     for a tie, and wrong for contact, where those DOFs could then never separate."""
     d = _build(
-        jno.Shape.regions(
-            left=jno.Shape.rect(0.0, 0.0, 1.0, 1.0),
-            right=jno.Shape.rect(1.0, 0.0, 2.0, 1.0),
+        jno.shape.regions(
+            left=jno.shape.rect(0.0, 0.0, 1.0, 1.0),
+            right=jno.shape.rect(1.0, 0.0, 2.0, 1.0),
             conforming=False,
         )
         .sized(0.34)
@@ -95,8 +95,8 @@ def test_a_conforming_interface_still_shares_its_nodes():
     CONFORMING, so the two regions must still meet on one shared node set."""
     d = _build(
         (
-            jno.Shape.rect(0.0, 0.0, 1.0, 1.0).name("left").sized(0.34)
-            + jno.Shape.rect(1.0, 0.0, 2.0, 1.0).name("right").sized(0.34)
+            jno.shape.rect(0.0, 0.0, 1.0, 1.0).name("left").sized(0.34)
+            + jno.shape.rect(1.0, 0.0, 2.0, 1.0).name("right").sized(0.34)
         ).domain()
     )
     nl, nr = _region_nodes(d, "left"), _region_nodes(d, "right")
@@ -110,9 +110,9 @@ def test_taylor_hood_now_builds_on_independently_meshed_bodies():
     """What the refusal cost: mixed-order elements were unavailable on a non-conforming domain, so
     P2/P1 Taylor-Hood could not be posed there at all -- and P1/P1 is inf-sup unstable."""
     d = (
-        jno.Shape.regions(
-            left=jno.Shape.rect(0.0, 0.0, 1.0, 1.0),
-            right=jno.Shape.rect(1.0, 0.0, 2.0, 1.0),
+        jno.shape.regions(
+            left=jno.shape.rect(0.0, 0.0, 1.0, 1.0),
+            right=jno.shape.rect(1.0, 0.0, 2.0, 1.0),
             conforming=False,
         )
         .sized(0.34)

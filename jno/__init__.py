@@ -16,7 +16,7 @@ from .core import core
 from .differential_operators import DifferentialOperators
 from .domain import domain
 from .fdm import fdm
-from .geometry import Path, Shape
+from .geometry import Path, Shape, shape
 from .integration_operators import IntegrationOperators
 from .noise import noise
 from .rcwa import Rcwa, RcwaError, rcwa
@@ -147,7 +147,8 @@ __all__ = [
     "Constraint",
     "sampler",
     "domain",
-    "Shape",
+    "shape",
+    "Shape",  # deprecated alias of `shape`
     "Path",
     "do",
     "fem",

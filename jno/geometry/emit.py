@@ -1,4 +1,4 @@
-"""Realize a :class:`~jno.geometry.shape.Shape` into a ``meshio.Mesh`` via gmsh-OCC.
+"""Realize a :class:`~jno.geometry.shape.shape` into a ``meshio.Mesh`` via gmsh-OCC.
 
 Pipeline: build the OCC entities from the plan -> synchronize -> classify the boundary
 (:mod:`jno.geometry.naming`) -> per-shape mesh-size fields -> generate -> assemble a
@@ -181,7 +181,7 @@ def _interior_probes(dim: int, coarse: float) -> Dict[int, "object"]:
 
 
 def _apply_region_sizes(dim: int, shape) -> Optional[float]:
-    """Per-**region** mesh size for a multi-material (:meth:`Shape.regions`) shape.
+    """Per-**region** mesh size for a multi-material (:meth:`shape.regions`) shape.
 
     The ordinary path (:func:`_apply_size_fields`) turns each ``size=`` into a Distance+Threshold
     *field*, which is a function of POSITION. That is wrong for a multi-material domain twice over.
@@ -334,7 +334,7 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
                 _f(0.0, 0.0, 0.0)
             except TypeError as _e:
                 raise TypeError(
-                    "jno.Shape(size=...): a mesh-size callable is called as f(x, y, z) -- three "
+                    "jno.shape(size=...): a mesh-size callable is called as f(x, y, z) -- three "
                     "coordinates, in 2-D as well as 3-D, where z is 0.0. Write "
                     "`size=lambda x, y, z: ...` (a 2-D function can simply ignore z). "
                     f"Calling it with three arguments raised: {_e}"
@@ -411,14 +411,14 @@ def _to_meshio(
 ):
     """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
 
-    ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
+    ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`shape.regions`
     multi-material domain) adds one volume ``cell_set`` per region — each cell assigned to the first
     region whose shape contains its centroid — plus one facet ``cell_set`` per material **interface**,
     auto-named by the region pair it separates (``"a|b"`` = every facet between those two materials,
     however many gmsh faces that spans). Only *topologically disjoint* interfaces of the same pair
     (e.g. two separate inclusions) additionally split into connected components ``"a|b.0"`` / ``"a|b.1"``.
 
-    ``nonconforming`` (``Shape.regions(conforming=False)``) changes how an interface is *found*. With
+    ``nonconforming`` (``shape.regions(conforming=False)``) changes how an interface is *found*. With
     the fragment skipped, the two sides of an interface are separate OCC entities each adjacent to a
     single volume, so the adjacency test above sees them as ordinary outer boundary. They are instead
     matched **geometrically** — two boundary faces of different regions occupying the same bounding
@@ -447,7 +447,7 @@ def _to_meshio(
             # because a quad's facet is a straight edge exactly as a triangle's is.
             if curved:
                 raise NotImplementedError(
-                    "Shape.quad().curved() is not supported: curved (isoparametric) geometry is order-2 "
+                    "shape.quad().curved() is not supported: curved (isoparametric) geometry is order-2 "
                     "simplices only, and a curved quadrilateral needs its own 9-node block."
                 )
             vtype, npv, vblock = _QUAD, 4, "quad"
@@ -673,25 +673,25 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
                 "mesh it -- recombination is per-surface, and in 2-D the two regions conform along a "
                 "shared edge -- but jNO's assembler carries ONE element table and ONE cell array, so the "
                 "mesh would build and fail to assemble. Use a single cell type for now; to combine two "
-                "meshes today, mesh the regions independently with Shape.regions(..., conforming=False) "
+                "meshes today, mesh the regions independently with shape.regions(..., conforming=False) "
                 "and tie them with u('a|b.a') - u('a|b.b')."
             )
         _cell = next(iter(_choices), None)
         if _cell == "quad" and dim == 3:
-            # Checked here rather than in `Shape.quad()` so that `.quad()` and `.structured()` compose
+            # Checked here rather than in `shape.quad()` so that `.quad()` and `.structured()` compose
             # in either order -- only the finished plan knows whether a lattice sits under the request.
             # A structured plan never reaches this function at all; it is meshed by `Geometries`.
             raise NotImplementedError(
-                "Shape.quad() on a 3-D shape needs a regular lattice: gmsh cannot hexahedral-mesh "
+                "shape.quad() on a 3-D shape needs a regular lattice: gmsh cannot hexahedral-mesh "
                 "general geometry (Recombine3DAll on a plain box returns 944 tetrahedra and no "
-                "hexahedra). Add .structured() -- `Shape.box(...).structured().quad()`."
+                "hexahedra). Add .structured() -- `shape.box(...).structured().quad()`."
             )
         if _cell == "quad":
             # Mesh triangles, then RECOMBINE them into quadrilaterals. This is gmsh's only general
             # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
             # recombines to 69 pure quads and a rectangle to 78, neither leaving any triangle behind.
             # (The 3-D analogue does not exist: `Recombine3DAll` on a plain box returns 944 tets and
-            # no hexes, which is why `Shape.quad()` refuses a 3-D shape rather than quietly meshing
+            # no hexes, which is why `shape.quad()` refuses a 3-D shape rather than quietly meshing
             # it with tetrahedra.)
             gmsh.option.setNumber("Mesh.RecombineAll", 1)
         gmsh.model.mesh.generate(dim)
@@ -787,7 +787,7 @@ def _boundary_once(shape, split_full, *, algorithm=None, threads=None):
             if k is None:
                 raise NotImplementedError(
                     f"the boundary mesher returned gmsh element type {int(etype)}, which "
-                    f"jno.Shape.tessellate does not read. It reads 2-node lines and 3-node "
+                    f"jno.shape.tessellate does not read. It reads 2-node lines and 3-node "
                     f"triangles -- the straight-sided facets a normal is constant over."
                 )
             blocks.append(lookup[np.asarray(nodes, dtype=np.int64).reshape(-1, k)])

@@ -119,7 +119,7 @@ def test_penal_as_a_runtime_exponent_scales_the_stiffness():
     """
     inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
     lam, mu = 0.3 / (1 - 0.09), 1 / 2.6
-    d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
+    d = jno.shape.rect(0, 0, 2, 1, size=0.5).domain()
     n_cells = int(d._cells_p1().shape[0])
     u, phi = d.fem_symbols(value_shape=(2,))
     _r, s = d.fem_symbols(space="P0", names=("r", "s"))

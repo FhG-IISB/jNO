@@ -42,13 +42,13 @@ single Laplacian node in the trace.
 
 Available on a bound view: `.x .y .z .t`, `.xx .yy .zz .tt`, `.xy` and other mixed partials.
 
-### 1.2 Domains: `jno.Shape` / `jno.Path` only
+### 1.2 Domains: `jno.shape` / `jno.Path` only
 
 ```python
-d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()                    # 2-D
-d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, 0.5, 4))    # 2-D + time
+d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()                    # 2-D
+d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, 0.5, 4))    # 2-D + time
 d = jno.Path(0, 0).line_to(1, 0).curve(size=0.02).domain()            # 1-D, ends named left/right
-d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain()                # 3-D
+d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain()                # 3-D
 ```
 
 Never `shapely.geometry.box`, never `jno.domain.rect(...)` / `.line(...)` / `.cube(...)` /
@@ -71,7 +71,7 @@ One line per idea. Chain the controls that return `self`. Build the constraint l
 
 ```python
 run = jno.setup(__file__)
-d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y, _ = d.variable("interior")
 
 net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
@@ -161,18 +161,18 @@ x, y, _ = d.variable("interior", sample=(500, None))      # 500 sampled points
 x0, y0, t0 = d.variable("initial")                        # the t = t0 slice
 ```
 
-### The `Shape` DSL
+### The `shape` DSL
 
-A `Shape` is an immutable build-plan (gmsh-OpenCASCADE); every call returns a new shape.
+A `shape` is an immutable build-plan (gmsh-OpenCASCADE); every call returns a new shape.
 
 | Primitive | Auto-named boundaries |
 |---|---|
-| `Shape.rect(x0, y0, x1, y1)` | `left` `right` `top` `bottom` |
-| `Shape.disk(cx, cy, r)` | `arc` |
-| `Shape.polygon(points)` | `e0 e1 … eN` |
-| `Shape.box(x0, y0, z0, x1, y1, z1)` | `left right top bottom front back` |
-| `Shape.cylinder(x, y, z, dx, dy, dz, r)` | `side` `top` `bottom` |
-| `Shape.sphere(cx, cy, cz, r)` | `surface` |
+| `shape.rect(x0, y0, x1, y1)` | `left` `right` `top` `bottom` |
+| `shape.disk(cx, cy, r)` | `arc` |
+| `shape.polygon(points)` | `e0 e1 … eN` |
+| `shape.box(x0, y0, z0, x1, y1, z1)` | `left right top bottom front back` |
+| `shape.cylinder(x, y, z, dx, dy, dz, r)` | `side` `top` `bottom` |
+| `shape.sphere(cx, cy, cz, r)` | `surface` |
 | `Path(…).face()` | per-segment, `name=` as you draw |
 
 `interior` and `boundary` always exist. Combine with `a - b` (cut), `a | b` (fuse), `a & b`
@@ -205,8 +205,8 @@ listed by `d.interface_tags()` and kept **out** of `d.boundary_tags()`.
 ```python
 d = jno.domain("part.msh")                                        # physical groups become tags
 d = jno.domain.from_array({"interior": pts, "boundary": bpts})    # point cloud (no mesh ⇒ no integrate/FD)
-d = jno.Shape.rect(0, 0, 1, 1, size=0.02).domain(structured=True) # uniform grid → fast FD stencils
-dom = 500 * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()        # replicate for operator learning
+d = jno.shape.rect(0, 0, 1, 1, size=0.02).domain(structured=True) # uniform grid → fast FD stencils
+dom = 500 * jno.shape.rect(0, 0, 2, 1, size=0.05).domain()        # replicate for operator learning
 ```
 
 `d.plot("domain.png")` renders mesh, regions and normals. Node coordinates: `d.built_mesh.points`,
@@ -551,7 +551,7 @@ rather than returning a wrong answer. In 2-D a corner node shared by two flux ed
 normal and falls back to the interior residual — give it an explicit Dirichlet value if it needs
 anchoring.
 
-**Structured grids.** `structured=True` on an axis-aligned `Shape.rect`/`Shape.box` builds a
+**Structured grids.** `structured=True` on an axis-aligned `shape.rect`/`shape.box` builds a
 uniform grid and switches the interior operators to direct 5-point (2-D) / 7-point (3-D) stencils
 by array reshaping. Same answer as the unstructured cotangent operator, cheaper. The inner Krylov
 defaults to **GMRES + geometric-multigrid V-cycle** because row-replaced Dirichlet makes the
@@ -662,9 +662,9 @@ remain the part worth keeping loaded.)
 
 | Stale | Current |
 |---|---|
-| `jno.domain.rect(mesh_size=…, time=…)` | `jno.Shape.rect(…, size=…).domain(time=…)` |
-| `jno.domain.cube(...)` | `jno.Shape.box(...).domain()` |
-| `jno.domain.l_shape(...)` | build it from `Shape` booleans |
+| `jno.domain.rect(mesh_size=…, time=…)` | `jno.shape.rect(…, size=…).domain(time=…)` |
+| `jno.domain.cube(...)` | `jno.shape.box(...).domain()` |
+| `jno.domain.l_shape(...)` | build it from `shape` booleans |
 | `jno.AdaptSpec` | gone |
 
 (`jno.domain.line(mesh_size=…)` still exists as a 1-D shorthand, but the house form — and what the
@@ -745,7 +745,7 @@ import foundax, jax, optax, jno
 run = jno.setup(__file__)
 pi, sin = jno.np.pi, jno.np.sin
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y, _ = d.variable("interior")
 
 net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
@@ -835,7 +835,7 @@ import foundax, jax, optax, jno
 run = jno.setup(__file__)
 pi, sin = jno.np.pi, jno.np.sin
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.1).domain()
 x, y, _ = d.variable("interior")
 
 f = 2 * pi**2 * sin(pi * x) * sin(pi * y) + sin(2 * pi * x) * sin(pi * y)
@@ -871,7 +871,7 @@ run = jno.setup(__file__)
 pi = jno.np.pi
 
 d = (jno.Path(3, 0).arc_to(-3, 0, through=(0, 3)).arc_to(3, 0, through=(0, -3))
-     .face().sized(0.25).domain())                       # a disc of radius 3, Shape/Path only
+     .face().sized(0.25).domain())                       # a disc of radius 3, shape/Path only
 x, y, _ = d.variable("interior")
 xb, yb, _ = d.variable("boundary")
 
@@ -965,7 +965,7 @@ import jax.numpy as jnp, numpy as np, jno
 
 run = jno.setup(__file__)
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.18).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.18).domain()
 u, phi = d.fem_symbols()                                  # trial / test
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -998,7 +998,7 @@ run = jno.setup(__file__)
 pi, sigma, a_r, a_t = np.pi, 4.0, 2.0, 3.0
 sin = jno.np.sin
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.22).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.22).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xl, yl, _ = d.variable("left", split=True)
@@ -1035,7 +1035,7 @@ E, nu, L, H, q = 1000.0, 0.3, 10.0, 1.0, 0.1
 lam, mu = E * nu / (1.0 - nu**2), E / (2.0 * (1.0 + nu))       # plane stress
 inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
 
-d = jno.Shape.rect(0, 0, L, H, size=0.5).domain()
+d = jno.shape.rect(0, 0, L, H, size=0.5).domain()
 u, phi = d.fem_symbols(value_shape=(2,), order=2)              # P2 vector displacement
 xi, yi, _ = d.variable("interior", split=True)
 xl, yl, _ = d.variable("left", split=True)                     # clamped root
@@ -1064,7 +1064,7 @@ run = jno.setup(__file__)
 nu = 1.0
 dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain(time=(0.0, 0.05, 26))
+d = jno.shape.rect(0, 0, 1, 1, size=0.08).domain(time=(0.0, 0.05, 26))
 u, phi = d.fem_symbols()
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -1103,7 +1103,7 @@ run = jno.setup(__file__)
 eps = 0.15
 exact = lambda x: np.tanh((x - 0.5) / (np.sqrt(2.0) * eps))  # noqa: E731
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.06).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xl, yl, _ = d.variable("left", split=True)
@@ -1133,7 +1133,7 @@ import numpy as np, jno
 
 run = jno.setup(__file__)
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.06).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -1161,7 +1161,7 @@ import jax, jax.numpy as jnp, numpy as np, optax, jno
 
 run = jno.setup(__file__)
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.1).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -1208,7 +1208,7 @@ import jno  # noqa: E402
 
 run = jno.setup(__file__)
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.06).domain()
 x, y, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 u = d.unknown()                                 # valued P1 nodal field
@@ -1241,7 +1241,7 @@ import jno  # noqa: E402
 
 run = jno.setup(__file__)
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y, _ = d.variable("interior", split=True)
 xbo, ybo, _ = d.variable("bottom", split=True)
 xl, yl, _ = d.variable("left", split=True)
@@ -1278,7 +1278,7 @@ import foundax, jax, optax, jno
 run = jno.setup(__file__)
 KEY, N, EPOCHS = jax.random.PRNGKey(0), 50, 2_000
 
-d = N * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()
+d = N * jno.shape.rect(0, 0, 2, 1, size=0.05).domain()
 x, y, _ = d.variable("interior")
 k = d.variable("k", jax.random.uniform(KEY, shape=(N, 1, 1), minval=0.5, maxval=1.5))
 

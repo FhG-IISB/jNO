@@ -74,7 +74,7 @@ def _movable(x, y):
 
 
 def build(size, space="Lagrange", movable=False):
-    d = jno.Shape.polygon(L_SHAPE, size=size).domain()
+    d = jno.shape.polygon(L_SHAPE, size=size).domain()
     if movable:
         # `.trainable()` on a spatial coordinate turns that region's mesh VERTICES into a design
         # variable: the assembler routes them into the element geometry, so `fem.solve()` becomes

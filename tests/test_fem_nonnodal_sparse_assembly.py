@@ -37,7 +37,7 @@ def _x64():
 
 
 def _n1e_cube(mesh_size):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]
@@ -104,7 +104,7 @@ def test_sparse_assembly_scales_past_dense_ceiling():
 # ------------------------------------------------------------------------------------
 def _n1e_cube_param(mesh_size, name="k"):
     """An N1E curl-curl form whose mass coefficient is a P1 NODAL FIELD parameter -- i.e. ε(x)."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     xi, yi, zi, _ = d.variable("interior", split=True)
     kf, _ = d.fem_symbols()  # a P1 coefficient field, independent of the N1E trial
     k = jno.np.parameter(kf, name=name)
@@ -142,7 +142,7 @@ def test_parametric_solve_gradient_matches_finite_differences():
     """The inverse-design payoff, end to end: differentiate a complex driven N1E SOLVE (not just the
     operator) w.r.t. a nodal ε(x) field. Central differences must agree -- the per-element scatter has to
     carry the tangent correctly, not merely produce a plausible matrix."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     xi, yi, zi, _ = d.variable("interior", split=True)
     kf, _ = d.fem_symbols()
     eps = jno.np.parameter(kf, name="eps")

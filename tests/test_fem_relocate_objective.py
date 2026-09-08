@@ -30,7 +30,7 @@ def _x64():
 
 def _peak(size=0.14, movable=True):
     """Poisson with a sharp off-center peak; a central box of interior nodes is movable."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -98,7 +98,7 @@ def test_the_string_objectives_still_work():
 
 def _channel_with_a_surface_term():
     """Poisson on [0,2]x[0,1] carrying ONE surface term, so the facet quadrature tables get built."""
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -126,7 +126,7 @@ def test_a_surface_term_without_facet_tables_refuses_by_name():
     """The tables are tabulated at BUILD time and only when the form itself carries a surface term, so
     a surface readout on a purely-volume problem has nothing to integrate against. It must say that
     rather than fail on `NoneType` unpacking six frames inside the element kernel."""
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.3).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -157,7 +157,7 @@ def _stokes_channel(size=0.5):
     the flow must develop a profile, so the channel's shape sets it (``max|du| = 7.2e-02`` for the same
     0.1 displacement) and ``d(objective)/d(vertex)`` genuinely runs through the solve.
     """
-    d = jno.Shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
     # Deform BEFORE tagging. A region's predicate is re-evaluated against the CURRENT points (both by
     # `tag_node_mask` and by relocate, which re-applies every predicate after moving the mesh), so a
     # mesh deformed after tagging leaves the tags describing a geometry that no longer exists -- here

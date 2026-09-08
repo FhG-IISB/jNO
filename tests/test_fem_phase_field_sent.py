@@ -57,11 +57,11 @@ def _sent(dim, *, h=0.03, thick=0.06, delta=1.4e-2, nout=8, limit=0.5):
     maximum, minimum, diff, ident = n.maximum, n.minimum, n.diff, n.identity
     w = 0.010
     if dim == 2:
-        shape = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h) - jno.Shape.rect(-0.01, 0.5 - w, 0.5, 0.5 + w, size=h)
+        shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h) - jno.shape.rect(-0.01, 0.5 - w, 0.5, 0.5 + w, size=h)
         top_pred, bot_pred = (lambda x, y: y > 1 - 1e-9), (lambda x, y: y < 1e-9)
         kbulk = LAM + MU  # plane strain
     else:
-        shape = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, thick, size=h) - jno.Shape.box(
+        shape = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, thick, size=h) - jno.shape.box(
             -0.01, 0.5 - w, -0.01, 0.5, 0.5 + w, thick + 0.01, size=h
         )
         top_pred, bot_pred = (lambda x, y, z: y > 1 - 1e-9), (lambda x, y, z: y < 1e-9)

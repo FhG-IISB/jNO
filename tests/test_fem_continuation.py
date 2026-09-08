@@ -37,7 +37,7 @@ def _nonlinear_diffusion(k_value=None):
     ``k`` is a runtime parameter when ``k_value`` is None, and a plain constant otherwise -- the two
     spellings assemble the same problem, which is what the equivalence test needs.
     """
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain()
     u, v = d.fem_symbols(names=("u", "v"), order=1)
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

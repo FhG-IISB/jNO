@@ -52,7 +52,7 @@ def _x64():
 
 
 def _cube(mesh_size=0.5):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]
@@ -127,7 +127,7 @@ def test_parametric_impedance_surface_mass_matches_and_differentiates():
     surface mass per args, DIFFERENTIABLY (inverse design of a surface impedance). The parametric operator
     at ``k=k0`` equals the constant-coefficient assembly, and a scalar readout's gradient w.r.t. ``k``
     matches central finite differences."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]
@@ -164,7 +164,7 @@ def test_transient_n1e_surface_impedance_reaches_steady_state():
     T, NS, AL, CI = 1.4, 28, 8.0, 3.0  # end time, steps, reaction coeff, impedance coeff (fast decay → converges)
 
     def _build(transient):
-        bx = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6)
+        bx = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6)
         d = bx.domain(time=(0.0, T, NS)) if transient else bx.domain()
         u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
         co = d.variable("interior", split=True)
@@ -199,7 +199,7 @@ def test_neural_impedance_surface_coefficient_matches_and_differentiates():
     (the non-nodal boundary net was previously rejected) and is DIFFERENTIABLE in the network weights — a
     *learned* surface impedance for inverse design. A constant-output net reproduces the scalar-coefficient
     operator exactly, and the operator's gradient w.r.t. the weights is finite and non-zero."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]

@@ -40,7 +40,7 @@ def _x64():
 
 
 def _disk(size, order):
-    return build(jno.Shape.disk(0.0, 0.0, 1.0, size=size), order=order)[0]
+    return build(jno.shape.disk(0.0, 0.0, 1.0, size=size), order=order)[0]
 
 
 def test_order_one_is_unchanged():
@@ -95,14 +95,14 @@ def test_a_polygon_is_unaffected_by_curving():
     """Affine is the special case: a straight-sided domain has no curvature to add, so the curved
     midside nodes must coincide with the chord midpoints. If they drift, the curving is inventing
     geometry rather than following the CAD."""
-    mesh = build(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3), order=2)[0]
+    mesh = build(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3), order=2)[0]
     pts = np.asarray(mesh.points)[:, :2]
     e = mesh.cells_dict["line3"]
     assert np.allclose(pts[e[:, 2]], 0.5 * (pts[e[:, 0]] + pts[e[:, 1]]), atol=1e-12)
 
 
 def test_curving_works_in_3d():
-    mesh = build(jno.Shape.sphere(0.0, 0.0, 0.0, 1.0, size=0.6), order=2)[0]
+    mesh = build(jno.shape.sphere(0.0, 0.0, 0.0, 1.0, size=0.6), order=2)[0]
     assert mesh.cells_dict["tetra10"].shape[1] == 10
     assert mesh.cells_dict["triangle6"].shape[1] == 6
     surf = np.unique(mesh.cells_dict["triangle6"])
@@ -111,7 +111,7 @@ def test_curving_works_in_3d():
 
 
 def _curved_disk_domain(size=0.3):
-    return jno.Shape.disk(0.0, 0.0, 1.0, size=size).curved().domain()
+    return jno.shape.disk(0.0, 0.0, 1.0, size=size).curved().domain()
 
 
 def test_the_domain_tags_the_whole_curved_facet():
@@ -128,11 +128,11 @@ def test_the_domain_tags_the_whole_curved_facet():
 
 
 def test_mesh_order_survives_the_csg_operators():
-    """`.curved()` must not be silently dropped by a later boolean or transform — every Shape
+    """`.curved()` must not be silently dropped by a later boolean or transform — every shape
     constructor rebuilds the dataclass, and each one that forgot the flag would lose the curving with
     no indication."""
-    disk = jno.Shape.disk(0.0, 0.0, 1.0, size=0.4).curved()
-    hole = jno.Shape.disk(0.0, 0.0, 0.3, size=0.4)
+    disk = jno.shape.disk(0.0, 0.0, 1.0, size=0.4).curved()
+    hole = jno.shape.disk(0.0, 0.0, 0.3, size=0.4)
     for shape, what in (
         (disk - hole, "cut"),
         (disk | hole, "fuse"),
@@ -153,7 +153,7 @@ def _poisson_terms(d, order):
 
 def _poisson_l2(curved, size, quad_degree=None):
     """-Δu = 1 on the unit disk (exact ``u = (1-r²)/4``), P2. Returns the RMS nodal error."""
-    sh = jno.Shape.disk(0.0, 0.0, 1.0, size=size)
+    sh = jno.shape.disk(0.0, 0.0, 1.0, size=size)
     d = (sh.curved() if curved else sh).domain()
     u, v = d.fem_symbols(order=2)
     c = d.variable("interior", split=True)

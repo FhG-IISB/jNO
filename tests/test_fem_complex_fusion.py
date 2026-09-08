@@ -43,7 +43,7 @@ def complex_fem():
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
         u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
         ci = d.variable("interior", split=True)
         x, y, z = ci[0], ci[1], ci[2]

@@ -2,7 +2,7 @@
 
 Chain ``.line_to`` / ``.arc_to`` from a start point. Used two ways:
 
-* **closed** -> ``.face()`` turns the contour into a 2-D :class:`~jno.geometry.shape.Shape`
+* **closed** -> ``.face()`` turns the contour into a 2-D :class:`~jno.geometry.shape.shape`
   region (a diameter + arc becomes a half-disk; all-line is a polygon).
 * **open** -> passed to ``profile.sweep(path)`` as a 3-D sweep trajectory.
 
@@ -49,19 +49,20 @@ class Path:
         return Path._extend(self._start, self._segs + (seg,))
 
     def face(self, name: str = "interior", size=None):
-        """Close the contour (using its x,y) and return it as a 2-D :class:`~jno.geometry.shape.Shape`."""
-        from . import shape as _shape
+        """Close the contour (using its x,y) and return it as a 2-D :class:`~jno.geometry.shape.shape`."""
         from .primitives import Contour
+        from .shape import _LEAF_KEYS
+        from .shape import shape as _shape
 
         start2 = (self._start[0], self._start[1])
         segs2 = tuple(
             (s[0], (s[1][0], s[1][1]), s[2]) if s[0] == "line" else (s[0], (s[1][0], s[1][1]), (s[2][0], s[2][1]), s[3])
             for s in self._segs
         )
-        return _shape.Shape(("leaf", Contour(start2, segs2), next(_shape._LEAF_KEYS)), 2, size)
+        return _shape(("leaf", Contour(start2, segs2), next(_LEAF_KEYS)), 2, size)
 
     def curve(self, size=None):
-        """Return this *open* path as a 1-D :class:`~jno.geometry.shape.Shape` (a curve domain).
+        """Return this *open* path as a 1-D :class:`~jno.geometry.shape.shape` (a curve domain).
 
         The 1-D sibling of :meth:`face`: ``face`` closes the contour into a 2-D region, ``curve``
         keeps it open as a 1-D manifold. The two overall endpoints are named ``left`` (start) and
@@ -70,12 +71,13 @@ class Path:
         keep their 3-D points, so ``arc_to`` gives a curved 1-D manifold and multiple segments a
         polyline (intermediate junctions are interior).
         """
-        from . import shape as _shape
         from .primitives import Curve
+        from .shape import _LEAF_KEYS
+        from .shape import shape as _shape
 
         if not self._segs:
             raise ValueError("curve() needs at least one segment -- call .line_to(...) / .arc_to(...) first")
-        return _shape.Shape(("leaf", Curve(self._start, self._segs), next(_shape._LEAF_KEYS)), 1, size)
+        return _shape(("leaf", Curve(self._start, self._segs), next(_LEAF_KEYS)), 1, size)
 
     # ----- trajectory use (for profile.sweep) -----------------------------------
     def _wire(self, occ):

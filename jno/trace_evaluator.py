@@ -83,7 +83,7 @@ def _uniform_grid_spec(domain, n_values: int):
         if not shape:
             raise ValueError(
                 "scheme='spectral' requires a uniform grid, and this domain has none. Build it with "
-                "Shape.structured() -- e.g. jno.Shape.rect(0, 0, 1, 1, size=h).structured().domain() "
+                "shape.structured() -- e.g. jno.shape.rect(0, 0, 1, 1, size=h).structured().domain() "
                 "-- which records the grid descriptor, or use scheme='finite_difference' on an "
                 "unstructured mesh."
             )
@@ -220,7 +220,7 @@ def _spectral_diff(values_flat, shape, spacing, axis: int, order: int, *, mirror
         return _unmirror_axis(out, axis, n_orig).reshape(-1)
 
     # jNO's structured grids span the interval INCLUSIVE of both ends, so the last node along an
-    # axis is the periodic image of the first: `Shape.rect(0,0,1,1, size=1/16)` gives 17 nodes for
+    # axis is the periodic image of the first: `shape.rect(0,0,1,1, size=1/16)` gives 17 nodes for
     # 16 intervals. The FFT wants exactly one period with no duplicate, so drop that node, transform
     # over the remaining n, and put it back afterwards. The finite-difference periodic stencils do
     # the same thing (`differential_operators.py`, `uu = moveaxis(U, dim, 0)[:-1]`). Without this
@@ -2259,7 +2259,7 @@ class TraceEvaluator:
             if is_boundary:
                 reg_indices = np.asarray(domain._boundary_registry[tag]["point_indices"])
                 region_pts_np = np.asarray(mc["points"])[reg_indices]
-                # A boundary face that carries its own edge subset (a Shape/CSG source-edge tag such
+                # A boundary face that carries its own edge subset (a shape/CSG source-edge tag such
                 # as ``boundary_chamber_0``) shares its two end corners with the perpendicular faces.
                 # The global ``nodal_ds`` lumps a corner's measure over *all* boundary edges meeting at
                 # that node, so counting the corner in this face over-attributes its perpendicular-edge

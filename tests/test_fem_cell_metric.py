@@ -31,7 +31,7 @@ def _x64():
 
 
 def _rect(n, lx=1.0, ly=1.0):
-    return jno.Shape.rect(0.0, 0.0, lx, ly).structured(n=n).domain(compute_mesh_connectivity=False)
+    return jno.shape.rect(0.0, 0.0, lx, ly).structured(n=n).domain(compute_mesh_connectivity=False)
 
 
 def _cell_metrics(dom):
@@ -135,7 +135,7 @@ def test_a_path_that_packs_no_jacobian_refuses_by_name(_x64, build):
 def test_a_boundary_term_is_refused_by_the_region_resolver(_x64):
     """A geometry symbol names no region, so pairing it with a boundary test function is refused there --
     the same way `dom.cell_size` already is. Pinned so the two symbols cannot drift apart."""
-    dom = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    dom = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     u, v = dom.fem_symbols()
     xi, yi, _ = dom.variable("interior", split=True)
     xb, yb, _, nx, _ny = dom.variable("boundary", normals=True, split=True)
@@ -156,7 +156,7 @@ def test_cell_metric_carries_a_mesh_gradient(_x64):
     """
     import jax.numpy as jnp
 
-    dom = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    dom = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     ym = dom.variable("mov", where=lambda x, y: (x > 0.15) & (x < 0.85) & (y > 0.15) & (y < 0.85), split=True)[1]
     ym.trainable(name="Y0")
     ids = np.asarray(dom._trainable_coords[0]["ids"], dtype=int)

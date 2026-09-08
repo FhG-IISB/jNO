@@ -719,7 +719,7 @@ class PolygonDomain(domain):
         return self
 
     def _register_tag_boundary_region(self, name, where, region=None):
-        # `region=` (a d.tag restriction to one body) only arises on a multi-body Shape.regions
+        # `region=` (a d.tag restriction to one body) only arises on a multi-body shape.regions
         # domain, which does not take this polygon path; accepted so the signatures match.
         """Polygon override: promote a *pure-boundary* ``domain.tag(name, where)`` to a normals-bearing
         boundary tag. The base method records the selected boundary facets as a region (so a Dirichlet

@@ -1,7 +1,7 @@
 """Local refinement of a quadrilateral or hexahedral mesh, with hanging-node constraints.
 
 This is the *other* h-adaptivity, and the one the tensor-product world actually uses. mmg adapts
-simplices by edge split/collapse/swap and has no quad analogue; rebuilding a ``Shape`` plan at a finer
+simplices by edge split/collapse/swap and has no quad analogue; rebuilding a ``shape`` plan at a finer
 size field works but is a global remesh that needs a geometry to rebuild from. Splitting a quadrilateral
 into 4 (a hexahedron into 8) needs neither -- it is local and works on a mesh loaded from a file. In 3-D
 it is the only option at all: no general all-hex mesher exists, so there is nothing to remesh *to*.
@@ -268,7 +268,7 @@ def refine_domain(domain, marked, *, copy: bool = False):
     """Refine a quadrilateral or hexahedral domain's marked cells in place, keeping its geometry exactly.
 
     The counterpart to :func:`~jno.utils.solver.fem_adapt._rebuild_to_size`, and the reason this exists:
-    that path re-runs gmsh on the ``Shape`` plan, so it needs a geometry to rebuild from and produces a
+    that path re-runs gmsh on the ``shape`` plan, so it needs a geometry to rebuild from and produces a
     mesh that does not nest inside the old one. Splitting cells needs neither -- it works on a mesh
     loaded from a file, and the old mesh's nodes all survive with their values. In 3-D it is the *only*
     option: no general all-hex mesher exists, so there is nothing to remesh to.

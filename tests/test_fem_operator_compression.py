@@ -69,7 +69,7 @@ def _matvec_matches_uncompressed(A, seed=0):
 
 
 def _poisson_3d(size=0.3):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, phi = d.fem_symbols()
     c = d.variable("interior", split=True)
     cb = d.variable("boundary", split=True)
@@ -99,7 +99,7 @@ def test_compression_does_not_move_the_solution():
 
 
 def _heat_2d(h=0.12, nsteps=6):
-    d = jno.Shape.rect(0, 0, 1, 1).sized(h).domain(time=(0.0, 0.03, nsteps))
+    d = jno.shape.rect(0, 0, 1, 1).sized(h).domain(time=(0.0, 0.03, nsteps))
     u, v = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -164,12 +164,12 @@ def test_1d_steady_operator_is_compressed():
 def _nonlinear(kind):
     """``(1 + u²)∇u·∇v`` — nonlinear in the unknown, so the Jacobian is re-assembled per Newton step."""
     if kind == "3d":
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1).sized(0.3).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1).sized(0.3).domain()
         u, v = d.fem_symbols()
         i, b = d.variable("interior", split=True), d.variable("boundary", split=True)
         a, c = u.bind(x=i[0], y=i[1], z=i[2]), v.bind(x=i[0], y=i[1], z=i[2])
         return jno.fem([(1.0 + a**2) * (a.x * c.x + a.y * c.y + a.z * c.z) - 1.0 * c, u(b[0], b[1], b[2]) - 0.0])
-    d = jno.Shape.rect(0, 0, 1, 1).sized(0.18).domain()
+    d = jno.shape.rect(0, 0, 1, 1).sized(0.18).domain()
     u, v = d.fem_symbols()
     i = d.variable("interior", split=True)
     r, ln = d.variable("right", split=True), d.variable("left", split=True)
@@ -244,7 +244,7 @@ def test_newton_still_converges_on_the_compressed_jacobian():
 
 
 def _poisson_3d_terms(size=0.28):
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, v = d.fem_symbols()
     i = d.variable("interior", split=True)
     b = d.variable("boundary", split=True)
@@ -330,7 +330,7 @@ def test_chunk_reaches_the_non_nodal_edge_family_assembler():
     pytest.importorskip("pygmsh", reason="pygmsh required for 3-D cube meshing")
     inner, vecf = jno.np.inner, jno.np.vector
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
@@ -415,7 +415,7 @@ def test_both_assemblers_share_one_chunk_policy():
 def _vertex_fem(space, h):
     """The form each family exists for: 4th-order full-Hessian for the C¹/biharmonic ones, a
     2nd-order form for Hermite (C⁰)."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=h).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=h).domain()
     u, v = d.fem_symbols(space=space)
     c = d.variable("interior", split=True)
     b = d.variable("boundary", split=True)
@@ -497,7 +497,7 @@ def _nonlinear_nonnodal(kind):
     """A genuinely nonlinear weak form, so the tangent depends on the state."""
     inner, vecf = jno.np.inner, jno.np.vector
     if kind == "n1e":  # nu(|B|) curl-curl -- the B-H-curve shape
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
         u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
         c = d.variable("interior", split=True)
         x, y, z = c[0], c[1], c[2]
@@ -505,7 +505,7 @@ def _nonlinear_nonnodal(kind):
         cu, cv = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
         src = vecf(0.0 * x, 0.0 * x, jno.np.where(x > 0.5, 1.0, 0.0))
         return jno.fem([(1.0 + inner(cu, cu)) * inner(cu, cv) + inner(ui, vi) - inner(src, vi)])
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.22).domain()  # nonlinear biharmonic on Morley
+    d = jno.shape.rect(0, 0, 1, 1, size=0.22).domain()  # nonlinear biharmonic on Morley
     u, v = d.fem_symbols(space="Morley")
     c = d.variable("interior", split=True)
     b = d.variable("boundary", split=True)

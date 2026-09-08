@@ -25,7 +25,7 @@ def _x64():
 def _periodic_transient(splat: bool):
     """Doubly-periodic transient solve; ties+IC written with either `u(*c)` or `u(c[0], c[1])`."""
     pitch, t_end, steps = 100.0, 45.0, 4
-    d = jno.Shape.rect(0.0, 0.0, pitch, pitch, size=pitch / 6).domain(time=(0.0, t_end, steps))
+    d = jno.shape.rect(0.0, 0.0, pitch, pitch, size=pitch / 6).domain(time=(0.0, t_end, steps))
     d.tag("left", lambda x, _: x < 1e-4)
     d.tag("right", lambda x, _: x > pitch - 1e-4)
     d.tag("bottom", lambda _, y: y < 1e-4)
@@ -78,7 +78,7 @@ def test_third_positional_coord_still_binds_z_in_3d():
     every dof Dirichlet-pinned, u ≡ 0 the correct answer, and the assertion vacuously broken.
     At 0.35 the mesh has 3 interior nodes (measured).
     """
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.35).domain()
+    d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.35).domain()
     u, phi = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
     cb = d.variable("boundary", split=True)  # (x, y, z, t)

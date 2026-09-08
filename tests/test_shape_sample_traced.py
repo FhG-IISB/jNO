@@ -32,7 +32,7 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
-S = jno.Shape
+S = jno.shape
 SHAPES = {
     "rect - disk": (S.rect(0, 0, 2, 1) - S.disk(0.7, 0.5, 0.28), 2),
     "polygon": (S.polygon([(0, 0), (2, 0), (1.6, 1), (0.5, 1.2)]), 2),

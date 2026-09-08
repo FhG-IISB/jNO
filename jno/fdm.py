@@ -44,8 +44,8 @@ boundaries are a tie constraint ``u(left) - u(right)`` (opposite faces, exactly 
 one-sided edge), structured-only since a strong-form stencil must wrap. A pure-Neumann
 problem (no Dirichlet node) is singular (solution up to a constant) and is solved as-is.
 
-**Structured grid.** ``jno.Shape.rect(x0, y0, x1, y1, size=h).structured().domain()`` (2-D) or
-``jno.Shape.box(x0, y0, z0, x1, y1, z1, size=h).structured().domain()`` (3-D) builds a regular
+**Structured grid.** ``jno.shape.rect(x0, y0, x1, y1, size=h).structured().domain()`` (2-D) or
+``jno.shape.box(x0, y0, z0, x1, y1, z1, size=h).structured().domain()`` (3-D) builds a regular
 grid — a right-triangulation in 2-D, a Kuhn 6-tets-per-voxel mesh in 3-D — and records a grid descriptor
 on ``mesh_connectivity["grid"]``; the interior operators (``jno.fdm.laplacian`` / ``gradient`` and the
 constraint-list ``u.d2(x)`` authoring) then take the assembly-free direct finite-difference stencils (the
@@ -336,13 +336,13 @@ def _has_unknown_derivative(node, unknown):
 def _mesh_nodes_in(pts, geom):
     """Indices of the mesh nodes ``pts`` inside a geometric region ``geom`` (registered via
     ``domain.region(name, region)``) — resolves the region to a node subset for pinning/solving on a
-    subdomain. A ``jno.Shape`` uses the analytic, shapely-free :meth:`Shape.contains` (2-D and 3-D — the
+    subdomain. A ``jno.shape`` uses the analytic, shapely-free :meth:`shape.contains` (2-D and 3-D — the
     primary path); a shapely geometry falls back to shapely (2-D mesh-conforming regions in
     ``polygon_domain``, which stay shapely by scope)."""
-    from .geometry import Shape
+    from .geometry import shape
 
     p = np.asarray(pts)
-    if isinstance(geom, Shape):
+    if isinstance(geom, shape):
         mask = np.asarray(geom.contains(p[:, : geom.dim]))
     else:
         import shapely
@@ -517,7 +517,7 @@ class _TraceFDM:
             if grid is None:
                 raise NotImplementedError(
                     "jno.fdm([...]): a periodic tie `u(A) - u(B)` requires a STRUCTURED grid — build the "
-                    "domain with `jno.Shape.rect(...).structured().domain()`. Periodic on an unstructured mesh is "
+                    "domain with `jno.shape.rect(...).structured().domain()`. Periodic on an unstructured mesh is "
                     "not supported (the FD stencil must wrap the grid, which a boundary tie alone cannot)."
                 )
             per = list(grid.get("periodic") or (False,) * len(grid["shape"]))

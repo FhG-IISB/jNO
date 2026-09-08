@@ -27,7 +27,7 @@ def _x64():
 
 
 def _poisson():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
     u, v = d.fem_symbols()
     xi, yi = d.variable("interior", split=True)[:2]
     xb, yb = d.variable("boundary", split=True)[:2]
@@ -88,7 +88,7 @@ def test_the_walls_fail_loud():
         crux.sweep(space_mixed)
 
     # a core with no FEM behind its constraints has nothing to march
-    d2 = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d2 = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     x = d2.variable("interior", split=True)[0]
     crux_nofem = jno.core([(x * 0.0).mae], domain=d2)
     space3 = jnn.tune.space()

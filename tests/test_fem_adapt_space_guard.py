@@ -23,7 +23,7 @@ from jno.utils.solver.fem_adapt import _vertex_view  # noqa: E402
 
 
 def _hermite_fem():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     xi, yi, _ = d.variable("interior", split=True)
     u, phi = d.fem_symbols(space="Hermite")
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
@@ -40,7 +40,7 @@ def test_a_hermite_field_is_refused_not_reinterpreted():
 
 def test_a_lagrange_field_still_works():
     """P1 and higher-order Lagrange are the case the branch was written for and must be untouched."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
     xi, yi, _ = d.variable("interior", split=True)
     u, phi = d.fem_symbols()
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)

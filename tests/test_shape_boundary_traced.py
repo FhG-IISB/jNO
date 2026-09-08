@@ -34,7 +34,7 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
-S = jno.Shape
+S = jno.shape
 SHAPES = {
     "rect": (S.rect(0, 0, 2, 1), 2),
     "disk": (S.disk(0, 0, 1), 2),

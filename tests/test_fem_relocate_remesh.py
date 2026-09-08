@@ -39,7 +39,7 @@ def _aspect(dom):
 
 def _peak(size=0.2):
     """Poisson with an off-centre peak; a central box of vertices is movable."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -132,7 +132,7 @@ def test_plain_relocate_is_unchanged():
 def _free_surface_channel(size=0.34):
     """Stokes channel with a traction-free top whose vertices may slide vertically -- the free-surface
     problem, whose objective is a SURFACE integral and so exercises the region resolution."""
-    d = jno.Shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
     p = np.asarray(d.mesh.points)
     p[:, 1] = p[:, 1] * (1.0 - 0.22 * p[:, 0] / 3.0 * p[:, 1])  # a deliberately wrong wall
     d.mesh.points = p

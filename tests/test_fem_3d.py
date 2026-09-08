@@ -56,7 +56,7 @@ def _solve(fem):
 
 
 def _cube(mesh_size=0.4, **kwargs):
-    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain(**kwargs)
+    return jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain(**kwargs)
 
 
 def _xyz(d):

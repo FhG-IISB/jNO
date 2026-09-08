@@ -87,7 +87,7 @@ def _cantilever_tip(nu, nx, ny, *, bbar, domain=None):
 def test_projecting_a_constant_is_exact():
     """A projection is exact on its own range: P0 of a constant is that constant, so a form built with
     `cellwise(1)` must solve identically to one built with `1`."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -186,7 +186,7 @@ def test_a_cellwise_inside_a_diff_target_raises_and_names_the_ordering():
     """`diff` is pointwise — it evaluates as `grad(sum(...))`, which is the per-point derivative only
     because the quadrature axis is a batch axis. A `cellwise` in the differentiated expression couples
     the points, so the result would silently be the cell-summed derivative."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     u, _phi = d.fem_symbols(value_shape=(2,))
     xi, yi, _ = d.variable("interior", split=True)
     eu = sym(u.bind(x=xi, y=yi), [xi, yi])
@@ -198,7 +198,7 @@ def test_fbar_ordering_with_cellwise_inside_wrt_is_accepted():
     """The counterpart of the refusal above: F-bar puts the projection inside `wrt`, where substitution
     replaces it with the value slot, so it never reaches the differentiated expression. That ordering
     must be ACCEPTED — otherwise the guard would forbid the very form it recommends."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     u, _phi = d.fem_symbols(value_shape=(2,))
     xi, yi, _ = d.variable("interior", split=True)
     eu = sym(u.bind(x=xi, y=yi), [xi, yi])
@@ -208,7 +208,7 @@ def test_fbar_ordering_with_cellwise_inside_wrt_is_accepted():
 
 def test_cellwise_of_an_integral_raises():
     """An already-reduced target has no quadrature axis left to average over."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     u, _phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     with pytest.raises(ValueError, match="Integral"):
@@ -218,7 +218,7 @@ def test_cellwise_of_an_integral_raises():
 def test_cellwise_on_a_boundary_term_raises_rather_than_averaging_the_wrong_points():
     """A surface term's kernel carries facet quadrature, not the cell's, so there is no per-cell mean to
     take. It must raise rather than average over whatever points happen to be in scope."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xt, yt, _ = d.variable("top", split=True)
@@ -241,7 +241,7 @@ def test_a_cellwise_term_is_not_reported_as_spatially_local():
     quadrature point depends on the whole cell, so peeling it would be wrong."""
     from jno.utils.solver.term_kind import classify_term
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)

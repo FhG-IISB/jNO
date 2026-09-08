@@ -63,7 +63,7 @@ def _build_periodic_problem(dx=0.4):
     uq, cnt = np.unique(Fs, axis=0, return_counts=True)
     BF = uq[cnt == 1]
 
-    d = _domain_from_arrays(jno.Shape.box(0, 0, 0, Lx, Ly, Lz, size=1.0).domain(), P, tets, BF, copy=True)
+    d = _domain_from_arrays(jno.shape.box(0, 0, 0, Lx, Ly, Lz, size=1.0).domain(), P, tets, BF, copy=True)
     d.tag("bottom", lambda x, y, z: z < Eb)
     d.tag("top", lambda x, y, z: z > Lz - Eb)
     d.tag("left", lambda x, y, z: x < Eb)
@@ -328,7 +328,7 @@ def test_parameter_anywhere_wavelength_and_eps_flow():
     import jax.numpy as jnp
 
     P0, Lz = 0.6, 3.2
-    d = jno.domain(jno.Shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
     e = 1e-6
     for nm, f in [
         ("left", lambda x, y, z: x < e),
@@ -391,7 +391,7 @@ def test_incidence_angle_source_parameter_is_differentiable():
     from jno.trace_evaluator import TraceEvaluator
 
     P0, Lz = 0.6, 3.2
-    d = jno.domain(jno.Shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
     e = 1e-6
     for nm, f in [
         ("left", lambda x, y, z: x < e),
@@ -491,7 +491,7 @@ def test_parameter_is_traced_no_solve_args():
     from jno.trace_evaluator import TraceEvaluator
 
     P0, Lz = 0.6, 3.2
-    d = jno.domain(jno.Shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
     e = 1e-6
     for nm, f in [
         ("left", lambda x, y, z: x < e),

@@ -476,7 +476,7 @@ def _apply_new_mesh(template: Any, new_mesh: Any, *, copy: bool):
 
 
 def _rebuild_to_size(domain: Any, vertex_size: np.ndarray, *, copy: bool = False):
-    """Remesh a **quadrilateral** domain by rebuilding its ``Shape`` plan at a new size field.
+    """Remesh a **quadrilateral** domain by rebuilding its ``shape`` plan at a new size field.
 
     There is no mmg for quads: mmg adapts by edge split/collapse/swap, operations defined on
     simplices. But a quadrilateral mesh in jNO is a triangle mesh that gmsh has recombined, and the
@@ -498,11 +498,11 @@ def _rebuild_to_size(domain: Any, vertex_size: np.ndarray, *, copy: bool = False
         raise NotImplementedError(
             "h-adaptive remeshing of a quadrilateral mesh rebuilds the geometry at a finer size field, "
             "and this domain has no geometry to rebuild from (it was loaded from a mesh file, not "
-            "built from a jno.Shape). Adapt a Shape-built domain, or refine the file's mesh outside jNO."
+            "built from a jno.shape). Adapt a shape-built domain, or refine the file's mesh outside jNO."
         )
     if getattr(plan, "_structured", None) is not None:
         raise NotImplementedError(
-            "h-adaptive remeshing cannot refine a Shape.structured() plan: a lattice's resolution is its "
+            "h-adaptive remeshing cannot refine a shape.structured() plan: a lattice's resolution is its "
             "cell COUNTS, so rebuilding it against a marked size field returns the same mesh -- a silent "
             "no-op. Drop .structured() to let gmsh mesh (and recombine) the geometry at a graded size, "
             "or rebuild the lattice yourself at a larger n."
@@ -547,7 +547,7 @@ def _rebuild_to_size(domain: Any, vertex_size: np.ndarray, *, copy: bool = False
 def _remesh_to_size(domain: Any, vertex_size, *, copy: bool = False, **mmg_kw):
     """Remesh to a per-vertex target size, by whichever mechanism the mesh's cell supports.
 
-    Simplices go to mmg, which adapts them locally; quadrilaterals rebuild from the ``Shape`` plan
+    Simplices go to mmg, which adapts them locally; quadrilaterals rebuild from the ``shape`` plan
     (:func:`_rebuild_to_size`). Everything else — a hexahedral mesh above all — refuses by name:
     there is no general all-hex mesher, so metric-driven hex remeshing is not a thing to implement.
     3-D tensor-product adaptivity needs octree refinement with hanging-node constraints instead.
@@ -573,7 +573,7 @@ def _capture_geometric_boundary_tags(domain: Any) -> None:
     """Give every named boundary region a **mesh-independent predicate**, so it survives a remesh.
 
     The mesh generator's named edge regions (``left`` / ``right`` / ``top`` / ``bottom`` / any
-    ``Shape`` sub-boundary) are baked into the ORIGINAL mesh as *cell sets*.  A remeshed mesh carries
+    ``shape`` sub-boundary) are baked into the ORIGINAL mesh as *cell sets*.  A remeshed mesh carries
     only ``interior`` and ``boundary`` (:func:`_domain_from_arrays` builds exactly those), so those
     names vanish at the first remesh — and a Dirichlet condition bound to one of them then reaches
     ``jno.fem`` as a whole-domain residual with a trial but no test function, failing with an error
@@ -2816,7 +2816,7 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         if spec.split:
             # Local refinement: split the marked cells and constrain the hanging nodes. No mesher, so
             # this is the branch a hexahedral mesh takes (there is nothing to remesh it to) and the one
-            # that works on a mesh with no `Shape` plan behind it.
+            # that works on a mesh with no `shape` plan behind it.
             from .fem_refine import refine_domain
 
             refine_domain(d, marked, copy=False)

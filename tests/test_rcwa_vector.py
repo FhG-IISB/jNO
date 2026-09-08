@@ -62,7 +62,7 @@ def _pillar(xi, yi, zi, eps_pillar=11.0):
 
 
 def _scalar_constraints():
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     _tag_faces(d)
     u, phi = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
@@ -89,7 +89,7 @@ def _scalar_constraints():
 
 
 def _vector_constraints():
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     _tag_faces(d)
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
@@ -150,7 +150,7 @@ def _param_pillar(xi, yi, zi, k):
 
 
 def _scalar_inverse_rc():
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     _tag_faces(d)
     k = jno.np.parameter((), name="k").initialize(jax.nn.initializers.constant(0.5))
     u, phi = d.fem_symbols()
@@ -182,7 +182,7 @@ def _scalar_inverse_rc():
 
 
 def _vector_inverse_rc():
-    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.2))
     _tag_faces(d)
     k = jno.np.parameter((), name="k").initialize(jax.nn.initializers.constant(0.5))
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")

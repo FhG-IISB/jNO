@@ -94,7 +94,7 @@ def _l_shape_polygon(size: float = 1.0) -> Polygon:
 
 
 def _l_shape_domain(mesh_size: float = 0.15):
-    return jno.Shape.polygon([(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)], size=mesh_size).domain()
+    return jno.shape.polygon([(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)], size=mesh_size).domain()
 
 
 def _corner_focused_size(points: np.ndarray, corner=(0.5, 0.5), fine=0.03, coarse=0.3) -> np.ndarray:
@@ -471,7 +471,7 @@ def test_anisotropic_adapt_beats_isotropic_on_oblique_layer():
 
 
 def _cube(mesh_size=0.35):
-    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    return jno.shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
 
 
 def test_remesh_and_solve_3d_recovers_linear_solution():
@@ -600,7 +600,7 @@ def test_adapt_vector_field_isotropic_refines_and_estimate_drops():
     """h-adaptivity on a VECTOR field: the ZZ estimator sums the per-component recovered-gradient errors,
     so one indicator refines the mesh where the vector solution varies sharply. The largest indicator sits
     at the feature, and the adaptive loop adds DOFs and cuts the global estimate (isotropic ZZ)."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
     u, phi = d.fem_symbols(value_shape=(2,))
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -628,7 +628,7 @@ def test_adapt_vector_field_isotropic_refines_and_estimate_drops():
 def test_adapt_vector_field_anisotropic_rejected():
     """The anisotropic Hessian metric is a single scalar-field Hessian, so a vector field must fall back to
     the (now vector-aware) isotropic ZZ path -- ``anisotropic=True`` on a vector field fails loud."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     u, phi = d.fem_symbols(value_shape=(2,))
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

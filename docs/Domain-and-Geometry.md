@@ -1,14 +1,14 @@
 # Domain & Geometry
 
 `jno.domain` holds a meshed geometry, its named regions, and the collocation points sampled on
-them. Build the geometry with the **`Shape`** DSL (gmsh-OpenCASCADE), load a mesh file, or pass a
+them. Build the geometry with the **`shape`** DSL (gmsh-OpenCASCADE), load a mesh file, or pass a
 point cloud.
 
 ```python
 import jno
-from jno import Shape
+from jno import shape
 
-solid = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).extrude(0.6)   # a strip under a roll
+solid = (shape.rect(0, 0, 4, 1) - shape.disk(2, 1, 0.4)).extrude(0.6)   # a strip under a roll
 d = solid.domain()                                                      # one-liner; == jno.domain(solid)
 
 x, y, z, t = d.variable("interior")                                     # coords (+ a trailing time coord t)
@@ -17,9 +17,9 @@ xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)  # a na
 
 ---
 
-## The `Shape` DSL
+## The `shape` DSL
 
-A `Shape` is an immutable build-plan: make **primitives**, combine them with **boolean operators**,
+A `shape` is an immutable build-plan: make **primitives**, combine them with **boolean operators**,
 reshape with **transforms**, then hand the result to `jno.domain`. Every call returns a new shape.
 
 ### Primitives
@@ -28,12 +28,12 @@ Each takes an optional `size=` (target element size near it).
 
 | Primitive | Auto-named boundaries |
 |---|---|
-| `Shape.rect(x0, y0, x1, y1)` | `left` `right` `top` `bottom` |
-| `Shape.disk(cx, cy, r)` | `arc` |
-| `Shape.polygon(points)` | `e0 e1 … eN` (one per edge) |
-| `Shape.box(x0, y0, z0, x1, y1, z1)` | `left right top bottom front back` |
-| `Shape.cylinder(x, y, z, dx, dy, dz, r)` | `side` `top` `bottom` (any axis) |
-| `Shape.sphere(cx, cy, cz, r)` | `surface` |
+| `shape.rect(x0, y0, x1, y1)` | `left` `right` `top` `bottom` |
+| `shape.disk(cx, cy, r)` | `arc` |
+| `shape.polygon(points)` | `e0 e1 … eN` (one per edge) |
+| `shape.box(x0, y0, z0, x1, y1, z1)` | `left right top bottom front back` |
+| `shape.cylinder(x, y, z, dx, dy, dz, r)` | `side` `top` `bottom` (any axis) |
+| `shape.sphere(cx, cy, cz, r)` | `surface` |
 | `Path(…).face()` | per-segment (see [Contours](#contours-with-arcs)) |
 
 `interior` (the area/volume) and `boundary` (all of it) are always present.
@@ -112,7 +112,7 @@ Control element size by attaching `size=` to a shape — gmsh's mesh-size fields
 (a Distance+Threshold field near a shape, a size callback for `f(x,y,z)`), combined by `min`:
 
 ```python
-Shape.disk(2, 1, 0.4, size=0.02)               # fine in the band around this shape's boundary
+shape.disk(2, 1, 0.4, size=0.02)               # fine in the band around this shape's boundary
 (strip - roll).sized(0.05)                      # a global size cap for the whole shape
 solid.sized(lambda x, y, z: 0.03 + 0.10 * y)    # graded: denser where the function is smaller
 ```
@@ -126,7 +126,7 @@ Meshes are simplicial by default (triangles, tetrahedra). `.quad()` asks gmsh to
 **quadrilaterals**, which works on any 2-D geometry:
 
 ```python
-d = Shape.disk(0, 0, 1, size=0.1).quad().domain()      # pure quads, curved boundary and all
+d = shape.disk(0, 0, 1, size=0.1).quad().domain()      # pure quads, curved boundary and all
 (plate.quad() - hole).sized(0.05)                       # survives the plan operators, like .sized()
 ```
 
@@ -136,8 +136,8 @@ Like `size=` and `.curved()`, this is a property of the shape rather than an arg
 plain box returns 944 tetrahedra and no hexahedra — so hexes come from a regular lattice:
 
 ```python
-d = Shape.box(0, 0, 0, 1, 1, 1).structured(n=16).quad().domain()    # 4096 hexahedra
-d = Shape.rect(0, 0, 1, 1).structured(n=40).quad().domain()          # 1600 quadrilaterals
+d = shape.box(0, 0, 0, 1, 1, 1).structured(n=16).quad().domain()    # 4096 hexahedra
+d = shape.rect(0, 0, 1, 1).structured(n=40).quad().domain()          # 1600 quadrilaterals
 ```
 
 `.quad()` and `.structured()` compose in either order.
@@ -154,8 +154,8 @@ things follow that a gmsh mesh cannot give:
   than holding to a tolerance.
 
 ```python
-d = Shape.rect(0, 0, 1, 1, size=0.1).structured().domain()   # counts from size=: 10x10 cells
-d = Shape.box(...).structured(n=(32, 16, 16)).domain()       # explicit, per axis
+d = shape.rect(0, 0, 1, 1, size=0.1).structured().domain()   # counts from size=: 10x10 cells
+d = shape.box(...).structured(n=(32, 16, 16)).domain()       # explicit, per axis
 
 d.grid          # {"shape": (Nx, Ny[, Nz]), "spacing": (...), "origin": (...)}
 u.reshape(d.grid["shape"])                                    # nodes are C-ordered
@@ -183,8 +183,8 @@ contains its centroid. Each region becomes its own variable set; the outer bound
 auto-names and internal interface facets are not boundary.
 
 ```python
-plate = Shape.rect(0, 0, 2, 1)
-core  = Shape.disk(1, 0.5, 0.3)
+plate = shape.rect(0, 0, 2, 1)
+core  = shape.disk(1, 0.5, 0.3)
 d = (core.name("inclusion") + plate.name("matrix")).sized(0.05).domain()
 
 d.variable("inclusion")     # the disk's cells/points (a distinct material)
@@ -193,7 +193,7 @@ d.boundary_tags()           # {left, right, top, bottom, boundary} — the plate
 ```
 
 `+` keeps the pieces as distinct materials with a conforming interface — unlike `|` (fuse), which
-merges them into one. It composes n-ary (`a + b + c`), and `Shape.regions(inclusion=core,
+merges them into one. It composes n-ary (`a + b + c`), and `shape.regions(inclusion=core,
 matrix=plate)` is the equivalent keyword form. Regions may overlap: here the disk overlaps the plate,
 and `inclusion` wins inside the disk because it is listed first. Use each region tag to restrict a
 `jno.fem` term or coefficient to that material (per-region volume integration), or to sample it in a
@@ -201,7 +201,7 @@ PINN. A multi-material shape is a top-level construct — call `.domain()` on it
 compose with boolean operators or transforms.
 
 Region names that are not valid Python identifiers go through the dict form:
-`Shape.regions({"Quartz.1": q1, "Quartz.2": q2})`. Dict order is priority order exactly as for
+`shape.regions({"Quartz.1": q1, "Quartz.2": q2})`. Dict order is priority order exactly as for
 keywords, and the two forms combine (dict entries first).
 
 ### Material properties — `.attach(...)`
@@ -217,8 +217,8 @@ the mapping is *data* rather than a material — values computed elsewhere, or a
 `default=` for regions that genuinely have no value.
 
 ```python
-kri = Shape.polygon(v).name("Kristall").attach(k=220.0, eps=0.794)
-gas = Shape.polygon(w).name("Gas").attach(k=0.186, eps=1.0)
+kri = shape.polygon(v).name("Kristall").attach(k=220.0, eps=0.794)
+gas = shape.polygon(w).name("Gas").attach(k=0.186, eps=1.0)
 d   = (kri + gas).domain()
 
 heat = d.k * (T.x*s.x + T.y*s.y) - d.q * s      # one equation, both materials
@@ -243,7 +243,7 @@ Rules worth knowing:
 * `d.<name>` raises if **any** region failed to declare that name, listing the ones that did not — a
   forgotten material surfaces at first use rather than as a region that silently conducts nothing. Use
   `d.by_region({...}, default=...)` explicitly when some regions genuinely have none.
-  **This check covers `Shape` regions only.** It reads `_shape_regions`, so on a **mesh-file domain**
+  **This check covers `shape` regions only.** It reads `_shape_regions`, so on a **mesh-file domain**
   it never fires: a region you forgot to attach falls through to `by_region`'s own default rather than
   raising. That matters most for a coefficient whose absence changes the operator's character — a
   forgotten reluctivity leaves `nu = 0` and with it no curl-curl term at all — so on a mesh-file domain
@@ -255,7 +255,7 @@ Rules worth knowing:
   `d.attach(...)` below, where the kind is resolved when it is declared.
 
 A property can also be attached **after** the domain exists, which is the only way to attach to a
-`domain.tag` — or to a mesh-file domain, which has no `Shape` to declare on:
+`domain.tag` — or to a mesh-file domain, which has no `shape` to declare on:
 
 ```python
 d.tag("wall", lambda x, y: x < 1e-9)
@@ -283,14 +283,14 @@ alongside the union `"a|b"`.
 === "Bolt-circle plate"
 
     ```python
-    holes = Shape.disk(3, 0, 0.3).array(6, about=((0, 0, 0), (0, 0, 1)))   # 6 holes in a ring
-    d = jno.domain((Shape.rect(-5, -5, 5, 5) - holes).extrude(0.4))
+    holes = shape.disk(3, 0, 0.3).array(6, about=((0, 0, 0), (0, 0, 1)))   # 6 holes in a ring
+    d = jno.domain((shape.rect(-5, -5, 5, 5) - holes).extrude(0.4))
     ```
 
 === "Filleted, drilled bracket"
 
     ```python
-    part = (Shape.box(0, 0, 0, 8, 4, 1) - Shape.cylinder(2, 2, -1, 0, 0, 3, 0.5)) \
+    part = (shape.box(0, 0, 0, 8, 4, 1) - shape.cylinder(2, 2, -1, 0, 0, 3, 0.5)) \
         .fillet(0.2, where=lambda x, y, z: z > 0.9)                          # round the top edges
     d = jno.domain(part)
     ```
@@ -298,15 +298,15 @@ alongside the union `"a|b"`.
 === "Bent pipe (sweep)"
 
     ```python
-    pipe = Shape.disk(0, 0, 0.4).sweep(Path(0, 0, 0).arc_to(2, 0, 2, through=(0.6, 0, 1.4)))
+    pipe = shape.disk(0, 0, 0.4).sweep(Path(0, 0, 0).arc_to(2, 0, 2, through=(0.6, 0, 1.4)))
     d = jno.domain(pipe)
     ```
 
 === "Graded roll-gap"
 
     ```python
-    strip = Shape.rect(0, 0, 4, 1, size=0.1)          # coarse in the bulk
-    roll  = Shape.disk(2, 1, 0.4, size=0.02)          # fine near the contact arc
+    strip = shape.rect(0, 0, 4, 1, size=0.1)          # coarse in the bulk
+    roll  = shape.disk(2, 1, 0.4, size=0.02)          # fine near the contact arc
     d = jno.domain((strip - roll).extrude(0.6))       # the carved arc is auto-named "arc"
     xc, yc, zc, tc, nx, ny, nz = d.variable("arc", normals=True, split=True)   # contact points + normals
     ```
@@ -350,22 +350,22 @@ re-export.
 d = jno.domain.from_array({"interior": interior_coords, "boundary": boundary_coords})
 ```
 
-**1-D domains** — an open path, exactly like every other dimension's `Shape`:
+**1-D domains** — an open path, exactly like every other dimension's `shape`:
 `jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()` (ends named `left`/`right`). This is the
 form used throughout the docs; the `jno.domain.line(...)` shorthand still exists. `jno.domain`
 also keeps the structured grids `equi_distant_rect` / `poseidon` and the point-cloud `from_array`.
-For 2-D/3-D geometry build the shape with `Shape` — `Shape.rect(...).domain()`,
-`Shape.box(...).domain()`, and so on. (Shapely geometries and vertex lists are also still accepted.)
+For 2-D/3-D geometry build the shape with `shape` — `shape.rect(...).domain()`,
+`shape.box(...).domain()`, and so on. (Shapely geometries and vertex lists are also still accepted.)
 
 ---
 
 ## Mesh-free sampling — what a PINN actually needs
 
-`shape.domain()` does **not** mesh. A `Shape` knows its own extent, its own membership test and its
+`shape.domain()` does **not** mesh. A `shape` knows its own extent, its own membership test and its
 own boundary in closed form, so collocation points are drawn from the geometry directly:
 
 ```python
-d = jno.Shape.box(0, 0, 0, 1, 1, 1).domain()          # no gmsh, in 1-D, 2-D or 3-D
+d = jno.shape.box(0, 0, 0, 1, 1, 1).domain()          # no gmsh, in 1-D, 2-D or 3-D
 x, y, z, t = d.variable("interior", sample=(20_000, None), split=True)
 ```
 
@@ -400,7 +400,7 @@ primitives' auto-names (`left`, `arc`, `surface`, …) are available before any 
 !!! note "Shapes with no closed form — the boundary tessellation"
     `fillet` has no analytic membership: it *removes* material near edges, so recursing to the child
     would answer for the un-filleted solid — a wrong-but-plausible mask. It is served by meshing the
-    **boundary only** — the perimeter in 2-D, the surface in 3-D — which `Shape.tessellate()` does
+    **boundary only** — the perimeter in 2-D, the surface in 3-D — which `shape.tessellate()` does
     once and caches. No volume fill runs, and `contains`, `sample_interior` and `sample_boundary`
     fall back to it automatically. The domain says which path it took:
 
@@ -423,7 +423,7 @@ primitives' auto-names (`left`, `arc`, `surface`, …) are available before any 
     through `.build()`, and the domain logs why rather than doing it silently.
 
 !!! warning "Plans that stay eager"
-    `.name(...)` / `Shape.regions(...)` (region and interface tags are the mesher's conforming
+    `.name(...)` / `shape.regions(...)` (region and interface tags are the mesher's conforming
     sub-bodies) and `.structured()` (already a lattice) mesh at construction as before, rather than
     being half-served.
 
@@ -452,7 +452,7 @@ you:
 ValueError: domain.variable('interior'): this domain is mesh-free and no mesh size was declared,
 so the tag has no node set to hand back and no natural point count. Say which you want:
   - continuous collocation points:  variable('interior', sample=(n, None))
-  - a mesh's nodes:                 give the shape a size, e.g. Shape.rect(..., size=0.05),
+  - a mesh's nodes:                 give the shape a size, e.g. shape.rect(..., size=0.05),
                                     or read d.mesh first
 ```
 

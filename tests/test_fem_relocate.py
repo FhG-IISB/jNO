@@ -33,7 +33,7 @@ def _min_detj(pts, cells):
 
 def _peak_scalar(size=0.14, movable=True):
     """Poisson with a sharp off-center peak source; interior nodes (a central box) tagged trainable."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -73,7 +73,7 @@ def test_relocate_requires_trainable_coordinates():
 
 def test_relocate_vector_field():
     """Generality: a vector problem relocates too (the monitor sums over components)."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.16).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.16).domain()
     u, phi = d.fem_symbols(value_shape=(2,))
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -104,7 +104,7 @@ def _mov(d):
 
 def test_relocate_nonlinear():
     """A steady *nonlinear* problem relocates (the objective's solve is a differentiable Newton solve)."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.18).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.18).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -142,7 +142,7 @@ def test_relocate_transient():
 
 def test_relocate_periodic():
     """A *periodic* problem relocates: interior relocation never touches the boundary ties."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.18).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.18).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", where=lambda x, y: x < 1e-6, split=True)
@@ -241,7 +241,7 @@ def test_relocate_beats_a_uniform_mesh_on_an_underresolved_front():
     T, NSTEP, SIZE, EPS = 2.0, 24, 0.06, 0.03
 
     def build(movable):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=SIZE).domain(time=(0.0, T, NSTEP))
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=SIZE).domain(time=(0.0, T, NSTEP))
         d.tag("right_edge", lambda x, y: x > 1.0 - 1e-9)
         u, v = d.fem_symbols()
         xi, yi, ti = d.variable("interior", split=True)
@@ -589,7 +589,7 @@ def test_relocate_monge_ampere_returns_its_best_mesh_not_its_last():
 def _peak_field(order, shape, size=0.14):
     """The same Poisson peak at a chosen element order and value shape; every component carries the
     identical field, which is what makes the scalar and vector runs comparable below."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
     xm, ym = d.variable("mov", where=lambda x, y: (x > 0.05) & (x < 0.95) & (y > 0.05) & (y < 0.95), split=True)[:2]
     xm.trainable(name="ix")
     ym.trainable(name="iy")
@@ -660,7 +660,7 @@ L_SHAPE_R = [(0, 0), (1, 0), (1, 0.5), (0.5, 0.5), (0.5, 1), (0, 1)]
 
 def _corner_problem(movable, size=0.12):
     """Poisson on an L-shape: a FIXED singularity at the re-entrant corner, nothing moving."""
-    d = jno.Shape.polygon(L_SHAPE_R, size=size).domain()
+    d = jno.shape.polygon(L_SHAPE_R, size=size).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -738,7 +738,7 @@ def test_the_objective_is_reachable_from_the_public_slot_and_validated():
 def _stokes_with_a_pressure_gauge(size=0.5):
     """Taylor-Hood Stokes in a channel, with `p.pin()` fixing the pressure gauge, and its top wall
     vertices free to slide vertically."""
-    d = jno.Shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
     p, q = d.fem_symbols(names=("p", "q"), order=1)
     x, y, _ = d.variable("interior", split=True)

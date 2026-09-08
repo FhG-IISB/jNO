@@ -40,7 +40,7 @@ def _x64():
 
 def _heat_fem(mesh_size=0.1, kappa=0.1, t_end=0.3, nt=21, order=1):
     """Scalar heat equation u_t = κΔu on the unit square, mode-(1,1) IC, homogeneous Dirichlet."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=mesh_size).domain(time=(0.0, t_end, nt))
+    d = jno.shape.rect(0, 0, 1, 1, size=mesh_size).domain(time=(0.0, t_end, nt))
     u, phi = d.fem_symbols(order=order)
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -63,7 +63,7 @@ def test_transient_adaptive_matches_analytic_heat_decay():
     assert abs(times[0]) < 1e-12 and abs(times[-1] - 0.3) < 1e-9  # spans [0, t_end], no drift
     assert fem.adapt_history, "expected at least one remesh during the march"
 
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.08).domain()
     ys = np.asarray(traj.resample(ref))  # (n_save, n_ref) uniform array
     xr = np.asarray(ref.mesh.points)[:, :2]
     base = np.sin(PI * xr[:, 0]) * np.sin(PI * xr[:, 1])
@@ -93,7 +93,7 @@ def test_transient_adaptive_holds_a_constant_budget():
 def test_resample_shape_and_final():
     fem, _ = _heat_fem(mesh_size=0.14, t_end=0.15, nt=13)
     traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=4))
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.1).domain()
     ys = np.asarray(traj.resample(ref))
     assert ys.shape == (len(traj), len(np.asarray(ref.mesh.points)))
     state_final, (pts, cells) = traj.final()
@@ -110,7 +110,7 @@ def test_solve_fn_with_transient_adapt_raises():
 # ── basis-aware transfer: the ordering-invariant locks (no remesh needed) ─────
 def _p2_scalar_layout():
     """A P2 scalar transient fem + its per-field layout and P1 base mesh."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.34).domain(time=(0.0, 0.1, 3))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.34).domain(time=(0.0, 0.1, 3))
     u, phi = d.fem_symbols(order=2)
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -162,7 +162,7 @@ def test_transient_adaptive_p2_scalar_matches_reference():
     traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=4, max_dofs=8000))
     assert isinstance(traj, AdaptiveTrajectory)
     assert fem.adapt_history, "expected at least one remesh"
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.08).domain()
     ys = np.asarray(traj.resample(ref))  # single scalar field -> (n_save, n_ref)
     xr = np.asarray(ref.mesh.points)[:, :2]
     base = np.sin(PI * xr[:, 0]) * np.sin(PI * xr[:, 1])
@@ -185,7 +185,7 @@ def test_transient_adaptive_two_coupled_scalar_fields():
     decay rates would be wrong — so matching each field's analytic decay proves the multifield state is
     split, transferred, and re-assembled correctly. Also exercises the (n_save, n_fields, n_ref) resample."""
     ku, kw = 0.12, 0.04
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 21))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 21))
     u, v = d.fem_symbols(names=("u", "v"))
     w, q = d.fem_symbols(names=("w", "q"))
     xi, yi, ti = d.variable("interior", split=True)
@@ -207,7 +207,7 @@ def test_transient_adaptive_two_coupled_scalar_fields():
     traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=6000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory)
 
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.08).domain()
     ys = np.asarray(traj.resample(ref))  # (n_save, n_fields=2, n_ref)
     assert ys.ndim == 3 and ys.shape[1] == 2
     xr = np.asarray(ref.mesh.points)[:, :2]
@@ -226,7 +226,7 @@ def test_transient_adaptive_mixed_order_fields():
     bookkeeping). Each must reproduce its analytic decay through the remeshes, proving the mixed-space
     offsets/transfer carry heterogeneous blocks correctly (not a uniform-n_verts assumption)."""
     ku, kw = 0.12, 0.05
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain(time=(0.0, 0.3, 21))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.12).domain(time=(0.0, 0.3, 21))
     u, v = d.fem_symbols(names=("u", "v"), order=2)  # P2 field
     w, q = d.fem_symbols(names=("w", "q"), order=1)  # P1 field
     xi, yi, ti = d.variable("interior", split=True)
@@ -250,7 +250,7 @@ def test_transient_adaptive_mixed_order_fields():
     traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=9000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory)
 
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.08).domain()
     xr = np.asarray(ref.mesh.points)[:, :2]
     base = np.sin(PI * xr[:, 0]) * np.sin(PI * xr[:, 1])
     ys = np.asarray(traj.resample(ref))  # both scalar -> (n_save, 2, n_ref)
@@ -265,7 +265,7 @@ def test_transient_adaptive_mixed_order_fields():
 
 def _nonlinear_reaction_fem(size, r=2.0, t_end=0.2, nt=21):
     """Semilinear heat u_t = Δu + r·u(1-u) — a NONLINEAR transient block (mass + residual)."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain(time=(0.0, t_end, nt))
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain(time=(0.0, t_end, nt))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -290,7 +290,7 @@ def test_transient_adaptive_nonlinear_matches_manufactured():
         us = ustar(x, y, t)
         return (2 * PI**2 - lam) * us - r * us * (1.0 - us)
 
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 21))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 21))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -303,7 +303,7 @@ def test_transient_adaptive_nonlinear_matches_manufactured():
     traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=9000))
     assert isinstance(traj, AdaptiveTrajectory) and fem.adapt_history
 
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.08).domain()
     ys = np.asarray(traj.resample(ref))
     xr = np.asarray(ref.mesh.points)[:, :2]
     base = np.sin(PI * xr[:, 0]) * np.sin(PI * xr[:, 1])
@@ -323,7 +323,7 @@ def test_transient_adaptive_nonlinear_slot_composes():
         nonlinear=jno.solve.newton(max_steps=40, rtol=1e-9, atol=1e-11),
     )
     assert isinstance(traj, AdaptiveTrajectory) and fem.adapt_history
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.1).domain()
     ys = np.asarray(traj.resample(ref))
     assert np.all(np.isfinite(ys)) and float(np.abs(ys).max()) > 1e-3  # a real, finite solution
 
@@ -344,7 +344,7 @@ def test_transient_adaptive_vector_p2_plus_scalar_p1():
     (the transient Taylor-Hood saddle assembles too; here we isolate the transfer, which is what adapt
     touches)."""
     kv, ks = 0.1, 0.04
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain(time=(0.0, 0.3, 21))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.12).domain(time=(0.0, 0.3, 21))
     u, w = d.fem_symbols(value_shape=(2,), names=("u", "w"), order=2)  # vector P2 (velocity-shaped)
     s, r = d.fem_symbols(names=("s", "r"), order=1)  # scalar P1 (pressure-shaped)
     xi, yi, ti = d.variable("interior", split=True)
@@ -372,7 +372,7 @@ def test_transient_adaptive_vector_p2_plus_scalar_p1():
     traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=12000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory)
 
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.08).domain()
     xr = np.asarray(ref.mesh.points)[:, :2]
     b0 = np.sin(PI * xr[:, 0]) * np.sin(PI * xr[:, 1])
     b1 = np.sin(2 * PI * xr[:, 0]) * np.sin(PI * xr[:, 1])
@@ -401,7 +401,7 @@ def test_transient_adaptive_pressure_pin_survives_remesh():
     P1 pressure, advection -> nonlinear -> the fast per-step Newton path), no-slip, ``p.pin()``, adapt on
     velocity: it must re-assemble across remeshes and develop a finite flow (the gauge holding)."""
     nu = 0.1
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.22).domain(time=(0.0, 0.06, 7))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.22).domain(time=(0.0, 0.06, 7))
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
     p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
     xi, yi, ti = d.variable("interior", split=True)
@@ -425,7 +425,7 @@ def test_transient_adaptive_pressure_pin_survives_remesh():
     assert len(fem.offsets) == 3 and not fem.is_linear  # P2 vel + P1 pressure saddle, nonlinear
     traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=2, max_dofs=4000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory) and fem.adapt_history  # remeshed >= once -> pin re-derived each time
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.1).domain()
     yv = np.asarray(traj.resample(ref, field=0))
     assert np.all(np.isfinite(yv)) and float(np.abs(yv[-1]).max()) > 1e-3  # a finite flow developed; the gauge held
 
@@ -445,7 +445,7 @@ def test_builtin_edge_regions_survive_a_remesh():
     """
 
     def build(builtin_left):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain(time=(0.0, 0.2, 6))
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain(time=(0.0, 0.2, 6))
         d.tag("right_edge", lambda x, y: x > 1.0 - 1e-9)
         if builtin_left:
             left = "left"
@@ -467,7 +467,7 @@ def test_builtin_edge_regions_survive_a_remesh():
             ]
         ), d
 
-    ref = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain()
+    ref = jno.shape.rect(0, 0, 1, 1, size=0.12).domain()
     out = {}
     for builtin in (True, False):
         fem, _ = build(builtin)

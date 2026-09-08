@@ -31,7 +31,7 @@ def test_polygon_domain_accepts_constant_z_vertices():
 
 def test_domain_poly_factory_is_lazy_unlike_meshed_shape_polygon():
     dom = jno.domain.poly(SQUARE_A, name="a")
-    mesh_dom = jno.Shape.polygon(SQUARE_A, size=0.5).domain(compute_mesh_connectivity=False)
+    mesh_dom = jno.shape.polygon(SQUARE_A, size=0.5).domain(compute_mesh_connectivity=False)
 
     assert isinstance(dom, jno.domain.csg)
     assert dom.mesh is None

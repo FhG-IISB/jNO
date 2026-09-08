@@ -40,7 +40,7 @@ def _imag_layer_fem(d, eps=0.05):
 
 
 def test_anisotropic_adaptation_runs_on_a_complex_field():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
     n0 = len(d.mesh.points)
     _imag_layer_fem(d).solve(adapt=jno.solve.remesh(anisotropic=True, max_iters=4, refine_factor=1.6, max_dofs=2500))
     assert len(d.mesh.points) > n0, "the mesh did not refine at all"
@@ -50,7 +50,7 @@ def test_the_metric_follows_the_imaginary_feature():
     """The layer is at x + y = 1 and exists only in Im(u). If the reduction dropped the imaginary
     part the field would be flat and refinement would spread out, so this is what makes the test
     about the reduction rather than about adaptation running."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
     _imag_layer_fem(d).solve(adapt=jno.solve.remesh(anisotropic=True, max_iters=4, refine_factor=1.6, max_dofs=2500))
 
     p = np.asarray(d.mesh.points)
@@ -64,7 +64,7 @@ def test_hessian_metric_still_refuses_complex_input():
     """Called directly it must raise, not diagonalise a complex-symmetric Hessian with `eigh`."""
     from jno.utils.solver.fem_adapt import hessian_metric
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     n = len(d.mesh.points)
     u = np.ones(n) * (1.0 + 1.0j)
     with pytest.raises((NotImplementedError, ValueError), match="complex"):
@@ -75,7 +75,7 @@ def test_the_real_path_is_unchanged():
     """A real field must take exactly the path it did before."""
     from jno.utils.solver.fem_adapt import hessian_metric
 
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
     p = np.asarray(d.mesh.points)
     u = np.tanh((p[:, 0] + p[:, 1] - 1.0) / 0.1)
     M = hessian_metric(d, u, target_complexity=200.0, hmin=0.01, hmax=1.0)

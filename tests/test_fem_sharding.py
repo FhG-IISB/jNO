@@ -68,7 +68,7 @@ def test_shard_argument_is_actually_wired_to_the_solve():
 
     assert "shard" in inspect.signature(jno.fem.__globals__["FEM"].solve).parameters, "FEM.solve must accept shard="
 
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.35).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.35).domain()
     u, phi = d.fem_symbols()
     c = d.variable("interior", split=True)
     cb = d.variable("boundary", split=True)

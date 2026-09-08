@@ -32,7 +32,7 @@ def _same_to_precision(_a, b, *, slack=32.0):
 
 def make_domain(mesh_size=0.35):
     """Create a small rectangular domain for fast VPINN tests."""
-    return jno.Shape.rect(0, 0, 1, 1, size=mesh_size).domain()
+    return jno.shape.rect(0, 0, 1, 1, size=mesh_size).domain()
 
 
 def init_vpinn_fem(dom, with_neumann_tags=True):
@@ -442,7 +442,7 @@ class TestVpinnScopeRefusals:
         The mesh must be fine enough to have INTERIOR nodes: the Dirichlet declaration masks every
         boundary test function, so a cube coarse enough that all its nodes lie on the surface gives an
         identically-zero residual -- correct, and useless to assert on."""
-        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+        dom = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
         u, phi = dom.fem_symbols()
         si = dom.variable("interior", split=True)
         xi, yi, zi = si[0], si[1], si[2]
@@ -658,7 +658,7 @@ class TestVpinnCoupledAsVector:
     def test_the_coupled_system_is_expressible_and_correct_as_a_vector_field(self):
         """Oracle: solve the SAME form with an FEM trial. If FEM recovers (s, 2s), the vector
         rewrite of the coupled system is right -- which is what the refusal message asserts."""
-        dom = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain()
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.12).domain()
         u, phi = dom.fem_symbols(value_shape=(2,))
         xi, yi, _ = dom.variable("interior", split=True)
         xb, yb, _ = dom.variable("boundary", split=True)
@@ -808,7 +808,7 @@ class TestVpinnTransientRefusal:
 
     @staticmethod
     def _heat(with_ic, ic_value=0.0, nsteps=5):
-        dom = jno.Shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0.0, 0.1, nsteps))
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0.0, 0.1, nsteps))
         u, phi = dom.fem_symbols()
         si = dom.variable("interior", split=True)
         xi, yi, ti = si[0], si[1], si[2]
@@ -861,7 +861,7 @@ class TestVpinn3D:
 
     @staticmethod
     def _cube(vec=False):
-        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+        dom = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
         u, phi = dom.fem_symbols(value_shape=(3,) if vec else ())
         si = dom.variable("interior", split=True)
         xi, yi, zi = si[0], si[1], si[2]

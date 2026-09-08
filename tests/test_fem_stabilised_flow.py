@@ -43,7 +43,7 @@ def _advection_diffusion(n, nu, stabilised):
     The exact solution is monotone in x with a boundary layer of width `nu` at the outflow. Galerkin
     P1 cannot represent it and rings; SUPG adds streamline diffusion and does not.
     """
-    dom = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain()
+    dom = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain()
     dom.tag("inflow", lambda x, y: x < 1e-9)
     dom.tag("outflow", lambda x, y: x > 1.0 - 1e-9)
     u, v = dom.fem_symbols()

@@ -31,7 +31,7 @@ def _x64():
 
 
 def _cantilever(value_shape=(2,)):
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 0.5, size=0.15).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 0.5, size=0.15).domain()
     d.tag("left", lambda x, n, names: x[:, 0] < 1e-6)
     d.tag("right", lambda x, n, names: x[:, 0] > 2.0 - 1e-6)
     u, v = d.fem_symbols(value_shape=value_shape)
@@ -117,7 +117,7 @@ def test_finite_strain_neo_hookean_in_the_natural_spelling():
         return sol.reshape(len(d.mesh.points), 2)
 
     def solve_scalar(load):
-        d = jno.Shape.rect(0.0, 0.0, 2.0, 0.5, size=0.15).domain()
+        d = jno.shape.rect(0.0, 0.0, 2.0, 0.5, size=0.15).domain()
         d.tag("left", lambda x, n, names: x[:, 0] < 1e-6)
         a, qa = d.fem_symbols(names=("a", "qa"))
         b, qb = d.fem_symbols(names=("b", "qb"))
@@ -147,7 +147,7 @@ def test_decoupled_component_laplacians_match_the_scalar_solve(order):
     """Two decoupled component Laplacians with the source on component 1 only: component 0 must stay
     identically zero and component 1 must equal the plain scalar Poisson solution — at P1 and P2, since
     the component tables are built from the same order-k basis as everything else."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     u, v = d.fem_symbols(value_shape=(2,), order=order)
     xi, yi = d.variable("interior", split=True)[:2]
     xb, yb = d.variable("boundary", split=True)[:2]
@@ -156,7 +156,7 @@ def test_decoupled_component_laplacians_match_the_scalar_solve(order):
     fem = jno.fem([weak, u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0])
     sol = np.asarray(fem.solve()).reshape(-1, 2)
 
-    d2 = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    d2 = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     us, vs = d2.fem_symbols(order=order)
     xi2, yi2 = d2.variable("interior", split=True)[:2]
     xb2, yb2 = d2.variable("boundary", split=True)[:2]
@@ -205,7 +205,7 @@ def test_component_and_whole_field_spellings_mix_in_one_term():
 # the assembler with a raw broadcast error that named nothing.
 # ==================================================================================================
 def _bar(size=0.5):
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=size).domain()
     d.tag("left", lambda x, y: x < 1e-9)
     return d
 

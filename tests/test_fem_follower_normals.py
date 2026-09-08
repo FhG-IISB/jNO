@@ -37,7 +37,7 @@ def _x64():
 
 def _form(follow, traction=True, size=0.34):
     """Unit square with a unit pressure on its top face. ``follow`` picks which normal that uses."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).sized(size).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).sized(size).domain()
     _ = d.built_mesh
     d.tag("top", lambda x, y: y > 1.0 - 1e-9)
     u, phi = d.fem_symbols(value_shape=(2,))
@@ -121,7 +121,7 @@ def test_the_reference_normal_is_still_the_default():
 
 def test_following_needs_an_unambiguous_displacement_field():
     """It has to know which field moves the surface; guessing wrong rotates every traction on it."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).sized(0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).sized(0.4).domain()
     _ = d.built_mesh
     d.tag("top", lambda x, y: y > 1.0 - 1e-9)
     u, phi = d.fem_symbols(value_shape=())  # a SCALAR field: nothing moves the surface

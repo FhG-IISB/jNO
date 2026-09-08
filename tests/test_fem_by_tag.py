@@ -25,7 +25,7 @@ import jno
 
 def _square(size=0.34):
     """Unit square with `left` / `right` boundary tags and the symbols a Robin term needs."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
     d.tag("left", lambda x, y: x < 1e-9)
     d.tag("right", lambda x, y: x > 1 - 1e-9)
     u, v = d.fem_symbols()
@@ -108,7 +108,7 @@ def test_the_mask_selects_exactly_the_dirichlet_facets():
 def test_three_tags_each_keep_their_own_value():
     """Extremes: more than two tags, including a zero one -- a zero coefficient must not be confused
     with an absent tag."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.34).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.34).domain()
     d.tag("l", lambda x, y: x < 1e-9)
     d.tag("r", lambda x, y: x > 1 - 1e-9)
     d.tag("b", lambda x, y: y < 1e-9)
@@ -210,8 +210,8 @@ def test_attach_rejects_an_unknown_target():
 def test_a_property_declared_on_both_a_region_and_a_tag_raises_on_read():
     """One name, two meanings: integrated over cells in one place and over facets in another."""
     d = (
-        jno.Shape.rect(0, 0, 1, 1, size=0.5).name("a").attach(rho=1.0)
-        + jno.Shape.rect(0, 0, 2, 1, size=0.5).name("b").attach(rho=2.0)
+        jno.shape.rect(0, 0, 1, 1, size=0.5).name("a").attach(rho=1.0)
+        + jno.shape.rect(0, 0, 2, 1, size=0.5).name("b").attach(rho=2.0)
     ).domain()
     d.tag("edge", lambda x, y: y < 1e-9)
     d.attach("edge", rho=5.0)
@@ -272,7 +272,7 @@ def test_by_tag_on_a_non_nodal_space_raises():
     Rejected explicitly rather than left to chance."""
     pytest.importorskip("pygmsh", reason="pygmsh required for 3D cube meshing")
     inner = jno.np.inner
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     d.tag("x0", lambda x, y, z: x < 1e-9)
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)

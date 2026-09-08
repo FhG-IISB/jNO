@@ -71,9 +71,9 @@ def _outer(x, y, z):
 def _geom(conforming, size=0.5, **dkw):
     """Two stacked unit blocks, meshed together (``conforming``) or independently (a tied interface)."""
     return (
-        jno.Shape.regions(
-            lower=jno.Shape.box(0, 0, 0, 1, 1, 1),
-            upper=jno.Shape.box(0, 0, 1, 1, 1, 2),
+        jno.shape.regions(
+            lower=jno.shape.box(0, 0, 0, 1, 1, 1),
+            upper=jno.shape.box(0, 0, 1, 1, 1, 2),
             conforming=conforming,
         )
         .sized(size)
@@ -300,7 +300,7 @@ def _mode_defect():
     as a pair: this one localises, that one falsifies.
     """
     d = (
-        jno.Shape.regions(lower=jno.Shape.box(0, 0, 0, 1, 1, 1), upper=jno.Shape.box(0, 0, 1, 1, 1, 2), conforming=False)
+        jno.shape.regions(lower=jno.shape.box(0, 0, 0, 1, 1, 1), upper=jno.shape.box(0, 0, 1, 1, 1, 2), conforming=False)
         .sized(0.5)
         .domain()
     )

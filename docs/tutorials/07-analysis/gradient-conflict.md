@@ -176,7 +176,7 @@ Take a **thin, anisotropic** domain ($L_x = 1$, $L_y = \tfrac{1}{20}$). Geometry
 
 ```python
 Lx, Ly, U = 1.0, 0.05, 3.0
-adom = jno.Shape.rect(0.0, 0.0, Lx, Ly, size=0.1).domain()
+adom = jno.shape.rect(0.0, 0.0, Lx, Ly, size=0.1).domain()
 ax, ay, _ = adom.variable("interior", split=True)
 ax = ax.unit("m").scale(Lx)          # characteristic length along x
 ay = ay.unit("m").scale(Ly)          # 20× shorter characteristic length along y

@@ -943,10 +943,10 @@ def _classify_triangles(domain, triangles: np.ndarray, pts: np.ndarray) -> np.nd
     cent = pts[triangles].mean(axis=1)
     region_of = np.full(triangles.shape[0], None, dtype=object)
     if not regions:
-        # A ``Shape.regions`` domain carries its regions as Shapes, not shapely geometries. They answer
-        # the same question through ``Shape.contains`` (analytic CSG membership, already vectorised
+        # A ``shape.regions`` domain carries its regions as Shapes, not shapely geometries. They answer
+        # the same question through ``shape.contains`` (analytic CSG membership, already vectorised
         # over points), and dict order is declaration order == region priority, matching the first-hit
-        # rule below. Without this an enclosure cannot be built on a Shape-built domain at all: every
+        # rule below. Without this an enclosure cannot be built on a shape-built domain at all: every
         # centroid stays unclassified, so no solid|medium interface edge is ever found.
         for name, sub in (getattr(domain, "_shape_regions", {}) or {}).items():
             try:
@@ -1177,7 +1177,7 @@ def build_enclosure(
         _transparent = {str(t) for t in medium_tags}
         solid_geoms = [g for name, g in _regions.items() if str(name) not in _transparent]
         if not solid_geoms and getattr(domain, "_shape_regions", None):
-            # A Shape.regions domain has no shapely regions, so the line above yields NOTHING and the
+            # A shape.regions domain has no shapely regions, so the line above yields NOTHING and the
             # enclosure would be built with an empty occluder model -- every pair mutually visible,
             # through solid metal and insulation alike. It fails silently: closure and reciprocity stay
             # perfect (they are enforced), so the F that comes out looks entirely plausible. Measured on

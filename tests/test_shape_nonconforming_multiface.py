@@ -49,10 +49,10 @@ _X0, _X1, _TOP = 1.5, 1.8, 1.2
 
 def _channel():
     """The beam as its own body, meshed independently of the fluid around it."""
-    notch = jno.Shape.rect(_X0, -0.1, _X1, _TOP)  # cut BELOW y=0 so the notch opens onto the floor
-    return jno.Shape.regions(
-        fluid=(jno.Shape.rect(0.0, 0.0, _L, _H) - notch).sized(0.12),
-        beam=jno.Shape.rect(_X0, 0.0, _X1, _TOP).sized(0.09),
+    notch = jno.shape.rect(_X0, -0.1, _X1, _TOP)  # cut BELOW y=0 so the notch opens onto the floor
+    return jno.shape.regions(
+        fluid=(jno.shape.rect(0.0, 0.0, _L, _H) - notch).sized(0.12),
+        beam=jno.shape.rect(_X0, 0.0, _X1, _TOP).sized(0.09),
         conforming=False,
     ).domain()
 
@@ -138,10 +138,10 @@ def test_the_tie_glues_across_every_face():
     """
 
     def solve(conforming):
-        notch = jno.Shape.rect(_X0, -0.1, _X1, _TOP)
-        d = jno.Shape.regions(
-            fluid=(jno.Shape.rect(0.0, 0.0, _L, _H) - notch).sized(0.12),
-            beam=jno.Shape.rect(_X0, 0.0, _X1, _TOP).sized(0.09),
+        notch = jno.shape.rect(_X0, -0.1, _X1, _TOP)
+        d = jno.shape.regions(
+            fluid=(jno.shape.rect(0.0, 0.0, _L, _H) - notch).sized(0.12),
+            beam=jno.shape.rect(_X0, 0.0, _X1, _TOP).sized(0.09),
             conforming=conforming,
         ).domain()
         u, v = d.fem_symbols()
