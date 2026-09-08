@@ -1538,13 +1538,13 @@ class domain(MeshIOMixin):
         Returns
         -------
         object
-            Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
+            Boundary-condition descriptor for use with ``init_fem_native(..., bcs=...)``.
         """
         try:
             from ..utils.solver.fem_route import dirichlet as _dirichlet_bc
         except ImportError as e:
             raise ImportError(
-                "FEM support is not available. Install the FEM/dev extras to use domain.dirichlet(...) and init_fem(...)."
+                "FEM support is not available. Install the FEM/dev extras to use domain.dirichlet(...) and init_fem_native(...)."
             ) from e
         return _dirichlet_bc(tags, values)
 
@@ -1560,13 +1560,13 @@ class domain(MeshIOMixin):
         Returns
         -------
         object
-            Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
+            Boundary-condition descriptor for use with ``init_fem_native(..., bcs=...)``.
         """
         try:
             from ..utils.solver.fem_route import neumann as _neumann_bc
         except ImportError as e:
             raise ImportError(
-                "FEM support is not available. Install the FEM/dev extras to use domain.neumann(...) and init_fem(...)."
+                "FEM support is not available. Install the FEM/dev extras to use domain.neumann(...) and init_fem_native(...)."
             ) from e
         return _neumann_bc(tags)
 
@@ -1576,7 +1576,7 @@ class domain(MeshIOMixin):
 
         Example
         -------
-            domain.init_fem(
+            domain.init_fem_native(
                 bcs=[domain.periodic(("left", "right"), ("bottom", "top"))],
             )
         """
@@ -1584,7 +1584,7 @@ class domain(MeshIOMixin):
             from ..utils.solver.fem_route import periodic as _periodic_bc
         except ImportError as e:
             raise ImportError(
-                "FEM support is not available. Install the FEM/dev extras to use domain.periodic(...) and init_fem(...)."
+                "FEM support is not available. Install the FEM/dev extras to use domain.periodic(...) and init_fem_native(...)."
             ) from e
         return _periodic_bc(*pairs)
 
