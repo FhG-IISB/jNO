@@ -1310,7 +1310,7 @@ def relocate(
 
 def enrich(
     *,
-    criterion,
+    criterion: Any,
     theta: float = 0.5,
     max_iters: int = 8,
     max_dofs: int | None = None,
