@@ -329,7 +329,14 @@ fem.solve(tau=fem.tau_schedule)                 # differentiable replay of that 
 Note what adaptivity does **not** fix. If the step is cut to the floor and the change still exceeds
 `limit`, that is an **unstable branch**, not a step that is merely too big: under load control a
 snap-back has no nearby equilibrium, so no refinement finds one. The error says so and points at
-displacement/arc-length control, which is a different instrument and is not built.
+[`fem.solve(tau=jno.solve.arclength(...))`](#arc-length-passing-a-limit-point), which advances along the
+equilibrium path rather than along the load and so can turn around.
+
+!!! warning "Arc-length exists; it does not yet compose with `staggered`"
+    It is refused with `nonlinear=jno.solve.staggered(...)`, because freezing the load factor while
+    sweeping a block *is* load control — which has no equilibrium past the fold. Since a phase-field
+    energy needs alternate minimization (see below), this particular study is still without an
+    instrument. The refusal says so rather than converging to something plausible.
 
 Keep `dm` in range with [`dm.bounds(0, 1)`](boundary-conditions.md#inequalities-uboundslo-hi), which composes with the march.
 Note that the bound does **not** replace the floor `eta` on the degradation: at `dm = 1` exactly,
@@ -386,3 +393,108 @@ Any energy-derived law works the same way — Mooney-Rivlin, Ogden, Gent, anisot
 does a chemical potential `mu = diff(f, c)` or an electro/magnetostrictive coupling.
 
 ---
+
+### Volumetric locking — `cellwise`, and the one-line B-bar
+
+Everything above has a failure mode that does not announce itself. As `nu -> 0.5` a standard
+displacement element goes rigid — **volumetric locking** — and since J2 plastic flow is *isochoric*,
+that is plasticity's default regime, not an edge case. The answer is simply too stiff; nothing warns.
+
+`jno.np.cellwise(expr)` is the quadrature-weighted mean of an expression over each cell,
+`(∫_K expr)/(∫_K 1)`, broadcast back to its quadrature points — the L2 projection onto the piecewise
+constants. B-bar is that projection applied to the volumetric strain, and nothing else. Written as a
+scalar contraction (the way the elastic and plastic forms above are written, `dev(A):dev(B) =
+A:B - tr(A)tr(B)/dim`, never an identity tensor):
+
+```python
+eu, ev   = eps(ui), eps(vi)
+tru, trv = trace(eu), trace(ev)
+cu, cv   = cellwise(tru), cellwise(trv)          # <- the whole change
+dev_uv   = inner(eu, ev, 2) - tru * trv / dim    # dev(eu) : dev(ev)
+mech     = lam * cu * cv + 2 * mu * (dev_uv + cu * cv / dim)     # sigma(ebar) : ebar(phi)
+```
+
+Delete the two `cellwise` calls and you have the standard form back, so **every J2 return map already
+written against an `eps` alias becomes locking-free by rebinding that one alias**.
+
+!!! measured "Refinement does not cure locking — that is what makes it locking"
+    Plane-strain Q1 cantilever under a body load, `nu = 0.4999`, max `|u_y|`:
+
+    | cells | standard | B-bar |
+    |---|---|---|
+    | 16x4 | 2.68e-02 | 3.03e-01 |
+    | 64x16 | 6.24e-02 | 3.01e-01 |
+    | 128x32 | 1.30e-01 | 3.02e-01 |
+
+    B-bar is converged on the coarsest mesh. The standard element is 11.3x too stiff there and still
+    **2.3x too stiff at 128x32**, having spent 64x the cells to get halfway. At `nu = 0.3`, where there
+    is nothing to cure, the two agree to 5.6%.
+
+F-bar is the finite-strain counterpart — project the determinant, and put the projection inside the
+variable you differentiate so `diff` still sees a pointwise expression:
+
+```python
+F    = I + jac(u, X)
+Fbar = (cellwise(det(F)) / det(F)) ** (1 / dim) * F
+mech = inner(diff(psi(Fbar), Fbar), jac(phi, X), 2)
+```
+
+Three scope limits, all fail-loud except the first, which is a property of the element rather than a
+restriction:
+
+* **It does nothing on P1 triangles/tets.** Their strain is already constant over the cell, so the
+  projection is the identity. B-bar is for quadrilateral/hexahedral cells and higher-order simplices;
+  for P1, use Q1/hex cells, raise the order, or write a mixed u-p formulation.
+* **Native-Lagrange volume terms only.** 1-D, non-nodal (Argyris/Morley/RT/N1E), surface terms and
+  VPINN/collocation residuals raise — averaging over those points would not be a per-cell mean.
+* **Not inside a `diff` target.** `diff` evaluates as `grad(sum(...))`, which is the per-point
+  derivative only because the quadrature axis is a batch axis; a projection couples the points and the
+  result would silently be the cell-summed derivative. Write `cellwise(diff(psi, F))`, or use the F-bar
+  ordering above, where the projection lives inside `wrt` and never reaches the differentiated
+  expression. The error says both.
+
+
+### Arc-length — passing a limit point
+
+Everything above drives the path by the **load**. That works until the load-deflection curve turns
+over: past a limit point there is no equilibrium at a higher load, so no step size finds one, and the
+adaptive stepper says exactly that rather than grinding to its floor.
+
+`fem.solve(tau=jno.solve.arclength(...))` makes the load factor an **unknown** and constrains the
+*increment* instead (Crisfield, *Computers & Structures* 13 (1981) 55-62; *Non-linear FEA of Solids and
+Structures* Vol. 1 §9.3.2):
+
+$$\Delta u \cdot \Delta u + \psi^2 \Delta\lambda^2 = \Delta s^2$$
+
+Nothing in the term list changes — the load is still a formula in `tau`. What changes is that `tau` is
+solved for. This is cheap in jNO because **`tau` is not a DOF**: it reaches the residual as a plain
+scalar argument, so the border rides a residual wrapper and `op.size` never moves.
+
+```python
+sol = fem.solve(tau=jno.solve.arclength(ds=1e-3))
+load = fem.tau_schedule          # the load factors reached — NON-monotone across a snap-back
+```
+
+!!! measured "It finds the fold, and goes round it"
+    Bratu's problem `-Δu = λ e^u`, whose fold is analytic at `λ_c = 3.5138307…`. Arc-length peaks at
+    **3.51871** (0.14% high, and the error halves under mesh refinement), then the load factor comes
+    back **down** to 2.11 while `‖u‖∞` keeps climbing 1.18 → 2.80. The same problem under load control
+    over the same span does not return a path at all — it fails, which is the honest outcome.
+
+Reading the knobs:
+
+* `ds` — the arc per step. Left `None` it is calibrated from the declared span, with the consequence
+  that on a **linear** problem arc-length reproduces the declared uniform grid exactly. With the
+  default `psi=0` it is a pure displacement measure, i.e. the same quantity `adaptive(limit=...)`
+  bounds.
+* `psi` — the weight on the load term; `0` is Crisfield's cylindrical constraint. Note the deviation:
+  Crisfield weights this by the reference load vector `qᵀq`, which jNO does not have (the load is an
+  arbitrary formula in `tau`). `psi` is a plain weight, and nothing is substituted for `qᵀq`.
+* `domain(tau=(start, end, n))` is **reinterpreted**: `end` sets the direction and the default arc, not
+  a target. So `n` buys resolution, not reach — to follow the path further, widen `end`.
+
+Refused by name rather than approximated: `nonlinear=jno.solve.staggered(...)` (freezing the load
+factor is load control), `newton(direct=True)` (the bordered tangent is not assembled — the system goes
+to a matrix-free Newton-Krylov whose `jax.linearize` builds the border for free), a runtime-parametric
+form, and `freeze_path(frames)`. The trajectory is differentiable; `fem.tau_schedule` is concrete
+observability.
