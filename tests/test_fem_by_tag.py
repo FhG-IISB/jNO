@@ -88,7 +88,14 @@ def test_the_mask_selects_exactly_the_dirichlet_facets():
 
     # Rows pinned by a Dirichlet condition on `left`.
     A_dir = _A(jno.fem([stiff, u(*d.variable("left", split=True)[:2]) - 0.0]))
-    pinned = {i for i in range(A_dir.shape[0]) if np.isclose(A_dir[i, i], 1.0) and np.allclose(np.delete(A_dir[i], i), 0.0)}
+    # A pinned row is identified by its STRUCTURE -- every off-diagonal zero, diagonal non-zero --
+    # not by a diagonal of exactly 1.0. Symmetric elimination writes `s*u_i = s*g` with `s` the local
+    # diagonal magnitude, so the operator stays uniformly scaled for the iterative solvers and
+    # preconditioners downstream (see `_apply_dirichlet_symmetric`). The value it pins is unchanged;
+    # only the scaling of the equation is, so reading `A[i, i] == 1.0` tests a convention.
+    pinned = {
+        i for i in range(A_dir.shape[0]) if np.allclose(np.delete(A_dir[i], i), 0.0) and not np.isclose(A_dir[i, i], 0.0)
+    }
 
     # Nodes touched by a `left`-only surface load.
     load = _b(jno.fem([stiff, d.by_tag({"left": 1.0}) * vb]))

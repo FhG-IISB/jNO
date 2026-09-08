@@ -216,3 +216,42 @@ def test_compiled_cached_precond_gives_the_same_answer():
     assert np.abs(first - ref).max() < 1e-8
     assert np.abs(second - ref).max() < 1e-8
     assert np.abs(second - first).max() < 1e-10
+
+
+# --- the wrapper must not hide what it wraps -------------------------------------------------
+
+
+def test_cached_forwards_complex_native():
+    """``complex_native`` selects HOW a complex system is solved, so a wrapper that hides it changes
+    the answer rather than the speed.
+
+    Declaring it routes the solve to the genuinely complex ``n``-sized operator; without it the
+    problem falls through to the fused real-equivalent ``2n`` block, where two things break at once:
+    ``fem.blocks`` describes the ``n`` layout so every slice covers the wrong half, and AMS is handed
+    the skew-dominated block its own docs record diverging to 1e+20 on. ``_Cached`` defined only its
+    own behaviour, so ``ams().cached()`` reported ``False`` and silently took that path -- making
+    ``.cached()`` and complex-native mutually exclusive, which is precisely backwards, since a
+    complex block preconditioner is the one whose setup most wants reusing.
+    """
+    assert jno.precond.ams().complex_native is True
+    assert getattr(jno.precond.ams().cached(), "complex_native", False) is True
+
+
+def test_cached_forwards_complex_ok():
+    """``complex_ok`` says a spec can be applied to a complex operator WITHOUT reformulation. AMS
+    reads it to decide whether its auxiliary blocks get split, so hiding it makes AMS silently revert
+    to the real-equivalent form that AMG is documented to diverge on."""
+    assert jno.precond.amg().complex_ok is True
+    assert getattr(jno.precond.amg().cached(), "complex_ok", False) is True
+
+
+def test_a_block_composition_sees_through_the_cache():
+    """The case that matters: the flag has to survive BOTH wrappers, since a block composition
+    inherits it from its children."""
+    tri = jno.precond.triangular(("u", jno.precond.ams().cached()), ("p", jno.precond.jacobi()))
+    assert tri.complex_native, "triangular lost complex_native through the cached child"
+
+
+def test_caching_a_plain_spec_still_reports_no_complex_support():
+    """Forwarding must report what the inner spec actually is, not assert capability."""
+    assert not getattr(jno.precond.jacobi().cached(), "complex_native", False)

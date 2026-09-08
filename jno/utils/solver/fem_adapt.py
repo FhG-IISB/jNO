@@ -200,6 +200,9 @@ def remesh_with_mmg(
     if field.shape[0] != pts.shape[0]:
         raise ValueError(f"metric field has {field.shape[0]} entries but the mesh has {pts.shape[0]} vertices.")
 
+    _n_elems = len(np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"]))
+    mat_refs, ref_names = _material_refs(domain, _n_elems, dim)
+
     if dim == 2:
         elems = np.asarray(domain.mesh.cells_dict["triangle"]).astype(np.int32)
         bfacets = _boundary_edges_from_triangles(elems)
@@ -207,7 +210,10 @@ def remesh_with_mmg(
         m = mmgpy.MmgMesh2D()
         m.set_mesh_size(len(pts), len(elems), 0, len(bfacets))
         m.set_vertices(pts)
-        m.set_triangles(elems)
+        if mat_refs is None:
+            m.set_triangles(elems)
+        else:
+            m.set_triangles(elems, mat_refs)  # material references: mmg keeps the interfaces between them
         m.set_edges(bfacets, np.ones(len(bfacets), dtype=np.int32))
         if len(corners):  # pin polygonal corners so the geometry is preserved exactly
             m.set_corners(corners)
@@ -218,7 +224,8 @@ def remesh_with_mmg(
         m = mmgpy.MmgMesh3D()
         m.set_mesh_size(len(pts), len(elems), 0, len(bfacets), 0, 0)
         m.set_vertices(pts)
-        m.set_tetrahedra(elems, np.ones(len(elems), dtype=np.int32))
+        # Real material references, so mmg preserves the interfaces between them (see `_material_refs`).
+        m.set_tetrahedra(elems, mat_refs if mat_refs is not None else np.ones(len(elems), dtype=np.int32))
         m.set_triangles(bfacets, np.ones(len(bfacets), dtype=np.int32))
         # mmg3d auto-detects the boundary ridges/corners of a polyhedral surface and keeps
         # boundary vertices on it, so a polyhedral geometry is preserved without extra marking
@@ -243,12 +250,20 @@ def remesh_with_mmg(
 
     v_out = np.asarray(m.get_vertices())[:, :dim]
     if dim == 2:
-        t_out, _ = m.get_triangles_with_refs()
+        t_out, t_refs = m.get_triangles_with_refs()
         f_out, _ = m.get_edges_with_refs()
     else:
-        t_out, _ = m.get_tetrahedra_with_refs()
+        t_out, t_refs = m.get_tetrahedra_with_refs()
         f_out, _ = m.get_triangles_with_refs()
-    return _domain_from_arrays(domain, v_out, np.asarray(t_out), np.asarray(f_out), copy=copy)
+    return _domain_from_arrays(
+        domain,
+        v_out,
+        np.asarray(t_out),
+        np.asarray(f_out),
+        copy=copy,
+        cell_refs=None if mat_refs is None else np.asarray(t_refs),
+        ref_names=ref_names,
+    )
 
 
 def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, copy: bool):
@@ -304,7 +319,60 @@ def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, 
     return _domain_from_arrays(domain, new_x.reshape(-1, 1), new_cells, bfacets, copy=copy)
 
 
-def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bfacets: np.ndarray, *, copy: bool):
+_RESERVED_CELL_SETS = ("interior", "boundary")
+
+
+def _material_refs(domain, n_elems: int, dim: int):
+    """Per-element integer material reference from the mesh's NAMED volume cell-sets.
+
+    Mmg is natively multi-domain: give each element its material reference and it keeps the surface
+    between differing references as a real interface, refining along it rather than moving nodes
+    through it. Passing a constant reference instead tells Mmg the whole mesh is one material, and a
+    thin inclusion is free to dissolve -- silently, since the result is still a valid mesh.
+
+    Returns ``(refs, name_of_ref)`` where ``name_of_ref`` maps each reference to the TUPLE of region
+    names that reference means (a cell can be in several -- see below), or ``(None, {})`` when the
+    mesh carries no named volume region,
+    in which case the caller keeps the single-material path. ``cell_sets`` indexes into each
+    ``mesh.cells`` block separately while mmg receives the concatenated ``cells_dict`` array, so the
+    per-block offset is applied here.
+    """
+    from ...domain.mesh_utils import mesh_cell_region_membership
+
+    membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
+    names = sorted(membership)
+    if not names:
+        return None, {}
+    member = np.stack([membership[nm] for nm in names], axis=1)
+    if member.shape[0] != n_elems:
+        raise ValueError(
+            f"jno.domain.refine: the mesh's cell regions describe {member.shape[0]} cells but the "
+            f"remesh is operating on {n_elems} -- the region membership and the element array "
+            "disagree about which mesh this is."
+        )
+
+    combos, inverse = np.unique(member, axis=0, return_inverse=True)
+    if len(combos) > 2048:
+        raise ValueError(
+            f"jno.domain.refine: the mesh's named volume regions form {len(combos)} distinct "
+            "overlap combinations, more material references than mmg is given here. Simplify the "
+            "region groups, or remesh with the overlapping groups removed."
+        )
+    refs = (np.asarray(inverse).reshape(-1) + 1).astype(np.int32)  # mmg references are 1-based
+    name_of_ref = {int(r + 1): tuple(np.asarray(names)[combos[r]].tolist()) for r in range(len(combos))}
+    return refs, name_of_ref
+
+
+def _domain_from_arrays(
+    template: Any,
+    points: np.ndarray,
+    elems: np.ndarray,
+    bfacets: np.ndarray,
+    *,
+    copy: bool,
+    cell_refs: np.ndarray | None = None,
+    ref_names: dict | None = None,
+):
     """Apply remeshed ``points / elements / boundary-facets`` to a domain.
 
     Builds a ``meshio.Mesh`` carrying ``interior`` (triangles in 2D / tetrahedra in 3D) and
@@ -338,12 +406,32 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
         lo = int(np.argmin(points[:, 0][np.asarray(bfacets).reshape(-1)]))
         cell_sets["left"] = [empty.copy(), np.array([lo], dtype=np.int64)]
         cell_sets["right"] = [empty.copy(), np.array([1 - lo], dtype=np.int64)]
+    # Named volume regions, restored from the references mmg carried through the remesh. Without
+    # this the regions exist in the mesh mmg returned but not in the domain rebuilt from it, so a
+    # multi-material problem silently becomes single-material one step after the interfaces survived.
+    if cell_refs is not None and ref_names:
+        refs = np.asarray(cell_refs).reshape(-1)
+        if refs.shape[0] != n_e:
+            raise ValueError(
+                f"jno.domain.refine: mmg returned {refs.shape[0]} element references for {n_e} "
+                "elements — the material reference array and the element array disagree."
+            )
+        by_name: dict = {}
+        for r, nms in ref_names.items():
+            for nm in nms if isinstance(nms, (tuple, list)) else (nms,):
+                by_name.setdefault(nm, []).append(r)
+        for nm, rs in by_name.items():
+            cell_sets[nm] = [np.flatnonzero(np.isin(refs, rs)).astype(np.int64), empty.copy()]
     new_mesh = meshio.Mesh(pts3, cells, cell_sets=cell_sets)
 
     target = _shallow_copy(template) if copy else template
     # Drop native-FEM caches keyed to the old mesh so they rebuild for the new one.
     for attr in list(vars(target)):
-        if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
+        # `_fem_assembly_points` / `_fem_assembly_cells` are the assembly-mesh snapshot that
+        # `_cell_region_mask` classifies against. They match neither "_fem_native" nor the explicit
+        # tuple, so they used to SURVIVE the remesh and a per-region coefficient was then built
+        # against the old mesh -- measured 433 mask entries for a 3,712-cell mesh.
+        if attr.startswith(("_fem_native", "_fem_assembly")) or attr == "_integral_weight_cache":
             delattr(target, attr)
     # Give the mesh-generator's named boundary regions a predicate BEFORE the reset, so they are
     # re-derived on the new mesh exactly like a user `.tag()` (see `_capture_geometric_boundary_tags`).
@@ -372,7 +460,11 @@ def _apply_new_mesh(template: Any, new_mesh: Any, *, copy: bool):
     """
     target = _shallow_copy(template) if copy else template
     for attr in list(vars(target)):
-        if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
+        # `_fem_assembly_points` / `_fem_assembly_cells` are the assembly-mesh snapshot that
+        # `_cell_region_mask` classifies against. They match neither "_fem_native" nor the explicit
+        # tuple, so they used to SURVIVE the remesh and a per-region coefficient was then built
+        # against the old mesh -- measured 433 mask entries for a 3,712-cell mesh.
+        if attr.startswith(("_fem_native", "_fem_assembly")) or attr == "_integral_weight_cache":
             delattr(target, attr)
     _capture_geometric_boundary_tags(target)
     if hasattr(target, "_reset_custom_tag_state"):
@@ -1844,6 +1936,16 @@ def hessian_metric(
     Reference: Alauzet & Loseille, *Metric-based anisotropic mesh adaptation* (2010).
     """
     dim = int(domain.dimension)
+    if np.iscomplexobj(np.asarray(u_vertex)):
+        # `recover_hessian` keeps the complex dtype, giving a complex SYMMETRIC H -- which is not
+        # Hermitian, so the `eigh` below would read one triangle, conjugate it, and return the
+        # spectrum of a DIFFERENT matrix without complaining. Reduce to a real field first (the
+        # adaptive driver uses |u|); refusing here keeps a direct caller from getting silent numbers.
+        raise NotImplementedError(
+            "hessian_metric: the driving field is complex. The Hessian of a complex field is complex "
+            "symmetric, not Hermitian, so its eigendecomposition here would be silently wrong. Pass a "
+            "real field -- np.abs(u) is what FEM.solve(adapt=...) uses."
+        )
     H = recover_hessian(domain, u_vertex)  # (n_vert, dim, dim)
     evals, evecs = np.linalg.eigh(H)  # ascending eigenvalues, orthonormal eigenvectors
     lam = np.abs(evals)  # |H|: interpolation error ~ |curvature|
@@ -2472,7 +2574,7 @@ def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np
     vertex view -- a traced criterion is assembled on the full vector, while the estimator wants the
     vertex one -- gets them from a single solve instead of solving the problem twice per round.
     """
-    from jno._fem import _infer_vec  # local import: fem_adapt is loaded lazily by the domain
+    from jno._fem import _infer_vec, _trial_spaces  # local: fem_adapt is loaded lazily by the domain
 
     sol = np.asarray(sol).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
@@ -2487,7 +2589,23 @@ def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np
     if sol.shape[0] == n_vert:
         return sol
     if sol.shape[0] > n_vert:
-        return sol[:n_vert]  # higher-order scalar: the first n_vert DOFs are the vertex (nodal) values
+        # Only higher-order LAGRANGE keeps its P1 vertices as ids 0..n_vert-1 (`_promote_to_degree`).
+        # Every other scalar space jNO has orders its DOFs differently -- Hermite carries value and
+        # both derivatives per vertex with the VALUE at 3*v, Argyris six per vertex, P0 one per CELL
+        # and no vertex value at all -- so slicing the first n_vert entries returns unrelated numbers
+        # of the right length and finite value, and the estimator then refines on them. Guard on the
+        # SPACE, not on the DOF count.
+        _spaces = _trial_spaces(fem._constraints) if getattr(fem, "_constraints", None) else {"Lagrange"}
+        _bad = sorted(sp for sp in _spaces if sp != "Lagrange")
+        if _bad:
+            raise NotImplementedError(
+                f"the ZZ / Hessian estimator reads VERTEX values, and the {', '.join(_bad)} space does "
+                f"not store them as its first {n_vert} DOFs (only higher-order Lagrange does). Adapting "
+                "on this field would refine on a reinterpretation of unrelated DOFs. Drive the "
+                "refinement from a Lagrange readout of the solution instead -- FEM.solve(adapt=...) "
+                "takes a `criterion` expression."
+            )
+        return sol[:n_vert]  # higher-order Lagrange: the first n_vert DOFs are the vertex values
     raise NotImplementedError(f"got {sol.shape[0]} DOFs for {n_vert} vertices (fewer than one per vertex).")
 
 
@@ -2602,10 +2720,16 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             refine_domain(d, marked, copy=False)
         elif spec.anisotropic:
             if np.iscomplexobj(u):
-                raise NotImplementedError(
-                    "anisotropic (Hessian-metric) adaptation is real-only; use isotropic ZZ "
-                    "(AdaptSpec(anisotropic=False)) for a complex field."
-                )
+                # The metric is a SCALAR estimator, so a complex solution is reduced to |u| here --
+                # the same modulus the isotropic ZZ indicator and the transient driver already use.
+                # It has to happen before `hessian_metric`: `recover_hessian` preserves the complex
+                # dtype and the resulting H is complex SYMMETRIC but not Hermitian, which `eigh`
+                # would silently diagonalise as a different matrix.
+                #
+                # |u| tracks magnitude features. A feature carried purely in the PHASE of an
+                # otherwise flat-modulus field is invisible to it; metric intersection of Re and Im
+                # is the fuller answer (see `hessian_metric`'s reference) and is not wired.
+                u = np.abs(u)
             h_typ = _mean_edge_length(d)
             hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
             hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0

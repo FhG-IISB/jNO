@@ -50,6 +50,23 @@ def _eval(expr, domain):
 # ---------------------------------------------------------------------------
 
 
+def _quad_tol(scale: float = 1.0, cells: int = 256) -> float:
+    """Tolerance for "this quadrature rule is EXACT for this integrand" -- at the working precision.
+
+    Exactness is a property of the rule, not of the arithmetic: summing a few hundred cell
+    contributions in float32 costs about ``cells * eps``, which is ~1e-5 relative, so a fixed 1e-9 bar
+    is only reachable when round-off happens to cancel on one particular mesh. It did on the mesh this
+    suite used to get, and stopped when the emitter's sizing changed -- the same rule now integrates to
+    0.99999994 instead of exactly 1.0, which is one ulp and says nothing about the rule.
+
+    These tests do not enable x64, so the bar follows whatever precision is actually in use.
+    """
+    import jax
+
+    eps = float(np.finfo(np.float64 if jax.config.jax_enable_x64 else np.float32).eps)
+    return max(1e-9, cells * eps * max(1.0, abs(scale)))
+
+
 class TestGaussQuadratureIntegrals:
     """``expr.integrate(quadrature=...)`` — element Gauss quadrature vs the default nodal rule.
 
@@ -65,13 +82,13 @@ class TestGaussQuadratureIntegrals:
     def test_gauss_constant_recovers_area(self, dom):
         x, y, _ = dom.variable("interior", split=True)
         area = float(_eval((x * 0.0 + 1.0).integrate(quadrature="gauss"), dom))
-        assert abs(area - 1.0) < 1e-9, f"Gauss ∫1 dA = {area:.6e}, expected 1.0"
+        assert abs(area - 1.0) < _quad_tol(1.0), f"Gauss ∫1 dA = {area:.6e}, expected 1.0"
 
     def test_gauss_exact_for_polynomial(self, dom):
         x, y, _ = dom.variable("interior", split=True)
         expr = (x**2) * (y**2)  # ∫_[0,1]² x²y² dA = 1/9
         gauss = float(_eval(expr.integrate(quadrature=4), dom))
-        assert abs(gauss - 1.0 / 9.0) < 1e-9, f"Gauss ∫x²y² dA = {gauss:.6e}, expected {1 / 9:.6e}"
+        assert abs(gauss - 1.0 / 9.0) < _quad_tol(1.0 / 9.0), f"Gauss ∫x²y² dA = {gauss:.6e}, expected {1 / 9:.6e}"
 
     def test_gauss_beats_nodal_on_polynomial(self, dom):
         x, y, _ = dom.variable("interior", split=True)

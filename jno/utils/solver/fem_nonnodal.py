@@ -144,8 +144,6 @@ def assemble_fem_nonnodal(
         bcoo_eliminate_dirichlet,
         bcoo_zero_rows_cols,
         compress_eager,
-        sum_duplicate_triplets,
-        unique_triplet_count,
     )
     from .weak_form import (
         _apply_sign,
@@ -163,10 +161,24 @@ def assemble_fem_nonnodal(
             if f["field_key"] not in field_index:
                 field_index[f["field_key"]] = len(fields)
                 fields.append(f)
+    # Block layout in ASSEMBLY (= offsets) order, for ``FEM.block_index``. ``_finalize`` snapshots
+    # this attribute; without it a non-nodal problem falls back to the CONSTRAINT-WALK order, which
+    # is a different order. Measured on a mixed N1E x Lagrange form: the assembler laid the blocks
+    # out as [u (n_edges), p (n_verts)] but the walk reported [p, u], so ``block_index(u)`` returned
+    # 1 and ``jno.precond.triangular((u, ams()), (p, amg()))`` handed AMS the scalar block. AMS
+    # forms G^T A G with G sized (n_edges, n_verts), so it raised a shape mismatch and the whole
+    # triangular(AMS, AMG) path was unreachable on any mixed non-nodal system. Where the two orders
+    # happen to agree it worked by luck; where the block SIZES also agree it would have been a
+    # silently wrong preconditioner rather than a shape error.
+    domain._fem_native_field_keys = [f["field_key"] for f in fields]
+
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley") for s in spaces):
+    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris and Morley; got {spaces}."
+            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris, Morley "
+            f"and Lagrange; got {spaces}. (Lagrange is admitted so a nodal scalar can be MIXED with a "
+            f"non-nodal field -- the A-V pair is N1E x Lagrange. A Lagrange-only form belongs on the "
+            f"native nodal assembler, which this path never sees.)"
         )
     # ``order=`` is a nodal-Lagrange knob. Every family here has an order INTRINSIC to the element
     # definition, and it is never plumbed to the factories (`degree=1` is hard-coded at the call
@@ -214,12 +226,33 @@ def assemble_fem_nonnodal(
         )
     if has_hermite and has_argyris:
         raise NotImplementedError("jno.fem (non-nodal): mixing Hermite and Argyris fields is not supported.")
-    if dirichlet_raw and not has_vertex:
-        raise NotImplementedError(
-            "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
-            "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`. "
-            "(A Hermite field DOES take a nodal value Dirichlet u(region) - g.)"
-        )
+    # A nodal Dirichlet pins VERTEX-VALUE DOFs, so its applicability is a property of the FIELD it
+    # targets, not of the problem: in the mixed A-V pair (N1E x Lagrange) the Dirichlet legitimately
+    # constrains the Lagrange potential V (terminal voltage) while the N1E field A takes its essential
+    # BC as the edge trace. The old check was GLOBAL ("an edge field exists somewhere, therefore
+    # reject every nodal Dirichlet"), which made V = g on a terminal unreachable. Resolve each
+    # constraint's target field and judge per space instead.
+    for _fk, _dregion, _comp, _dval, _dvnode in dirichlet_raw:
+        _fi = field_index.get(_fk)
+        if _fi is None:
+            raise ValueError(
+                f"jno.fem (non-nodal): a Dirichlet condition on region {_dregion!r} targets a field "
+                f"that appears in no volume term (known fields: {list(field_index)}). An essential "
+                "condition must constrain one of the solved unknowns -- is the field's trial missing "
+                "from the weak form?"
+            )
+        if spaces[_fi] in ("RT", "N1E"):
+            raise NotImplementedError(
+                "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
+                "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`. "
+                "(A vertex-valued field -- Lagrange / Hermite / Argyris / Morley -- DOES take a nodal "
+                "value Dirichlet u(region) - g.)"
+            )
+        if spaces[_fi] == "P0":
+            raise NotImplementedError(
+                "jno.fem (non-nodal): a P0 (cell-DOF) field carries no vertex values, so a nodal "
+                "Dirichlet u(region) - g does not apply to it; constrain it weakly instead."
+            )
 
     # --- runtime parameters (inverse problems): collect the parameter name->expr map so the assembler can
     # return a *parametric* FemLinearSystem / FemResidualOperator / time block whose operator is re-assembled
@@ -285,6 +318,22 @@ def assemble_fem_nonnodal(
         return tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
 
     _field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
+    # A P0 ("cell") field parameter has no gather on this path: `_field_param_names` is used below as
+    # if every field parameter were P1 VERTEX data (`_fv[name][cells_j[c]]`, interpolated with
+    # `p1_shape_vals`). Handing it a per-cell array reads the values at vertex ids -- wrong numbers,
+    # out-of-range indices clamped by JAX, and no error. Refuse it, and name what does work here.
+    from .parametric_helpers import _fem_field_kind
+
+    _cell_param_names = sorted(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "cell")
+    if _cell_param_names:
+        raise NotImplementedError(
+            f"jno.fem (non-nodal): the P0 (per-cell) field parameter(s) {_cell_param_names} are not "
+            "wired on this assembler -- only nodal P1 field parameters are, and a per-cell array would "
+            "be gathered at VERTEX indices and silently give the wrong coefficient. For a per-region "
+            'material use d.by_region({"steel": 16.0, ...}) (or d.attach), which is one value per cell '
+            "and is threaded through the per-cell region masks; for a smooth field, use a P1 "
+            "(Lagrange) parameter."
+        )
 
     # Neural coefficients (``jno.nn.wrap(net)`` in the weak form) on a non-nodal element: like the native
     # path, the network is re-evaluated at the quad points and its weights ride the runtime ``args`` as a
@@ -306,21 +355,93 @@ def assemble_fem_nonnodal(
     neural_param_names, _neural_models = _neural.param_names, _neural.models
     _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
 
+    # Trainable mesh coordinates (`domain.variable(region).trainable()`) -- the shape-derivative
+    # handle. They are scattered into the geometry points before the cell Jacobian is formed, so
+    # d(solve)/dX flows through the ordinary assembly. They ride `runtime_parameter_exprs` (so crux
+    # discovers them and their value arrives in `args`) but stay OUT of `runtime_parameter_tags`:
+    # they are not term coefficients, and `rt_scalar` must not pack them. Collected after
+    # `runtime_parameter_tags` is frozen above, which keeps that separation automatic.
+    _coord_specs: List[Tuple[Any, int, str]] = []
+    for _cspec in getattr(domain, "_trainable_coords", None) or []:
+        _cname = str(_cspec["name"])
+        _param_and_neural_exprs = {**_param_and_neural_exprs, _cname: _cspec["expr"]}
+        _coord_specs.append((jnp.asarray(_cspec["ids"], dtype=jnp.int32), int(_cspec["axis"]), _cname))
+
     # Simplex dimension from the mesh: 2D triangle vs 3D tetrahedron. The edge (RT/N1E) push-forward and
     # topology are dimension-agnostic; the vertex families (Hermite/Argyris/Morley) and RT are 2D-only, so
     # in 3D only Nédélec (N1E, edge/H(curl)) is wired -- everything else raises rather than silently mis-map.
     dim = 3 if "tetra" in domain.mesh.cells_dict else 2
-    if dim == 3 and any(s != "N1E" for s in spaces):
+    if dim == 3 and any(s not in ("N1E", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh only the Nédélec `N1E` element is supported "
-            f"(H(curl), for Maxwell / curl-curl); got spaces {spaces}. RT / P0 / Hermite / Argyris / Morley "
-            "are 2D-triangle only."
+            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh only Nédélec `N1E` and nodal `Lagrange` "
+            f"are supported; got spaces {spaces}. N1E x Lagrange is the A-V (magnetic vector potential "
+            "+ electric scalar potential) pair: V carries the terminal condition on a cut conductor, "
+            "which A alone cannot express. RT / P0 / Hermite / Argyris / Morley are 2D-triangle only."
         )
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :dim]
+
+    def _apply_coord_params(p, args):
+        """Scatter trainable coordinate parameters into the geometry points.
+
+        A no-op without them. With them, the returned points are TRACED, so the cell Jacobian, detJ
+        and the quadrature coordinates downstream all become differentiable in the node positions --
+        which is the whole shape derivative. The static `pts` above is still what every DOF-locating
+        helper (Dirichlet pins, surface bucketing) uses: those pick *which* DOFs, not *where*, and
+        must stay concrete."""
+        if not _coord_specs or args is None:
+            return p
+        for _ids, _axis, _name in _coord_specs:
+            if _name in args:
+                p = p.at[_ids, _axis].set(jnp.asarray(args[_name], dtype=p.dtype).reshape(-1))
+        return p
+
     cells = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
     n_cells = int(cells.shape[0])
     n_verts = int(pts.shape[0])
     cells_j = jnp.asarray(cells, dtype=jnp.int32)
+
+    # --- frozen (known) fields: `ui.bind(...).freeze(values)` used as a COEFFICIENT ------------------
+    # Mirrors the native path (fem_native `_collect_frozen_fields` / `_frozen_gathered`), with one
+    # difference: there, a frozen field is a pinned copy of a field that is already among the solved
+    # unknowns, so it gathers on `cells_f_j[field_index[key]]`. Here the trial is N1E (edge DOFs) and a
+    # frozen coefficient lives on the P1 VERTEX space instead — the same space the P1 field parameters
+    # already use — so it gathers on `cells_j` and is interpolated with `p1_shape_vals`. That is what
+    # lets a computed source (e.g. J_s from an electrokinetic pre-solve) enter an H(curl) form.
+    def _collect_frozen_fields(terms):
+        from ...trace import FrozenField
+        from .solver_helper import iter_children
+
+        found: dict = {}
+        seen: set = set()
+        stack = list(terms)
+        while stack:
+            n = stack.pop()
+            if id(n) in seen:
+                continue
+            seen.add(id(n))
+            if isinstance(n, FrozenField):
+                found[n.frozen_id] = n
+                continue
+            stack.extend(iter_children(n))
+        return found
+
+    _frozen_nodes = _collect_frozen_fields(
+        list(volume_terms) + [e for exprs in (boundary_terms or {}).values() for e in exprs]
+    )
+    # Per-cell nodal slice, a compile-time constant (no args threading, no jacfwd tangent).
+    # scalar (n_nodes,) -> (n_cell, n_local, 1); VECTOR (n_nodes, vec) -> (n_cell, n_local, vec).
+    _frozen_gathered: dict = {}
+    for _fid, _fnode in _frozen_nodes.items():
+        _fvals = jnp.asarray(_fnode.values)
+        if _fvals.shape[0] != n_verts:
+            raise ValueError(
+                f"jno.fem (non-nodal): a frozen field coefficient must carry one value per MESH VERTEX "
+                f"({n_verts}); got {_fvals.shape[0]}. On an N1E form the frozen field is a P1 coefficient, "
+                "not a copy of the (edge-DOF) unknown."
+            )
+        _frozen_gathered[_fid] = (
+            _fvals[cells_j].reshape(n_cells, cells_j.shape[1], 1) if _fvals.ndim == 1 else _fvals[cells_j]
+        )
 
     # --- edge families (RT/N1E): contravariant/covariant Piola over a shared edge topology (one
     # ``edge_ref`` dispatch serves both -- same edge DOFs/topology, family-specific push-forward) ---
@@ -383,7 +504,7 @@ def assemble_fem_nonnodal(
     # from its mesh-vertex values per cell (3 barycentric on a triangle, 4 on a tetrahedron), independent of
     # the trial element's own basis. The kernel contraction ``shape_vals . cell_nodal`` is vertex-count
     # agnostic, so only this reference-basis table is dimension-specific.
-    if _field_param_names:
+    if _field_param_names or _frozen_gathered or "Lagrange" in spaces:
         _bary0 = 1.0 - qp[:, 0] - qp[:, 1] - (qp[:, 2] if dim == 3 else 0.0)
         p1_shape_vals = jnp.stack([_bary0, qp[:, 0], qp[:, 1]] + ([qp[:, 2]] if dim == 3 else []), axis=1)
     else:
@@ -472,6 +593,8 @@ def assemble_fem_nonnodal(
             return 6 * n_verts + n_edges
         if s == "Morley":
             return n_verts + n_edges
+        if s == "Lagrange":
+            return n_verts
         return n_edges if s in ("RT", "N1E") else n_cells
 
     ndof = [_field_ndof(s) for s in spaces]
@@ -489,6 +612,8 @@ def assemble_fem_nonnodal(
             return offs[i] + morley_cdofs  # (n_cells, 6)
         if spaces[i] in ("RT", "N1E"):
             return offs[i] + ce  # (n_cells, 3)
+        if spaces[i] == "Lagrange":
+            return offs[i] + cells_j  # (n_cells, dim+1)
         return offs[i] + jnp.arange(n_cells)[:, None]  # (n_cells, 1) P0
 
     cdofs = [_field_cdofs(i) for i in range(len(fields))]
@@ -500,12 +625,42 @@ def assemble_fem_nonnodal(
         tangent."""
         return [u_blocks[i][cdofs[i][c] - offs[i]] for i in range(len(fields))]
 
-    def _cell_fields(c, cell_sols):
-        verts = pts[cells_j[c]]
+    def _cell_fields(c, cell_sols, pts_dyn=None):
+        # `pts_dyn` is the coordinate-parameter-scattered geometry; it defaults to the static mesh.
+        # Defaulting is REFUSED when coordinates are trainable rather than silently falling back --
+        # a static fallback there returns a shape derivative of exactly zero, which looks like a
+        # converged design instead of a missing feature.
+        if pts_dyn is None:
+            if _coord_specs:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): trainable mesh coordinates are threaded through the steady "
+                    "linear assembly only. This residual / transient / nonlinear path still reads the "
+                    "static mesh, so d(solve)/dX would come back as exactly zero. Use a steady linear "
+                    "form, or extend the threading to this path."
+                )
+            pts_dyn = pts
+        verts = pts_dyn[cells_j[c]]
         J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)  # (dim, dim): 2x2 tri / 3x3 tet
         detJ = jnp.linalg.det(J)
         per = []
         for i, s in enumerate(spaces):
+            if s == "Lagrange":
+                # P1 on a simplex: barycentric values (already tabulated as `p1_shape_vals` for the
+                # field-parameter path) and CONSTANT gradients, J^-T @ ref. Tagged "Lagrange" for the
+                # same reason Hermite is — the shared evaluator reads value / .x from scalar shape data.
+                # `cell_sol` takes the [:, None] SCALAR convention Hermite/Argyris/Morley use (vec = 1
+                # as an explicit column); only the vector families (RT/N1E) pass it flat.
+                g_ref = jnp.concatenate([-jnp.ones((1, dim)), jnp.eye(dim)], axis=0)  # (dim+1, dim)
+                g = g_ref @ jnp.linalg.inv(J)  # (dim+1, dim)
+                per.append(
+                    {
+                        "shape_vals": p1_shape_vals,  # (n_quad, dim+1)
+                        "shape_grads": jnp.broadcast_to(g, (n_quad, dim + 1, dim)),
+                        "cell_sol": cell_sols[i][:, None],
+                        "space": "Lagrange",
+                    }
+                )
+                continue
             if s == "Hermite":  # C0 vertex value+derivative DOFs via the M(cell) DOF-transform
                 rv, rg, rh = hermite_ref
                 phi, grad, hess = hermite_pushforward(rv, rg, rh, J, detJ, None)
@@ -561,6 +716,26 @@ def assemble_fem_nonnodal(
                 )
         return per, verts[0][None, :] + qp @ J.T, jnp.abs(detJ)
 
+    # A complex COEFFICIENT with a real basis: the element residual is complex while the
+    # linearisation point stays real, so ONE data pass carries the full complex operator. The flag
+    # sizes every accumulator below; without it the scatter-add into a real buffer RAISES on dtype
+    # (it never silently casts), which is why the historic route split each term into Re/Im legs
+    # and assembled twice.
+    from ..._fem import _bares_have_complex_coeff as _cx_bares
+    from ...trace import FunctionCall as _FC_cx
+
+    def _provably_real(b):
+        # A top-level ``.real``/``.imag`` wrap is the historic two-leg split's leg shape: the value
+        # is real BY CONSTRUCTION even though the complex literal survives inside the wrapped tree.
+        # Without this the split's legs would assemble complex-dtype -- twice the data for a zero
+        # imaginary part, handed to consumers that expect real legs.
+        return isinstance(b, _FC_cx) and getattr(b, "_name", None) in ("real", "imag") and len(b.args) == 1
+
+    _cx_form = _cx_bares(
+        [b for b in volume_terms if not _provably_real(b)]
+        + [e for _bt in (boundary_terms or {}).values() for e in _bt if not _provably_real(e)]
+    )
+
     def _make_residual(terms):
         """Build a ``residual(u_flat)`` closure for the given weak ``terms`` over the shared field
         layout. Reused for the steady system (``jacfwd`` -> A, ``-residual(0)`` -> b), the steady
@@ -590,12 +765,16 @@ def assemble_fem_nonnodal(
                 if name not in _field_param_names
             }
             field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=u_flat.dtype) for name in _field_param_names}
-            R = jnp.zeros(total, dtype=u_flat.dtype)
+            R = jnp.zeros(total, dtype=jnp.result_type(u_flat.dtype, np.complex64) if _cx_form else u_flat.dtype)
             _nt = neural_local_table(_neural, args)  # once per call, not per (term × cell) inside `_cell`
+            # Scatter trainable coordinates once per residual evaluation, not per (term x cell).
+            # The steady linear operator is built FROM this residual (jacfwd -> A, -residual(0) -> b),
+            # so without this the shape derivative is lost before `assemble` is ever reached.
+            _pts_r = _apply_coord_params(pts, _a)
             for coeff, tfi, rnames in typed:
 
-                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames):
-                    per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks))
+                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r):
+                    per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
                     vol_vars = tuple(
                         (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
                         for name in runtime_parameter_tags
@@ -612,8 +791,12 @@ def assemble_fem_nonnodal(
                         "region_mask_names": _rn,
                         "volume_vars": vol_vars + _cell_masks(c, _rn),
                     }
-                    if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
+                    if (
+                        _field_param_names or _frozen_gathered
+                    ):  # P1 basis to interpolate a field parameter (top-level, param-only key)
                         local["shape_vals"] = p1_shape_vals
+                    if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
+                        local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
                     if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                         local["neural_coefficients"] = _nt
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
@@ -623,7 +806,7 @@ def assemble_fem_nonnodal(
                     (jnp.arange(n_cells),),
                     _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(cdofs[tfi].shape[1]), _chunk_setting),
                 )
-                R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
+                R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1).astype(R.dtype))
             return R
 
         return residual
@@ -740,6 +923,19 @@ def assemble_fem_nonnodal(
     _rot_as_dir = [(fk, region, None, None, vn) for (fk, region, vn) in rotation_bcs]
     if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
+    if ("Lagrange" in spaces) and dirichlet_raw:  # Lagrange value-Dirichlet: pin the region's vertex DOFs to g
+        pins = pins + _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
+    extra = getattr(domain, "_extra_dof_pins", None)
+    if extra:  # caller-supplied (dof, value) pins — e.g. a tree-cotree gauge + air-V restriction,
+        _bad = [d_ for d_, _v in extra if not (0 <= int(d_) < total)]
+        if _bad:
+            raise ValueError(
+                f"jno.fem (non-nodal): domain._extra_dof_pins contains {len(_bad)} DOF indices "
+                f"outside [0, {total}) (first: {_bad[0]}) — the pin list was built against a "
+                "different mesh or DOF layout. Rebuild it for this domain; refusing to pin "
+                "arbitrary DOFs silently."
+            )
+        pins = pins + [(int(d_), float(v_)) for d_, v_ in extra]  # applied identically to BOTH complex legs
     if has_argyris and dirichlet_raw:  # deflection: pin the boundary value + tangential trace, free the normal
         pins = pins + _argyris_dirichlet_pins(
             dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts, kind="value"
@@ -794,23 +990,74 @@ def assemble_fem_nonnodal(
         _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
         _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
         _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # u=0: the LINEAR default
-        _vol_rows_l, _vol_cols_l = [], []
+        # TERMS SHARING A TEST FIELD are one GROUP: their element blocks have identical (row, col)
+        # layout, so they are summed at the element level and emit ONE pattern block -- the old
+        # per-term emission stored an identical full triplet set for every additive term, which is
+        # a factor of ~n_terms in peak memory for nothing.
+        _groups: list = []  # (tfi, [(coeff, rnames), ...]) in first-occurrence order
+        _gpos: dict = {}
         for _cf_p, _tfi_p, _rn_p in _typed:
-            _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])  # (n_cells, n_test, n_local_all)
-            _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
-            _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
-        _vol_idx = (
-            jnp.stack(
-                [jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)], axis=1
-            )
-            if _vol_rows_l
-            else jnp.zeros((0, 2), jnp.int32)
-        )
+            if _tfi_p not in _gpos:
+                _gpos[_tfi_p] = len(_groups)
+                _groups.append((_tfi_p, []))
+            _groups[_gpos[_tfi_p]][1].append((_cf_p, _rn_p))
 
-        try:
-            _vol_nse = unique_triplet_count(_vol_idx) if _vol_rows_l else None
-        except Exception:  # noqa: BLE001 -- a traced pattern breaks the static-count invariant
-            _vol_nse = None  # fall back to the uncompressed (still correct) operator
+        # THE SYMBOLIC PASS, once, on the host, in numpy end to end: the unique sparsity pattern and
+        # the inverse map from every emitted entry to its final slot. Element values then SCATTER-ADD
+        # straight into a buffer of exactly the final size -- no stored duplicates, no in-trace sort
+        # (the old `sum_duplicate_triplets` collapse, whose argsort workspace over the unreduced
+        # triplet array was the dominant assembly temporary). The full jnp triplet pattern is built
+        # ONLY on the unplanned fallback: with a plan, nothing downstream needs it, and at ~20M
+        # triplets it alone is hundreds of MB. Intermediates are freed as soon as consumed -- the
+        # audit that motivated this found the peak made of stacked full-length copies, not one villain.
+        _uidx = _vinv = _vol_idx = None
+        _vol_nse = None
+        _grp_sizes = []
+        if _groups:
+            try:
+                _enc_l = []
+                for _tfi_p, _terms_p in _groups:
+                    _nt = int(cdofs[_tfi_p].shape[1])
+                    _nl = int(_cell_all_dofs.shape[1])
+                    _r = np.broadcast_to(np.asarray(cdofs[_tfi_p])[:, :, None], (n_cells, _nt, _nl))
+                    _c = np.broadcast_to(np.asarray(_cell_all_dofs)[:, None, :], (n_cells, _nt, _nl))
+                    _enc_l.append((_r.astype(np.int64) * np.int64(total) + _c.astype(np.int64)).reshape(-1))
+                    _grp_sizes.append(n_cells * _nt * _nl)
+                    del _r, _c
+                _enc = np.concatenate(_enc_l) if len(_enc_l) > 1 else _enc_l[0]
+                del _enc_l
+                _unq, _inv = np.unique(_enc, return_inverse=True)
+                del _enc
+                _uidx = jnp.stack(
+                    [
+                        jnp.asarray((_unq // np.int64(total)).astype(np.int32)),
+                        jnp.asarray((_unq % np.int64(total)).astype(np.int32)),
+                    ],
+                    axis=1,
+                )  # sorted row-major by construction of np.unique
+                _vol_nse = int(_unq.size)
+                del _unq
+                _inv = _inv.astype(np.int32)
+                # per-group slices of the inverse map, so values scatter INSIDE the group loop and the
+                # full-length data vector never exists
+                _off = np.cumsum([0] + _grp_sizes)
+                _vinv = [jnp.asarray(_inv[_off[i] : _off[i + 1]]) for i in range(len(_grp_sizes))]
+                del _inv
+            except Exception:  # noqa: BLE001 -- a traced pattern cannot be planned on the host
+                _uidx = _vinv = None
+                _vol_nse = None  # fall back to the uncompressed (still correct) operator
+        if _vinv is None and _groups:
+            _vol_rows_l, _vol_cols_l = [], []
+            for _tfi_p, _terms_p in _groups:
+                _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])
+                _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
+                _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
+            _vol_idx = jnp.stack(
+                [jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)],
+                axis=1,
+            )
+        elif not _groups:
+            _vol_idx = jnp.zeros((0, 2), jnp.int32)
 
         def assemble(args=None, *, surface=True, u_flat=None):
             # ``u_flat=None`` linearises at u=0, which is exact for a LINEAR form (the tangent does not
@@ -830,11 +1077,12 @@ def assemble_fem_nonnodal(
                 name: jnp.asarray(_a.get(name, _asm_zero_field), dtype=zeros.dtype) for name in _field_param_names
             }
             _nt = neural_local_table(_neural, args)
+            _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
 
             def _elem_res(c, la, coeff, tfi, rnames):
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
                 cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
-                per, xq, meas = _cell_fields(c, cell_sols)
+                per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
                 vol_vars = tuple(
                     (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
                     for name in runtime_parameter_tags
@@ -851,36 +1099,61 @@ def assemble_fem_nonnodal(
                     "region_mask_names": rnames,
                     "volume_vars": vol_vars + _cell_masks(c, rnames),
                 }
-                if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
+                if (
+                    _field_param_names or _frozen_gathered
+                ):  # P1 basis to interpolate a field parameter (top-level, param-only key)
                     local["shape_vals"] = p1_shape_vals
+                if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
+                    local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
                 if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                     local["neural_coefficients"] = _nt
                 return _integrate_term(domain, coeff, local, qw * meas)
 
-            data_l = []  # only the element data is args-dependent; the (row, col) pattern is `_vol_idx`
-            for coeff, tfi, rnames in _typed:
+            # values scatter into their final slots PER GROUP: the full-length data vector exists
+            # only on the unplanned fallback, where the uncompressed triplet path still needs it
+            _acc_dtype = jnp.result_type(zeros.dtype, np.complex64) if _cx_form else zeros.dtype
+            _acc = jnp.zeros((_vol_nse,), _acc_dtype) if _vinv is not None else None
+            data_l = []  # fallback only; the (row, col) pattern is `_vol_idx`
+            for gi, (tfi, terms_g) in enumerate(_groups):
 
-                def _ke(c, la, _e=coeff, _t=tfi, _rn=rnames):
-                    return jax.jacfwd(lambda v: _elem_res(c, v, _e, _t, _rn))(la)
+                def _ke(c, la, _g=tuple(terms_g), _t=tfi):
+                    # ONE jacfwd of the SUMMED residual: linearity makes it equal to the sum of the
+                    # per-term jacobians, at one element-block buffer per GROUP instead of per term
+                    # (and `_cell_fields` is shared across the group's terms instead of recomputed).
+                    def _res_sum(v):
+                        r = None
+                        for _e, _rn in _g:
+                            t = _elem_res(c, v, _e, _t, _rn)
+                            r = t if r is None else r + t
+                        return r
+
+                    return jax.jacfwd(_res_sum)(la)
 
                 Ke = _elem_map(  # (n_cells, n_test_tfi, n_local_all)
                     _ke,
                     (jnp.arange(n_cells), _local_u),
                     _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(_cell_all_dofs.shape[1]), _chunk_setting),
                 )
-                data_l.append(Ke.reshape(-1))
+                if _acc is not None:
+                    _acc = _acc.at[_vinv[gi]].add(Ke.reshape(-1).astype(_acc.dtype))
+                else:
+                    data_l.append(Ke.reshape(-1))
 
-            data = jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype)
+            data = _acc if _acc is not None else (jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype))
             # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
             # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
             sm = _surf_mass_of(args, sparse=True) if surface else None
+            if _vinv is not None:
+                # values already landed in their FINAL slots inside the group loop; nothing to sort,
+                # nothing to collapse, and the flags let every matvec skip the lazy re-summation.
+                _emit_idx = _uidx
+                _emit_flags = dict(indices_sorted=True, unique_indices=True)
+            else:
+                _emit_idx = _vol_idx  # unplanned fallback: uncompressed, still correct
+                _emit_flags = {}
             if sm is None:
-                A = _jsparse.BCOO((data, _vol_idx), shape=(total, total))
-                # `_vol_idx` is hoisted out of the trace already, so its unique count is host-static
-                # and the compression runs INSIDE the trace -- which is what reaches the parametric
-                # and per-step N1E/RT re-assemblies, the 3-D vector runs where memory is the wall.
-                return sum_duplicate_triplets(A, nse=_vol_nse) if _vol_nse is not None else A
-            idx = jnp.concatenate([_vol_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
+                return _jsparse.BCOO((data, _emit_idx), shape=(total, total), **_emit_flags)
+            idx = jnp.concatenate([_emit_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
             data = jnp.concatenate([data, sm.data])
             # Deliberately NOT compressed. The static count would have to cover `sm.indices`, which is
             # produced inside the trace by `_surf_mass_of(args)`; assuming it is args-independent and
@@ -1260,7 +1533,12 @@ def assemble_fem_nonnodal(
     # --- steady linear parametric (inverse): re-assemble A(args), b(args) each call, kept differentiable in
     #     the parameter (mirrors the native path); the Dirichlet pins are RE-APPLIED per args. Returns a
     #     FemLinearSystem so `fem.solve()` gives a differentiable trace node crux can optimise. ---
-    if runtime_parameter_tags or neural_param_names:
+    # `_coord_specs` belongs in this gate for the same reason it does in the native assembler: a
+    # trainable mesh coordinate makes the operator parameter-dependent even though it is not a term
+    # COEFFICIENT, so it never appears in `runtime_parameter_tags`. Without it here the assembler
+    # returns a static (A, b) and the shape derivative is silently zero -- which reads as a
+    # converged design rather than a missing feature.
+    if runtime_parameter_tags or neural_param_names or _coord_specs:
         from ...trace import FemLinearSystem
 
         def _assemble_at(args):
@@ -1277,6 +1555,9 @@ def assemble_fem_nonnodal(
         # a neural coefficient rides its stored module)
         _ph = {n: (jnp.zeros((n_verts,)) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
         _ph.update({n: _neural_models[n].module for n in neural_param_names})
+        # a coordinate parameter's placeholder is the CURRENT node positions, not zeros: `.A` / `.b`
+        # must describe the mesh as it stands, and zeros would collapse those vertices onto the origin.
+        _ph.update({_nm: pts[_ids, _ax] for _ids, _ax, _nm in _coord_specs})
         a0, b0 = _assemble_at(_ph)
         return (
             FemLinearSystem(
@@ -1737,6 +2018,60 @@ def _plate_moment_load(b, mn_node, fidx, region_nodes, space, domain, top, pts_n
             gdofs = np.concatenate([cells[c], n_verts + ce[c]])
         np.add.at(b, np.asarray(int(base) + gdofs, dtype=np.intp), contrib)
     return jnp.asarray(b)
+
+
+def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs):
+    """Value-Dirichlet ``(dof, value)`` pins for a P1 Lagrange field on the non-nodal path: one DOF per
+    mesh vertex, so ``u = g`` on a region pins DOF ``offs[fidx] + v`` to ``g(vertex v)`` for every vertex
+    the region's location predicate selects. This is the scalar-potential half of the A-V (N1E x Lagrange)
+    pair -- V = g on a terminal face -- and the exact analogue of :func:`_hermite_dirichlet_pins` with a
+    1-DOF-per-vertex layout (Hermite's value DOF sits at ``3*v``; Lagrange's IS ``v``).
+
+    Unlike the Hermite loop, ``g`` is evaluated in ONE :func:`_eval_value_node_at` call over the whole
+    region (a terminal face of a production mesh has thousands of vertices; a per-vertex TraceEvaluator
+    round-trip is minutes of pure Python). Every degenerate case raises rather than degrades: an empty
+    region (a predicate that matched nothing -- the float32-tolerance trap), a complex ``g`` (the
+    complex non-nodal split assembles two REAL legs whose fused Dirichlet rows solve to ``u_r = g,
+    u_i = 0``, correct only for real ``g``), and a value/vertex-count mismatch.
+    """
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    pins = []
+    for fk, region, _comp, _value, value_node in dirichlet_raw:
+        fidx = field_index.get(fk)
+        if fidx is None or spaces[fidx] != "Lagrange":
+            continue
+        vs = np.asarray(_region_node_ids(domain, region), dtype=np.int64)
+        if vs.size == 0:
+            raise ValueError(
+                f"jno.fem (non-nodal): the Dirichlet region {region!r} on the Lagrange field matched "
+                "NO mesh vertex -- the essential condition would be silently dropped. Check the region "
+                "name / tag predicate (and its tolerance: a predicate finer than float32 eps needs the "
+                "float64 tag path, see domain.tag_node_mask)."
+            )
+        g = np.asarray(_eval_value_node_at(value_node, jnp.asarray(pts_np[vs])))
+        if np.iscomplexobj(g):
+            if np.abs(g.imag).max() > 0.0:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): a COMPLEX Dirichlet value on the Lagrange field is not wired -- "
+                    "the complex split assembles two real legs sharing one real pin value, whose fused "
+                    "rows enforce u_re = g, u_im = 0. Drive with a real terminal value (phase-reference "
+                    "the source) or split the constraint yourself."
+                )
+            g = g.real
+        g = g.reshape(-1)
+        if g.shape[0] == 1 and vs.size > 1:  # a constant value node evaluates once; broadcast it
+            g = np.full(vs.size, float(g[0]))
+        if g.shape[0] != vs.size:
+            raise ValueError(
+                f"jno.fem (non-nodal): the Dirichlet value on region {region!r} evaluated to "
+                f"{g.shape[0]} values for {vs.size} region vertices -- the value expression must be "
+                "scalar per point (bind the boundary coordinate variables, not a vector expression)."
+            )
+        base = int(offs[fidx])
+        pins.extend((base + int(v), float(gv)) for v, gv in zip(vs, g))
+    return pins
 
 
 def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs):

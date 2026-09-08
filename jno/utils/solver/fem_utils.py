@@ -673,10 +673,45 @@ def _cell_region_mask(domain, region):
                     f"shape."
                 ) from exc
     else:
-        raise ValueError(
-            f"jno.fem per-region integration: unknown region {region!r}. Define it with "
-            f"domain.tag(name, predicate), a Shape.regions() sub-region, or a geometry part."
-        )
+        # A NAMED VOLUME REGION OF THE MESH FILE (a gmsh physical volume). Resolved last, so a
+        # same-named `domain.tag` predicate keeps winning and nothing that worked before changes.
+        #
+        # Unlike every branch above this is exact membership, not centroid membership: the mesh
+        # already records which cell belongs to which material, so there is nothing to classify.
+        # That is the point -- a coordinate predicate evaluated at centroids for one purpose and at
+        # quadrature points for another disagrees on cells straddling a material boundary.
+        from ...domain.mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
+
+        membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
+        if region not in membership:
+            raise ValueError(
+                f"jno.fem per-region integration: unknown region {region!r}. Define it with "
+                f"domain.tag(name, predicate), a Shape.regions() sub-region, or a geometry part, "
+                f"or name a volume region of the mesh file. Mesh volume regions here: "
+                f"{sorted(membership)}."
+            )
+        m = membership[region]
+        if a_cells is not None:
+            # The membership indexes the DOMAIN mesh; the mask must describe the cell order the
+            # kernel vmaps over. Equal length is not enough -- a rebuild can produce the same count
+            # in a different order, and the coefficient would then be permuted per cell rather than
+            # wrong in a way anything notices. Compare the connectivity itself.
+            _want = volume_cell_type(domain.mesh, dim)
+            _dom_cells = np.asarray(p1_cells_dict(domain.mesh)[_want]) if _want else None
+            if _dom_cells is None or not np.array_equal(np.asarray(a_cells), _dom_cells):
+                raise ValueError(
+                    f"jno.fem per-region integration: region {region!r} comes from the mesh file's "
+                    f"cell sets, but the assembly mesh ({len(np.asarray(a_cells))} cells) is not the "
+                    f"domain mesh it was read from "
+                    f"({0 if _dom_cells is None else len(_dom_cells)} cells). Re-assemble after the "
+                    "mesh change so the two agree."
+                )
+        if not m.any():
+            raise ValueError(
+                f"jno.fem per-region integration: the mesh region {region!r} owns NO cell on this "
+                "mesh, so its coefficient would contribute a silent zero. Check the region name "
+                "against domain.avaiable_mesh_tags."
+            )
     return np.asarray(m, dtype=bool).astype(np.float64)
 
 
@@ -909,6 +944,42 @@ def _prefix_align(a, b):
     return (quad_first, b) if a.ndim < b.ndim else (a, quad_first)
 
 
+def _field_slot_or_none(local, node):
+    """Index into ``local["fields"]`` supplying ``node``'s basis, or ``None`` if no field supplies it.
+
+    Its own key first; failing that, any field on the SAME space and order -- identical nodes,
+    connectivity and shape functions on this mesh, so borrowing that slot is exact rather than an
+    approximation. See :func:`_resolve_field_slot` for why a foreign key occurs at all.
+    """
+    idx = local["field_index"].get(getattr(node, "field_key", getattr(node, "op_id", None)))
+    if idx is not None:
+        return idx
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    want_order = int(getattr(node, "order", 1))
+    for i, f in enumerate(local["fields"]):
+        if int(f.get("order", 1)) == want_order and (str(f.get("space", "Lagrange")) or "Lagrange") == want_space:
+            return i
+    return None
+
+
+def _slotless_p1_coefficient_or_raise(local, node):
+    """Guard the one case that may read the top-level P1 shape data instead of a field-table slot.
+
+    A frozen P1 coefficient in a form whose fields are all non-nodal -- an N1E problem whose source
+    was computed elsewhere -- has no slot to borrow, since no field here is P1. The assembler still
+    supplies P1 shape data at the top level for exactly this, so it is read from there.
+
+    Everything else that lands slotless is refused. A frozen coefficient declaring a HIGHER space
+    gets :func:`_resolve_field_slot`'s message, because answering it with P1 data would gather the
+    wrong nodes -- a P2 field has edge nodes a P1 basis never sees. A node that is not frozen at all
+    is an assembler bug, and gets the field-table message.
+    """
+    _coefficient_only_or_raise(local, node, getattr(node, "field_key", getattr(node, "op_id", None)))
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    if want_space != "Lagrange" or int(getattr(node, "order", 1)) != 1:
+        _resolve_field_slot(local, node)  # raises: names the space, and what to do about it
+
+
 def _resolve_field_slot(local, node):
     """Index into ``local["fields"]`` supplying ``node``'s basis, resolving a FOREIGN field by space.
 
@@ -923,21 +994,34 @@ def _resolve_field_slot(local, node):
     ``fem_native._frozen_field_basis_index`` refuses the same case at gather time with the fuller
     message; this is the kernel-side guard for the paths that reach here first.
     """
-    fields = local["fields"]
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    idx = local["field_index"].get(key)
+    idx = _field_slot_or_none(local, node)
     if idx is not None:
         return idx
     want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
     want_order = int(getattr(node, "order", 1))
-    for i, f in enumerate(fields):
-        if int(f.get("order", 1)) == want_order and (str(f.get("space", "Lagrange")) or "Lagrange") == want_space:
-            return i
     raise NotImplementedError(
         f"jno.fem: a field on a {want_space} order-{want_order} space is used in a form whose own "
         "fields do not include that space, so there is no basis to evaluate it on. This is usually a "
         "frozen coefficient (ui.freeze(values)) from a different space than the auxiliary form's "
         "unknown -- project it onto the form's space first, or write the form over a matching field."
+    )
+
+
+def _coefficient_only_or_raise(local, node, key):
+    """A missing ``field_index`` entry is legitimate for exactly ONE node kind: a :class:`FrozenField`
+    used as a coefficient, whose values ride ``local["frozen_fields"]`` rather than the field table.
+
+    For any other node a missing key is a BUG -- a trial/test function that never made it into the
+    field table -- and falling back to the top-level P1 shape data would answer with a silently wrong
+    basis instead of failing. Raise there, exactly as ``field_index[key]`` used to.
+    """
+    if isinstance(node, FrozenField):
+        return
+    raise KeyError(
+        f"jno.fem: field key {key!r} ({type(node).__name__}) is not in this problem's field table "
+        f"{list(local.get('field_index') or {})}. Only a frozen COEFFICIENT field may be absent from "
+        "it; a trial or test function must be present, so this is an assembler bug rather than a "
+        "usage error -- refusing to fall back to the P1 shape data and answer with the wrong basis."
     )
 
 
@@ -951,7 +1035,16 @@ def _field_data(local, node):
     fields = local.get("fields")
     if fields is None:
         return local["shape_vals"], local.get("shape_grads"), local.get("cell_sol")
-    fd = fields[_resolve_field_slot(local, node)]
+    idx = _field_slot_or_none(local, node)
+    if idx is None:
+        # A COEFFICIENT-ONLY field: a FrozenField whose source is not among this problem's solved
+        # unknowns, and whose space no field here supplies (an N1E form reading a P1 source computed
+        # elsewhere). It borrows the top-level P1 shape data the assembler supplies for coefficients.
+        # `cell_sol` is None -- a frozen field carries its values via ``local["frozen_fields"]``,
+        # never the live state.
+        _slotless_p1_coefficient_or_raise(local, node)
+        return local["shape_vals"], local.get("shape_grads"), None
+    fd = fields[idx]
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
@@ -977,7 +1070,12 @@ def _field_hess(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("shape_hess")
-    return fields[_resolve_field_slot(local, node)].get("shape_hess")
+    idx = _field_slot_or_none(local, node)
+    if idx is None:
+        # Coefficient-only field: no slot to borrow, and P1 tabulates no second derivative anyway.
+        _slotless_p1_coefficient_or_raise(local, node)
+        return None
+    return fields[idx].get("shape_hess")
 
 
 def _field_space(local, node):
@@ -990,7 +1088,13 @@ def _field_space(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("space", "Lagrange")
-    return fields[_resolve_field_slot(local, node)].get("space", "Lagrange")
+    idx = _field_slot_or_none(local, node)
+    if idx is None:
+        # A COEFFICIENT-ONLY field with no slot to borrow IS nodal Lagrange -- which is also the
+        # default, so the value branches downstream take the same path as any P1 coefficient.
+        _slotless_p1_coefficient_or_raise(local, node)
+        return "Lagrange"
+    return fields[idx].get("space", "Lagrange")
 
 
 def _eval_frozen_coefficient(domain, model, local):
@@ -4266,13 +4370,18 @@ _ELEM_MAP_CACHE_MAX = 128
 #: See :func:`compress_plan` for why content rather than identity (a remesh changes the content and
 #: misses, so staleness is impossible) and for the measured hash-vs-work ratio.
 #:
-#: Bounded at 4 because an entry pins DEVICE arrays, and the ``inverse`` leg is one int32 per RAW
-#: triplet -- the largest array the plan holds (38 MiB at 9.5M triplets, against ~3 MiB for the unique
-#: indices). Four covers the two-to-three patterns one build registers plus a neighbour, which is the
-#: repeated-build case this exists for; holding a dead problem's pattern any longer costs device
-#: memory for nothing.
+#: Bounded in BYTES first, count second. An entry pins DEVICE arrays sized by the MESH (the
+#: ``inverse`` leg is one int32 per raw triplet), so a count-only bound means nothing: 4 entries of
+#: a 1.3M-tet fused-block plan is ~4 GB, 4 entries of a toy is 4 kB. The byte bound keeps the
+#: repeated-build win for small and medium problems and simply skips caching where the plan itself
+#: is the memory problem -- a big mesh recomputes ``np.unique`` (~1-2 s at 22M triplets) on a
+#: rebuild instead of pinning a gigabyte for the whole session. The count bound is a secondary
+#: tidy-up for many tiny patterns; it is 12 because one COMPLEX build registers ~4 patterns (two
+#: legs, the fused 2n block, the complex union) and at the historical bound of 4 a single such
+#: build evicted its own entries before any rebuild could hit them.
 _PLAN_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
-_PLAN_CACHE_MAX = 4
+_PLAN_CACHE_MAX = 12
+_PLAN_CACHE_MAX_BYTES = 256 * 2**20
 
 
 #: Content digests of baked array leaves, keyed by object id. Each entry PINS the array it was
@@ -4848,9 +4957,13 @@ def compress_plan(indices):
     # feeds these straight to `segment_sum` and the BCOO constructor, both of which take numpy, so
     # nothing downstream needs the conversion -- it only ever created the hazard.
     plan = idx, inverse.reshape(-1).astype(np.int32), int(uniq.shape[0])
-    _PLAN_CACHE[key] = plan
-    while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
-        _PLAN_CACHE.popitem(last=False)
+    entry_bytes = plan[0].nbytes + plan[1].nbytes
+    if entry_bytes <= _PLAN_CACHE_MAX_BYTES:  # an oversized plan is returned but never cached
+        _PLAN_CACHE[key] = plan
+        while len(_PLAN_CACHE) > _PLAN_CACHE_MAX or (
+            len(_PLAN_CACHE) > 1 and sum(p[0].nbytes + p[1].nbytes for p in _PLAN_CACHE.values()) > _PLAN_CACHE_MAX_BYTES
+        ):
+            _PLAN_CACHE.popitem(last=False)
     return plan
 
 
@@ -4867,9 +4980,25 @@ def compress_eager(A):
     but the check runs on the ALREADY-COMPRESSED values, which are ~16x smaller than the raw triplets,
     so it is a cheap transfer rather than a full round trip.
 
+    An operator that arrives with ``unique_indices`` and ``indices_sorted`` both set skips the plan
+    entirely -- the flags are set only by paths that guarantee them (the planned assemblers, and this
+    function). Recomputing a plan for one is a no-op that the cache then PINS: measured on a 275k-tet
+    complex build, ~70 MB of no-op inverse per leg. The explicit-zero drop still runs, because the
+    planned path emits canonical patterns WITH zero slots (a term whose Re or Im leg vanishes keeps
+    its pattern) -- on the same build the legs arrived 2.9M stored, 1.4M of them zero.
+
     Falls back to the sorting path for anything non-concrete -- correctness never depends on this."""
     if not hasattr(A, "indices"):
         return A
+    if getattr(A, "unique_indices", False) and getattr(A, "indices_sorted", False):
+        try:
+            keep = np.asarray(jnp.abs(A.data) > 0.0)
+            if bool(keep.all()):
+                return A
+            sel = jnp.asarray(np.flatnonzero(keep))
+            return jsparse.BCOO((A.data[sel], A.indices[sel]), shape=A.shape, indices_sorted=True, unique_indices=True)
+        except Exception:  # noqa: BLE001 -- traced data: keep the canonical operator as-is
+            return A
     try:
         plan = compress_plan(A.indices)
     except Exception:  # noqa: BLE001 -- traced operator: no host plan available
@@ -4882,7 +5011,7 @@ def compress_eager(A):
     if not bool(keep.all()):
         sel = jnp.asarray(np.flatnonzero(keep))
         data, idx = data[sel], idx[sel]
-    return jsparse.BCOO((data, idx), shape=A.shape)
+    return jsparse.BCOO((data, idx), shape=A.shape, indices_sorted=True, unique_indices=True)
 
 
 def apply_compress_plan(data, plan, shape):

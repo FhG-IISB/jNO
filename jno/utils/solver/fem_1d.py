@@ -59,6 +59,7 @@ from typing import Any, Dict, List, NamedTuple, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsp
 from jax.flatten_util import ravel_pytree
 
 from .fem_utils import (
@@ -685,9 +686,30 @@ def _make_residual(
 def _apply_dirichlet_symmetric(A, b, dirichlet_pairs: List[Tuple[int, float]]):
     """Symmetric Dirichlet elimination on a linear system ``A u = b``.
 
-    Moves known columns to the RHS, then zeros the constrained rows *and* columns
-    and sets a unit diagonal — so ``A`` stays symmetric (as in the 2D/3D
-    path), unlike a row-only replacement."""
+    Moves known columns to the RHS, then zeros the constrained rows *and* columns and pins the
+    diagonal — so ``A`` stays symmetric (as in the 2D/3D path), unlike a row-only replacement.
+
+    **The pinned row is SCALED to the local diagonal magnitude, not set to one.** On the sparse
+    (BCOO) path the constrained equation is written ``s·u_i = s·g`` with ``s = |A_ii|`` before
+    elimination (the mean ``|A|`` where that diagonal vanished), rather than the ``1·u_i = g`` a
+    row replacement would give. The two are algebraically identical and the solution is unchanged
+    -- but they are not equivalent numerically:
+
+    a unit row sitting among rows of magnitude 1e5 is a badly scaled matrix, and the condition
+    number it produces is felt directly by every iterative solver and preconditioner downstream.
+    That is why this exists at all: the H(curl) / AMS stack cannot afford it. Keeping the pinned
+    row at the local scale leaves the operator uniformly scaled.
+
+    Two consequences worth knowing before "fixing" this back:
+
+    * ``A[i, i]`` on a pinned row is **not 1.0**. A test that identifies pinned rows by that value
+      is reading a convention, not a property -- identify them by structure instead (every
+      off-diagonal zero, diagonal non-zero), which is what "this row pins exactly this DOF" means.
+    * ``b[i]`` carries ``s·g``, not ``g``. Read the imposed value off the SOLUTION, never off the
+      load vector.
+
+    The dense fallback below still uses a unit diagonal: it exists for small systems that go to a
+    direct solve, where scaling buys nothing."""
     if not dirichlet_pairs:
         return A, b
     dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
@@ -695,8 +717,20 @@ def _apply_dirichlet_symmetric(A, b, dirichlet_pairs: List[Tuple[int, float]]):
     if hasattr(A, "indices"):  # BCOO (native 2D/3D assembler) — keep it sparse, never densify
         e = jnp.zeros(A.shape[0], b.dtype).at[dofs].set(vals)  # the known-column lift
         b = b - A @ e  # carry the known columns to the load (a BCOO matvec, no dense column slice)
+        ii, jj = A.indices[:, 0], A.indices[:, 1]
+        diag0 = jnp.zeros(A.shape[0], jnp.abs(A.data).dtype).at[ii].add(jnp.where(ii == jj, jnp.abs(A.data), 0.0))
+        fallback = jnp.mean(jnp.abs(A.data))
+        s_all = jnp.ones(A.shape[0], diag0.dtype)
+        s_all = s_all.at[dofs].set(jnp.where(diag0[dofs] > 0.0, diag0[dofs], fallback))
         A = bcoo_set_unit_diag(bcoo_zero_rows_cols(A, dofs), dofs)
-        b = b.at[dofs].set(vals)
+        A = jsp.BCOO(
+            (
+                jnp.where(A.indices[:, 0] == A.indices[:, 1], A.data * s_all[A.indices[:, 0]].astype(A.data.dtype), A.data),
+                A.indices,
+            ),
+            shape=A.shape,
+        )
+        b = b.at[dofs].set(vals * s_all[dofs].astype(b.dtype))
         return A, b
     b = b - A[:, dofs] @ vals  # carry the known columns to the load
     A = A.at[dofs, :].set(0.0).at[:, dofs].set(0.0).at[dofs, dofs].set(1.0)

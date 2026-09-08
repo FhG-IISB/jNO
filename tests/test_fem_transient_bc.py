@@ -74,8 +74,14 @@ def test_transient_nonhomog_dirichlet_single_field():
     pts = np.asarray(fem.field_points[0])
     rows = np.where(np.asarray(jax.vmap(d._make_tag_location_fn("boundary"))(jax.numpy.asarray(pts))).reshape(-1))[0]
     assert rows.size > 0 and np.allclose(_dense(fem.M)[rows], 0.0)
-    # and the load c carries g=1 on those rows
-    assert np.allclose(np.asarray(fem.operator.affine_bias).reshape(-1)[rows], 1.0)
+    # and the load carries g=1 on those rows -- read as bias/diagonal, not as the bias alone.
+    # Symmetric elimination writes the pinned equation `s*u_i = s*g` with `s` the local diagonal
+    # magnitude, so the operator stays uniformly scaled for the iterative solvers and preconditioners
+    # downstream (see `_apply_dirichlet_symmetric`). The imposed VALUE is the ratio; the bias on its
+    # own is `s*g` and reads as g only under the older unit-diagonal convention.
+    _A_dense = _dense(fem.operator.A)
+    _bias = np.asarray(fem.operator.affine_bias).reshape(-1)[rows]
+    assert np.allclose(_bias / _A_dense[rows, rows], 1.0)
     w = _march(fem)
     assert np.abs(w - 1.0).max() < 5e-3  # u -> 1 everywhere
 

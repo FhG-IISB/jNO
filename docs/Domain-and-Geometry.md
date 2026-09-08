@@ -208,7 +208,13 @@ keywords, and the two forms combine (dict entries first).
 
 A region can carry its own material properties, read back off the domain as a **per-region
 coefficient** ready to drop into a weak form. `d.k` is exactly the `d.by_region({...})` assembled from
-every region that declared a `k`:
+every region that declared a `k`.
+
+**This is the preferred way to express materials.** It puts each property next to the region it
+describes, lets several properties travel together, and leaves the weak form reading in physical names
+(`d.k`, `d.eps`) instead of coefficients assembled elsewhere. Use `d.by_region({...})` directly when
+the mapping is *data* rather than a material — values computed elsewhere, or a case needing an explicit
+`default=` for regions that genuinely have no value.
 
 ```python
 kri = Shape.polygon(v).name("Kristall").attach(k=220.0, eps=0.794)
@@ -237,6 +243,11 @@ Rules worth knowing:
 * `d.<name>` raises if **any** region failed to declare that name, listing the ones that did not — a
   forgotten material surfaces at first use rather than as a region that silently conducts nothing. Use
   `d.by_region({...}, default=...)` explicitly when some regions genuinely have none.
+  **This check covers `Shape` regions only.** It reads `_shape_regions`, so on a **mesh-file domain**
+  it never fires: a region you forgot to attach falls through to `by_region`'s own default rather than
+  raising. That matters most for a coefficient whose absence changes the operator's character — a
+  forgotten reluctivity leaves `nu = 0` and with it no curl-curl term at all — so on a mesh-file domain
+  attach **every** region explicitly and do not rely on this guard.
 * Values must agree on one view type across regions; a matrix on one region and a vector on another
   raises rather than silently taking whichever came last.
 * Properties are **declared, not typed** for volume regions: whether `eps` is used as a volume or a

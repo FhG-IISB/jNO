@@ -142,6 +142,82 @@ def p1_cells_dict(mesh):
     return {**cd, **extra} if extra else cd
 
 
+#: The top-dimensional ("volume") cell blocks jNO assembles on, per spatial dimension. One canonical
+#: list: a mesh carries exactly one of these (``_refuse_mixed_cells``), and every site that has to
+#: ask "which blocks are cells rather than facets?" reads it from here.
+VOLUME_BLOCKS_BY_DIM = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}
+
+
+def volume_cell_type(mesh, dim: int):
+    """The mesh's volume block name in the **P1 view**, or ``None`` for a surface/shell mesh.
+
+    Goes through :func:`p1_cells_dict`, so a curved mesh -- which stores only ``tetra10`` /
+    ``triangle6`` -- answers ``"tetra"`` / ``"triangle"`` rather than nothing.
+    """
+    cd = p1_cells_dict(mesh) if getattr(mesh, "cells_dict", None) else {}
+    return next((n for n in VOLUME_BLOCKS_BY_DIM.get(int(dim), ()) if n in cd), None)
+
+
+def mesh_cell_region_membership(mesh, dim: int):
+    """``{region_name: (n_cells,) bool}`` for the mesh's NAMED volume cell regions.
+
+    A mesh loaded from a file keeps its gmsh physical volumes in ``cell_sets``. This is the one
+    place that turns them into a flat per-cell membership over ``p1_cells_dict[volume_type]`` order
+    -- the cell axis every assembler vmaps over -- so the remesh label path and the per-region
+    coefficient path cannot drift apart.
+
+    Three things it has to get right, each of which has already cost a debugging session:
+
+    * **Block offsets.** ``cell_sets[name]`` is a list parallel to ``mesh.cells`` with indices local
+      to each block, while ``cells_dict[...]`` is the concatenation. A real gmsh mesh has many
+      blocks (17 observed on one device), so each block's indices need its cumulative offset.
+    * **Curved blocks.** Matching ``blk.type`` against ``"tetra"`` misses ``tetra10`` entirely and
+      silently yields no regions. Compare :func:`base_cell_type` instead.
+    * **Reader metadata.** ``gmsh:bounding_entities`` and friends are not regions: they carry
+      NEGATIVE sentinel indices that would write a label from the wrong end of the array.
+
+    ``interior`` and ``boundary`` are excluded -- they are jNO's own whole-domain sets, not
+    materials.
+    """
+    cell_sets = getattr(mesh, "cell_sets", None) or {}
+    want = volume_cell_type(mesh, dim)
+    if not cell_sets or want is None:
+        return {}
+    n_cells = int(np.asarray(p1_cells_dict(mesh)[want]).shape[0])
+
+    offset, seen = {}, 0
+    for bi, blk in enumerate(getattr(mesh, "cells", None) or []):
+        if base_cell_type(getattr(blk, "type", "")) == want:
+            offset[bi] = seen
+            seen += len(blk.data)
+
+    out = {}
+    for name, entries in cell_sets.items():
+        if name in ("interior", "boundary") or ":" in str(name):
+            continue  # jNO's own whole-domain sets, and reader metadata
+        m = np.zeros(n_cells, dtype=bool)
+        hit = False
+        for bi, arr in enumerate(entries or []):
+            if arr is None or len(arr) == 0 or bi not in offset:
+                continue
+            idx = np.asarray(arr, dtype=np.int64)
+            # Same local-vs-global rule the mesh loader applies: a block-local index cannot exceed
+            # block_len - 1, so anything larger must be a global id and is rebased. Reading these
+            # arrays with a different convention than the loader would resolve DIFFERENT cells for
+            # the same region name on the same mesh.
+            block_len = len(getattr(mesh, "cells")[bi].data)
+            if idx.size and int(idx.max()) >= block_len:
+                idx = idx - int(idx.min())
+            idx = idx + offset[bi]
+            sel = idx[(idx >= 0) & (idx < n_cells)]
+            if sel.size:
+                m[sel] = True
+                hit = True
+        if hit:
+            out[str(name)] = m
+    return out
+
+
 class MeshUtils:
     #: Memory budget, in float64 elements, for one row-block of the axisymmetric ring kernel's
     #: (M, M, n_phi) intermediate. Lower it if the view-factor build OOMs on a small GPU; it changes

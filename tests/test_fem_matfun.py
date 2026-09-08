@@ -34,24 +34,31 @@ def _x64():
 
 
 def test_krylov_breakdown_raises_instead_of_returning_nan():
-    """The failure the suite's own fixture never saw, because it uses no Dirichlet term and a fine mesh.
+    """Lanczos can only build a subspace as large as the number of DISTINCT eigenvalues; asked for
+    more, ``logdet`` returned NaN and ``applyfun`` returned inf. Both must raise, and must do so
+    under a trace too: these estimators exist to be differentiated, so an eager-only check would
+    guard nothing.
 
-    Lanczos can only build a subspace as large as the number of DISTINCT eigenvalues, and a pinned jNO
-    FEM operator has far fewer than it has rows: every Dirichlet DOF is an identity row, so eigenvalue
-    1.0 carries the pinned count as its multiplicity. Measured at mesh 0.25 -- n=30, 16 pinned rows,
-    15 distinct eigenvalues -- the DEFAULT ``order=25`` overran that and ``logdet`` returned NaN while
-    ``applyfun`` returned inf. Both must raise, and must do so under a trace too: these estimators
-    exist to be differentiated, so an eager-only check would guard nothing."""
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
-    u, v = d.fem_symbols()
-    xi, yi, _ = d.variable("interior", split=True)
-    xb, yb, _ = d.variable("boundary", split=True)
-    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-    A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
-    S = jnp.asarray(np.asarray(A.todense()))
-    n = S.shape[0]
-    ev = np.linalg.eigvalsh(np.asarray(S))
-    assert len(np.unique(np.round(ev, 9))) < n, "the premise: pinning collapses the distinct spectrum"
+    The collapsed spectrum is built EXPLICITLY rather than taken from a pinned FEM operator. It used
+    to come from one -- at mesh 0.25, n=30 with 16 identity Dirichlet rows all at eigenvalue 1.0, so
+    15 distinct values against a default ``order=25``. Symmetric elimination now writes the pinned
+    equation ``s*u_i = s*g`` with ``s`` the local diagonal magnitude (see
+    ``_apply_dirichlet_symmetric``), so those rows no longer share an eigenvalue: measured on the same
+    problem, 28 distinct values and NONE at 1.0. That is a real improvement for Krylov methods -- and
+    it silently removed this test's premise, which is exactly why the premise should not have been a
+    side effect of an assembly convention in the first place."""
+    # The old shape, built explicitly: an SPD block plus EXACT identity rows, which is what a pinned
+    # operator used to be. The repetition has to be exact -- a rotated matrix with the same nominal
+    # multiplicity has eigenvalues that differ at round-off, Lanczos never hits a true breakdown, and
+    # the guard is never reached.
+    n, k = 30, 14
+    rng = np.random.default_rng(0)
+    B = rng.standard_normal((k, k))
+    S_np = np.eye(n)
+    S_np[:k, :k] = B @ B.T + k * np.eye(k)
+    S = jnp.asarray(S_np)
+    ev = np.linalg.eigvalsh(S_np)
+    assert len(np.unique(np.round(ev, 9))) < n, "the premise: the identity rows collapse the spectrum"
 
     with pytest.raises(FloatingPointError, match="Krylov"):
         jno.solve.logdet(S, samples=8)  # default order=25 -> NaN before the guard
@@ -93,8 +100,13 @@ def test_applyfun_is_order_independent_past_the_krylov_dimension():
     for order in (8, 15, 20, 25, 29, 30):
         got = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=order))
         rel = np.linalg.norm(got - ref) / np.linalg.norm(ref)
-        # order=8 is genuinely below the Krylov dimension, so it is approximate but not broken
-        assert rel < (1e-5 if order == 8 else 1e-12), f"order={order} gave rel {rel:.2e}"
+        # order=8 is genuinely below the Krylov dimension, so it is approximate but not broken. Its
+        # bar is loose ON PURPOSE and tracks the spectrum: symmetric elimination no longer gives the
+        # pinned rows a shared eigenvalue at 1.0 (see `_apply_dirichlet_symmetric`), so this operator
+        # has 28 distinct eigenvalues where it had 15, and an order-8 subspace now spans relatively
+        # less of it -- 1.6e-05 rather than under 1e-05. The property under test is the OTHER orders
+        # agreeing to 1e-12, which is what "order is an upper bound, not a request" means.
+        assert rel < (1e-4 if order == 8 else 1e-12), f"order={order} gave rel {rel:.2e}"
 
 
 def test_applyfun_arnoldi_path_and_expmv_agree_with_a_dense_expm():

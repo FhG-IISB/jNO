@@ -24,6 +24,7 @@ import jax.numpy as jnp
 __all__ = [
     "fgmres",
     "minres",
+    "cocg",
     "chebyshev_iteration",
     "power_iteration_bound",
     "lanczos_spectrum_bounds",
@@ -254,6 +255,80 @@ def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
         w = (v - oldeps * w1 - delta * w2) / gamma
         x = x + phi * w
         return x, r1, r2, y, oldb, beta, dbar, epsln, phibar, cs, sn, w, w2, itn + 1
+
+    return jax.lax.while_loop(cond, body, state0)[0]
+
+
+# ---------------------------------------------------------------------------
+# COCG
+# ---------------------------------------------------------------------------
+
+
+def cocg(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
+    """COCG — **complex-symmetric** systems, ``A = A^T`` (NOT ``A = A^H``).
+
+    H. A. van der Vorst & J. B. M. Melissen, *A Petrov-Galerkin type method for solving Ax = b,
+    where A is symmetric complex*, IEEE Trans. Magn. 26(2), 1990, 706-708.
+
+    The time-harmonic operators assembled here — eddy-current A-V, Helmholtz, RCWA — are complex
+    **symmetric** rather than Hermitian. For those, CG's three-term recurrence survives if the
+    Hermitian inner product is replaced by the **bilinear** form ``x^T y``, giving a short
+    recurrence where GMRES needs a growing basis: one matvec, one preconditioner apply and O(n)
+    work per iteration, with no restart parameter to tune.
+
+    **The inner product here is bilinear, and that is deliberate.** ``fgmres`` above conjugates its
+    Arnoldi projections (``jnp.conj(V) @ w``) because it orthogonalises in the Hermitian inner
+    product; COCG must NOT, and ``@`` on 1-D arrays is exactly the non-conjugating contraction the
+    method wants. Adding a ``conj`` here to "match fgmres" silently turns this into a method for a
+    matrix that is not the one being solved.
+
+    Two consequences of the bilinear form, both handled below:
+
+      * ``x^T x`` is not a norm — it can vanish for ``x != 0`` — so **convergence is still measured
+        in the ordinary Hermitian 2-norm** ``||r||`` relative to ``||b||``. Only the projections
+        are bilinear.
+      * the method can **break down** (``p^T A p = 0`` with ``p != 0``) where CG on an SPD system
+        cannot. That is a genuine property, not a rounding artefact, so it stops the iteration and
+        returns the last iterate rather than dividing by a clamped denominator and reporting a
+        confident wrong answer. ``jno.solve``'s residual guard then reports it.
+
+    ``M`` is the ``v -> M^{-1} v`` applier and should itself be complex-symmetric for the recurrence
+    to remain valid.
+    """
+    M = M or _ident
+    b = jnp.asarray(b)
+    x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
+
+    rdtype = jnp.zeros((), b.dtype).real.dtype  # norms and tolerances are REAL even for complex b
+    tiny = _tiny_of(rdtype)  # float32-safe breakdown floor (see _tiny_of)
+    tol = _effective_tol(tol, rdtype)  # a sub-eps request cannot converge; floor it
+
+    r0 = b - matvec(x0)
+    z0 = M(r0)
+    tol_abs = tol * jnp.maximum(jnp.linalg.norm(b), tiny)
+
+    # state: x, r, z, p, rho, itn, broke
+    state0 = (x0, r0, z0, z0, r0 @ z0, jnp.asarray(0), jnp.asarray(False))
+
+    def cond(s):
+        r, itn, broke = s[1], s[5], s[6]
+        return (jnp.linalg.norm(r) > tol_abs) & (itn < maxiter) & jnp.logical_not(broke)
+
+    def body(s):
+        x, r, z, p, rho, itn, broke = s
+        q = matvec(p)
+        pq = p @ q  # bilinear, NOT conj(p) @ q — see the docstring
+        bad = (jnp.abs(pq) <= tiny) | (jnp.abs(rho) <= tiny)
+        # Freeze the iterate on breakdown (alpha = beta = 0) instead of propagating inf/NaN, so the
+        # returned x is the last good one and the caller's residual check sees the truth.
+        alpha = jnp.where(bad, 0.0, rho / jnp.where(bad, 1.0, pq))
+        x = x + alpha * p
+        r = r - alpha * q
+        z = M(r)
+        rho_new = r @ z
+        beta = jnp.where(bad, 0.0, rho_new / jnp.where(bad, 1.0, rho))
+        p = z + beta * p
+        return (x, r, z, p, rho_new, itn + 1, broke | bad)
 
     return jax.lax.while_loop(cond, body, state0)[0]
 
