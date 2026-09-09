@@ -1173,7 +1173,7 @@ class domain(MeshIOMixin):
                 name,
                 self._tag_predicates.get(base),
                 max(10 * n_now, 1000),
-                _np.random.default_rng(),
+                self._geometry_sample_rng(),
                 kind == "boundary",
             )
 
@@ -2738,13 +2738,30 @@ class domain(MeshIOMixin):
             f"names appears to be empty on this geometry."
         )
 
+    def _geometry_sample_rng(self):
+        """The generator geometry sampling draws from: reproducible per domain, and advancing.
+
+        Seeded once and then carried, so a run repeats exactly while successive draws on the same
+        domain still differ -- the resampling strategies rely on the second property and every test
+        that measures a sampled distribution relies on the first. This was `default_rng()`, i.e. OS
+        entropy, and nothing a caller could do made it repeat: `test_burgers_rad_...` drew a
+        different working set every run, its starting mean |x| wandered between 0.47 and 0.53 here
+        and 0.446 on CI, and the drop it asserts rode that spread from 0.25 down to 0.08 -- through
+        a threshold of 0.10. The reference clouds below were already pinned for the same reason.
+        """
+        rng = getattr(self, "_sample_rng", None)
+        if rng is None:
+            rng = np.random.default_rng(0)
+            self._sample_rng = rng
+        return rng
+
     def _sample_geometry_tag(self, tag, source_tag, n_samples, normals, batch_count, apply_time_value):
         """Fill ``context[tag]`` from the geometry, in the ``(B, T, N, D)`` layout ``sample`` uses."""
         kind, name = self._geometry_tags[source_tag]
         predicate = self._tag_predicates.get(source_tag)
         if name is not None or kind == "boundary":
             kind = "boundary"
-        rng = np.random.default_rng()
+        rng = self._geometry_sample_rng()
         want_normals = bool(normals) and kind == "boundary"
         if normals and kind != "boundary":
             raise ValueError(f"normals are only available on a boundary tag, and '{source_tag}' is interior.")
