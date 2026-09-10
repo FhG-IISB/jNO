@@ -818,7 +818,7 @@ def pardiso_lu_solve(A, b):
     )
 
 
-def host_lu_solve(A, b):
+def host_lu_solve(A, b, *, reuse: bool = True):
     """Sparse-direct solve factored on the HOST (SuperLU), driven from the device.
 
     Same contract as :func:`sparse_lu_solve` -- ``(A, b) -> x``, jit-compatible, reverse-mode
@@ -878,11 +878,25 @@ def host_lu_solve(A, b):
         # factorization exactly -- a changed coefficient misses and re-factors, which is the whole
         # correctness requirement. `transpose` is deliberately NOT in the key: one factorization
         # serves both directions via SuperLU's trans="T", so the adjoint reuses the forward's.
-        h = hashlib.blake2b(digest_size=16)
-        h.update(dat.view(_np.uint8))
-        h.update(idx.view(_np.uint8))
-        key = (h.digest(), shape, dat.dtype.str)
+        if reuse:
+            h = hashlib.blake2b(digest_size=16)
+            h.update(dat.view(_np.uint8))
+            h.update(idx.view(_np.uint8))
+            key = (h.digest(), shape, dat.dtype.str)
 
+        # ``reuse=False`` factorises and FREES within this one callback. That matters for a march,
+        # not just for the hash it saves: XLA:CPU runs each pure_callback on a different thread, so a
+        # factorisation retained past the callback that built it is freed on some LATER thread, and
+        # glibc cannot return that arena to the allocator. The result is one factorisation's worth of
+        # unreclaimable RSS per Newton iteration. Measured on a 4-field melt pool, 13,278 DOFs, 200
+        # steps: cached OOM-kills a 62 GB machine, uncached peaks at 2.08 GB, and the two answers
+        # agree to ten significant figures.
+        if not reuse:
+            mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
+            lu = _spla.splu(mat)
+            out = _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
+            del lu, mat
+            return out
         lu = _FACTOR_CACHE.get(key)
         if lu is None:
             mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
