@@ -4911,6 +4911,48 @@ def unique_triplet_count(indices) -> int:
     return 0 if plan is None else int(plan[2])
 
 
+def _collapse_coo(arr):
+    """Collapse duplicate ``(row, col)`` triplets host-side, returning ``(idx, inverse32, nse)``.
+
+    Bit-identical to ``np.unique(rows * stride + cols, return_inverse=True)`` -- same ascending
+    lexicographic order of the unique pairs, same inverse -- but with roughly a third of the peak
+    scratch. ``np.unique`` allocates an ``intp`` argsort permutation, a sorted int64 copy AND an
+    int64 inverse on top of the int64 key, and the caller's ``astype(np.int64)`` of both index
+    columns adds two more full-length arrays before the key even exists; on a 3-D operator that is
+    ~65 bytes of transient per RAW triplet to produce a 4-byte-per-triplet inverse. Here only the
+    key, its permutation and the sorted copy are ever int64-sized, the ranks and the inverse are
+    written as int32 directly, and the key is dropped as soon as the sorted copy exists.
+
+    Pure host numpy on index metadata -- nothing here is traced or differentiated.
+    """
+    rows = arr[:, 0]
+    cols = arr[:, 1]
+    if cols.dtype.kind not in "iu":  # a non-integer pattern would break the in-place `key += cols`
+        cols = cols.astype(np.int64)
+    stride = int(cols.max()) + 1
+    key = rows.astype(np.int64)
+    key *= stride
+    key += cols
+    order = np.argsort(key, kind="stable")
+    skey = key[order]
+    del key
+    n = skey.shape[0]
+    flag = np.empty(n, bool)
+    flag[0] = True
+    np.not_equal(skey[1:], skey[:-1], out=flag[1:])
+    ranks = np.cumsum(flag, dtype=np.int32)
+    ranks -= 1
+    uniq = skey[flag]
+    del skey, flag
+    inv32 = np.empty(n, np.int32)
+    inv32[order] = ranks
+    del order, ranks
+    idx = np.empty((uniq.shape[0], 2), np.int32)
+    idx[:, 0] = uniq // stride
+    idx[:, 1] = uniq % stride
+    return idx, inv32, int(uniq.shape[0])
+
+
 def compress_plan(indices):
     """Host-side compression plan ``(unique_indices, inverse, nse)``, or ``None`` for an empty pattern.
 
@@ -4951,20 +4993,16 @@ def compress_plan(indices):
     if hit is not None:
         _PLAN_CACHE.move_to_end(key)
         return hit
-    rows = arr[:, 0].astype(np.int64)
-    cols = arr[:, 1].astype(np.int64)
-    stride = int(cols.max()) + 1
-    uniq, inverse = np.unique(rows * stride + cols, return_inverse=True)
-    idx = np.stack([uniq // stride, uniq % stride], axis=1).astype(np.int32)
     # int32 inverse: it is one entry per RAW triplet, so on a large 3-D operator it is the biggest
-    # array the plan holds -- halving it against numpy's int64 default is worth the cast.
+    # array the plan holds -- halving it against numpy's int64 default is worth the cast, and
+    # `_collapse_coo` writes it at that width instead of casting an int64 one down afterwards.
     # NUMPY, not jnp. This plan is pure host data -- it comes from mesh connectivity -- and it is kept
     # in a module-level cache. Building it with `jnp.asarray` while inside a trace produced trace-bound
     # arrays, cached them, and handed them back to a later trace: JAX raised UnexpectedTracerError from
     # a staggered sweep, which builds its Jacobian wrapper inside a `while_body`. `apply_compress_plan`
     # feeds these straight to `segment_sum` and the BCOO constructor, both of which take numpy, so
     # nothing downstream needs the conversion -- it only ever created the hazard.
-    plan = idx, inverse.reshape(-1).astype(np.int32), int(uniq.shape[0])
+    plan = _collapse_coo(arr)
     entry_bytes = plan[0].nbytes + plan[1].nbytes
     if entry_bytes <= _PLAN_CACHE_MAX_BYTES:  # an oversized plan is returned but never cached
         _PLAN_CACHE[key] = plan
