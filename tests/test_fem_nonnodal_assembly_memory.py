@@ -58,6 +58,13 @@ def _mixed_many_terms(size=0.35):
             - inner_(vec(1.0 + 0.0 * x, 0.0 * x, 0.0 * x), V_),
             1j * w * inner_(A_, tg(Vt)) + 1j * w * inner_(g(Vs), tg(Vt)),
             u.vector.cross(d.variable("boundary", normals=True)),
+            # GROUND THE SCALAR POTENTIAL. A-V determines V only up to an additive constant, so
+            # without this the operator carries that gauge as an exact null space -- measured rank
+            # 222 of 223, smallest singular value 8.3e-13 against a next-smallest of 84. The solve
+            # below then means nothing: host SuperLU factors straight through the tiny pivot and
+            # returns a vector that is finite and wrong, while a GPU sparse LU refuses it outright
+            # ("Singular matrix in linear solve"). The GPU is the one telling the truth.
+            p(*d.variable("boundary", split=True)[:3]) - 0.0,
         ]
     )
 
