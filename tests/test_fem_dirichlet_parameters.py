@@ -22,6 +22,24 @@ import pytest
 import jno
 
 
+@pytest.fixture(autouse=True)
+def _x64():
+    """float64 for this file.
+
+    Its tests compare a runtime-parameter solve against a literal-valued oracle -- two assemblies of
+    the same problem -- at ``rtol=1e-4``. In float32 the two agree only to 1.9e-4: not a difference
+    between the paths but the precision they are computed in, which is why it passed on one backend
+    and failed on another. In float64 they agree to 8.8e-9, so the comparison measures the thing it
+    is named for and has four orders of margin instead of landing on the tolerance.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
 def _poisson_pieces(size=0.3, time=None):
     d = jno.shape.rect(0, 0, 1, 1, size=size).domain(**({"time": time} if time else {}))
     u, v = d.fem_symbols()
