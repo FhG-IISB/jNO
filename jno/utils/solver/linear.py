@@ -38,11 +38,26 @@ __all__ = ["sparse_lu_solve", "jacobi", "matrix_diagonal"]
 #: That is the deliberate trade: a small tax on the case that cannot benefit, against removing all
 #: but one factorization from the case that can.
 #:
-#: Bounded at 2 because the win is a repeated operator, not a diverse population of them, and a
-#: sparse factorization is the biggest object either side of the solve (fill-in): holding a stale one
-#: costs host memory for nothing. Two covers an alternating pair (a coupled two-field march).
+#: Bounded because the win is a repeated operator, not a diverse population of them, and a sparse
+#: factorization is the biggest object either side of the solve (fill-in): holding a stale one costs
+#: host memory for nothing.
+#:
+#: The bound is 8, not 2. Two covers an alternating pair (a coupled two-field march), which is what
+#: a MONOLITHIC solve produces -- but a BLOCK preconditioner does not: `triangular((T, inner(lu())),
+#: (u, ...), (p, ...), (w, ...))` calls this once per block with a different operator, and again on
+#: every Krylov application. Below the block count no entry survives to be reused, so the hit rate is
+#: not merely reduced, it is exactly zero. Measured on the 4-field melt pool at h=8um, 120 steps,
+#: same answer throughout (peak T 1917 K, |u| 5.1616e-01 m/s):
+#:     bound 2, reuse=True    OOM -- SIGKILL, RSS climbs until the kernel intervenes
+#:     bound 2, reuse=False   3330 s
+#:     bound 8, reuse=True    1998 s
+#: The OOM is the thrash, not the caching: evicting and re-factorising every application strands
+#: per-thread glibc arenas faster than they are reused.
+#:
+#: Raising the cap cannot cost the monolithic case anything -- it is a CAP, not an allocation, and
+#: that case only ever inserts one key. 8 covers a four-field system and its transpose solves.
 _FACTOR_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
-_FACTOR_CACHE_MAX = 2
+_FACTOR_CACHE_MAX = 8
 
 #: cuDSS solvers, keyed on the operator's **SPARSITY** rather than its full content.
 #:
