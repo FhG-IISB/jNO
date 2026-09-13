@@ -338,6 +338,16 @@ def test_bdf2_damps_the_stiff_modes_crank_nicolson_rings_on():
     assert np.abs(b2[-1]).max() < 0.2 * np.abs(cn[-1]).max()
 
 
+def test_bdf2_marches_under_a_traced_evaluation():
+    """`jno.core(...)` evaluates a solve inside a trace -- the path every inverse problem takes. BDF2 took
+    its startup time as `float()` of a staged `jnp.linspace` there and raised ConcretizationTypeError; it
+    had only ever run eagerly (`.fn()`), which is how every test above calls it."""
+    sol = _heat(12).solve(time=jno.solve.bdf2())
+    traced = np.asarray(jno.core([sol.mse]).eval([sol]))[-1].reshape(-1)
+    eager = _final(_heat(12), time=jno.solve.bdf2()).reshape(-1)
+    assert np.allclose(traced, eager, atol=1e-10), float(np.abs(traced - eager).max())
+
+
 def test_bdf2_composes_with_the_solver_slots():
     """`linear=`/`precond=` reach the per-step solve through BDF2 exactly as through the theta march --
     it reuses `block.step`, so there is one implementation and it cannot drift."""

@@ -160,7 +160,7 @@ class _BDF2Scheme(_TimeScheme):
         import jax
         import jax.numpy as jnp
 
-        from .backend_blocks import _block_time_grid, _resample_trajectory
+        from .backend_blocks import _resample_trajectory
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
         md = block.metadata or {}
@@ -181,8 +181,15 @@ class _BDF2Scheme(_TimeScheme):
         s0 = block.state0_fn(args) if getattr(block, "state0_fn", None) is not None else block.state0
         s0 = jnp.asarray(s0).reshape(-1)
         dtype = s0.dtype
-        grid_ts = _block_time_grid(block)
         dt = float(block.dt)
+        # The grid is built on the HOST. `_block_time_grid` returns a `jnp.linspace`, and under a trace --
+        # which is how `jno.core(...)` evaluates a solve, i.e. every inverse problem -- even a linspace of
+        # plain floats is staged, so `float(grid_ts[1])` below raised a ConcretizationTypeError. BDF2 had
+        # only ever been exercised eagerly (`.fn()`), so it was unusable inside `jno.core` without a word.
+        import numpy as np
+
+        t0, t1 = float(block.t0), float(block.t1)
+        grid_ts = np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)  # concrete: numpy, not jnp
 
         # A nonlinear step's own convergence guard cannot fire inside the scan, so the step reports
         # its residual norms and they are judged below -- as in the theta march and the load path.
