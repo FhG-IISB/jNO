@@ -118,7 +118,7 @@ def test_the_flat_sweep_cannot_solve_what_the_grouped_one_can():
 # --------------------------------------------------------------------------------------------------
 # Groups must not disturb the flat behaviour they generalise
 # --------------------------------------------------------------------------------------------------
-def test_a_group_of_one_is_the_flat_form():
+def test_a_group_of_one_is_the_flat_form(bitwise_backend):
     """``[[v, p], [T]]`` and ``[v, p, T]`` differ; ``[[a], [b]]`` and ``[a, b]`` must not."""
     fem, v, p, T = _stokes_thermal()
     a = fem.solve(nonlinear=jno.solve.staggered([[v, p], [T]], direct=True, rtol=1e-11, atol=1e-13), linear=_lu())

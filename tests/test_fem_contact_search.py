@@ -57,7 +57,7 @@ def _stacked_bars(size=0.4, c=1.0e3):
 # ----------------------------------------------------------------------------------------------
 # The invariant the whole thing rests on
 # ----------------------------------------------------------------------------------------------
-def test_repairing_at_zero_displacement_reproduces_the_frozen_pairing():
+def test_repairing_at_zero_displacement_reproduces_the_frozen_pairing(bitwise_backend):
     """Bit-identical, not merely close. The search runs the same projection the build-time tables did,
     so at ``u = 0`` it must land on the same facets with the same weights and the same ``g0``; asserted
     through the residual, at two states, because that is what every consumer of the tables sees."""

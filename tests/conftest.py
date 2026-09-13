@@ -21,6 +21,33 @@ import jax.numpy as jnp
 import pytest
 
 
+@pytest.fixture
+def bitwise_backend():
+    """Skip a bit-equality guard on a backend that is not bitwise reproducible run-to-run.
+
+    A few tests assert ``np.array_equal`` between two SEPARATE solves -- that ``relax=1.0`` is
+    inert, that re-pairing at ``u=0`` reproduces the frozen pairing, that a bare symbol lowers to
+    the flat form. Each is a statement about the code path, and on CPU it holds exactly: three
+    identical solves measured 0.0 apart.
+
+    GPU scatter-add is not run-to-run reproducible. Two identical solves measured 1.3e-16 apart
+    here, with nothing varying between them -- so on GPU these tests compare the backend against
+    itself and report the difference as a library failure. `relax=1.0` does not even reach the
+    blend (`if u_prev is not None and relax != 1.0`), so there is nothing in the library to fix.
+
+    `XLA_FLAGS=--xla_gpu_deterministic_ops=true` does make all three pass, and cannot be used: the
+    same three files went from 306s to 9h20m with it, a 110x cost that the `fem` group's existing
+    2h33m cannot absorb.
+
+    Loosening to a tolerance would not recover the guard either -- `relax=0.5`, a genuine damping
+    change, also lands 2e-16 from the default at the fixed point, so no tolerance separates "the
+    option leaked" from "the backend reassociated". Bit equality is the whole assertion; it runs
+    where it means something, which includes CI.
+    """
+    if jax.default_backend() != "cpu":
+        pytest.skip(f"bit-equality guard: the {jax.default_backend()} backend is not bitwise reproducible")
+
+
 @pytest.fixture(autouse=True)
 def _restore_x64():
     """Put ``jax_enable_x64`` back the way the test found it.

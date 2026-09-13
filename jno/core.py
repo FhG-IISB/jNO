@@ -4129,9 +4129,14 @@ class core:
                             # Update normals atomically when the candidate pool provides them.
                             normal_tag = f"n_{tag}"
                             if normal_tag in full_context and candidates_pts is not None and candidates_nrms is not None:
-                                cand_pts_j = jnp.array(candidates_pts)  # (N_pool, D)
-                                cand_nrm_j = jnp.array(candidates_nrms)  # (N_pool, D)
-                                prev_nrm_bn = jnp.array(full_context[normal_tag])[:, 0]  # (B, N, D)
+                                # Same co-location as the points above, and for the same reason: these three
+                                # come from host-side context, so under a CPU+GPU build they land on CPU while
+                                # `nearest` below is computed from the already-relocated points and lands on
+                                # the default device. The gather then sees one argument per platform and JAX
+                                # refuses it outright -- a GPU-only failure, invisible to a CPU-only CI.
+                                cand_pts_j = jax.device_put(jnp.array(candidates_pts), _default_device)  # (N_pool, D)
+                                cand_nrm_j = jax.device_put(jnp.array(candidates_nrms), _default_device)  # (N_pool, D)
+                                prev_nrm_bn = jax.device_put(jnp.array(full_context[normal_tag])[:, 0], _default_device)
                                 new_nrm_batches = []
                                 for b in range(n_batch):
                                     # A strategy returns a MIX: points freshly drawn from the pool, and

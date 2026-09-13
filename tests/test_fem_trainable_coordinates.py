@@ -228,7 +228,14 @@ def test_transient_coordinate_gradient_matches_fd():
     assert float(jnp.linalg.norm(g["ix"])) > 1e-6, "du/dX vanished — the coordinate never reached the assembly"
     assert float(jnp.linalg.norm(g["iy"])) > 1e-6
 
-    h = 1e-6
+    # Central FD has a V-curve in h: truncation falls as h^2, roundoff grows as 1/(2h) times the
+    # precision the function is actually evaluated to. `march` is a transient solve, not an exact
+    # expression -- its loss carries ~1e-11 -- so 1/(2h) at h=1e-6 multiplies that by 5e5. Measured
+    # against AD: h=1e-6 gives 2.6e-5, h=1e-5 2.3e-5, h=1e-4 4.8e-9, h=1e-3 4.4e-6, h=1e-2 4.4e-4.
+    # The old h sat on the roundoff branch within a factor of 4 of the rel=1e-4 below, so GPU
+    # run-to-run variation tipped it over and this test failed the nightly intermittently. h=1e-4
+    # is the floor of the curve, five orders clear of the tolerance.
+    h = 1e-4
 
     def bumped(delta):
         return float(loss({k: (v.at[0].add(delta) if k == "ix" else v) for k, v in X.items()}))

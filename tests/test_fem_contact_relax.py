@@ -47,7 +47,7 @@ def test_a_relax_outside_the_unit_interval_is_refused(bad):
         fem.solve(contact=jno.solve.contact(relax=bad))
 
 
-def test_the_default_is_bit_identical_to_not_passing_it():
+def test_the_default_is_bit_identical_to_not_passing_it(bitwise_backend):
     """`relax` must be inert until asked for: this is an existing-behaviour guard, so it asserts bit
     equality rather than closeness."""
     _, fem_a = _stacked_bars()
