@@ -278,6 +278,43 @@ alongside the union `"a|b"`.
 
 ---
 
+### Signed distance — `.sdf(...)`
+
+`contains` answers *inside or not*; `sdf` answers *how far* — negative inside, zero on the boundary,
+positive outside. It takes either an array of points or one coordinate per axis:
+
+```python
+d = shape.sdf(points)        # (N, dim) numpy or jax array  -> an array
+d = shape.sdf(x, y)          # jno Variables                -> an expression, usable in a form
+```
+
+The expression form is the useful one. Because the distance is exactly zero on the boundary, it
+turns a boundary condition that a PINN would otherwise have to *learn* into one that *holds*:
+
+```python
+plate = jno.shape.rect(0, 0, 2, 1) - jno.shape.disk(0.7, 0.5, 0.28)
+dom   = plate.domain()
+x, y  = dom.variable("interior", split=True)[:2]
+phi   = plate.sdf(x, y)                       # 0 on every boundary, hole included
+u     = g + phi * net(x, y)                   # u == g on the boundary, for ANY network weights
+```
+
+No hand-written `x * (1 - x)` factor is needed, and none exists for a rectangle with a hole in it.
+The same expression gives a material that changes by region without a conforming mesh:
+`eps = 1 + (eps_r - 1) * 0.5 * (1 - jno.np.tanh(shape.sdf(x, y) / w))`.
+
+!!! note "What is exact, and what is only a bound"
+    Distances to a single primitive — rect, box, disk, sphere, cylinder, polygon — are exact, and
+    translating or rotating preserves them. Combining shapes (`|`, `&`, `-`) is exact **on the
+    boundary**, which is all a boundary condition or a smoothed indicator needs, but strictly inside a
+    combined shape the value is only a bound on the true distance. `sweep` and `fillet` have no closed
+    form and raise; `revolve` is not wired yet.
+
+!!! note "Differentiable in the coordinates, not in the shape"
+    Gradients with respect to the query point are finite everywhere, in float32 as well as float64.
+    The shape's own radii, corners and vertices are fixed numbers, so optimising the geometry itself
+    does not go through `sdf`.
+
 ## Worked examples
 
 === "Bolt-circle plate"
