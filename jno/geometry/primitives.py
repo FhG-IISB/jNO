@@ -914,3 +914,116 @@ SURFACE_SAMPLERS = {
     "Sphere": sphere_surface,
     "Polygon": polygon_surface,
 }
+
+
+# --- signed distance ------------------------------------------------------------------------
+# Each is written against a pluggable array module ``xp`` and takes the coordinates as SEPARATE
+# scalars, so one implementation serves three backends: numpy (host), jax.numpy (traced arrays,
+# for sampling), and jno.np (trace nodes, for a weak form or a PINN ansatz). Only sqrt / abs /
+# minimum / maximum / where are used, which all three provide.
+#
+# Sign convention: negative inside, zero on the boundary, positive outside.
+
+
+def _safe_sqrt(xp, s):
+    """``sqrt(s)`` for ``s >= 0``, with gradient 0 -- not NaN -- where ``s`` is exactly 0.
+
+    Every distance below takes the root of a sum of squares that is exactly zero somewhere, and for a
+    box's "outside" term that is the whole interior. ``d sqrt/ds`` is infinite there, the chain rule
+    multiplies it by a zero, and JAX returns NaN. A ``s + 1e-300`` guard holds only in float64: in
+    float32 the constant rounds to exactly 0, and every interior point of a box and the centre of a
+    disk came back with a NaN gradient. float32 is what a PINN trains in, and a hard-BC ansatz is the
+    reason the trace form exists, so that was the headline use failing from the inside.
+
+    The two ``where``s are the standard fix: the ``sqrt`` never sees a 0, the branch that would have
+    is masked out, so the value is exactly 0 and so is its gradient. No constant means no bias either
+    -- a boundary point reads 0, where the guard gave 1e-150.
+    """
+    pos = s > 0.0
+    return xp.where(pos, xp.sqrt(xp.where(pos, s, 1.0)), 0.0)
+
+
+def _box_sdf(xp, lo_hi):
+    """Exact distance to an axis-aligned box, from per-axis ``(lo, hi, coord)`` triples."""
+    d = [xp.maximum(lo - c, c - hi) for lo, hi, c in lo_hi]
+    outside = _safe_sqrt(xp, sum(xp.maximum(di, 0.0) ** 2 for di in d))
+    inner = d[0]
+    for di in d[1:]:
+        inner = xp.maximum(inner, di)
+    return outside + xp.minimum(inner, 0.0)
+
+
+def rect_sdf(prim, c, xp):
+    return _box_sdf(xp, [(prim.x0, prim.x1, c[0]), (prim.y0, prim.y1, c[1])])
+
+
+def box_sdf(prim, c, xp):
+    return _box_sdf(xp, [(prim.x0, prim.x1, c[0]), (prim.y0, prim.y1, c[1]), (prim.z0, prim.z1, c[2])])
+
+
+def disk_sdf(prim, c, xp):
+    return _safe_sqrt(xp, (c[0] - prim.cx) ** 2 + (c[1] - prim.cy) ** 2) - prim.r
+
+
+def sphere_sdf(prim, c, xp):
+    return _safe_sqrt(xp, (c[0] - prim.cx) ** 2 + (c[1] - prim.cy) ** 2 + (c[2] - prim.cz) ** 2) - prim.r
+
+
+def cylinder_sdf(prim, c, xp):
+    """Capped cylinder about an arbitrary axis: radial and axial distances combined as for a box."""
+    ax = np.array([prim.dx, prim.dy, prim.dz], dtype=float)
+    alen = float(np.linalg.norm(ax)) or 1.0
+    u = ax / alen
+    v = [c[i] - o for i, o in enumerate((prim.x, prim.y, prim.z))]
+    t = sum(v[i] * u[i] for i in range(3))  # along the axis
+    perp2 = sum(v[i] ** 2 for i in range(3)) - t**2
+    radial = _safe_sqrt(xp, xp.maximum(perp2, 0.0)) - prim.r
+    axial = xp.maximum(-t, t - alen)
+    outside = _safe_sqrt(xp, xp.maximum(radial, 0.0) ** 2 + xp.maximum(axial, 0.0) ** 2)
+    return outside + xp.minimum(xp.maximum(radial, axial), 0.0)
+
+
+def polygon_sdf(prim, c, xp):
+    """Distance to the perimeter, signed by the even-odd crossing rule.
+
+    The parity is carried as a FLOAT in {0, 1} and combined with ``a + b - 2ab``, which is xor
+    written arithmetically. The natural spelling -- ``(yi > y) != (yj > y)`` then ``inside ^= ...`` --
+    works on arrays and silently does the wrong thing on trace nodes: jNO reserves ``==``/``!=`` for
+    node identity, so the comparison returns a Python bool and the following ``&`` raises. Arithmetic
+    has no such overload to collide with.
+
+    The loop is over a STATIC vertex list, so it unrolls under trace; no data-dependent control flow.
+    """
+    verts = np.asarray(prim.points, dtype=float)
+    x, y = c[0], c[1]
+    n = len(verts)
+    dist2 = None
+    parity = 0.0
+    for i in range(n):
+        ax_, ay_ = verts[i]
+        bx_, by_ = verts[(i + 1) % n]
+        ex, ey = bx_ - ax_, by_ - ay_
+        wx, wy = x - ax_, y - ay_
+        ee = (ex * ex + ey * ey) or 1e-300
+        t = xp.minimum(xp.maximum((wx * ex + wy * ey) / ee, 0.0), 1.0)
+        dx, dy = wx - t * ex, wy - t * ey
+        d2 = dx * dx + dy * dy
+        dist2 = d2 if dist2 is None else xp.minimum(dist2, d2)
+        above_a = xp.where(ay_ > y, 1.0, 0.0)
+        above_b = xp.where(by_ > y, 1.0, 0.0)
+        straddles = xp.abs(above_a - above_b)
+        left = xp.where(x < (bx_ - ax_) * (y - ay_) / (by_ - ay_ + 1e-300) + ax_, 1.0, 0.0)
+        cross = straddles * left
+        parity = parity + cross - 2.0 * parity * cross  # xor, arithmetically
+    d = _safe_sqrt(xp, dist2)
+    return xp.where(parity > 0.5, -d, d)
+
+
+SDFS = {
+    "Rect": rect_sdf,
+    "Disk": disk_sdf,
+    "Box": box_sdf,
+    "Sphere": sphere_sdf,
+    "Cylinder": cylinder_sdf,
+    "Polygon": polygon_sdf,
+}

@@ -110,6 +110,59 @@ def sample_inside(contains_fn, lo, hi, key, n: int, *, batch: int = 0, max_round
     return buf, cursor
 
 
+def _node_sdf(node, c, xp):
+    """Signed distance over the CSG tree. ``c`` is a list of per-axis coordinate expressions.
+
+    Booleans compose as the usual lattice: union is ``min``, intersection is ``max``, and a cut is
+    ``max(a, -b)``. Those are EXACT on the boundary -- the zero set is right, which is what a hard
+    boundary condition and a material indicator both depend on -- but only a bound on the true
+    distance strictly inside a composite. Fillet radii and anything else that needs the real
+    distance in the interior should not lean on this.
+    """
+    from .primitives import SDFS, _safe_sqrt
+
+    kind = node[0]
+    if kind == "leaf":
+        prim = node[1]
+        name = type(prim).__name__
+        if name not in SDFS:
+            raise NotImplementedError(f"shape.sdf: no signed distance for {name}; have {sorted(SDFS)}.")
+        return SDFS[name](prim, c, xp)
+    if kind == "fuse":
+        return xp.minimum(_node_sdf(node[1]._node, c, xp), _node_sdf(node[2]._node, c, xp))
+    if kind == "inter":
+        return xp.maximum(_node_sdf(node[1]._node, c, xp), _node_sdf(node[2]._node, c, xp))
+    if kind == "cut":
+        return xp.maximum(_node_sdf(node[1]._node, c, xp), -_node_sdf(node[2]._node, c, xp))
+    if kind == "regions":
+        out = None
+        for _name, sub in node[1]:
+            d = _node_sdf(sub._node, c, xp)
+            out = d if out is None else xp.minimum(out, d)
+        return out
+    if kind == "translate":
+        off = np.asarray(node[2], dtype=float)
+        return _node_sdf(node[1]._node, [c[i] - float(off[i]) for i in range(len(c))], xp)
+    if kind == "rotate":
+        R = _rodrigues(node[3], -node[4])  # undo the rotation
+        ap = np.asarray(node[2], dtype=float)
+        c3 = list(c) + [0.0] * (3 - len(c))
+        v = [c3[i] - float(ap[i]) for i in range(3)]
+        loc = [sum(float(R[i][j]) * v[j] for j in range(3)) + float(ap[i]) for i in range(3)]
+        return _node_sdf(node[1]._node, loc[: len(c)] if len(c) < 3 else loc, xp)
+    if kind == "extrude":
+        h = float(node[2])
+        lo, hi = min(0.0, h), max(0.0, h)
+        base = _node_sdf(node[1]._node, [c[0], c[1]], xp)  # the profile lives at z = 0
+        axial = xp.maximum(lo - c[2], c[2] - hi)
+        outside = _safe_sqrt(xp, xp.maximum(base, 0.0) ** 2 + xp.maximum(axial, 0.0) ** 2)
+        return outside + xp.minimum(xp.maximum(base, axial), 0.0)
+    raise NotImplementedError(
+        f"shape.sdf: a {kind!r} plan has no closed-form signed distance. sweep and fillet are only "
+        f"available through the boundary tessellation, which is host-side; revolve is not wired yet."
+    )
+
+
 def _rodrigues(axis_dir, angle):
     """3x3 rotation matrix about ``axis_dir`` by ``angle`` (static, so plain numpy)."""
     u = np.asarray(axis_dir, dtype=float)
@@ -1091,6 +1144,53 @@ class shape:
             # No closed form (sweep/fillet): ask the boundary tessellation instead. `tol` has no
             # meaning there -- membership is the polyhedron's, exact to its own facets.
             return self.tessellate().contains(pts)
+
+    def sdf(self, *coords, dim: int | None = None):
+        """Signed distance to this shape: **negative inside, zero on the boundary, positive outside**.
+
+        Two calling forms, because the two places it is useful speak different languages::
+
+            shape.sdf(points)          # (N, dim) numpy or jax array  -> an array
+            shape.sdf(x, y)            # jno Variables                -> a trace node
+
+        The array form backs sampling, membership and mesh sizing. The trace form is the one that
+        composes into a weak form or a PINN ansatz, where the coordinates are ``Variable`` nodes and
+        arithmetic has to be emitted through ``jno.np`` rather than evaluated. The same per-primitive
+        formulas serve both -- only the array module differs.
+
+        Two things it is for::
+
+            u   = g + shape.sdf(x, y) * net(x, y)      # a boundary condition that HOLDS, not one
+                                                       # that is penalised: the factor is exactly
+                                                       # zero on the boundary by construction
+            eps = 1 + (eps_r - 1) * 0.5 * (1 - jno.np.tanh(shape.sdf(x, y) / w))
+                                                       # a material that varies by region without a
+                                                       # conforming multi-material mesh
+
+        ``contains`` is the sign of this: ``contains(p) == (sdf(p) <= 0)``.
+
+        **Exactness.** Per-primitive distances are exact, and rigid transforms preserve them. Boolean
+        composition (``min``/``max``) is exact ON THE BOUNDARY -- the zero set is right, which is all a
+        hard boundary condition or a smoothed indicator needs -- but is only a bound strictly inside a
+        composite. Do not lean on the interior value where the true distance matters.
+
+        **Differentiability.** Differentiable in the query coordinates, with a finite gradient
+        everywhere -- inside, on the boundary and at a centre, in float32 as in float64. Not in the
+        shape's own parameters: radii, corners and vertices are static floats read at trace time, so
+        optimising the geometry itself does not go through here.
+
+        ``sweep``/``fillet`` have no closed form and raise; ``revolve`` is not wired yet.
+        """
+        if len(coords) == 1 and getattr(coords[0], "ndim", 0) == 2:
+            pts = coords[0]
+            xp = _xp(pts)
+            d = int(dim or pts.shape[1])
+            return _node_sdf(self._node, [pts[:, i] for i in range(d)], xp)
+        if not coords:
+            raise TypeError("shape.sdf needs either an (N, dim) array or one expression per axis.")
+        from .. import jnp_ops as _jnp_ops  # jno.np: the traced array module
+
+        return _node_sdf(self._node, list(coords), _jnp_ops)
 
     def bounds(self):
         """Axis-aligned bounding box as ``(lo, hi)``, two 3-vectors — no gmsh.
