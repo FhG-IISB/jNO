@@ -181,6 +181,13 @@ round, `0` marked on the next. `theta` is refused with a constraint (there is no
 choose), and a bare comparison (`q > 2.0`) is refused too: it records which cells are bad but not by
 how much, so marking would take a fraction of them and quietly leave the rest.
 
+**On a march** the same condition is a *trigger*. With `remesh(criterion=jno.le(...), every=k)` on a
+transient problem it is checked on the current mesh every `k` steps, and the mesh is rebuilt only when
+some cell breaks it; `fem.adapt_history` records `remeshed: False` for the rounds it held, so a
+condition that never breaks never remeshes. A ranking criterion (`1 - phi**2`, `|grad u|`) is evaluated
+on the live state at each remesh, and the vertex budget (`max_dofs`, else the starting count) is held on
+both the isotropic and the anisotropic path.
+
 Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
 bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
 it runs out of rounds. And pass a **callable** for a geometry criterion: a geometry node captures the

@@ -1061,17 +1061,25 @@ def remesh(
 
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
-    toward convergence. On a **transient** problem it remeshes every ``every`` steps at a *constant*
-    budget and carries the state across (basis-aware transfer), so the mesh tracks a moving feature and
-    coarsens its wake instead of ratcheting up::
+    toward convergence. On a **transient** problem it remeshes every ``every`` steps and carries the
+    state across (basis-aware transfer), so the mesh tracks a moving feature. It holds a *constant*
+    budget -- ``max_dofs`` vertices, else the initial vertex count -- on both paths: the isotropic one
+    refines the marked cells by ``refine_factor`` relative to the rest and then scales the whole size
+    field to the budget, so the wake coarsens instead of the mesh ratcheting up::
 
         fem.solve(adapt=jno.solve.remesh(anisotropic=True, max_dofs=6000, every=4))
+        fem.solve(adapt=jno.solve.remesh(criterion=1.0 - phi * phi, every=4))      # follow an interface
 
-    ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the solution's
-    curvature) instead of isotropic ZZ marking — far fewer DOFs for a layer or a front, and the right
-    choice for an interface. ``hmin``/``hmax`` bound the edge sizes; ``metric_field`` picks which coupled
-    field drives the metric. Metric-based DOF control is approximate, so ``max_dofs`` is honoured only
-    loosely in that mode.
+    On a march a ``criterion=`` is evaluated on the live state at every remesh. A **condition** criterion
+    is a trigger there: the mesh is rebuilt only when some cell breaks it, so
+    ``remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1)`` remeshes exactly when the mesh
+    degrades, and never while the condition holds.
+
+    ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the curvature of the
+    solution -- or of the ``criterion``, when one is given) instead of isotropic ZZ marking — far fewer
+    DOFs for a layer or a front, and the right choice for an interface. ``hmin``/``hmax`` bound the edge
+    sizes; ``metric_field`` picks which coupled field drives the metric. DOF control is approximate on
+    both paths (the mesher honours a size field loosely), so ``max_dofs`` is a target, not a cap.
 
     Steady-only: ``max_iters``, ``tol``, ``eps`` (a relative-change plateau detector, not a certified
     bound). Transient-only: ``every``, ``metric_field``.

@@ -1051,7 +1051,9 @@ elimination produces). It raises a clear error. Carry the complex part in the op
 
 `adapt=` composes with a complex **transient** too: the stacked `[Re; Im]` halves transfer across
 each remesh as a doubled field layout, the **modulus** `|u|` drives the remesh metric (refining on
-`Re` alone would miss a rotating phase), and the saved frames come back complex.
+`Re` alone would miss a rotating phase), and the saved frames come back complex. A `criterion=` is
+refused there by name: it would be assembled against the stacked real state, whose halves it cannot
+tell apart. Drop it to remesh on the modulus.
 
 Not yet supported (clear errors): a Bloch tie on a **real** transient march (the phase forces a
 complex field — make the problem complex, or use a plain tie) or on a **nonlinear** form (complex

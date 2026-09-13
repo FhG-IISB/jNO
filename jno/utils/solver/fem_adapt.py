@@ -1430,6 +1430,11 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
             # `dom.cell_size` resolve to a region literally called 'cell_size'.
             if isinstance(tg, str) and (tg in ("cell_size", "cell_metric") or tg.startswith(("gap_", "slide_"))):
                 continue
+            # The TIME variable of a transient form is not a region either: a criterion that falls back to
+            # the form's own terms found `ti` beside `xi, yi` and was refused as spanning
+            # ['__time__', 'interior'] -- which made every transient criterion unusable.
+            if getattr(var, "axis", None) == "temporal" or tg == "__time__":
+                continue
             if isinstance(tg, str) and tg not in found:
                 found.append(tg)
         return found
@@ -2090,6 +2095,62 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
         marked_vertices = np.unique(tris[marked_cells].reshape(-1))
         size[marked_vertices] = h0[marked_vertices] / float(refine_factor)
     return size
+
+
+def _hold_vertex_budget(domain: Any, size: np.ndarray, *, target: float, hmin: float, hmax: float) -> np.ndarray:
+    """Scale a per-vertex size field so the mesh it asks for has about ``target`` vertices.
+
+    Marking decides WHERE the mesh should be finer than the rest; this decides HOW MANY vertices there
+    are in total. Without it an isotropic marked remesh refines by ``refine_factor`` every round and
+    never coarsens, which is right for the steady loop (it grows toward convergence) and wrong on a
+    march, where the mesh has to follow a feature at a fixed cost.
+
+    The count a size field produces is predicted from the mesh at hand rather than from a per-dimension
+    constant: vertex density goes as ``h^-d``, so ``N(h) ≈ N_now · ∫h^-d / ∫h_now^-d`` over the current
+    cells. One global factor ``s`` then scales ``size`` (so the marked pattern is kept) until the clamped
+    ``clip(s·size, hmin, hmax)`` predicts ``target``. The mesher honours a size field approximately, so
+    the delivered count lands near the target, not on it.
+
+    If the clamps make the budget unreachable, the clamped field is returned and a warning says which
+    bound bit -- a budget quietly not met is the failure this exists to remove.
+    """
+    import warnings
+
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
+    cells = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64)
+    edges = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim)
+    vol = np.abs(np.linalg.det(edges)) / float(np.prod(np.arange(1, dim + 1)))
+    size = np.asarray(size, dtype=np.float64).reshape(-1)
+    h_now = size_field_from_marks(domain, np.empty(0, dtype=np.int64))  # the current local size
+
+    def _density(h):
+        return float(np.sum(vol * np.mean(np.asarray(h)[cells] ** (-dim), axis=1)))
+
+    ref = _density(h_now)
+
+    def _predicted(s):
+        return pts.shape[0] * _density(np.clip(s * size, hmin, hmax)) / ref
+
+    lo, hi = 1e-6, 1e6  # _predicted is non-increasing in s; bracket, then bisect on log s
+    if _predicted(lo) < target:
+        warnings.warn(
+            f"adapt: the vertex budget {target:.0f} is out of reach -- even at hmin={hmin:.3g} everywhere the "
+            f"mesh would have ~{_predicted(lo):.0f} vertices. Lower hmin to allow a finer mesh.",
+            stacklevel=3,
+        )
+        return np.clip(lo * size, hmin, hmax)
+    if _predicted(hi) > target:
+        warnings.warn(
+            f"adapt: the vertex budget {target:.0f} is out of reach -- even at hmax={hmax:.3g} everywhere the "
+            f"mesh would keep ~{_predicted(hi):.0f} vertices. Raise hmax to allow a coarser mesh.",
+            stacklevel=3,
+        )
+        return np.clip(hi * size, hmin, hmax)
+    for _ in range(80):
+        mid = np.sqrt(lo * hi)
+        lo, hi = (mid, hi) if _predicted(mid) > target else (lo, mid)
+    return np.clip(np.sqrt(lo * hi) * size, hmin, hmax)
 
 
 def _mean_edge_length(domain: Any) -> float:
@@ -2755,13 +2816,18 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         # -- `_vertex_view` assumes a single trial function -- on a value that branch never uses.
         _needs_view = spec.criterion is None or spec.anisotropic
         u = _vertex_view(_full, cur, allow_vector=True) if _needs_view else None
-        if u is not None and u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
-            raise NotImplementedError(  # anisotropic Hessian metric is scalar-only (a single Hessian field)
-                "anisotropic (Hessian-metric) adaptation is scalar-only; use isotropic ZZ "
-                "(AdaptSpec(anisotropic=False)) to refine a vector field."
-            )
         _crit = _resolve_criterion(spec.criterion, d)
         _is_constraint = isinstance(_crit, Constraint)
+        # A ranking criterion drives the anisotropic metric itself (it used to be ignored there: the metric
+        # was always the SOLUTION's Hessian, whatever the criterion said). It is a scalar field, so a vector
+        # problem can then be adapted anisotropically too.
+        _metric_from_criterion = spec.anisotropic and _crit is not None and not _is_constraint
+        if u is not None and u.ndim == 2 and spec.anisotropic and not _metric_from_criterion:
+            raise NotImplementedError(  # the anisotropic Hessian metric is scalar-only (a single Hessian field)
+                "anisotropic (Hessian-metric) adaptation is scalar-only; use isotropic ZZ "
+                "(AdaptSpec(anisotropic=False)) to refine a vector field, or pass a scalar criterion= to "
+                "drive the metric."
+            )
         if _is_constraint:
             # A CONSTRAINT criterion (`jno.le(d.cell_aspect(), 6.0)`) states a condition, not a ranking:
             # its signed margin is positive exactly on the cells that break it. Those are marked --
@@ -2821,6 +2887,14 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
 
             refine_domain(d, marked, copy=False)
         elif spec.anisotropic:
+            if _metric_from_criterion:
+                if _criterion_is_geometric(_crit):
+                    raise NotImplementedError(
+                        "adapt(criterion=<per-cell geometry quantity>, anisotropic=True): a per-cell quantity "
+                        "has no nodal field to build a Hessian metric from. Use the isotropic path "
+                        "(anisotropic=False), or state it as a condition (jno.le/jno.ge)."
+                    )
+                u = _criterion_nodal(cur, _crit, _full, int(spec.metric_field))[:n_dofs]
             if np.iscomplexobj(u):
                 # The metric is a SCALAR estimator, so a complex solution is reduced to |u| here --
                 # the same modulus the isotropic ZZ indicator and the transient driver already use.
@@ -4123,6 +4197,15 @@ def run_adaptive_transient(
     (:func:`transfer_solution`), so the mesh **tracks a moving feature**. Returns an
     :class:`AdaptiveTrajectory` (each frame on its own adapted mesh).
 
+    **What drives a remesh.** ``spec.criterion`` when one is given, evaluated on the live state and the
+    current mesh at every remesh: a ranking criterion marks cells (isotropic) or supplies the field whose
+    Hessian is the metric (anisotropic); a ``jno.le``/``jno.ge`` **condition** is a trigger, rebuilding the
+    mesh only when some cell breaks it (``adapt_history`` records ``remeshed: False`` for the rounds that
+    held). Without a criterion, the recovery estimate / Hessian of ``spec.metric_field``. Both paths hold
+    the vertex budget -- ``spec.max_dofs``, else the initial count: the anisotropic metric is normalised to
+    it, and the isotropic marked size field is scaled to it (:func:`_hold_vertex_budget`), so the wake
+    coarsens instead of the mesh ratcheting up by ``refine_factor`` each round.
+
     **Fields**: one or several coupled native-Lagrange fields — scalar or **vector**, **P1 or higher
     order (P2)**, and **mixed spaces** (e.g. Taylor-Hood P2 velocity + P1 pressure). State is carried
     across each remesh by a basis-aware, value-shape-aware transfer (:func:`_eval_fe_fields_at_points`);
@@ -4203,6 +4286,21 @@ def run_adaptive_transient(
     n_steps = len(ts) - 1
     every = max(1, int(spec.every))
 
+    # A criterion is read on this path too: it used to be ignored here, silently, so a phase-field
+    # `criterion=phi*(1-phi)` refined on the recovery estimate of `metric_field` instead of on the interface.
+    if isinstance(_resolve_criterion(spec.criterion, d), Constraint) and float(spec.theta) != 0.5:
+        raise ValueError(
+            f"adapt(criterion=jno.le(...)/jno.ge(...), theta={spec.theta}): a constraint marks every cell "
+            "that breaks it, so there is no bulk fraction to choose and `theta` would do nothing. Drop "
+            "`theta`, or pass a plain expression if you want Dorfler marking."
+        )
+    if spec.criterion is not None and is_cx:
+        raise NotImplementedError(
+            "adapt(criterion=...) on a complex transient is not wired: the criterion is assembled against the "
+            "real stacked [Re; Im] state, whose halves it cannot tell apart. Drop criterion= to remesh on the "
+            "modulus of `metric_field`."
+        )
+
     # Transient budget: a CONSTANT target complexity + a FIXED edge-size window (from the initial mesh), so
     # each remesh REDISTRIBUTES ~the same number of DOFs to follow the moving feature — the mesh tracks it
     # and coarsens the wake, instead of ratcheting up by refine_factor every remesh like the steady loop
@@ -4248,22 +4346,56 @@ def run_adaptive_transient(
         if i >= n_steps:
             break
 
-        # remesh from the metric-driving field (fixed budget above), then carry every field's block over
-        if is_cx:  # the modulus drives the metric — refining on Re alone would miss a rotating phase
-            _re = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)
-            _im = _scalar_vertex_metric(state, tlayout, mf + n_fields, cur_nverts)
-            u_v = np.sqrt(_re**2 + _im**2)
-        else:
-            u_v = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
+        # Remesh (at the fixed budget above), then carry every field's block over. A criterion, when given,
+        # says where to refine -- evaluated on the LIVE state and the current mesh (a callable criterion is
+        # rebuilt against it). A CONDITION criterion is a trigger: the mesh is rebuilt only when some cell
+        # breaks it, and a march on which it always holds never remeshes at all.
+        crit = _resolve_criterion(spec.criterion, d) if spec.criterion is not None else None
+        is_condition = isinstance(crit, Constraint)
+        _full = np.asarray(state)
+        marked = None
+        if is_condition:
+            marked = np.flatnonzero(_criterion_margin(cur, crit, _full, mf) > 0.0).astype(np.int64)
+            if marked.size == 0:
+                history.append(
+                    {"t": float(ts[i]), "n_dofs": int(tlayout["offsets"][-1]), "fields": n_fields, "remeshed": False}
+                )
+                continue
         old_pts, old_cells = cur_mesh
         if spec.anisotropic:
+            if crit is not None and not is_condition:
+                if _criterion_is_geometric(crit):
+                    raise NotImplementedError(
+                        "adapt(criterion=<per-cell geometry quantity>, anisotropic=True): a per-cell quantity has "
+                        "no nodal field to build a Hessian metric from. Use the isotropic path "
+                        "(anisotropic=False), or state it as a condition (jno.le/jno.ge) to trigger remeshes."
+                    )
+                # the criterion's own curvature drives the metric: an interface indicator `1 - phi^2` is a
+                # ridge, and its Hessian stretches the elements along the interface and packs them across it
+                u_v = _criterion_nodal(cur, crit, _full, mf)[:cur_nverts]
+            elif is_cx:  # the modulus drives the metric — refining on Re alone would miss a rotating phase
+                _re = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)
+                _im = _scalar_vertex_metric(state, tlayout, mf + n_fields, cur_nverts)
+                u_v = np.sqrt(_re**2 + _im**2)
+            else:
+                u_v = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
             metric = hessian_metric(d, u_v, target_complexity=target, hmin=hmin, hmax=hmax)
             remesh_with_mmg(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
         else:
-            eta, _est = zz_error_indicators(d, u_v)
-            remesh_with_mmg(
-                d, size_field_from_marks(d, dorfler_mark(eta, spec.theta), refine_factor=spec.refine_factor), copy=False
-            )
+            if marked is None:
+                if crit is not None:
+                    eta, _est = _criterion_indicators(cur, crit, _full, mf)
+                elif is_cx:
+                    _re = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)
+                    _im = _scalar_vertex_metric(state, tlayout, mf + n_fields, cur_nverts)
+                    eta, _est = zz_error_indicators(d, np.sqrt(_re**2 + _im**2))
+                else:
+                    eta, _est = zz_error_indicators(d, _scalar_vertex_metric(state, tlayout, mf, cur_nverts))
+                marked = dorfler_mark(eta, spec.theta)
+            # Refine the marked cells by refine_factor RELATIVE to the rest, then scale the whole field to
+            # the budget -- so the wake coarsens as the feature moves on, instead of the mesh ratcheting up.
+            size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
+            remesh_with_mmg(d, _hold_vertex_budget(d, size, target=target, hmin=hmin, hmax=hmax), copy=False)
         for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):  # flux tags re-derive on the new facets
             d.tag(_name, _pred)
         # Drop the cached p.pin() gauge nodes so `_lower_gauge_pin` re-creates the single-vertex pin region
@@ -4292,7 +4424,7 @@ def run_adaptive_transient(
         )
         state = jnp.concatenate([v.reshape(-1) for v in vals])
         off, layout, tlayout, cur_nverts = new_layout["offsets"], new_layout, new_tlayout, new_n
-        history.append({"t": float(ts[i]), "n_dofs": int(tlayout["offsets"][-1]), "fields": n_fields})
+        history.append({"t": float(ts[i]), "n_dofs": int(tlayout["offsets"][-1]), "fields": n_fields, "remeshed": True})
 
     fem.__dict__.update(cur.__dict__)  # rebind to the final adapted mesh (matches the steady driver)
     fem.adapt_history = history
