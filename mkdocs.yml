@@ -183,6 +183,7 @@ nav:
       - "Cavity to Re=5000 (continuation)": tutorials/08-fem-and-varpinns/cavity-high-reynolds.md
       - "Equal-Order Flow in 3-D": tutorials/08-fem-and-varpinns/cavity-3d-equal-order.md
       - "Vortex Shedding (DFG 2D-2)": tutorials/08-fem-and-varpinns/vortex-shedding-dfg-2d2.md
+      - "Droplet Merger (Cahn–Hilliard–Navier–Stokes)": tutorials/08-fem-and-varpinns/droplet-merge-chns-2d.md
       - "Stokes 3D (Duct Past a Sphere)": tutorials/08-fem-and-varpinns/stokes-3d-duct-sphere.md
       - "LES Subgrid Models (3-D)": tutorials/08-fem-and-varpinns/les-subgrid-3d.md
       - "Laser Melt Pool (thermo-mechanical)": tutorials/08-fem-and-varpinns/melt-pool-laser.md
