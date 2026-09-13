@@ -290,14 +290,16 @@ class SemidiscreteTimeBlock:
             # coefficient c(y⁺) cannot be a fixed matrix), so the step residual is
             #     G(y⁺) = mass_residual(y⁺; u_prev=y)/dt + R(y⁺)
             # Newton on G is exact (both matrix-free — jax linearizes through c(y⁺) and (y⁺−y) — and
-            # sparse-direct, which adds mass_residual_jac(y⁺)/dt to R's Jacobian). Backward Euler only.
+            # sparse-direct, which adds mass_residual_jac(y⁺)/dt to R's Jacobian). Every step is a θ=1 step:
+            # backward Euler takes it from u^n over dt, and BDF2 (`jno.solve.bdf2`) from the shifted state
+            # u* = (4u^n - u^{n-1})/3 over 2dt/3, which lands on BDF2's own non-conservative mass action.
             if self.mass_residual is not None:
                 if abs(thn - 1.0) > 1e-12:
                     raise ValueError(
-                        "jno.fem: a state-dependent (nonlinear) transient mass `c(u)·u_t` supports only "
-                        f"backward Euler (theta=1), not theta={thn:g}. A θ≠1 half-step needs the mass at the "
-                        "half-state, which is ill-defined for a coefficient that depends on the unknown. "
-                        "Drop `jno.solve.theta(...)` (use the default) for a nonlinear mass."
+                        "jno.fem: a state-dependent (nonlinear) transient mass `c(u)·u_t` is marched by backward "
+                        f"Euler or BDF2, not by a theta-step with theta={thn:g}. A θ≠1 half-step needs the mass at "
+                        "the half-state, which is ill-defined for a coefficient that depends on the unknown. "
+                        "Drop `jno.solve.theta(...)` (use the default), or use `jno.solve.bdf2()` for second order."
                     )
                 # Deliver the previous state y as each prev-field's nodal slice on the load-path channel.
                 # A vector field's DOFs are node-major interleaved (node·vec + comp), so reshape its slice to

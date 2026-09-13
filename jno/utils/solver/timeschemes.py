@@ -164,12 +164,14 @@ class _BDF2Scheme(_TimeScheme):
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
         md = block.metadata or {}
-        if getattr(block, "mass_residual", None) is not None:
-            raise NotImplementedError(
-                "jno.solve.bdf2(): a state-dependent (nonlinear) transient mass `c(u)*u_t` is backward "
-                "Euler only -- its mass action is assembled as a residual against ONE previous state, so "
-                "there is nowhere for the second BDF2 level to enter. Use the default theta scheme."
-            )
+        # A STATE-DEPENDENT mass `c(u)*u_t` needs nothing extra here. Its mass action is assembled as
+        # `c(u)(u - u_prev)/h` with `u_prev` the step's own starting state (see `SemidiscreteTimeBlock.step`),
+        # and the reduction below starts each step from `u* = (4u^n - u^{n-1})/3` over `h = 2dt/3` -- so it
+        # lands on exactly `c(u^{n+1})(3u^{n+1} - 4u^n + u^{n-1})/(2dt)`: BDF2 in its NON-conservative form,
+        # second order in time (measured, `tests/test_fem_bdf2_state_dependent_mass.py`). It used to be
+        # refused on the reading that one previous state left nowhere for the second level to enter; the
+        # shifted start state is where it enters. What this is not: the conservative `(3H(u^{n+1}) - ...)`
+        # form for an enthalpy-type mass `H(u)_t`, which would need `H` itself rather than `c = H'`.
         if md.get("second_order"):
             raise NotImplementedError(
                 "jno.solve.bdf2(): a second-order-in-time (u_tt) block is assembled with theta=1/2 "

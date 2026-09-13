@@ -977,9 +977,11 @@ initial amplitude with the sign flipped; BDF2 reaches `-0.023`. On a Navier–St
 where the pressure has no time derivative at all, that ringing is exactly what you do not want.
 
 The first BDF2 step is plain backward Euler — a multistep method has no second level to start from.
-Refused loudly rather than mis-integrated: a state-dependent mass `c(u)·u_t`, a second-order-in-time
-(`u_tt`) block (assembled at θ=½ *so that* it is not damped), and `.adaptive()` (step doubling sizes
-a one-step method).
+A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
+`c(uⁿ⁺¹)(3uⁿ⁺¹ − 4uⁿ + uⁿ⁻¹)/(2Δt)`, second order in time (measured on a manufactured `c(u) = 1 + u²`);
+it is not the conservative form an enthalpy mass `H(u)_t` would want. Refused loudly rather than
+mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not damped),
+and `.adaptive()` (step doubling sizes a one-step method).
 
  The slots configure the *per-step* solves of the default theta-method integrator:
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is

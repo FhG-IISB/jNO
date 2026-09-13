@@ -1482,10 +1482,14 @@ def bdf2():
     has no second level to start from); its ``O(dt^2)`` local error is what the second-order global
     rate needs.
 
-    Refused, loudly, rather than silently mis-integrated: a **state-dependent mass** ``c(u)*u_t``
-    (backward Euler only) and a **second-order-in-time** (``u_tt``) block (assembled at ``theta=1/2``
-    so an undamped wave is not damped -- and an L-stable scheme would damp it). ``.adaptive()`` is
-    also refused: the controller sizes a one-step method by step doubling.
+    A **state-dependent mass** ``c(u)*u_t`` (variable density, an apparent heat capacity) is marched
+    in BDF2's non-conservative form ``c(u^{n+1})(3u^{n+1} - 4u^n + u^{n-1})/(2 dt)``, second order in
+    time (measured on a manufactured ``c(u) = 1 + u^2``). It is not the conservative form an enthalpy
+    mass ``H(u)_t`` would want, which needs ``H`` itself rather than ``c = H'``.
+
+    Refused, loudly, rather than silently mis-integrated: a **second-order-in-time** (``u_tt``) block
+    (assembled at ``theta=1/2`` so an undamped wave is not damped -- and an L-stable scheme would damp
+    it). ``.adaptive()`` is also refused: the controller sizes a one-step method by step doubling.
 
     Reference: Curtiss & Hirschfelder, *PNAS* **38** (1952) 235; Hairer & Wanner, *Solving Ordinary
     Differential Equations II*, 2nd ed., Sec. V.1."""
