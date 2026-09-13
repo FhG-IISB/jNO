@@ -1473,7 +1473,7 @@ class TraceEvaluator:
                     raise NotImplementedError(
                         f"Boundary TestFunction gradients requested on region '{region_id}', "
                         "but 'face_shape_grads' is not stored in fem_context['surface_data']'. "
-                        "Add boundary shape gradients in domain.init_fem() first."
+                        "Add boundary shape gradients in domain.init_fem_native() first."
                     )
 
                 dN_face = surf_data["face_shape_grads"]
