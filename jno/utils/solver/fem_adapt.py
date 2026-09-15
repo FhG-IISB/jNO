@@ -1717,16 +1717,19 @@ def _field_vec(fem: Any, field: int = 0) -> tuple:
     return n_nodes, max(1, (hi - lo) // max(n_nodes, 1))
 
 
-def _criterion_nodal(fem: Any, criterion: Any, u: np.ndarray, field: int = 0, stride: int = 1) -> np.ndarray:
+def _criterion_nodal(
+    fem: Any, criterion: Any, u: np.ndarray, field: int = 0, stride: int = 1, t: float = 0.0
+) -> np.ndarray:
     """A field criterion as a nodal array scaled like ``g`` itself, not like ``g x volume``.
 
     Also the quantity a NODE-based adaptivity wants unreduced: h-refinement collapses it to cells to
     decide which to split, `jno.solve.enrich` marks on it directly to decide which nodes carry covers.
     ``stride`` skips the padded slots of an enriched field, whose DOF nodes are the mesh nodes repeated.
+    ``t`` is the time the criterion is read at: the remesh time on a transient march, 0 on a steady one.
     """
     weak, mass_term = _criterion_weak_terms(fem, criterion, field)
-    num = np.asarray(fem.eval(weak, u)).reshape(-1)
-    mass = np.asarray(fem.eval(mass_term, u)).reshape(-1)
+    num = np.asarray(fem._eval_at(weak, u, t)).reshape(-1)
+    mass = np.asarray(fem._eval_at(mass_term, u, t)).reshape(-1)
     # The criterion is tested against FIELD `field`, so its contributions land on THAT block's DOFs.
     # Reading the first `n_vert` entries assumes the tested field starts at 0 -- true only for field 0.
     # With `metric_field=1` this read the untouched velocity rows: every indicator came back exactly
@@ -1744,7 +1747,7 @@ def _criterion_nodal(fem: Any, criterion: Any, u: np.ndarray, field: int = 0, st
     return g[::stride] if stride > 1 else g
 
 
-def _criterion_margin(fem: Any, constraint: Any, u: np.ndarray, field: int = 0) -> np.ndarray:
+def _criterion_margin(fem: Any, constraint: Any, u: np.ndarray, field: int = 0, t: float = 0.0) -> np.ndarray:
     """Per-cell **violation margin** of a ``jno.le``/``jno.ge`` criterion: ``> 0`` is a breach.
 
     ``Constraint`` normalises its residual to the ``g <= 0`` convention whichever sense it was written
@@ -1761,10 +1764,10 @@ def _criterion_margin(fem: Any, constraint: Any, u: np.ndarray, field: int = 0) 
 
     dom = fem.domain
     cells = np.asarray(dom.mesh.cells_dict[mesh_cell_type(dom, int(dom.dimension))])
-    return _criterion_nodal(fem, residual, u, field)[cells].max(axis=1)
+    return _criterion_nodal(fem, residual, u, field, t=t)[cells].max(axis=1)
 
 
-def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 0) -> tuple:
+def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 0, t: float = 0.0) -> tuple:
     """Per-cell indicators from a traced criterion, in the shape :func:`zz_error_indicators` returns.
 
     ``FEM.eval`` gives ``int g phi_i``; dividing by the lumped mass ``int phi_i`` turns that into a
@@ -1777,7 +1780,7 @@ def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 
         # to divide by. Marking then ranks cells by their own distortion.
         eta = np.abs(_criterion_percell(fem, criterion))
         return eta, float(np.sqrt(np.sum(eta**2)))
-    g = _criterion_nodal(fem, criterion, u, field)
+    g = _criterion_nodal(fem, criterion, u, field, t=t)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
     eta = np.abs(_integrate_nodal_per_cell(fem.domain, g[:n_vert]))
     return eta, float(np.sqrt(np.sum(eta**2)))
@@ -4198,7 +4201,7 @@ def run_adaptive_transient(
     (:func:`transfer_solution`), so the mesh **tracks a moving feature**. Returns an
     :class:`AdaptiveTrajectory` (each frame on its own adapted mesh).
 
-    **What drives a remesh.** ``spec.criterion`` when one is given, evaluated on the live state and the
+    **What drives a remesh.** ``spec.criterion`` when one is given, evaluated at the remesh time on the live state and the
     current mesh at every remesh: a ranking criterion marks cells (isotropic) or supplies the field whose
     Hessian is the metric (anisotropic); a ``jno.le``/``jno.ge`` **condition** is a trigger, rebuilding the
     mesh only when some cell breaks it (``adapt_history`` records ``remeshed: False`` for the rounds that
@@ -4354,9 +4357,12 @@ def run_adaptive_transient(
         crit = _resolve_criterion(spec.criterion, d) if spec.criterion is not None else None
         is_condition = isinstance(crit, Constraint)
         _full = np.asarray(state)
+        # ...and at the time the state is AT. FEM.eval assembles at t = 0, so a criterion that reads the
+        # time (a moving source, a switch-on) was otherwise marked where things stood at the start.
+        _t_now = float(ts[i])
         marked = None
         if is_condition:
-            marked = np.flatnonzero(_criterion_margin(cur, crit, _full, mf) > 0.0).astype(np.int64)
+            marked = np.flatnonzero(_criterion_margin(cur, crit, _full, mf, t=_t_now) > 0.0).astype(np.int64)
             if marked.size == 0:
                 history.append(
                     {"t": float(ts[i]), "n_dofs": int(tlayout["offsets"][-1]), "fields": n_fields, "remeshed": False}
@@ -4373,7 +4379,7 @@ def run_adaptive_transient(
                     )
                 # the criterion's own curvature drives the metric: an interface indicator `1 - phi^2` is a
                 # ridge, and its Hessian stretches the elements along the interface and packs them across it
-                u_v = _criterion_nodal(cur, crit, _full, mf)[:cur_nverts]
+                u_v = _criterion_nodal(cur, crit, _full, mf, t=_t_now)[:cur_nverts]
             elif is_cx:  # the modulus drives the metric — refining on Re alone would miss a rotating phase
                 _re = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)
                 _im = _scalar_vertex_metric(state, tlayout, mf + n_fields, cur_nverts)
@@ -4385,7 +4391,7 @@ def run_adaptive_transient(
         else:
             if marked is None:
                 if crit is not None:
-                    eta, _est = _criterion_indicators(cur, crit, _full, mf)
+                    eta, _est = _criterion_indicators(cur, crit, _full, mf, t=_t_now)
                 elif is_cx:
                     _re = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)
                     _im = _scalar_vertex_metric(state, tlayout, mf + n_fields, cur_nverts)

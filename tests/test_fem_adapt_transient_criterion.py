@@ -10,6 +10,8 @@ Oracles:
     symmetry of the mesh -- the corner it names ends up far denser than the mirrored one;
   * a field criterion on an advected hump must follow the hump's position at the time of the remesh (the
     LIVE state), not its initial one;
+  * a criterion that reads ``t`` is read at the remesh time: a marker switched on only around that time
+    gives exactly the mesh the always-on marker gives;
   * an isotropic remesh with ``max_dofs`` holds the vertex count, instead of ratcheting it up;
   * a condition criterion (``jno.le``) that already holds remeshes nothing, and ``theta`` beside a condition
     is refused, as on the steady loop.
@@ -82,6 +84,45 @@ def test_fem_eval_assembles_on_a_transient_problem():
     fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(x0, y0) - 1.0])
     load = np.asarray(fem.eval(1.0 * vi, np.zeros(fem.dofs)))
     assert abs(load.sum() - 1.0) < 1e-12, f"the load vector of 1·v sums to {load.sum():.15f}; the area is 1"
+
+
+def _timed_heat():
+    """A 6-step march that remeshes ONCE (every=3), at t = 0.03. Returns the time variable as well."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.06, 7))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    x0, y0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ic = u(x0, y0) - jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [x0, y0])
+    return jno.fem([ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, ic]), vi, xi, yi, ti
+
+
+def test_fem_eval_at_reads_the_time():
+    """`FEM.eval` assembles at t = 0; the adaptive driver reads a criterion through `_eval_at` at the remesh
+    time. Oracle: the hats sum to one, so the load vector of `t·v` sums to t times the area (= t)."""
+    fem, vi, _, _, ti = _timed_heat()
+    z = np.zeros(fem.dofs)
+    assert abs(np.asarray(fem.eval(ti * vi, z)).sum()) < 1e-14, "public fem.eval is documented at t = 0"
+    assert abs(np.asarray(fem._eval_at(ti * vi, z, 0.5)).sum() - 0.5) < 1e-12
+
+
+@pytest.mark.parametrize("anisotropic", [False, True])
+def test_a_transient_criterion_is_read_at_the_remesh_time(anisotropic):
+    """The criterion used to be assembled at t = 0 at every remesh, whatever the time of the state. This
+    march remeshes once, at t = 0.03: a left-half marker switched on ONLY in a window around 0.03 must give
+    exactly the mesh the always-on marker gives. Read at t = 0 -- or a step early or late -- it is zero
+    everywhere and the mesh differs."""
+    spec = dict(anisotropic=anisotropic, every=3, max_dofs=900)
+    fem0, _, xi, yi, _ = _timed_heat()
+    left = jno.fn(lambda a, b: jnp.where(a < 0.5, 1.0, 0.0), [xi, yi])
+    always = fem0.solve(adapt=jno.solve.remesh(criterion=left, **spec))
+    fem1, _, xi, yi, ti = _timed_heat()
+    window = jno.fn(lambda a, b, s: jnp.where((a < 0.5) & (jnp.abs(s - 0.03) < 0.005), 1.0, 0.0), [xi, yi, ti])
+    switched = fem1.solve(adapt=jno.solve.remesh(criterion=window, **spec))
+    assert [h["t"] for h in fem1.adapt_history] == pytest.approx([0.03])
+    P0, P1 = np.asarray(always.meshes[-1][0]), np.asarray(switched.meshes[-1][0])
+    assert P0.shape == P1.shape and np.allclose(P0, P1), "the windowed criterion was not read at the remesh time"
 
 
 def test_a_transient_criterion_steers_the_remesh():

@@ -1070,8 +1070,8 @@ def remesh(
         fem.solve(adapt=jno.solve.remesh(anisotropic=True, max_dofs=6000, every=4))
         fem.solve(adapt=jno.solve.remesh(criterion=1.0 - phi * phi, every=4))      # follow an interface
 
-    On a march a ``criterion=`` is evaluated on the live state at every remesh. A **condition** criterion
-    is a trigger there: the mesh is rebuilt only when some cell breaks it, so
+    On a march a ``criterion=`` is evaluated on the live state, at the remesh time, at every remesh.
+    A **condition** criterion is a trigger there: the mesh is rebuilt only when some cell breaks it, so
     ``remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1)`` remeshes exactly when the mesh
     degrades, and never while the condition holds.
 

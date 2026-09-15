@@ -3092,7 +3092,16 @@ class FEM:
         ``term`` is any weak term built from this domain's symbols (it carries the test function); it does
         **not** have to be one of the terms this FEM was built from, so a diagnostic form — a sub-term, a
         different stress measure — can be assembled against an existing solution. A term with no test
-        function is a field readout rather than an assembly and is refused by name.
+        function is a field readout rather than an assembly and is refused by name. On a transient problem
+        the term is assembled at ``t = 0``.
+        """
+        return self._eval_at(term, u, 0.0, args=args)
+
+    def _eval_at(self, term, u, t_eval, *, args=None):
+        """:meth:`eval` at time ``t_eval``. A transient remesh criterion needs it: one that reads the time -- a
+        moving heat source, a switch-on -- would otherwise be marked as it stood at ``t = 0`` at every
+        remesh. Private because the adaptive driver is its only caller; ``eval`` is this at ``t = 0``.
+        Not named ``t``: the term loop below binds ``t``, and the time would silently become a term.
         """
         from .utils.solver.solver_helper import contains_node_type
 
@@ -3130,7 +3139,7 @@ class FEM:
                     "the quantity as a volume term."
                 )
             (bares.append(bare) if support == "volume" else b_bares.setdefault(region, []).append(bare))
-        return _as_flat(factory(bares, b_bares or None)(jnp.asarray(u).reshape(-1), 0.0, args))
+        return _as_flat(factory(bares, b_bares or None)(jnp.asarray(u).reshape(-1), t_eval, args))
 
     def region_dofs(self, region, *, field=0, component=None):
         """Global DOF indices of a tagged region — the companion to :meth:`eval`.

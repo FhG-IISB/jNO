@@ -185,8 +185,9 @@ how much, so marking would take a fraction of them and quietly leave the rest.
 transient problem it is checked on the current mesh every `k` steps, and the mesh is rebuilt only when
 some cell breaks it; `fem.adapt_history` records `remeshed: False` for the rounds it held, so a
 condition that never breaks never remeshes. A ranking criterion (`1 - phi**2`, `|grad u|`) is evaluated
-on the live state at each remesh, and the vertex budget (`max_dofs`, else the starting count) is held on
-both the isotropic and the anisotropic path.
+on the live state at each remesh -- and at that remesh's time, so it may read `t` (a moving source) -- and
+the vertex budget (`max_dofs`, else the starting count) is held on both the isotropic and the anisotropic
+path.
 
 Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
 bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
