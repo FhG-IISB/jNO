@@ -4778,12 +4778,22 @@ def mesh_velocity(term):
     Returns ``None`` for an ordinary term. A term carrying a :class:`TestFunction` is never a geometry term
     (that is a weak form whose *integrand* happens to mention a coordinate derivative), which keeps this from
     stealing constraints from the weak-form classifier.
+
+    Refused by name rather than integrated as something else: a term that also carries the unknown
+    (``u(xb, yb) - yb.d(tb)`` -- taken as mesh motion, its Dirichlet condition vanished), the time
+    derivative of a symbol derived FROM the mesh (``nx.d(tb)``, ``cell_size.d(ti)``), and a second time
+    derivative (``xi.d(ti).d(ti)`` -- the walk found the inner derivative and dropped the outer one).
     """
     node = term._expr if hasattr(term, "_expr") else term
     if not isinstance(node, Placeholder):
         return None
     seen: set = set()
     found = []
+    trial = []
+    second = []
+
+    def temporal(jac):
+        return [v for v in jac.variables if getattr(v, "axis", None) == "temporal"]
 
     def visit(n):
         if not isinstance(n, Placeholder) or id(n) in seen:
@@ -4792,10 +4802,17 @@ def mesh_velocity(term):
         if isinstance(n, TestFunction):
             found.append(None)  # a weak form -- poison the whole term, it is not a geometry equation
             return
+        if isinstance(n, TrialFunction):
+            trial.append(n)
+        if isinstance(n, Jacobian) and temporal(n):
+            inner = n.target
+            if len(temporal(n)) > 1 or (
+                isinstance(inner, Jacobian) and temporal(inner) and getattr(inner.target, "axis", None) == "spatial"
+            ):
+                second.append(n)
         if isinstance(n, Jacobian) and getattr(n.target, "axis", None) == "spatial":
-            for v in n.variables:
-                if getattr(v, "axis", None) == "temporal":
-                    found.append((n.target, v, n))
+            for v in temporal(n):
+                found.append((n.target, v, n))
         for kind, _attr, val in _iter_placeholder_children(n):
             for c in val if kind == "list" else (val,):
                 visit(c)
@@ -4803,6 +4820,27 @@ def mesh_velocity(term):
     visit(node)
     if not found or any(f is None for f in found):
         return None
+    if second:
+        raise ValueError(
+            "jno.fem: a geometry term takes the second time derivative of a coordinate. The mesh driver "
+            "integrates a FIRST-order law x' = v only; a second-order motion needs its velocity as a solved "
+            "field that the first-order law reads."
+        )
+    for coord, _t, _jac in found:
+        tg = getattr(coord, "tag", None)
+        if isinstance(tg, str) and (tg in ("cell_size", "cell_metric") or tg.startswith(("n_", "gap_", "slide_"))):
+            raise ValueError(
+                f"jno.fem: a geometry term differentiates {tg!r} in time, but that is not a mesh coordinate "
+                "-- it is derived FROM the mesh (an outward normal, the element size, a contact gap) and "
+                "follows the coordinates by itself. Move the coordinates: `yb.d(tb) - v`."
+            )
+    if trial:
+        raise ValueError(
+            "jno.fem: this term both differentiates a mesh coordinate in time and carries the unknown "
+            f"{getattr(trial[0], 'name', 'u')!r}, so it is neither a geometry law nor a field equation the "
+            "assembler can read. State the mesh motion as its own term (`yb.d(tb) - v`); a field equation "
+            "reading the mesh velocity is not supported yet."
+        )
     if len(found) > 1:
         names = ", ".join(str(getattr(f[0], "tag", f[0])) for f in found)
         raise ValueError(
