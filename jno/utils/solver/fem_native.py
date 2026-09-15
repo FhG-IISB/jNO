@@ -1968,9 +1968,13 @@ def assemble_fem_native(
     # out of the compile-time frozen gather, keep only its per-cell connectivity, and let the load-step
     # driver deliver each step's nodal slice through ``args["__loadpath__"]`` (like ``__history__``).
     from ...trace import LoadPathField as _LoadPathField
+    from ...trace import MeshVelocityField as _MeshVelocityField
 
     _path_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _LoadPathField)}
-    _frozen_nodes = {fid: n for fid, n in _frozen_nodes.items() if not isinstance(n, _LoadPathField)}
+    # The MESH velocity (`coord.d(t)` inside a weak form, rewritten by jno.fem) is likewise per-step data:
+    # the moving-mesh driver delivers it each step. Split out here, registered below.
+    _mv_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _MeshVelocityField)}
+    _frozen_nodes = {fid: n for fid, n in _frozen_nodes.items() if not isinstance(n, (_LoadPathField, _MeshVelocityField))}
 
     # Per-cell gather of each frozen field's nodal slice (n_cell, n_local, 1) -- a compile-time constant
     # (no args threading, no jacfwd tangent), gathered on the frozen field's own FE space via the same
@@ -2019,6 +2023,28 @@ def assemble_fem_native(
             field_index[_fnode.field_key] = _p1_idx  # resolve the load-path field's basis to the P1 field
             _path_conn[_fid] = cells_f_j[_p1_idx]  # scalar P1 vertex connectivity (n_cell, n_local)
             path_specs[_fid] = {"name": _fnode.name, "frames": jnp.asarray(_fnode.path_frames), "n_steps": _fnode.n_steps}
+
+    # The mesh velocity w lives on the mesh VERTICES (the driver delivers (X_n - X_c)/dt as (n_verts, dim)),
+    # so it borrows a P1 Lagrange field's vertex basis and connectivity, as a load-path field does. The
+    # compile-time zero is what the eager build (args=None, before any motion) sees; the driver's per-step
+    # slice overrides it through `_add_loadpath_fields`. jno.fem only creates the node when the problem has
+    # a geometry term, and a geometry problem solves only through the moving-mesh driver.
+    if _mv_nodes:
+        _p1_mv = next(
+            (i for i, f in enumerate(fields) if int(f["order"]) == 1 and str(f.get("space", "Lagrange")) == "Lagrange"),
+            None,
+        )
+        if _p1_mv is None:
+            raise NotImplementedError(
+                "jno.fem: a weak form reads the mesh velocity (`coord.d(t)`), which lives on the mesh vertices "
+                "and borrows the vertex basis of a P1 Lagrange field -- but this problem has none. Give one "
+                "field order=1 (a P1 pressure of a Taylor-Hood pair qualifies)."
+            )
+        for _fid, _fnode in _mv_nodes.items():
+            field_index[_fnode.field_key] = _p1_mv
+            _path_conn[_fid] = cells_f_j[_p1_mv]
+            _mvc = cells_f_j[_p1_mv]
+            _frozen_gathered[_fid] = jnp.zeros((_mvc.shape[0], _mvc.shape[1], _fnode.num_components))
 
     if path_specs and not (_is_march and history_specs):
         # A load-path field's per-step slice is delivered by the load-step driver; without a march (a
@@ -2504,6 +2530,9 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for the parent cell
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        # Per-step fields (load path, previous state, mesh velocity) on the parent cell, as in the volume.
+        # Without this a surface term reading one raised: the channel reached volume kernels only.
+        _add_loadpath_fields(loc, c, args)
         if surface_history_specs and args is not None:
             # This face's per-quad-point surface-history slice (n_quad_surf, depth, *shape), gathered from
             # the buffers on ``args`` by the global boundary-face id -- a per-face constant, so ``jacfwd``
@@ -2561,6 +2590,7 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        _add_loadpath_fields(loc, c, args)  # per-step field slices, as in `_surf_elem_res`
         if surface_history_specs and args is not None:
             sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
             if sbuf:

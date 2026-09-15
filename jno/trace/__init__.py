@@ -4453,6 +4453,31 @@ class PrevStateField(FrozenField):
         return f"PrevStateField(source_key={self.field_key})"
 
 
+class MeshVelocityField(FrozenField):
+    """The MESH velocity ``w`` -- what ``coord.d(t)`` means inside a weak form on a moving mesh.
+
+    Synthesized by ``jno.fem`` (never user-constructed): each ``xi.d(ti)`` in a test-carrying term becomes
+    component ``xi.dim[0]`` of this one vector field. It lives on the mesh vertices -- the assembler borrows
+    a P1 Lagrange field's vertex basis for it -- and its per-step values ``(X_{n+1} - X_n)/dt`` arrive on
+    ``args["__loadpath__"]`` from the moving-mesh driver, as :class:`PrevStateField`'s do. Being a
+    :class:`FrozenField` it reads out its value and its gradient in the kernel and stays invisible to
+    unknown-detection; being no Variable, retagging and region detection never touch it.
+    """
+
+    def __init__(self, dim):
+        import types
+
+        import jax.numpy as _jnp
+
+        dim = int(dim)
+        src = types.SimpleNamespace(name="w", value_shape=(dim,), order=1, space="Lagrange", field_key=_next_op_id())
+        super().__init__(src, _jnp.zeros((1, dim)))
+        self.name = "mesh_velocity"
+
+    def __repr__(self):
+        return f"MeshVelocityField(dim={self.value_shape[0]})"
+
+
 def load_path_fields_in(expr):
     """The distinct :class:`LoadPathField` nodes in ``expr`` (by identity, first-seen order)."""
     return [f for f in frozen_fields_in(expr) if isinstance(f, LoadPathField)]

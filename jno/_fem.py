@@ -995,6 +995,95 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
             v.tag = target
 
 
+def _coordinate_rates(node: Any) -> List[Any]:
+    """Every ``coord.d(t)`` in a tree: a Jacobian of a spatial coordinate Variable with respect to time."""
+    from .trace import Jacobian
+
+    return [
+        n
+        for n in _walk(node)
+        if isinstance(n, Jacobian)
+        and isinstance(n.target, Variable)
+        and getattr(n.target, "axis", None) == "spatial"
+        and any(getattr(v, "axis", None) == "temporal" for v in n.variables)
+    ]
+
+
+def _rewrite_mesh_velocity(constraints: List[Any], geometry: List[Any], domain: Any) -> Tuple[List[Any], Any]:
+    """Give ``coord.d(t)`` inside a weak form its meaning: the MESH velocity ``w``.
+
+    On a moving mesh a nodal value rides with its vertex, so its time derivative is the ALE derivative
+    ``∂u/∂t|_X = ∂u/∂t|_x + w·∇u``. A transport equation written on the moving mesh therefore carries the
+    mesh velocity -- ``u_t + (c - w)·∇u = ...`` -- and ``w`` is written as what it is, the rate of a
+    coordinate: ``xi.d(ti)``, ``yi.d(ti)``. Every such rate in a test-carrying term becomes a component of
+    ONE internal :class:`jno.trace.MeshVelocityField`, whose per-step vertex values ``(X_{n+1} - X_n)/dt``
+    the moving-mesh driver delivers: the discrete motion of every vertex, harmonically extended ones included.
+
+    Runs before any detector reads the weak forms (transient detection counts ``d/dt`` of anything; the
+    retag rewrites coordinate tags), so everything downstream sees ``w`` as known data. Refused by name: a
+    rate with no geometry term (``w`` would be identically zero), the rate of a symbol derived from the
+    mesh, a mixed or repeated derivative, and the rate of the mesh velocity itself."""
+    import copy
+
+    from .trace import Jacobian, MeshVelocityField, substitute
+
+    W = None
+    out: List[Any] = []
+    for c in constraints:
+        bare = _bare(c)
+        rates = _coordinate_rates(bare) if isinstance(bare, Placeholder) else []
+        if not rates or not _contains(c, TestFunction):
+            out.append(c)
+            continue
+        if not geometry:
+            raise ValueError(
+                "jno.fem: a weak form differentiates a coordinate in time (`xi.d(ti)`), which is the MESH "
+                "velocity -- but no term moves the mesh, so it would be identically zero. Add a geometry term "
+                "(`xb.d(tb) - v`) that states the motion, or drop the mesh-velocity term."
+            )
+        _region_and_support(c, domain)  # on the ORIGINAL term, so a rate from another region still raises
+        ids = {id(j) for j in rates}
+        for j in rates:
+            tg = getattr(j.target, "tag", None)
+            if isinstance(tg, str) and (tg in ("cell_size", "cell_metric") or tg.startswith(("n_", "gap_", "slide_"))):
+                raise ValueError(
+                    f"jno.fem: a weak form differentiates {tg!r} in time, but that is not a mesh coordinate -- "
+                    "it is derived FROM the mesh. The mesh velocity is the rate of a coordinate: `xi.d(ti)`."
+                )
+            if len(j.variables) != 1:
+                raise ValueError(
+                    "jno.fem: a weak form takes a mixed or repeated derivative of a coordinate. The mesh "
+                    "velocity is the first time derivative of a coordinate, `xi.d(ti)`, and nothing else."
+                )
+        for n in _walk(bare):
+            if (
+                isinstance(n, Jacobian)
+                and id(n) not in ids
+                and any(getattr(v, "axis", None) == "temporal" for v in n.variables)
+                and any(id(m) in ids for m in _walk(n.target))
+            ):
+                raise ValueError(
+                    "jno.fem: a weak form takes the time derivative of the mesh velocity (`xi.d(ti).d(ti)`, the "
+                    "mesh acceleration). Only the mesh velocity itself, `xi.d(ti)`, is available."
+                )
+        if W is None:
+            W = MeshVelocityField(int(domain.dimension))
+        view = W._field_view()
+        new_bare = substitute(bare, {j: _bare(view[int(j.target.dim[0])]) for j in rates})
+        if _coordinate_rates(new_bare):
+            raise NotImplementedError(
+                "jno.fem: a mesh-velocity term `xi.d(ti)` sits inside a construct the rewrite cannot reach "
+                "(a normal derivative of a view, say). Write it as a plain factor of the weak form."
+            )
+        if _is_view(c):
+            c = copy.copy(c)  # keeps the view's `_coord_vars`, which carry a bound term's region
+            c._expr = new_bare
+        else:
+            c = new_bare
+        out.append(c)
+    return out, W
+
+
 def _constant_of(node: Any) -> Optional[float]:
     """Best-effort scalar extraction from a constant/Literal node."""
     for attr in ("value", "val", "data", "constant"):
@@ -1600,6 +1689,7 @@ class FEM:
         self._constraints = None  # original constraint list; attached by fem() for the adaptive driver
         self._fem_kwargs = {}  # original fem() build options; attached by fem() for the adaptive driver
         self._geometry = []  # `coord.d(t) - v` mesh-motion terms; attached by fem()
+        self._mesh_velocity = None  # the MeshVelocityField `coord.d(t)` in a weak form became; attached by fem()
 
         self._A = self._b = None
         if mode == "linear":
@@ -5251,7 +5341,7 @@ def _fem_impl(
     _geometry, _rest = [], []
     for c in constraints:
         (_geometry if mesh_velocity(c) is not None else _rest).append(c)
-    constraints = _rest
+    constraints, _mesh_velocity_node = _rewrite_mesh_velocity(_rest, _geometry, domain)
     if rotation_bcs and not (_trial_spaces(constraints) - _NATIVE_SPACES):
         raise NotImplementedError(
             "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
@@ -5350,6 +5440,7 @@ def _fem_impl(
         fem_obj._constraints = _orig_constraints
         fem_obj._fem_kwargs = _orig_fem_kwargs
         fem_obj._geometry = list(_geometry)  # `coord.d(t) - v` terms: the mesh-motion driver reads these
+        fem_obj._mesh_velocity = _mesh_velocity_node  # `coord.d(t)` in a weak form; the driver feeds it
         # Field-key snapshots for FEM.block_index: the assembler's list is offsets-ordered (and
         # must be captured NOW — a later assembly on the same domain overwrites the attribute);
         # the constraint-walk order is the fallback for paths that don't run the native assembler.

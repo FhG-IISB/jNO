@@ -948,7 +948,8 @@ def _l2_transfer_jax(
     rather than removing it (and, not being monotone, it overshoots slightly where the pointwise route
     undershoots). Removing it entirely means not transferring at all -- holding the DOFs on the moving
     vertices (Lagrangian) and carrying the motion in an ALE ``-w·∇u`` term instead, which is a different
-    semidiscretisation, not a better transfer.
+    semidiscretisation, not a better transfer. :func:`run_mesh_motion` does exactly that when a weak form
+    reads the mesh velocity ``xi.d(ti)``.
 
     **Cost.** More location work than the pointwise route (a cell's quadrature points against a wider
     patch, rather than one moved vertex against its own ring) plus a mass solve, but the march is
@@ -5004,8 +5005,9 @@ def run_mesh_motion(
     Each step: evaluate every geometry term's velocity on the current mesh and state, scatter it into the
     vertices and axes those terms name, harmonically extend over everything they do *not* name
     (:func:`harmonic_extension`), move, re-assemble, and carry the state onto the moved mesh by
-    conservative L2 projection (:func:`_l2_transfer_jax`). Returns an :class:`AdaptiveTrajectory`, one
-    frame per moved mesh.
+    conservative L2 projection (:func:`_l2_transfer_jax`) -- or, when a weak form reads the mesh velocity
+    ``xi.d(ti)``, let the nodal values ride with their vertices (ALE, below). Returns an
+    :class:`AdaptiveTrajectory`, one frame per moved mesh.
 
     **Method / scope** (house rule: fail loud on the rest).
 
@@ -5024,11 +5026,21 @@ def run_mesh_motion(
       spatial error exactly.
 
       The term-list spelling reads like a coupled equation and this is not one — moving the mesh
-      implicitly would need the coordinates as unknowns in the monolithic system *and* the ALE
-      convective ``(c-w)·∇u`` term. The state is re-projected onto the moved mesh, which transports the
-      field under the mesh motion; that is right for a field whose material is quasi-stationary while the
-      domain deforms, and wrong when a represented material velocity differs from the mesh velocity (it
-      would double-count advection).
+      implicitly would need the coordinates as unknowns in the monolithic system.
+    - **Two ways to carry the state**, chosen by the weak form:
+
+      * *No weak form reads the mesh velocity:* the state is re-projected onto the moved mesh, which
+        transports the field under the mesh motion. Right for a field whose material is quasi-stationary
+        while the domain deforms.
+      * *A weak form reads it* (``xi.d(ti)``, ``yi.d(ti)`` -- ``jno.fem`` rewrites them into one internal
+        vertex field ``w``): ALE. The form states transport relative to the mesh, ``u_t + (c - w)·∇u``, so
+        the nodal values ride with their vertices and nothing is transferred; each step receives
+        ``w = (X_{n+1} - X_n)/dt`` for every vertex, harmonically extended ones included. This is the
+        non-conservative ALE form (mass and operator on the end configuration), backward Euler. Measured
+        (``tests/test_fem_ale_mesh_velocity.py``): a mesh translating rigidly with the material
+        reproduces the fixed-mesh diffusion march to 1.1e-15, and a Gaussian advected past a mesh
+        moving at half its speed meets its closed form to 2.0 % (5.2 % on the fixed mesh). The field
+        needs a P1 Lagrange field in the problem to borrow the vertex basis from.
     - **The transfer is diffusive**, though far less so than the pointwise re-interpolation it replaced
       (a marginally-resolved peak loses ~9 % rather than ~33 %, and refining ``dt`` now helps instead of
       hurting). See :func:`_l2_transfer_jax` for the measurements and for what would remove it entirely.
@@ -5332,6 +5344,12 @@ def run_mesh_motion(
     _on_bnd[np.unique(np.asarray(_bfac).reshape(-1))] = True
     interior_cell_j = jnp.asarray(~_on_bnd[shared_cells].any(axis=1))
     sgn0 = jnp.sign(_signed_simplex_measures_jax(X0, cells_j, dim))  # orientation baseline is the START, not the seed mesh
+    # ALE: a weak form that reads `coord.d(t)` states the transport relative to the moving mesh itself
+    # (`u_t + (c - w).grad u`), so the nodal values RIDE with their vertices -- transferring them as well
+    # would count the mesh advection twice. jno.fem rewrote those rates into this one vertex field; each
+    # step delivers it the discrete motion of every vertex, harmonically extended ones included.
+    _mv = getattr(cur, "_mesh_velocity", None)
+    _mv_fid = None if _mv is None else _mv.frozen_id
 
     def _march_step(carry, t0c):
         u_c, X_c, bad = carry
@@ -5354,31 +5372,39 @@ def run_mesh_motion(
         #    field under the motion; this IS the ALE convective term, treated semi-Lagrangian. The
         #    pointwise re-interpolation this replaces lost 27.6 % of a marginally-resolved peak over 2
         #    steps and 33.0 % over 16, i.e. it got worse as `dt` shrank. See `_l2_transfer_jax`.
-        u_t, q_esc = _l2_transfer_jax(
-            X_c,
-            X_n,
-            shared_cells,
-            dim,
-            u_c,
-            off,
-            orders=layout["orders"],
-            vecs=layout["vecs"],
-            cells_f=layout["cells_f"],
-        )
-        # An escaping quadrature point of an INTERIOR cell means the projection integrated against a
-        # clamped extension rather than the field: the same fault the vertex route reports, at the same
-        # place. A cell touching the boundary genuinely leaves the old mesh when that boundary moves
-        # outward, so it is not a fault there.
-        esc_cell = jnp.any(q_esc, axis=1) & interior_cell_j
+        #    Under ALE (`_mv_fid`) the values ride instead: the identity, exact for P1 and for P{k} on
+        #    straight simplices, whose DOFs sit where the moved vertices put them.
+        if _mv_fid is None:
+            u_t, q_esc = _l2_transfer_jax(
+                X_c,
+                X_n,
+                shared_cells,
+                dim,
+                u_c,
+                off,
+                orders=layout["orders"],
+                vecs=layout["vecs"],
+                cells_f=layout["cells_f"],
+            )
+            # An escaping quadrature point of an INTERIOR cell means the projection integrated against a
+            # clamped extension rather than the field: the same fault the vertex route reports, at the same
+            # place. A cell touching the boundary genuinely leaves the old mesh when that boundary moves
+            # outward, so it is not a fault there.
+            esc_cell = jnp.any(q_esc, axis=1) & interior_cell_j
+        else:
+            u_t, esc_cell = u_c, jnp.zeros_like(interior_cell_j)
 
         # 3) step on the moved mesh. The operator and the mass are re-formed from the moved vertices HERE,
         #    inside the step, through `args` -- `_apply_coord_params` scatters them into the P1 geometry
         #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
+        step_args = _coord_args(X_n)
+        if _mv_fid is not None:
+            step_args["__loadpath__"] = {_mv_fid: ((X_n - X_c) / dt).astype(u_c.dtype)}
         u_n = block.step(
             u_t,
             t0c.astype(u_c.dtype),
             dt,
-            args=_coord_args(X_n),
+            args=step_args,
             theta=theta,
             linear_solve=_lin,
             nonlinear_solve=nonlin_s,

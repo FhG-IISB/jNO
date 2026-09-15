@@ -283,6 +283,40 @@ Each step: evaluate every geometry term's velocity, scatter it into the vertices
 extend harmonically over everything they do not, move, re-assemble on the moved vertices, and carry the state
 across.
 
+### The mesh velocity inside a weak form (ALE)
+
+On a moving mesh a nodal value follows its vertex, so its rate is the ALE derivative
+
+$$
+\left.\frac{\partial u}{\partial t}\right|_{X} = \left.\frac{\partial u}{\partial t}\right|_{x} + w\cdot\nabla u ,
+$$
+
+with $w$ the mesh velocity. Transport written on the moving mesh therefore carries $w$, and you write it as
+what it is — the rate of a coordinate:
+
+```python
+w0, w1 = xi.d(ti), yi.d(ti)                                        # the mesh velocity w
+fem = jno.fem([ui.t * vi + ((c0 - w0) * ui.x + (c1 - w1) * ui.y) * vi   # u_t + (c - w)·∇u
+               + nu * (ui.x * vi.x + ui.y * vi.y),
+               xi.d(ti) - c0, yi.d(ti) - c1,                       # the mesh: it follows the flow
+               u(*ci) - u0])
+```
+
+When a weak form reads `coord.d(t)`, the nodal values **ride with their vertices** and nothing is transferred
+(transferring as well would count the mesh advection twice). Each step, `w` is the discrete motion of every
+vertex, $(X^{n+1} - X^n)/\Delta t$, harmonically extended vertices included, in volume and surface terms
+alike. This is the non-conservative ALE form, backward Euler, with mass and operator on the end-of-step
+configuration. Measured (`tests/test_fem_ale_mesh_velocity.py`):
+
+* a mesh translating rigidly with the material reproduces the fixed-mesh diffusion march to **1.1e-15**;
+* a surface term `(w·n) u v` equals `(c·n) u v` on that mesh to 3.6e-16;
+* a Gaussian advected at `c` past a mesh moving at `c/2` meets its closed form to **2.0 %** (5.2 % on a fixed
+  mesh with the same `h` and `dt`, since less relative motion means less numerical diffusion).
+
+`w` lives on the mesh vertices and borrows a **P1 Lagrange** field's basis, so the problem needs one (a
+Taylor–Hood pressure qualifies). Refused by name: `coord.d(t)` with no geometry term (it would be identically
+zero), the rate of a normal or of `cell_size`, and the mesh acceleration `xi.d(ti).d(ti)`.
+
 **Scope** — the rest raises rather than guessing:
 
 * **Operator-split ALE, explicit in the velocity**, hence first order in the step — *measured*, against a
@@ -305,7 +339,8 @@ across.
       this replaced fell ~33 %, and got *worse* as `dt` shrank). Conservation is algebraic — `Σφ = 1` — so the
       residual is quadrature error on an integrand with kinks: ~2e-4 relative against the pointwise route's
       3e-3 to 9e-3. Removing the diffusion entirely means not transferring at all (Lagrangian DOFs plus an ALE
-      `-w·∇u` term), which is a different semidiscretisation.
+      `-w·∇u` term), which is a different semidiscretisation — and what happens when a weak form reads the
+      mesh velocity (above).
     * **Requires `jax_enable_x64`.** The transfer locates quadrature points in the previous mesh, and in float32
       that carries ~4e-4 — enough for a mesh that never moves to drift 1.5e-3 over a march (2.6e-10 with x64).
     * **Backward Euler only**: `θ` comes from the block, and `time=jno.solve.theta(...)` is a solver slot, which
