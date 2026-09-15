@@ -4439,6 +4439,7 @@ def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
     pts = np.asarray(dom.mesh.points)
     specs = []
     for term in fem._geometry:
+        term = _unretagged(term)
         coord, _tvar, jac = mesh_velocity(term)
         ids = np.asarray(Variable._region_vertex_ids(dom, coord.tag, pts), dtype=int)
         if ids.size == 0:
@@ -4468,6 +4469,40 @@ def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
         s["frozen"] = frozen_fields_in(s["term"])
         s["frozen_blocks"] = _frozen_blocks(fem, dom, s["frozen"], coord_tag=s["coord"].tag)
     return specs
+
+
+def _unretagged(expr: Any) -> Any:
+    """``expr`` with every coordinate the quadrature retag rebound put back on its own region.
+
+    ``jno.fem`` retags a weak term's coordinate Variables IN PLACE to the quadrature pool (see
+    ``_retag_coords_for_quadrature``). A geometry term holding the same objects -- a free surface written
+    the natural way reuses ``xs, ys`` in the capillary term and in the kinematic law -- then names region
+    ``'fem_gauss'`` / ``'gauss_<tag>'``, which no vertex set answers to, and the march raised "has no
+    location function". The weak form keeps its retag (its lazy operators re-read ``.tag``); the law gets
+    clones on the recorded region, ``_jno_region_tag`` -- the recovery ``_region_and_support`` does."""
+    import copy
+
+    from ...trace import Placeholder, Variable, _iter_placeholder_children, substitute
+
+    node = expr._expr if hasattr(expr, "_expr") else expr
+    seen: set = set()
+    mapping: dict = {}
+
+    def visit(n):
+        if not isinstance(n, Placeholder) or id(n) in seen:
+            return
+        seen.add(id(n))
+        tg = getattr(n, "tag", None) if isinstance(n, Variable) else None
+        if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
+            clone = copy.copy(n)
+            clone.tag = getattr(n, "_jno_region_tag", None) or (tg[6:] if tg.startswith("gauss_") else tg)
+            mapping[n] = clone
+        for kind, _attr, val in _iter_placeholder_children(n):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    visit(node)
+    return substitute(node, mapping) if mapping else expr
 
 
 def _frozen_blocks(fem: Any, dom: Any, frozen: list, *, coord_tag: str = "?") -> dict:
