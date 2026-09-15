@@ -223,12 +223,26 @@ def test_the_velocity_may_read_the_solved_field():
     """A state-dependent law: the boundary speed is proportional to the solution's own boundary gradient,
     the shape a Stefan condition takes. The frozen field is re-pinned to the live state each step."""
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.2, 6))
-    u, _v = d.fem_symbols()
+    # The law must freeze the field the problem SOLVES. (It used to freeze a symbol of its own while `_heat`
+    # solved another, which only worked because every frozen field was handed the whole state -- the defect
+    # that let a law in a coupled problem read the wrong field.)
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
     parts = d.variable("boundary", normals=True, split=True)
     xb, yb, tb, nx, ny = parts[0], parts[1], parts[2], parts[-2], parts[-1]
     tf = u.bind(x=xb, y=yb).freeze(np.zeros(len(d.mesh.points)))
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y),
+            u(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - 1.0,
+            yb.d(tb) - 0.05 * (tf.x * nx + tf.y * ny) * ny,
+        ]
+    )
 
-    traj = _heat(d, yb.d(tb) - 0.05 * (tf.x * nx + tf.y * ny) * ny).solve()
+    traj = fem.solve()
     p0, p1 = traj.meshes[0][0], traj.meshes[-1][0]
     assert len(p1) == len(p0)
     assert not np.allclose(p0[:, 1], p1[:, 1]), "a state-dependent velocity produced no motion at all"

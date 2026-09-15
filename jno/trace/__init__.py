@@ -4551,7 +4551,12 @@ def refreeze(frozen, values):
     import copy as _copy
 
     clone = _copy.copy(frozen)
-    clone.values = jnp.asarray(values).reshape(-1)
+    # The same layout the constructor gives: flat for a scalar field, (n_nodes, vec) for a vector one.
+    # Flattening every field turned a vector field into (2n,), and the next assembly then failed on an
+    # unrelated reshape of a cell's gathered values.
+    _v = jnp.asarray(values)
+    _nc = getattr(frozen, "num_components", 1)
+    clone.values = _v.reshape(-1) if _nc == 1 else _v.reshape(-1, _nc)
     clone.frozen_id = _next_op_id()  # new gather-table key ⇒ the compiler bakes THESE values
     clone.op_id = _next_op_id()
     return clone

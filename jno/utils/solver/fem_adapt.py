@@ -4466,7 +4466,79 @@ def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
         )
     for s in specs:
         s["frozen"] = frozen_fields_in(s["term"])
+        s["frozen_blocks"] = _frozen_blocks(fem, dom, s["frozen"], coord_tag=s["coord"].tag)
     return specs
+
+
+def _frozen_blocks(fem: Any, dom: Any, frozen: list, *, coord_tag: str = "?") -> dict:
+    """``{frozen_id: (start, stop, vec)}`` — where each frozen field's OWN values sit in the flat state.
+
+    A frozen field in a geometry law stands for a solved field, and the driver delivers the live state to
+    it each step. It used to deliver the WHOLE flat state to every frozen field, and the readout then took
+    its first ``n_vertices`` entries -- the first field's block. A law reading any other field of a coupled
+    problem read the wrong field without a symptom (a law on a field that is 0 moved the mesh 0.1).
+
+    Resolved from the field key the frozen field shares with its source, against this FEM's own block
+    snapshot (``_block_field_keys`` / ``offsets`` / ``field_points``), so it is right whatever order the
+    assembler put the blocks in. A frozen field of a symbol no weak form solves has no values in the state
+    and is refused by name."""
+    if not frozen:
+        return {}
+    n_state = int(np.asarray(fem._op.state0).reshape(-1).shape[0])
+    keys = list(getattr(fem, "_block_field_keys", None) or [])
+    offs = [int(o) for o in (fem.offsets or [0, n_state])]
+    fpts = fem.field_points
+    if not keys:  # a single field with no block structure
+        keys = [getattr(frozen[0], "field_key", None)] if len(offs) == 2 else []
+    if len(keys) != len(offs) - 1 or fpts is None or len(fpts) != len(keys):
+        raise NotImplementedError(
+            f"jno.fem: the geometry term on region {coord_tag!r} reads the solved field, but this problem's "
+            "per-field block layout is not available (a non-native assembly), so the law cannot be handed "
+            "its own field's values."
+        )
+    n_verts = int(np.asarray(dom.mesh.points).shape[0])
+    blocks = {}
+    for f in frozen:
+        key = getattr(f, "field_key", None)
+        if key not in keys:
+            name = getattr(f, "name", "frozen[?]")
+            raise ValueError(
+                f"jno.fem: the geometry term on region {coord_tag!r} reads {name}, a field this problem does "
+                "not solve -- no weak form in the list carries it, so the state holds no values for it. A "
+                "geometry law can read only a solved field: add its equation, or write the law without it."
+            )
+        i = keys.index(key)
+        s0, s1 = offs[i], offs[i + 1]
+        n_nodes = int(np.asarray(fpts[i]).shape[0])
+        vec = (s1 - s0) // max(1, n_nodes)
+        if vec != int(getattr(f, "num_components", 1)):
+            raise ValueError(
+                f"jno.fem: the geometry term on region {coord_tag!r} reads {getattr(f, 'name', '?')} as a "
+                f"{f.num_components}-component field, but its block holds {vec} component(s) per node."
+            )
+        # The readout maps VERTEX values onto the sample points, so a higher-order block is read through its
+        # vertex DOFs, which the assembly numbers first (`_promote_to_degree` keeps the P1 vertices as DOFs
+        # 0..n_verts-1; `_scalar_vertex_metric` relies on the same). A varying P2 field pins it in
+        # tests/test_fem_geometry_law_reads_its_field.py. The coordinates are not compared against the mesh
+        # here: after a move the FEM's DOF snapshot is the seed mesh while the domain has moved on.
+        if n_nodes < n_verts:
+            raise NotImplementedError(
+                f"jno.fem: the geometry term on region {coord_tag!r} reads {getattr(f, 'name', '?')}, whose "
+                f"block has {n_nodes} nodes for {n_verts} mesh vertices, so its vertex values cannot be read off it."
+            )
+        blocks[f.frozen_id] = (s0, s1, vec)
+    return blocks
+
+
+def _frozen_block_values(state: Any, block: tuple, n_verts: int) -> Any:
+    """A frozen field's own VERTEX values out of the flat ``state``: ``(n_verts,)`` for a scalar field,
+    ``(n_verts, vec)`` for a vector one (the state is node-major, ``node*vec + comp``)."""
+    import jax.numpy as jnp
+
+    s0, s1, vec = block
+    blk = jnp.asarray(state).reshape(-1)[s0:s1]
+    blk = blk if vec == 1 else blk.reshape(-1, vec)
+    return blk[:n_verts]
 
 
 def _tags_read(expr) -> list:
@@ -4767,7 +4839,12 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
                     "needs the current state. This is a driver bug -- report it."
                 )
             ctx["__mesh_points__"] = pts
-            ctx["__frozen_values__"] = {fid: jnp.asarray(state).reshape(-1) for fid in frozen_ids}
+            # Each frozen field gets ITS OWN field's vertex values (see `_frozen_blocks`), not the whole flat
+            # state: the readout takes the first n_vertices entries it is handed, which is the first field.
+            _blocks = spec["frozen_blocks"]
+            ctx["__frozen_values__"] = {
+                fid: _frozen_block_values(state, _blocks[fid], verts.shape[0]) for fid in frozen_ids
+            }
         r0 = jnp.asarray(fn0(mdl, ctx, batchsize=None, key=None)).reshape(-1)
         r1 = jnp.asarray(fn1(mdl, ctx, batchsize=None, key=None)).reshape(-1)
         # `[perm]` gathers the driven vertices out of the driven tag's FIRST (B, T) slice. With `__time__`
@@ -4805,7 +4882,14 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     """
     from ...trace import refreeze, substitute
 
-    live = {f: refreeze(f, np.asarray(state)) for f in spec["frozen"]}
+    # Each frozen field is re-pinned to ITS OWN field's vertex values (see `_frozen_blocks`). Pinning the
+    # whole flat state had the same defect as the traced route, which is why the parity test between the
+    # two could not catch it.
+    _nv = int(np.asarray(dom.mesh.points).shape[0])
+    live = {
+        f: refreeze(f, np.asarray(_frozen_block_values(np.asarray(state), spec["frozen_blocks"][f.frozen_id], _nv)))
+        for f in spec["frozen"]
+    }
 
     def _ev(node):
         # One `Crux` per term, built once and reused. `Crux.eval` keys its compiled-function cache on the
