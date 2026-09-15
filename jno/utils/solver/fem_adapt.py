@@ -2461,7 +2461,7 @@ def move_mesh(domain: Any, displacement: np.ndarray, *, copy: bool = True, check
 
     Scope / limitations (fail-loud, each a later extension):
     - **Connectivity-preserving** only -- large boundary motion eventually tangles; the recovery is an
-      outer remesh + transfer, not this call.
+      outer remesh + transfer, not this call (:func:`run_mesh_motion` does that under ``adapt=``).
     - **Boundary sub-tags re-derive from the domain's spatial predicates on the moved coordinates.** A
       predicate pinned to a fixed location (e.g. ``x == 1``) will *not* follow an edge that moved past it;
       the moving surface should be tagged by a predicate that tracks it, or driven through the outer loop.
@@ -5002,8 +5002,82 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     return v[perm]
 
 
+def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
+    """The ``adapt=`` spec of a moving-mesh march, validated -- or ``None`` without one.
+
+    On a moving mesh ``adapt=`` means one thing: rebuild the mesh when a mesh-geometry CONDITION breaks
+    (``jno.le(d.cell_aspect(), 3.0)``), checked on the moved vertices between chunks of the march. The
+    rest is refused by name rather than run as something else:
+
+    * another adapt kind, or a remesh without a condition (it would remesh on the solution);
+    * a law reading a region a remesh cannot re-derive. Vertex ids do not survive a remesh; the whole
+      ``boundary`` (the topological boundary) and ``interior`` re-derive from the new mesh, but any other
+      region is a positional predicate or a distance to the SEED facets, which names the wrong vertices
+      once the surface has moved;
+    * a traced solve: the remesh is a host decision and cuts the gradient through the vertex positions.
+    """
+    import jax
+
+    from ...trace import mesh_velocity
+
+    if adapt is None:
+        return None
+    head = (
+        "jno.fem: on a moving mesh, adapt= rebuilds the mesh when a mesh-geometry CONDITION breaks -- "
+        "`fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0)))`. "
+    )
+    kinds = {"split": "refine()", "enrich": "enrich()", "relocate": "relocate()", "anisotropic": "remesh(anisotropic=True)"}
+    kind = next((name for flag, name in kinds.items() if getattr(adapt, flag, False)), None)
+    if kind is not None:
+        raise NotImplementedError(head + f"jno.solve.{kind} is not supported with a geometry term.")
+    if adapt.criterion is None:
+        raise NotImplementedError(
+            head + "A remesh with no criterion remeshes on the solution every few steps, which a moving mesh "
+            "does not support."
+        )
+    saved = list(getattr(d, "_trainable_coords", None) or [])
+    d._trainable_coords = []  # the condition asks about the mesh itself, not about coordinate parameters
+    try:
+        crit = _resolve_criterion(adapt.criterion, d)
+    finally:
+        d._trainable_coords = saved
+    if not isinstance(crit, Constraint) or not _criterion_is_geometric(crit.residual):
+        raise NotImplementedError(
+            head + "This criterion is not one: a plain expression only ranks cells, and a condition on the "
+            "solution says nothing about whether the moved elements are still fit to march on."
+        )
+    for term in fem._geometry:
+        law = _unretagged(term)
+        coord = mesh_velocity(law)[0]
+        for tg in _tags_read(law):
+            if tg in ("boundary", "interior", "n_boundary", "cell_size", "cell_metric") or tg.startswith("__time"):
+                continue
+            raise NotImplementedError(
+                f"jno.fem: the geometry term on region {coord.tag!r} reads region {tg!r}, which cannot "
+                "re-derive after a remesh: vertex ids do not survive one, and that region is found by a "
+                "position (a predicate, or the distance to the seed facets), which names the wrong vertices "
+                "once the surface has moved. With adapt=, state the motion on 'boundary' (the whole "
+                "surface, re-derived from the topology) or 'interior'."
+            )
+    if any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(kwargs)):
+        raise NotImplementedError(
+            "jno.fem: adapt= on a moving mesh inside a traced solve (jax.grad / jax.jit). The remesh is a "
+            "host decision and cuts the gradient through the vertex positions; differentiate the march "
+            "without adapt=."
+        )
+    return adapt
+
+
 def run_mesh_motion(
-    fem: Any, *, solve_fn: Any = None, nonlinear: Any = None, linear: Any = None, precond: Any = None, **kwargs: Any
+    fem: Any,
+    *,
+    adapt: Any = None,
+    solve_fn: Any = None,
+    nonlinear: Any = None,
+    linear: Any = None,
+    precond: Any = None,
+    _resume: Any = None,
+    **kwargs: Any,
 ) -> "AdaptiveTrajectory":
     """March a transient problem whose ``jno.fem([...])`` list contains **geometry terms** — the mesh moves
     as those terms say, the physics marches on the moved mesh, and the state is carried across each move.
@@ -5053,9 +5127,18 @@ def run_mesh_motion(
     - **Backward Euler only** in practice: ``θ`` is read from the block's metadata, and the only way to
       set it is ``fem.solve(time=jno.solve.theta(...))``, which the slot guard below rejects. Crank–
       Nicolson on a moving mesh is not reachable today.
-    - **Connectivity-preserving only.** A move that would invert an element raises (:func:`move_mesh`
-      ``check``); remesh-on-tangle for large deformation is the next extension. Reduce the step or the
-      motion.
+    - **Connectivity-preserving, unless told to remesh.** A move that would invert an element raises
+      (:func:`move_mesh` ``check``). With ``adapt=jno.solve.remesh(criterion=jno.le(d.cell_aspect(), b))``
+      the march runs in chunks of ``every`` steps; after each, the condition is checked on the moved
+      mesh, and where it breaks the mesh is rebuilt (mmg, at the starting vertex budget), the problem
+      re-assembled on it, and the state carried across by basis-aware interpolation. Measured on a top
+      edge bulging as ``y' = 2 y sin(pi x)`` (``tests/test_fem_moving_mesh_remesh.py``): worst aspect
+      6.27 -> 3.19 with one remesh, the surface where the plain march puts it, a constant field exact
+      to 4e-16. A condition that always holds reproduces the plain march exactly. Scope: the laws may
+      read only ``boundary`` and ``interior`` (any other region is found by a position that does not
+      follow a moved surface), the remesh is a host decision (refused under ``jax.grad``), and a
+      ``.trainable()`` starting geometry is refused. Each remesh also drifts a curved boundary's
+      enclosed area (mmg, ~6e-3 measured on a disk).
     - Boundary conditions on a moving surface must be **natural** or tied to a whole-boundary / held tag —
       those re-derive on the moved mesh. A Dirichlet BC pinned to the moving surface by a spatial
       sub-predicate would not follow the motion.
@@ -5107,6 +5190,7 @@ def run_mesh_motion(
     dim = int(d.dimension)
     if dim not in (2, 3):
         raise NotImplementedError(f"mesh motion supports 2D/3D simplicial meshes; got dimension {dim}.")
+    _cond = _moving_mesh_condition(fem, adapt, d, kwargs)
 
     cons, kw = fem._constraints, fem._fem_kwargs
     block = fem._op
@@ -5144,6 +5228,11 @@ def run_mesh_motion(
     _init_specs = [
         {"ids": np.asarray(sp["ids"], dtype=int), "axis": int(sp["axis"]), "name": str(sp["name"])} for sp in _init_coords
     ]
+    if _cond is not None and _init_specs:
+        raise NotImplementedError(
+            "jno.fem: a `.trainable()` starting geometry does not survive a remesh -- its vertices are replaced. "
+            "Drop adapt=, or the trainable coordinate."
+        )
     d._trainable_coords = []  # re-registered from the CURRENT mesh just below
     _all_parts = d.variable("__meshmotion_all__", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
     for _a, _nm in enumerate(_axis_names):
@@ -5165,6 +5254,23 @@ def run_mesh_motion(
     except NotImplementedError as _e:
         raise NotImplementedError(f"jno.fem: a geometry term needs a nodal-Lagrange assembly. {_e}") from _e
     off = [int(x) for x in layout["offsets"]]
+    if _resume is not None:
+        # A segment after a remesh: carry the state the previous segment ended with across the change of
+        # mesh -- each old field evaluated at its new DOF points with its own element basis (the transfer
+        # the transient remesher uses). `_l2_transfer_jax` cannot: it shares one cell array between meshes.
+        _opts, _ocells, _ostate, _olay = _resume["old"]
+        _vals = _eval_fe_fields_at_points(
+            _opts,
+            _ocells,
+            jnp.asarray(_ostate),
+            _olay["offsets"],
+            _olay["orders"],
+            _olay["cells_f"],
+            _olay["vecs"],
+            layout["field_points"],
+            dim=dim,
+        )
+        state = jnp.concatenate([jnp.asarray(v).reshape(-1) for v in _vals])
 
     # Runtime parameter VALUES (a coefficient, a neural field) travel with the coordinates. Without this
     # they were accepted by `**kwargs` and silently discarded: the block exposes them in
@@ -5250,7 +5356,22 @@ def run_mesh_motion(
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
     dt = float(block.dt)
     theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
+    _start = 0 if _resume is None else int(_resume["start"])
+    ts = ts[_start:]  # a segment after a remesh marches the rest of the grid
     n_steps = len(ts) - 1
+    if _cond is not None:
+        # The remesh budget is fixed ONCE, from the mesh the march started on, exactly as the transient
+        # remesher fixes it: each remesh redistributes the same vertex count inside the same edge window.
+        if _resume is None:
+            _h0 = _mean_edge_length(d)
+            _budget = (
+                _cond.hmin if _cond.hmin is not None else _h0 / 50.0,
+                _cond.hmax if _cond.hmax is not None else 2.0 * _h0,
+                float(_cond.max_dofs) if _cond.max_dofs is not None else float(n_verts),
+            )
+        else:
+            _budget = _resume["budget"]
+        _every = max(1, int(_cond.every))
 
     # The step is compiled ONCE and reused, so the march re-traces nothing per step. `dt`, `theta` and the
     # linear solve are closed over as constants; only the state, the time and the moved vertices are
@@ -5418,27 +5539,100 @@ def run_mesh_motion(
         bad = (bad[0] | tangled, bad[1] | jnp.any(esc_cell))
         return (u_n, X_n, bad), (u_n, X_n)
 
-    (_u_f, _X_f, (tangled_any, escaped_any)), (u_hist, X_hist) = jax.lax.scan(
-        _march_step, (state, X0, (jnp.array(False), jnp.array(False))), jnp.asarray(ts[:-1])
-    )
+    def _raise_if_bad(tangled, escaped):
+        if bool(tangled):
+            hint = (
+                "take a smaller `every`, so the condition is checked before the elements invert"
+                if _cond is not None
+                else "let the mesh be rebuilt when it degrades: "
+                "`fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0)))`"
+            )
+            raise ValueError(
+                "jno.fem: the mesh motion inverts or collapses an element (the mesh would tangle). Take a "
+                "smaller time step, drive the motion through a region whose harmonic extension can "
+                f"accommodate it, or {hint}."
+            )
+        if bool(escaped):
+            raise ValueError(
+                "jno.fem: a step moved an interior vertex further than its own element, so the state transfer "
+                "could not locate it and would have silently clamped it to the nearest simplex. Take a smaller "
+                "time step, or refine the mesh where the motion is fastest."
+            )
 
-    if bool(tangled_any):
-        raise ValueError(
-            "jno.fem: the mesh motion inverts or collapses an element (the mesh would tangle). Take a "
-            "smaller time step, or drive the motion through a region whose harmonic extension can "
-            "accommodate it."
-        )
-    if bool(escaped_any):
-        raise ValueError(
-            "jno.fem: a step moved an interior vertex further than its own element, so the state transfer "
-            "could not locate it and would have silently clamped it to the nearest simplex. Take a smaller "
-            "time step, or refine the mesh where the motion is fastest."
-        )
+    carry = (state, X0, (jnp.array(False), jnp.array(False)))
+    if _cond is None:
+        carry, (u_hist, X_hist) = jax.lax.scan(_march_step, carry, jnp.asarray(ts[:-1]))
+        _raise_if_bad(*carry[2])
+        u_frames = [u_hist[i] for i in range(n_steps)]
+        X_frames = [X_hist[i] for i in range(n_steps)]
+        history = [{"t": float(ts[i + 1]), "n_dofs": int(off[-1]), "remeshed": False} for i in range(n_steps)]
+    else:
+        # Chunks of `every` steps -- one compiled scan per mesh (two shapes at most: `every` and the
+        # remainder), since an eager scan on a fresh closure recompiles every call (0.6 s a chunk, measured)
+        # -- then a HOST check of the condition on the moved mesh. Where it breaks: remesh at the fixed
+        # budget, and march the rest of the grid on the new mesh (a new segment: the problem is rebuilt
+        # there and the state carried across). Frames and history of both segments are joined.
+        _scan = jax.jit(lambda c, tt: jax.lax.scan(_march_step, c, tt))
+        u_frames, X_frames, history, i = [], [], [], 0
+        while i < n_steps:
+            m = min(_every, n_steps - i)
+            carry, (uh, Xh) = _scan(carry, jnp.asarray(ts[i : i + m]))
+            _raise_if_bad(*carry[2])
+            u_frames += [uh[j] for j in range(m)]
+            X_frames += [Xh[j] for j in range(m)]
+            history += [{"t": float(ts[i + j + 1]), "n_dofs": int(off[-1]), "remeshed": False} for j in range(m)]
+            i += m
+            if i >= n_steps:
+                break
+            X_now = np.asarray(carry[1])
+            move_mesh(d, X_now - np.asarray(d.mesh.points)[:, :dim], copy=False, check=False)
+            margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
+            if not (margin > 0.0).any():
+                continue
+            history[-1]["remeshed"] = True
+            marked = np.flatnonzero(margin > 0.0).astype(np.int64)
+            size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
+            remesh_with_mmg(
+                d, _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]), copy=False
+            )
+            for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+                d.tag(_name, _pred)
+            d.__dict__.pop("_gauge_pin_coords", None)  # same reason as every other rebuild in this file
+            # Re-sample every region the laws read, as the end of a march does: the next segment aligns
+            # each region's sample points with the NEW mesh vertices, and the pools still hold the old ones.
+            for _tag in {
+                tg for sp in specs for tg in _tags_read(sp["term"]) if not tg.startswith(("__time", "n_", "cell_"))
+            }:
+                try:
+                    d.variable(_tag, normals=True, split=True)
+                except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
+                    d.variable(_tag, split=True)
+            rest = run_mesh_motion(
+                fem,
+                adapt=adapt,
+                solve_fn=solve_fn,
+                nonlinear=nonlinear,
+                linear=linear,
+                precond=precond,
+                _resume={
+                    "start": _start + i,
+                    "old": (X_now, shared_cells, np.asarray(carry[0]), layout),
+                    "budget": _budget,
+                },
+                **kwargs,
+            )
+            fem.adapt_history = history + list(fem.adapt_history)
+            return AdaptiveTrajectory(
+                np.concatenate([np.asarray(ts[: i + 1], dtype=float), np.asarray(rest.times[1:], dtype=float)]),
+                [state] + u_frames + list(rest.states[1:]),
+                [(X0, shared_cells)] + [(x, shared_cells) for x in X_frames] + list(rest.meshes[1:]),
+                layouts=[layout] * (i + 1) + list(rest.layouts[1:]),
+            )
+    _X_f = carry[1]
 
     times = [float(t) for t in ts]
-    states = [state] + [u_hist[i] for i in range(n_steps)]
-    meshes = [(X0, shared_cells)] + [(X_hist[i], shared_cells) for i in range(n_steps)]
-    history = [{"t": float(ts[i + 1]), "n_dofs": int(n_verts)} for i in range(n_steps)]
+    states = [state] + u_frames
+    meshes = [(X0, shared_cells)] + [(x, shared_cells) for x in X_frames]
 
     # Leave the domain on the final moved mesh, as the eager driver did -- callers inspect `fem.points`
     # after a solve. Host state, so it can only take a concrete value: inside `jax.grad` the final
@@ -5449,7 +5643,8 @@ def run_mesh_motion(
     except Exception:  # noqa: BLE001 -- a tracer: differentiating through the march, nothing to write back
         _final_pts = None
     if _final_pts is not None:
-        move_mesh(d, _final_pts - _pts0, copy=False, check=False)
+        # Relative to where the domain IS: under adapt= it was written back after every chunk.
+        move_mesh(d, _final_pts - np.asarray(d.mesh.points)[:, :dim], copy=False, check=False)
         # Re-tag and re-sample so the domain is left SELF-CONSISTENT: `move_mesh` moves
         # `domain.mesh.points` without touching the cached tag pools / contexts, and a second `solve()`
         # on the same domain resolves its sample<->vertex alignment against both. Stale pools made that

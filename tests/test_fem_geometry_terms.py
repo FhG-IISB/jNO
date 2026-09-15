@@ -262,12 +262,13 @@ def test_a_geometry_term_needs_a_transient_problem():
 
 
 def test_motion_does_not_silently_share_the_march():
-    """The motion driver owns the march and re-assembles each step, so it cannot also be owned by adapt=
-    or a solver slot. Refuse rather than let one of them win quietly."""
+    """The motion driver owns the march and re-assembles each step. adapt= composes with it only as a
+    remesh TRIGGERED by a mesh-geometry condition; a plain remesh() -- which would remesh on the solution
+    every few steps -- is refused rather than run as something else."""
     d = _dom()
     _xb, yb, tb = d.variable("boundary", split=True)
     fem = _heat(d, yb.d(tb) - 0.1)
-    with pytest.raises(NotImplementedError, match="does not compose"):
+    with pytest.raises(NotImplementedError, match="mesh-geometry CONDITION"):
         fem.solve(adapt=jno.solve.remesh())
 
 
@@ -1509,6 +1510,10 @@ def test_a_march_owning_argument_is_still_refused_on_a_moving_mesh():
     """Relaxing the guard for the per-step slots must not let anything that owns a MARCH through."""
     d = _dom()
     _xb, yb, tb = d.variable("boundary", split=True)
-    for kw in ({"adapt": jno.solve.remesh()}, {"time": jno.solve.theta(0.5)}):
-        with pytest.raises(NotImplementedError, match="does not compose"):
+    for kw, why in (
+        ({"adapt": jno.solve.remesh()}, "mesh-geometry CONDITION"),
+        ({"adapt": jno.solve.refine()}, "mesh-geometry CONDITION"),
+        ({"time": jno.solve.theta(0.5)}, "does not compose"),
+    ):
+        with pytest.raises(NotImplementedError, match=why):
             _heat(d, yb.d(tb) - 0.1).solve(**kw)

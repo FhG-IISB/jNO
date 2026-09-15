@@ -346,8 +346,15 @@ zero), the rate of a normal or of `cell_size`, and the mesh acceleration `xi.d(t
       that carries ~4e-4 — enough for a mesh that never moves to drift 1.5e-3 over a march (2.6e-10 with x64).
     * **Backward Euler only**: `θ` comes from the block, and `time=jno.solve.theta(...)` is a solver slot, which
       a geometry term does not compose with.
-    * **Connectivity-preserving**: a move that would invert an element raises. Remesh-on-tangle is the next
-      extension.
+    * **Connectivity-preserving, unless told to remesh**: a move that would invert an element raises. With
+      `fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1))` the march
+      checks the condition on the moved mesh every `every` steps and, where it breaks, rebuilds the mesh
+      (mmg, at the starting vertex budget), re-assembles and carries the state across. Measured on a top edge
+      bulging as `y' = 2y sin(πx)`: worst cell aspect 6.27 → 3.19 with one remesh, the surface where the plain
+      march puts it, a constant field exact to 4e-16. The laws may read only `boundary` and `interior` (any
+      other region is found by a position that does not follow a moved surface), a remesh is not
+      differentiable (refused under `jax.grad`), and each remesh drifts a curved boundary's enclosed area by
+      ~6e-3 (mmg, measured on a disk).
     * A Dirichlet BC on the moving surface must be tied to a whole-boundary or held tag, not to a spatial
       sub-predicate — a predicate does not follow the motion.
     * **Any nodal-Lagrange field(s), real, non-periodic**, 2D or 3D — scalar or vector, P1 or higher, and

@@ -1912,7 +1912,9 @@ class FEM:
         ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
         frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
         term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
-        (operator-split ALE; scalar-P1, real).
+        (operator-split ALE; nodal-Lagrange fields, real). A weak form may read the mesh velocity
+        ``xi.d(ti)`` (the nodal values then ride with the mesh), and
+        ``adapt=jno.solve.remesh(criterion=<mesh-geometry condition>)`` rebuilds a mesh that degrades.
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
@@ -2343,9 +2345,9 @@ class FEM:
             # which the march does not own, and the transient adaptive driver already composes them for
             # exactly that reason. Refusing them here left a moving-mesh problem on the matrix-free
             # default, with no way to reach a sparse-direct Newton -- which is the only thing that
-            # converges on a saddle step.
+            # converges on a saddle step. adapt= is not a march owner here either: the driver consumes it,
+            # as a remesh triggered between chunks of the march (see `run_mesh_motion`).
             _march_owners = (
-                ("adapt", adapt),
                 ("time", time),
                 ("tau", tau),
                 ("x0", x0),
@@ -2355,7 +2357,8 @@ class FEM:
                 raise NotImplementedError(
                     f"jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with "
                     f"{'/'.join(_clash)}= — the mesh-motion driver owns the march and re-assembles each "
-                    "step. The per-step solver slots (nonlinear=/linear=/precond=) DO compose."
+                    "step. The per-step solver slots (nonlinear=/linear=/precond=) DO compose, and so does "
+                    "adapt= as a remesh triggered by a mesh-geometry condition."
                 )
             if self._mode != "transient":
                 raise NotImplementedError(
@@ -2365,7 +2368,9 @@ class FEM:
                 )
             from .utils.solver.fem_adapt import run_mesh_motion
 
-            return run_mesh_motion(self, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs)
+            return run_mesh_motion(
+                self, adapt=adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+            )
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
             # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
