@@ -327,6 +327,26 @@ The crossover is around 15–20k DOFs. Note what the direct solve is *not* doing
 memory — it scales as roughly `O(N³)` in time and simply loses. Below the crossover it is the right
 choice and stays the default.
 
+### AMG on a march
+
+`jno.precond.amg()` needs a **concrete** matrix — pyamg builds the hierarchy on the host — and a
+transient march linearises inside `lax.scan`, where every operator is traced. Both Newton modes hit it:
+the matrix-free JVP has no matrix at all, and `newton(direct=True)` assembles one, but *inside* the
+trace. It used to surface as `AMG setup needs a concrete matrix but got a traced one`, several frames
+inside the Newton loop.
+
+A march now builds it once, before the scan, from the step tangent at the initial state, and reuses it
+for every step:
+
+```python
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())   # transient, nonlinear — just works
+```
+
+The tangent drifts as the march proceeds and the frozen hierarchy does not follow it; that is the
+standard frozen-preconditioner trade, and it is always correct — a preconditioner changes how fast the
+Krylov solve converges, never what it converges to. Traceable specs (`jacobi`, which reads its diagonal
+off the traced operator) are left exactly as they were, refreshing per linearisation.
+
 ### When the pressure mass is not enough
 
 `saddle()`'s pressure-mass Schur approximation stands in for the Schur complement of a **viscous**

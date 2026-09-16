@@ -938,6 +938,10 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     an unbuilt ``amg``, ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own
     targeted errors when materialized.
 
+    On a **transient march** an unbuilt ``amg`` composes anyway: the march's own driver freezes it
+    first (:func:`_freeze_precond_for_march`), building the hierarchy from the step tangent at the
+    initial state, outside the scan. That is the one place the representative operator is known.
+
     **A DIRECT ``linear=`` slot picks the direct Newton.** ``lu``/``dense``/``amg`` need an assembled
     matrix, and a matrix-free tangent has none to give them, so pairing one with the matrix-free
     Newton cannot work -- it used to surface as ``LinearOperator.dense(): a matvec-only operator
@@ -1024,6 +1028,83 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     return _composed
 
 
+def _specs_in(spec):
+    """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
+    (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. A tree is non-traceable
+    as soon as ONE leaf is, so the whole tree has to be walked rather than just its root."""
+    yield spec
+    child = getattr(spec, "spec", None)
+    if child is not None:
+        yield from _specs_in(child)
+    for pair in getattr(spec, "pairs", ()) or ():
+        yield from _specs_in(pair[1] if isinstance(pair, tuple) else pair)
+
+
+class _FrozenMarchPrecond:
+    """A preconditioner applier materialized ONCE, outside the trace, and reused by every step.
+
+    Wraps the applier as a bare ``ctx -> apply`` spec (the duck type ``materialize_precond`` already
+    accepts), so nothing downstream needs to know a march is what it came from.
+    """
+
+    __slots__ = ("_apply", "_of")
+
+    def __init__(self, apply, of):
+        self._apply, self._of = apply, of
+
+    def __call__(self, _ctx):
+        return self._apply
+
+    def __repr__(self):
+        return f"frozen-for-march({self._of!r})"
+
+
+def _freeze_precond_for_march(precond, fem, block):
+    """Materialize a NON-traceable preconditioner once, from the step tangent at the initial state.
+
+    ``spec.traceable`` is the library's own word for "can materialize inside a trace". ``jacobi`` reads
+    its diagonal off the traced operator and is left exactly as it was; ``amg``/``ilu`` run a host-side
+    setup (pyamg, scipy) that a tracer cannot reach, and used to die several frames inside the Newton
+    loop with "AMG setup needs a concrete matrix but got a traced one" -- on the perfectly reasonable
+    ``fem.solve(precond=jno.precond.amg())`` over a transient problem.
+
+    The tangent drifts as the march proceeds; the hierarchy built here does not follow it. That is the
+    standard frozen-preconditioner trade and it is always CORRECT: a preconditioner changes how fast the
+    Krylov solve converges, never what it converges to. It is also what the LINEAR transient path already
+    does one branch below, where the step operator is formed once and materialized before the scan.
+
+    Built from ``M + theta*dt*J(u0, t0)``, which is ``dt`` times the true step tangent
+    ``M/dt + theta*J``. A uniform scaling of the operator leaves the Krylov iterates unchanged (it
+    rescales the preconditioned residual, not the subspace), so the extra factor costs nothing.
+    """
+    if precond is None:
+        return None
+    if all(bool(getattr(s, "traceable", True)) for s in _specs_in(precond)):
+        return precond  # nothing here needs a concrete matrix -- leave the per-linearization path alone
+
+    name = getattr(precond, "name", type(precond).__name__)
+    if block.jacobian is None or block.mass is None:
+        raise TypeError(
+            f"fem.solve(precond={name}): this preconditioner needs an assembled matrix, and this march "
+            "cannot offer one -- its block carries no (mass, jacobian) pair to form the step tangent from "
+            "(a state-dependent mass is the usual reason). Use a traceable preconditioner "
+            "(jno.precond.jacobi()), or pre-build this one yourself with spec.build(A)."
+        )
+    if block.state0 is None or block.dt is None:
+        raise TypeError(
+            f"fem.solve(precond={name}): this preconditioner needs an assembled matrix, and the step "
+            "tangent cannot be formed here because the block carries no initial state / step size. Use "
+            "jno.precond.jacobi(), or pre-build with spec.build(A)."
+        )
+    theta = float((block.metadata or {}).get("theta", 1.0))
+    t0 = float((block.metadata or {}).get("t0", 0.0))
+    J = block.jacobian(block.state0, t0, None)
+    M = block.mass(t0, None)
+    op = LinearOperator(_add_step_operator(M, J, theta * float(block.dt)))
+    prepare_precond(precond, fem)
+    return _FrozenMarchPrecond(materialize_precond(precond, PrecondContext(op, fem)), precond)
+
+
 def _add_step_operator(M, A, scale):
     """Form the theta-step operator ``M + scale * A`` once, eagerly.
 
@@ -1068,6 +1149,11 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
       matvec-only operator that still exposes the exact step diagonal (so ``jacobi`` works).
     """
     if block.is_nonlinear():
+        # A preconditioner that must SEE a matrix cannot be materialized in here: the per-step solve runs
+        # inside the march's scan, so both the matrix-free JVP and the `direct=True` assembled tangent are
+        # traced by the time it is asked for. Build it once, now, from the step tangent at the initial
+        # state, and freeze it for the march.
+        precond = _freeze_precond_for_march(precond, fem, block)
         return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
     if nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
