@@ -131,3 +131,14 @@ def test_the_frozen_wrapper_hands_back_the_applier_untouched():
     assert frozen(None) is sentinel
     assert frozen("a different ctx entirely") is sentinel, "the frozen applier must ignore per-solve context"
     assert "amg()" in repr(frozen), "repr feeds the driver's cache key; it must name what was frozen"
+
+
+def test_a_useless_hierarchy_is_refused_at_compose_time():
+    """A preconditioner that AMPLIFIES cannot converge, and inside a march that shows up only as
+    "fgmres did not solve the system" from a debug callback, after the whole trajectory has been
+    traced. On this problem at 4751 dofs the V-cycle makes a random residual 7.5x worse (measured:
+    smoothed aggregation on a tangent carrying `2u grad u . delta u` is not its case), so the march
+    must say so before it starts."""
+    fem = _nonlinear_heat(size=0.016, nt=11)
+    with pytest.raises(ValueError, match="WORSE"):
+        fem.solve(linear=jno.solve.fgmres(tol=1e-8), precond=jno.precond.amg()).fn()

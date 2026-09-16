@@ -1100,9 +1100,48 @@ def _freeze_precond_for_march(precond, fem, block):
     t0 = float((block.metadata or {}).get("t0", 0.0))
     J = block.jacobian(block.state0, t0, None)
     M = block.mass(t0, None)
-    op = LinearOperator(_add_step_operator(M, J, theta * float(block.dt)))
+    dt = float(block.dt)
+    A_rep = _add_step_operator(M, J, theta * dt)
+    op = LinearOperator(A_rep)
     prepare_precond(precond, fem)
-    return _FrozenMarchPrecond(materialize_precond(precond, PrecondContext(op, fem)), precond)
+    applier = materialize_precond(precond, PrecondContext(op, fem))
+    _refuse_a_useless_applier(applier, A_rep, name)
+    return _FrozenMarchPrecond(applier, precond)
+
+
+def _refuse_a_useless_applier(applier, A, name):
+    """One probe: does ``M^-1`` actually reduce a residual on the operator it was built from?
+
+    A preconditioner is free to be mediocre, but one that AMPLIFIES is worse than none, and inside a
+    march that surfaces only as ``fgmres did not solve the system`` from a debug callback several
+    frames deep, after the whole trajectory has been traced. Measured here it costs one apply.
+
+    Smoothed aggregation is the case that hits this. It assumes a Laplacian-like operator, and a
+    Newton tangent need not be one: for ``(1 + u^2) grad u . grad phi`` the tangent carries an extra
+    ``2u grad u . delta u`` term, and its V-cycle amplifies a random residual 7.5x (measured, 4751
+    dofs) -- while the same problem's LINEAR step operator contracts by 0.32. Symmetrising it,
+    rescaling it and lagging the coefficient were each measured to change nothing.
+    """
+    import numpy as _np
+
+    apply_fn = getattr(applier, "fwd", applier)
+    n = A.shape[0]
+    r = _np.asarray(jax.random.normal(jax.random.PRNGKey(0), (n,)), dtype=float)
+    try:
+        z = _np.asarray(apply_fn(jnp.asarray(r))).reshape(-1)
+        left = _np.linalg.norm(r - _np.asarray((A @ jnp.asarray(z))).reshape(-1)) / _np.linalg.norm(r)
+    except Exception:  # noqa: BLE001 -- a spec that cannot be probed is left alone; the solve will say so
+        return
+    if not (left == left) or left <= 1.0:
+        return
+    raise ValueError(
+        f"fem.solve(precond={name}): on this march the preconditioner makes a random residual "
+        f"{left:.1f}x WORSE, so the Krylov solve cannot converge with it -- it would stall inside the "
+        "time loop instead of failing here. This is what an algebraic-multigrid hierarchy does on a "
+        "tangent that is not Laplacian-like (a strongly nonlinear coefficient contributes a term that "
+        "breaks its strength-of-connection assumption). Use jno.precond.jacobi(), which reads the "
+        "diagonal off the tangent itself, or precondition a problem whose step operator is definite."
+    )
 
 
 def _add_step_operator(M, A, scale):

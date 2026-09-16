@@ -347,6 +347,23 @@ standard frozen-preconditioner trade, and it is always correct — a preconditio
 Krylov solve converges, never what it converges to. Traceable specs (`jacobi`, which reads its diagonal
 off the traced operator) are left exactly as they were, refreshing per linearisation.
 
+**Reachable is not the same as useful.** Smoothed aggregation assumes a Laplacian-like operator, and a
+Newton tangent need not be one. Measured on `u_t = div((1 + u²) grad u)` at 4751 DOFs, whose tangent
+carries an extra `2u grad u . delta u`: one V-cycle makes a random residual **7.5× worse**, while the
+same problem's *linear* step operator contracts it by 0.32. Symmetrising the tangent (7.28×), rescaling
+it (scale-invariant) and lagging the coefficient with `jno.lag` (7.50×) each changed nothing — it is the
+operator, not the freezing. So the march **probes the applier once** and refuses a preconditioner that
+amplifies, naming the factor, rather than letting `fgmres` stall inside the time loop:
+
+```
+fem.solve(precond=jno.precond.amg()): on this march the preconditioner makes a random residual
+7.5x WORSE, so the Krylov solve cannot converge with it -- ... Use jno.precond.jacobi(), which
+reads the diagonal off the tangent itself, or precondition a problem whose step operator is definite.
+```
+
+On a march whose step operator *is* definite — a linear block, or a mildly nonlinear one — AMG composes
+and the probe passes silently.
+
 ### When the pressure mass is not enough
 
 `saddle()`'s pressure-mass Schur approximation stands in for the Schur complement of a **viscous**
