@@ -318,6 +318,20 @@ configuration. Measured (`tests/test_fem_ale_mesh_velocity.py`):
 Taylor–Hood pressure qualifies). Refused by name: `coord.d(t)` with no geometry term (it would be identically
 zero), the rate of a normal or of `cell_size`, and the mesh acceleration `xi.d(ti).d(ti)`.
 
+!!! danger "A capillary flow needs its own `tau` — the advection recipe silently over-damps it"
+    The SUPG/PSPG `tau` of the stabilised-flow tutorial is built for advection-dominated flow. A surface-tension
+    driven drop is the opposite regime — nearly inviscid and nearly stagnant — and that `tau` then contributes
+    **about ten times the physical damping** and feeds a spurious `n = 4` surface mode. Measured on an ellipse
+    released from rest (`tests/test_fem_drop_oscillation.py`): with the advection `tau`, the `n = 2` mode does
+    not oscillate at all and `n = 4` grows sevenfold; scaled by `1e-4`, the drop rings at **ω within 0.7 % of**
+    Lamb's `ω² = n(n²−1)σ/(ρR³)` and decays within **12 %** of `2n(n−1)ν/R²`. The time integration is not
+    involved: quartering `dt` changes the answer in the fourth digit.
+
+    Two further practicalities. Measure the shape as a **Fourier mode of `r(θ)`**, not as a bounding-box aspect
+    ratio, and fit a damped sinusoid — extremum counting returned `+7.4/s` and `−1.6/s` for the same run over
+    different spans. And the capillary time step is tighter than `√(ρh³/2πσ)` suggests: at `h = 0.03` that
+    estimate gives `8e-4` while `5e-4` already tangles, so shrink `dt` as you refine.
+
 ### Bodies that merge — `remesh(alpha=...)`
 
 Moving a mesh cannot change its topology: two droplets meshed as separate bodies in a void can approach
