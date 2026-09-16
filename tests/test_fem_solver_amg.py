@@ -288,3 +288,74 @@ def test_picard_keeps_the_momentum_block_definite_where_newton_does_not():
         resid[name] = float(_np.linalg.norm(F @ x - b) / _np.linalg.norm(b))
     assert resid["picard"] < 1e-8, f"AMG must converge on the Oseen block, got {resid['picard']:.2e}"
     assert resid["picard"] < resid["newton"] / 100.0, resid
+
+
+def _laplacian_1d(n=1200):
+    """A symmetric tridiagonal Laplacian: its dominant eigenvector is the most OSCILLATORY one, so the
+    deterministic ones-vector start of the power iteration has almost no overlap with it and the
+    estimate climbs very slowly. That is the mechanism found on a melt-pool-shaped Newton tangent,
+    where 20 iterations gave 0.54*rho -- and 40 gave the same, so "two runs agree" proves nothing."""
+    import jax.experimental.sparse as jsp
+
+    A = np.diag(2.0 * np.ones(n)) + np.diag(-np.ones(n - 1), 1) + np.diag(-np.ones(n - 1), -1)
+    return jsp.BCOO.fromdense(jnp.asarray(A)), A
+
+
+def _vcycle_contraction(A_bcoo, A_dense, seed=0):
+    """How much ONE V-cycle changes a random residual: < 1 contracts, > 1 amplifies."""
+    from jno.utils.solver.amg import build_hierarchy, vcycle_apply
+
+    levels = build_hierarchy(A_bcoo, max_levels=10, coarse_size=100, smoother_degree=2)
+    r = np.random.default_rng(seed).standard_normal(A_dense.shape[0])
+    y = np.asarray(vcycle_apply(levels, jnp.asarray(r)))
+    return float(np.linalg.norm(r - A_dense @ y) / np.linalg.norm(r)), levels
+
+
+def test_the_smoother_bound_never_falls_below_the_spectrum():
+    """Chebyshev damps ``[lmin, lmax]`` and AMPLIFIES above ``lmax``, so an underestimated bound does
+    not smooth badly -- it diverges. Power iteration approaches the dominant eigenvalue from BELOW and
+    can stall there, so the bound is used only when the smoother it implies is measured to damp."""
+    A_bcoo, A_dense = _laplacian_1d()
+    rho = float(np.abs(np.linalg.eigvalsh(A_dense)).max())
+    _, levels = _vcycle_contraction(A_bcoo, A_dense)
+    assert float(levels[0]["lmax"]) >= rho, (
+        f"the fine-level Chebyshev bound {float(levels[0]['lmax']):.4e} is below the spectral radius "
+        f"{rho:.4e}; the smoother will amplify every mode above it"
+    )
+
+
+def test_a_stalling_power_estimate_still_gives_a_contracting_vcycle():
+    """The regression: taken on trust, that stalled estimate made one V-cycle AMPLIFY a random
+    residual (measured 7.5x on the tangent that found it, 4751 dofs)."""
+    A_bcoo, A_dense = _laplacian_1d()
+    contraction, _ = _vcycle_contraction(A_bcoo, A_dense)
+    assert contraction < 1.0, f"one V-cycle made the residual {contraction:.2f}x WORSE"
+
+
+def test_a_well_behaved_operator_keeps_its_tight_bound():
+    """Gershgorin is the fallback: rigorous, but loose enough to cost smoothing quality (measured 0.33
+    -> 0.46 on a step operator). So it must NOT displace a power estimate that is already good."""
+    fem = _poisson()
+    A = fem.operator[0] if isinstance(fem.operator, tuple) else fem.operator
+    A_dense = np.asarray(A.todense())
+    rho = float(np.abs(np.linalg.eigvals(A_dense)).max())
+    gershgorin = float(np.abs(A_dense).sum(axis=1).max())
+    contraction, levels = _vcycle_contraction(A, A_dense)
+    lmax = float(levels[0]["lmax"])
+    assert rho <= lmax < gershgorin, f"lmax {lmax:.4e}: rho {rho:.4e}, gershgorin {gershgorin:.4e}"
+    assert contraction < 1.0, f"one V-cycle made the residual {contraction:.2f}x WORSE"
+
+
+def test_chebyshev_cannot_smooth_a_strongly_nonsymmetric_operator():
+    """SCOPE, measured: a correct bound is not sufficient. Chebyshev damps a real INTERVAL, and a
+    strongly skew operator has a complex spectrum, where it amplifies whatever the bound says (62x
+    here). Nothing about lmax fixes that -- it is why a march probes its applier and refuses one that
+    amplifies (see _refuse_a_useless_applier) rather than trusting the setup to have gone well."""
+    import jax.experimental.sparse as jsp
+
+    n = 1200
+    A = np.diag(2.0 * np.ones(n)) + np.diag(-np.ones(n - 1), 1) + np.diag(-np.ones(n - 1), -1)
+    A = A + np.diag(0.9 * np.ones(n - 1), 1) - np.diag(0.9 * np.ones(n - 1), -1)
+    contraction, levels = _vcycle_contraction(jsp.BCOO.fromdense(jnp.asarray(A)), A)
+    assert float(levels[0]["lmax"]) >= float(np.abs(np.linalg.eigvals(A)).max()), "the bound itself is sound"
+    assert contraction > 1.0, "if this now contracts, Chebyshev grew a complex-spectrum path -- update the note"

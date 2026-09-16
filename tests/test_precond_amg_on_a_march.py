@@ -133,12 +133,29 @@ def test_the_frozen_wrapper_hands_back_the_applier_untouched():
     assert "amg()" in repr(frozen), "repr feeds the driver's cache key; it must name what was frozen"
 
 
-def test_a_useless_hierarchy_is_refused_at_compose_time():
-    """A preconditioner that AMPLIFIES cannot converge, and inside a march that shows up only as
-    "fgmres did not solve the system" from a debug callback, after the whole trajectory has been
-    traced. On this problem at 4751 dofs the V-cycle makes a random residual 7.5x worse (measured:
-    smoothed aggregation on a tangent carrying `2u grad u . delta u` is not its case), so the march
-    must say so before it starts."""
+def test_amg_now_solves_at_a_size_that_used_to_amplify():
+    """4751 dofs: this march stalled at a 6e-02 relative residual, because the Chebyshev bound for the
+    smoother was taken from a power iteration that had stalled at 0.54*rho and the V-cycle amplified
+    7.5x. With the bound verified (see test_fem_solver_amg.py) the same march solves."""
     fem = _nonlinear_heat(size=0.016, nt=11)
+    got = np.asarray(fem.solve(linear=jno.solve.fgmres(tol=1e-8), precond=jno.precond.amg()).fn())
+    ref = np.asarray(_nonlinear_heat(size=0.016, nt=11).solve().fn())
+    assert np.abs(got - ref).max() < 1e-7, "a preconditioner changed the answer"
+
+
+def test_an_amplifying_preconditioner_is_refused_at_compose_time():
+    """The backstop for what a spectral bound cannot catch -- Chebyshev on a complex spectrum, say.
+    A preconditioner that makes the residual worse cannot converge, and inside a march that surfaces
+    only as "fgmres did not solve the system" from a debug callback, after the whole trajectory has
+    been traced. One probe at compose time says it plainly instead."""
+
+    class _Amplifier:
+        traceable = False  # so the march freezes it, which is where the probe lives
+        name = "amplifier()"
+
+        def materialize(self, _ctx):
+            return lambda v: -10.0 * v
+
+    fem = _nonlinear_heat()
     with pytest.raises(ValueError, match="WORSE"):
-        fem.solve(linear=jno.solve.fgmres(tol=1e-8), precond=jno.precond.amg()).fn()
+        fem.solve(linear=jno.solve.fgmres(tol=1e-8), precond=_Amplifier()).fn()
