@@ -18,7 +18,7 @@ class DirichletBC:
     Essential boundary-condition descriptor for FEM assembly.
 
     Instances are created through `dirichlet(...)` and later normalized by
-    `expand_bcs(...)` during `domain.init_fem(...)`.
+    `expand_bcs(...)` during `domain.init_fem_native(...)`.
 
     Parameters
     ----------
@@ -126,7 +126,7 @@ def dirichlet(tags, values=None):
 
     This is the public helper used in FEM setup, for example:
 
-        domain.init_fem(
+        domain.init_fem_native(
             bcs=[
                 domain.dirichlet("left", 0.0),
                 domain.dirichlet(["bottom", "top"], {"x": 0.0, "y": 1.0}),
