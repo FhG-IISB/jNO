@@ -29,6 +29,57 @@ def _circumradius_2d(P: np.ndarray) -> np.ndarray:
     return a * b * c / (4.0 * np.maximum(area, 1e-300))
 
 
+def _manage_nodes(
+    X: np.ndarray, cells: np.ndarray, h: float, *, long_f: float, short_f: float, max_growth: float
+) -> tuple[np.ndarray, int, int]:
+    """PFEM node management: ``(points, n_inserted, n_removed)``.
+
+    Re-triangulating cannot fix a bad point DISTRIBUTION -- Delaunay already maximises the minimum angle
+    for the points it is given. A body that stretches thins its nodes, and one that merges is left with
+    whatever spacing the two surfaces happened to have, so the mesh degrades however often it is
+    reconnected. Measured on a coalescing drop with reconnection alone: the smallest angle fell from 41.5
+    to 8.3 degrees and the largest cell grew to 57x the smallest, with the slivers lined up along the
+    plane where the two bodies joined. So nodes are added and dropped, as PFEM does:
+
+    * an edge longer than ``long_f * h`` gains its MIDPOINT. On a boundary edge that midpoint lies on the
+      straight edge itself, so the polygon -- and the liquid area -- is unchanged;
+    * an INTERIOR node closer than ``short_f * h`` to another node is dropped. Boundary nodes are never
+      dropped: removing one cuts a corner off the body and loses liquid.
+
+    ``max_growth`` caps insertion per call (as a fraction of the node count) so a stretching body cannot
+    grow its mesh without bound; the longest edges are served first.
+    """
+    from scipy.spatial import cKDTree
+
+    from .fem_adapt import _boundary_edges_from_triangles
+
+    on_bnd = np.zeros(X.shape[0], dtype=bool)
+    on_bnd[np.asarray(_boundary_edges_from_triangles(cells)).reshape(-1)] = True
+
+    edges = np.unique(np.sort(np.concatenate([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]), axis=1), axis=0)
+    length = np.linalg.norm(X[edges[:, 0]] - X[edges[:, 1]], axis=1)
+    too_long = np.flatnonzero(length > long_f * h)
+    if too_long.size:
+        budget = max(1, int(max_growth * X.shape[0]))
+        if too_long.size > budget:  # serve the worst offenders first
+            too_long = too_long[np.argsort(-length[too_long])[:budget]]
+    fresh = 0.5 * (X[edges[too_long, 0]] + X[edges[too_long, 1]])
+
+    drop: set[int] = set()
+    if short_f > 0.0:
+        for i, j in cKDTree(X).query_pairs(short_f * h, output_type="ndarray"):
+            if i in drop or j in drop:
+                continue
+            if not on_bnd[i]:
+                drop.add(int(i))
+            elif not on_bnd[j]:
+                drop.add(int(j))  # both on the boundary: keep them, or the surface would move
+    keep = np.ones(X.shape[0], dtype=bool)
+    if drop:
+        keep[list(drop)] = False
+    return np.concatenate([X[keep], fresh]) if fresh.size else X[keep], int(fresh.shape[0]), len(drop)
+
+
 def alpha_reconnect(
     points: np.ndarray,
     h: float,
@@ -36,8 +87,17 @@ def alpha_reconnect(
     *,
     previous: np.ndarray | None = None,
     hysteresis: float = 1.5,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Re-triangulate ``points`` and keep the alpha shape: ``(cells (n_cells, 3), boundary edges (n_b, 2))``.
+    manage: bool = True,
+    long_f: float = 1.5,
+    short_f: float = 0.55,
+    max_growth: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Re-triangulate ``points`` and keep the alpha shape: ``(points, cells (n, 3), boundary edges (n_b, 2))``.
+
+    ``points`` comes back because ``manage=True`` (the default) also INSERTS and DROPS nodes -- see
+    :func:`_manage_nodes`, which is what keeps the elements usable rather than merely optimally connected.
+    When the node set is unchanged the array is returned as it came in, and a caller carrying a P1 state
+    by identity can check that; when it changes, the state has to be interpolated from the old mesh.
 
     ``h`` is the mesh's length scale (its mean edge length) and ``alpha`` the filter: a triangle is kept
     when its circumradius is below ``alpha * h``. A regular triangle of side ``h`` has circumradius
@@ -71,15 +131,26 @@ def alpha_reconnect(
         raise ValueError(
             f"alpha reconnection: hysteresis widens the threshold for existing cells, so it must be >= 1; got {hysteresis}."
         )
-    cells = Delaunay(X).simplices
-    radius = _circumradius_2d(X[cells])
-    keep = radius < alpha * h
-    if previous is not None and np.asarray(previous).size:
-        # A cell already in use survives up to the wider threshold -- see the docstring on flicker.
-        held = {tuple(c) for c in np.sort(np.asarray(previous, dtype=np.int64), axis=1)}
-        existing = np.fromiter((tuple(c) in held for c in np.sort(cells, axis=1)), dtype=bool, count=cells.shape[0])
-        keep |= existing & (radius < hysteresis * alpha * h)
-    cells = cells[keep]
+
+    def _filter(pts: np.ndarray, prev: np.ndarray | None) -> np.ndarray:
+        cells = Delaunay(pts).simplices
+        radius = _circumradius_2d(pts[cells])
+        keep = radius < alpha * h
+        if prev is not None and np.asarray(prev).size:
+            # A cell already in use survives up to the wider threshold -- see the docstring on flicker.
+            held = {tuple(c) for c in np.sort(np.asarray(prev, dtype=np.int64), axis=1)}
+            existing = np.fromiter((tuple(c) in held for c in np.sort(cells, axis=1)), dtype=bool, count=cells.shape[0])
+            keep |= existing & (radius < hysteresis * alpha * h)
+        return cells[keep]
+
+    cells = _filter(X, previous)
+    if manage:
+        moved, n_new, n_gone = _manage_nodes(X, cells, h, long_f=long_f, short_f=short_f, max_growth=max_growth)
+        if n_new or n_gone:
+            # The node numbering has changed, so `previous` no longer names the same cells: this pass runs
+            # on the plain threshold. Node management is occasional, so the hysteresis that steadies the
+            # ordinary steps is not lost in practice.
+            X, cells = moved, _filter(moved, None)
     t = X[cells]
     p, q = t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]
     flip = (p[:, 0] * q[:, 1] - p[:, 1] * q[:, 0]) < 0.0
@@ -93,7 +164,7 @@ def alpha_reconnect(
             f"-- free particles, further than about {alpha} h from the rest. They would be dropped and every "
             "other node renumbered, silently permuting the state. Raise alpha, or refine where the body thins."
         )
-    return cells.astype(np.int64), np.asarray(_boundary_edges_from_triangles(cells), dtype=np.int64)
+    return X, cells.astype(np.int64), np.asarray(_boundary_edges_from_triangles(cells), dtype=np.int64)
 
 
 def n_components(n_points: int, cells: np.ndarray) -> int:

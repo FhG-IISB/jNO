@@ -74,9 +74,13 @@ def test_two_drops_in_a_void_merge_into_one_body():
     assert bodies[1] == 2, f"merged immediately -- the gap started below the threshold ({bodies})"
     assert bodies[bodies.index(1) :] == [1] * (len(bodies) - bodies.index(1))
     assert any(h["remeshed"] for h in fem.adapt_history), "nothing reconnected"
+    # Reconnection keeps the nodes it is given, but it also INSERTS and DROPS them as the body deforms
+    # (PFEM node management), so the count moves. What must hold is that the state tracks the mesh: this
+    # problem carries one scalar per node, on every frame, however the node set has changed.
     n0 = len(np.asarray(traj.meshes[0][0]))
-    assert all(len(np.asarray(m[0])) == n0 for m in traj.meshes), "reconnection kept every node"
-    assert all(np.asarray(s).shape == np.asarray(traj.states[0]).shape for s in traj.states)
+    for m, s in zip(traj.meshes, traj.states):
+        assert np.asarray(s).reshape(-1).size == len(np.asarray(m[0])), "state and mesh disagree"
+    assert 0.6 * n0 < len(np.asarray(traj.meshes[-1][0])) < 1.8 * n0, "the node count ran away"
 
 
 def test_the_field_diffuses_across_the_new_neck():

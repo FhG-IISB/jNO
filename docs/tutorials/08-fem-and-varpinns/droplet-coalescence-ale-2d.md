@@ -44,28 +44,42 @@ traj = fem.solve(nonlinear=jno.solve.newton(direct=True),
 `alpha=` re-triangulates the **nodes** — a Delaunay triangulation filtered to the triangles whose
 circumradius is below $\alpha h$, the alpha shape of the Particle Finite Element Method. When the gap
 between two bodies closes below about $2\alpha h$, the bridging triangles survive the filter and two meshes
-become one. Every node stays where it is, so the P1 state carries across **by identity**.
+become one.
+
+Re-triangulating is not enough on its own, though, and the reason is worth knowing: Delaunay already
+maximises the smallest angle **for the points it is given**, so it cannot repair a bad point *distribution*.
+A body that stretches thins its nodes; one that merges inherits whatever spacing the two surfaces happened
+to have. Left alone, this run degraded from a 41.5° smallest angle to 8.3°, with the largest cell 57× the
+smallest and the slivers lined up along the plane where the drops joined. So nodes are inserted and dropped
+as well — an edge longer than $1.5h$ gains its midpoint (on a boundary edge that midpoint lies *on* the
+edge, so the liquid area is untouched), and an interior node crowding within $0.55h$ of another is removed,
+never a boundary node. With that, the smallest angle stays above **18.6°** for the whole run and no cell
+ends below 20°, for 8 % more nodes.
+
+When the node set is unchanged the P1 state carries across **by identity**; when nodes are inserted or
+dropped it is interpolated from the old mesh, the same transfer a remesh uses.
 
 ## What it produces
 
-246 nodes, 738 dofs, 300 steps — 1.06 capillary times $t_\sigma=\sqrt{\rho R^3/\sigma}$, in about 9 minutes
-on this machine (CPU), with **124 reconnections**.
+300 steps — 1.06 capillary times $t_\sigma=\sqrt{\rho R^3/\sigma}$ — in about 10 minutes on this machine
+(CPU), with **130 reconnections** and the mesh growing from 246 to 266 nodes.
 
-| $t/t_\sigma$ | bodies | area | width | height | neck |
-|---|---|---|---|---|---|
-| 0.00 | **2** | 0.24972 | 0.820 | 0.400 | 0.078 |
-| 0.27 | **1** | 0.25911 | 0.817 | 0.392 | 0.304 |
-| 0.53 | 1 | 0.25892 | 0.806 | 0.388 | 0.388 |
-| 1.06 | 1 | 0.25798 | 0.783 | 0.499 | 0.499 |
+| $t/t_\sigma$ | bodies | area | width | height | neck | surface | nodes |
+|---|---|---|---|---|---|---|---|
+| 0.00 | **2** | 0.24972 | 0.820 | 0.400 | 0.078 | 2.509 | 246 |
+| 0.27 | **1** | 0.25915 | 0.816 | 0.390 | 0.300 | 2.113 | 255 |
+| 0.53 | 1 | 0.25898 | 0.804 | 0.387 | 0.387 | 2.044 | 258 |
+| 1.06 | 1 | 0.25873 | 0.782 | 0.508 | 0.508 | 1.948 | 266 |
 
-The neck opens from 0.078 to 0.499 — as tall as the drop itself — and the free surface shrinks from 2.509
-to 1.950, which is what surface tension is for. Peak speed is 9.5, against the capillary velocity
-$\sqrt{\sigma/\rho R}=7.07$.
+The neck opens from 0.078 to 0.508 — as tall as the drop itself — and the free surface shrinks from 2.509
+to 1.948, which is what surface tension is for. Peak speed is 9.5, against the capillary velocity
+$\sqrt{\sigma/\rho R}=7.07$. The surface never lengthens in a single step (worst change **+0.00 %**), so
+nothing is being bitten out of it.
 
 Area is **two** statements, and conflating them would flatter the scheme. Merging *adds* liquid: the bridge
-fills the 0.02 gap the drops left between them, +3.3 % here and nearly all of it in the first few steps.
+fills the 0.02 gap the drops left between them, +3.6 % here and nearly all of it in the first few steps.
 That is the contact model, not an error in the solver. What the solver owes is conservation once the
-topology has settled, and there it holds to **−0.44 %** from just after the merge to the end, across 124
+topology has settled, and there it holds to **−0.16 %** from just after the merge to the end, across 130
 re-triangulations that each rebuild the problem.
 
 ![Two drops merging, speed on the mesh each step ran on](/jNO/assets/droplet_coalescence_ale_2d.png)
@@ -101,12 +115,12 @@ on. The drops start at rest; the flow is fastest near the neck as it opens.*
   ($\approx 2\alpha h$), not by resolving film drainage. A larger $\alpha$ merges earlier and adds area
   through wider bridges: at $1.06\,t_\sigma$ the liquid has grown +3.3 % at $\alpha=1.2$, +3.6 % at 1.6 and
   +6.4 % at 2.2 — most of it the bridge that fills the initial 0.02 gap.
-- **The filter can still flicker.** Re-deciding every cell each step makes a triangle sitting near
-  $\alpha h$ drop out and return, so the surface loses and regains wedges. `alpha_reconnect` holds an
-  existing cell to a wider threshold (hysteresis), which removes most of it: over 300 steps the worst
-  one-step change in surface length falls from +25 % to +13 %, and the events from many to **2**. Those
-  two remain because a Delaunay edge flip creates triangles that are *new*, and a new triangle faces
-  $\alpha$ alone. Node insertion — which real PFEM does, and this does not — is what would close it.
+- **Two mechanisms keep the filter steady, and both are needed.** Re-deciding every cell each step makes a
+  triangle sitting near $\alpha h$ drop out and return, so the surface loses and regains wedges: with one
+  threshold and no node management, the worst one-step change in surface length was **+25 %**. Holding an
+  existing cell to a wider threshold (hysteresis) brought that to +13 % over 2 steps of 300; adding node
+  insertion and removal brought it to **+0.00 %**, because the edges that sat near the threshold are the
+  over-long ones that now get split.
 - **2-D and P1 only.** Reconnection refuses P2 — a new edge bridging two bodies has its midpoint in the void
   — and 3-D, where Delaunay plus an alpha filter leaves sliver tetrahedra.
 

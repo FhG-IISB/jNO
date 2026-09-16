@@ -5641,15 +5641,23 @@ def run_mesh_motion(
                 # `previous=` is what stops the filter FLICKERING: a cell already in use is held until it
                 # exceeds a wider threshold, so the free surface does not lose and regain wedges from one
                 # step to the next (measured: the perimeter swung +22 % and back -18 % without it).
-                new_cells, new_bf = alpha_reconnect(X_now, _budget[3], float(_cond.alpha), previous=shared_cells)
-                _same = new_cells.shape == shared_cells.shape and np.array_equal(
-                    np.sort(np.sort(new_cells, axis=1), axis=0), np.sort(np.sort(shared_cells, axis=1), axis=0)
+                new_pts, new_cells, new_bf = alpha_reconnect(X_now, _budget[3], float(_cond.alpha), previous=shared_cells)
+                _nodes_changed = new_pts.shape != X_now.shape or not np.array_equal(new_pts, X_now)
+                _same = (
+                    not _nodes_changed
+                    and new_cells.shape == shared_cells.shape
+                    and np.array_equal(
+                        np.sort(np.sort(new_cells, axis=1), axis=0), np.sort(np.sort(shared_cells, axis=1), axis=0)
+                    )
                 )
                 if _same:
-                    continue  # the same elements: nothing to rebuild
+                    continue  # the same elements on the same nodes: nothing to rebuild
                 history[-1]["remeshed"] = True
-                _domain_from_arrays(d, X_now, new_cells, new_bf, copy=False)
-                _carry = "identity"
+                _domain_from_arrays(d, new_pts, new_cells, new_bf, copy=False)
+                # Nodes kept: the P1 state already IS the state on the new mesh. Nodes inserted or dropped
+                # (PFEM node management, which is what keeps the elements usable): it has to be carried the
+                # way a remesh carries it, each old field read at the new DOF points.
+                _carry = "interpolate" if _nodes_changed else "identity"
             else:
                 margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
                 if not (margin > 0.0).any():

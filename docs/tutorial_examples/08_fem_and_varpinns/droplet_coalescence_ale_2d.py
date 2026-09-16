@@ -12,8 +12,15 @@ with w the MESH velocity and D(u) the symmetric gradient. Two things make the to
 The surface rides with the fluid, written as geometry terms `xs.d(ts) - u`, so `jno.fem` marches the mesh
 and the flow together. And `remesh(alpha=...)` re-decides which nodes form elements each step -- the alpha
 shape of the Particle Finite Element Method -- so when the gap between two bodies closes below ~2 alpha h,
-the bridging triangles survive the filter and two meshes become one. Every node stays where it is, so the
-P1 state carries across by identity.
+the bridging triangles survive the filter and two meshes become one.
+
+Re-connecting alone is not enough: Delaunay already maximises the smallest angle FOR THE POINTS IT IS
+GIVEN, so it cannot repair a point distribution that the motion has ruined. Without node management this
+run fell from a 41.5 degree smallest angle to 8.3, the largest cell reaching 57x the smallest, the slivers
+lined up along the plane where the drops joined. So `alpha=` also inserts a midpoint on any edge longer
+than 1.5 h and drops interior nodes that crowd within 0.55 h -- never boundary nodes, which would cut
+liquid away. The smallest angle then holds above 18.6 degrees for 8 % more nodes. Where the node set is
+unchanged the P1 state carries by identity; where it changes it is interpolated from the old mesh.
 
 Three details are not optional, and each is measured in the tests:
 
@@ -213,9 +220,16 @@ plt.rcParams.update(
         "axes.titleweight": "light",
     }
 )
-off = [int(o) for o in fem.offsets]
 frames = (0, last // 2, last)
-speeds = [np.linalg.norm(np.asarray(traj.states[k])[off[0] : off[1]].reshape(-1, 2), axis=1) for k in frames]
+# Each frame has its OWN layout: node management inserts and drops nodes, so the velocity block does not
+# sit at the same offsets from one frame to the next. `fem.offsets` is only the LAST problem's.
+speeds = [
+    np.linalg.norm(
+        np.asarray(traj.states[k])[int(traj.layouts[k]["offsets"][0]) : int(traj.layouts[k]["offsets"][1])].reshape(-1, 2),
+        axis=1,
+    )
+    for k in frames
+]
 v_max = float(max(s.max() for s in speeds))  # one scale for all three panels, so they are comparable
 fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.7))
 for ax, k, speed in zip(axes, frames, speeds):
