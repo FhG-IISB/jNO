@@ -45,6 +45,30 @@ def test_the_nodes_are_kept_and_the_cells_are_counter_clockwise():
     assert area.sum() == pytest.approx(2.0 + 0.15, rel=1e-12)  # the two squares plus the bridged gap
 
 
+def test_hysteresis_holds_a_bridge_that_a_fresh_filter_would_drop():
+    """A march re-decides the triangulation every step, so a cell sitting near ``alpha h`` would drop out
+    and come back -- the surface flickering wedges in and out. An existing cell is therefore held to a
+    wider threshold: here the bodies stay joined as the gap widens past the merge threshold."""
+    g_star = H * np.sqrt(4.0 * ALPHA**2 - 1.0)
+    merged, _ = alpha_reconnect(_two_squares(0.98 * g_star), H, ALPHA)
+    wider = _two_squares(1.05 * g_star)  # a gap a fresh filter would NOT bridge
+    assert n_components(len(wider), alpha_reconnect(wider, H, ALPHA)[0]) == 2
+    held, _ = alpha_reconnect(wider, H, ALPHA, previous=merged)
+    assert n_components(len(wider), held) == 1, "hysteresis did not hold the existing bridge"
+
+
+def test_hysteresis_still_lets_a_far_cell_go():
+    """It widens the threshold; it does not disable it. A gap well beyond `hysteresis * alpha * h` splits."""
+    far = _two_squares(4.0 * H * np.sqrt(4.0 * ALPHA**2 - 1.0))
+    merged, _ = alpha_reconnect(_two_squares(0.5 * H), H, ALPHA)
+    assert n_components(len(far), alpha_reconnect(far, H, ALPHA, previous=merged)[0]) == 2
+
+
+def test_a_hysteresis_below_one_is_refused():
+    with pytest.raises(ValueError, match="must be >= 1"):
+        alpha_reconnect(_two_squares(0.15), H, ALPHA, hysteresis=0.9)
+
+
 def test_a_free_particle_is_refused():
     X = np.concatenate([_two_squares(0.15), [[5.0, 5.0]]])
     with pytest.raises(ValueError, match="in no triangle"):

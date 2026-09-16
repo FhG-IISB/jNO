@@ -5638,7 +5638,10 @@ def run_mesh_motion(
                 # 2*alpha*h are bridged here -- this is where a topology change happens.
                 from .reconnect import alpha_reconnect
 
-                new_cells, new_bf = alpha_reconnect(X_now, _budget[3], float(_cond.alpha))
+                # `previous=` is what stops the filter FLICKERING: a cell already in use is held until it
+                # exceeds a wider threshold, so the free surface does not lose and regain wedges from one
+                # step to the next (measured: the perimeter swung +22 % and back -18 % without it).
+                new_cells, new_bf = alpha_reconnect(X_now, _budget[3], float(_cond.alpha), previous=shared_cells)
                 _same = new_cells.shape == shared_cells.shape and np.array_equal(
                     np.sort(np.sort(new_cells, axis=1), axis=0), np.sort(np.sort(shared_cells, axis=1), axis=0)
                 )
