@@ -1079,15 +1079,21 @@ def _freeze_precond_for_march(precond, fem, block):
     """
     if precond is None:
         return None
-    if all(bool(getattr(s, "traceable", True)) for s in _specs_in(precond)):
+    # Only a LEAF decides this. A block container (`triangular`, `block_diag`) inherits the base
+    # `traceable = False`, but it assembles nothing itself -- freezing a tree of jacobi leaves because
+    # of its wrapper took a configuration that worked (measured 0.18 s/step on the melt pool's T+w) and
+    # refused it at the probe, since a block-triangular applier is not required to reduce a full
+    # residual in one application the way a V-cycle is.
+    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
+    if all(bool(getattr(s, "traceable", True)) for s in leaves):
         return precond  # nothing here needs a concrete matrix -- leave the per-linearization path alone
 
     name = getattr(precond, "name", type(precond).__name__)
-    if block.jacobian is None or block.mass is None:
+    if block.jacobian is None or (block.mass is None and block.mass_residual_jac is None):
         raise TypeError(
             f"fem.solve(precond={name}): this preconditioner needs an assembled matrix, and this march "
-            "cannot offer one -- its block carries no (mass, jacobian) pair to form the step tangent from "
-            "(a state-dependent mass is the usual reason). Use a traceable preconditioner "
+            "cannot offer one -- its block carries neither a mass matrix nor an assembled mass-residual "
+            "Jacobian to form the step tangent from. Use a traceable preconditioner "
             "(jno.precond.jacobi()), or pre-build this one yourself with spec.build(A)."
         )
     if block.state0 is None or block.dt is None:
@@ -1098,9 +1104,27 @@ def _freeze_precond_for_march(precond, fem, block):
         )
     theta = float((block.metadata or {}).get("theta", 1.0))
     t0 = float((block.metadata or {}).get("t0", 0.0))
-    J = block.jacobian(block.state0, t0, None)
-    M = block.mass(t0, None)
     dt = float(block.dt)
+    J = block.jacobian(block.state0, t0, None)
+    if block.mass is None:
+        # STATE-DEPENDENT mass (``c(u) u_t``, e.g. an enthalpy-porosity heat capacity): there is no mass
+        # MATRIX, the mass action lives in a residual whose Jacobian is assembled per state, and the step
+        # tangent is ``J_spatial + J_mass/dt`` -- the same combination `SemidiscreteTimeBlock.step` forms.
+        # ``mass_residual_jac`` reads the previous state off the load-path channel, so it is delivered
+        # here exactly as the stepper delivers it, from the initial state.
+        _lp: dict = {}
+        _u0 = jnp.asarray(block.state0).reshape(-1)
+        for _fid, _s0, _s1, _vec in (block.metadata or {}).get("prev_state_slices", []):
+            _slice = _u0[_s0:_s1]
+            _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
+        J_mass = block.mass_residual_jac(block.state0, t0, {"__loadpath__": _lp})
+        A_rep = _add_step_operator(J, J_mass, 1.0 / dt)
+        op = LinearOperator(A_rep)
+        prepare_precond(precond, fem)
+        applier = materialize_precond(precond, PrecondContext(op, fem))
+        _refuse_a_useless_applier(applier, A_rep, name)
+        return _FrozenMarchPrecond(applier, precond)
+    M = block.mass(t0, None)
     A_rep = _add_step_operator(M, J, theta * dt)
     op = LinearOperator(A_rep)
     prepare_precond(precond, fem)

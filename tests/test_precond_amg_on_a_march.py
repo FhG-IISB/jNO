@@ -159,3 +159,49 @@ def test_an_amplifying_preconditioner_is_refused_at_compose_time():
     fem = _nonlinear_heat()
     with pytest.raises(ValueError, match="WORSE"):
         fem.solve(linear=jno.solve.fgmres(tol=1e-8), precond=_Amplifier()).fn()
+
+
+def _nonlinear_mass_heat(size=0.16, nt=5):
+    """``c(u) u_t = div(grad u)``: a STATE-DEPENDENT mass. There is no mass MATRIX at all -- the mass
+    action lives in a residual whose Jacobian is assembled per state -- which is the shape a latent-heat
+    (enthalpy-porosity) melt pool takes, where its heat capacity depends on temperature."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain(time=(0.0, 0.04, nt))
+    u, v = d.fem_symbols(order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    x0, y0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ic = jno.fn(lambda x, y: jnp.sin(np.pi * x) * jnp.sin(np.pi * y), [x0, y0])
+    fem = jno.fem([(1.0 + ui * ui) * ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(x0, y0) - ic])
+    return fem
+
+
+def test_amg_preconditions_a_march_whose_mass_depends_on_the_state():
+    """The step tangent is ``J_spatial + J_mass/dt`` there, not ``M + theta*dt*J``: asking such a block
+    for a mass matrix got None and refused the preconditioner by name. Found on the melt pool, whose
+    heat capacity carries the latent heat."""
+    fem = _nonlinear_mass_heat()
+    assert fem._op.mass is None and fem._op.mass_residual is not None, "this test needs the nonlinear-mass path"
+    got = np.asarray(fem.solve(linear=jno.solve.fgmres(tol=1e-10), precond=jno.precond.amg()).fn())
+    ref = np.asarray(_nonlinear_mass_heat().solve().fn())
+    assert np.abs(got - ref).max() < 1e-8, "a preconditioner changed the answer"
+
+
+def test_a_block_of_traceable_specs_is_not_frozen():
+    """`triangular`/`block_diag` assemble nothing themselves, so a tree whose LEAVES are all traceable
+    must keep the per-linearisation path. Freezing it on the container's own flag then refused it at the
+    probe -- a block-triangular applier need not reduce a full residual in one application the way a
+    V-cycle does -- which broke a melt-pool configuration measured at 0.15 s/step."""
+    fem0 = _nonlinear_heat()
+    ref = np.asarray(fem0.solve().fn())
+    fem1 = _nonlinear_heat()
+    u = fem1.domain.fem_symbols(order=1)[0]
+    got = np.asarray(
+        fem1.solve(
+            nonlinear=jno.solve.newton(direct=True),
+            linear=jno.solve.fgmres(tol=1e-10),
+            precond=jno.precond.block_diag((0, jno.precond.jacobi())),
+        ).fn()
+    )
+    assert np.abs(got - ref).max() < 1e-8
+    del u
