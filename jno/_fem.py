@@ -2385,6 +2385,15 @@ class FEM:
                     "For a fixed graded mesh instead, put the refinement in the geometry: "
                     "`shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
                 )
+            if getattr(adapt, "alpha", None) is not None:
+                # `alpha=` re-triangulates the MOVED nodes. Without a geometry term nothing moves them,
+                # so there is nothing to reconnect -- and the flag would otherwise fall through to an
+                # ordinary remesh, which is a different operation (new nodes, no topology change).
+                raise NotImplementedError(
+                    "jno.solve.remesh(alpha=...) re-triangulates the nodes a MOVING mesh has carried, so "
+                    "that bodies which come within about 2*alpha*h merge. This problem has no geometry "
+                    "term, so nothing moves the nodes: add one (`coord.d(t) - velocity`), or drop alpha=."
+                )
             if getattr(adapt, "enrich", False):
                 # p-adaptivity: raise the local order by switching interpolation covers on at the marked
                 # NODES. The mesh -- points, cells, connectivity -- is untouched, so the DOF *nodes* are

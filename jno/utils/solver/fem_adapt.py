@@ -2548,6 +2548,17 @@ class AdaptSpec:
     hmin: float | None = None
     hmax: float | None = None
     every: int = 5
+    alpha: float | None = None
+    """**Moving meshes only**: re-triangulate the moved NODES every ``every`` steps and keep the
+    triangles whose circumradius is below ``alpha`` x the starting mean edge length -- the alpha shape.
+
+    This is the remeshing step of the Particle Finite Element Method (Idelsohn, Oñate & Del Pin, IJNME
+    61 (2004) 964-989; alpha shapes: Edelsbrunner & Mücke, ACM TOG 13 (1994) 43-72). Unlike the mesher,
+    it keeps every node where the motion left it and only re-decides which nodes form elements -- so the
+    TOPOLOGY can change: two bodies whose gap closes below about ``2 alpha h`` become one mesh, which is
+    how droplets meshed as separate bodies in a void merge. What :func:`jno.solve.remesh` sets from
+    ``alpha=``.
+    """
     metric_field: int = 0
     criterion: Any = None
     """Refine on a **traced expression** instead of the recovery error estimator.
@@ -5005,11 +5016,18 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
 def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
     """The ``adapt=`` spec of a moving-mesh march, validated -- or ``None`` without one.
 
-    On a moving mesh ``adapt=`` means one thing: rebuild the mesh when a mesh-geometry CONDITION breaks
-    (``jno.le(d.cell_aspect(), 3.0)``), checked on the moved vertices between chunks of the march. The
-    rest is refused by name rather than run as something else:
+    On a moving mesh ``adapt=`` means one of two things, checked between chunks of the march:
 
-    * another adapt kind, or a remesh without a condition (it would remesh on the solution);
+    * ``remesh(criterion=<mesh-geometry condition>)`` -- rebuild the mesh (new nodes, same topology)
+      when the condition breaks on the moved vertices, e.g. ``jno.le(d.cell_aspect(), 3.0)``;
+    * ``remesh(alpha=...)`` -- RECONNECT: keep every node where the motion left it and re-decide which
+      of them form elements (the alpha shape). The topology may change, which is how two bodies that
+      come within about ``2 alpha h`` merge.
+
+    The rest is refused by name rather than run as something else:
+
+    * another adapt kind, or a remesh with neither a condition nor ``alpha`` (it would remesh on the
+      solution);
     * a law reading a region a remesh cannot re-derive. Vertex ids do not survive a remesh; the whole
       ``boundary`` (the topological boundary) and ``interior`` re-derive from the new mesh, but any other
       region is a positional predicate or a distance to the SEED facets, which names the wrong vertices
@@ -5030,22 +5048,37 @@ def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
     kind = next((name for flag, name in kinds.items() if getattr(adapt, flag, False)), None)
     if kind is not None:
         raise NotImplementedError(head + f"jno.solve.{kind} is not supported with a geometry term.")
-    if adapt.criterion is None:
-        raise NotImplementedError(
-            head + "A remesh with no criterion remeshes on the solution every few steps, which a moving mesh "
-            "does not support."
-        )
-    saved = list(getattr(d, "_trainable_coords", None) or [])
-    d._trainable_coords = []  # the condition asks about the mesh itself, not about coordinate parameters
-    try:
-        crit = _resolve_criterion(adapt.criterion, d)
-    finally:
-        d._trainable_coords = saved
-    if not isinstance(crit, Constraint) or not _criterion_is_geometric(crit.residual):
-        raise NotImplementedError(
-            head + "This criterion is not one: a plain expression only ranks cells, and a condition on the "
-            "solution says nothing about whether the moved elements are still fit to march on."
-        )
+    if adapt.alpha is not None:
+        # RECONNECT: the trigger is the cadence `every`, not a condition -- the point is to re-decide the
+        # elements often enough to catch a gap as it closes, and the filter itself decides what survives.
+        if int(d.dimension) != 2:
+            raise NotImplementedError(
+                f"jno.solve.remesh(alpha=...) is 2-D only; this domain is {int(d.dimension)}-D. In 3-D the "
+                "Delaunay + alpha filter leaves sliver tetrahedra, a known PFEM problem needing its own fix."
+            )
+        if adapt.criterion is not None:
+            raise NotImplementedError(
+                "jno.solve.remesh(alpha=..., criterion=...): reconnection (re-triangulating the moved nodes) "
+                "and a condition-triggered remesh (meshing the geometry afresh) are different operations, "
+                "and combining them is not supported. Use one per solve."
+            )
+    else:
+        if adapt.criterion is None:
+            raise NotImplementedError(
+                head + "A remesh with neither a criterion nor alpha= remeshes on the solution every few "
+                "steps, which a moving mesh does not support."
+            )
+        saved = list(getattr(d, "_trainable_coords", None) or [])
+        d._trainable_coords = []  # the condition asks about the mesh itself, not about coordinate parameters
+        try:
+            crit = _resolve_criterion(adapt.criterion, d)
+        finally:
+            d._trainable_coords = saved
+        if not isinstance(crit, Constraint) or not _criterion_is_geometric(crit.residual):
+            raise NotImplementedError(
+                head + "This criterion is not one: a plain expression only ranks cells, and a condition on "
+                "the solution says nothing about whether the moved elements are still fit to march on."
+            )
     for term in fem._geometry:
         law = _unretagged(term)
         coord = mesh_velocity(law)[0]
@@ -5254,7 +5287,19 @@ def run_mesh_motion(
     except NotImplementedError as _e:
         raise NotImplementedError(f"jno.fem: a geometry term needs a nodal-Lagrange assembly. {_e}") from _e
     off = [int(x) for x in layout["offsets"]]
-    if _resume is not None:
+    if _cond is not None and _cond.alpha is not None and any(int(o) != 1 for o in layout["orders"]):
+        raise NotImplementedError(
+            "jno.solve.remesh(alpha=...) carries the state across a reconnection by identity -- every node "
+            "stays where it is, so every P1 value is still its own. A P2 (or higher) field has DOFs on the "
+            f"EDGES, and reconnection makes new ones: this problem has orders {list(layout['orders'])}, and a "
+            "new edge bridging two bodies has its midpoint in the void, where no old element can be read. "
+            "Use P1 fields (a stabilised equal-order pair for flow)."
+        )
+    if _resume is not None and _resume.get("carry") == "identity":
+        # After a RECONNECTION the node set is unchanged, in the same order -- only the elements differ --
+        # so a P1 state is already the state on the new mesh. Nothing to interpolate, nothing to lose.
+        state = jnp.asarray(_resume["old"][2])
+    elif _resume is not None:
         # A segment after a remesh: carry the state the previous segment ended with across the change of
         # mesh -- each old field evaluated at its new DOF points with its own element basis (the transfer
         # the transient remesher uses). `_l2_transfer_jax` cannot: it shares one cell array between meshes.
@@ -5368,6 +5413,7 @@ def run_mesh_motion(
                 _cond.hmin if _cond.hmin is not None else _h0 / 50.0,
                 _cond.hmax if _cond.hmax is not None else 2.0 * _h0,
                 float(_cond.max_dofs) if _cond.max_dofs is not None else float(n_verts),
+                _h0,  # the STARTING length scale: the alpha filter's threshold must not drift as cells stretch
             )
         else:
             _budget = _resume["budget"]
@@ -5586,15 +5632,32 @@ def run_mesh_motion(
                 break
             X_now = np.asarray(carry[1])
             move_mesh(d, X_now - np.asarray(d.mesh.points)[:, :dim], copy=False, check=False)
-            margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
-            if not (margin > 0.0).any():
-                continue
-            history[-1]["remeshed"] = True
-            marked = np.flatnonzero(margin > 0.0).astype(np.int64)
-            size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
-            remesh_with_mmg(
-                d, _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]), copy=False
-            )
+            if _cond.alpha is not None:
+                # RECONNECT: re-decide which nodes form elements, keeping every node where the motion
+                # left it (so a P1 state carries by identity). Bodies whose gap has closed below about
+                # 2*alpha*h are bridged here -- this is where a topology change happens.
+                from .reconnect import alpha_reconnect
+
+                new_cells, new_bf = alpha_reconnect(X_now, _budget[3], float(_cond.alpha))
+                _same = new_cells.shape == shared_cells.shape and np.array_equal(
+                    np.sort(np.sort(new_cells, axis=1), axis=0), np.sort(np.sort(shared_cells, axis=1), axis=0)
+                )
+                if _same:
+                    continue  # the same elements: nothing to rebuild
+                history[-1]["remeshed"] = True
+                _domain_from_arrays(d, X_now, new_cells, new_bf, copy=False)
+                _carry = "identity"
+            else:
+                margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
+                if not (margin > 0.0).any():
+                    continue
+                history[-1]["remeshed"] = True
+                marked = np.flatnonzero(margin > 0.0).astype(np.int64)
+                size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
+                remesh_with_mmg(
+                    d, _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]), copy=False
+                )
+                _carry = "interpolate"
             for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
                 d.tag(_name, _pred)
             d.__dict__.pop("_gauge_pin_coords", None)  # same reason as every other rebuild in this file
@@ -5618,6 +5681,7 @@ def run_mesh_motion(
                     "start": _start + i,
                     "old": (X_now, shared_cells, np.asarray(carry[0]), layout),
                     "budget": _budget,
+                    "carry": _carry,
                 },
                 **kwargs,
             )

@@ -318,6 +318,41 @@ configuration. Measured (`tests/test_fem_ale_mesh_velocity.py`):
 Taylor–Hood pressure qualifies). Refused by name: `coord.d(t)` with no geometry term (it would be identically
 zero), the rate of a normal or of `cell_size`, and the mesh acceleration `xi.d(ti).d(ti)`.
 
+### Bodies that merge — `remesh(alpha=...)`
+
+Moving a mesh cannot change its topology: two droplets meshed as separate bodies in a void can approach
+forever and stay two meshes. `alpha=` re-decides which nodes form elements, instead of meshing the geometry
+afresh — a Delaunay triangulation of the nodes where the motion left them, keeping only the triangles whose
+circumradius is below `alpha` × the starting mean edge length (the **alpha shape**, the remeshing step of the
+Particle Finite Element Method):
+
+```python
+traj = fem.solve(adapt=jno.solve.remesh(alpha=1.2, every=1))   # re-triangulate the nodes every step
+```
+
+Every node stays put, so a P1 state carries across **by identity** — nothing is interpolated and nothing is
+lost. What changes is which nodes are neighbours, so a gap that closes gets bridged and the two bodies become
+one mesh.
+
+!!! measured "Two disks (R = 0.5, h = 0.075, 357 nodes) driven together"
+    | gap | 0.35 → 0.150 | 0.136 |
+    |---|---|---|
+    | bodies | 2 | **1** |
+
+    They merge at about `1.8 h`, a little later than the flat-wall threshold `2·alpha·h = 0.18`: two facing
+    arcs put fewer nodes near the closest point than two straight walls do. The node count is unchanged
+    (357), the cell count goes 630 → 638, and the field — two flat plateaus at ∓1 — starts to diffuse across
+    the new neck (minimum |u| there 0.479, against 0.972 when the bodies never merge). Only 2 of 12 steps
+    actually rebuilt anything: the reconnection is skipped when it reproduces the elements already there.
+    The march cost 5.0 s against 3.6 s without reconnection.
+
+Merging is therefore a **mesh-length contact model** — bodies join when their gap is comparable to the
+element size — and not film drainage. Scope: 2-D, P1 fields (a new edge bridging two bodies has its midpoint
+in the void, where a P2 value cannot be read), a geometry term must be present (nothing else moves the
+nodes), and `alpha=` does not combine with `criterion=` — they are different operations. A node left in no
+triangle (a free particle) is refused rather than dropped, because dropping it would renumber the rest and
+silently permute the state.
+
 **Scope** — the rest raises rather than guessing:
 
 * **Operator-split ALE, explicit in the velocity**, hence first order in the step — *measured*, against a

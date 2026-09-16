@@ -1006,6 +1006,7 @@ def remesh(
     anisotropic: bool = False,
     max_dofs: int | None = None,
     every: int = 5,
+    alpha: float | None = None,
     metric_field: int = 0,
     hmin: float | None = None,
     hmax: float | None = None,
@@ -1081,13 +1082,28 @@ def remesh(
     sizes; ``metric_field`` picks which coupled field drives the metric. DOF control is approximate on
     both paths (the mesher honours a size field loosely), so ``max_dofs`` is a target, not a cap.
 
+    ``alpha=`` is the **moving-mesh** form, and it is a different operation: instead of meshing the
+    geometry afresh it re-triangulates the NODES the motion has carried and keeps the triangles whose
+    circumradius is below ``alpha`` × the starting mean edge length — the alpha shape, the remeshing step
+    of the Particle Finite Element Method (Idelsohn, Oñate & Del Pin, *IJNME* **61** (2004) 964–989;
+    alpha shapes: Edelsbrunner & Mücke, *ACM TOG* **13** (1994) 43–72). Every node stays where it is, so a
+    P1 state carries across by identity — and because only the *elements* are re-decided, the **topology**
+    may change: two bodies whose gap closes below about ``2·alpha·h`` become one mesh::
+
+        fem.solve(adapt=jno.solve.remesh(alpha=1.2, every=1))   # droplets in a void: they merge on contact
+
+    Merging is therefore a **mesh-length contact model**, not film drainage. Requires a geometry term
+    (nothing else moves the nodes), 2-D, and P1 fields.
+
     Steady-only: ``max_iters``, ``tol``, ``eps`` (a relative-change plateau detector, not a certified
-    bound). Transient-only: ``every``, ``metric_field``.
+    bound). Transient-only: ``every``, ``metric_field``. Moving-mesh-only: ``alpha``.
 
     Args:
         anisotropic: Hessian-metric refinement instead of isotropic ZZ + Dörfler marking.
         max_dofs: Vertex budget. Steady: stop once reached. Transient: the constant target.
-        every: Transient only — remesh every ``every`` time steps.
+        every: Transient only — remesh every ``every`` time steps (with ``alpha``, reconnect that often).
+        alpha: Moving meshes only — re-triangulate the moved NODES and keep the triangles smaller than
+            ``alpha`` × the starting mean edge length. Bodies closer than ~``2·alpha·h`` merge.
         metric_field: Transient multifield only — index of the field driving the metric.
         hmin: Smallest allowed edge length (default: mean edge / 50).
         hmax: Largest allowed edge length (default: 2 × mean edge).
@@ -1107,6 +1123,11 @@ def remesh(
     """
     from .utils.solver.fem_adapt import AdaptSpec
 
+    if alpha is not None and not (float(alpha) > 0.0):
+        raise ValueError(
+            f"remesh(alpha=...): alpha multiplies the mean edge length to set the size a triangle may "
+            f"reach before it is discarded, so it must be > 0; got {alpha}."
+        )
     return AdaptSpec(
         theta=theta,
         max_iters=max_iters,
@@ -1118,6 +1139,7 @@ def remesh(
         hmin=hmin,
         hmax=hmax,
         every=every,
+        alpha=alpha,
         metric_field=metric_field,
         criterion=criterion,
     )
