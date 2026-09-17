@@ -541,6 +541,45 @@ answer is wrong by exactly that factor with no error raised, so bind `dV` once a
     form by anything — they are extra terms you must write out. This is precisely why jNO does not offer
     to apply the weighting automatically: it would be exact for scalars and quietly wrong for vectors.
 
+### The vector recipe, written out
+
+A displacement `u = (u_r, u_z)` on the meridian strains four components, not three:
+
+$$\varepsilon_{rr}=\partial_r u_r,\qquad \varepsilon_{zz}=\partial_z u_z,\qquad \varepsilon_{rz}=\tfrac12(\partial_z u_r+\partial_r u_z),\qquad \boxed{\varepsilon_{\theta\theta}=u_r/r}$$
+
+The last one is the whole difference, and it is ordinary arithmetic in the term list:
+
+```python
+u, v = d.fem_symbols(value_shape=(2,), order=2)          # (u_r, u_z)
+r, z, _ = d.variable("interior", split=True)
+ub, vb = u.bind(x=r, y=z), v.bind(x=r, y=z)
+
+def strains(w):
+    return w.x[0], w.y[1], w[0] / r, 0.5 * (w.y[0] + w.x[1])   # rr, zz, THETA-THETA, rz
+
+e_rr, e_zz, e_qq, e_rz = strains(ub)
+f_rr, f_zz, f_qq, f_rz = strains(vb)
+tr_u, tr_v = e_rr + e_zz + e_qq, f_rr + f_zz + f_qq            # the trace carries it too
+energy = lam * tr_u * tr_v + 2 * mu * (e_rr*f_rr + e_zz*f_zz + e_qq*f_qq + 2*e_rz*f_rz)
+fem = jno.fem([energy * (2 * np.pi * r), ...])                 # and then the ring measure
+```
+
+For flow the same four components appear, and the **divergence** is
+$\nabla\!\cdot\!\mathbf u=\partial_r u_r+u_r/r+\partial_z u_z$ — so `div_u = e_rr + e_qq + e_zz`, which is
+what the continuity equation and the pressure term must both use.
+
+!!! measured "Both halves are pinned by `tests/test_fem_axisymmetric_vector.py`"
+    **Lamé thick-walled cylinder** under internal pressure (plane strain), exact
+    $u_r = \frac{(1+\nu)pa^2}{E(b^2-a^2)}\left[(1-2\nu)r + b^2/r\right]$: the form above reproduces it to
+    **under 1 %**, with $u_z$ vanishing. Drop `ε_θθ` from that same form and the error is **over 10 %**
+    and the cylinder measurably softer — with no error raised, which is what makes it worth a test.
+
+    **Poiseuille pipe** ($u_z = G(R^2-r^2)/4\eta$) on a meridian that *includes the axis*, Taylor–Hood
+    P2/P1: **machine precision**, since P2 represents the parabola exactly. Two details matter — a
+    traction-free pipe end is not what fully developed flow satisfies (the parabola carries a shear
+    traction $\eta u_z'$ on a z-face), and on the axis `u_r/r` is harmless because quadrature points sit
+    strictly inside cells and $u_r=0$ is imposed there.
+
 !!! danger "This applies to vector EM too, and there is no guard"
     An axisymmetric `(r, z)` **vector
     Maxwell / eddy-current** form — the natural geometry for a coil, a solenoid, a tokamak vessel — is

@@ -254,6 +254,13 @@ path is unaffected.
 ??? warning "Axisymmetric vector forms are your responsibility"
     The `2πr` measure is exact for scalars and wrong for vectors — elasticity hoop strain, and for
     vector Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling.
+
+    For **elasticity and flow** the extra terms are short, and the recipe is written out and verified in
+    [*The vector recipe*](geometry.md#the-vector-recipe-written-out): add `ε_θθ = u_r/r` to the strains
+    and to the trace (so `div u = ∂ᵣu_r + u_r/r + ∂zu_z`). It reproduces the Lamé thick-walled cylinder
+    to under 1 % and Poiseuille pipe flow to machine precision; dropping the hoop term is over 10 % wrong
+    and raises nothing (`tests/test_fem_axisymmetric_vector.py`). **Vector Maxwell** is the case with no
+    recipe here: use a full 3-D mesh.
     jNO ships no axisymmetric H(curl)/H(div) element, and multiplying by `r` is arithmetic the
     assembler cannot distinguish from a legitimate radial coefficient, so **nothing raises**.
 
