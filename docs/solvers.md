@@ -37,6 +37,7 @@ Pick by structure:
 | cuSolver refuses it, or is slow | `lu(backend="host")` | SuperLU on the host, driven from the device — same answer, same gradients. Often **faster** than cuSolver, and runs meshes it rejects |
 | **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS. Fastest **per solve** — caches the symbolic plan on the sparsity, so it survives a change of values. Needs the optional stack |
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. Fastest **factorization** — a Newton step reuses the analysis. x86-64 |
+| **a Newton march** (the tangent changes every iteration) | `lu(backend="host", reuse=False)` | the host factorization cache keys on the operator, so a never-repeating tangent fills it and leaks a factorization a step; `reuse=False` drops each one |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 
 !!! warning "jNO warns you when this applies"
@@ -329,40 +330,25 @@ choice and stays the default.
 
 ### AMG on a march
 
-`jno.precond.amg()` needs a **concrete** matrix — pyamg builds the hierarchy on the host — and a
-transient march linearises inside `lax.scan`, where every operator is traced. Both Newton modes hit it:
-the matrix-free JVP has no matrix at all, and `newton(direct=True)` assembles one, but *inside* the
-trace. It used to surface as `AMG setup needs a concrete matrix but got a traced one`, several frames
-inside the Newton loop.
+`jno.precond.amg()` builds its hierarchy on the host from a **concrete** matrix, and a march linearises
+inside `lax.scan` where every operator is traced — so it used to refuse every transient problem. A march
+now builds it once, before the scan, from the step tangent (a state-dependent mass `c(u) u_t` included).
 
-A march now builds it once, before the scan, from the step tangent at the initial state, and reuses it
-for every step:
+A frozen setup stays correct — a preconditioner changes convergence speed, never the answer — but goes
+stale when the operator moves. `cached(spec, refresh=k)` spells the cadence, and the march then runs as
+`ceil(n/k)` scans, re-composed against the carried state:
 
 ```python
-fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())   # transient, nonlinear — just works
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())                      # frozen once
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.cached(jno.precond.amg(), refresh=25))
 ```
 
-The tangent drifts as the march proceeds and the frozen hierarchy does not follow it; that is the
-standard frozen-preconditioner trade, and it is always correct — a preconditioner changes how fast the
-Krylov solve converges, never what it converges to. Traceable specs (`jacobi`, which reads its diagonal
-off the traced operator) are left exactly as they were, refreshing per linearisation.
+Measured where a melt pool's coefficients move ~`1e13` between solid and molten: frozen once, the Krylov
+residual stalls at `2.9e-03`; at `refresh=25` it reaches `1.5e-04`. `theta()`/`exponential()` integrate
+the march themselves and are not chunked, so a cadence beside one raises rather than never firing.
 
-**Reachable is not the same as useful.** Smoothed aggregation assumes a Laplacian-like operator, and a
-Newton tangent need not be one. Measured on `u_t = div((1 + u²) grad u)` at 4751 DOFs, whose tangent
-carries an extra `2u grad u . delta u`: one V-cycle makes a random residual **7.5× worse**, while the
-same problem's *linear* step operator contracts it by 0.32. Symmetrising the tangent (7.28×), rescaling
-it (scale-invariant) and lagging the coefficient with `jno.lag` (7.50×) each changed nothing — it is the
-operator, not the freezing. So the march **probes the applier once** and refuses a preconditioner that
-amplifies, naming the factor, rather than letting `fgmres` stall inside the time loop:
-
-```
-fem.solve(precond=jno.precond.amg()): on this march the preconditioner makes a random residual
-7.5x WORSE, so the Krylov solve cannot converge with it -- ... Use jno.precond.jacobi(), which
-reads the diagonal off the tangent itself, or precondition a problem whose step operator is definite.
-```
-
-On a march whose step operator *is* definite — a linear block, or a mildly nonlinear one — AMG composes
-and the probe passes silently.
+A frozen preconditioner is probed once and refused if it makes a random residual worse — but only when it
+stands alone, since a block preconditioner need not reduce a full residual in one application.
 
 ### When the pressure mass is not enough
 
