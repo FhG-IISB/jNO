@@ -509,6 +509,55 @@ def _block_time_grid(block):
     return jnp.linspace(t0, t1, n_steps + 1)
 
 
+def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, theta=None):
+    """March in chunks of ``cadence`` steps, re-composing the per-step solvers between them.
+
+    A preconditioner whose setup cannot run under a trace (an AMG hierarchy, an ILU) is frozen once,
+    before the scan. That is correct and fast while the operator stays put -- measured 4.8x faster and
+    7.4x lighter than re-factorising per linearisation on a melt pool -- and it stalls when the
+    operator does not stay put: between solid and molten that same problem moves its Carman-Kozeny
+    drag by 1e13, its PSPG ``tau`` by 1e9 and its stiffness by 1e6, and a setup frozen on the cold
+    state stagnates at ~1e-4 however many Krylov iterations it is given.
+
+    ``jno.precond.cached(spec, refresh=k)`` already spells the remedy -- "rebuilds every k-th
+    materialization -- the cadence policy for a ... transient march whose operator values drift step by
+    step". A rebuild must happen OUTSIDE the trace, so honouring it means running ``ceil(n/k)`` scans
+    instead of one, each starting from the carried state and re-frozen against it.
+
+    The compiled step is shared across chunks (identical shapes), so the extra cost is one host-side
+    setup per chunk. Reverse mode still works -- each chunk's scan is checkpointed exactly as before.
+    """
+    import dataclasses
+
+    import jax.numpy as jnp
+    import numpy as _np
+
+    ts = _np.asarray(save_ts, dtype=float).reshape(-1)
+    t0, t1, dt = float(block.t0), float(block.t1), float(block.dt)
+    n_steps = max(1, round((t1 - t0) / dt))
+    tol = 1e-9 * max(abs(t1 - t0), 1.0)
+    state, out, lo, done = block.state0, [], t0, 0
+    while done < n_steps:
+        k = int(min(cadence, n_steps - done))
+        hi = t0 + (done + k) * dt
+        lo_ok = ts >= lo - tol if not out else ts > lo + tol
+        sel = ts[lo_ok & (ts <= hi + tol)]
+        sub = _np.unique(_np.concatenate([sel, _np.asarray([hi])]))
+        # state0_fn would re-form the INITIAL state from args and undo the carry, so it goes with it.
+        chunk = dataclasses.replace(block, t0=lo, t1=hi, state0=state, state0_fn=None)
+        lin_s, nonlin_s = compose(chunk, state)
+        ys = _default_transient_integrate(
+            chunk, args, jnp.asarray(sub), linear_solve=lin_s, nonlinear_solve=nonlin_s, theta=theta
+        )
+        state = ys[-1]
+        keep = _np.isin(sub, sel)
+        if keep.any():
+            out.append(ys[_np.flatnonzero(keep)])
+        done += k
+        lo = hi
+    return jnp.concatenate(out, axis=0)
+
+
 def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None, theta=None):
     """Default transient integrator: backward Euler at the block's *own* assembled step ``dt``,
     advanced with ``jax.lax.scan`` (reverse-mode differentiable) and sampled at ``save_ts`` by

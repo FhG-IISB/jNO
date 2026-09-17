@@ -1028,6 +1028,40 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     return _composed
 
 
+def _uncached(spec):
+    """Strip ``cached(...)`` wrappers from a spec tree, keeping the structure around them.
+
+    A march that honours a cadence rebuilds once per chunk, so the wrapper's own "every k-th
+    materialization" counter must not apply on top: with chunks of k steps it would rebuild every k
+    CHUNKS, i.e. every k^2 steps, and the setup the user asked to refresh every k steps would go stale
+    exactly as before. The chunk length is the policy; the wrapper's memoisation is what it replaces.
+    """
+    inner = getattr(spec, "spec", None)
+    if inner is not None and hasattr(spec, "refresh"):
+        return _uncached(inner)
+    pairs = getattr(spec, "pairs", None)
+    if pairs:
+        return type(spec)([(f, _uncached(child)) for f, child in pairs])
+    return spec
+
+
+def _refresh_cadence(precond):
+    """Steps between preconditioner rebuilds, from ``jno.precond.cached(spec, refresh=k)``.
+
+    That spelling already documents this exact policy -- "an ``int k`` rebuilds every k-th
+    materialization -- the cadence policy for a Newton loop or transient march whose operator values
+    drift step by step" -- so honouring it needs no new argument anywhere. ``None`` (or ``refresh``
+    True/False, which are the shape/never policies) leaves the march as a single scan.
+    """
+    for spec in _specs_in(precond):
+        r = getattr(spec, "refresh", None)
+        if isinstance(r, bool) or not isinstance(r, int):
+            continue
+        if r > 0:
+            return int(r)
+    return None
+
+
 def _specs_in(spec):
     """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
     (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. A tree is non-traceable
@@ -1059,7 +1093,7 @@ class _FrozenMarchPrecond:
         return f"frozen-for-march({self._of!r})"
 
 
-def _freeze_precond_for_march(precond, fem, block):
+def _freeze_precond_for_march(precond, fem, block, state=None):
     """Materialize a NON-traceable preconditioner once, from the step tangent at the initial state.
 
     ``spec.traceable`` is the library's own word for "can materialize inside a trace". ``jacobi`` reads
@@ -1079,6 +1113,11 @@ def _freeze_precond_for_march(precond, fem, block):
     """
     if precond is None:
         return None
+    # ``state`` is the state to linearise about. The block's own ``state0`` is the INITIAL condition,
+    # which for a melt pool is cold and fully solid -- Carman-Kozeny ~1e13, PSPG tau ~1e-9, a stiffness
+    # 1e6x its molten value -- so a setup frozen there describes an operator the march leaves behind.
+    # A driver that re-composes (a refresh cadence, or the adaptive loop between remeshes) passes the
+    # live state instead.
     # Only a LEAF decides this. A block container (`triangular`, `block_diag`) inherits the base
     # `traceable = False`, but it assembles nothing itself -- freezing a tree of jacobi leaves because
     # of its wrapper took a configuration that worked (measured 0.18 s/step on the melt pool's T+w) and
@@ -1089,6 +1128,7 @@ def _freeze_precond_for_march(precond, fem, block):
         return precond  # nothing here needs a concrete matrix -- leave the per-linearization path alone
 
     name = getattr(precond, "name", type(precond).__name__)
+    at = block.state0 if state is None else state
     if block.jacobian is None or (block.mass is None and block.mass_residual_jac is None):
         raise TypeError(
             f"fem.solve(precond={name}): this preconditioner needs an assembled matrix, and this march "
@@ -1096,7 +1136,7 @@ def _freeze_precond_for_march(precond, fem, block):
             "Jacobian to form the step tangent from. Use a traceable preconditioner "
             "(jno.precond.jacobi()), or pre-build this one yourself with spec.build(A)."
         )
-    if block.state0 is None or block.dt is None:
+    if at is None or block.dt is None:
         raise TypeError(
             f"fem.solve(precond={name}): this preconditioner needs an assembled matrix, and the step "
             "tangent cannot be formed here because the block carries no initial state / step size. Use "
@@ -1105,7 +1145,7 @@ def _freeze_precond_for_march(precond, fem, block):
     theta = float((block.metadata or {}).get("theta", 1.0))
     t0 = float((block.metadata or {}).get("t0", 0.0))
     dt = float(block.dt)
-    J = block.jacobian(block.state0, t0, None)
+    J = block.jacobian(at, t0, None)
     if block.mass is None:
         # STATE-DEPENDENT mass (``c(u) u_t``, e.g. an enthalpy-porosity heat capacity): there is no mass
         # MATRIX, the mass action lives in a residual whose Jacobian is assembled per state, and the step
@@ -1113,11 +1153,11 @@ def _freeze_precond_for_march(precond, fem, block):
         # ``mass_residual_jac`` reads the previous state off the load-path channel, so it is delivered
         # here exactly as the stepper delivers it, from the initial state.
         _lp: dict = {}
-        _u0 = jnp.asarray(block.state0).reshape(-1)
+        _u0 = jnp.asarray(at).reshape(-1)
         for _fid, _s0, _s1, _vec in (block.metadata or {}).get("prev_state_slices", []):
             _slice = _u0[_s0:_s1]
             _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
-        J_mass = block.mass_residual_jac(block.state0, t0, {"__loadpath__": _lp})
+        J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
         A_rep = _add_step_operator(J, J_mass, 1.0 / dt)
         op = LinearOperator(A_rep)
         prepare_precond(precond, fem)
@@ -1193,7 +1233,7 @@ def _add_step_operator(M, A, scale):
     return dense(M) + scale * dense(A)
 
 
-def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None):
+def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None, state=None):
     """Compose the slots into per-step solvers for the transient integrator.
 
     Returns ``(linear_step_solve, nonlinear_step_solve)`` (one is ``None``), matching
@@ -1216,7 +1256,7 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # inside the march's scan, so both the matrix-free JVP and the `direct=True` assembled tangent are
         # traced by the time it is asked for. Build it once, now, from the step tangent at the initial
         # state, and freeze it for the march.
-        precond = _freeze_precond_for_march(precond, fem, block)
+        precond = _freeze_precond_for_march(precond, fem, block, state)
         return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
     if nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")

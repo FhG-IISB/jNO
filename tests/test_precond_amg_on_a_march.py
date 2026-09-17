@@ -205,3 +205,47 @@ def test_a_block_of_traceable_specs_is_not_frozen():
     )
     assert np.abs(got - ref).max() < 1e-8
     del u
+
+
+def test_a_refresh_cadence_rebuilds_without_changing_the_answer():
+    """`cached(spec, refresh=k)` already documents "rebuilds every k-th materialization -- the cadence
+    policy for a ... transient march whose operator values drift step by step". Honouring it means the
+    march runs as ceil(n/k) scans rather than one, because a host-side setup cannot be rebuilt under a
+    trace. A cadence changes WHEN the setup is built, never what the march converges to."""
+    ref = np.asarray(_nonlinear_heat(nt=13).solve().fn())
+    for k in (1, 3):
+        got = np.asarray(
+            _nonlinear_heat(nt=13)
+            .solve(linear=jno.solve.fgmres(tol=1e-10), precond=jno.precond.cached(jno.precond.amg(), refresh=k))
+            .fn()
+        )
+        assert got.shape == ref.shape, f"refresh={k} changed the trajectory shape: {got.shape} vs {ref.shape}"
+        assert np.abs(got - ref).max() < 1e-8, f"refresh={k} changed the answer by {np.abs(got - ref).max():.2e}"
+
+
+def test_the_cadence_is_actually_honoured(monkeypatch):
+    """Counted, not assumed: 12 steps at refresh=4 must build the hierarchy 3 times, where the frozen
+    default builds it once. Without this the feature could 'work' by silently never refreshing."""
+    import jno.utils.solver.amg as amg_mod
+
+    def _count(spec, nt=13):
+        calls = []
+        real = amg_mod.build_hierarchy
+        monkeypatch.setattr(amg_mod, "build_hierarchy", lambda A, **kw: (calls.append(1), real(A, **kw))[1])
+        _nonlinear_heat(nt=nt).solve(linear=jno.solve.fgmres(tol=1e-10), precond=spec).fn()
+        monkeypatch.undo()
+        return len(calls)
+
+    assert _count(jno.precond.amg()) == 1, "the default must still freeze once for the whole march"
+    assert _count(jno.precond.cached(jno.precond.amg(), refresh=4)) == 3, "12 steps at refresh=4 is 3 chunks"
+
+
+def test_only_an_integer_cadence_chunks_the_march():
+    """`refresh=True`/`False` are the shape-change and never policies, not cadences -- reading them as
+    one would chunk a march that asked for no such thing."""
+    from jno.utils.solver.solver_api import _refresh_cadence
+
+    assert _refresh_cadence(jno.precond.amg()) is None
+    assert _refresh_cadence(jno.precond.cached(jno.precond.amg())) is None
+    assert _refresh_cadence(jno.precond.cached(jno.precond.amg(), refresh=True)) is None
+    assert _refresh_cadence(jno.precond.cached(jno.precond.amg(), refresh=5)) == 5
