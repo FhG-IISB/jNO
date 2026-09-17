@@ -1162,18 +1162,18 @@ def _freeze_precond_for_march(precond, fem, block, state=None):
         op = LinearOperator(A_rep)
         prepare_precond(precond, fem)
         applier = materialize_precond(precond, PrecondContext(op, fem))
-        _refuse_a_useless_applier(applier, A_rep, name)
+        _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
         return _FrozenMarchPrecond(applier, precond)
     M = block.mass(t0, None)
     A_rep = _add_step_operator(M, J, theta * dt)
     op = LinearOperator(A_rep)
     prepare_precond(precond, fem)
     applier = materialize_precond(precond, PrecondContext(op, fem))
-    _refuse_a_useless_applier(applier, A_rep, name)
+    _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
     return _FrozenMarchPrecond(applier, precond)
 
 
-def _refuse_a_useless_applier(applier, A, name):
+def _refuse_a_useless_applier(applier, A, name, *, single_leaf):
     """One probe: does ``M^-1`` actually reduce a residual on the operator it was built from?
 
     A preconditioner is free to be mediocre, but one that AMPLIFIES is worse than none, and inside a
@@ -1188,6 +1188,14 @@ def _refuse_a_useless_applier(applier, A, name):
     """
     import numpy as _np
 
+    if not single_leaf:
+        # ONLY a spec that stands alone. For a BLOCK composition this measure is not evidence: what a
+        # Krylov solve needs is a clustered spectrum of M^-1 A, not a residual drop from one application,
+        # and on a system whose scales span 1e13 (Carman-Kozeny drag) to 1e-12 (a PSPG pressure block) the
+        # two part company. Measured on the 4-field melt pool: `triangular` with an inner LU per block
+        # "amplifies" 735x by this probe and converges perfectly well in the march (26.5 s for 10 steps);
+        # jacobi likewise, at 319x. Refusing on that basis blocked configurations that work.
+        return
     apply_fn = getattr(applier, "fwd", applier)
     n = A.shape[0]
     r = _np.asarray(jax.random.normal(jax.random.PRNGKey(0), (n,)), dtype=float)

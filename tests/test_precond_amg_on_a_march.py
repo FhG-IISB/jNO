@@ -249,3 +249,28 @@ def test_only_an_integer_cadence_chunks_the_march():
     assert _refresh_cadence(jno.precond.cached(jno.precond.amg())) is None
     assert _refresh_cadence(jno.precond.cached(jno.precond.amg(), refresh=True)) is None
     assert _refresh_cadence(jno.precond.cached(jno.precond.amg(), refresh=5)) == 5
+
+
+def test_a_block_composition_is_not_refused_for_amplifying():
+    """The probe is evidence only for a spec that stands ALONE. A block preconditioner is not required
+    to reduce a full residual in one application: measured on the 4-field melt pool, `triangular` with
+    an inner LU per block amplifies a random residual 735x and converges perfectly well (26.5 s for 10
+    steps), and jacobi likewise at 319x. Refusing on that basis blocked configurations that work."""
+
+    class _Amplifier:
+        traceable = False  # so the march freezes it, which is where the probe lives
+        name = "amplifier()"
+
+        def materialize(self, _ctx):
+            return lambda v: -10.0 * v  # a scalar multiple of the identity: Krylov copes fine
+
+    fem = _nonlinear_heat()
+    got = np.asarray(
+        fem.solve(
+            nonlinear=jno.solve.newton(direct=True),
+            linear=jno.solve.fgmres(tol=1e-10),
+            precond=jno.precond.block_diag((0, _Amplifier())),
+        ).fn()
+    )
+    ref = np.asarray(_nonlinear_heat().solve().fn())
+    assert np.abs(got - ref).max() < 1e-8
