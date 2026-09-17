@@ -24,15 +24,13 @@ bounded by what a caller actually puts in.
 These tests pin the mechanism -- eviction against block count -- not a wall-clock number.
 """
 
+import jax
+import jax.experimental.sparse as jsp
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse as sp
 
-import jax
-import jax.experimental.sparse as jsp
-import jax.numpy as jnp
-
-import jno
 from jno.utils.solver import linear as _linear
 
 
@@ -95,9 +93,7 @@ def test_a_round_robin_over_n_blocks_reuses_every_factorization():
     keys_after_first = set(_linear._FACTOR_CACHE)
     for op in ops:  # second sweep: must be all hits
         _linear.host_lu_solve(op, b)
-    assert set(_linear._FACTOR_CACHE) == keys_after_first, (
-        "the second sweep re-factorised instead of hitting the cache"
-    )
+    assert set(_linear._FACTOR_CACHE) == keys_after_first, "the second sweep re-factorised instead of hitting the cache"
 
 
 def test_the_cached_solve_is_the_same_answer_as_an_uncached_one():

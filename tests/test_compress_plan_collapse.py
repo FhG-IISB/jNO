@@ -42,16 +42,10 @@ def _case(name):
         "heavy_duplication": rng.integers(0, 30, (200_000, 2)).astype(np.int32),
         "sparse_wide": rng.integers(0, 100_000, (200_000, 2)).astype(np.int32),
         # a rectangular block -- a coupling term whose test and trial spaces differ in size
-        "rectangular": np.stack(
-            [rng.integers(0, 7, 50_000), rng.integers(0, 90_000, 50_000)], 1
-        ).astype(np.int32),
+        "rectangular": np.stack([rng.integers(0, 7, 50_000), rng.integers(0, 90_000, 50_000)], 1).astype(np.int32),
         # a degenerate axis: a scalar constraint row, or a single-dof gauge column
-        "single_column": np.stack(
-            [rng.integers(0, 5000, 20_000), np.zeros(20_000)], 1
-        ).astype(np.int32),
-        "single_row": np.stack(
-            [np.zeros(20_000), rng.integers(0, 5000, 20_000)], 1
-        ).astype(np.int32),
+        "single_column": np.stack([rng.integers(0, 5000, 20_000), np.zeros(20_000)], 1).astype(np.int32),
+        "single_row": np.stack([np.zeros(20_000), rng.integers(0, 5000, 20_000)], 1).astype(np.int32),
         # int64 input: what the dof maps are under x64 before the int32 cast landed upstream
         "int64_input": rng.integers(0, 1000, (50_000, 2)).astype(np.int64),
     }[name]

@@ -93,9 +93,7 @@ def _smoother_lmax(A_host, A_dev, *, safety: float, iters: int, degree: int, lmi
     its 0.33 unchanged.
     """
     gershgorin = float(abs(A_host).sum(axis=1).max())
-    tight = safety * float(
-        power_iteration_bound(lambda v: A_dev @ v, A_dev.shape[0], dtype=A_dev.data.dtype, iters=iters)
-    )
+    tight = safety * float(power_iteration_bound(lambda v: A_dev @ v, A_dev.shape[0], dtype=A_dev.data.dtype, iters=iters))
     if not (0.0 < tight < gershgorin):  # already at or above the guaranteed bound: nothing to gain
         return gershgorin
     r = jax.random.normal(jax.random.PRNGKey(0), (A_dev.shape[0],), dtype=A_dev.data.dtype)
@@ -156,9 +154,7 @@ def build_hierarchy(
         A_l = jsp.BCOO.from_scipy_sparse(lvl.A.tocoo())
         P = jsp.BCOO.from_scipy_sparse(lvl.P.tocoo())
         R = jsp.BCOO.from_scipy_sparse(lvl.R.tocoo())
-        lmax = _smoother_lmax(
-            lvl.A, A_l, safety=safety, iters=bound_iters, degree=smoother_degree, lmin_ratio=lmin_ratio
-        )
+        lmax = _smoother_lmax(lvl.A, A_l, safety=safety, iters=bound_iters, degree=smoother_degree, lmin_ratio=lmin_ratio)
         levels.append({"A": A_l, "P": P, "R": R, "lmin": lmin_ratio * lmax, "lmax": lmax, "degree": smoother_degree})
     A_c = np.asarray(ml.levels[-1].A.todense())
     if not np.isfinite(A_c).all() or not np.abs(A_c).max() > 0:
