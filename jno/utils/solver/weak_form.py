@@ -702,6 +702,17 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
     if isinstance(expr, Diff) and _contains_unknown_symbol(domain, expr.wrt):
         return True
 
+    # A `jno.derived` field is a FrozenField, and a FrozenField is invisible to unknown-detection BY
+    # DESIGN (that is what lets a known field sit in a linear form). But a derived field's values ARE a
+    # function of the unknown -- that is its entire point -- so left unmarked a form like `tau * vi` would
+    # classify LINEAR and be assembled exactly once against the zero placeholder the field is built with:
+    # not a slow answer, a wrong one. Structural, like the gap and the follower normal above; its inputs
+    # are validated to be trial functions at construction, so the dependence is never in doubt.
+    from ...trace import DerivedField
+
+    if isinstance(expr, DerivedField):
+        return True
+
     if isinstance(expr, BinaryOp):
         left_has = _contains_unknown_symbol(domain, expr.left)
         right_has = _contains_unknown_symbol(domain, expr.right)

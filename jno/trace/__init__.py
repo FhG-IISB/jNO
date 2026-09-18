@@ -4478,9 +4478,58 @@ class MeshVelocityField(FrozenField):
         return f"MeshVelocityField(dim={self.value_shape[0]})"
 
 
+class DerivedField(FrozenField):
+    """A nodal field **computed from the current state** by a pure-JAX rule -- the value side of nonlocal
+    coupling, as opposed to :class:`jno.Coupling`'s residual side. Built by :func:`jno.derived`.
+
+    Where a :class:`Coupling` adds a nonlocal *residual vector* ``R(u) += c(u)``, a derived field carries a
+    nonlocal *nodal value* ``d = f(u)`` that can be used **anywhere a field can** -- as a coefficient, a
+    source, a material property. That is what a beam's optical depth ``tau(u)`` needs: ``exp(-tau)``
+    multiplies a source, it is not a load.
+
+    The values are produced inside the residual from ``stop_gradient(u)`` and delivered on the load-path
+    channel (``args["__loadpath__"]``), exactly as a :class:`PrevStateField`'s are. Two consequences, and
+    they are the whole design:
+
+    * the element Jacobian only ever sees the field as **data**, so the linearization is the *lagged*
+      (Picard) one automatically -- no outer driver, the nonlinear solver itself is the fixed-point loop;
+    * ``R(u) = 0`` does not depend on gradient markers, so the **converged root is exact** -- lagging
+      changes the path, not the answer (the argument :func:`jno.lag` already makes).
+
+    Carries its own ``fn``, the field keys of its ``inputs`` (whose nodal slices ``fn`` receives), the key of
+    the field it lives ``on`` (whose space and connectivity it borrows -- a real field of the problem, so
+    unlike :class:`LoadPathField` it borrows no foreign P1 basis and any nodal Lagrange order works), its
+    ``every`` cadence and any ``params``.
+    """
+
+    def __init__(self, fn, *, input_keys, on, every, params=None):
+        import jax.numpy as _jnp
+
+        src = getattr(on, "_expr", on)
+        _nc = 1
+        for _s in tuple(getattr(src, "value_shape", ()) or ()):
+            _nc *= int(_s)
+        # a placeholder, reshapeable by the parent: the real nodal values arrive on args["__loadpath__"]
+        super().__init__(src, _jnp.zeros(max(1, _nc)))
+        self.fn = fn
+        self.input_keys = list(input_keys)
+        self.on_field_key = src.field_key
+        self.every = str(every)
+        self.params = list(params or [])
+        self.name = f"derived[{getattr(src, 'name', 'u')}]"
+
+    def __repr__(self):
+        return f"DerivedField(on={self.on_field_key!r}, every={self.every!r}, inputs={len(self.input_keys)})"
+
+
 def load_path_fields_in(expr):
     """The distinct :class:`LoadPathField` nodes in ``expr`` (by identity, first-seen order)."""
     return [f for f in frozen_fields_in(expr) if isinstance(f, LoadPathField)]
+
+
+def derived_fields_in(expr):
+    """The distinct :class:`DerivedField` nodes in ``expr`` (by identity, first-seen order)."""
+    return [f for f in frozen_fields_in(expr) if isinstance(f, DerivedField)]
 
 
 # ---------------------------------------------------------------------------

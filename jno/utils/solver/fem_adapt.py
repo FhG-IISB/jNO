@@ -5572,7 +5572,13 @@ def run_mesh_motion(
         #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
         step_args = _coord_args(X_n)
         if _mv_fid is not None:
-            step_args["__loadpath__"] = {_mv_fid: ((X_n - X_c) / dt).astype(u_c.dtype)}
+            # MERGE, never replace: the load-path channel carries more than the mesh velocity (a
+            # `freeze_path` field, a `jno.derived(every="step")` rule), and an assignment here would drop
+            # every other key on a march that happened to carry both.
+            step_args["__loadpath__"] = {
+                **(step_args.get("__loadpath__") or {}),
+                _mv_fid: ((X_n - X_c) / dt).astype(u_c.dtype),
+            }
         u_n = block.step(
             u_t,
             t0c.astype(u_c.dtype),

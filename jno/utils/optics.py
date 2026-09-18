@@ -16,7 +16,17 @@ outside the mesh contribute nothing, so a non-convex body, or two droplets with 
 no special handling and shadowing comes out for free. The cost is that the quadrature sees the body's
 edge as a step, which is first-order accurate in the sample spacing.
 
-Private: no public spelling exists for this yet.
+These helpers stay private -- they are the beam's GEOMETRY, and jNO does not write your physics for you.
+The public spelling that puts them in a weak form is ``jno.derived``, which turns any pure-JAX rule on the
+state into a nodal field usable anywhere a field is::
+
+    nodes, w = beam_paths(pts, cells, direction, pts)              # host geometry, built once
+    tau = jno.derived(lambda T: optical_depth(alpha(T), nodes, w), inputs=[u], on=u)
+    Q   = alpha_of(u) * I0 * jno.np.exp(-tau)                      # tau reads as an ordinary field
+
+which is what makes the two-way coupling -- a hotter body absorbs more, so the deposited power depends on
+the field it is producing -- an ordinary term rather than a special case. The tables above are fixed for
+the life of the ``jno.fem``, so on a MOVING mesh they go stale: rebuild them and rebuild the problem.
 """
 
 from __future__ import annotations

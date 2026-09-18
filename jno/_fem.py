@@ -244,6 +244,111 @@ def lag(expr: Any) -> Any:
     return jax.lax.stop_gradient(expr)  # plain arrays inside hand-written residuals
 
 
+def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
+    """A nodal field **computed from the current state** by a rule that is not a local integrand --
+    the general spelling for nonlocal coupling that enters as a *value*.
+
+    A weak term is *local*: an integrand evaluated at one quadrature point. Some physics is not. Where
+    :class:`jno.Coupling` carries a nonlocal *residual* ``R(u) += c(u)``, ``derived`` carries a nonlocal
+    *value* ``d = f(u)`` on the nodes, usable **anywhere a field is** -- a coefficient, a source, a
+    material property. The distinction is not cosmetic: a beam's attenuation ``exp(-tau(u))``
+    *multiplies* a source, so it cannot be written as a load; and a quantity needed inside a term has
+    nowhere else to come from.
+
+    Beer--Lambert absorption, where the heat deposited at a point depends on everything the beam passed
+    through to reach it::
+
+        nodes, w = beam_paths(pts, cells, direction, pts)      # host geometry, built ONCE
+        tau = jno.derived(lambda T: optical_depth(alpha(T), nodes, w), inputs=[u], on=u)
+        Q   = alpha_of(u) * I0 * jno.np.exp(-tau)              # tau reads as an ordinary field
+        fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - Q * vi, u(xb, yb) - 0.0])
+
+    ``fn`` is **pure JAX**, taking each input field's nodal vector -- ``(n_nodes,)`` scalar,
+    ``(n_nodes, vec)`` vector -- and returning nodal values on ``on``'s space. Host-side geometry (view
+    factors, ray tables, neighbour lists) is computed once *before* the call and closed over; only the
+    part that depends on the state goes inside. A non-traceable ``fn`` is caught at ``jno.fem`` build, not
+    at solve time.
+
+    **The semantics are lagged (Picard).** The values are produced inside the residual from
+    ``stop_gradient(u)``, so the linearization treats them as data and the nonlinear solver *is* the
+    fixed-point loop -- no extra solver slot, no outer driver. Two things follow, and both matter:
+
+    * the **converged root is exact**. ``R(u) = 0`` does not depend on gradient markers, so lagging
+      changed the path, not the answer (the argument :func:`jno.lag` already makes). Convergence is
+      checked on the *true* coupled residual, so a fixed point that does not converge fails loudly
+      rather than returning a plausible wrong field;
+    * convergence is **linear, not quadratic**, at a rate set by the coupling strength. For a strongly
+      coupled nonlocality -- radiation-dominated enclosure, optically thick beam -- it can stall or
+      diverge, where an in-residual :class:`jno.Coupling` would have kept the coupling in its tangent.
+      ``fem.solve(nonlinear=jno.solve.picard(damping=...))`` or ``newton(line_search=True)`` is the
+      remedy. Reach for ``Coupling`` when you need the exact tangent, ``derived`` when you need the
+      value inside a term or the cheap tangent.
+
+    ``every`` sets the cadence. ``"residual"`` (default) re-evaluates ``fn`` at every residual
+    evaluation, so a transient step is fully implicit in the coupling; ``"step"`` evaluates it once per
+    step of a march from the previous step's state, which is cheaper but is an operator splitting and
+    carries its own ``O(dt)`` error -- one no residual check can see, because the step converges, just to
+    a slightly different problem.
+
+    ``params=[...]`` declares ``jno.np.parameter`` nodes used only inside ``fn`` (the trace walk that
+    finds weak-form parameters cannot see into an opaque function); ``fn`` then takes a trailing
+    ``{name: value}`` dict, as a :class:`jno.Coupling`'s residual does.
+
+    **Inverse-problem caveat**: parameters inside ``fn`` are not lagged, so the direct sensitivity
+    through them is exact, but the path through ``u`` uses the lagged Jacobian -- the standard "Picard
+    adjoint", descent-worthy and trainable through ``jno.core``, but not exact. A finite-difference
+    gradient check will not agree to machine precision.
+
+    **Limits**: ``on`` must be a nodal Lagrange field (values live on nodes, so element-wise,
+    quadrature-point and edge/face-DOF quantities are out). Host geometry closed over by ``fn`` is fixed
+    for the life of the ``jno.fem`` -- on a **moving mesh it goes stale silently**, and a rebuild means a
+    new ``jno.fem``. A derived field cannot read another derived field.
+    """
+    from .trace import DerivedField
+
+    if not callable(fn):
+        raise TypeError(f"jno.derived: `fn` must be a callable of the input fields' nodal values; got {type(fn)!r}.")
+    if every not in ("residual", "step"):
+        raise ValueError(
+            f"jno.derived: every={every!r} is not a cadence. Use 'residual' (re-evaluate every residual "
+            "evaluation -- implicit in the coupling) or 'step' (once per march step, cheaper, O(dt) splitting)."
+        )
+
+    def _field(obj, what):
+        node = getattr(obj, "_expr", obj)
+        if getattr(node, "field_key", None) is None:
+            raise TypeError(
+                f"jno.derived: {what} must be a trial function of this form (or a bound view of one, "
+                f"e.g. `u.bind(x=xi, y=yi)`); got {type(obj).__name__}. A derived field is a function of "
+                "the unknowns, so its inputs are fields, not values or expressions."
+            )
+        if isinstance(node, DerivedField):
+            raise ValueError(
+                f"jno.derived: {what} is itself a derived field. Chained derived fields are not supported "
+                "-- there is no defined evaluation order between them. Fold the two rules into one `fn`."
+            )
+        return node
+
+    if isinstance(inputs, (str, bytes)) or not isinstance(inputs, (list, tuple)):
+        raise TypeError(f"jno.derived: `inputs` must be a list of trial functions; got {type(inputs).__name__}.")
+    if not inputs:
+        raise ValueError(
+            "jno.derived: `inputs` is empty, so `fn` would not depend on the state. A field that does not "
+            "read the solution is a KNOWN field -- use `u.bind(...).freeze(values)` instead."
+        )
+    in_nodes = [_field(o, f"inputs[{i}]") for i, o in enumerate(inputs)]
+    on_node = _field(on, "`on`")
+
+    space = str(getattr(on_node, "space", "Lagrange"))
+    if space != "Lagrange":
+        raise ValueError(
+            f"jno.derived: on= is a {space!r} field, but a derived field's values are NODAL. "
+            "Point `on=` at a Lagrange field of this form (the derived values live on its nodes)."
+        )
+
+    return DerivedField(fn, input_keys=[n.field_key for n in in_nodes], on=on_node, every=every, params=params)
+
+
 # ---------------------------------------------------------------------------
 # expression helpers
 # ---------------------------------------------------------------------------

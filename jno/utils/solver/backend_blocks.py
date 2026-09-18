@@ -274,6 +274,21 @@ class SemidiscreteTimeBlock:
         dtype = u.dtype
         t_next = t + dt
 
+        # A `jno.derived(..., every="step")` field is evaluated ONCE per step, from the state this step
+        # starts at, and put on the load-path channel for the whole step. The assembler's `_derived_args`
+        # leaves a key a driver already supplied alone, so this decides the cadence on its own: the rule
+        # no longer runs inside the Newton loop. The price is an operator splitting -- the step converges,
+        # to a problem whose coupling lags by dt -- which is why `every="residual"` is the default.
+        _step_derived = {
+            _fid: _s for _fid, _s in ((self.metadata or {}).get("derived_specs") or {}).items() if _s["every"] == "step"
+        }
+        if _step_derived:
+            _lp_d = dict(args.get("__loadpath__", {}) or {})
+            for _fid, _s in _step_derived.items():
+                _xs = [u[a:b] if v == 1 else u[a:b].reshape(-1, v) for (a, b, v) in _s["in_slices"]]
+                _lp_d[_fid] = _s["fn"](*_xs, args) if _s["params"] else _s["fn"](*_xs)
+            args = {**args, "__loadpath__": _lp_d}
+
         # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
         def _operand(x):
             return x if hasattr(x, "todense") else jnp.asarray(x, dtype)

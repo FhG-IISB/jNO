@@ -115,6 +115,73 @@ def test_a_beer_lambert_source_drives_a_solve_to_its_closed_form():
     assert err < 0.02, f"temperature is off its closed form by {100 * err:.2f} %"
 
 
+def _beam_problem(size=0.05, n_samples=600):
+    """The slab of :func:`test_a_beer_lambert_source_drives_a_solve_to_its_closed_form`, set up once."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    pts = np.asarray(d.mesh.points)[:, :2]
+    cells = np.asarray(d.mesh.cells_dict["triangle"])
+    nodes, w = beam_paths(pts, cells, DOWN, pts, n_samples=n_samples)  # the depth AT the mesh nodes
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    return d, u, v, (xi, yi), (xb, yb), pts, nodes, w
+
+
+def test_a_derived_source_reduces_to_the_frozen_one_when_the_absorption_is_constant():
+    """``jno.derived`` is the public spelling for this: the same physics, now free to depend on the answer.
+
+    With a CONSTANT absorption the rule does not actually read the state, so it must reproduce the frozen
+    field of :func:`test_a_beer_lambert_source_drives_a_solve_to_its_closed_form` exactly -- the strongest
+    oracle available, because any error in the plumbing (wrong connectivity, a stale placeholder, values
+    landing in the wrong node order) would show up as a difference here and nowhere else.
+
+    The agreement is at the nonlinear solver's tolerance rather than at machine epsilon: a derived field
+    routes the form through the residual path, so this is a converged Newton against a direct linear solve.
+    """
+    alpha0, I0, k = 2.5, 4.0, 0.7
+    _, u, v, (xi, yi), (xb, yb), pts, nodes, w = _beam_problem()
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    stiff = k * (ui.x * vi.x + ui.y * vi.y)
+
+    rule = lambda T: alpha0 * I0 * jax.numpy.exp(-optical_depth(jax.numpy.full_like(T, alpha0), nodes, w))  # noqa: E731
+    src = jno.derived(rule, inputs=[u], on=u)
+    T = np.asarray(jno.fem([stiff - src * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    q_nodes = alpha0 * I0 * np.exp(-np.asarray(optical_depth(np.full(len(pts), alpha0), nodes, w)))
+    frozen = u.bind(x=xi, y=yi).freeze(q_nodes)
+    T_frozen = np.asarray(jno.fem([stiff - frozen * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    assert np.abs(T - T_frozen).max() < 1e-8, f"derived and frozen differ by {np.abs(T - T_frozen).max():.2e}"
+
+
+def test_an_absorption_that_depends_on_temperature_closes_the_loop():
+    """The case that needs ``derived`` and nothing else: the beam heats the body, and the hotter body
+    absorbs more, so the deposited power depends on the field it is producing.
+
+    There is no closed form for this, so the oracle is the fixed-point property itself: freeze the source
+    AT the converged state, solve the resulting ORDINARY linear problem, and the same field must come back.
+    That is the statement ``R(u) = 0``, checked through a completely separate code path -- and it is what
+    "the converged root is exact" means, lagging or no lagging.
+    """
+    a0, I0, k, beta = 2.5, 4.0, 0.7, 0.15
+    _, u, v, (xi, yi), (xb, yb), pts, nodes, w = _beam_problem()
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    stiff = k * (ui.x * vi.x + ui.y * vi.y)
+
+    alpha = lambda T: a0 * (1.0 + beta * T)  # noqa: E731 -- absorption rises with temperature
+    rule = lambda T: alpha(T) * I0 * jax.numpy.exp(-optical_depth(alpha(T), nodes, w))  # noqa: E731
+    T = np.asarray(jno.fem([stiff - jno.derived(rule, inputs=[u], on=u) * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    at_root = u.bind(x=xi, y=yi).freeze(np.asarray(rule(jax.numpy.asarray(T))))
+    T_again = np.asarray(jno.fem([stiff - at_root * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    drift = np.abs(T - T_again).max() / np.abs(T).max()
+    assert drift < 1e-7, f"the converged field is not a fixed point of its own source (drift {drift:.2e})"
+
+    cold = u.bind(x=xi, y=yi).freeze(np.asarray(rule(jax.numpy.zeros(len(pts)))))
+    T_cold = np.asarray(jno.fem([stiff - cold * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    moved = np.abs(T - T_cold).max() / np.abs(T_cold).max()
+    assert moved > 0.05, f"the feedback changed the answer by only {100 * moved:.1f} % -- oracle is near-vacuous"
+
+
 def test_the_optical_depth_is_differentiable_in_the_absorption_field():
     """``d tau / d alpha_j`` is the path weight of node j -- exact, not a finite difference."""
     pts, cells = _mesh(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12), 0.12)
