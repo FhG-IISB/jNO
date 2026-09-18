@@ -229,6 +229,47 @@ def test_evaluating_once_per_step_costs_a_first_order_splitting_error():
     assert all(0.7 < r < 1.4 for r in rates), f"splitting error is not first order in dt: gaps {gaps}, rates {rates}"
 
 
+def test_a_parameter_inside_the_rule_threads_and_is_differentiable_as_the_picard_adjoint():
+    """A ``jno.np.parameter`` used only inside the rule is invisible to the trace walk -- the rule is a
+    plain function, not an expression -- so it is declared with ``params=[...]`` and merged into the
+    operator's runtime parameters, exactly as a :class:`jno.Coupling`'s is.
+
+    The gradient is the honest part. The parameter itself is NOT lagged, so the direct sensitivity through
+    it is exact; the path through ``u`` uses the lagged Jacobian. What comes out is the standard Picard
+    adjoint: right sign, right magnitude, descent-worthy -- and measurably not the true derivative. The
+    test asserts the *measured* gap rather than pretending it is 1e-6.
+    """
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    p = jno.np.parameter((1,), name="cstr")
+    p.initialize(jax.nn.initializers.constant(0.5))
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=SIZE).domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    rule = lambda T, pp: pp["cstr"].reshape(()) * jnp.mean(T) * jnp.ones_like(T)  # noqa: E731
+    src = jno.derived(rule, inputs=[u], on=u, params=[p])
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - (1.0 + src) * vi, u(xb, yb) - 0.0])
+    op, n = fem.operator, int(fem.dofs)
+    assert "cstr" in (op.runtime_parameter_exprs or {}), "a params=[...] value never reached the solve's args"
+
+    def qoi(c):  # the mean temperature of the coupled solve, as a function of the coupling strength
+        res = lambda w: jnp.asarray(op.residual(w, {"cstr": jnp.atleast_1d(c)})).reshape(-1)  # noqa: E731
+        return jnp.mean(newton_krylov(res, jnp.zeros(n)))
+
+    # the forward answer is the exact coupled root, so the closed form still holds
+    w = np.asarray(_mean_source(0.0)[0].solve()).reshape(-1)
+    assert float(qoi(0.5)) == pytest.approx(float(np.mean(w / (1.0 - 0.5 * w.mean()))), rel=1e-6)
+
+    g = float(jax.grad(qoi)(0.5))
+    fd = float((qoi(0.5 + 1e-5) - qoi(0.5 - 1e-5)) / 2e-5)
+    assert np.isfinite(g) and abs(g) > 1e-8, f"no sensitivity to a parameter inside the rule (grad {g:.3e})"
+    assert g * fd > 0, f"the Picard adjoint has the wrong SIGN: grad {g:.3e} vs finite difference {fd:.3e}"
+    gap = abs(g - fd) / abs(fd)
+    assert gap < 0.05, f"Picard adjoint is {100 * gap:.1f} % off the true derivative -- expected a few percent"
+
+
 def _periodic_mean_source(c, *, size=0.25):
     """The same nonlocal source, now on a form with a periodic tie ``u(left) = u(right)``."""
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()

@@ -5609,6 +5609,25 @@ def _fem_impl(
                 "inequality, which needs a residual to test — not a transient stepper or a complex "
                 "real-equivalent block."
             )
+        # A `jno.derived` rule is opaque to the trace walk for the same reason a Coupling's residual is --
+        # it is a plain function, not an expression -- so a `jno.np.parameter` declared with `params=[...]`
+        # has to be merged into the operator's runtime parameters by hand, or it would never reach the
+        # solve's args and the rule would read a missing key. Mirrors `_merge_coupling_params` below.
+        from .trace import derived_fields_in
+
+        # ...unwrapping the views the term list holds: `frozen_fields_in` walks trace nodes, not views.
+        _derived_params = [
+            p for c in core_constraints for f in derived_fields_in(getattr(c, "_expr", c)) for p in f.params
+        ]
+        if _derived_params:
+            from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+            _tgt = fem_obj._op
+            _rpe = dict(getattr(_tgt, "runtime_parameter_exprs", {}) or {})
+            for _p in _derived_params:
+                _collect_runtime_parameter_exprs(_p, _rpe)
+            _tgt.runtime_parameter_exprs = _rpe
+
         if couplings and periodic_ties and fem_obj.is_transient:
             # The native periodic *transient* block reduces eagerly into a main-DOF space; the coupling
             # residual is written in the full nodal space, so the two cannot be composed on that path yet.
