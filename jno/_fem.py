@@ -4806,6 +4806,21 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     # assemblies produce that shape, and every reduction below (M, A, operator_fn, forcing, state0)
     # then acts on the 2N system.
     _meta_in = getattr(block, "metadata", None) or {}
+    # `residual`/`jacobian` are wrapped to PROLONG their input, so a derived field evaluated inside the
+    # residual still sees full nodal values and composes here with no special case. A derived field on the
+    # `every="step"` cadence does NOT: the stepper hands it the state it is marching, which on a reduced
+    # block is the MAIN-DOF vector, and the rule would slice it with this form's full-space offsets --
+    # reading the wrong entries, or a short vector, and reporting nothing. Measured: a 17-DOF reduced
+    # state fed to a rule expecting 20 nodes returned a plausible field.
+    _step_derived = [s["name"] for s in (_meta_in.get("derived_specs") or {}).values() if s["every"] == "step"]
+    if _step_derived:
+        raise NotImplementedError(
+            f"jno.fem: periodic ties combined with a *transient* `jno.derived(..., every='step')` field "
+            f"({_step_derived[0]}) are not supported -- the periodic transient block marches the reduced "
+            "main-DOF state, which is not the nodal vector the rule reads. Use every='residual' (the "
+            "default), which is evaluated inside the residual where the state is prolonged back to the "
+            "full nodal space, and composes with periodic ties today."
+        )
     _bloch = "blocks" not in periodic and bool(periodic.get("is_bloch"))
     if _bloch and not _meta_in.get("complex"):
         # A complex phase forces a complex-valued field; this march carries a REAL state (a plain or

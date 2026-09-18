@@ -725,3 +725,96 @@ All four (bare function, `params`, `field_key`, transient) are covered in
 Ch. 4–5 (view factors; the net-radiation / radiosity method for diffuse-grey enclosures).
 
 ---
+
+## Nonlocal coupling, in general — `jno.Coupling` and `jno.derived`
+
+Enclosure radiation is one instance of a shape that recurs: **gather → operate → scatter**, where the
+"operate" is not a local integrand. jNO has two mechanisms for it, and which one you want is decided by
+*what the nonlocal quantity is*, not by the physics.
+
+| | `jno.Coupling(fn)` | `jno.derived(fn, inputs=[...], on=u)` |
+|---|---|---|
+| produces | a **residual vector** `R(u) += c(u)` | a **nodal field** `d = f(u)` |
+| used as | a term in the `jno.fem([...])` list | a value **inside** any term |
+| tangent | carries the coupling **exactly** | **lagged** (Picard); stays local and sparse |
+| solver | matrix-free Newton–Krylov only | assembled tangent, so `newton(direct=True)` works |
+| converges | quadratically | linearly, and can stall on a strong coupling |
+
+**Reach for `derived` when the nonlocal quantity is needed inside a term**, which is the case a residual
+vector simply cannot express. A laser's Beer–Lambert attenuation is the clean example: the depth
+`τ(x) = ∫α ds` depends on the whole chord behind each point, and `exp(−τ)` *multiplies* the source:
+
+```python
+from jno.utils.optics import beam_paths, optical_depth      # the beam GEOMETRY (private; host-side, once)
+
+nodes, w = beam_paths(pts, cells, direction, pts, n_samples=600)
+alpha    = lambda T: a0 * (1.0 + beta * T)                  # a hotter body absorbs more
+tau      = jno.derived(lambda T: optical_depth(alpha(T), nodes, w), inputs=[u], on=u)
+Q        = a0 * I0 * jno.np.exp(-tau)                       # tau reads as an ordinary field
+
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - Q * vi, u(xb, yb) - 0.0])
+```
+
+The rule is **pure JAX** on the input fields' nodal values. Everything host-side — ray tables, view
+factors, neighbour lists — is built once *outside* and closed over; a numpy/scipy rule is refused at
+`jno.fem` build, with the fix named. Non-traceability, a wrong output length and an unknown `on=` field
+all fail there rather than inside a Newton step.
+
+**What lagging does and does not change.** The values are computed inside the residual from
+`stop_gradient(u)`, so the linearization sees them as data and the nonlinear solver *is* the fixed-point
+loop — no extra solver slot, no outer driver.
+
+- The **converged root is exact**: `R(u) = 0` does not depend on gradient markers, so lagging changed the
+  path, not the answer (the same argument `jno.lag` makes). Convergence is checked on the *true* coupled
+  residual, so a fixed point that does not converge **raises** rather than returning a plausible field.
+- Convergence is **linear**, at a rate set by the coupling strength. Past a critical strength it does not
+  converge at all; `fem.solve(nonlinear=jno.solve.picard(damping=...))` or `newton(line_search=True)` is
+  the remedy, and `jno.Coupling` is the alternative when you want the coupling in the tangent.
+- Gradients are the **Picard adjoint** — descent-worthy and trainable through `jno.core`, but not exact;
+  a finite-difference check will not agree to machine precision. A `params=[...]` value inside the rule is
+  *not* lagged, so the direct sensitivity through it is exact.
+
+**Cadence.** `every="residual"` (default) re-evaluates the rule at every residual evaluation, so a
+transient step is fully implicit in the coupling. `every="step"` evaluates it once per step of a march
+from the previous step's state — cheaper, but an operator splitting with its own `O(dt)` error that no
+residual check can see, because the step converges, just to a slightly different problem.
+
+!!! warning "Host geometry is frozen at build"
+    Ray tables and view factors closed over by the rule are fixed for the life of the `jno.fem`. On a
+    **moving mesh they go stale silently** — a rebuild means a new `jno.fem`. This is the same caveat the
+    enclosure carries, and it is the open edge of droplet-plus-laser work.
+
+### The same enclosure, written as a derived field
+
+`gap.load(q)` returns an *integrated* load, so it becomes a nodal field by dividing out the consistent
+weights `W_j = ∫φ_j ds` — which is `gap.load` of a unit flux, no new API:
+
+```python
+W  = gap.load(jnp.ones(gap.size), size=nd)               # the consistent nodal weight
+qn = jno.derived(lambda T: gap.load(q_elem(T), size=nd) / jnp.where(W > 0, W, 1.0), inputs=[u], on=u)
+fem = jno.fem([conduction, qn * v.bind(x=xg1, y=yg1), qn * v.bind(x=xg2, y=yg2), *bcs])
+```
+
+Because `Σ_i (M_∂)_ij = W_j`, the **total radiative power is conserved exactly**; the difference is one P1
+boundary-mass smoothing of its distribution, consistent at `O(h²)` — measured at a thousandth of a kelvin
+on the concentric-cylinder case in `tests/test_fem_enclosure_radiation.py`. What it buys is the tangent:
+the derived form has an assembled sparse Jacobian, so `newton(direct=True)` solves it, where the
+`Coupling` path is matrix-free only because its tangent couples every enclosure element to every other.
+What it costs is robustness on a radiation-dominated enclosure, per above. **Both spellings are supported;
+the `Coupling` one remains the default in the examples.**
+
+### What stays on its own path — contact
+
+Contact is *not* written with either mechanism, and deliberately. The gap value is a weighted gather
+**inside** the differentiated residual, so the secondary–main coupling is exact in the tangent; only the
+*pairing* is lagged, by a host-side search between rounds. Routing it through `derived` would
+`stop_gradient` the gap value itself, turning a quadratic Newton contact into a Picard iteration on a
+penalty interface — the regime where Picard is worst. The gap also lives at face quadrature points rather
+than on nodes, so there is nothing for `on=` to name.
+
+What contact *does* share is the delivery contract: **host-frozen shapes, per-round values threaded on
+`args`**. `__gap_tables__`, `__loadpath__` (load-path fields, previous states, the mesh velocity) and
+derived fields are all that one idea. Anything that writes to those channels must **merge**, never assign
+— a march can carry a mesh velocity and a derived field at once.
+
+---

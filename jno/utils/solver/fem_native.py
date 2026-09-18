@@ -1249,7 +1249,14 @@ def assemble_fem_native(
             stack.extend(iter_children(n))
         return found
 
-    _frozen_nodes = _collect_frozen_fields(list(volume_terms) + list(boundary_terms))
+    # ``boundary_terms`` is a DICT keyed by region, so ``list(...)`` yields the region NAMES: a frozen
+    # field used ONLY in a boundary term was never collected, and the surface kernel then raised "a path
+    # that does not thread frozen fields" on a channel that does in fact thread them (see the gather at
+    # `_surf_elem_res`). Flatten the values.
+    _bterms = (
+        [t for _ts in boundary_terms.values() for t in _ts] if isinstance(boundary_terms, dict) else list(boundary_terms)
+    )
+    _frozen_nodes = _collect_frozen_fields(list(volume_terms) + _bterms)
 
     # Per-quadrature-point STEP HISTORY (``v.i(k)``): scan the terms for HistoryRef nodes and record, per
     # base variable, how many past states to buffer (the most-negative offset). The buffer itself lives on
@@ -4397,6 +4404,7 @@ def assemble_fem_native(
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.derived_specs = derived_specs  # {fid: {fn, in_slices, every, ...}} — jno.derived rules
         _op_np.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
         _op_np.contact_pairs = dict(_contact_pairs)
         return (_op_np, "nonlinear", offs)

@@ -14,8 +14,12 @@ path is unaffected.
       suboptimal. `shape.curved()` fixes it (order 2, simplices) — see
       [Curved geometry](geometry.md#curved-isoparametric-geometry-shapecurved).
     - **The `2πr` measure on an axisymmetric *vector* form** — exact for scalars, wrong for vectors.
+    - **Host geometry inside a `jno.derived` rule on a moving mesh** — ray tables, view factors and
+      neighbour lists are built once, outside the rule, and closed over. They are correct for the mesh
+      they were built on and are never rebuilt; on a mesh that moves or is remeshed they silently
+      describe the old one. Rebuild them and build a new `jno.fem`.
 
-    Both are detailed below, and stated again at the point where you make the choice.
+    All three are detailed below, and stated again at the point where you make the choice.
 
 | Area | The limit | How it fails |
 |---|---|---|
@@ -25,6 +29,7 @@ path is unaffected.
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
+| `jno.derived` nonlocal fields | nodal Lagrange `on=` only; no chained derived fields; host geometry closed over by the rule is **frozen at build**, so it goes stale on a moving mesh | raises, except the moving mesh — **silent** |
 | Plasticity | small-strain, isotropic, linear-hardening | raises |
 | Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |

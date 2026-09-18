@@ -498,6 +498,12 @@ class PendingElementExpr:
     are already the gather and the scatter, so deferring them covers all of them with one mechanism.
     The physics in between stays yours to write.
 
+    This is the **residual** spelling of that shape: it produces a load vector, in-residual, with the
+    nonlocality carried exactly in the tangent. :func:`jno.derived` is the **value** spelling -- a nodal
+    field, lagged, usable anywhere a field is. An enclosure flux fits either (divide ``load`` by the
+    consistent weights ``gap.load(ones)`` to get nodal values); a quantity needed INSIDE a term, like a
+    beam's attenuation multiplying a source, fits only the second. See ``docs/fem/geometry.md``.
+
     .. important::
        The block this produces is **dense** in element space. It reads like a weak term and is not
        one: its Jacobian couples every element to every other, which is why ``fem.solve`` stays on

@@ -1448,3 +1448,114 @@ def test_axisymmetric_kernel_row_chunking_matches_the_unblocked_build():
                 f"max rel {np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-300):.2e})"
             )
         assert np.all(np.isfinite(ref))
+
+
+def test_radiosity_as_a_derived_field_matches_the_coupling_and_the_analytic_series():
+    """The same enclosure radiation written as a ``jno.derived`` COEFFICIENT rather than a ``jno.Coupling``.
+
+    ``gap.load(q)`` returns an *integrated* consistent load, so it becomes a nodal field by dividing out
+    the consistent weights ``W_j = int phi_j ds`` -- which is ``gap.load`` of a unit flux, no new API. The
+    weak form then carries an ordinary Neumann term ``q_h v`` on the enclosure tags instead of a nonlocal
+    residual vector::
+
+        W  = gap.load(jnp.ones(gap.size), size=nd)
+        qn = jno.derived(lambda T: gap.load(q_elem(T), size=nd) / W, inputs=[u], on=u)
+        fem = jno.fem([conduction, qn * v_gap1, qn * v_gap2, *bcs])
+
+    What that changes, and what it does not. Since ``sum_i (M_bnd)_ij = int phi_j ds = W_j``, the total
+    radiative power is conserved EXACTLY; the difference is one P1 boundary-mass smoothing of its
+    distribution, which is consistent at O(h^2) -- measured below at a thousandth of a kelvin. What it
+    buys is the tangent: the derived form has an ASSEMBLED sparse Jacobian, so ``newton(direct=True)``
+    solves it, while the ``Coupling`` path is matrix-free only because its tangent couples every enclosure
+    element to every other.
+
+    What it COSTS is robustness, and that is why the ``Coupling`` path is not being retired: lagging turns
+    a Newton that carries the full T^4 radiative coupling in its tangent into successive substitution on
+    it, whose rate is set by the radiative-to-conductive stiffness ratio ~4 eps sigma T^3 L / k. This
+    enclosure is conduction-dominated so it converges easily; a radiation-dominated one may need
+    ``jno.solve.picard(damping=...)``, or the ``Coupling`` spelling.
+    """
+    from shapely.geometry import Point
+
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from scipy.optimize import fsolve
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps1, eps2, T_hot, T_cold = 20.0, 0.8, 0.6, 1000.0, 300.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45)
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    xg1, yg1, _ = d.variable("inner_gap", split=True)
+    xg2, yg2, _ = d.variable("outer_gap", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
+    ar = np.asarray(gap.areas)
+    F = jnp.asarray(gap.view_factor)
+    eps = gap.emissivity({"inner_gap": eps1, "outer_gap": eps2})
+    rho, eye, s_row = 1.0 - eps, jnp.eye(gap.size), F.sum(axis=1)
+    nd = int(np.asarray(d.mesh.points).shape[0])
+
+    def q_elem(T):  # the user's grey-body radiosity, per enclosure element -- jNO supplies only geometry
+        J = jnp.linalg.solve(eye - rho[:, None] * F, eps * sigma * gap.field(T) ** 4)
+        return s_row * J - F @ J
+
+    W = gap.load(jnp.ones(gap.size), size=nd)  # the consistent nodal weight int phi_i ds
+    qn = jno.derived(lambda T: gap.load(q_elem(T), size=nd) / jnp.where(W > 0, W, 1.0), inputs=[u], on=u)
+    fem = jno.fem(
+        [
+            k0 * (ui.x * vi.x + ui.y * vi.y),
+            qn * v.bind(x=xg1, y=yg1),
+            qn * v.bind(x=xg2, y=yg2),
+            u(xh, yh) - T_hot,
+            u(xc, yc) - T_cold,
+        ]
+    )
+    assert fem._mode == "nonlinear", "a derived field makes the form nonlinear; a linear assembly would use the zero"
+    # sparse-direct Newton -- available here precisely BECAUSE the coupling was lagged out of the tangent
+    T = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, max_steps=80))).reshape(-1)
+
+    Tsf = np.asarray(gap.field(jnp.asarray(T)))
+    Ts1 = float((Tsf[mi] * ar[mi]).sum() / ar[mi].sum())
+    Ts2 = float((Tsf[mo] * ar[mo]).sum() / ar[mo].sum())
+    D = 1 / eps1 + (r1 / r2) * (1 / eps2 - 1)
+    ts1_a, ts2_a = fsolve(
+        lambda x: [
+            2 * np.pi * k0 * (T_hot - x[0]) / np.log(r1 / r0) - 2 * np.pi * r1 * sigma * (x[0] ** 4 - x[1] ** 4) / D,
+            2 * np.pi * r1 * sigma * (x[0] ** 4 - x[1] ** 4) / D - 2 * np.pi * k0 * (x[1] - T_cold) / np.log(r3 / r2),
+        ],
+        [800.0, 500.0],
+    )
+    assert T_hot > Ts1 > Ts2 > T_cold, "temperatures must be monotone hot>Ts1>Ts2>cold"
+    assert abs(Ts1 - ts1_a) / ts1_a < 5e-3, f"derived-path Ts1 {Ts1:.1f} vs analytic {ts1_a:.1f}"
+    assert abs(Ts2 - ts2_a) / ts2_a < 5e-3, f"derived-path Ts2 {Ts2:.1f} vs analytic {ts2_a:.1f}"
+
+    # ...and the SAME field as the Coupling spelling on the SAME mesh: the P1 smoothing is all that differs
+    opC = jno.fem(
+        [k0 * (ui.x * vi.x + ui.y * vi.y), lambda w: gap.load(q_elem(w), size=nd), u(xh, yh) - T_hot, u(xc, yc) - T_cold]
+    ).operator
+
+    def _newton(res, x, steps=80, tol=1e-9):  # BYO: the Coupling path has no assembled tangent to factorize
+        f = lambda z: jnp.asarray(res(z)).reshape(-1)  # noqa: E731
+        for _ in range(steps):
+            dx = jnp.linalg.solve(jax.jacfwd(f)(x), -f(x))
+            x = x + dx
+            if float(jnp.linalg.norm(dx)) < tol:
+                break
+        return x
+
+    TC = np.asarray(_newton(lambda w: opC.residual(w, {}), jnp.full((nd,), 0.5 * (T_hot + T_cold))))
+    spread = np.abs(T - TC).max()
+    assert spread < 0.05, f"derived and Coupling spellings differ by {spread:.3f} K -- more than a P1 smoothing"

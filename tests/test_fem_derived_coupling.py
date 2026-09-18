@@ -229,6 +229,62 @@ def test_evaluating_once_per_step_costs_a_first_order_splitting_error():
     assert all(0.7 < r < 1.4 for r in rates), f"splitting error is not first order in dt: gaps {gaps}, rates {rates}"
 
 
+def _periodic_mean_source(c, *, size=0.25):
+    """The same nonlocal source, now on a form with a periodic tie ``u(left) = u(right)``."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    src = jno.derived(lambda T: c * jnp.mean(T) * jnp.ones_like(T), inputs=[u], on=u)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - (1.0 + src) * vi, u(xl, yl) - u(xr, yr), u(xb, yb) - 0.0])
+    r = fem.solve()
+    return np.asarray(r.fn() if hasattr(r, "fn") else r).reshape(-1)
+
+
+def test_a_steady_periodic_form_composes_with_a_derived_field():
+    """Periodic ties reduce LAZILY on the steady nonlinear path (``P^T r(P.)``), so the rule still sees
+    full nodal values and the same closed form holds. Worth checking rather than assuming: the reduced
+    state is shorter than the nodal vector, and a rule fed the wrong one returns a plausible field."""
+    c = 0.5
+    w = _periodic_mean_source(0.0)
+    T = _periodic_mean_source(c)
+    exact = w / (1.0 - c * w.mean())
+    assert np.abs(T - exact).max() < 1e-7, f"periodic + derived misses its closed form by {np.abs(T - exact).max():.2e}"
+
+
+def test_a_periodic_transient_refuses_the_step_cadence_instead_of_reading_the_reduced_state():
+    """The one place the two features genuinely do not compose, refused by name.
+
+    A periodic transient block marches the REDUCED main-DOF state. Evaluated inside the residual that is
+    harmless -- the wrapper prolongs its input back to the nodal space first -- but the ``every="step"``
+    driver sees the reduced vector and would slice it with the form's full-space offsets. Measured before
+    the guard: a 17-DOF reduced state handed to a rule expecting 20 nodes, and a plausible field returned.
+    """
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34), time=(0.0, 0.1, 4))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    terms = lambda q: [  # noqa: E731
+        ui.t * vi + ui.x * vi.x + ui.y * vi.y - q * vi,
+        u(xl, yl) - u(xr, yr),
+        u(xb, yb) - 0.0,
+        u(ci[0], ci[1]) - 1.0,
+    ]
+    rule = lambda T: 0.2 * jnp.mean(T) * jnp.ones_like(T)  # noqa: E731
+    with pytest.raises(NotImplementedError, match="every='step'"):
+        jno.fem(terms(jno.derived(rule, inputs=[u], on=u, every="step")))
+    # ...and the default cadence composes, marching to a full-length nodal field
+    marched = np.asarray(jno.fem(terms(jno.derived(rule, inputs=[u], on=u))).solve().fn())
+    assert marched.ndim == 2 and np.all(np.isfinite(marched)), f"periodic transient + derived gave {marched.shape}"
+
+
 # ---------------------------------------------------------------------------
 # refusals -- each names the fix, and each is a mistake that would otherwise be silent
 # ---------------------------------------------------------------------------
