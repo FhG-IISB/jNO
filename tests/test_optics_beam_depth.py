@@ -135,22 +135,29 @@ def test_a_derived_source_reduces_to_the_frozen_one_when_the_absorption_is_const
     oracle available, because any error in the plumbing (wrong connectivity, a stale placeholder, values
     landing in the wrong node order) would show up as a difference here and nowhere else.
 
-    The agreement is at the nonlinear solver's tolerance rather than at machine epsilon: a derived field
-    routes the form through the residual path, so this is a converged Newton against a direct linear solve.
+    BOTH sides are pinned to direct solves, which is what makes the comparison sharp. Left on the default
+    iterative linear solver the two agree only to ~8e-9 -- and that is not the mechanism at all, it is the
+    FROZEN path's own BiCGStab tolerance (its default and its direct LU differ by the same 7.9e-9). With
+    the iterative tolerance taken out of the comparison the two spellings agree to 2.5e-14, i.e. machine
+    precision, and the bound below keeps three orders of headroom over that. For scale, getting the
+    plumbing subtly wrong -- interpolating exp(-tau) instead of exponentiating the interpolated tau -- moves
+    the answer by 3.6e-3, so this bound still catches such a slip by eleven orders of magnitude.
     """
     alpha0, I0, k = 2.5, 4.0, 0.7
     _, u, v, (xi, yi), (xb, yb), pts, nodes, w = _beam_problem()
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     stiff = k * (ui.x * vi.x + ui.y * vi.y)
+    tight = jno.solve.newton(direct=True, rtol=1e-14, atol=1e-14, max_steps=30)
 
     rule = lambda T: alpha0 * I0 * jax.numpy.exp(-optical_depth(jax.numpy.full_like(T, alpha0), nodes, w))  # noqa: E731
     src = jno.derived(rule, inputs=[u], on=u)
-    T = np.asarray(jno.fem([stiff - src * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    T = np.asarray(jno.fem([stiff - src * vi, u(xb, yb) - 0.0]).solve(nonlinear=tight)).reshape(-1)
 
     q_nodes = alpha0 * I0 * np.exp(-np.asarray(optical_depth(np.full(len(pts), alpha0), nodes, w)))
     frozen = u.bind(x=xi, y=yi).freeze(q_nodes)
-    T_frozen = np.asarray(jno.fem([stiff - frozen * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
-    assert np.abs(T - T_frozen).max() < 1e-8, f"derived and frozen differ by {np.abs(T - T_frozen).max():.2e}"
+    T_frozen = np.asarray(jno.fem([stiff - frozen * vi, u(xb, yb) - 0.0]).solve(linear=jno.solve.lu())).reshape(-1)
+    gap = np.abs(T - T_frozen).max() / np.abs(T_frozen).max()
+    assert gap < 1e-11, f"derived and frozen differ by {gap:.2e} relative -- not the same field"
 
 
 def test_an_absorption_that_depends_on_temperature_closes_the_loop():
@@ -161,23 +168,29 @@ def test_an_absorption_that_depends_on_temperature_closes_the_loop():
     AT the converged state, solve the resulting ORDINARY linear problem, and the same field must come back.
     That is the statement ``R(u) = 0``, checked through a completely separate code path -- and it is what
     "the converged root is exact" means, lagging or no lagging.
+
+    Both solves are direct, for the reason given in the test above: on the default iterative linear solver
+    the comparison bottoms out at that solver's tolerance (~1e-8) rather than at anything to do with the
+    coupling, which would leave this bound measuring the wrong quantity.
     """
     a0, I0, k, beta = 2.5, 4.0, 0.7, 0.15
     _, u, v, (xi, yi), (xb, yb), pts, nodes, w = _beam_problem()
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     stiff = k * (ui.x * vi.x + ui.y * vi.y)
+    tight = jno.solve.newton(direct=True, rtol=1e-14, atol=1e-14, max_steps=30)
 
     alpha = lambda T: a0 * (1.0 + beta * T)  # noqa: E731 -- absorption rises with temperature
     rule = lambda T: alpha(T) * I0 * jax.numpy.exp(-optical_depth(alpha(T), nodes, w))  # noqa: E731
-    T = np.asarray(jno.fem([stiff - jno.derived(rule, inputs=[u], on=u) * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    fem_d = jno.fem([stiff - jno.derived(rule, inputs=[u], on=u) * vi, u(xb, yb) - 0.0])
+    T = np.asarray(fem_d.solve(nonlinear=tight)).reshape(-1)
 
     at_root = u.bind(x=xi, y=yi).freeze(np.asarray(rule(jax.numpy.asarray(T))))
-    T_again = np.asarray(jno.fem([stiff - at_root * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    T_again = np.asarray(jno.fem([stiff - at_root * vi, u(xb, yb) - 0.0]).solve(linear=jno.solve.lu())).reshape(-1)
     drift = np.abs(T - T_again).max() / np.abs(T).max()
-    assert drift < 1e-7, f"the converged field is not a fixed point of its own source (drift {drift:.2e})"
+    assert drift < 1e-10, f"the converged field is not a fixed point of its own source (drift {drift:.2e})"
 
     cold = u.bind(x=xi, y=yi).freeze(np.asarray(rule(jax.numpy.zeros(len(pts)))))
-    T_cold = np.asarray(jno.fem([stiff - cold * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    T_cold = np.asarray(jno.fem([stiff - cold * vi, u(xb, yb) - 0.0]).solve(linear=jno.solve.lu())).reshape(-1)
     moved = np.abs(T - T_cold).max() / np.abs(T_cold).max()
     assert moved > 0.05, f"the feedback changed the answer by only {100 * moved:.1f} % -- oracle is near-vacuous"
 
