@@ -1985,9 +1985,7 @@ def assemble_fem_native(
     # A DERIVED field (`jno.derived`) carries values computed from the state itself, on the same channel.
     _derived_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _DerivedField)}
     _frozen_nodes = {
-        fid: n
-        for fid, n in _frozen_nodes.items()
-        if not isinstance(n, (_LoadPathField, _MeshVelocityField, _DerivedField))
+        fid: n for fid, n in _frozen_nodes.items() if not isinstance(n, (_LoadPathField, _MeshVelocityField, _DerivedField))
     }
 
     # Per-cell gather of each frozen field's nodal slice (n_cell, n_local, 1) -- a compile-time constant

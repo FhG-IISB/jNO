@@ -146,7 +146,7 @@ def test_dropping_the_hoop_strain_leaves_a_free_cylinder_with_no_radial_stiffnes
     assert cond_good < 1e8, f"the correct form should be well conditioned, got cond {cond_good:.1e}"
     assert cond_bad > 1e14, f"dropping eps_qq should leave a null space, got cond {cond_bad:.1e}"
 
-    u_r, u_z = null[:, 0], null[:, 1]              # and the null mode is exactly what the physics says
+    u_r, u_z = null[:, 0], null[:, 1]  # and the null mode is exactly what the physics says
     assert np.abs(u_z).max() < 1e-8 * np.abs(u_r).max(), "the null mode should not move u_z"
     spread = np.ptp(u_r) / np.abs(u_r).mean()
     assert spread < 1e-6, f"the null mode should be a UNIFORM radial translation; spread {spread:.2e}"

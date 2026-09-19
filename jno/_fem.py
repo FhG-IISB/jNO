@@ -5616,9 +5616,7 @@ def _fem_impl(
         from .trace import derived_fields_in
 
         # ...unwrapping the views the term list holds: `frozen_fields_in` walks trace nodes, not views.
-        _derived_params = [
-            p for c in core_constraints for f in derived_fields_in(getattr(c, "_expr", c)) for p in f.params
-        ]
+        _derived_params = [p for c in core_constraints for f in derived_fields_in(getattr(c, "_expr", c)) for p in f.params]
         if _derived_params:
             from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 

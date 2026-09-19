@@ -166,9 +166,7 @@ def test_the_same_physics_as_a_coupling_reaches_the_same_root():
     xi2, yi2, _ = d2.variable("interior", split=True)
     xb2, yb2, _ = d2.variable("boundary", split=True)
     ui2, vi2 = u2.bind(x=xi2, y=yi2), v2.bind(x=xi2, y=yi2)
-    coupled = jno.fem(
-        [ui2.x * vi2.x + ui2.y * vi2.y - 1.0 * vi2, lambda w: c * jnp.mean(w) * b1, u2(xb2, yb2) - 0.0]
-    )
+    coupled = jno.fem([ui2.x * vi2.x + ui2.y * vi2.y - 1.0 * vi2, lambda w: c * jnp.mean(w) * b1, u2(xb2, yb2) - 0.0])
 
     T_derived = np.asarray(_mean_source(c)[0].solve()).reshape(-1)
     T_coupling = np.asarray(coupled.solve()).reshape(-1)
