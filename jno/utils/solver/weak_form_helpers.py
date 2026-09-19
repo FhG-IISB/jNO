@@ -42,6 +42,7 @@ from .solver_helper import (
     contains_node_type,
     depends_on_domain_variables,
     iter_placeholder_children,
+    max_temporal_derivative_order,
     unique_by_id,
 )
 
@@ -112,6 +113,22 @@ def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
                     bucket = None
                 if bucket is not None and bucket[0] == "boundary":
                     return [(sign, node)]
+            # ...and distribute ONLY where it changes the routing. What motivated this is that callers
+            # route a sub-term by its TEMPORAL ORDER, so a group of MIXED order read as one order sends
+            # the stiffness into the mass matrix. Where every part carries the same order, the atomic
+            # product routes identically, and splitting it is not free: the bucket hook above cannot
+            # always tell a facet term from a volume one -- a VPINN boundary flux `(1.0 + 0.0*x_r)*v_r`
+            # infers as ('volume', 'volume') -- so distributing strands its constant part in the volume
+            # channel, and an RT0 natural pressure BC loses the edge it was integrated over.
+            try:
+                _orders = {
+                    max_temporal_derivative_order(_p)
+                    for _s, _p in split_weak_additive_terms(domain, group, 1.0, infer_term_bucket)
+                }
+            except Exception:  # noqa: BLE001 - an order the walker declines is not evidence to split on
+                _orders = {0}
+            if len(_orders) < 2:
+                continue
             out = []
             for part_sign, part in split_weak_additive_terms(domain, group, sign, infer_term_bucket):
                 if node.op == "/":
