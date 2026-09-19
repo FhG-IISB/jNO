@@ -68,6 +68,12 @@ def test_a_condition_that_always_holds_changes_nothing():
 
 
 def test_a_degrading_mesh_is_remeshed_and_marches_on():
+    # The only test in this file that actually rebuilds a mesh, so the only one that reaches mmg (the
+    # lazy import inside `remesh_with_mmg`). The guard is on the test rather than the module -- which is
+    # where `tests/test_fem_adapt.py` and friends put it -- because the other three here never remesh: one
+    # holds a condition that always passes, two are refusals that raise first. Module-scoped it would drop
+    # three passing tests from every environment without the optional dependency, CI included.
+    pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     _, plain = _bulge()
     fem, run = _bulge(jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1))
     assert any(h["remeshed"] for h in fem.adapt_history), "the condition broke and nothing was remeshed"
