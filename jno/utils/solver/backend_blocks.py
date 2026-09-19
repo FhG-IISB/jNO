@@ -636,6 +636,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
             _r_start,
             grid_ts[1:],
             nonlinear_solve,
+            states=ys,
             what="transient march",
             coord="t",
             advice=_TRANSIENT_ADVICE,

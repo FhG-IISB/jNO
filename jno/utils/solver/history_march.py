@@ -162,7 +162,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             return (u, new_buffers, new_sbuffers), (u, r_end, r_start)
 
         _final, (traj, r_end, r_start) = lax.scan(step, (u0, buffers0, sbuffers0), (_grid, _frames))
-        _check_march_converged(r_end, r_start, _grid, solve_fn)
+        _check_march_converged(r_end, r_start, _grid, solve_fn, states=traj)
         return traj  # (n_steps, n_dofs)
 
     # ---- ADAPTIVE load stepping (`fem.solve(tau=jno.solve.adaptive(limit=...))`) --------------------
@@ -527,7 +527,9 @@ _TRANSIENT_ADVICE = (
 )
 
 
-def _check_march_converged(r_end, r_start, grid, solve_fn=None, *, what="load-path march", coord="τ", advice=None):
+def _check_march_converged(
+    r_end, r_start, grid, solve_fn=None, *, states=None, what="load-path march", coord="τ", advice=None
+):
     """Raise if any step of a ``lax.scan`` march returned a non-root.
 
     The per-step driver already knows how to refuse a stalled solve — ``newton_krylov``'s
@@ -555,7 +557,7 @@ def _check_march_converged(r_end, r_start, grid, solve_fn=None, *, what="load-pa
     bound = atol + rtol * np.asarray(r_start, dtype=float)
     bad = ~np.isfinite(r_end) | (r_end > bound)
     if not bad.any():
-        _check_march_moved(r_end, r_start, bound, rtol, atol, what=what)
+        _check_march_moved(r_end, r_start, bound, rtol, atol, states=states, what=what)
         return
     k = int(np.argmax(bad))
     tau_k = float(np.asarray(grid)[k]) if np.asarray(grid).size > k else float("nan")
@@ -567,7 +569,7 @@ def _check_march_converged(r_end, r_start, grid, solve_fn=None, *, what="load-pa
     )
 
 
-def _check_march_moved(r_end, r_start, bound, rtol, atol, *, what="load-path march"):
+def _check_march_moved(r_end, r_start, bound, rtol, atol, *, states=None, what="load-path march"):
     """Raise if no step of the march took a single Newton update — the trajectory IS its initial state.
 
     ``atol`` is an ABSOLUTE floor, and a weak form carries whatever residual scale its units give it. A
@@ -594,6 +596,16 @@ def _check_march_moved(r_end, r_start, bound, rtol, atol, *, what="load-path mar
         return
     peak = float(np.max(r_start))
     if not (peak > 0.0):  # a genuinely exact root at every step -- nothing was there to solve
+        return
+    # The residual signature alone is not enough, because a step may legitimately BEGIN at a root: an
+    # arc-length predictor on a linear path lands on the solution, so Newton correctly takes no update
+    # and r_end == r_start at machine precision (measured 1.07e-12 .. 2.68e-12 over four steps). What
+    # distinguishes that from the pathology is the TRAJECTORY -- the claim being made here is that it is
+    # the initial state. So the states decide, and without them there is no evidence to raise on.
+    if states is None:
+        return
+    s = np.asarray(states)
+    if isinstance(states, jax.core.Tracer) or s.size == 0 or not np.all(s == s[0]):
         return
     raise RuntimeError(
         f"fem.solve: the {what} returned its INITIAL STATE unchanged — no step took a single Newton "

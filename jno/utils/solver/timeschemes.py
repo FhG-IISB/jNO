@@ -230,6 +230,7 @@ class _BDF2Scheme(_TimeScheme):
                 _r_start,
                 grid_ts[2:],
                 nonlinear_solve,
+                states=ys,
                 what="transient march (BDF2)",
                 coord="t",
                 advice=_TRANSIENT_ADVICE,
