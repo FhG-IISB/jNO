@@ -69,13 +69,13 @@ first-order scheme losing to the L-stable second-order one on exactly the quanti
 scheme distorts — the [time-scheme note](../../solvers.md#transient-problems) makes the same argument
 on a heat problem, and here it costs 1.5 % of a benchmark number.
 
-## One combination that is refused, and correctly
+## A quasi-static residual, named as one
 
 A fully consistent transient `tau` puts `u_t` in the momentum strong residual. That makes the
-stabilisation a **state-dependent mass** `c(u)·u_t`, and `jno.solve.bdf2()` refuses it by name: such a
-mass is assembled as a residual against *one* previous state, so BDF2's second level has nowhere to
-go. The residual here is therefore quasi-static — a real approximation, named as one. Backward Euler
-would accept the consistent form; that trade has not been measured.
+stabilisation a **state-dependent mass** `c(u)·u_t`. `jno.solve.bdf2()` marches such a mass (in its
+non-conservative form, second order in time), but this tutorial keeps the quasi-static residual it was
+built with — a real approximation, named as one. Whether the consistent form moves the Strouhal number
+has not been measured.
 
 ## Scope
 

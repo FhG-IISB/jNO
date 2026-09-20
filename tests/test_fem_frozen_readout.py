@@ -207,16 +207,24 @@ def test_vector_frozen_field_as_coefficient_matches_analytic():
     assert np.max(np.abs(bf - br)) < 1e-9, "vector frozen source must match the analytic source (P1-exact)"
 
 
-def test_vector_frozen_field_standalone_eval_fails_loud():
-    """A standalone ``.eval()`` readout of a VECTOR frozen field is not wired (its values are (n_nodes, vec));
-    it must fail loud rather than silently reshape-flatten. (Assembly as a coefficient is supported above.)"""
+def test_vector_frozen_field_standalone_eval_reads_out_its_components():
+    """A standalone ``.eval()`` of a VECTOR frozen field reads out as its components stacked on a trailing
+    axis -- the ``jno.np.stack`` layout -- so one component ``uf[i]`` is the same shape as any point quantity.
+    (It used to refuse. A free surface reads the liquid's velocity this way, ``y.d(t) - uf[1]``.)"""
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
     u, _ = d.fem_symbols(value_shape=(2,), names=("u", "phi"))
     xb, yb, _ = d.variable("boundary", split=True)
-    nvv = int(np.asarray(d.built_mesh.points).shape[0])
-    uf = u.bind(x=xb, y=yb).freeze(np.ones((nvv, 2)))
-    with pytest.raises(NotImplementedError, match="VECTOR frozen field"):
-        uf.eval()
+    pts = np.asarray(d.built_mesh.points)[:, :2]
+    uf = u.bind(x=xb, y=yb).freeze(np.stack([pts[:, 0], 2.0 * pts[:, 1]], axis=1))  # u = (x, 2y)
+    x, y = np.asarray(xb.eval()).reshape(-1), np.asarray(yb.eval()).reshape(-1)
+    whole = np.asarray(uf.eval())
+    assert whole.shape[-1] == 2, whole.shape
+    assert np.allclose(whole[..., 0].reshape(-1), x) and np.allclose(whole[..., 1].reshape(-1), 2.0 * y)
+    assert np.allclose(np.asarray(uf[1].eval()).reshape(-1), 2.0 * y)
+    # the property that matters: a component combines with a coordinate POINTWISE (no outer product)
+    prod = np.asarray((yb * uf[1]).eval())
+    assert prod.shape == np.asarray(yb.eval()).shape, (prod.shape, np.asarray(yb.eval()).shape)
+    assert np.allclose(prod.reshape(-1), y * 2.0 * y)
 
 
 def test_nn_readout_is_host_precomputed_and_matches_argmin():

@@ -4453,9 +4453,83 @@ class PrevStateField(FrozenField):
         return f"PrevStateField(source_key={self.field_key})"
 
 
+class MeshVelocityField(FrozenField):
+    """The MESH velocity ``w`` -- what ``coord.d(t)`` means inside a weak form on a moving mesh.
+
+    Synthesized by ``jno.fem`` (never user-constructed): each ``xi.d(ti)`` in a test-carrying term becomes
+    component ``xi.dim[0]`` of this one vector field. It lives on the mesh vertices -- the assembler borrows
+    a P1 Lagrange field's vertex basis for it -- and its per-step values ``(X_{n+1} - X_n)/dt`` arrive on
+    ``args["__loadpath__"]`` from the moving-mesh driver, as :class:`PrevStateField`'s do. Being a
+    :class:`FrozenField` it reads out its value and its gradient in the kernel and stays invisible to
+    unknown-detection; being no Variable, retagging and region detection never touch it.
+    """
+
+    def __init__(self, dim):
+        import types
+
+        import jax.numpy as _jnp
+
+        dim = int(dim)
+        src = types.SimpleNamespace(name="w", value_shape=(dim,), order=1, space="Lagrange", field_key=_next_op_id())
+        super().__init__(src, _jnp.zeros((1, dim)))
+        self.name = "mesh_velocity"
+
+    def __repr__(self):
+        return f"MeshVelocityField(dim={self.value_shape[0]})"
+
+
+class DerivedField(FrozenField):
+    """A nodal field **computed from the current state** by a pure-JAX rule -- the value side of nonlocal
+    coupling, as opposed to :class:`jno.Coupling`'s residual side. Built by :func:`jno.derived`.
+
+    Where a :class:`Coupling` adds a nonlocal *residual vector* ``R(u) += c(u)``, a derived field carries a
+    nonlocal *nodal value* ``d = f(u)`` that can be used **anywhere a field can** -- as a coefficient, a
+    source, a material property. That is what a beam's optical depth ``tau(u)`` needs: ``exp(-tau)``
+    multiplies a source, it is not a load.
+
+    The values are produced inside the residual from ``stop_gradient(u)`` and delivered on the load-path
+    channel (``args["__loadpath__"]``), exactly as a :class:`PrevStateField`'s are. Two consequences, and
+    they are the whole design:
+
+    * the element Jacobian only ever sees the field as **data**, so the linearization is the *lagged*
+      (Picard) one automatically -- no outer driver, the nonlinear solver itself is the fixed-point loop;
+    * ``R(u) = 0`` does not depend on gradient markers, so the **converged root is exact** -- lagging
+      changes the path, not the answer (the argument :func:`jno.lag` already makes).
+
+    Carries its own ``fn``, the field keys of its ``inputs`` (whose nodal slices ``fn`` receives), the key of
+    the field it lives ``on`` (whose space and connectivity it borrows -- a real field of the problem, so
+    unlike :class:`LoadPathField` it borrows no foreign P1 basis and any nodal Lagrange order works), its
+    ``every`` cadence and any ``params``.
+    """
+
+    def __init__(self, fn, *, input_keys, on, every, params=None):
+        import jax.numpy as _jnp
+
+        src = getattr(on, "_expr", on)
+        _nc = 1
+        for _s in tuple(getattr(src, "value_shape", ()) or ()):
+            _nc *= int(_s)
+        # a placeholder, reshapeable by the parent: the real nodal values arrive on args["__loadpath__"]
+        super().__init__(src, _jnp.zeros(max(1, _nc)))
+        self.fn = fn
+        self.input_keys = list(input_keys)
+        self.on_field_key = src.field_key
+        self.every = str(every)
+        self.params = list(params or [])
+        self.name = f"derived[{getattr(src, 'name', 'u')}]"
+
+    def __repr__(self):
+        return f"DerivedField(on={self.on_field_key!r}, every={self.every!r}, inputs={len(self.input_keys)})"
+
+
 def load_path_fields_in(expr):
     """The distinct :class:`LoadPathField` nodes in ``expr`` (by identity, first-seen order)."""
     return [f for f in frozen_fields_in(expr) if isinstance(f, LoadPathField)]
+
+
+def derived_fields_in(expr):
+    """The distinct :class:`DerivedField` nodes in ``expr`` (by identity, first-seen order)."""
+    return [f for f in frozen_fields_in(expr) if isinstance(f, DerivedField)]
 
 
 # ---------------------------------------------------------------------------
@@ -4551,7 +4625,12 @@ def refreeze(frozen, values):
     import copy as _copy
 
     clone = _copy.copy(frozen)
-    clone.values = jnp.asarray(values).reshape(-1)
+    # The same layout the constructor gives: flat for a scalar field, (n_nodes, vec) for a vector one.
+    # Flattening every field turned a vector field into (2n,), and the next assembly then failed on an
+    # unrelated reshape of a cell's gathered values.
+    _v = jnp.asarray(values)
+    _nc = getattr(frozen, "num_components", 1)
+    clone.values = _v.reshape(-1) if _nc == 1 else _v.reshape(-1, _nc)
     clone.frozen_id = _next_op_id()  # new gather-table key ⇒ the compiler bakes THESE values
     clone.op_id = _next_op_id()
     return clone
@@ -4773,12 +4852,22 @@ def mesh_velocity(term):
     Returns ``None`` for an ordinary term. A term carrying a :class:`TestFunction` is never a geometry term
     (that is a weak form whose *integrand* happens to mention a coordinate derivative), which keeps this from
     stealing constraints from the weak-form classifier.
+
+    Refused by name rather than integrated as something else: a term that also carries the unknown
+    (``u(xb, yb) - yb.d(tb)`` -- taken as mesh motion, its Dirichlet condition vanished), the time
+    derivative of a symbol derived FROM the mesh (``nx.d(tb)``, ``cell_size.d(ti)``), and a second time
+    derivative (``xi.d(ti).d(ti)`` -- the walk found the inner derivative and dropped the outer one).
     """
     node = term._expr if hasattr(term, "_expr") else term
     if not isinstance(node, Placeholder):
         return None
     seen: set = set()
     found = []
+    trial = []
+    second = []
+
+    def temporal(jac):
+        return [v for v in jac.variables if getattr(v, "axis", None) == "temporal"]
 
     def visit(n):
         if not isinstance(n, Placeholder) or id(n) in seen:
@@ -4787,10 +4876,17 @@ def mesh_velocity(term):
         if isinstance(n, TestFunction):
             found.append(None)  # a weak form -- poison the whole term, it is not a geometry equation
             return
+        if isinstance(n, TrialFunction):
+            trial.append(n)
+        if isinstance(n, Jacobian) and temporal(n):
+            inner = n.target
+            if len(temporal(n)) > 1 or (
+                isinstance(inner, Jacobian) and temporal(inner) and getattr(inner.target, "axis", None) == "spatial"
+            ):
+                second.append(n)
         if isinstance(n, Jacobian) and getattr(n.target, "axis", None) == "spatial":
-            for v in n.variables:
-                if getattr(v, "axis", None) == "temporal":
-                    found.append((n.target, v, n))
+            for v in temporal(n):
+                found.append((n.target, v, n))
         for kind, _attr, val in _iter_placeholder_children(n):
             for c in val if kind == "list" else (val,):
                 visit(c)
@@ -4798,6 +4894,27 @@ def mesh_velocity(term):
     visit(node)
     if not found or any(f is None for f in found):
         return None
+    if second:
+        raise ValueError(
+            "jno.fem: a geometry term takes the second time derivative of a coordinate. The mesh driver "
+            "integrates a FIRST-order law x' = v only; a second-order motion needs its velocity as a solved "
+            "field that the first-order law reads."
+        )
+    for coord, _t, _jac in found:
+        tg = getattr(coord, "tag", None)
+        if isinstance(tg, str) and (tg in ("cell_size", "cell_metric") or tg.startswith(("n_", "gap_", "slide_"))):
+            raise ValueError(
+                f"jno.fem: a geometry term differentiates {tg!r} in time, but that is not a mesh coordinate "
+                "-- it is derived FROM the mesh (an outward normal, the element size, a contact gap) and "
+                "follows the coordinates by itself. Move the coordinates: `yb.d(tb) - v`."
+            )
+    if trial:
+        raise ValueError(
+            "jno.fem: this term both differentiates a mesh coordinate in time and carries the unknown "
+            f"{getattr(trial[0], 'name', 'u')!r}, so it is neither a geometry law nor a field equation the "
+            "assembler can read. State the mesh motion as its own term (`yb.d(tb) - v`); a field equation "
+            "reading the mesh velocity is not supported yet."
+        )
     if len(found) > 1:
         names = ", ".join(str(getattr(f[0], "tag", f[0])) for f in found)
         raise ValueError(

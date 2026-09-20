@@ -720,6 +720,20 @@ class TraceEvaluator:
         mesh = _MeshCtx(mesh_points, int(mesh_points.shape[0]), domain, int(domain.mesh_connectivity["dimension"]))
 
         u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
+        # A frozen field -- or one component `uf[i]` of a vector one -- reads out as (1, N, 1) like every point
+        # quantity (see `_eval_frozen_field`). On the mesh that is one value per VERTEX, not an operator's
+        # image-shaped output, so it is flattened here. Left to the image branch below, `tf.x` came back on
+        # the mesh vertices instead of the sample points.
+        _frozen = target if isinstance(target, FrozenField) else None
+        if _frozen is None and getattr(target, "name", None) == "getitem" and getattr(target, "args", None):
+            _frozen = target.args[0] if isinstance(target.args[0], FrozenField) else None
+        if _frozen is not None:
+            if int(u_full.size) != mesh.n:
+                raise NotImplementedError(
+                    "The gradient of a VECTOR frozen field as a whole (`uf.x`) is not supported in a readout or "
+                    "a geometry law. Take the gradient of one component instead: `uf[i].x`."
+                )
+            return mesh, jnp.reshape(u_full, (mesh.n,)), None, 1
         u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
         if u_squeezed.ndim > 1 and u_squeezed.size == mesh.n:
             return mesh, u_squeezed.reshape(mesh.n), u_full.shape, 1
@@ -1290,14 +1304,10 @@ class TraceEvaluator:
         active sample points: map its per-vertex values onto the points in context for the region it was
         bound to. Its gradient (``.x`` / ``.y``) is produced by :meth:`_eval_jacobian`'s FD-over-mesh path
         (a nodal mesh field has no analytic coordinate-function to auto-differentiate)."""
-        if getattr(expr, "num_components", 1) != 1:
-            # A VECTOR frozen field stores (n_nodes, vec); a standalone readout maps ONE scalar per vertex.
-            # It works as a coefficient inside a jno.fem form (the assembler gathers the vec-vectors); a
-            # standalone .eval() of the whole vector is not wired (fail loud, not a silent reshape).
-            raise NotImplementedError(
-                "FrozenField.eval(): standalone readout of a VECTOR frozen field is not supported yet — a "
-                "vector frozen field works as a coefficient in a jno.fem form. Read a single component."
-            )
+        # A VECTOR frozen field stores (n_nodes, vec) and reads out as (n_points, vec), one vec-vector per
+        # sample point; a component `uf[1]` is then the ordinary `x[..., 1]` getitem on that (it is how a
+        # free surface reads the liquid's vertical velocity). A scalar field stays flat.
+        vec = int(getattr(expr, "num_components", 1))
         # A caller marching a MOVING mesh supplies the nodal values and the mesh geometry through the eval
         # context instead of the graph node and the domain object. Both are otherwise host state captured
         # when the expression was built, so under a `lax.scan` a frozen field would silently keep reading
@@ -1305,7 +1315,8 @@ class TraceEvaluator:
         # keys, every existing `FrozenField.eval()` caller takes the original path unchanged.
         _ctx_vals = ctx.context.get("__frozen_values__")
         _ctx_vals = None if _ctx_vals is None else _ctx_vals.get(getattr(expr, "frozen_id", None))
-        values = jnp.asarray(expr.values if _ctx_vals is None else _ctx_vals).reshape(-1)
+        values = jnp.asarray(expr.values if _ctx_vals is None else _ctx_vals)
+        values = values.reshape(-1) if vec == 1 else values.reshape(-1, vec)
 
         _ctx_pts = ctx.context.get("__mesh_points__")
         domain = getattr(expr, "_domain", None)
@@ -1336,7 +1347,15 @@ class TraceEvaluator:
             pts = pts[0]
         if pts.ndim == 1:
             pts = pts[jnp.newaxis, :]
-        return self._map_mesh_to_sampled(mesh_points, pts[:, :mesh_dim], values)
+        out = self._map_mesh_to_sampled(mesh_points, pts[:, :mesh_dim], values)
+        # Read out in the per-point layout the rest of an expression uses: (N, 1) per batch element, which is
+        # what a coordinate is inside the batch vmap (and it right-aligns with a time-batched (T, N, 1) too). A
+        # bare (N,) broadcast against a coordinate as an OUTER product -- `yb * tf` became (1, N, N) -- so a
+        # law mixing a coordinate with a frozen value read the wrong vertices with no error (measured). A
+        # vector field reads out as its components stacked on a trailing axis, (N, 1, vec) -- the
+        # `jno.np.stack` layout -- so the plain getitem `uf[1]` gives back an (N, 1) scalar that broadcasts
+        # correctly as well.
+        return out[:, jnp.newaxis] if vec == 1 else out[:, jnp.newaxis, :]
 
     def _eval_normal_derivative(self, target, normal_var, scheme, ctx):
         """``∇(target)·n`` at the eval points, where ``normal_var`` is a boundary/interface normal

@@ -21,11 +21,11 @@ transient path publishes no free (pre-Dirichlet) residual, so it is not availabl
 number needs no forces at all -- it is the frequency of the transverse velocity at a fixed point in
 the wake, which is read straight out of the trajectory.
 
-**One combination that is refused, and correctly.** A fully consistent transient `tau` puts `u_t` in
-the strong residual. That makes the stabilisation a *state-dependent mass* `c(u)*u_t`, which
-`jno.solve.bdf2()` refuses by name -- its mass action is assembled against one previous state, and
-there is nowhere for BDF2's second level to enter. The residual below is therefore quasi-static
-(no `u_t`), which is a real approximation and is named as one.
+**A quasi-static residual, named as one.** A fully consistent transient `tau` puts `u_t` in the strong
+residual. That makes the stabilisation a *state-dependent mass* `c(u)*u_t`, which `jno.solve.bdf2()`
+marches in its non-conservative form -- but the residual below stays quasi-static (no `u_t`), the form
+this tutorial was built and measured with. That is a real approximation, named as one; whether the
+consistent form moves the Strouhal number has not been measured.
 """
 
 import os

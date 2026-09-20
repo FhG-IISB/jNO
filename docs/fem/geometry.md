@@ -181,6 +181,14 @@ round, `0` marked on the next. `theta` is refused with a constraint (there is no
 choose), and a bare comparison (`q > 2.0`) is refused too: it records which cells are bad but not by
 how much, so marking would take a fraction of them and quietly leave the rest.
 
+**On a march** the same condition is a *trigger*. With `remesh(criterion=jno.le(...), every=k)` on a
+transient problem it is checked on the current mesh every `k` steps, and the mesh is rebuilt only when
+some cell breaks it; `fem.adapt_history` records `remeshed: False` for the rounds it held, so a
+condition that never breaks never remeshes. A ranking criterion (`1 - phi**2`, `|grad u|`) is evaluated
+on the live state at each remesh -- and at that remesh's time, so it may read `t` (a moving source) -- and
+the vertex budget (`max_dofs`, else the starting count) is held on both the isotropic and the anisotropic
+path.
+
 Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
 bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
 it runs out of rounds. And pass a **callable** for a geometry criterion: a geometry node captures the
@@ -276,6 +284,89 @@ Each step: evaluate every geometry term's velocity, scatter it into the vertices
 extend harmonically over everything they do not, move, re-assemble on the moved vertices, and carry the state
 across.
 
+### The mesh velocity inside a weak form (ALE)
+
+On a moving mesh a nodal value follows its vertex, so its rate is the ALE derivative
+
+$$
+\left.\frac{\partial u}{\partial t}\right|_{X} = \left.\frac{\partial u}{\partial t}\right|_{x} + w\cdot\nabla u ,
+$$
+
+with $w$ the mesh velocity. Transport written on the moving mesh therefore carries $w$, and you write it as
+what it is — the rate of a coordinate:
+
+```python
+w0, w1 = xi.d(ti), yi.d(ti)                                        # the mesh velocity w
+fem = jno.fem([ui.t * vi + ((c0 - w0) * ui.x + (c1 - w1) * ui.y) * vi   # u_t + (c - w)·∇u
+               + nu * (ui.x * vi.x + ui.y * vi.y),
+               xi.d(ti) - c0, yi.d(ti) - c1,                       # the mesh: it follows the flow
+               u(*ci) - u0])
+```
+
+When a weak form reads `coord.d(t)`, the nodal values **ride with their vertices** and nothing is transferred
+(transferring as well would count the mesh advection twice). Each step, `w` is the discrete motion of every
+vertex, $(X^{n+1} - X^n)/\Delta t$, harmonically extended vertices included, in volume and surface terms
+alike. This is the non-conservative ALE form, backward Euler, with mass and operator on the end-of-step
+configuration. Measured (`tests/test_fem_ale_mesh_velocity.py`):
+
+* a mesh translating rigidly with the material reproduces the fixed-mesh diffusion march to **1.1e-15**;
+* a surface term `(w·n) u v` equals `(c·n) u v` on that mesh to 3.6e-16;
+* a Gaussian advected at `c` past a mesh moving at `c/2` meets its closed form to **2.0 %** (5.2 % on a fixed
+  mesh with the same `h` and `dt`, since less relative motion means less numerical diffusion).
+
+`w` lives on the mesh vertices and borrows a **P1 Lagrange** field's basis, so the problem needs one (a
+Taylor–Hood pressure qualifies). Refused by name: `coord.d(t)` with no geometry term (it would be identically
+zero), the rate of a normal or of `cell_size`, and the mesh acceleration `xi.d(ti).d(ti)`.
+
+!!! danger "A capillary flow needs its own `tau` — the advection recipe silently over-damps it"
+    The SUPG/PSPG `tau` of the stabilised-flow tutorial is built for advection-dominated flow. A surface-tension
+    driven drop is the opposite regime — nearly inviscid and nearly stagnant — and that `tau` then contributes
+    **about ten times the physical damping** and feeds a spurious `n = 4` surface mode. Measured on an ellipse
+    released from rest (`tests/test_fem_drop_oscillation.py`): with the advection `tau`, the `n = 2` mode does
+    not oscillate at all and `n = 4` grows sevenfold; scaled by `1e-4`, the drop rings at **ω within 0.7 % of**
+    Lamb's `ω² = n(n²−1)σ/(ρR³)` and decays within **12 %** of `2n(n−1)ν/R²`. The time integration is not
+    involved: quartering `dt` changes the answer in the fourth digit.
+
+    Two further practicalities. Measure the shape as a **Fourier mode of `r(θ)`**, not as a bounding-box aspect
+    ratio, and fit a damped sinusoid — extremum counting returned `+7.4/s` and `−1.6/s` for the same run over
+    different spans. And the capillary time step is tighter than `√(ρh³/2πσ)` suggests: at `h = 0.03` that
+    estimate gives `8e-4` while `5e-4` already tangles, so shrink `dt` as you refine.
+
+### Bodies that merge — `remesh(alpha=...)`
+
+Moving a mesh cannot change its topology: two droplets meshed as separate bodies in a void can approach
+forever and stay two meshes. `alpha=` re-decides which nodes form elements, instead of meshing the geometry
+afresh — a Delaunay triangulation of the nodes where the motion left them, keeping only the triangles whose
+circumradius is below `alpha` × the starting mean edge length (the **alpha shape**, the remeshing step of the
+Particle Finite Element Method):
+
+```python
+traj = fem.solve(adapt=jno.solve.remesh(alpha=1.2, every=1))   # re-triangulate the nodes every step
+```
+
+Every node stays put, so a P1 state carries across **by identity** — nothing is interpolated and nothing is
+lost. What changes is which nodes are neighbours, so a gap that closes gets bridged and the two bodies become
+one mesh.
+
+!!! measured "Two disks (R = 0.5, h = 0.075, 357 nodes) driven together"
+    | gap | 0.35 → 0.150 | 0.136 |
+    |---|---|---|
+    | bodies | 2 | **1** |
+
+    They merge at about `1.8 h`, a little later than the flat-wall threshold `2·alpha·h = 0.18`: two facing
+    arcs put fewer nodes near the closest point than two straight walls do. The node count is unchanged
+    (357), the cell count goes 630 → 638, and the field — two flat plateaus at ∓1 — starts to diffuse across
+    the new neck (minimum |u| there 0.479, against 0.972 when the bodies never merge). Only 2 of 12 steps
+    actually rebuilt anything: the reconnection is skipped when it reproduces the elements already there.
+    The march cost 5.0 s against 3.6 s without reconnection.
+
+Merging is therefore a **mesh-length contact model** — bodies join when their gap is comparable to the
+element size — and not film drainage. Scope: 2-D, P1 fields (a new edge bridging two bodies has its midpoint
+in the void, where a P2 value cannot be read), a geometry term must be present (nothing else moves the
+nodes), and `alpha=` does not combine with `criterion=` — they are different operations. A node left in no
+triangle (a free particle) is refused rather than dropped, because dropping it would renumber the rest and
+silently permute the state.
+
 **Scope** — the rest raises rather than guessing:
 
 * **Operator-split ALE, explicit in the velocity**, hence first order in the step — *measured*, against a
@@ -298,13 +389,21 @@ across.
       this replaced fell ~33 %, and got *worse* as `dt` shrank). Conservation is algebraic — `Σφ = 1` — so the
       residual is quadrature error on an integrand with kinks: ~2e-4 relative against the pointwise route's
       3e-3 to 9e-3. Removing the diffusion entirely means not transferring at all (Lagrangian DOFs plus an ALE
-      `-w·∇u` term), which is a different semidiscretisation.
+      `-w·∇u` term), which is a different semidiscretisation — and what happens when a weak form reads the
+      mesh velocity (above).
     * **Requires `jax_enable_x64`.** The transfer locates quadrature points in the previous mesh, and in float32
       that carries ~4e-4 — enough for a mesh that never moves to drift 1.5e-3 over a march (2.6e-10 with x64).
     * **Backward Euler only**: `θ` comes from the block, and `time=jno.solve.theta(...)` is a solver slot, which
       a geometry term does not compose with.
-    * **Connectivity-preserving**: a move that would invert an element raises. Remesh-on-tangle is the next
-      extension.
+    * **Connectivity-preserving, unless told to remesh**: a move that would invert an element raises. With
+      `fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1))` the march
+      checks the condition on the moved mesh every `every` steps and, where it breaks, rebuilds the mesh
+      (mmg, at the starting vertex budget), re-assembles and carries the state across. Measured on a top edge
+      bulging as `y' = 2y sin(πx)`: worst cell aspect 6.27 → 3.19 with one remesh, the surface where the plain
+      march puts it, a constant field exact to 4e-16. The laws may read only `boundary` and `interior` (any
+      other region is found by a position that does not follow a moved surface), a remesh is not
+      differentiable (refused under `jax.grad`), and each remesh drifts a curved boundary's enclosed area by
+      ~6e-3 (mmg, measured on a disk).
     * A Dirichlet BC on the moving surface must be tied to a whole-boundary or held tag, not to a spatial
       sub-predicate — a predicate does not follow the motion.
     * **Any nodal-Lagrange field(s), real, non-periodic**, 2D or 3D — scalar or vector, P1 or higher, and
@@ -441,6 +540,45 @@ answer is wrong by exactly that factor with no error raised, so bind `dV` once a
     `ε_θθ = u_r/r`, and divergence picks up `u_r/r`. Neither can be produced by weighting the Cartesian
     form by anything — they are extra terms you must write out. This is precisely why jNO does not offer
     to apply the weighting automatically: it would be exact for scalars and quietly wrong for vectors.
+
+### The vector recipe, written out
+
+A displacement `u = (u_r, u_z)` on the meridian strains four components, not three:
+
+$$\varepsilon_{rr}=\partial_r u_r,\qquad \varepsilon_{zz}=\partial_z u_z,\qquad \varepsilon_{rz}=\tfrac12(\partial_z u_r+\partial_r u_z),\qquad \boxed{\varepsilon_{\theta\theta}=u_r/r}$$
+
+The last one is the whole difference, and it is ordinary arithmetic in the term list:
+
+```python
+u, v = d.fem_symbols(value_shape=(2,), order=2)          # (u_r, u_z)
+r, z, _ = d.variable("interior", split=True)
+ub, vb = u.bind(x=r, y=z), v.bind(x=r, y=z)
+
+def strains(w):
+    return w.x[0], w.y[1], w[0] / r, 0.5 * (w.y[0] + w.x[1])   # rr, zz, THETA-THETA, rz
+
+e_rr, e_zz, e_qq, e_rz = strains(ub)
+f_rr, f_zz, f_qq, f_rz = strains(vb)
+tr_u, tr_v = e_rr + e_zz + e_qq, f_rr + f_zz + f_qq            # the trace carries it too
+energy = lam * tr_u * tr_v + 2 * mu * (e_rr*f_rr + e_zz*f_zz + e_qq*f_qq + 2*e_rz*f_rz)
+fem = jno.fem([energy * (2 * np.pi * r), ...])                 # and then the ring measure
+```
+
+For flow the same four components appear, and the **divergence** is
+$\nabla\!\cdot\!\mathbf u=\partial_r u_r+u_r/r+\partial_z u_z$ — so `div_u = e_rr + e_qq + e_zz`, which is
+what the continuity equation and the pressure term must both use.
+
+!!! measured "Both halves are pinned by `tests/test_fem_axisymmetric_vector.py`"
+    **Lamé thick-walled cylinder** under internal pressure (plane strain), exact
+    $u_r = \frac{(1+\nu)pa^2}{E(b^2-a^2)}\left[(1-2\nu)r + b^2/r\right]$: the form above reproduces it to
+    **under 1 %**, with $u_z$ vanishing. Drop `ε_θθ` from that same form and the error is **over 10 %**
+    and the cylinder measurably softer — with no error raised, which is what makes it worth a test.
+
+    **Poiseuille pipe** ($u_z = G(R^2-r^2)/4\eta$) on a meridian that *includes the axis*, Taylor–Hood
+    P2/P1: **machine precision**, since P2 represents the parabola exactly. Two details matter — a
+    traction-free pipe end is not what fully developed flow satisfies (the parabola carries a shear
+    traction $\eta u_z'$ on a z-face), and on the axis `u_r/r` is harmless because quadrature points sit
+    strictly inside cells and $u_r=0$ is imposed there.
 
 !!! danger "This applies to vector EM too, and there is no guard"
     An axisymmetric `(r, z)` **vector
@@ -585,5 +723,98 @@ also how you reach the options below:
 All four (bare function, `params`, `field_key`, transient) are covered in
 `tests/test_fem_enclosure_radiation.py`. Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed.,
 Ch. 4–5 (view factors; the net-radiation / radiosity method for diffuse-grey enclosures).
+
+---
+
+## Nonlocal coupling, in general — `jno.Coupling` and `jno.derived`
+
+Enclosure radiation is one instance of a shape that recurs: **gather → operate → scatter**, where the
+"operate" is not a local integrand. jNO has two mechanisms for it, and which one you want is decided by
+*what the nonlocal quantity is*, not by the physics.
+
+| | `jno.Coupling(fn)` | `jno.derived(fn, inputs=[...], on=u)` |
+|---|---|---|
+| produces | a **residual vector** `R(u) += c(u)` | a **nodal field** `d = f(u)` |
+| used as | a term in the `jno.fem([...])` list | a value **inside** any term |
+| tangent | carries the coupling **exactly** | **lagged** (Picard); stays local and sparse |
+| solver | matrix-free Newton–Krylov only | assembled tangent, so `newton(direct=True)` works |
+| converges | quadratically | linearly, and can stall on a strong coupling |
+
+**Reach for `derived` when the nonlocal quantity is needed inside a term**, which is the case a residual
+vector simply cannot express. A laser's Beer–Lambert attenuation is the clean example: the depth
+`τ(x) = ∫α ds` depends on the whole chord behind each point, and `exp(−τ)` *multiplies* the source:
+
+```python
+from jno.utils.optics import beam_paths, optical_depth      # the beam GEOMETRY (private; host-side, once)
+
+nodes, w = beam_paths(pts, cells, direction, pts, n_samples=600)
+alpha    = lambda T: a0 * (1.0 + beta * T)                  # a hotter body absorbs more
+tau      = jno.derived(lambda T: optical_depth(alpha(T), nodes, w), inputs=[u], on=u)
+Q        = a0 * I0 * jno.np.exp(-tau)                       # tau reads as an ordinary field
+
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - Q * vi, u(xb, yb) - 0.0])
+```
+
+The rule is **pure JAX** on the input fields' nodal values. Everything host-side — ray tables, view
+factors, neighbour lists — is built once *outside* and closed over; a numpy/scipy rule is refused at
+`jno.fem` build, with the fix named. Non-traceability, a wrong output length and an unknown `on=` field
+all fail there rather than inside a Newton step.
+
+**What lagging does and does not change.** The values are computed inside the residual from
+`stop_gradient(u)`, so the linearization sees them as data and the nonlinear solver *is* the fixed-point
+loop — no extra solver slot, no outer driver.
+
+- The **converged root is exact**: `R(u) = 0` does not depend on gradient markers, so lagging changed the
+  path, not the answer (the same argument `jno.lag` makes). Convergence is checked on the *true* coupled
+  residual, so a fixed point that does not converge **raises** rather than returning a plausible field.
+- Convergence is **linear**, at a rate set by the coupling strength. Past a critical strength it does not
+  converge at all; `fem.solve(nonlinear=jno.solve.picard(damping=...))` or `newton(line_search=True)` is
+  the remedy, and `jno.Coupling` is the alternative when you want the coupling in the tangent.
+- Gradients are the **Picard adjoint** — descent-worthy and trainable through `jno.core`, but not exact;
+  a finite-difference check will not agree to machine precision. A `params=[...]` value inside the rule is
+  *not* lagged, so the direct sensitivity through it is exact.
+
+**Cadence.** `every="residual"` (default) re-evaluates the rule at every residual evaluation, so a
+transient step is fully implicit in the coupling. `every="step"` evaluates it once per step of a march
+from the previous step's state — cheaper, but an operator splitting with its own `O(dt)` error that no
+residual check can see, because the step converges, just to a slightly different problem.
+
+!!! warning "Host geometry is frozen at build"
+    Ray tables and view factors closed over by the rule are fixed for the life of the `jno.fem`. On a
+    **moving mesh they go stale silently** — a rebuild means a new `jno.fem`. This is the same caveat the
+    enclosure carries, and it is the open edge of droplet-plus-laser work.
+
+### The same enclosure, written as a derived field
+
+`gap.load(q)` returns an *integrated* load, so it becomes a nodal field by dividing out the consistent
+weights `W_j = ∫φ_j ds` — which is `gap.load` of a unit flux, no new API:
+
+```python
+W  = gap.load(jnp.ones(gap.size), size=nd)               # the consistent nodal weight
+qn = jno.derived(lambda T: gap.load(q_elem(T), size=nd) / jnp.where(W > 0, W, 1.0), inputs=[u], on=u)
+fem = jno.fem([conduction, qn * v.bind(x=xg1, y=yg1), qn * v.bind(x=xg2, y=yg2), *bcs])
+```
+
+Because `Σ_i (M_∂)_ij = W_j`, the **total radiative power is conserved exactly**; the difference is one P1
+boundary-mass smoothing of its distribution, consistent at `O(h²)` — measured at a thousandth of a kelvin
+on the concentric-cylinder case in `tests/test_fem_enclosure_radiation.py`. What it buys is the tangent:
+the derived form has an assembled sparse Jacobian, so `newton(direct=True)` solves it, where the
+`Coupling` path is matrix-free only because its tangent couples every enclosure element to every other.
+What it costs is robustness on a radiation-dominated enclosure, per above. **Both spellings are supported;
+the `Coupling` one remains the default in the examples.**
+
+### What stays on its own path — contact
+
+Contact is *not* written with either mechanism, and deliberately. The gap value is a weighted gather
+**inside** the differentiated residual, so the secondary–main coupling is exact in the tangent; only the
+*pairing* is lagged, by a host-side search between rounds. Routing it through `derived` would
+`stop_gradient` the gap value itself, turning a quadratic Newton contact into a Picard iteration on a
+penalty interface — the regime where Picard is worst. The gap also lives at face quadrature points rather
+than on nodes, so there is nothing for `on=` to name.
+
+What contact *does* share is the delivery contract: **host-frozen shapes, per-round values threaded on
+`args`**. `__gap_tables__`, `__loadpath__` (load-path fields, previous states, the mesh velocity) and
+derived fields are all that one idea. Anything that writes to those channels must **merge**, never assign
+— a march can carry a mesh velocity and a derived field at once.
 
 ---

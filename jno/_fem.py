@@ -244,6 +244,111 @@ def lag(expr: Any) -> Any:
     return jax.lax.stop_gradient(expr)  # plain arrays inside hand-written residuals
 
 
+def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
+    """A nodal field **computed from the current state** by a rule that is not a local integrand --
+    the general spelling for nonlocal coupling that enters as a *value*.
+
+    A weak term is *local*: an integrand evaluated at one quadrature point. Some physics is not. Where
+    :class:`jno.Coupling` carries a nonlocal *residual* ``R(u) += c(u)``, ``derived`` carries a nonlocal
+    *value* ``d = f(u)`` on the nodes, usable **anywhere a field is** -- a coefficient, a source, a
+    material property. The distinction is not cosmetic: a beam's attenuation ``exp(-tau(u))``
+    *multiplies* a source, so it cannot be written as a load; and a quantity needed inside a term has
+    nowhere else to come from.
+
+    Beer--Lambert absorption, where the heat deposited at a point depends on everything the beam passed
+    through to reach it::
+
+        nodes, w = beam_paths(pts, cells, direction, pts)      # host geometry, built ONCE
+        tau = jno.derived(lambda T: optical_depth(alpha(T), nodes, w), inputs=[u], on=u)
+        Q   = alpha_of(u) * I0 * jno.np.exp(-tau)              # tau reads as an ordinary field
+        fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - Q * vi, u(xb, yb) - 0.0])
+
+    ``fn`` is **pure JAX**, taking each input field's nodal vector -- ``(n_nodes,)`` scalar,
+    ``(n_nodes, vec)`` vector -- and returning nodal values on ``on``'s space. Host-side geometry (view
+    factors, ray tables, neighbour lists) is computed once *before* the call and closed over; only the
+    part that depends on the state goes inside. A non-traceable ``fn`` is caught at ``jno.fem`` build, not
+    at solve time.
+
+    **The semantics are lagged (Picard).** The values are produced inside the residual from
+    ``stop_gradient(u)``, so the linearization treats them as data and the nonlinear solver *is* the
+    fixed-point loop -- no extra solver slot, no outer driver. Two things follow, and both matter:
+
+    * the **converged root is exact**. ``R(u) = 0`` does not depend on gradient markers, so lagging
+      changed the path, not the answer (the argument :func:`jno.lag` already makes). Convergence is
+      checked on the *true* coupled residual, so a fixed point that does not converge fails loudly
+      rather than returning a plausible wrong field;
+    * convergence is **linear, not quadratic**, at a rate set by the coupling strength. For a strongly
+      coupled nonlocality -- radiation-dominated enclosure, optically thick beam -- it can stall or
+      diverge, where an in-residual :class:`jno.Coupling` would have kept the coupling in its tangent.
+      ``fem.solve(nonlinear=jno.solve.picard(damping=...))`` or ``newton(line_search=True)`` is the
+      remedy. Reach for ``Coupling`` when you need the exact tangent, ``derived`` when you need the
+      value inside a term or the cheap tangent.
+
+    ``every`` sets the cadence. ``"residual"`` (default) re-evaluates ``fn`` at every residual
+    evaluation, so a transient step is fully implicit in the coupling; ``"step"`` evaluates it once per
+    step of a march from the previous step's state, which is cheaper but is an operator splitting and
+    carries its own ``O(dt)`` error -- one no residual check can see, because the step converges, just to
+    a slightly different problem.
+
+    ``params=[...]`` declares ``jno.np.parameter`` nodes used only inside ``fn`` (the trace walk that
+    finds weak-form parameters cannot see into an opaque function); ``fn`` then takes a trailing
+    ``{name: value}`` dict, as a :class:`jno.Coupling`'s residual does.
+
+    **Inverse-problem caveat**: parameters inside ``fn`` are not lagged, so the direct sensitivity
+    through them is exact, but the path through ``u`` uses the lagged Jacobian -- the standard "Picard
+    adjoint", descent-worthy and trainable through ``jno.core``, but not exact. A finite-difference
+    gradient check will not agree to machine precision.
+
+    **Limits**: ``on`` must be a nodal Lagrange field (values live on nodes, so element-wise,
+    quadrature-point and edge/face-DOF quantities are out). Host geometry closed over by ``fn`` is fixed
+    for the life of the ``jno.fem`` -- on a **moving mesh it goes stale silently**, and a rebuild means a
+    new ``jno.fem``. A derived field cannot read another derived field.
+    """
+    from .trace import DerivedField
+
+    if not callable(fn):
+        raise TypeError(f"jno.derived: `fn` must be a callable of the input fields' nodal values; got {type(fn)!r}.")
+    if every not in ("residual", "step"):
+        raise ValueError(
+            f"jno.derived: every={every!r} is not a cadence. Use 'residual' (re-evaluate every residual "
+            "evaluation -- implicit in the coupling) or 'step' (once per march step, cheaper, O(dt) splitting)."
+        )
+
+    def _field(obj, what):
+        node = getattr(obj, "_expr", obj)
+        if getattr(node, "field_key", None) is None:
+            raise TypeError(
+                f"jno.derived: {what} must be a trial function of this form (or a bound view of one, "
+                f"e.g. `u.bind(x=xi, y=yi)`); got {type(obj).__name__}. A derived field is a function of "
+                "the unknowns, so its inputs are fields, not values or expressions."
+            )
+        if isinstance(node, DerivedField):
+            raise ValueError(
+                f"jno.derived: {what} is itself a derived field. Chained derived fields are not supported "
+                "-- there is no defined evaluation order between them. Fold the two rules into one `fn`."
+            )
+        return node
+
+    if isinstance(inputs, (str, bytes)) or not isinstance(inputs, (list, tuple)):
+        raise TypeError(f"jno.derived: `inputs` must be a list of trial functions; got {type(inputs).__name__}.")
+    if not inputs:
+        raise ValueError(
+            "jno.derived: `inputs` is empty, so `fn` would not depend on the state. A field that does not "
+            "read the solution is a KNOWN field -- use `u.bind(...).freeze(values)` instead."
+        )
+    in_nodes = [_field(o, f"inputs[{i}]") for i, o in enumerate(inputs)]
+    on_node = _field(on, "`on`")
+
+    space = str(getattr(on_node, "space", "Lagrange"))
+    if space != "Lagrange":
+        raise ValueError(
+            f"jno.derived: on= is a {space!r} field, but a derived field's values are NODAL. "
+            "Point `on=` at a Lagrange field of this form (the derived values live on its nodes)."
+        )
+
+    return DerivedField(fn, input_keys=[n.field_key for n in in_nodes], on=on_node, every=every, params=params)
+
+
 # ---------------------------------------------------------------------------
 # expression helpers
 # ---------------------------------------------------------------------------
@@ -995,6 +1100,95 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
             v.tag = target
 
 
+def _coordinate_rates(node: Any) -> List[Any]:
+    """Every ``coord.d(t)`` in a tree: a Jacobian of a spatial coordinate Variable with respect to time."""
+    from .trace import Jacobian
+
+    return [
+        n
+        for n in _walk(node)
+        if isinstance(n, Jacobian)
+        and isinstance(n.target, Variable)
+        and getattr(n.target, "axis", None) == "spatial"
+        and any(getattr(v, "axis", None) == "temporal" for v in n.variables)
+    ]
+
+
+def _rewrite_mesh_velocity(constraints: List[Any], geometry: List[Any], domain: Any) -> Tuple[List[Any], Any]:
+    """Give ``coord.d(t)`` inside a weak form its meaning: the MESH velocity ``w``.
+
+    On a moving mesh a nodal value rides with its vertex, so its time derivative is the ALE derivative
+    ``∂u/∂t|_X = ∂u/∂t|_x + w·∇u``. A transport equation written on the moving mesh therefore carries the
+    mesh velocity -- ``u_t + (c - w)·∇u = ...`` -- and ``w`` is written as what it is, the rate of a
+    coordinate: ``xi.d(ti)``, ``yi.d(ti)``. Every such rate in a test-carrying term becomes a component of
+    ONE internal :class:`jno.trace.MeshVelocityField`, whose per-step vertex values ``(X_{n+1} - X_n)/dt``
+    the moving-mesh driver delivers: the discrete motion of every vertex, harmonically extended ones included.
+
+    Runs before any detector reads the weak forms (transient detection counts ``d/dt`` of anything; the
+    retag rewrites coordinate tags), so everything downstream sees ``w`` as known data. Refused by name: a
+    rate with no geometry term (``w`` would be identically zero), the rate of a symbol derived from the
+    mesh, a mixed or repeated derivative, and the rate of the mesh velocity itself."""
+    import copy
+
+    from .trace import Jacobian, MeshVelocityField, substitute
+
+    W = None
+    out: List[Any] = []
+    for c in constraints:
+        bare = _bare(c)
+        rates = _coordinate_rates(bare) if isinstance(bare, Placeholder) else []
+        if not rates or not _contains(c, TestFunction):
+            out.append(c)
+            continue
+        if not geometry:
+            raise ValueError(
+                "jno.fem: a weak form differentiates a coordinate in time (`xi.d(ti)`), which is the MESH "
+                "velocity -- but no term moves the mesh, so it would be identically zero. Add a geometry term "
+                "(`xb.d(tb) - v`) that states the motion, or drop the mesh-velocity term."
+            )
+        _region_and_support(c, domain)  # on the ORIGINAL term, so a rate from another region still raises
+        ids = {id(j) for j in rates}
+        for j in rates:
+            tg = getattr(j.target, "tag", None)
+            if isinstance(tg, str) and (tg in ("cell_size", "cell_metric") or tg.startswith(("n_", "gap_", "slide_"))):
+                raise ValueError(
+                    f"jno.fem: a weak form differentiates {tg!r} in time, but that is not a mesh coordinate -- "
+                    "it is derived FROM the mesh. The mesh velocity is the rate of a coordinate: `xi.d(ti)`."
+                )
+            if len(j.variables) != 1:
+                raise ValueError(
+                    "jno.fem: a weak form takes a mixed or repeated derivative of a coordinate. The mesh "
+                    "velocity is the first time derivative of a coordinate, `xi.d(ti)`, and nothing else."
+                )
+        for n in _walk(bare):
+            if (
+                isinstance(n, Jacobian)
+                and id(n) not in ids
+                and any(getattr(v, "axis", None) == "temporal" for v in n.variables)
+                and any(id(m) in ids for m in _walk(n.target))
+            ):
+                raise ValueError(
+                    "jno.fem: a weak form takes the time derivative of the mesh velocity (`xi.d(ti).d(ti)`, the "
+                    "mesh acceleration). Only the mesh velocity itself, `xi.d(ti)`, is available."
+                )
+        if W is None:
+            W = MeshVelocityField(int(domain.dimension))
+        view = W._field_view()
+        new_bare = substitute(bare, {j: _bare(view[int(j.target.dim[0])]) for j in rates})
+        if _coordinate_rates(new_bare):
+            raise NotImplementedError(
+                "jno.fem: a mesh-velocity term `xi.d(ti)` sits inside a construct the rewrite cannot reach "
+                "(a normal derivative of a view, say). Write it as a plain factor of the weak form."
+            )
+        if _is_view(c):
+            c = copy.copy(c)  # keeps the view's `_coord_vars`, which carry a bound term's region
+            c._expr = new_bare
+        else:
+            c = new_bare
+        out.append(c)
+    return out, W
+
+
 def _constant_of(node: Any) -> Optional[float]:
     """Best-effort scalar extraction from a constant/Literal node."""
     for attr in ("value", "val", "data", "constant"):
@@ -1600,6 +1794,7 @@ class FEM:
         self._constraints = None  # original constraint list; attached by fem() for the adaptive driver
         self._fem_kwargs = {}  # original fem() build options; attached by fem() for the adaptive driver
         self._geometry = []  # `coord.d(t) - v` mesh-motion terms; attached by fem()
+        self._mesh_velocity = None  # the MeshVelocityField `coord.d(t)` in a weak form became; attached by fem()
 
         self._A = self._b = None
         if mode == "linear":
@@ -1822,7 +2017,9 @@ class FEM:
         ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
         frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
         term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
-        (operator-split ALE; scalar-P1, real).
+        (operator-split ALE; nodal-Lagrange fields, real). A weak form may read the mesh velocity
+        ``xi.d(ti)`` (the nodal values then ride with the mesh), and
+        ``adapt=jno.solve.remesh(criterion=<mesh-geometry condition>)`` rebuilds a mesh that degrades.
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
@@ -2253,9 +2450,9 @@ class FEM:
             # which the march does not own, and the transient adaptive driver already composes them for
             # exactly that reason. Refusing them here left a moving-mesh problem on the matrix-free
             # default, with no way to reach a sparse-direct Newton -- which is the only thing that
-            # converges on a saddle step.
+            # converges on a saddle step. adapt= is not a march owner here either: the driver consumes it,
+            # as a remesh triggered between chunks of the march (see `run_mesh_motion`).
             _march_owners = (
-                ("adapt", adapt),
                 ("time", time),
                 ("tau", tau),
                 ("x0", x0),
@@ -2265,7 +2462,8 @@ class FEM:
                 raise NotImplementedError(
                     f"jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with "
                     f"{'/'.join(_clash)}= — the mesh-motion driver owns the march and re-assembles each "
-                    "step. The per-step solver slots (nonlinear=/linear=/precond=) DO compose."
+                    "step. The per-step solver slots (nonlinear=/linear=/precond=) DO compose, and so does "
+                    "adapt= as a remesh triggered by a mesh-geometry condition."
                 )
             if self._mode != "transient":
                 raise NotImplementedError(
@@ -2275,7 +2473,9 @@ class FEM:
                 )
             from .utils.solver.fem_adapt import run_mesh_motion
 
-            return run_mesh_motion(self, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs)
+            return run_mesh_motion(
+                self, adapt=adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+            )
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
             # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
@@ -2289,6 +2489,15 @@ class FEM:
                     "transferred onto each new mesh — wired for the transient stepper, not for `tau=`. "
                     "For a fixed graded mesh instead, put the refinement in the geometry: "
                     "`shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
+                )
+            if getattr(adapt, "alpha", None) is not None:
+                # `alpha=` re-triangulates the MOVED nodes. Without a geometry term nothing moves them,
+                # so there is nothing to reconnect -- and the flag would otherwise fall through to an
+                # ordinary remesh, which is a different operation (new nodes, no topology change).
+                raise NotImplementedError(
+                    "jno.solve.remesh(alpha=...) re-triangulates the nodes a MOVING mesh has carried, so "
+                    "that bodies which come within about 2*alpha*h merge. This problem has no geometry "
+                    "term, so nothing moves the nodes: add one (`coord.d(t) - velocity`), or drop alpha=."
                 )
             if getattr(adapt, "enrich", False):
                 # p-adaptivity: raise the local order by switching interpolation covers on at the marked
@@ -3035,7 +3244,16 @@ class FEM:
         ``term`` is any weak term built from this domain's symbols (it carries the test function); it does
         **not** have to be one of the terms this FEM was built from, so a diagnostic form — a sub-term, a
         different stress measure — can be assembled against an existing solution. A term with no test
-        function is a field readout rather than an assembly and is refused by name.
+        function is a field readout rather than an assembly and is refused by name. On a transient problem
+        the term is assembled at ``t = 0``.
+        """
+        return self._eval_at(term, u, 0.0, args=args)
+
+    def _eval_at(self, term, u, t_eval, *, args=None):
+        """:meth:`eval` at time ``t_eval``. A transient remesh criterion needs it: one that reads the time -- a
+        moving heat source, a switch-on -- would otherwise be marked as it stood at ``t = 0`` at every
+        remesh. Private because the adaptive driver is its only caller; ``eval`` is this at ``t = 0``.
+        Not named ``t``: the term loop below binds ``t``, and the time would silently become a term.
         """
         from .utils.solver.solver_helper import contains_node_type
 
@@ -3073,7 +3291,7 @@ class FEM:
                     "the quantity as a volume term."
                 )
             (bares.append(bare) if support == "volume" else b_bares.setdefault(region, []).append(bare))
-        return _as_flat(factory(bares, b_bares or None)(jnp.asarray(u).reshape(-1), 0.0, args))
+        return _as_flat(factory(bares, b_bares or None)(jnp.asarray(u).reshape(-1), t_eval, args))
 
     def region_dofs(self, region, *, field=0, component=None):
         """Global DOF indices of a tagged region — the companion to :meth:`eval`.
@@ -4621,6 +4839,21 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     # assemblies produce that shape, and every reduction below (M, A, operator_fn, forcing, state0)
     # then acts on the 2N system.
     _meta_in = getattr(block, "metadata", None) or {}
+    # `residual`/`jacobian` are wrapped to PROLONG their input, so a derived field evaluated inside the
+    # residual still sees full nodal values and composes here with no special case. A derived field on the
+    # `every="step"` cadence does NOT: the stepper hands it the state it is marching, which on a reduced
+    # block is the MAIN-DOF vector, and the rule would slice it with this form's full-space offsets --
+    # reading the wrong entries, or a short vector, and reporting nothing. Measured: a 17-DOF reduced
+    # state fed to a rule expecting 20 nodes returned a plausible field.
+    _step_derived = [s["name"] for s in (_meta_in.get("derived_specs") or {}).values() if s["every"] == "step"]
+    if _step_derived:
+        raise NotImplementedError(
+            f"jno.fem: periodic ties combined with a *transient* `jno.derived(..., every='step')` field "
+            f"({_step_derived[0]}) are not supported -- the periodic transient block marches the reduced "
+            "main-DOF state, which is not the nodal vector the rule reads. Use every='residual' (the "
+            "default), which is evaluated inside the residual where the state is prolonged back to the "
+            "full nodal space, and composes with periodic ties today."
+        )
     _bloch = "blocks" not in periodic and bool(periodic.get("is_bloch"))
     if _bloch and not _meta_in.get("complex"):
         # A complex phase forces a complex-valued field; this march carries a REAL state (a plain or
@@ -5284,7 +5517,7 @@ def _fem_impl(
     _geometry, _rest = [], []
     for c in constraints:
         (_geometry if mesh_velocity(c) is not None else _rest).append(c)
-    constraints = _rest
+    constraints, _mesh_velocity_node = _rewrite_mesh_velocity(_rest, _geometry, domain)
     if rotation_bcs and not (_trial_spaces(constraints) - _NATIVE_SPACES):
         raise NotImplementedError(
             "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
@@ -5383,6 +5616,7 @@ def _fem_impl(
         fem_obj._constraints = _orig_constraints
         fem_obj._fem_kwargs = _orig_fem_kwargs
         fem_obj._geometry = list(_geometry)  # `coord.d(t) - v` terms: the mesh-motion driver reads these
+        fem_obj._mesh_velocity = _mesh_velocity_node  # `coord.d(t)` in a weak form; the driver feeds it
         # Field-key snapshots for FEM.block_index: the assembler's list is offsets-ordered (and
         # must be captured NOW — a later assembly on the same domain overwrites the attribute);
         # the constraint-walk order is the fallback for paths that don't run the native assembler.
@@ -5408,6 +5642,23 @@ def _fem_impl(
                 "inequality, which needs a residual to test — not a transient stepper or a complex "
                 "real-equivalent block."
             )
+        # A `jno.derived` rule is opaque to the trace walk for the same reason a Coupling's residual is --
+        # it is a plain function, not an expression -- so a `jno.np.parameter` declared with `params=[...]`
+        # has to be merged into the operator's runtime parameters by hand, or it would never reach the
+        # solve's args and the rule would read a missing key. Mirrors `_merge_coupling_params` below.
+        from .trace import derived_fields_in
+
+        # ...unwrapping the views the term list holds: `frozen_fields_in` walks trace nodes, not views.
+        _derived_params = [p for c in core_constraints for f in derived_fields_in(getattr(c, "_expr", c)) for p in f.params]
+        if _derived_params:
+            from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+            _tgt = fem_obj._op
+            _rpe = dict(getattr(_tgt, "runtime_parameter_exprs", {}) or {})
+            for _p in _derived_params:
+                _collect_runtime_parameter_exprs(_p, _rpe)
+            _tgt.runtime_parameter_exprs = _rpe
+
         if couplings and periodic_ties and fem_obj.is_transient:
             # The native periodic *transient* block reduces eagerly into a main-DOF space; the coupling
             # residual is written in the full nodal space, so the two cannot be composed on that path yet.

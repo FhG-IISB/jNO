@@ -160,16 +160,18 @@ class _BDF2Scheme(_TimeScheme):
         import jax
         import jax.numpy as jnp
 
-        from .backend_blocks import _block_time_grid, _resample_trajectory
+        from .backend_blocks import _resample_trajectory
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
         md = block.metadata or {}
-        if getattr(block, "mass_residual", None) is not None:
-            raise NotImplementedError(
-                "jno.solve.bdf2(): a state-dependent (nonlinear) transient mass `c(u)*u_t` is backward "
-                "Euler only -- its mass action is assembled as a residual against ONE previous state, so "
-                "there is nowhere for the second BDF2 level to enter. Use the default theta scheme."
-            )
+        # A STATE-DEPENDENT mass `c(u)*u_t` needs nothing extra here. Its mass action is assembled as
+        # `c(u)(u - u_prev)/h` with `u_prev` the step's own starting state (see `SemidiscreteTimeBlock.step`),
+        # and the reduction below starts each step from `u* = (4u^n - u^{n-1})/3` over `h = 2dt/3` -- so it
+        # lands on exactly `c(u^{n+1})(3u^{n+1} - 4u^n + u^{n-1})/(2dt)`: BDF2 in its NON-conservative form,
+        # second order in time (measured, `tests/test_fem_bdf2_state_dependent_mass.py`). It used to be
+        # refused on the reading that one previous state left nowhere for the second level to enter; the
+        # shifted start state is where it enters. What this is not: the conservative `(3H(u^{n+1}) - ...)`
+        # form for an enthalpy-type mass `H(u)_t`, which would need `H` itself rather than `c = H'`.
         if md.get("second_order"):
             raise NotImplementedError(
                 "jno.solve.bdf2(): a second-order-in-time (u_tt) block is assembled with theta=1/2 "
@@ -181,8 +183,15 @@ class _BDF2Scheme(_TimeScheme):
         s0 = block.state0_fn(args) if getattr(block, "state0_fn", None) is not None else block.state0
         s0 = jnp.asarray(s0).reshape(-1)
         dtype = s0.dtype
-        grid_ts = _block_time_grid(block)
         dt = float(block.dt)
+        # The grid is built on the HOST. `_block_time_grid` returns a `jnp.linspace`, and under a trace --
+        # which is how `jno.core(...)` evaluates a solve, i.e. every inverse problem -- even a linspace of
+        # plain floats is staged, so `float(grid_ts[1])` below raised a ConcretizationTypeError. BDF2 had
+        # only ever been exercised eagerly (`.fn()`), so it was unusable inside `jno.core` without a word.
+        import numpy as np
+
+        t0, t1 = float(block.t0), float(block.t1)
+        grid_ts = np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)  # concrete: numpy, not jnp
 
         # A nonlinear step's own convergence guard cannot fire inside the scan, so the step reports
         # its residual norms and they are judged below -- as in the theta march and the load path.

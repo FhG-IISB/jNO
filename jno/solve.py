@@ -1023,6 +1023,7 @@ def remesh(
     anisotropic: bool = False,
     max_dofs: int | None = None,
     every: int = 5,
+    alpha: float | None = None,
     metric_field: int = 0,
     hmin: float | None = None,
     hmax: float | None = None,
@@ -1078,25 +1079,48 @@ def remesh(
 
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
-    toward convergence. On a **transient** problem it remeshes every ``every`` steps at a *constant*
-    budget and carries the state across (basis-aware transfer), so the mesh tracks a moving feature and
-    coarsens its wake instead of ratcheting up::
+    toward convergence. On a **transient** problem it remeshes every ``every`` steps and carries the
+    state across (basis-aware transfer), so the mesh tracks a moving feature. It holds a *constant*
+    budget -- ``max_dofs`` vertices, else the initial vertex count -- on both paths: the isotropic one
+    refines the marked cells by ``refine_factor`` relative to the rest and then scales the whole size
+    field to the budget, so the wake coarsens instead of the mesh ratcheting up::
 
         fem.solve(adapt=jno.solve.remesh(anisotropic=True, max_dofs=6000, every=4))
+        fem.solve(adapt=jno.solve.remesh(criterion=1.0 - phi * phi, every=4))      # follow an interface
 
-    ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the solution's
-    curvature) instead of isotropic ZZ marking — far fewer DOFs for a layer or a front, and the right
-    choice for an interface. ``hmin``/``hmax`` bound the edge sizes; ``metric_field`` picks which coupled
-    field drives the metric. Metric-based DOF control is approximate, so ``max_dofs`` is honoured only
-    loosely in that mode.
+    On a march a ``criterion=`` is evaluated on the live state, at the remesh time, at every remesh.
+    A **condition** criterion is a trigger there: the mesh is rebuilt only when some cell breaks it, so
+    ``remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1)`` remeshes exactly when the mesh
+    degrades, and never while the condition holds.
+
+    ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the curvature of the
+    solution -- or of the ``criterion``, when one is given) instead of isotropic ZZ marking — far fewer
+    DOFs for a layer or a front, and the right choice for an interface. ``hmin``/``hmax`` bound the edge
+    sizes; ``metric_field`` picks which coupled field drives the metric. DOF control is approximate on
+    both paths (the mesher honours a size field loosely), so ``max_dofs`` is a target, not a cap.
+
+    ``alpha=`` is the **moving-mesh** form, and it is a different operation: instead of meshing the
+    geometry afresh it re-triangulates the NODES the motion has carried and keeps the triangles whose
+    circumradius is below ``alpha`` × the starting mean edge length — the alpha shape, the remeshing step
+    of the Particle Finite Element Method (Idelsohn, Oñate & Del Pin, *IJNME* **61** (2004) 964–989;
+    alpha shapes: Edelsbrunner & Mücke, *ACM TOG* **13** (1994) 43–72). Every node stays where it is, so a
+    P1 state carries across by identity — and because only the *elements* are re-decided, the **topology**
+    may change: two bodies whose gap closes below about ``2·alpha·h`` become one mesh::
+
+        fem.solve(adapt=jno.solve.remesh(alpha=1.2, every=1))   # droplets in a void: they merge on contact
+
+    Merging is therefore a **mesh-length contact model**, not film drainage. Requires a geometry term
+    (nothing else moves the nodes), 2-D, and P1 fields.
 
     Steady-only: ``max_iters``, ``tol``, ``eps`` (a relative-change plateau detector, not a certified
-    bound). Transient-only: ``every``, ``metric_field``.
+    bound). Transient-only: ``every``, ``metric_field``. Moving-mesh-only: ``alpha``.
 
     Args:
         anisotropic: Hessian-metric refinement instead of isotropic ZZ + Dörfler marking.
         max_dofs: Vertex budget. Steady: stop once reached. Transient: the constant target.
-        every: Transient only — remesh every ``every`` time steps.
+        every: Transient only — remesh every ``every`` time steps (with ``alpha``, reconnect that often).
+        alpha: Moving meshes only — re-triangulate the moved NODES and keep the triangles smaller than
+            ``alpha`` × the starting mean edge length. Bodies closer than ~``2·alpha·h`` merge.
         metric_field: Transient multifield only — index of the field driving the metric.
         hmin: Smallest allowed edge length (default: mean edge / 50).
         hmax: Largest allowed edge length (default: 2 × mean edge).
@@ -1116,6 +1140,11 @@ def remesh(
     """
     from .utils.solver.fem_adapt import AdaptSpec
 
+    if alpha is not None and not (float(alpha) > 0.0):
+        raise ValueError(
+            f"remesh(alpha=...): alpha multiplies the mean edge length to set the size a triangle may "
+            f"reach before it is discarded, so it must be > 0; got {alpha}."
+        )
     return AdaptSpec(
         theta=theta,
         max_iters=max_iters,
@@ -1127,6 +1156,7 @@ def remesh(
         hmin=hmin,
         hmax=hmax,
         every=every,
+        alpha=alpha,
         metric_field=metric_field,
         criterion=criterion,
     )
@@ -1491,10 +1521,14 @@ def bdf2():
     has no second level to start from); its ``O(dt^2)`` local error is what the second-order global
     rate needs.
 
-    Refused, loudly, rather than silently mis-integrated: a **state-dependent mass** ``c(u)*u_t``
-    (backward Euler only) and a **second-order-in-time** (``u_tt``) block (assembled at ``theta=1/2``
-    so an undamped wave is not damped -- and an L-stable scheme would damp it). ``.adaptive()`` is
-    also refused: the controller sizes a one-step method by step doubling.
+    A **state-dependent mass** ``c(u)*u_t`` (variable density, an apparent heat capacity) is marched
+    in BDF2's non-conservative form ``c(u^{n+1})(3u^{n+1} - 4u^n + u^{n-1})/(2 dt)``, second order in
+    time (measured on a manufactured ``c(u) = 1 + u^2``). It is not the conservative form an enthalpy
+    mass ``H(u)_t`` would want, which needs ``H`` itself rather than ``c = H'``.
+
+    Refused, loudly, rather than silently mis-integrated: a **second-order-in-time** (``u_tt``) block
+    (assembled at ``theta=1/2`` so an undamped wave is not damped -- and an L-stable scheme would damp
+    it). ``.adaptive()`` is also refused: the controller sizes a one-step method by step doubling.
 
     Reference: Curtiss & Hirschfelder, *PNAS* **38** (1952) 235; Hairer & Wanner, *Solving Ordinary
     Differential Equations II*, 2nd ed., Sec. V.1."""

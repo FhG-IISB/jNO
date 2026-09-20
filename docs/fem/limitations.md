@@ -14,8 +14,12 @@ path is unaffected.
       suboptimal. `shape.curved()` fixes it (order 2, simplices) — see
       [Curved geometry](geometry.md#curved-isoparametric-geometry-shapecurved).
     - **The `2πr` measure on an axisymmetric *vector* form** — exact for scalars, wrong for vectors.
+    - **Host geometry inside a `jno.derived` rule on a moving mesh** — ray tables, view factors and
+      neighbour lists are built once, outside the rule, and closed over. They are correct for the mesh
+      they were built on and are never rebuilt; on a mesh that moves or is remeshed they silently
+      describe the old one. Rebuild them and build a new `jno.fem`.
 
-    Both are detailed below, and stated again at the point where you make the choice.
+    All three are detailed below, and stated again at the point where you make the choice.
 
 | Area | The limit | How it fails |
 |---|---|---|
@@ -28,6 +32,7 @@ path is unaffected.
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
+| `jno.derived` nonlocal fields | nodal Lagrange `on=` only; no chained derived fields; host geometry closed over by the rule is **frozen at build**, so it goes stale on a moving mesh | raises, except the moving mesh — **silent** |
 | Plasticity | small-strain, isotropic, linear-hardening | raises |
 | Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
@@ -257,6 +262,13 @@ path is unaffected.
 ??? warning "Axisymmetric vector forms are your responsibility"
     The `2πr` measure is exact for scalars and wrong for vectors — elasticity hoop strain, and for
     vector Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling.
+
+    For **elasticity and flow** the extra terms are short, and the recipe is written out and verified in
+    [*The vector recipe*](geometry.md#the-vector-recipe-written-out): add `ε_θθ = u_r/r` to the strains
+    and to the trace (so `div u = ∂ᵣu_r + u_r/r + ∂zu_z`). It reproduces the Lamé thick-walled cylinder
+    to under 1 % and Poiseuille pipe flow to machine precision; dropping the hoop term is over 10 % wrong
+    and raises nothing (`tests/test_fem_axisymmetric_vector.py`). **Vector Maxwell** is the case with no
+    recipe here: use a full 3-D mesh.
     jNO ships no axisymmetric H(curl)/H(div) element, and multiplying by `r` is arithmetic the
     assembler cannot distinguish from a legitimate radial coefficient, so **nothing raises**.
 

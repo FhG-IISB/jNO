@@ -274,6 +274,21 @@ class SemidiscreteTimeBlock:
         dtype = u.dtype
         t_next = t + dt
 
+        # A `jno.derived(..., every="step")` field is evaluated ONCE per step, from the state this step
+        # starts at, and put on the load-path channel for the whole step. The assembler's `_derived_args`
+        # leaves a key a driver already supplied alone, so this decides the cadence on its own: the rule
+        # no longer runs inside the Newton loop. The price is an operator splitting -- the step converges,
+        # to a problem whose coupling lags by dt -- which is why `every="residual"` is the default.
+        _step_derived = {
+            _fid: _s for _fid, _s in ((self.metadata or {}).get("derived_specs") or {}).items() if _s["every"] == "step"
+        }
+        if _step_derived:
+            _lp_d = dict(args.get("__loadpath__", {}) or {})
+            for _fid, _s in _step_derived.items():
+                _xs = [u[a:b] if v == 1 else u[a:b].reshape(-1, v) for (a, b, v) in _s["in_slices"]]
+                _lp_d[_fid] = _s["fn"](*_xs, args) if _s["params"] else _s["fn"](*_xs)
+            args = {**args, "__loadpath__": _lp_d}
+
         # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
         def _operand(x):
             return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
@@ -290,14 +305,16 @@ class SemidiscreteTimeBlock:
             # coefficient c(y⁺) cannot be a fixed matrix), so the step residual is
             #     G(y⁺) = mass_residual(y⁺; u_prev=y)/dt + R(y⁺)
             # Newton on G is exact (both matrix-free — jax linearizes through c(y⁺) and (y⁺−y) — and
-            # sparse-direct, which adds mass_residual_jac(y⁺)/dt to R's Jacobian). Backward Euler only.
+            # sparse-direct, which adds mass_residual_jac(y⁺)/dt to R's Jacobian). Every step is a θ=1 step:
+            # backward Euler takes it from u^n over dt, and BDF2 (`jno.solve.bdf2`) from the shifted state
+            # u* = (4u^n - u^{n-1})/3 over 2dt/3, which lands on BDF2's own non-conservative mass action.
             if self.mass_residual is not None:
                 if abs(thn - 1.0) > 1e-12:
                     raise ValueError(
-                        "jno.fem: a state-dependent (nonlinear) transient mass `c(u)·u_t` supports only "
-                        f"backward Euler (theta=1), not theta={thn:g}. A θ≠1 half-step needs the mass at the "
-                        "half-state, which is ill-defined for a coefficient that depends on the unknown. "
-                        "Drop `jno.solve.theta(...)` (use the default) for a nonlinear mass."
+                        "jno.fem: a state-dependent (nonlinear) transient mass `c(u)·u_t` is marched by backward "
+                        f"Euler or BDF2, not by a theta-step with theta={thn:g}. A θ≠1 half-step needs the mass at "
+                        "the half-state, which is ill-defined for a coefficient that depends on the unknown. "
+                        "Drop `jno.solve.theta(...)` (use the default), or use `jno.solve.bdf2()` for second order."
                     )
                 # Deliver the previous state y as each prev-field's nodal slice on the load-path channel.
                 # A vector field's DOFs are node-major interleaved (node·vec + comp), so reshape its slice to

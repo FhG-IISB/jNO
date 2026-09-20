@@ -1249,7 +1249,14 @@ def assemble_fem_native(
             stack.extend(iter_children(n))
         return found
 
-    _frozen_nodes = _collect_frozen_fields(list(volume_terms) + list(boundary_terms))
+    # ``boundary_terms`` is a DICT keyed by region, so ``list(...)`` yields the region NAMES: a frozen
+    # field used ONLY in a boundary term was never collected, and the surface kernel then raised "a path
+    # that does not thread frozen fields" on a channel that does in fact thread them (see the gather at
+    # `_surf_elem_res`). Flatten the values.
+    _bterms = (
+        [t for _ts in boundary_terms.values() for t in _ts] if isinstance(boundary_terms, dict) else list(boundary_terms)
+    )
+    _frozen_nodes = _collect_frozen_fields(list(volume_terms) + _bterms)
 
     # Per-quadrature-point STEP HISTORY (``v.i(k)``): scan the terms for HistoryRef nodes and record, per
     # base variable, how many past states to buffer (the most-negative offset). The buffer itself lives on
@@ -1967,10 +1974,19 @@ def assemble_fem_native(
     # A LOAD-PATH field (``freeze_path``) is a FrozenField whose nodal values vary per load step: split it
     # out of the compile-time frozen gather, keep only its per-cell connectivity, and let the load-step
     # driver deliver each step's nodal slice through ``args["__loadpath__"]`` (like ``__history__``).
+    from ...trace import DerivedField as _DerivedField
     from ...trace import LoadPathField as _LoadPathField
+    from ...trace import MeshVelocityField as _MeshVelocityField
 
     _path_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _LoadPathField)}
-    _frozen_nodes = {fid: n for fid, n in _frozen_nodes.items() if not isinstance(n, _LoadPathField)}
+    # The MESH velocity (`coord.d(t)` inside a weak form, rewritten by jno.fem) is likewise per-step data:
+    # the moving-mesh driver delivers it each step. Split out here, registered below.
+    _mv_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _MeshVelocityField)}
+    # A DERIVED field (`jno.derived`) carries values computed from the state itself, on the same channel.
+    _derived_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _DerivedField)}
+    _frozen_nodes = {
+        fid: n for fid, n in _frozen_nodes.items() if not isinstance(n, (_LoadPathField, _MeshVelocityField, _DerivedField))
+    }
 
     # Per-cell gather of each frozen field's nodal slice (n_cell, n_local, 1) -- a compile-time constant
     # (no args threading, no jacfwd tangent), gathered on the frozen field's own FE space via the same
@@ -2020,6 +2036,90 @@ def assemble_fem_native(
             _path_conn[_fid] = cells_f_j[_p1_idx]  # scalar P1 vertex connectivity (n_cell, n_local)
             path_specs[_fid] = {"name": _fnode.name, "frames": jnp.asarray(_fnode.path_frames), "n_steps": _fnode.n_steps}
 
+    # The mesh velocity w lives on the mesh VERTICES (the driver delivers (X_n - X_c)/dt as (n_verts, dim)),
+    # so it borrows a P1 Lagrange field's vertex basis and connectivity, as a load-path field does. The
+    # compile-time zero is what the eager build (args=None, before any motion) sees; the driver's per-step
+    # slice overrides it through `_add_loadpath_fields`. jno.fem only creates the node when the problem has
+    # a geometry term, and a geometry problem solves only through the moving-mesh driver.
+    if _mv_nodes:
+        _p1_mv = next(
+            (i for i, f in enumerate(fields) if int(f["order"]) == 1 and str(f.get("space", "Lagrange")) == "Lagrange"),
+            None,
+        )
+        if _p1_mv is None:
+            raise NotImplementedError(
+                "jno.fem: a weak form reads the mesh velocity (`coord.d(t)`), which lives on the mesh vertices "
+                "and borrows the vertex basis of a P1 Lagrange field -- but this problem has none. Give one "
+                "field order=1 (a P1 pressure of a Taylor-Hood pair qualifies)."
+            )
+        for _fid, _fnode in _mv_nodes.items():
+            field_index[_fnode.field_key] = _p1_mv
+            _path_conn[_fid] = cells_f_j[_p1_mv]
+            _mvc = cells_f_j[_p1_mv]
+            _frozen_gathered[_fid] = jnp.zeros((_mvc.shape[0], _mvc.shape[1], _fnode.num_components))
+
+    # A DERIVED field (`jno.derived`) lives on a field of THIS problem -- that is what ``on=`` names -- so
+    # unlike a load-path field it borrows no foreign P1 basis: it takes its own field's connectivity, and
+    # any nodal Lagrange order works. Its values are computed from the state inside the residual by
+    # ``_derived_args`` below and delivered on the same ``args["__loadpath__"]`` channel; the zero here is
+    # what an eager build (args=None) sees before any state exists.
+    derived_specs: Dict[Any, Any] = {}
+    for _fid, _fnode in _derived_nodes.items():
+        _didx = field_index.get(_fnode.on_field_key)
+        if _didx is None:
+            raise ValueError(
+                f"jno.derived: on= names a field that is not among this form's fields {list(field_index)}. "
+                "Point `on=` at a trial function of this problem (the derived values live on its nodes)."
+            )
+        _dconn = cells_f_j[_didx]
+        _path_conn[_fid] = _dconn
+        _frozen_gathered[_fid] = jnp.zeros((_dconn.shape[0], _dconn.shape[1], _fnode.num_components))
+
+        _in_slices = []
+        for _k in _fnode.input_keys:
+            _ki = field_index.get(_k)
+            if _ki is None:
+                raise ValueError(
+                    f"jno.derived: an `inputs=` field is not among this form's fields {list(field_index)}. "
+                    "A derived field reads the unknowns of the form it is used in."
+                )
+            _in_slices.append((int(offs[_ki]), int(offs[_ki + 1]), int(vecs[_ki])))
+
+        _n_out, _nc_out = int(n_nodes_f[_didx]), int(_fnode.num_components)
+        _out_shape = (_n_out,) if _nc_out == 1 else (_n_out, _nc_out)
+        # Purity + shape probe. ``eval_shape`` traces ABSTRACTLY, so a numpy/scipy ``fn`` raises here, at
+        # build, naming the fix -- rather than somewhere unrecognisable inside a Newton step. (Skipped when
+        # the rule declares ``params=[...]``: their values do not exist until the solve assembles the model,
+        # so there is nothing concrete to probe with; such an ``fn`` is checked on its first evaluation.)
+        if not _fnode.params:
+            _probe_in = [
+                jax.ShapeDtypeStruct((int(b - a),) if v == 1 else (int((b - a) // v), v), _frozen_gathered[_fid].dtype)
+                for (a, b, v) in _in_slices
+            ]
+            try:
+                _probe_out = jax.eval_shape(_fnode.fn, *_probe_in)
+            except Exception as exc:  # noqa: BLE001 -- re-raised with the fix named
+                raise ValueError(
+                    f"jno.derived: the rule for {_fnode.name} is not traceable by JAX ({type(exc).__name__}: {exc}). "
+                    "Write it in JAX (`jax.numpy`, not `numpy`/`scipy`), and precompute the host-side geometry "
+                    "part ONCE outside the rule -- build ray tables / view factors / neighbour lists eagerly and "
+                    "close over the arrays; only the part that depends on the state belongs inside `fn`."
+                ) from exc
+            if tuple(_probe_out.shape) != _out_shape:
+                raise ValueError(
+                    f"jno.derived: the rule for {_fnode.name} returns {tuple(_probe_out.shape)}, but `on=` has "
+                    f"{_n_out} nodes, so it must return {_out_shape}. A derived field's values are NODAL, one "
+                    "per node of the field it lives on."
+                )
+        derived_specs[_fid] = {
+            "name": _fnode.name,
+            "fn": _fnode.fn,
+            "params": bool(_fnode.params),
+            "every": _fnode.every,
+            "in_slices": _in_slices,
+            "out_shape": _out_shape,
+        }
+
     if path_specs and not (_is_march and history_specs):
         # A load-path field's per-step slice is delivered by the load-step driver; without a march (a
         # `tau=` grid + step-history to drive it) it would never be supplied. Fail loud, name the fix.
@@ -2052,6 +2152,31 @@ def assemble_fem_native(
                 else:
                     fz[_fid] = _arr[_conn[c]]
         loc["frozen_fields"] = fz
+
+    def _derived_args(u_flat, args=None):
+        """Each ``jno.derived`` field's nodal values, computed from the state and merged into
+        ``args['__loadpath__']`` so ``_add_loadpath_fields`` gathers them like any per-step field.
+
+        The state is read through ``stop_gradient``, and that is the whole semantics: the element Jacobian
+        already cannot see args-borne data, and this makes the MATRIX-FREE tangent (``jax.linearize`` of
+        this residual) agree with it exactly. Without it the assembled and matrix-free paths would solve
+        different operators -- a silent inconsistency, not a performance detail. The converged root is
+        unaffected: ``R(u) = 0`` does not depend on gradient markers.
+
+        A value a DRIVER already put on the channel WINS -- that is what makes ``every="step"`` work: the
+        stepper writes the field once from the previous step's state and this leaves it alone for the whole
+        step. Absent a driver, every residual evaluation recomputes it (``every="residual"``).
+        """
+        if not derived_specs:
+            return args
+        lp = dict((args or {}).get("__loadpath__", {}) or {})
+        uf = jax.lax.stop_gradient(jnp.asarray(u_flat).reshape(-1))
+        for _fid, _spec in derived_specs.items():
+            if _fid in lp:
+                continue
+            xs = [uf[a:b] if v == 1 else uf[a:b].reshape(-1, v) for (a, b, v) in _spec["in_slices"]]
+            lp[_fid] = _spec["fn"](*xs, args or {}) if _spec["params"] else _spec["fn"](*xs)
+        return {**(args or {}), "__loadpath__": lp}
 
     def _split_cell_local(local_vals):
         """Split a cell's gathered all-field local vector into per-field ``(n_local_i, vec_i)``."""
@@ -2248,6 +2373,7 @@ def assemble_fem_native(
         buffer. Freezing rather than zeroing is what lets a zero-initialised plastic strain leave the
         unrestricted region elastic without a second constitutive branch, and it keeps the formula from
         ever being evaluated on cells carrying another material's constants."""
+        args = _derived_args(u_flat, args)  # an `.evolves` formula may read a jno.derived field
         local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
         out: Dict[Any, Any] = {}
         for key, formula in readout_formulas.items():
@@ -2504,6 +2630,9 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for the parent cell
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        # Per-step fields (load path, previous state, mesh velocity) on the parent cell, as in the volume.
+        # Without this a surface term reading one raised: the channel reached volume kernels only.
+        _add_loadpath_fields(loc, c, args)
         if surface_history_specs and args is not None:
             # This face's per-quad-point surface-history slice (n_quad_surf, depth, *shape), gathered from
             # the buffers on ``args`` by the global boundary-face id -- a per-face constant, so ``jacfwd``
@@ -2561,6 +2690,7 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        _add_loadpath_fields(loc, c, args)  # per-step field slices, as in `_surf_elem_res`
         if surface_history_specs and args is not None:
             sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
             if sbuf:
@@ -2572,6 +2702,7 @@ def assemble_fem_native(
 
         Returns ``{key: (n_bfaces, n_quad_surf, *value_shape)}`` -- the region's faces filled, every other
         boundary face zero (unused). The march rolls these into the surface depth buffers."""
+        args = _derived_args(u_flat, args)  # an `.evolves` formula may read a jno.derived field
         out: Dict[Any, Any] = {}
         for key, spec in surface_history_specs.items():
             formula = readout_formulas.get(key)
@@ -2712,6 +2843,7 @@ def assemble_fem_native(
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
 
         def residual(u_flat, t=0.0, args=None):
+            args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             R = jnp.zeros(total, dtype=u_flat.dtype)
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
@@ -2944,6 +3076,7 @@ def assemble_fem_native(
             return _pattern_cache["val"]
 
         def jacobian(u_flat, t=0.0, args=None):
+            args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
             # between rounds and the contact block's indices move with it.
             _idx_static, _plan, _blk_sizes = _pattern(args)
@@ -3661,6 +3794,21 @@ def assemble_fem_native(
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
     zeros = jnp.zeros(total)
 
+    # Publish the FREE (pre-Dirichlet) residual factory so `FEM.eval` can assemble an arbitrary weak
+    # term at a solution. Every solve path elimination-mutates its own copy -- symmetric elimination for
+    # the linear system, row replacement for Newton -- which zeroes exactly the rows a reaction/flux
+    # readout needs. Snapshotted onto the FEM in `_finalize`, like the field keys and DOF points.
+    #
+    # Published HERE, before the transient branch returns, not after it: a transient build used to leave
+    # it unset, so `fem.eval` refused every transient problem, and a transient build on a domain that had
+    # earlier hosted a steady one would have snapshotted THAT build's stale factory.
+    domain._fem_native_term_residual = _make_residual
+    # Whether the FACET tables exist. They are tabulated only when the FORM carries a surface term
+    # (see `face_tables_per_field`), so a later `fem.eval` of a surface term on a problem with no
+    # boundary terms has nothing to integrate against -- it must say so rather than fail deep inside
+    # the element kernel on `NoneType` unpacking.
+    domain._fem_native_has_facet_tables = bool(boundary_terms)
+
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
@@ -3921,7 +4069,10 @@ def assemble_fem_native(
                     residual=res_bc,
                     jacobian=jac_bc,
                     runtime_parameter_exprs=dict(_param_and_neural_exprs),
-                    metadata={"prev_state_slices": prev_state_slices} if _nonlinear_mass else {},
+                    metadata={
+                        **({"prev_state_slices": prev_state_slices} if _nonlinear_mass else {}),
+                        **({"derived_specs": derived_specs} if derived_specs else {}),
+                    },
                     **common,
                 ),
                 "transient",
@@ -4065,16 +4216,8 @@ def assemble_fem_native(
     # constant pairs, because their held value changes every load step. The march threads them below.
     _tv_dirichlet = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])
     residual = _make_residual(volume_terms, boundary_terms)
-    # Publish the FREE (pre-Dirichlet) residual factory so `FEM.eval` can assemble an arbitrary weak
-    # term at a solution. Every solve path elimination-mutates its own copy -- symmetric elimination for
-    # the linear system, row replacement for Newton -- which zeroes exactly the rows a reaction/flux
-    # readout needs. Snapshotted onto the FEM in `_finalize`, like the field keys and DOF points.
-    domain._fem_native_term_residual = _make_residual
-    # Whether the FACET tables exist. They are tabulated only when the FORM carries a surface term
-    # (see `face_tables_per_field`), so a later `fem.eval` of a surface term on a problem with no
-    # boundary terms has nothing to integrate against -- it must say so rather than fail deep inside
-    # the element kernel on `NoneType` unpacking.
-    domain._fem_native_has_facet_tables = bool(boundary_terms)
+    # (the free-residual factory behind `FEM.eval` and the facet-tables flag are published above, before
+    # the transient branch, so that both routes carry them)
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a
@@ -4092,6 +4235,19 @@ def assemble_fem_native(
     # a matrix/rhs pair. Same reason as history above, different cause.
     if bounded:
         nonlinear = True
+    # A `jno.derived` field's values are a function of the unknown, so the form is nonlinear -- belt and
+    # braces with the structural marker in `_is_obviously_nonlinear_in_unknown`, because the linear branch
+    # would assemble ONCE against the compile-time zero placeholder and return a wrong answer, not a slow one.
+    if derived_specs:
+        nonlinear = True
+        _steady_step = [s["name"] for s in derived_specs.values() if s["every"] == "step"]
+        if _steady_step:
+            raise ValueError(
+                f"jno.derived(..., every='step') on {_steady_step[0]}: there is no march to step. The per-step "
+                "values are supplied by a driver -- a transient `.solve(dt=...)`, a `domain(tau=...)` load-step "
+                "march, or a moving mesh -- and on a steady problem nothing would supply them. Use "
+                "every='residual' (the default), which re-evaluates the rule at every residual evaluation."
+            )
     s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
     s_d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
@@ -4202,6 +4358,7 @@ def assemble_fem_native(
             _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP VOLUME state}; march driver
             _op.surface_state_readout = surface_state_readout  # (u, t, args) -> {key: next per-FACE state}
             _op.path_specs = path_specs  # {fid: {frames (n_steps, n_nodes), ...}} — per-step load-path fields
+            _op.derived_specs = derived_specs  # {fid: {fn, in_slices, every, ...}} — jno.derived rules
             _op.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
             _op.contact_pairs = dict(_contact_pairs)
             return (_op, "nonlinear", offs)
@@ -4271,6 +4428,7 @@ def assemble_fem_native(
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.derived_specs = derived_specs  # {fid: {fn, in_slices, every, ...}} — jno.derived rules
         _op_np.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
         _op_np.contact_pairs = dict(_contact_pairs)
         return (_op_np, "nonlinear", offs)
