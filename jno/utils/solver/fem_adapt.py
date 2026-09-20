@@ -3554,7 +3554,48 @@ def _p1_operators(pts, cells, dim):
     for a in range(dim + 1):
         for b in range(dim + 1):
             np.add.at(k, (cells[:, a], cells[:, b]), loc[:, a, b])
-    return sg, measure, np.maximum(wsum, 1e-300), k + 1.0 / n
+    # The shift must remove ONE constant mode PER CONNECTED COMPONENT, not one overall: `K·1_c = 0`
+    # holds separately on each component, so a mesh of `m` disjoint bodies has an m-dimensional null
+    # space and a single rank-one `(1/n)·11ᵀ` leaves m-1 of it. Verified on two disjoint disks: null
+    # dim 1 survives the flat shift (smallest singular value 8.1e-17) and 0 with this one. Left
+    # singular, the Monge-Ampère potential is undetermined by a constant per body -- an arbitrary
+    # RELATIVE DISPLACEMENT between them -- which showed up as a relocation round that would have
+    # inverted 116 of 296 cells on a two-ball melt problem.
+    comp = _connected_components(cells, n)
+    k = k + _component_mean_shift(comp, n)
+    return sg, measure, np.maximum(wsum, 1e-300), k
+
+
+def _connected_components(cells, n_vert: int) -> np.ndarray:
+    """Component id per vertex, by union-find over the cells. Vertices in no cell get their own id."""
+    parent = np.arange(int(n_vert), dtype=np.int64)
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = int(parent[a])
+        return int(a)
+
+    cl = np.asarray(cells, dtype=np.int64)
+    for tri in cl:
+        r = find(int(tri[0]))
+        for v in tri[1:]:
+            rv = find(int(v))
+            if rv != r:
+                parent[rv] = r
+    roots = np.array([find(int(i)) for i in range(int(n_vert))], dtype=np.int64)
+    _, comp = np.unique(roots, return_inverse=True)
+    return comp.astype(np.int64)
+
+
+def _component_mean_shift(comp: np.ndarray, n_vert: int) -> np.ndarray:
+    """``Σ_c (1/n_c)·1_c 1_cᵀ`` -- the projector-scaled shift that kills every component constant."""
+    out = np.zeros((int(n_vert), int(n_vert)), dtype=float)
+    for c in range(int(comp.max()) + 1 if comp.size else 0):
+        idx = np.flatnonzero(comp == c)
+        if idx.size:
+            out[np.ix_(idx, idx)] += 1.0 / idx.size
+    return out
 
 
 def _nodal_grad_jax(f, sg_j, meas_j, wsum_j, cells_j, n_local, dim):

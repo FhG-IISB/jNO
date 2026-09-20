@@ -154,3 +154,38 @@ def test_a_relocation_may_not_invert_a_cell():
         area = float(np.abs(cross).sum() * 0.5)
         a0 = area if a0 is None else a0
         assert abs(area / a0 - 1.0) < 1e-6, f"frame {k}: area drifted to {area / a0:.6f} of the start"
+
+
+def test_the_monge_ampere_operator_is_nonsingular_on_disconnected_bodies():
+    """``K``'s null space is one constant PER CONNECTED COMPONENT, not one overall.
+
+    The P1 stiffness satisfies ``K·1_c = 0`` separately on each component, so a mesh of ``m`` disjoint
+    bodies has an ``m``-dimensional constant null space. A single rank-one ``(1/n)·11ᵀ`` shift leaves
+    ``m-1`` of it, and a singular operator means the Monge-Ampere potential is undetermined by a
+    constant per body -- an arbitrary RELATIVE DISPLACEMENT between them. Two disjoint disks measured
+    a surviving singular value of 8.1e-17 before the per-component shift.
+
+    This matters because a weld bridges two bodies: the mesh is disconnected until they merge.
+    """
+    import numpy as _np
+    from jno.utils.solver.fem_adapt import _p1_operators
+
+    def _disk(cx, r=1.0, n=12):
+        th = _np.linspace(0.0, 2 * _np.pi, n, endpoint=False)
+        pts = _np.vstack([[cx, 0.0], _np.column_stack([cx + r * _np.cos(th), r * _np.sin(th)])])
+        cells = _np.array([[0, i + 1, (i + 1) % n + 1] for i in range(n)], dtype=_np.int64)
+        return pts, cells
+
+    p1, c1 = _disk(0.0)
+    p2, c2 = _disk(3.0)
+    p3, c3 = _disk(6.0)
+    cases = {
+        1: (p1, c1),
+        2: (_np.vstack([p1, p2]), _np.vstack([c1, c2 + len(p1)])),
+        3: (_np.vstack([p1, p2, p3]), _np.vstack([c1, c2 + len(p1), c3 + 2 * len(p1)])),
+    }
+    for m, (pts, cells) in cases.items():
+        k = _np.asarray(_p1_operators(pts, cells, 2)[3])
+        sv = _np.linalg.svd(k, compute_uv=False)
+        n_null = int((sv < sv.max() * 1e-12).sum())
+        assert n_null == 0, f"{m} bodies: operator still has a {n_null}-dimensional null space"
