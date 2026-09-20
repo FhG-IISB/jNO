@@ -31,6 +31,8 @@ import itertools
 from dataclasses import dataclass
 from typing import Any
 
+import os
+
 import numpy as np
 
 from ...trace import Constraint
@@ -885,6 +887,78 @@ def _cell_patch_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.nd
     # produces a singular solve -- the same convention `_one_ring_cells` uses
     cand = np.where(mask, cand, cand[:, :1])
     return cand, mask
+
+
+def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts, dst_cells, dst_layout,
+                              dim, *, total_dst):
+    """Conservative L2 projection of a P1 state from one mesh onto a DIFFERENT one: the Galerkin
+    transfer ``M(dst) u_new = b``, ``b_i = int_{Omega_dst} u_old phi_i^dst``.
+
+    :func:`_l2_transfer_jax` already does this for mesh MOTION, but it requires both meshes to share one
+    cell array -- its point location is a one-ring search, which is right when vertices have shifted a
+    little and useless when the mesh has been rebuilt. So a remesh fell back to pointwise nodal
+    interpolation (``_eval_fe_fields_at_points``), which is what `_l2_transfer_jax`'s own docstring warns
+    about: on a translating Gaussian it lost **27.6 % of the peak over 2 steps**.
+
+    Measured on a laser-heated drop, where the field is a 300 -> 3000 K layer a few cells thick, the
+    pointwise transfer cost **540 K of peak and 6 % of the thermal energy at a single remesh** -- the melt
+    pool visibly collapsed. This routine is conservative by construction: integrating against the new
+    basis preserves ``int u`` exactly, up to quadrature.
+
+    Host-side (a KD-tree point location, :func:`_locate_in_cells`), which is where a remesh happens
+    anyway -- that is precisely the constraint that forced the traced version to use a one-ring search.
+
+    P1 only: the stencil `_locate_in_cells` returns is the P1 shape function over the containing cell, so
+    a higher-order SOURCE field cannot be evaluated through it. The caller falls back for those.
+    """
+    import numpy as _np
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import spsolve
+
+    # degree-4 rule on the reference triangle (weights sum to 1; scaled by the physical area below).
+    # Degree 4 rather than the 2 a P1 mass matrix needs: `u_old` is piecewise linear on the OTHER mesh,
+    # so on a destination cell it is not a polynomial and the load vector is the inexact part.
+    a1, b1, w1 = 0.816847572980459, 0.091576213509771, 0.109951743655322
+    a2, b2, w2 = 0.108103018168070, 0.445948490915965, 0.223381589678011
+    bary = _np.array([[a1, b1, b1], [b1, a1, b1], [b1, b1, a1],
+                      [a2, b2, b2], [b2, a2, b2], [b2, b2, a2]])
+    wq = _np.array([w1, w1, w1, w2, w2, w2])
+
+    P_s, C_s = _np.asarray(src_pts)[:, :dim], _np.asarray(src_cells)
+    P_d, C_d = _np.asarray(dst_pts)[:, :dim], _np.asarray(dst_cells)
+    u_src = _np.asarray(src_state)
+    nd = len(P_d)
+
+    V = P_d[C_d]                                            # (n_cell, 3, dim)
+    area = 0.5 * _np.abs((V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1])
+                         - (V[:, 2, 0] - V[:, 0, 0]) * (V[:, 1, 1] - V[:, 0, 1]))
+    qx = _np.einsum("qa,cad->qcd", bary, V)                 # (n_q, n_cell, dim) physical quad points
+    loc = _locate_in_cells(P_s, C_s, qx.reshape(-1, dim), tol=1e-9, k=12)
+    cell_idx, wts = _np.asarray(loc[0]), _np.asarray(loc[1])
+
+    # consistent mass on the destination mesh: M_ij = sum_q w_q |T| N_i N_j
+    rows, cols, vals = [], [], []
+    for i in range(3):
+        for j in range(3):
+            rows.append(C_d[:, i]); cols.append(C_d[:, j])
+            vals.append(_np.einsum("q,q,q->", wq, bary[:, i], bary[:, j]) * area)
+    M = coo_matrix((_np.concatenate(vals), (_np.concatenate(rows), _np.concatenate(cols))),
+                   shape=(nd, nd)).tocsr()
+
+    out = []
+    offs, vecs = src_layout["offsets"], src_layout["vecs"]
+    for f in range(len(vecs)):
+        blk = u_src[int(offs[f]): int(offs[f + 1])].reshape(-1, int(vecs[f]))
+        comp = []
+        for c in range(int(vecs[f])):
+            src_nodal = blk[:, c]
+            uq = _np.einsum("qa,qa->q", wts, src_nodal[C_s[cell_idx]]).reshape(len(wq), -1)
+            b = _np.zeros(nd)
+            for i in range(3):
+                _np.add.at(b, C_d[:, i], _np.einsum("q,q,qc->c", wq, bary[:, i], uq) * area)
+            comp.append(spsolve(M, b))
+        out.append(_np.stack(comp, axis=1) if int(vecs[f]) > 1 else comp[0][:, None])
+    return _np.concatenate([o.reshape(-1) for o in out])[:total_dst]
 
 
 def _l2_transfer_jax(
@@ -5300,22 +5374,29 @@ def run_mesh_motion(
         # so a P1 state is already the state on the new mesh. Nothing to interpolate, nothing to lose.
         state = jnp.asarray(_resume["old"][2])
     elif _resume is not None:
-        # A segment after a remesh: carry the state the previous segment ended with across the change of
-        # mesh -- each old field evaluated at its new DOF points with its own element basis (the transfer
-        # the transient remesher uses). `_l2_transfer_jax` cannot: it shares one cell array between meshes.
+        # A segment after a remesh: carry the state across a CHANGED NODE SET. Pointwise nodal
+        # interpolation is what `_l2_transfer_jax`'s docstring warns about (27.6 % of a peak over 2
+        # steps), and it showed: on a laser-heated drop, whose field is a 300 -> 3000 K layer a few
+        # cells thick, one remesh cost 540 K of peak and 6 % of the thermal energy. Use the conservative
+        # Galerkin projection where it applies -- P1 only, because the point-location stencil is P1.
         _opts, _ocells, _ostate, _olay = _resume["old"]
-        _vals = _eval_fe_fields_at_points(
-            _opts,
-            _ocells,
-            jnp.asarray(_ostate),
-            _olay["offsets"],
-            _olay["orders"],
-            _olay["cells_f"],
-            _olay["vecs"],
-            layout["field_points"],
-            dim=dim,
-        )
-        state = jnp.concatenate([jnp.asarray(v).reshape(-1) for v in _vals])
+        _p1_ok = all(int(o) == 1 for o in _olay["orders"]) and all(int(o) == 1 for o in layout["orders"])
+        # `key` is resolved further down; this block is guarded to dim == 2, so the cell type is known.
+        _new_cells_now = np.asarray(d.mesh.cells_dict["triangle"]).astype(np.int64) if dim == 2 else None
+        if _p1_ok and dim == 2:
+            state = jnp.asarray(
+                _l2_project_across_meshes(
+                    np.asarray(_opts), np.asarray(_ocells), np.asarray(_ostate), _olay,
+                    np.asarray(d.mesh.points), _new_cells_now, layout, dim,
+                    total_dst=int(layout["offsets"][-1]),
+                )
+            )
+        else:
+            _vals = _eval_fe_fields_at_points(
+                _opts, _ocells, jnp.asarray(_ostate), _olay["offsets"], _olay["orders"],
+                _olay["cells_f"], _olay["vecs"], layout["field_points"], dim=dim,
+            )
+            state = jnp.concatenate([jnp.asarray(v).reshape(-1) for v in _vals])
 
     # Runtime parameter VALUES (a coefficient, a neural field) travel with the coordinates. Without this
     # they were accepted by `**kwargs` and silently discarded: the block exposes them in
@@ -5525,7 +5606,11 @@ def run_mesh_motion(
     _mv_fid = None if _mv is None else _mv.frozen_id
 
     def _march_step(carry, t0c):
-        u_c, X_c, bad = carry
+        # `topo` rides the CARRY rather than the closure, so the connectivity reaches the compiled scan as
+        # a TRACER. A reconnection that keeps every shape (a Delaunay edge flip -- measured, the common
+        # case by 6:1) then swaps values in the carry and the same compiled program serves it. Closing
+        # over it instead is what used to force a rebuild, at one XLA compilation and ~31 s per flip.
+        u_c, X_c, bad, topo = carry
         # 1) MOVE: each geometry term drives its own vertices along its own axis; everything the terms do
         #    not name relaxes harmonically around them (so a moving boundary drags the interior smoothly,
         #    and a moving interior region lets the mesh around it accommodate).
@@ -5535,11 +5620,11 @@ def run_mesh_motion(
             # documented scheme and what `test_prescribed_motion_converges_first_order_to_the_analytic_domain`
             # pins -- it asserts the march reproduces forward Euler exactly.
             disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c, _law_args, t0c), dtype=X_c.dtype) * dt)
-        X_n = X_c + _harmonic_extension_jax(X_c, shared_cells, dim, disp, named_j)
+        X_n = X_c + _harmonic_extension_jax(X_c, topo["cells"], dim, disp, named_j)
 
         # A tangled step cannot `raise` from inside a trace, so it is carried out and raised after the
         # march -- the failure stays loud, the trace stays valid.
-        tangled = jnp.any(jnp.sign(_signed_simplex_measures_jax(X_n, cells_j, dim)) != sgn0)
+        tangled = jnp.any(jnp.sign(_signed_simplex_measures_jax(X_n, topo["cells"], dim)) != topo["sgn"])
 
         # 2) carry the state onto the moved mesh -- a CONSERVATIVE L2 projection, which transports the
         #    field under the motion; this IS the ALE convective term, treated semi-Lagrangian. The
@@ -5571,6 +5656,9 @@ def run_mesh_motion(
         #    inside the step, through `args` -- `_apply_coord_params` scatters them into the P1 geometry
         #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
         step_args = _coord_args(X_n)
+        if topo.get("bundle") is not None:
+            # Same channel as the moved vertices above: a value this evaluation is handed.
+            step_args[_TOPOLOGY_ARG] = topo["bundle"]
         if _mv_fid is not None:
             # MERGE, never replace: the load-path channel carries more than the mesh velocity (a
             # `freeze_path` field, a `jno.derived(every="step")` rule), and an assignment here would drop
@@ -5589,7 +5677,7 @@ def run_mesh_motion(
             nonlinear_solve=nonlin_s,
         )
         bad = (bad[0] | tangled, bad[1] | jnp.any(esc_cell))
-        return (u_n, X_n, bad), (u_n, X_n)
+        return (u_n, X_n, bad, topo), (u_n, X_n)
 
     def _raise_if_bad(tangled, escaped):
         if bool(tangled):
@@ -5611,7 +5699,41 @@ def run_mesh_motion(
                 "time step, or refine the mesh where the motion is fastest."
             )
 
-    carry = (state, X0, (jnp.array(False), jnp.array(False)))
+    # ---- runtime connectivity ---------------------------------------------------------------------
+    # Available only when the operator was assembled with `dynamic_topology` (it publishes its bundle
+    # builder on the domain). Without it this is None everywhere and the driver behaves exactly as it did:
+    # every reconnection rebuilds.
+    from .fem_facets import build_facet_connectivity  # noqa: PLC0415
+    from .fem_native import TOPOLOGY_ARG as _TOPOLOGY_ARG  # noqa: PLC0415 -- avoids an import cycle
+
+    _topo_build = getattr(d, "_fem_native_topology_bundle", None)
+
+    def _make_topo(cells_host, X_ref):
+        """The carry's topology for ``cells_host``: what the mesh kernels index with, plus the operator's
+        bundle. ``sgn`` is re-read on the NEW cells because a flip can reverse a cell's orientation, and
+        the tangle test compares against it."""
+        cj = jnp.asarray(cells_host)
+        out = {"cells": cj, "sgn": jnp.sign(_signed_simplex_measures_jax(X_ref, cj, dim)), "bundle": None}
+        if _topo_build is not None:
+            cn = build_facet_connectivity(np.asarray(cells_host), key)
+            out["bundle"] = _topo_build(
+                cells_host,
+                [cells_host] * len(layout["cells_f"]),
+                cn.parent_cell,
+                cn.face_nodes,
+                cn.local_face,
+            )
+        return out
+
+    # meshes index -> the connectivity in force from that frame on (see the swap below). One entry
+    # unless a same-shape reconnection happens, which is exactly the old "one shared cell array" case.
+
+    _cells_at = {0: shared_cells}
+
+    def _cells_for(k):
+        return _cells_at[max(i for i in _cells_at if i <= k)]
+
+    carry = (state, X0, (jnp.array(False), jnp.array(False)), _make_topo(shared_cells, X0))
     if _cond is None:
         carry, (u_hist, X_hist) = jax.lax.scan(_march_step, carry, jnp.asarray(ts[:-1]))
         _raise_if_bad(*carry[2])
@@ -5658,11 +5780,38 @@ def run_mesh_motion(
                 )
                 if _same:
                     continue  # the same elements on the same nodes: nothing to rebuild
+                if not _nodes_changed and _topo_build is not None and new_cells.shape == shared_cells.shape:
+                    # Same NODES, different elements -- a Delaunay edge flip. The compiled program depends
+                    # on shapes, not on these values, so hand the new connectivity to the carry and keep
+                    # marching: no rebuild, no trace, no XLA compilation (~0.13 s against ~31 s). Gated on
+                    # the node set holding, because `manage=True` also inserts and drops nodes, and that
+                    # genuinely is a different problem.
+                    try:
+                        _new_topo = _make_topo(new_cells.astype(np.int64), X_now)
+                        _pl = (_new_topo.get("bundle") or {}).get("plans") or []
+                        if any(_p is None for _p in _pl):
+                            # A Jacobian's nonzero COUNT moved. `num_segments` is static in the compiled
+                            # scatter, so that really is a different program: rebuild rather than fall back
+                            # to the uncompressed path, which would cost more than the rebuild saves.
+                            _new_topo = None
+                    except ValueError:
+                        _new_topo = None  # the bundle refused (boundary moved): fall through and rebuild
+                    if _new_topo is not None:
+                        shared_cells = new_cells.astype(np.int64)
+                        # Frames ALREADY emitted keep the connectivity they were computed on; the new one
+                        # applies from the next frame, or the trajectory would be labelled with a
+                        # triangulation its earlier frames were never solved on.
+                        _cells_at[len(u_frames) + 1] = shared_cells
+                        carry = (carry[0], carry[1], carry[2], _new_topo)
+                        history[-1]["remeshed"] = True
+                        history[-1]["rebuilt"] = False
+                        continue
                 history[-1]["remeshed"] = True
                 _domain_from_arrays(d, new_pts, new_cells, new_bf, copy=False)
                 # Nodes kept: the P1 state already IS the state on the new mesh. Nodes inserted or dropped
                 # (PFEM node management, which is what keeps the elements usable): it has to be carried the
-                # way a remesh carries it, each old field read at the new DOF points.
+                # way a remesh carries it -- and that transfer is now the conservative L2 projection, which
+                # matters far more here than it did when only a rare mmg remesh triggered it.
                 _carry = "interpolate" if _nodes_changed else "identity"
             else:
                 margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
@@ -5706,14 +5855,16 @@ def run_mesh_motion(
             return AdaptiveTrajectory(
                 np.concatenate([np.asarray(ts[: i + 1], dtype=float), np.asarray(rest.times[1:], dtype=float)]),
                 [state] + u_frames + list(rest.states[1:]),
-                [(X0, shared_cells)] + [(x, shared_cells) for x in X_frames] + list(rest.meshes[1:]),
+                [(X0, _cells_for(0))]
+                + [(x, _cells_for(k + 1)) for k, x in enumerate(X_frames)]
+                + list(rest.meshes[1:]),
                 layouts=[layout] * (i + 1) + list(rest.layouts[1:]),
             )
     _X_f = carry[1]
 
     times = [float(t) for t in ts]
     states = [state] + u_frames
-    meshes = [(X0, shared_cells)] + [(x, shared_cells) for x in X_frames]
+    meshes = [(X0, _cells_for(0))] + [(x, _cells_for(k + 1)) for k, x in enumerate(X_frames)]
 
     # Leave the domain on the final moved mesh, as the eager driver did -- callers inspect `fem.points`
     # after a solve. Host state, so it can only take a concrete value: inside `jax.grad` the final
