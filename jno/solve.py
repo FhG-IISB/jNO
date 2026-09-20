@@ -1283,6 +1283,8 @@ def relocate(
     relax: int = 60,
     relax_step: float = 0.1,
     every: int = 5,
+    escalate: float | None = None,
+    escalate_growth: float = 1.2,
 ) -> AdaptSpec:
     """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
 
@@ -1332,7 +1334,27 @@ def relocate(
     7.5e-09 on a Stokes channel whose no-slip bottom couples the flow to the wall's position, where the
     through-flow falls 11.4x over 60 rounds (12.5x at 120: this is a descent, not a root-find).
 
-    Two things to know. The objective is a **scalar**, so it needs a scalar test function: on a
+**h-adaptivity only when r-adaptivity is not enough.** ``escalate=tol`` adds a fallback: after each
+    relocation the **P1 interpolation error** of the relocated mesh is measured, and if its p90 exceeds
+    ``tol`` (relative to the field's range) the march stops moving nodes and adds some, via the
+    anisotropic ``mmg`` path so the new elements are stretched along the feature::
+
+        fem.solve(adapt=jno.solve.relocate(method="monge_ampere", every=20, escalate=0.5))
+
+    Relocation gets first refusal because it costs ~0.4 ms against the 8-15 s a node-set change costs,
+    and escalation then *measures* whether that was enough instead of assuming it. The vertex budget
+    grows by ``escalate_growth`` each time, capped by ``max_dofs``; the loop is self-limiting, since
+    more vertices lower the indicator and the gate stops tripping.
+
+    The trigger is deliberately **not** a shape-quality floor. On an anisotropically adapted mesh an
+    isotropic quality measure is anti-correlated with the mesh being good: measured on the 600 W melt
+    ball at 26 / 74 / 163 nodes, the interpolation error's p90 falls 0.306 -> 0.172 -> 0.078 while the
+    number of cells rejected by ``4 sqrt(3) A / sum l^2 < 0.2`` RISES 1 -> 5 -> 8. Triggering on the
+    latter refines a mesh that is already right -- and at the final frame it flagged 5 cells of which
+    **none** was genuinely bad (stretched *and* across the feature), while 1 truly bad cell went
+    unflagged.
+
+        Two things to know. The objective is a **scalar**, so it needs a scalar test function: on a
     velocity/pressure saddle the pressure test is picked automatically. And when the expression reaches
     its region only through a **bound view** (``u.bind(x=xr, y=yr)``, which absorbs its coordinates),
     the test function cannot be auto-bound — carry it yourself, ``objective=<expr> * v_r[0]``. That
@@ -1415,6 +1437,12 @@ def relocate(
     """
     if method not in ("descent", "monge_ampere"):
         raise ValueError(f"jno.solve.relocate(method={method!r}): expected 'descent' or 'monge_ampere'.")
+    if escalate is not None and not (float(escalate) > 0.0):
+        raise ValueError(f"jno.solve.relocate(escalate={escalate!r}): a relative error tolerance must be > 0.")
+    if not (float(escalate_growth) > 1.0):
+        raise ValueError(
+            f"jno.solve.relocate(escalate_growth={escalate_growth!r}): must be > 1.0 — an escalation adds vertices."
+        )
     from .utils.solver.fem_adapt import AdaptSpec
 
     return AdaptSpec(
@@ -1427,6 +1455,8 @@ def relocate(
         ma_relax=relax,
         ma_dt=relax_step,
         every=int(every),
+        escalate=None if escalate is None else float(escalate),
+        escalate_growth=float(escalate_growth),
     )
 
 

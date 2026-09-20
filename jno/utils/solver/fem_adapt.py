@@ -2707,6 +2707,28 @@ class AdaptSpec:
     ma_dt: float = 0.1
     """``relocate_method="monge_ampere"`` only: the relaxation pseudo-step ``Δt`` of eq. (3.7). Larger
     converges faster and can overshoot; the nonlinearity is carried entirely by this outer relaxation."""
+    escalate_growth: float = 1.2
+    """Relocation only: the factor the vertex budget grows by at each :attr:`escalate`. Capped by
+    :attr:`max_dofs` when that is set.
+
+    The default is the largest growth measured to survive the default cadence. An escalated mesh is
+    finer, so it accumulates more strain between adaptation rounds, and past some refinement it tangles
+    before the next round can relieve it. On the 600 W melt ball (74 nodes, ``every=20``, 800 steps):
+    growth 1.2 (-> 112 nodes) completes; growth 1.5 (-> 125 nodes) tangles at ``every=20`` and
+    ``every=10``, and completes only at ``every=5``. Refine harder than this and shorten ``every`` to
+    match."""
+    escalate: float | None = None
+    """Relocation only: **escalate from r- to h-adaptivity** when the mesh can no longer represent the
+    solution, measured as the p90 of :func:`_interp_error_indicator` — the P1 interpolation error
+    relative to the field's range. ``None`` (the default) never escalates: relocation holds the node
+    set for the whole march. A value such as ``0.2`` means "if 10 % of cells misrepresent the field by
+    more than 20 % of its span, stop moving nodes and add some", which then takes the anisotropic
+    ``mmg`` path so the new elements are stretched along the feature rather than shrunk in every
+    direction.
+
+    This is deliberately **not** a shape-quality floor. On an anisotropically adapted mesh an isotropic
+    quality measure is anti-correlated with the mesh being good (see :func:`_interp_error_indicator`),
+    so escalating on one refines a mesh that is already right."""
     relocate_method: str = "descent"
     remesh_spec: Any = None
     """Set by :meth:`remesh`: an h-adaptive spec to interleave into a relocation march."""
@@ -3436,6 +3458,68 @@ def _tri_area(pts, cells):
     """Total area of the triangulation -- the meshed body's area, which is what mass conservation sees."""
     a, b, c = pts[cells[:, 0]], pts[cells[:, 1]], pts[cells[:, 2]]
     return float(0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])).sum())
+
+
+def _interp_error_indicator(pts, cells, u_nodal, dim):
+    """Per-cell **P1 interpolation error**, relative to the field's range — the r→h escalation signal.
+
+    For a P1 space the interpolation error on a cell is bounded by the solution's curvature measured
+    ALONG that cell's own edges: ``max_e eᵀ|H|e`` over the cell's edge vectors ``e``, with ``|H|`` the
+    Hessian made positive by taking ``|λ|`` in its own eigenbasis (Alauzet & Loseille, *J. Comput.
+    Phys.* **229** (2010) §2.2). Pairing each curvature with the extent **in its own direction** is the
+    whole point: an element stretched ALONG an isotherm is long where the solution is flat and short
+    where it curves, so it carries a small error despite a large aspect ratio. Multiplying the largest
+    curvature by the longest edge regardless of direction — which is what an isotropic measure amounts
+    to — reports the opposite and penalises exactly the elements that are doing their job.
+
+    Divided by the field's range so the result is dimensionless and comparable across time, fields and
+    meshes: 0.1 means the worst cell misrepresents the field by ~10 % of its span.
+
+    Why this and not a shape-quality floor. Measured on the 600 W melt ball at three resolutions, the
+    p90 of this indicator falls 0.306 → 0.172 → 0.078 as the mesh goes 26 → 74 → 163 nodes, while the
+    number of cells an isotropic floor (``4√3A/Σl²`` < 0.2) rejects RISES 1 → 5 → 8. On an
+    anisotropically adapted mesh the isotropic ruler is anti-correlated with the mesh being good, so
+    triggering h-refinement on it refines a mesh that is already right.
+
+    The Hessian is recovered from the P1 gradients (constant per cell) by area-weighted patch averaging
+    to the vertices and one further differentiation — the standard Zienkiewicz–Zhu route, and the only
+    one available when the basis has no second derivative of its own.
+    """
+    pts = np.asarray(pts, dtype=float)[:, :dim]
+    cells = np.asarray(cells, dtype=np.int64)
+    u = np.asarray(u_nodal, dtype=float).reshape(-1)[: len(pts)]
+    if dim != 2 or cells.shape[1] != 3:
+        raise NotImplementedError(
+            f"_interp_error_indicator: P1 triangles in 2-D; got dim={dim}, {cells.shape[1]} nodes per cell."
+        )
+    a, b, c = pts[cells[:, 0]], pts[cells[:, 1]], pts[cells[:, 2]]
+    jac = np.stack([b - a, c - a], axis=-1)  # (nc, 2, 2)
+    area = 0.5 * np.abs(np.linalg.det(jac))
+    jt = np.transpose(jac, (0, 2, 1))
+    du = np.stack([u[cells[:, 1]] - u[cells[:, 0]], u[cells[:, 2]] - u[cells[:, 0]]], axis=-1)
+    grad = np.linalg.solve(jt, du[..., None])[..., 0]  # (nc, 2), constant per cell
+
+    gv = np.zeros((len(pts), 2))
+    wt = np.zeros(len(pts))
+    for k in range(3):  # area-weighted patch recovery to the vertices
+        np.add.at(gv, cells[:, k], grad * area[:, None])
+        np.add.at(wt, cells[:, k], area)
+    gv /= np.maximum(wt, 1e-300)[:, None]
+
+    hess = np.zeros((len(cells), 2, 2))
+    for comp in range(2):  # differentiate each recovered gradient component again
+        dg = np.stack(
+            [gv[cells[:, 1], comp] - gv[cells[:, 0], comp], gv[cells[:, 2], comp] - gv[cells[:, 0], comp]], axis=-1
+        )
+        hess[:, comp, :] = np.linalg.solve(jt, dg[..., None])[..., 0]
+    hess = 0.5 * (hess + np.transpose(hess, (0, 2, 1)))
+
+    ev, evec = np.linalg.eigh(hess)
+    habs = np.einsum("cij,cj,ckj->cik", evec, np.abs(ev), evec)  # |H| = V|Λ|Vᵀ
+    edges = (b - a, c - b, a - c)
+    err = np.max([np.einsum("ci,cij,cj->c", e, habs, e) for e in edges], axis=0)
+    span = float(np.nanmax(u) - np.nanmin(u))
+    return err / max(span, 1e-300)
 
 
 def _p1_operators(pts, cells, dim):
@@ -6242,11 +6326,62 @@ def run_mesh_motion(
                             flush=True,
                         )
                     move_mesh(d, _Xr - np.asarray(d.mesh.points)[:, :dim], copy=False, check=False)
+                    X_now = _Xr
                     carry = (jnp.asarray(_u_r), jnp.asarray(_Xr), carry[2], _make_topo(shared_cells, _Xr))
                     history[-1]["remeshed"] = True
                     history[-1]["relocated"] = True
                     history[-1]["rebuilt"] = False
-                    continue
+                    # ESCALATE r -> h, but only when the RELOCATED mesh still cannot represent the
+                    # solution. Relocation gets first refusal because it is ~0.4 ms against the 8-15 s a
+                    # node-set change costs; escalating measures whether that was enough rather than
+                    # assuming it. The signal is the P1 interpolation error, NOT a shape-quality floor --
+                    # on an anisotropically adapted mesh the latter is anti-correlated with the mesh being
+                    # good, so it would refine a mesh that is already right (see the indicator's
+                    # docstring for the three-resolution measurement).
+                    _esc = getattr(_cond, "escalate", None)
+                    if _esc is not None and dim == 2 and shared_cells.shape[1] == 3:
+                        _ind = _interp_error_indicator(_Xr, shared_cells, np.asarray(_u_r), dim)
+                        _p90 = float(np.percentile(_ind, 90.0))
+                        history[-1]["interp_error_p90"] = _p90
+                        _tgt = float(_budget[2]) * float(getattr(_cond, "escalate_growth", 1.2) or 1.2)
+                        if _cond.max_dofs is not None:
+                            _tgt = min(_tgt, float(_cond.max_dofs))
+                        if _p90 > float(_esc) and _tgt > float(_budget[2]) + 0.5:
+                            # Grow the vertex budget and hand the mesh to the ANISOTROPIC mmg path, so the
+                            # nodes that get added are stretched along the feature. The budget growth is
+                            # self-limiting: more vertices lower the indicator, so the gate stops tripping.
+                            try:
+                                _met = hessian_metric(
+                                    d,
+                                    np.asarray(_u_r)[:n_verts].astype(float),
+                                    target_complexity=_tgt,
+                                    hmin=float(_budget[0]),
+                                    hmax=float(_budget[1]),
+                                )
+                                remesh_with_mmg(d, _met, copy=False)
+                            except (RuntimeError, ValueError) as _exc:
+                                # mmg can refuse a metric it cannot mesh. Escalation optimises the
+                                # DISCRETISATION, never the physics, so declining it leaves a mesh that is
+                                # merely under-resolved rather than losing the whole march -- the same
+                                # trade the relocation round itself makes. Visible in the history, and
+                                # JNO_RELOCATE_STRICT=1 raises instead.
+                                if bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
+                                    raise
+                                _lg = getattr(getattr(fem, "domain", None), "log", None)
+                                if _lg is not None:
+                                    _lg.warning(
+                                        f"jno.solve.relocate(escalate=): mmg refused the escalation "
+                                        f"({type(_exc).__name__}); continuing on the relocated mesh."
+                                    )
+                                history[-1]["escalate_failed"] = True
+                            else:
+                                _budget = (_budget[0], _budget[1], _tgt, _budget[3])
+                                history[-1]["escalated"] = True
+                                history[-1]["rebuilt"] = True
+                                _carry = "interpolate"
+                                _relocate_rebuild = True
+                    if not _relocate_rebuild:
+                        continue
             else:
                 margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
                 if not (margin > 0.0).any():
