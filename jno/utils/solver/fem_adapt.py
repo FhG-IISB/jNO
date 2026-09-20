@@ -27,6 +27,7 @@ across a remesh in a transient / moving-mesh loop), ``zz_error_indicators``, ``d
 from __future__ import annotations
 
 import copy
+import gc
 import itertools
 from dataclasses import dataclass
 from typing import Any
@@ -5836,6 +5837,29 @@ def run_mesh_motion(
                     d.variable(_tag, normals=True, split=True)
                 except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
                     d.variable(_tag, split=True)
+            # The resume is a RECURSIVE call, so every level of the chain holds its own stack frame --
+            # and with it that segment's compiled `_scan` executable and assembled operators. Measured on
+            # a laser-melt march: RSS flat to 2 MB across 752 rebuild-free steps, then +0.5-2 GB per
+            # rebuild (the growth scales with the accumulated trajectory, so deeper chains cost more),
+            # and a 29-rebuild run was OOM-killed at 54.9 GB with all of its output lost.
+            #
+            # Nothing below this point reads them: the trajectory is rebuilt from `u_frames`/`X_frames`/
+            # `ts`, which are plain lists of arrays, and `_cells_for` closes only over `_cells_at`. So
+            # freeze the resume's (already concrete) inputs, then drop this segment's heavy objects and
+            # collect before descending.
+            _resume_arg = {
+                "start": _start + i,
+                "old": (X_now, shared_cells, np.asarray(carry[0]), layout),
+                "budget": _budget,
+                "carry": _carry,
+            }
+            _scan = _march_step = cur = specs = carry = _topo_build = None
+            # Dropping the Python references is NOT enough: measured, the per-rebuild growth stayed at
+            # ~0.35 GB (vs 0.36 unpatched). The executables are retained by JAX's own jaxpr/lowering/
+            # compiled caches, which a local rebinding cannot reach -- so clear them. This segment's
+            # program is dead either way; the child recompiles regardless, so nothing is re-paid.
+            jax.clear_caches()
+            gc.collect()
             rest = run_mesh_motion(
                 fem,
                 adapt=adapt,
@@ -5843,12 +5867,7 @@ def run_mesh_motion(
                 nonlinear=nonlinear,
                 linear=linear,
                 precond=precond,
-                _resume={
-                    "start": _start + i,
-                    "old": (X_now, shared_cells, np.asarray(carry[0]), layout),
-                    "budget": _budget,
-                    "carry": _carry,
-                },
+                _resume=_resume_arg,
                 **kwargs,
             )
             fem.adapt_history = history + list(fem.adapt_history)
