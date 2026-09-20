@@ -4106,6 +4106,90 @@ def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, his
     return u_final
 
 
+def _drop_region_pools(d, tag: str) -> None:
+    """Forget a region's sampled pools, so the next ``d.variable(tag, ...)`` REPLACES rather than aliases.
+
+    ``Domain.sample`` refuses to clobber an existing sample: it walks ``tag``, ``tag_0``, ``tag_1`` ...
+    until it finds a free name (`domain_class.py:5202`). That is right for a caller taking two different
+    draws of one region, and wrong for a march, which re-samples the SAME region every time the mesh
+    changes. Two consequences, both measured:
+
+      * every rebuild adds another full pool -- shaped ``(1, n_steps+1, n_points, dim)``, so it grows
+        with the time grid AND with the rebuild count -- and the old ones are never released;
+      * the BASE name, which is what the constraints reference, keeps the OLD mesh's points, because the
+        fresh sample went to the alias instead.
+
+    Dropping the pools first makes the loop find ``tag`` free, so the new sample lands on the base name.
+    """
+    ctx = getattr(d, "context", None)
+    if ctx is None:
+        return
+    for _pre in (tag, f"n_{tag}", f"v_{tag}", f"f_{tag}"):
+        ctx.pop(_pre, None)
+        _i = 0
+        while ctx.pop(f"{_pre}_{_i}", None) is not None:
+            _i += 1
+    ctx.pop(f"__time_{tag}__", None)
+
+
+def _march_mem_probe(tag: str, d=None) -> None:
+    """Env-gated (``JNO_MARCH_MEMDEBUG=1``) breakdown of where a rebuilding march's memory sits.
+
+    Diagnostic only -- the residual per-rebuild growth was chased twice by REASONING about which
+    reference was retained, and both guesses were wrong. Measure the split instead: JAX device buffers
+    vs Python heap vs the rest of RSS.
+    """
+    if os.environ.get("JNO_MARCH_MEMDEBUG", "") not in ("1", "true", "yes"):
+        return
+    import gc as _gc
+
+    import jax as _jax
+
+    try:
+        _rss = int(open("/proc/self/statm").read().split()[1]) * os.sysconf("SC_PAGESIZE") / 2**30
+    except Exception:  # noqa: BLE001
+        _rss = float("nan")
+    _live = _jax.live_arrays()
+    _dev = sum(int(getattr(a, "nbytes", 0)) for a in _live) / 2**30
+    _counts: dict[str, int] = {}
+    for o in _gc.get_objects():
+        _t = type(o).__name__
+        if _t in ("ndarray", "ArrayImpl", "function", "dict", "list", "Mesh", "Domain", "FEM"):
+            _counts[_t] = _counts.get(_t, 0) + 1
+    # The biggest live buffers, grouped by shape+dtype: a handful of LARGE arrays, not the many tiny
+    # trajectory frames, is what actually moves RSS -- so print sizes, not just counts.
+    _by: dict = {}
+    for _a in _live:
+        _k = (tuple(getattr(_a, "shape", ())), str(getattr(_a, "dtype", "?")))
+        _n, _b = _by.get(_k, (0, 0))
+        _by[_k] = (_n + 1, _b + int(getattr(_a, "nbytes", 0)))
+    _top = sorted(_by.items(), key=lambda kv: -kv[1][1])[:6]
+    _fmt = "  ".join(f"{k[0]}{k[1][:3]}x{v[0]}={v[1] / 2**20:.0f}MB" for k, v in _top)
+    print(
+        f"[memdebug {tag}] rss={_rss:.3f}GB jax_live={len(_live)} ({_dev:.3f}GB) "
+        f"objs={ {k: _counts[k] for k in sorted(_counts)} } gc_tracked={len(_gc.get_objects())}\n"
+        f"    top buffers: {_fmt}\n"
+        f"    domain.context={len(getattr(d, 'context', {}) or {})} keys={sorted(getattr(d, 'context', {}) or {})[:14]}",
+        flush=True,
+    )
+
+
+def _cp_take(cp, T_frames, u_frames, X_frames, _cells_for, layout, n_local, **flush_kw):
+    """Hand the buffered frame tail to the checkpoint store, write it, and release it.
+
+    ``n_local`` is how many frames this SEGMENT has emitted. The tail's segment-local frame indices --
+    which is what ``_cells_for`` is keyed on -- therefore run ``n_local - len(X_frames) + k + 1``; the
+    buffer is cleared each time, so it cannot be indexed by ``len(u_frames)`` any more.
+    """
+    base = n_local - len(X_frames)
+    for k in range(len(X_frames)):
+        cp.append(T_frames[k], u_frames[k], X_frames[k], _cells_for(base + k + 1), layout)
+    cp.flush(**flush_kw)
+    T_frames.clear()
+    u_frames.clear()
+    X_frames.clear()
+
+
 @dataclass
 class AdaptiveTrajectory:
     """Output of a **transient adaptive** solve (``FEM.solve(adapt=...)`` on a ``u.t`` problem).
@@ -5184,6 +5268,7 @@ def run_mesh_motion(
     nonlinear: Any = None,
     linear: Any = None,
     precond: Any = None,
+    checkpoint: Any = None,
     _resume: Any = None,
     **kwargs: Any,
 ) -> "AdaptiveTrajectory":
@@ -5298,9 +5383,56 @@ def run_mesh_motion(
     dim = int(d.dimension)
     if dim not in (2, 3):
         raise NotImplementedError(f"mesh motion supports 2D/3D simplicial meshes; got dimension {dim}.")
+    _cp_resumed = False
+    if checkpoint is not None and _resume is None and getattr(checkpoint, "resume", True):
+        # Continue an interrupted march rather than starting over. `latest.npz` holds both the SOURCE
+        # mesh+state the next segment transfers FROM and the domain it starts ON -- restore the domain,
+        # then hand the rest to the ordinary resume path, the same one every rebuild takes.
+        from .march_checkpoint import load as _cp_load
+
+        # Only a MISSING store means "start fresh". A store that exists but cannot be read is a
+        # broken checkpoint, and silently restarting would throw away the run it was meant to save --
+        # so that raises. (It used to be swallowed, and a tuple budget that failed to deserialise
+        # restarted the march without a word.)
+        if os.path.exists(os.path.join(os.path.expanduser(checkpoint.path), "manifest.json")):
+            _man_r, _res_r, _ = _cp_load(checkpoint.path)
+        else:
+            _res_r = None
+        if _res_r is not None:
+            _dm = _res_r.pop("domain", None)
+            if _dm is not None:
+                _dc = np.asarray(_dm[1]).astype(np.int64)
+                _domain_from_arrays(d, np.asarray(_dm[0]), _dc, _boundary_edges_from_triangles(_dc), copy=False)
+            _resume, _cp_resumed = _res_r, True
     _cond = _moving_mesh_condition(fem, adapt, d, kwargs)
 
     cons, kw = fem._constraints, fem._fem_kwargs
+    if _cp_resumed:
+        # The domain now carries the CHECKPOINT's mesh, but its region pools still hold the sample
+        # points of the mesh this process meshed at startup, and a geometry law bound to those would
+        # read seed positions for the whole march. Re-tag and re-sample before anything binds -- the
+        # same refresh a rebuild does after it swaps the mesh, just driven off the constraints because
+        # the motion specs do not exist yet.
+        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+            d.tag(_name, _pred)
+        d.__dict__.pop("_gauge_pin_coords", None)
+        # Re-sample what the domain ACTUALLY holds. The motion specs do not exist yet, so there is no
+        # spec list to read tags off; `context` is the set of regions already materialised on the old
+        # mesh, which is exactly the set that is now stale. `initial_0`/`initial_1` are split
+        # components of `initial` -- refreshing the base tag regenerates them.
+        _ctx = {k for k in getattr(d, "context", {}) if not k.startswith("__")}
+        _bases = set()
+        for _k in _ctx:
+            _h = _k.rsplit("_", 1)
+            _bases.add(_h[0] if len(_h) == 2 and _h[1].isdigit() else _k)
+        for _tag in sorted(_bases & (_ctx | set(getattr(d, "_mesh_pool", {}) or {}))):
+            _drop_region_pools(d, _tag)
+            for _kw in ({"normals": True, "split": True}, {"split": True}):
+                try:
+                    d.variable(_tag, **_kw)
+                    break
+                except Exception:  # noqa: BLE001 -- an interior region has no normals; coordinates suffice
+                    continue
     block = fem._op
     n_verts = int(np.asarray(d.mesh.points).shape[0])
     state = jnp.asarray(block.state0).reshape(-1)
@@ -5735,7 +5867,16 @@ def run_mesh_motion(
         return _cells_at[max(i for i in _cells_at if i <= k)]
 
     carry = (state, X0, (jnp.array(False), jnp.array(False)), _make_topo(shared_cells, X0))
+    _cp, T_frames, _nlocal = None, [], 0
     if _cond is None:
+        if checkpoint is not None:
+            raise NotImplementedError(
+                "fem.solve(checkpoint=): this march has no adapt= condition, so it runs as ONE compiled "
+                "scan over the whole time grid. There is no host-side boundary at which a partial "
+                "trajectory could be written, and a crash inside the scan would lose it anyway. "
+                "Checkpointing is wired for the adaptive march -- adapt=jno.solve.remesh(...) -- which "
+                "steps in host-visible chunks."
+            )
         carry, (u_hist, X_hist) = jax.lax.scan(_march_step, carry, jnp.asarray(ts[:-1]))
         _raise_if_bad(*carry[2])
         u_frames = [u_hist[i] for i in range(n_steps)]
@@ -5749,6 +5890,25 @@ def run_mesh_motion(
         # there and the state carried across). Frames and history of both segments are joined.
         _scan = jax.jit(lambda c, tt: jax.lax.scan(_march_step, c, tt))
         u_frames, X_frames, history, i = [], [], [], 0
+        # One store for the whole march: a rebuild re-enters this function, so the writer is created at
+        # the top and handed down the resume chain rather than made afresh per segment.
+        _cp = _resume.get("_writer") if isinstance(_resume, dict) else None
+        if checkpoint is not None and _cp is None:
+            from .march_checkpoint import MarchCheckpoint
+
+            _cp = MarchCheckpoint(
+                checkpoint,
+                meta={
+                    "dt": float(dt),
+                    "t0": float(ts[0]),
+                    "t1": float(ts[-1]),
+                    "n_steps": int(n_steps),
+                    "dim": int(dim),
+                },
+                reopen=_cp_resumed,
+            )
+            if not _cp_resumed:  # on a resume the stored tail IS frame 0; writing it again duplicates it
+                _cp.append(float(ts[0]), state, X0, _cells_for(0), layout)
         while i < n_steps:
             m = min(_every, n_steps - i)
             carry, (uh, Xh) = _scan(carry, jnp.asarray(ts[i : i + m]))
@@ -5756,7 +5916,11 @@ def run_mesh_motion(
             u_frames += [uh[j] for j in range(m)]
             X_frames += [Xh[j] for j in range(m)]
             history += [{"t": float(ts[i + j + 1]), "n_dofs": int(off[-1]), "remeshed": False} for j in range(m)]
+            T_frames += [float(ts[i + j + 1]) for j in range(m)]
+            _nlocal += m
             i += m
+            if _cp is not None and len(X_frames) >= int(checkpoint.every):
+                _cp_take(_cp, T_frames, u_frames, X_frames, _cells_for, layout, _nlocal)
             if i >= n_steps:
                 break
             X_now = np.asarray(carry[1])
@@ -5802,7 +5966,7 @@ def run_mesh_motion(
                         # Frames ALREADY emitted keep the connectivity they were computed on; the new one
                         # applies from the next frame, or the trajectory would be labelled with a
                         # triangulation its earlier frames were never solved on.
-                        _cells_at[len(u_frames) + 1] = shared_cells
+                        _cells_at[_nlocal + 1] = shared_cells
                         carry = (carry[0], carry[1], carry[2], _new_topo)
                         history[-1]["remeshed"] = True
                         history[-1]["rebuilt"] = False
@@ -5833,6 +5997,7 @@ def run_mesh_motion(
             for _tag in {
                 tg for sp in specs for tg in _tags_read(sp["term"]) if not tg.startswith(("__time", "n_", "cell_"))
             }:
+                _drop_region_pools(d, _tag)  # replace, do not alias: see the docstring there
                 try:
                     d.variable(_tag, normals=True, split=True)
                 except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
@@ -5853,13 +6018,36 @@ def run_mesh_motion(
                 "budget": _budget,
                 "carry": _carry,
             }
-            _scan = _march_step = cur = specs = carry = _topo_build = None
+            if _cp is not None:
+                # A rebuild is the natural checkpoint: it is where the layout changes, and where a
+                # restart would have to begin. Write the frames AND the resume payload, then hand the
+                # writer down so the next segment appends to the same store.
+                _cp_take(
+                    _cp,
+                    T_frames,
+                    u_frames,
+                    X_frames,
+                    _cells_for,
+                    layout,
+                    _nlocal,
+                    resume=_resume_arg,
+                    domain=(np.asarray(d.mesh.points)[:, :dim], np.asarray(d.mesh.cells_dict[key])),
+                )
+                _resume_arg["_writer"] = _cp
+            _march_mem_probe("before-release", d)
+            # `vel_fns` is the expensive one: each geometry-velocity closure captures that segment's
+            # SAMPLED REGION POOLS, shaped (1, n_steps+1, n_points, dim) -- 3.6 MB apiece here, and
+            # proportional to the whole time grid, so they grow with steps AND with rebuilds. Measured
+            # by dumping the largest live buffers: (1,1401,163,2) x4 -> x6 -> x8 across three rebuilds.
+            # That product is the `steps x rebuilds` scaling behind the 54.9 GB OOM.
+            _scan = _march_step = cur = specs = carry = _topo_build = vel_fns = None
             # Dropping the Python references is NOT enough: measured, the per-rebuild growth stayed at
             # ~0.35 GB (vs 0.36 unpatched). The executables are retained by JAX's own jaxpr/lowering/
             # compiled caches, which a local rebinding cannot reach -- so clear them. This segment's
             # program is dead either way; the child recompiles regardless, so nothing is re-paid.
             jax.clear_caches()
             gc.collect()
+            _march_mem_probe("after-release", d)
             rest = run_mesh_motion(
                 fem,
                 adapt=adapt,
@@ -5867,10 +6055,15 @@ def run_mesh_motion(
                 nonlinear=nonlinear,
                 linear=linear,
                 precond=precond,
+                checkpoint=checkpoint,
                 _resume=_resume_arg,
                 **kwargs,
             )
             fem.adapt_history = history + list(fem.adapt_history)
+            if _cp is not None:
+                # Every segment wrote into the SAME store, so the child's trajectory already spans the
+                # whole march; concatenating this segment on top would double it (and it was released).
+                return rest
             return AdaptiveTrajectory(
                 np.concatenate([np.asarray(ts[: i + 1], dtype=float), np.asarray(rest.times[1:], dtype=float)]),
                 [state] + u_frames + list(rest.states[1:]),
@@ -5906,12 +6099,19 @@ def run_mesh_motion(
         for _name, _pred in _preds.items() if hasattr(_preds, "items") else []:
             d.tag(_name, _pred)
         for _tag in {sp["coord"].tag for sp in specs}:
+            _drop_region_pools(d, _tag)
             try:
                 d.variable(_tag, normals=True, split=True)  # keep the normals a Stefan-type law reads
             except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
                 d.variable(_tag, split=True)
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
+    if _cp is not None:
+        _cp_take(_cp, T_frames, u_frames, X_frames, _cells_for, layout, _nlocal, complete=True)
+        _t, _st, _ms, _lay = _cp.frames()
+        if getattr(checkpoint, "keep", "last") == "all":
+            _st, _ms, _lay = list(_st), list(_ms), list(_lay)  # materialise: caller asked to stay in RAM
+        return AdaptiveTrajectory(_t, _st, _ms, layouts=_lay)
     # One layout, repeated: the move preserves topology, so every frame has the same per-field orders,
     # value shapes and connectivity. Carrying it is what lets `AdaptiveTrajectory.resample` take its
     # basis-aware branch -- without it a P2 or vector trajectory falls to the legacy scalar-P1 path, which

@@ -69,6 +69,7 @@ __all__ = [
     "adaptive",
     "arclength",
     "remesh",
+    "checkpoint",
     "enrich",
     "refine",
     "relocate",
@@ -1015,6 +1016,53 @@ def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, ma
     from .utils.solver.matfun import lstsq as _lstsq
 
     return _lstsq(A, b, damp=damp, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
+
+
+def checkpoint(
+    path: str,
+    *,
+    every: int = 500,
+    keep: str = "last",
+    resume: bool = True,
+):
+    """**Checkpoint a moving-mesh march** to disk: ``fem.solve(adapt=..., checkpoint=...)``.
+
+    A march holds every frame in memory and returns them only when ``solve()`` returns, so a run
+    that dies -- OOM, a kill, a power cut -- yields **nothing**, however far it got. This writes
+    frames to ``path`` as they are produced and records what the march needs to restart, so a dead
+    run costs the last partial chunk instead of everything.
+
+    The restart is not new machinery: a topology rebuild already re-enters the march with
+    ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``. That tuple is the
+    checkpoint; this only writes it down.
+
+    ``every`` -- steps between writes. A write also happens at every rebuild, which is where the
+    field layout changes and therefore where a restart has to begin anyway.
+
+    ``keep`` -- ``"last"`` (default) flushes each chunk and **drops it from memory**; the returned
+    trajectory loads frames from disk on demand, so a march no longer has to fit in RAM. ``"all"``
+    keeps everything resident as before, and checkpoints purely for crash-resilience.
+
+    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over.
+    A finished run (``complete`` in its manifest) is never resumed; delete the directory to redo it.
+
+    Note this is about the TRAJECTORY, not the solver's working set: per-step memory is already flat
+    (measured: 752 steps added 2 MB). What grows a long adaptive march is the rebuild path.
+
+    Example::
+
+        traj = fem.solve(
+            nonlinear=jno.solve.newton(direct=True),
+            adapt=jno.solve.remesh(alpha=1.2, every=1),
+            checkpoint=jno.solve.checkpoint("runs/ball", every=500),
+        )
+
+    Returns:
+        CheckpointSpec: pass as ``fem.solve(checkpoint=...)``.
+    """
+    from .utils.solver.march_checkpoint import CheckpointSpec
+
+    return CheckpointSpec(path=str(path), every=int(every), keep=str(keep), resume=bool(resume))
 
 
 def remesh(

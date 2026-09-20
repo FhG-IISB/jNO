@@ -2145,6 +2145,7 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
+        checkpoint=None,
         contact=None,
         continuation=None,
         x0=None,
@@ -2320,6 +2321,7 @@ class FEM:
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
+                    checkpoint=checkpoint,
                     contact=contact,
                     continuation=continuation,
                     x0=x0,
@@ -2551,6 +2553,7 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
+        checkpoint=None,
         contact=None,
         x0=None,
         nonlinear=None,
@@ -2669,7 +2672,14 @@ class FEM:
             from .utils.solver.fem_adapt import run_mesh_motion
 
             return run_mesh_motion(
-                self, adapt=adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+                self,
+                adapt=adapt,
+                solve_fn=solve_fn,
+                nonlinear=nonlinear,
+                linear=linear,
+                precond=precond,
+                checkpoint=checkpoint,
+                **kwargs,
             )
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
