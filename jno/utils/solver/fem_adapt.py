@@ -5317,7 +5317,10 @@ def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
     # mesh. Vertex positions ride the CARRY, so relocating is a new `X` for the same compiled program --
     # no new nodes, no new connectivity, no rebuild and no XLA compilation. h-adaptivity is the opposite:
     # it changes shapes, which is what costs 8-15 s a time.
-    kinds = {"split": "refine()", "enrich": "enrich()", "anisotropic": "remesh(anisotropic=True)"}
+    # `anisotropic=True` is NOT in here either: it is the same mmg rebuild the criterion path
+    # already takes, with a Hessian METRIC instead of a scalar size -- so it costs what an isotropic
+    # remesh costs and buys direction. It still needs a criterion to say WHEN (see below).
+    kinds = {"split": "refine()", "enrich": "enrich()"}
     kind = next((name for flag, name in kinds.items() if getattr(adapt, flag, False)), None)
     if kind is not None:
         raise NotImplementedError(head + f"jno.solve.{kind} is not supported with a geometry term.")
@@ -6249,11 +6252,27 @@ def run_mesh_motion(
                 if not (margin > 0.0).any():
                     continue
                 history[-1]["remeshed"] = True
-                marked = np.flatnonzero(margin > 0.0).astype(np.int64)
-                size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
-                remesh_with_mmg(
-                    d, _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]), copy=False
-                )
+                if getattr(_cond, "anisotropic", False):
+                    # ANISOTROPIC: a Hessian metric sets the direction as well as the size, so a
+                    # directional feature -- a thermal boundary layer, a recoil crater -- is resolved by
+                    # elements stretched ALONG it rather than by shrinking them in every direction.
+                    # Measured on the melt ball, the stretched cells a purely r-adaptive march produces
+                    # already align with the isotherms (|long axis . grad T| = 0.125), which says the
+                    # feature IS directional; what r-adaptivity cannot do is BOUND the aspect ratio, and
+                    # a metric does exactly that through hmin/hmax.
+                    _uv = np.asarray(carry[0])[:n_verts].astype(float)
+                    _met = hessian_metric(
+                        d, _uv, target_complexity=float(_budget[2]), hmin=float(_budget[0]), hmax=float(_budget[1])
+                    )
+                    remesh_with_mmg(d, _met, copy=False)
+                else:
+                    marked = np.flatnonzero(margin > 0.0).astype(np.int64)
+                    size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
+                    remesh_with_mmg(
+                        d,
+                        _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]),
+                        copy=False,
+                    )
                 _carry = "interpolate"
             for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
                 d.tag(_name, _pred)

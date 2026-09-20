@@ -33,6 +33,24 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
+@pytest.fixture(autouse=True)
+def _no_persistent_compile_cache():
+    """Count COMPILATIONS, not cache lookups.
+
+    This test asserts on ``n_long - n_short``, which cancels anything both marches pay equally. The
+    PERSISTENT on-disk cache breaks that symmetry: whether either march finds its programs already
+    compiled depends on what ran earlier in the session, so the difference stops being a property of
+    the code under test. Observed as an order-dependent failure -- green alone and in every subset,
+    red once inside a ten-file run.
+    """
+    prev = jax.config.jax_enable_compilation_cache
+    jax.config.update("jax_enable_compilation_cache", False)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_compilation_cache", prev)
+
+
 class _CompileCounter:
     """Counts XLA compilations. Private JAX entry point -- asserted to exist, so a JAX upgrade that
     moves it fails loudly here rather than silently making the test vacuous."""
