@@ -16,7 +16,6 @@ neither case:
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import jno
 import jno.utils.solver.peec as P

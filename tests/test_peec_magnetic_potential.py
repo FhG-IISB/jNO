@@ -27,9 +27,7 @@ SIG = 5.8e7
 
 
 def _lattice(nx=4, ny=3, nz=2, p=0.002):
-    return bar_filaments(
-        jno.Shape.box(0, 0, 0, nx * p, ny * p, nz * p, size=(p, p, p)), size=(p, p, p), sigma=SIG
-    )
+    return bar_filaments(jno.Shape.box(0, 0, 0, nx * p, ny * p, nz * p, size=(p, p, p)), size=(p, p, p), sigma=SIG)
 
 
 def _dense_P(fil, quad=2):

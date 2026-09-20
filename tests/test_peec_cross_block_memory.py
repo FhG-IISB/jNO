@@ -23,7 +23,6 @@ against 4.5 s, all dispatch), which is why the budget is on the product.
 import resource
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 

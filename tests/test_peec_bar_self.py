@@ -98,7 +98,7 @@ def test_it_agrees_with_a_brute_force_integral():
     q = rng.random((n, 3)) * np.array([w, t, length])
     r = np.linalg.norm(p - q, axis=1)
     vol = w * t * length
-    integral = vol**2 * np.mean(1.0 / r)          # <1/r> over V x V, times |V|^2
+    integral = vol**2 * np.mean(1.0 / r)  # <1/r> over V x V, times |V|^2
     L_mc = MU0 / (4 * np.pi) * integral / (w * t) ** 2
     L = L_of(float(bar_self(np.array([length]), np.array([w]), np.array([t]))[0]), length)
     assert abs(L / L_mc - 1) < 0.02, f"exact {L * 1e12:.4f} pH vs Monte Carlo {L_mc * 1e12:.4f} pH"

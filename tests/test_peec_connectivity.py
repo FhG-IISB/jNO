@@ -61,9 +61,7 @@ def test_a_DEVICE_bridges_the_gap_it_sits_across():
     term["M"] = terminal_nodes(f, lambda q: (q[:, 0] > 0.0089) & (q[:, 0] < 0.0101))
     term["N"] = terminal_nodes(f, lambda q: (q[:, 0] > 0.0199) & (q[:, 0] < 0.0211))
     assert len(term["M"]) and len(term["N"])  # the pads exist, or the test proves nothing
-    cur, _phi, inj = solve_network(
-        f, SIG, term, [("A", "B", 1.0 + 0j)], (), (), (("M", "N", 1e-3),), omega=0.0
-    )
+    cur, _phi, inj = solve_network(f, SIG, term, [("A", "B", 1.0 + 0j)], (), (), (("M", "N", 1e-3),), omega=0.0)
     assert np.isfinite(complex(inj["A"])) and abs(complex(inj["A"])) > 0
 
 

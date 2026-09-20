@@ -30,9 +30,7 @@ def _net(core=None, both=False, wire=False):
     sh = bar
     if core is not None:
         props = {"mu_r": core} | ({"sigma": CU} if both else {})
-        sh = sh + jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002, 0.002, 0.002)).attach(
-            **props
-        ).name("core")
+        sh = sh + jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002, 0.002, 0.002)).attach(**props).name("core")
     if wire:
         sh = sh + jno.Shape.line(
             [(0.002, 0.002, 0.002), (0.002, 0.002, 0.005), (0.018, 0.002, 0.002)], r=2e-4, size=0.002
@@ -112,9 +110,11 @@ def test_a_core_above_a_conductor_raises_the_inductance():
 
     def stacked(mu=None):
         bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
-        sh = bar if mu is None else bar + jno.Shape.box(
-            0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3
-        ).attach(mu_r=mu).name("core")
+        sh = (
+            bar
+            if mu is None
+            else bar + jno.Shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=mu).name("core")
+        )
         d = sh.domain()
         d.tag("A", lambda x, y, z: x < 0.0011)
         d.tag("B", lambda x, y, z: x > 0.0189)
@@ -180,9 +180,7 @@ def test_a_unit_permeability_region_is_air_and_says_so():
 def test_a_unit_permeability_conductor_still_conducts():
     """The same region carrying a sigma is a perfectly good conductor; only the core part is air."""
     bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
-    both = jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(
-        mu_r=1.0, sigma=CU
-    ).name("both")
+    both = jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(mu_r=1.0, sigma=CU).name("both")
     d = (bar + both).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)
