@@ -37,6 +37,7 @@ def mc_mutual(l, w, t, d, n=3_000_000, seed=0):
 def _two_bar_mutual(l, w, t, d, quad=3, quad_t=2):
     """M between two parallel lattice-shaped bars, through jNO's own sub-point machinery."""
     import jax.numpy as jnp
+
     from jno.utils.solver.kernel import pair_matrix
 
     gl, wl = np.polynomial.legendre.leggauss(quad)
@@ -47,20 +48,22 @@ def _two_bar_mutual(l, w, t, d, quad=3, quad_t=2):
     pos = np.concatenate([P, P + np.array([d, 0.0, 0.0])])
     mom = np.concatenate([np.stack([np.zeros_like(W), W, np.zeros_like(W)], -1)] * 2)
     grp = np.concatenate([np.zeros(len(P), int), np.ones(len(P), int)])
-    M = np.asarray(pair_matrix(jnp.asarray(pos), jnp.asarray(mom), lambda r: 1.0 / r,
-                               jnp.asarray([1.0, 1.0]), group=grp)) * MU0 / (4 * np.pi)
+    M = (
+        np.asarray(pair_matrix(jnp.asarray(pos), jnp.asarray(mom), lambda r: 1.0 / r, jnp.asarray([1.0, 1.0]), group=grp))
+        * MU0
+        / (4 * np.pi)
+    )
     return M[0, 1]
 
 
-@pytest.mark.parametrize("l,t,tol", [(0.5e-3, 0.0625e-3, 0.03), (0.25e-3, 0.25e-3, 0.06),
-                                     (0.0625e-3, 0.5e-3, 0.12)])
+@pytest.mark.parametrize("l,t,tol", [(0.5e-3, 0.0625e-3, 0.03), (0.25e-3, 0.25e-3, 0.06), (0.0625e-3, 0.5e-3, 0.12)])
 def test_the_transverse_rule_fixes_the_near_neighbour_mutual(l, t, tol):
     """Across the aspect ratios a lattice actually produces, including the pathological one."""
     w = 0.0625e-3
     d = 2 * w
     ref = mc_mutual(l, w, t, d)
     got = _two_bar_mutual(l, w, t, d, quad=3, quad_t=2)
-    assert abs(got / ref - 1) < tol, f"l/t={l/t:.2f}: {got * 1e12:.4f} pH vs {ref * 1e12:.4f} pH"
+    assert abs(got / ref - 1) < tol, f"l/t={l / t:.2f}: {got * 1e12:.4f} pH vs {ref * 1e12:.4f} pH"
 
 
 @pytest.mark.parametrize("l,t", [(0.25e-3, 0.25e-3), (0.0625e-3, 0.5e-3)])
@@ -71,7 +74,7 @@ def test_the_transverse_rule_is_strictly_better_than_the_line_rule(l, t):
     ref = mc_mutual(l, w, t, d)
     line = abs(_two_bar_mutual(l, w, t, d, quad=3, quad_t=1) / ref - 1)
     vol = abs(_two_bar_mutual(l, w, t, d, quad=3, quad_t=2) / ref - 1)
-    assert vol < 0.5 * line, f"line {100*line:.1f} % -> volume {100*vol:.1f} %"
+    assert vol < 0.5 * line, f"line {100 * line:.1f} % -> volume {100 * vol:.1f} %"
 
 
 def test_a_lattice_elements_moments_still_sum_to_its_length():
@@ -120,9 +123,7 @@ def _bar_L(cells, quad_t, hz=1.0):
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
-    _c, _phi, inj = solve_network(
-        f, sig, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * hz, matrix_free=False
-    )
+    _c, _phi, inj = solve_network(f, sig, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * hz, matrix_free=False)
     return complex(1.0 / inj["A"]).imag / (2 * np.pi * hz)
 
 

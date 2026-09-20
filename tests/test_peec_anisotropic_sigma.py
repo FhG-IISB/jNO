@@ -69,8 +69,9 @@ def test_the_gradient_reaches_one_component_alone():
             "A": terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9),
             "B": terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9),
         }
-        _c, _p, inj = solve_network(f, f.lattice["resolve"]([(s * SIG, SIG, SIG)]), term,
-                                    [("A", "B", 1.0 + 0j)], (), (), (), omega=0.0)
+        _c, _p, inj = solve_network(
+            f, f.lattice["resolve"]([(s * SIG, SIG, SIG)]), term, [("A", "B", 1.0 + 0j)], (), (), (), omega=0.0
+        )
         return jnp.real(1.0 / inj["A"])
 
     g = float(jax.grad(loss)(1.0))
@@ -87,16 +88,25 @@ def test_a_WIRE_takes_the_component_along_its_own_tangent():
     f = line_filaments(sh)
     from jno.utils.solver.peec import element_centres, resolve_sigma
 
-    got = np.asarray(resolve_sigma((SIG, 3.0 * SIG, 7.0 * SIG), np.asarray(element_centres(f)),
-                                   "wire", tangent=np.asarray(f.mom)[:: f.mom.shape[0] // len(np.asarray(f.length))]))
+    got = np.asarray(
+        resolve_sigma(
+            (SIG, 3.0 * SIG, 7.0 * SIG),
+            np.asarray(element_centres(f)),
+            "wire",
+            tangent=np.asarray(f.mom)[:: f.mom.shape[0] // len(np.asarray(f.length))],
+        )
+    )
     assert np.allclose(got, 2.0 * SIG, rtol=1e-9)  # (1 + 3)/2 = 2
 
 
 def test_a_three_element_conductor_refuses_the_ambiguous_spelling():
     """``(3,)`` on a 3-element conductor is either three components or three elements. Ask, do not guess."""
     with pytest.raises(ValueError, match="ambiguous"):
-        bar_filaments(jno.Shape.box(0, 0, 0, 0.003, 0.001, 0.001), size=0.001,  # exactly 3 cells
-                      sigma=[np.array([SIG, SIG, SIG])])
+        bar_filaments(
+            jno.Shape.box(0, 0, 0, 0.003, 0.001, 0.001),
+            size=0.001,  # exactly 3 cells
+            sigma=[np.array([SIG, SIG, SIG])],
+        )
 
 
 def test_a_wrong_length_triple_is_refused():

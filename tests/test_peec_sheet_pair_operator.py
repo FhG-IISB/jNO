@@ -8,7 +8,6 @@ operator half of that: the pairing is made by hand here, because nothing emits o
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import jno
 from jno.utils.solver.peec import _element_impedance, bar_filaments, solve_network, terminal_nodes
@@ -94,9 +93,7 @@ def _port(fil, pair, matrix_free):
     a = terminal_nodes(fil, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(fil, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
     f = fil if pair is None else fil._replace(pair=pair)
-    _c, _phi, inj = solve_network(
-        f, SIG, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=OMEGA, matrix_free=matrix_free
-    )
+    _c, _phi, inj = solve_network(f, SIG, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=OMEGA, matrix_free=matrix_free)
     return complex(1.0 / inj["A"])
 
 

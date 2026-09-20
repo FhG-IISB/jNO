@@ -23,7 +23,6 @@ that is untested. None of the four claims below depends on which the winding is;
 discretisation of one turn changed, and the refusal itself is covered in the front-door tests.
 """
 
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -77,8 +76,10 @@ def _solve(sh, freq=1e5, restart=None):
     d.tag("B", lambda x, y, z: (x < -0.0021) & (z > 0.0039) & (z < 0.0059))
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build().solve(
-        **({} if restart is None else {"restart": restart})
+    sol = (
+        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq)
+        .build()
+        .solve(**({} if restart is None else {"restart": restart}))
     )
     return jnp.real(sol.L)
 

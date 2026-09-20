@@ -12,7 +12,6 @@ weak core instead of like the air it is, which no absolute test of a strong core
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from jno.utils.solver.kernel import magnetic_reluctance
 

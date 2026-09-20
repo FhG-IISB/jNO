@@ -9,7 +9,6 @@ has a sign, so K_BA is K_AB transposed. The full 2x2 is symmetric, as a partial 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from jno.utils.solver.kernel import lattice_operator
 

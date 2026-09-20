@@ -17,7 +17,6 @@ pointing back here. So the sign is pinned in isolation, against Ampere's law.
 
 import jax
 import numpy as np
-import pytest
 
 from jno.utils.solver.peec import _bar_rule, coupling_generator
 
