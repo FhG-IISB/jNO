@@ -37,6 +37,7 @@ Pick by structure:
 | cuSolver refuses it, or is slow | `lu(backend="host")` | SuperLU on the host, driven from the device — same answer, same gradients. Often **faster** than cuSolver, and runs meshes it rejects |
 | **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS. Fastest **per solve** — caches the symbolic plan on the sparsity, so it survives a change of values. Needs the optional stack |
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. Fastest **factorization** — a Newton step reuses the analysis. x86-64 |
+| **a Newton march** (the tangent changes every iteration) | `lu(backend="host", reuse=False)` | the host factorization cache keys on the operator, so a never-repeating tangent fills it and leaks a factorization a step; `reuse=False` drops each one |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 
 !!! warning "jNO warns you when this applies"
@@ -326,6 +327,28 @@ is why the Navier–Stokes preconditioning literature builds on Picard.
 The crossover is around 15–20k DOFs. Note what the direct solve is *not* doing: it does not run out of
 memory — it scales as roughly `O(N³)` in time and simply loses. Below the crossover it is the right
 choice and stays the default.
+
+### AMG on a march
+
+`jno.precond.amg()` builds its hierarchy on the host from a **concrete** matrix, and a march linearises
+inside `lax.scan` where every operator is traced — so it used to refuse every transient problem. A march
+now builds it once, before the scan, from the step tangent (a state-dependent mass `c(u) u_t` included).
+
+A frozen setup stays correct — a preconditioner changes convergence speed, never the answer — but goes
+stale when the operator moves. `cached(spec, refresh=k)` spells the cadence, and the march then runs as
+`ceil(n/k)` scans, re-composed against the carried state:
+
+```python
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())                      # frozen once
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.cached(jno.precond.amg(), refresh=25))
+```
+
+Measured where a melt pool's coefficients move ~`1e13` between solid and molten: frozen once, the Krylov
+residual stalls at `2.9e-03`; at `refresh=25` it reaches `1.5e-04`. `theta()`/`exponential()` integrate
+the march themselves and are not chunked, so a cadence beside one raises rather than never firing.
+
+A frozen preconditioner is probed once and refused if it makes a random residual worse — but only when it
+stands alone, since a block preconditioner need not reduce a full residual in one application.
 
 ### When the pressure mass is not enough
 

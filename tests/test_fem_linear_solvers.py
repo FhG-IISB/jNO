@@ -425,3 +425,36 @@ def test_pardiso_agrees_with_the_iterative_default_on_a_symmetric_tangent():
     got = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True), linear=jno.solve.lu(backend="pardiso")))
     assert np.abs(ref).max() > 1e-6
     assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-8, "the LDLt factorization changed the answer"
+
+
+def test_lu_host_reuse_false_does_not_retain_a_factorization():
+    """``reuse=False`` must factor and free inside ONE callback, leaving the cache empty.
+
+    The cache is keyed on the operator's content, so a Newton tangent never hits it -- the docstring
+    says as much. What it does instead is hold host memory: XLA:CPU runs each pure_callback on a
+    different thread, so a factorization retained past the callback that built it is freed on a LATER
+    thread and glibc cannot return that arena. One factorization's worth of unreclaimable RSS per
+    Newton iteration. Measured on a 4-field melt pool at 13,278 dofs over 200 steps: the default
+    OOM-kills a 62 GB machine, ``reuse=False`` peaks at 2.01 GB, and the answers agree to ten
+    significant figures.
+
+    Memory is awkward to assert on directly, so this pins the mechanism instead: nothing is retained.
+    """
+    from jno.utils.solver.linear import _FACTOR_CACHE, host_lu_solve
+
+    n = 24
+    rows = np.arange(n)
+    A = jsp.BCOO((jnp.asarray(np.full(n, 2.0)), jnp.asarray(np.stack([rows, rows], axis=1))), shape=(n, n))
+    b = jnp.asarray(np.ones(n))
+
+    _FACTOR_CACHE.clear()
+    x_cached = np.asarray(host_lu_solve(A, b))
+    assert len(_FACTOR_CACHE) == 1, "the default should retain the factorization it just built"
+
+    _FACTOR_CACHE.clear()
+    x_free = np.asarray(host_lu_solve(A, b, reuse=False))
+    assert len(_FACTOR_CACHE) == 0, "reuse=False retained a factorization anyway"
+
+    # ...and the answer is the same one, so this is a memory choice and not a numerical one.
+    assert np.abs(x_cached - x_free).max() < 1e-12
+    assert np.abs(x_free - 0.5).max() < 1e-12

@@ -70,6 +70,38 @@ def _to_scipy_csr(A):
     return sp.csr_matrix(np.asarray(A))
 
 
+_tiny = 1e-300
+
+
+def _smoother_lmax(A_host, A_dev, *, safety: float, iters: int, degree: int, lmin_ratio: float) -> float:
+    """Upper bound on a level's spectrum for the Chebyshev smoother -- verified, never assumed.
+
+    Chebyshev damps the band ``[lmin, lmax]`` and AMPLIFIES whatever lies above ``lmax``, so a bound
+    that is too small does not merely smooth poorly, it makes the V-cycle divergent. Power iteration
+    returns a Rayleigh quotient, which approaches the dominant eigenvalue **from below**, and on a
+    nonsymmetric operator it can STALL far short of it: measured on the Newton tangent of
+    ``(1 + u^2) grad u . grad phi`` (4751 dofs) it sat at ``0.54 * rho`` at 20 iterations and again at
+    40 -- so "two runs agree" reads as converged there, and is worthless as a check -- while 200
+    iterations were needed to reach ``rho``. One V-cycle then amplified a random residual **7.5x**,
+    surfacing only as a stalled Krylov solve several frames away. The same problem's LINEAR step
+    operator estimates to ``1.007 * rho``, which is why this went unnoticed.
+
+    So the estimate is USED only if the smoother it implies is measured to damp; otherwise the level
+    falls back to Gershgorin's disc theorem, ``rho(A) <= max_i sum_j |a_ij|``, which holds for any
+    matrix and costs one pass over a matrix already assembled here. The probe is one Chebyshev apply.
+    Measured: the broken case 7.5 -> 0.36, and the case that already worked keeps its tight bound and
+    its 0.33 unchanged.
+    """
+    gershgorin = float(abs(A_host).sum(axis=1).max())
+    tight = safety * float(power_iteration_bound(lambda v: A_dev @ v, A_dev.shape[0], dtype=A_dev.data.dtype, iters=iters))
+    if not (0.0 < tight < gershgorin):  # already at or above the guaranteed bound: nothing to gain
+        return gershgorin
+    r = jax.random.normal(jax.random.PRNGKey(0), (A_dev.shape[0],), dtype=A_dev.data.dtype)
+    x = chebyshev_apply(lambda v: A_dev @ v, r, lmin=lmin_ratio * tight, lmax=tight, degree=degree)
+    damped = float(jnp.linalg.norm(r - A_dev @ x) / jnp.maximum(jnp.linalg.norm(r), _tiny))
+    return tight if damped < 1.0 else gershgorin
+
+
 def build_hierarchy(
     A: Any,
     *,
@@ -122,9 +154,7 @@ def build_hierarchy(
         A_l = jsp.BCOO.from_scipy_sparse(lvl.A.tocoo())
         P = jsp.BCOO.from_scipy_sparse(lvl.P.tocoo())
         R = jsp.BCOO.from_scipy_sparse(lvl.R.tocoo())
-        lmax = float(
-            safety * power_iteration_bound(lambda v: A_l @ v, A_l.shape[0], dtype=A_l.data.dtype, iters=bound_iters)
-        )
+        lmax = _smoother_lmax(lvl.A, A_l, safety=safety, iters=bound_iters, degree=smoother_degree, lmin_ratio=lmin_ratio)
         levels.append({"A": A_l, "P": P, "R": R, "lmin": lmin_ratio * lmax, "lmax": lmax, "degree": smoother_degree})
     A_c = np.asarray(ml.levels[-1].A.todense())
     if not np.isfinite(A_c).all() or not np.abs(A_c).max() > 0:

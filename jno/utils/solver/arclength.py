@@ -200,7 +200,7 @@ def march_arclength(fem, spec, *, solve_fn, op, readout, surf_readout, buffers0,
 
     carry0 = (u_1, jnp.asarray(lam_1, dtype=dtype), du_1, dlam_1, b1, s1)
     _final, (traj, lams, r_end, r_start) = lax.scan(step, carry0, None, length=n_steps - 2)
-    _check_march_converged(r_end, r_start, np.asarray(tau_pts)[2:], solve_fn)
+    _check_march_converged(r_end, r_start, np.asarray(tau_pts)[2:], solve_fn, states=traj)
 
     lam_all = jnp.concatenate([jnp.asarray([lam0, lam_1], dtype=dtype), lams])
     fem._tau_schedule = np.asarray(jax.lax.stop_gradient(lam_all))

@@ -2094,6 +2094,33 @@ class domain(MeshIOMixin):
             # an untagged outlet edge is left as a natural (do-nothing) outflow
         """
         self._tag_predicates = getattr(self, "_tag_predicates", {})
+        # A geometry name already means a FACE of the shape. Re-tagging one is an ordinary idiom --
+        # `d.tag("left", lambda x, y: x < 1e-9)` restates where `left` already is, harmlessly. But the
+        # predicate only filters POINT SAMPLING; boundary-facet mapping keeps the geometry's own face.
+        # So a predicate naming a DIFFERENT face silently splits the region, and a surface term
+        # integrates somewhere other than where the caller sampled. Measured on a box whose `top` is
+        # z=max, tagged as y=max: pinning y=max failed to silence a surface source (25.418 K rise)
+        # while pinning z=max silenced it (0.000) -- the integral was on z=max the whole time.
+        #
+        # Warned, not raised: `tests/test_fem_history_march.py` tags a unit cube's `top` as y=max and
+        # is CORRECT because of this resolution (it clamps z=0 and wants the opposite face), and 157
+        # call sites across the repo re-tag geometry names. Refusing would break working code; staying
+        # quiet is how a laser ends up firing at the wrong face of a weld.
+        if name in (self.__dict__.get("_geometry_tags") or {}) and callable(where):
+            _agree = self._predicate_agrees_with_geometry_face(name, where)
+            if _agree is not None and _agree < 0.5:
+                import warnings as _warnings
+
+                _warnings.warn(
+                    f"tag({name!r}, ...): {name!r} already names a region of this geometry, and this "
+                    f"predicate accepts only {_agree:.0%} of that region's own points -- it describes "
+                    f"a different part of the boundary. Point sampling will follow your predicate, but "
+                    f"a SURFACE TERM bound to {name!r} integrates over the geometry's {name!r} instead, "
+                    f"with no further warning. Use a name the geometry does not already use (e.g. "
+                    f"{name + '_'!r}) unless you meant the geometry's own region. Geometry regions "
+                    f"here: {sorted(self.__dict__.get('_geometry_tags') or {})}.",
+                    stacklevel=2,
+                )
         if callable(where) and _is_facet_predicate(where):
             # Richer boundary-facet predicate f(x, n, name): coords + outward normal + current name.
             return self._tag_by_facet(name, where)
@@ -2681,6 +2708,34 @@ class domain(MeshIOMixin):
 
     def _is_geometry_tag(self, tag: str) -> bool:
         return self.__dict__.get("_mesh") is None and tag in self.__dict__.get("_geometry_tags", {})
+
+    def _predicate_agrees_with_geometry_face(self, name, where):
+        """Fraction of the geometry region ``name``'s own points that ``where`` accepts, or ``None``.
+
+        ``None`` means "could not tell" -- no lazy plan, an unclassifiable region, a predicate that
+        raises on these coordinates -- and the caller then does not refuse. Deciding this by drawing
+        from the face is the same measured-not-assumed approach as
+        :meth:`_classify_predicate_region`: the predicate's source cannot be inspected, but what it
+        accepts can be.
+        """
+        import numpy as _np
+
+        try:
+            entry = (self.__dict__.get("_geometry_tags") or {}).get(name)
+            if entry is None or self.__dict__.get("_lazy_plan") is None:
+                return None
+            kind, gname = entry
+            pts, _n = self._draw_geometry_points(kind, gname, None, 256, _np.random.default_rng(0), False)
+            pts = _np.asarray(pts)
+            if pts.size == 0:
+                return None
+            cols = [pts[:, i] for i in range(min(int(self.dimension), pts.shape[1]))]
+            keep = _np.asarray(where(*cols))
+            if keep.shape != (pts.shape[0],):
+                return None
+            return float(_np.count_nonzero(keep)) / float(pts.shape[0])
+        except Exception:  # noqa: BLE001 -- "cannot tell" must never break tagging
+            return None
 
     def _classify_predicate_region(self, where):
         """Is ``where`` selecting a slice of the boundary, or a lump of the interior?

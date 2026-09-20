@@ -38,11 +38,26 @@ __all__ = ["sparse_lu_solve", "jacobi", "matrix_diagonal"]
 #: That is the deliberate trade: a small tax on the case that cannot benefit, against removing all
 #: but one factorization from the case that can.
 #:
-#: Bounded at 2 because the win is a repeated operator, not a diverse population of them, and a
-#: sparse factorization is the biggest object either side of the solve (fill-in): holding a stale one
-#: costs host memory for nothing. Two covers an alternating pair (a coupled two-field march).
+#: Bounded because the win is a repeated operator, not a diverse population of them, and a sparse
+#: factorization is the biggest object either side of the solve (fill-in): holding a stale one costs
+#: host memory for nothing.
+#:
+#: The bound is 8, not 2. Two covers an alternating pair (a coupled two-field march), which is what
+#: a MONOLITHIC solve produces -- but a BLOCK preconditioner does not: `triangular((T, inner(lu())),
+#: (u, ...), (p, ...), (w, ...))` calls this once per block with a different operator, and again on
+#: every Krylov application. Below the block count no entry survives to be reused, so the hit rate is
+#: not merely reduced, it is exactly zero. Measured on the 4-field melt pool at h=8um, 120 steps,
+#: same answer throughout (peak T 1917 K, |u| 5.1616e-01 m/s):
+#:     bound 2, reuse=True    OOM -- SIGKILL, RSS climbs until the kernel intervenes
+#:     bound 2, reuse=False   3330 s
+#:     bound 8, reuse=True    1998 s
+#: The OOM is the thrash, not the caching: evicting and re-factorising every application strands
+#: per-thread glibc arenas faster than they are reused.
+#:
+#: Raising the cap cannot cost the monolithic case anything -- it is a CAP, not an allocation, and
+#: that case only ever inserts one key. 8 covers a four-field system and its transpose solves.
 _FACTOR_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
-_FACTOR_CACHE_MAX = 2
+_FACTOR_CACHE_MAX = 8
 
 #: cuDSS solvers, keyed on the operator's **SPARSITY** rather than its full content.
 #:
@@ -818,7 +833,7 @@ def pardiso_lu_solve(A, b):
     )
 
 
-def host_lu_solve(A, b):
+def host_lu_solve(A, b, *, reuse: bool = True):
     """Sparse-direct solve factored on the HOST (SuperLU), driven from the device.
 
     Same contract as :func:`sparse_lu_solve` -- ``(A, b) -> x``, jit-compatible, reverse-mode
@@ -878,11 +893,25 @@ def host_lu_solve(A, b):
         # factorization exactly -- a changed coefficient misses and re-factors, which is the whole
         # correctness requirement. `transpose` is deliberately NOT in the key: one factorization
         # serves both directions via SuperLU's trans="T", so the adjoint reuses the forward's.
-        h = hashlib.blake2b(digest_size=16)
-        h.update(dat.view(_np.uint8))
-        h.update(idx.view(_np.uint8))
-        key = (h.digest(), shape, dat.dtype.str)
+        if reuse:
+            h = hashlib.blake2b(digest_size=16)
+            h.update(dat.view(_np.uint8))
+            h.update(idx.view(_np.uint8))
+            key = (h.digest(), shape, dat.dtype.str)
 
+        # ``reuse=False`` factorises and FREES within this one callback. That matters for a march,
+        # not just for the hash it saves: XLA:CPU runs each pure_callback on a different thread, so a
+        # factorisation retained past the callback that built it is freed on some LATER thread, and
+        # glibc cannot return that arena to the allocator. The result is one factorisation's worth of
+        # unreclaimable RSS per Newton iteration. Measured on a 4-field melt pool, 13,278 DOFs, 200
+        # steps: cached OOM-kills a 62 GB machine, uncached peaks at 2.08 GB, and the two answers
+        # agree to ten significant figures.
+        if not reuse:
+            mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
+            lu = _spla.splu(mat)
+            out = _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
+            del lu, mat
+            return out
         lu = _FACTOR_CACHE.get(key)
         if lu is None:
             mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)

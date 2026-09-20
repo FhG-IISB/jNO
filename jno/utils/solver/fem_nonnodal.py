@@ -1174,6 +1174,10 @@ def assemble_fem_nonnodal(
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
 
         sub = [_apply_sign(domain, s, t) for bare in volume_terms for s, t in _split_additive_terms(domain, bare)]
+        from .weak_form_helpers import refuse_mixed_temporal_group
+
+        for _t in sub:
+            refuse_mixed_temporal_group(_t, where="jno.fem (non-nodal)")
         temporal = [t for t in sub if _contains_temporal_derivative(t)]
         spatial = [t for t in sub if not _contains_temporal_derivative(t)]
         if not temporal:

@@ -42,6 +42,7 @@ from .solver_helper import (
     contains_node_type,
     depends_on_domain_variables,
     iter_placeholder_children,
+    max_temporal_derivative_order,
     unique_by_id,
 )
 
@@ -80,7 +81,105 @@ def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
                 domain, node.right, -sign, infer_term_bucket
             )
 
+    # A scalar multiplying (or dividing) an additive GROUP is not an atomic term. Left whole, the
+    # callers that route a sub-term by its temporal order -- the transient mass/stiffness split, the
+    # second-order mass/damping/stiffness split, the complex-transient split -- read ONE order for the
+    # whole product. `c * (rho*(u_t,v) + mu*(grad u, grad v) - (p, div v))` then reports order 1, so the
+    # viscous and pressure parts are stripped into the MASS matrix and the stiffness is empty: the march
+    # returns a finite, plausible trajectory with no restoring force (measured on a traction-driven
+    # Stokes film: 2.99e-3 m/s against a correct 3.28, growing linearly with step count instead of
+    # saturating). Distribution is exact and restores the answer bit-for-bit.
+    #
+    # `-(a + b)` is `Literal(-1) * (a + b)`, so a negated group is the same trap and is fixed here too.
+    # Division distributes only through its NUMERATOR: `c / (a + b)` is not `c/a + c/b`.
+    if isinstance(node, BinaryOp) and node.op in {"*", "/"}:
+        sides = (
+            ((node.left, node.right, False),)
+            if node.op == "/"
+            else (
+                (node.left, node.right, False),
+                (node.right, node.left, True),
+            )
+        )
+        for group, other, other_on_left in sides:
+            if not (isinstance(group, BinaryOp) and group.op in {"+", "-"}):
+                continue
+            # Keep a whole boundary group together, exactly as the +/- branch above does -- a facet
+            # term is assembled as one kernel and must not be scattered across sub-terms.
+            if infer_term_bucket is not None:
+                try:
+                    bucket = infer_term_bucket(domain, node)
+                except Exception:
+                    bucket = None
+                if bucket is not None and bucket[0] == "boundary":
+                    return [(sign, node)]
+            # ...and distribute ONLY where it changes the routing. What motivated this is that callers
+            # route a sub-term by its TEMPORAL ORDER, so a group of MIXED order read as one order sends
+            # the stiffness into the mass matrix. Where every part carries the same order, the atomic
+            # product routes identically, and splitting it is not free: the bucket hook above cannot
+            # always tell a facet term from a volume one -- a VPINN boundary flux `(1.0 + 0.0*x_r)*v_r`
+            # infers as ('volume', 'volume') -- so distributing strands its constant part in the volume
+            # channel, and an RT0 natural pressure BC loses the edge it was integrated over.
+            try:
+                _orders = {
+                    max_temporal_derivative_order(_p)
+                    for _s, _p in split_weak_additive_terms(domain, group, 1.0, infer_term_bucket)
+                }
+            except Exception:  # noqa: BLE001 - an order the walker declines is not evidence to split on
+                _orders = {0}
+            if len(_orders) < 2:
+                continue
+            out = []
+            for part_sign, part in split_weak_additive_terms(domain, group, sign, infer_term_bucket):
+                if node.op == "/":
+                    product = part / other
+                else:
+                    product = (other * part) if other_on_left else (part * other)
+                # Recurse: `other` may itself be additive, and each pass strictly removes one additive
+                # node, so this terminates.
+                out.extend(split_weak_additive_terms(domain, product, part_sign, infer_term_bucket))
+            return out
+
     return [(sign, node)]
+
+
+def refuse_mixed_temporal_group(node, where="jno.fem"):
+    """Raise if an additive group inside ``node`` mixes temporal orders.
+
+    The callers that route a sub-term by its temporal order -- the transient mass/stiffness split, the
+    second-order mass/damping/stiffness split, the complex-transient split -- read ONE order per
+    sub-term. `split_weak_additive_terms` distributes a scalar over an additive group so the usual
+    spellings separate, but a group it cannot reach stays atomic: an argument to an operator, as in
+    `inner(u_t + (u.grad)u, v)`, where distributing would mean asserting that the operator is linear in
+    that slot.
+
+    Left alone the whole sub-term is read as order 1 and its spatial part is stripped into the MASS
+    matrix, so the march returns a finite, plausible trajectory with no restoring force. Measured on a
+    transient Stokes film with a linear drag: `inner(u_t, v) + K inner(u, v)` gives a final peak
+    velocity of 2.118, and `rho inner(u_t + (K/rho) u, v)` -- the same equation -- gives 0.177619.
+
+    So it is refused by name. Splitting the term by hand is always available and is what every jNO
+    tutorial already does.
+    """
+    from .solver_helper import iter_children
+    from .solver_helper import max_temporal_derivative_order as _mto
+
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, BinaryOp) and n.op in {"+", "-"}:
+            ol, orr = _mto(n.left), _mto(n.right)
+            if ol != orr:
+                raise ValueError(
+                    f"{where}: a weak term adds a temporal-derivative expression (order {max(ol, orr)}) "
+                    f"to a non-temporal one (order {min(ol, orr)}) inside a sub-expression this "
+                    "assembler cannot split -- typically an operator argument such as "
+                    "`inner(u.t + (u.grad)u, v)`. The whole group would be routed by ONE temporal "
+                    "order, stripping the spatial part into the mass matrix and silently returning a "
+                    "march with no restoring force. Write the `u.t` part as its own term: "
+                    "`inner(u.t, v) + inner((u.grad)u, v)`."
+                )
+        stack.extend(iter_children(n) or ())
 
 
 # ---------------------------------------------------------------------------

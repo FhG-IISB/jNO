@@ -2674,13 +2674,46 @@ class FEM:
                     "conditions, and each step already warm-starts from the previous state."
                 )
             from .utils.solver.backend_blocks import _default_transient_integrate
-            from .utils.solver.solver_api import compose_transient_step_solvers
+            from .utils.solver.solver_api import (
+                _refresh_cadence,
+                _uncached,
+                compose_transient_step_solvers,
+            )
 
-            lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, self, self._op, time)
+            # `cached(spec, refresh=k)` asks for a rebuild every k steps. A setup that cannot run under a
+            # trace can only be rebuilt between scans, so the march is chunked at that cadence instead of
+            # running as one scan; without it nothing changes.
+            _cadence = None if precond is None else _refresh_cadence(precond)
+            if _cadence is not None and time is not None:
+                raise NotImplementedError(
+                    f"fem.solve(precond=jno.precond.cached(..., refresh={_cadence})) asks for a rebuild every "
+                    f"{_cadence} steps, but a jno.solve.theta(...)/exponential(...) scheme integrates the march "
+                    "itself and is not chunked here, so the setup would silently never refresh. Drop the "
+                    "cadence, or use the default scheme."
+                )
+            # Composed per chunk below when a cadence is set; composing here too would build once more
+            # than asked for (measured: 4 builds where 3 were requested).
+            lin_s, nonlin_s = (
+                (None, None)
+                if _cadence is not None
+                else compose_transient_step_solvers(nonlinear, linear, precond, self, self._op, time)
+            )
 
             def _stepper(block, args, save_ts):
                 if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
                     return time.integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
+                if _cadence is not None and not isinstance(save_ts, jax.core.Tracer):
+                    from .utils.solver.backend_blocks import _refreshing_transient_integrate
+
+                    return _refreshing_transient_integrate(
+                        block,
+                        args,
+                        save_ts,
+                        cadence=_cadence,
+                        compose=lambda blk, st: compose_transient_step_solvers(
+                            nonlinear, linear, _uncached(precond), self, blk, time, st
+                        ),
+                    )
                 return _default_transient_integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
 
             return _stepper, kwargs

@@ -2883,16 +2883,24 @@ def assemble_fem_native(
             if _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
                 return _pattern_cache["val"]
             _idx_rows, _idx_cols = [], []
+            # int32 SOURCES, not an int32 cast of the result. Under x64 `cdofs` / `cell_all_dofs` are
+            # int64 (`jnp.arange` in the dof-map builder promotes), so every broadcast block below and
+            # both concatenated vectors were int64 -- 8 bytes per raw triplet, three times over, to
+            # produce an array that is cast back down to int32 one line later. Casting the small
+            # (n_cells, n_local) maps ONCE makes the whole pattern pipeline int32. These arrays are
+            # index metadata for the host-side plan; they are never differentiated.
+            _cdofs32 = [_c.astype(jnp.int32) for _c in cdofs]
+            _cad32 = cell_all_dofs.astype(jnp.int32)
             for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
                 _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                _idx_rows.append(jnp.broadcast_to(cdofs[_tfi_s][:, :, None], _sh).reshape(-1))
-                _idx_cols.append(jnp.broadcast_to(cell_all_dofs[:, None, :], _sh).reshape(-1))
+                _idx_rows.append(jnp.broadcast_to(_cdofs32[_tfi_s][:, :, None], _sh).reshape(-1))
+                _idx_cols.append(jnp.broadcast_to(_cad32[:, None, :], _sh).reshape(-1))
             for _region_s, _face_ids_s, _btyped_s in surface_work:
                 _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
-                _fcols = cell_all_dofs[_pc]
+                _fcols = _cad32[_pc]
                 for _bcoeff_s, _btfi_s in _btyped_s:
                     _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                    _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
+                    _idx_rows.append(jnp.broadcast_to(_cdofs32[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
                     _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
                     # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
                     # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
@@ -2914,10 +2922,24 @@ def assemble_fem_native(
                 if _idx_rows
                 else None
             )
+            # Hand the plan builder a HOST copy and let go of the device array before it allocates its
+            # scratch: the two held the same bytes twice through the most memory-hungry phase of the
+            # build. When a plan comes back the raw pattern is DEAD -- the only reader is the
+            # `_plan is None` fallback below, and `_static_idx_for` publishes `_plan[0]` -- so it is
+            # never rebuilt; when compression fails the fallback path needs it on device, so it is
+            # re-uploaded there and only there.
+            _host_idx = None
             try:
-                _plan = compress_plan(_idx_static) if _idx_static is not None else None
+                _host_idx = np.asarray(_idx_static) if _idx_static is not None else None
+                _idx_static = None  # release the device buffer for the duration of compress_plan
+                _plan = compress_plan(_host_idx) if _host_idx is not None else None
             except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
-                _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
+                # Drop the pattern as the pre-plan code always did: a TRACED one must not be cached
+                # across traces, and the fallback below rebuilds it in-trace anyway.
+                _idx_static, _host_idx, _plan = None, None, None
+            if _plan is None and _host_idx is not None:
+                _idx_static = jnp.asarray(_host_idx)
+            _host_idx = None
             _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
             return _pattern_cache["val"]
 
@@ -3652,6 +3674,10 @@ def assemble_fem_native(
         sub_signed = [
             _apply_sign(domain, sign, sub) for bare in volume_terms for sign, sub in _split_additive_terms(domain, bare)
         ]
+        from .weak_form_helpers import refuse_mixed_temporal_group
+
+        for _t in sub_signed:
+            refuse_mixed_temporal_group(_t, where="jno.fem")
         temporal = [t for t in sub_signed if _contains_temporal_derivative(t)]
         spatial = [t for t in sub_signed if not _contains_temporal_derivative(t)]
         if not temporal:

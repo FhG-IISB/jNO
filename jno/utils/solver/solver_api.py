@@ -938,6 +938,10 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     an unbuilt ``amg``, ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own
     targeted errors when materialized.
 
+    On a **transient march** an unbuilt ``amg`` composes anyway: the march's own driver freezes it
+    first (:func:`_freeze_precond_for_march`), building the hierarchy from the step tangent at the
+    initial state, outside the scan. That is the one place the representative operator is known.
+
     **A DIRECT ``linear=`` slot picks the direct Newton.** ``lu``/``dense``/``amg`` need an assembled
     matrix, and a matrix-free tangent has none to give them, so pairing one with the matrix-free
     Newton cannot work -- it used to surface as ``LinearOperator.dense(): a matvec-only operator
@@ -1024,6 +1028,194 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     return _composed
 
 
+def _uncached(spec):
+    """Strip ``cached(...)`` wrappers from a spec tree, keeping the structure around them.
+
+    A march that honours a cadence rebuilds once per chunk, so the wrapper's own "every k-th
+    materialization" counter must not apply on top: with chunks of k steps it would rebuild every k
+    CHUNKS, i.e. every k^2 steps, and the setup the user asked to refresh every k steps would go stale
+    exactly as before. The chunk length is the policy; the wrapper's memoisation is what it replaces.
+    """
+    inner = getattr(spec, "spec", None)
+    if inner is not None and hasattr(spec, "refresh"):
+        return _uncached(inner)
+    pairs = getattr(spec, "pairs", None)
+    if pairs:
+        return type(spec)([(f, _uncached(child)) for f, child in pairs])
+    return spec
+
+
+def _refresh_cadence(precond):
+    """Steps between preconditioner rebuilds, from ``jno.precond.cached(spec, refresh=k)``.
+
+    That spelling already documents this exact policy -- "an ``int k`` rebuilds every k-th
+    materialization -- the cadence policy for a Newton loop or transient march whose operator values
+    drift step by step" -- so honouring it needs no new argument anywhere. ``None`` (or ``refresh``
+    True/False, which are the shape/never policies) leaves the march as a single scan.
+    """
+    for spec in _specs_in(precond):
+        r = getattr(spec, "refresh", None)
+        if isinstance(r, bool) or not isinstance(r, int):
+            continue
+        if r > 0:
+            return int(r)
+    return None
+
+
+def _specs_in(spec):
+    """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
+    (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. A tree is non-traceable
+    as soon as ONE leaf is, so the whole tree has to be walked rather than just its root."""
+    yield spec
+    child = getattr(spec, "spec", None)
+    if child is not None:
+        yield from _specs_in(child)
+    for pair in getattr(spec, "pairs", ()) or ():
+        yield from _specs_in(pair[1] if isinstance(pair, tuple) else pair)
+
+
+class _FrozenMarchPrecond:
+    """A preconditioner applier materialized ONCE, outside the trace, and reused by every step.
+
+    Wraps the applier as a bare ``ctx -> apply`` spec (the duck type ``materialize_precond`` already
+    accepts), so nothing downstream needs to know a march is what it came from.
+    """
+
+    __slots__ = ("_apply", "_of")
+
+    def __init__(self, apply, of):
+        self._apply, self._of = apply, of
+
+    def __call__(self, _ctx):
+        return self._apply
+
+    def __repr__(self):
+        return f"frozen-for-march({self._of!r})"
+
+
+def _freeze_precond_for_march(precond, fem, block, state=None):
+    """Materialize a NON-traceable preconditioner once, from the step tangent at the initial state.
+
+    ``spec.traceable`` is the library's own word for "can materialize inside a trace". ``jacobi`` reads
+    its diagonal off the traced operator and is left exactly as it was; ``amg``/``ilu`` run a host-side
+    setup (pyamg, scipy) that a tracer cannot reach, and used to die several frames inside the Newton
+    loop with "AMG setup needs a concrete matrix but got a traced one" -- on the perfectly reasonable
+    ``fem.solve(precond=jno.precond.amg())`` over a transient problem.
+
+    The tangent drifts as the march proceeds; the hierarchy built here does not follow it. That is the
+    standard frozen-preconditioner trade and it is always CORRECT: a preconditioner changes how fast the
+    Krylov solve converges, never what it converges to. It is also what the LINEAR transient path already
+    does one branch below, where the step operator is formed once and materialized before the scan.
+
+    Built from ``M + theta*dt*J(u0, t0)``, which is ``dt`` times the true step tangent
+    ``M/dt + theta*J``. A uniform scaling of the operator leaves the Krylov iterates unchanged (it
+    rescales the preconditioned residual, not the subspace), so the extra factor costs nothing.
+    """
+    if precond is None:
+        return None
+    # ``state`` is the state to linearise about. The block's own ``state0`` is the INITIAL condition,
+    # which for a melt pool is cold and fully solid -- Carman-Kozeny ~1e13, PSPG tau ~1e-9, a stiffness
+    # 1e6x its molten value -- so a setup frozen there describes an operator the march leaves behind.
+    # A driver that re-composes (a refresh cadence, or the adaptive loop between remeshes) passes the
+    # live state instead.
+    # Only a LEAF decides this. A block container (`triangular`, `block_diag`) inherits the base
+    # `traceable = False`, but it assembles nothing itself -- freezing a tree of jacobi leaves because
+    # of its wrapper took a configuration that worked (measured 0.18 s/step on the melt pool's T+w) and
+    # refused it at the probe, since a block-triangular applier is not required to reduce a full
+    # residual in one application the way a V-cycle is.
+    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
+    if all(bool(getattr(s, "traceable", True)) for s in leaves):
+        return precond  # nothing here needs a concrete matrix -- leave the per-linearization path alone
+
+    name = getattr(precond, "name", type(precond).__name__)
+    at = block.state0 if state is None else state
+    if block.jacobian is None or (block.mass is None and block.mass_residual_jac is None):
+        raise TypeError(
+            f"fem.solve(precond={name}): this preconditioner needs an assembled matrix, and this march "
+            "cannot offer one -- its block carries neither a mass matrix nor an assembled mass-residual "
+            "Jacobian to form the step tangent from. Use a traceable preconditioner "
+            "(jno.precond.jacobi()), or pre-build this one yourself with spec.build(A)."
+        )
+    if at is None or block.dt is None:
+        raise TypeError(
+            f"fem.solve(precond={name}): this preconditioner needs an assembled matrix, and the step "
+            "tangent cannot be formed here because the block carries no initial state / step size. Use "
+            "jno.precond.jacobi(), or pre-build with spec.build(A)."
+        )
+    theta = float((block.metadata or {}).get("theta", 1.0))
+    t0 = float((block.metadata or {}).get("t0", 0.0))
+    dt = float(block.dt)
+    J = block.jacobian(at, t0, None)
+    if block.mass is None:
+        # STATE-DEPENDENT mass (``c(u) u_t``, e.g. an enthalpy-porosity heat capacity): there is no mass
+        # MATRIX, the mass action lives in a residual whose Jacobian is assembled per state, and the step
+        # tangent is ``J_spatial + J_mass/dt`` -- the same combination `SemidiscreteTimeBlock.step` forms.
+        # ``mass_residual_jac`` reads the previous state off the load-path channel, so it is delivered
+        # here exactly as the stepper delivers it, from the initial state.
+        _lp: dict = {}
+        _u0 = jnp.asarray(at).reshape(-1)
+        for _fid, _s0, _s1, _vec in (block.metadata or {}).get("prev_state_slices", []):
+            _slice = _u0[_s0:_s1]
+            _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
+        J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
+        A_rep = _add_step_operator(J, J_mass, 1.0 / dt)
+        op = LinearOperator(A_rep)
+        prepare_precond(precond, fem)
+        applier = materialize_precond(precond, PrecondContext(op, fem))
+        _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
+        return _FrozenMarchPrecond(applier, precond)
+    M = block.mass(t0, None)
+    A_rep = _add_step_operator(M, J, theta * dt)
+    op = LinearOperator(A_rep)
+    prepare_precond(precond, fem)
+    applier = materialize_precond(precond, PrecondContext(op, fem))
+    _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
+    return _FrozenMarchPrecond(applier, precond)
+
+
+def _refuse_a_useless_applier(applier, A, name, *, single_leaf):
+    """One probe: does ``M^-1`` actually reduce a residual on the operator it was built from?
+
+    A preconditioner is free to be mediocre, but one that AMPLIFIES is worse than none, and inside a
+    march that surfaces only as ``fgmres did not solve the system`` from a debug callback several
+    frames deep, after the whole trajectory has been traced. Measured here it costs one apply.
+
+    Smoothed aggregation is the case that hits this. It assumes a Laplacian-like operator, and a
+    Newton tangent need not be one: for ``(1 + u^2) grad u . grad phi`` the tangent carries an extra
+    ``2u grad u . delta u`` term, and its V-cycle amplifies a random residual 7.5x (measured, 4751
+    dofs) -- while the same problem's LINEAR step operator contracts by 0.32. Symmetrising it,
+    rescaling it and lagging the coefficient were each measured to change nothing.
+    """
+    import numpy as _np
+
+    if not single_leaf:
+        # ONLY a spec that stands alone. For a BLOCK composition this measure is not evidence: what a
+        # Krylov solve needs is a clustered spectrum of M^-1 A, not a residual drop from one application,
+        # and on a system whose scales span 1e13 (Carman-Kozeny drag) to 1e-12 (a PSPG pressure block) the
+        # two part company. Measured on the 4-field melt pool: `triangular` with an inner LU per block
+        # "amplifies" 735x by this probe and converges perfectly well in the march (26.5 s for 10 steps);
+        # jacobi likewise, at 319x. Refusing on that basis blocked configurations that work.
+        return
+    apply_fn = getattr(applier, "fwd", applier)
+    n = A.shape[0]
+    r = _np.asarray(jax.random.normal(jax.random.PRNGKey(0), (n,)), dtype=float)
+    try:
+        z = _np.asarray(apply_fn(jnp.asarray(r))).reshape(-1)
+        left = _np.linalg.norm(r - _np.asarray((A @ jnp.asarray(z))).reshape(-1)) / _np.linalg.norm(r)
+    except Exception:  # noqa: BLE001 -- a spec that cannot be probed is left alone; the solve will say so
+        return
+    if not (left == left) or left <= 1.0:
+        return
+    raise ValueError(
+        f"fem.solve(precond={name}): on this march the preconditioner makes a random residual "
+        f"{left:.1f}x WORSE, so the Krylov solve cannot converge with it -- it would stall inside the "
+        "time loop instead of failing here. This is what an algebraic-multigrid hierarchy does on a "
+        "tangent that is not Laplacian-like (a strongly nonlinear coefficient contributes a term that "
+        "breaks its strength-of-connection assumption). Use jno.precond.jacobi(), which reads the "
+        "diagonal off the tangent itself, or precondition a problem whose step operator is definite."
+    )
+
+
 def _add_step_operator(M, A, scale):
     """Form the theta-step operator ``M + scale * A`` once, eagerly.
 
@@ -1049,7 +1241,7 @@ def _add_step_operator(M, A, scale):
     return dense(M) + scale * dense(A)
 
 
-def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None):
+def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None, state=None):
     """Compose the slots into per-step solvers for the transient integrator.
 
     Returns ``(linear_step_solve, nonlinear_step_solve)`` (one is ``None``), matching
@@ -1068,6 +1260,11 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
       matvec-only operator that still exposes the exact step diagonal (so ``jacobi`` works).
     """
     if block.is_nonlinear():
+        # A preconditioner that must SEE a matrix cannot be materialized in here: the per-step solve runs
+        # inside the march's scan, so both the matrix-free JVP and the `direct=True` assembled tangent are
+        # traced by the time it is asked for. Build it once, now, from the step tangent at the initial
+        # state, and freeze it for the march.
+        precond = _freeze_precond_for_march(precond, fem, block, state)
         return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
     if nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
