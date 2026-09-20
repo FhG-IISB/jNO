@@ -6288,6 +6288,33 @@ def run_mesh_motion(
                     _disp = _constrain_boundary_slide(_disp, X_now, shared_cells, dim)
                     _T_slide = _t.perf_counter() - _T0
                     _Xr = X_now + _disp
+                    # Relocation keeps the CELLS, so it must also keep their orientation: an inverted
+                    # cell here is a tangle, not a flip. It has to be caught against the sign the carry
+                    # already holds, because `_make_topo` re-reads `sgn` from whatever mesh it is given
+                    # -- right after a reconnection, where a flip legitimately reverses a cell, and
+                    # wrong after a relocation, where it would record the inversion as the new
+                    # reference and silently disarm the march's tangle test for good. Measured cost of
+                    # not doing this: a 600 W run lost 55 % of its domain area over ~1 ms and ~4000
+                    # frames with nothing raised, temperatures still in a plausible band throughout.
+                    _sgn_ref = np.asarray(carry[3]["sgn"]) if isinstance(carry[3], dict) else None
+                    if _sgn_ref is not None and _sgn_ref.shape[0] == shared_cells.shape[0]:
+                        _sgn_new = np.sign(np.asarray(_signed_simplex_measures_jax(jnp.asarray(_Xr), jnp.asarray(shared_cells), dim)))
+                        if not np.array_equal(_sgn_new, _sgn_ref):
+                            _n_inv = int((_sgn_new != _sgn_ref).sum())
+                            if bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
+                                raise FloatingPointError(
+                                    f"jno.solve.relocate: the displacement inverts {_n_inv}/{len(shared_cells)} "
+                                    "cells. Relocation keeps the connectivity, so an orientation change is a "
+                                    "tangled mesh, not a flip."
+                                )
+                            _lg = getattr(getattr(fem, "domain", None), "log", None)
+                            if _lg is not None:
+                                _lg.warning(
+                                    f"jno.solve.relocate: skipped one round -- it would invert {_n_inv} cell(s)."
+                                )
+                            history[-1]["relocate_skipped"] = True
+                            history[-1]["relocate_would_invert"] = _n_inv
+                            continue
                     if not np.isfinite(_Xr).all() and not bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
                         # One degenerate cell is enough to make the Monge-Ampere operator singular. Skipping
                         # this round leaves the mesh exactly as the march produced it -- valid, just not

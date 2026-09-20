@@ -129,3 +129,28 @@ def test_relocate_on_a_moving_mesh_is_2d_only():
     fem = jno.fem([ui.t * vi + 0.05 * (ui.x * vi.x), u(ci[0], ci[1], ci[2]) - 1.0, xi.d(ti) - 0.0])
     with pytest.raises(NotImplementedError, match="2-D only"):
         fem.solve(adapt=jno.solve.relocate())
+
+
+def test_a_relocation_may_not_invert_a_cell():
+    """Relocation keeps the CELLS, so an orientation change is a tangle -- and must be rejected.
+
+    The march's tangle test compares each cell's signed measure against a reference sign carried in
+    the topology. ``_make_topo`` re-reads that reference from whatever mesh it is handed, which is
+    right after a RECONNECTION (a flip legitimately reverses a cell) and wrong after a RELOCATION,
+    where it would record the inversion as the new reference and disarm the test permanently.
+
+    Measured cost of not checking: a 600 W melt-ball run lost 55 % of its domain area across ~1 ms
+    and ~4000 frames with nothing raised, and its temperatures stayed in a plausible band the whole
+    way -- so a physical-bounds check would not have caught it either. Only area and orientation do.
+    """
+    fem, tr = _disk(jno.solve.relocate(method="monge_ampere", every=2, relax=10), vel=0.0, n=17, T=0.4)
+    a0 = None
+    for k in range(len(tr)):
+        P, C = (np.asarray(x) for x in tr.meshes[k])
+        a, b, c = P[C[:, 0]], P[C[:, 1]], P[C[:, 2]]
+        cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        signs = np.sign(cross)
+        assert np.all(signs == signs[0]), f"frame {k}: {int((signs != signs[0]).sum())} cells inverted"
+        area = float(np.abs(cross).sum() * 0.5)
+        a0 = area if a0 is None else a0
+        assert abs(area / a0 - 1.0) < 1e-6, f"frame {k}: area drifted to {area / a0:.6f} of the start"
