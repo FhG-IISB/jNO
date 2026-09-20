@@ -3337,6 +3337,107 @@ def _huang_ea_jax(pts, pts0, u_nodal, cells, dim, *, theta=1.0 / 3.0, p=1.5):
     return jnp.sum(vol * (theta * align + (1.0 - 2.0 * theta) * dim ** (dim * p / 2.0) * equi))
 
 
+_MA_JIT_CACHE: dict = {}
+
+
+def _ma_round_jitted(cells_np, n_verts: int, dim: int, n_relax: int, dt: float):
+    """A jitted ``(monitor, ops...) -> displacement`` for one Monge-Ampere round, cached by SHAPE.
+
+    ``n_relax`` is a PYTHON loop bound inside :func:`_monge_ampere_displacement`, so the traced graph is
+    proportional to it. Called bare, every round retraces and recompiles that whole unrolled relaxation:
+    measured ~3.5 s a round at ``relax=60`` on a 74-node mesh -- XLA compilation, not arithmetic, which
+    is why dropping to ``relax=10`` looked like a 6x speedup when it was really a 6x smaller graph.
+
+    The steady driver avoids this by calling it inside its own ``@jax.jit`` (`_ma_round`). A march has no
+    such enclosing jit, so cache one here. The key is shapes only -- the mesh GEOMETRY changes every
+    round and rightly so (unlike the steady case, a marching mesh moves by physics between rounds, so
+    the computational mesh cannot be hoisted), but geometry rides through as a traced value.
+    """
+    import jax as _jax  # this module imports jax per-function, not at top level
+
+    # SHAPES only: geometry and connectivity both ride through as traced values, so neither the mesh
+    # moving each round nor a reconnection changing the elements forces a recompile.
+    key = (int(n_verts), int(np.asarray(cells_np).shape[0]), int(np.asarray(cells_np).shape[1]),
+           int(dim), int(n_relax), float(dt))
+    fn = _MA_JIT_CACHE.get(key)
+    if fn is None:
+
+        def _round(monitor, sg, meas, wsum, kmat, cells_j):
+            return _monge_ampere_displacement(monitor, (sg, meas, wsum, kmat), cells_j, dim, n_relax=n_relax, dt=dt)
+
+        fn = _jax.jit(_round)
+        _MA_JIT_CACHE[key] = fn
+    return fn
+
+
+def _constrain_boundary_slide(disp, pts, cells, dim):
+    """Project boundary-vertex displacements onto the chord joining their neighbours; interior free.
+
+    A moving mesh must not let relocation change the BODY, only the sampling of it. The exact statement
+    in 2-D: the polygon area
+
+        A = 1/2 sum_i (x_i y_{i+1} - x_{i+1} y_i)
+
+    is a LINEAR function of each vertex, so dA/dP is a fixed vector perpendicular to the chord joining
+    P's two boundary neighbours. Moving P parallel to that chord therefore changes the enclosed area by
+    EXACTLY zero -- not to first order, exactly -- while still letting the node slide to where the
+    monitor wants it. Perimeter is not conserved by this and should not be: a free surface stretches.
+
+    Interior vertices keep the full displacement. In 3-D the same argument needs the vertex's incident
+    boundary-triangle fan, which is not wired here, so boundary vertices are simply pinned.
+    """
+    out = np.array(disp, dtype=float, copy=True)
+    bnd = _boundary_edges_from_triangles(cells) if dim == 2 else None
+    if bnd is None or len(bnd) == 0:
+        return out
+    bnd = np.asarray(bnd)
+    nb: dict[int, list[int]] = {}
+    for a, b in bnd:
+        nb.setdefault(int(a), []).append(int(b))
+        nb.setdefault(int(b), []).append(int(a))
+    for v, ns in nb.items():
+        if len(ns) != 2:  # a corner where three boundary edges meet: pin it, the chord is ambiguous
+            out[v] = 0.0
+            continue
+        chord = pts[ns[1]] - pts[ns[0]]
+        n2 = float(chord @ chord)
+        out[v] = 0.0 if n2 <= 0.0 else chord * (float(out[v] @ chord) / n2)
+
+    # The chord projection kills the FIRST-order area change only. Area is linear in each vertex
+    # SEPARATELY, so one vertex sliding is exact -- but all of them sliding at once leaves the quadratic
+    # cross terms (1/2) sum d_i x d_{i+1}. Measured: 4.7e-3 relative on a 0.05 move, i.e. O(|d|^2) as
+    # that predicts. So drive it out: offset the boundary along its outward normal by the uniform amount
+    # that restores the area, and repeat. Each pass is first-order in a residual that is already
+    # second-order, so a couple of rounds reach machine precision.
+    vs = sorted(nb)
+    a0 = _tri_area(pts, cells)
+    for _ in range(8):
+        cur = pts + out
+        da = a0 - _tri_area(cur, cells)
+        if abs(da) <= 1e-15 * max(abs(a0), 1e-300):
+            break
+        # normals and perimeter from the MOVED boundary, not the original -- recomputing them is what
+        # lets the correction converge past its own linearisation error (4.6e-7 -> machine, measured).
+        nrm = np.zeros((len(vs), 2))
+        for k, v in enumerate(vs):
+            e = cur[nb[v][1]] - cur[nb[v][0]]
+            t = e / max(float(np.hypot(*e)), 1e-300)
+            nrm[k] = (t[1], -t[0])
+        if float(((cur[vs] - cur[vs].mean(axis=0)) * nrm).sum()) < 0.0:
+            nrm = -nrm  # outward
+        per = float(np.hypot(*(cur[bnd[:, 1]] - cur[bnd[:, 0]]).T).sum())
+        if per <= 0.0:
+            break
+        out[vs] += (da / per) * nrm
+    return out
+
+
+def _tri_area(pts, cells):
+    """Total area of the triangulation -- the meshed body's area, which is what mass conservation sees."""
+    a, b, c = pts[cells[:, 0]], pts[cells[:, 1]], pts[cells[:, 2]]
+    return float(0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])).sum())
+
+
 def _p1_operators(pts, cells, dim):
     """Constant P1 operators on a **fixed** mesh: ``(sg, measure, wsum, stiffness+null-space shift)``.
 
@@ -3476,12 +3577,21 @@ def _monge_ampere_displacement(monitor, ops, cells, dim, *, n_relax=60, dt=0.1):
     cells_j = jnp.asarray(cells)
     lu = jax.scipy.linalg.lu_factor(jnp.asarray(k_shift))  # constant mesh ⇒ factorize ONCE
     n_vert = wsum.shape[0]
-    total = float(measure.sum())
+    # GEOMETRY stays traceable; only CONNECTIVITY is host-side. The steady driver can hand this
+    # function numpy operators because its computational mesh never moves, so they constant-fold. A
+    # MARCHING mesh moves by physics between rounds, so the operators change every round -- and
+    # `float(measure.sum())` alone forced them concrete, which meant the whole relaxation had to be
+    # re-traced each time (measured ~3.5 s a round at relax=60 on 74 nodes: compilation, not
+    # arithmetic). `counts` genuinely needs concrete `cells`, and connectivity IS fixed across a
+    # relocation, so that one stays on the host.
+    total = jnp.sum(jnp.asarray(measure))
 
-    counts = np.zeros(n_vert)  # incident element count per vertex (patch arity)
-    np.add.at(counts, cells.ravel(), 1.0)
-    k_comp = wsum / np.maximum(counts, 1.0)  # mean incident element volume = local computational cell size
-    monitor = monitor * jnp.asarray(k_comp / k_comp.mean())  # a global scale cancels in θ; kept O(1) for dt
+    # `.at[].add` takes TRACED indices, so the patch arity needs no host round-trip either -- which
+    # leaves nothing in this function that has to be concrete, and lets a caller jit it once per SHAPE
+    # rather than once per mesh.
+    counts = jnp.zeros((n_vert,)).at[jnp.asarray(cells).ravel()].add(1.0)  # incident elements per vertex
+    k_comp = jnp.asarray(wsum) / jnp.maximum(counts, 1.0)  # mean incident element volume
+    monitor = monitor * (k_comp / jnp.mean(k_comp))  # a global scale cancels in θ; kept O(1) for dt
     fac = 1.0 / ((dim + 1) * (dim + 2))  # P1 consistent mass: ∫φᵢφⱼ = |K|·(1+δᵢⱼ)/((d+1)(d+2))
 
     n_local = cells.shape[1]
@@ -5203,7 +5313,11 @@ def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
         "jno.fem: on a moving mesh, adapt= rebuilds the mesh when a mesh-geometry CONDITION breaks -- "
         "`fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0)))`. "
     )
-    kinds = {"split": "refine()", "enrich": "enrich()", "relocate": "relocate()", "anisotropic": "remesh(anisotropic=True)"}
+    # `relocate()` is NOT in here: r-adaptivity is the one kind that composes cheaply with a moving
+    # mesh. Vertex positions ride the CARRY, so relocating is a new `X` for the same compiled program --
+    # no new nodes, no new connectivity, no rebuild and no XLA compilation. h-adaptivity is the opposite:
+    # it changes shapes, which is what costs 8-15 s a time.
+    kinds = {"split": "refine()", "enrich": "enrich()", "anisotropic": "remesh(anisotropic=True)"}
     kind = next((name for flag, name in kinds.items() if getattr(adapt, flag, False)), None)
     if kind is not None:
         raise NotImplementedError(head + f"jno.solve.{kind} is not supported with a geometry term.")
@@ -5220,6 +5334,15 @@ def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
                 "jno.solve.remesh(alpha=..., criterion=...): reconnection (re-triangulating the moved nodes) "
                 "and a condition-triggered remesh (meshing the geometry afresh) are different operations, "
                 "and combining them is not supported. Use one per solve."
+            )
+    elif getattr(adapt, "relocate", False):
+        # r-ADAPTIVITY: like alpha, the trigger is the cadence `every`, not a condition -- there is no
+        # "has the mesh gone bad" test to make, the vertices simply slide down the monitor each round.
+        if int(d.dimension) != 2:
+            raise NotImplementedError(
+                f"jno.solve.relocate() on a moving mesh is 2-D only; this domain is {int(d.dimension)}-D. "
+                "The area-preserving boundary slide needs the vertex's two boundary neighbours, which in "
+                "3-D is an incident-triangle fan and is not wired."
             )
     else:
         if adapt.criterion is None:
@@ -5978,6 +6101,149 @@ def run_mesh_motion(
                 # way a remesh carries it -- and that transfer is now the conservative L2 projection, which
                 # matters far more here than it did when only a rare mmg remesh triggered it.
                 _carry = "interpolate" if _nodes_changed else "identity"
+            elif getattr(_cond, "relocate", False):
+                # r-ADAPTIVITY, and the reason it belongs on a moving mesh: vertex positions ride the
+                # CARRY, so a relocation is a new `X` handed to the SAME compiled program. No new nodes,
+                # no new connectivity, no rebuild, no XLA compilation -- against 8-15 s for the
+                # h-adaptive alternative. The state is carried by the conservative L2 projection, and
+                # boundary vertices may only slide along the chord between their neighbours, which leaves
+                # the enclosed area EXACTLY unchanged (polygon area is linear in each vertex).
+                # A SLIVER IS A CONNECTIVITY DEFECT -- the wrong three nodes forming a triangle -- and
+                # moving nodes cannot repair it; only retriangulation can. Measured: the Monge-Ampere
+                # operator inverts every cell's edge matrix, so one cell at 3e-4 of the mean area makes
+                # the displacement non-finite and relocation dies. So when the spec chains a
+                # `.remesh(alpha=...)`, RECONNECT FIRST at a FIXED node set (`manage=False`): the
+                # topology swap serves a new connectivity on the same nodes without a rebuild, which is
+                # what makes "reconnect every step, relocate periodically" cost nothing.
+                _relocate_rebuild = False
+                _rs = getattr(_cond, "remesh_spec", None)
+                if _rs is not None and getattr(_rs, "alpha", None) is not None and _topo_build is not None:
+                    from .reconnect import alpha_reconnect
+
+                    # `manage=False` keeps the node set, which is what makes the swap free -- but the
+                    # alpha filter then REFUSES a node it would have to drop ("free particles, further
+                    # than about 1.2 h from the rest"). That is the filter being strict, not the mesh
+                    # being broken: a wider alpha keeps the same nodes and still triangulates them. So
+                    # widen until it accepts, and if it never does, march on the old connectivity rather
+                    # than fail -- the physics is untouched, only this round's maintenance is skipped.
+                    _rp = _rc = None
+                    for _af in (1.0, 1.4, 2.0, 3.0):
+                        try:
+                            _rp, _rc, _rb = alpha_reconnect(
+                                X_now,
+                                _budget[3],
+                                float(_rs.alpha) * _af,
+                                previous=shared_cells,
+                                # manage=True lets the fallback INSERT nodes when relocation cannot hold
+                                # the quality -- measured: redistributing 74 nodes saturates at min
+                                # quality 0.135 however often it runs, while h-adaptivity reaches 0.332
+                                # by adding 4. Insertion changes shapes and costs a rebuild, so it is
+                                # the expensive half and belongs behind the cheap one.
+                                manage=bool(int(os.environ.get("JNO_RELOCATE_MANAGE", "0"))),
+                            )
+                            break
+                        except ValueError:
+                            _rp = _rc = None
+                    _key = lambda c: np.sort(np.sort(np.asarray(c), axis=1), axis=0)  # noqa: E731
+                    if _rc is not None and _rp.shape != X_now.shape:
+                        # Node management inserted or dropped: shapes moved, so this really is a
+                        # different compiled program. Hand it to the SHARED rebuild path below -- the
+                        # same one the alpha branch uses -- by setting the carry mode and NOT
+                        # continuing. This is the expensive half, and it now only runs when relocation
+                        # could not hold the mesh on its own.
+                        history[-1]["remeshed"] = True
+                        history[-1]["relocate_gave_up"] = True
+                        _domain_from_arrays(d, _rp, np.asarray(_rc).astype(np.int64), _rb, copy=False)
+                        _carry = "interpolate"
+                        _relocate_rebuild = True
+                    elif _rc is not None and not np.array_equal(_key(_rc), _key(shared_cells)):
+                        try:
+                            _tp = _make_topo(np.asarray(_rc).astype(np.int64), X_now)
+                            if not any(_q is None for _q in ((_tp.get("bundle") or {}).get("plans") or [])):
+                                shared_cells = np.asarray(_rc).astype(np.int64)
+                                _cells_at[_nlocal + 1] = shared_cells
+                                carry = (carry[0], carry[1], carry[2], _tp)
+                                history[-1]["reconnected"] = True
+                        except ValueError:
+                            pass  # the bundle refused: keep the old connectivity and relocate anyway
+                import time as _t
+
+                _T0 = _t.perf_counter()
+                # Relocation only runs if the fallback did NOT change the node set. When it did,
+                # shapes moved and this is a different compiled program, so fall through to the
+                # shared rebuild path below -- the expensive half, now reached only when moving
+                # nodes could no longer hold the mesh.
+                if not _relocate_rebuild:
+                    _u_now = np.asarray(carry[0])
+                    _T_pull = _t.perf_counter() - _T0
+                    _T0 = _t.perf_counter()
+                    _ops = _p1_operators(X_now, shared_cells, dim)
+                    _sg, _meas, _wsum = (jnp.asarray(_o) for _o in _ops[:3])
+                    _mon = _arclength_monitor_jax(
+                        jnp.asarray(_u_now[:n_verts]),
+                        _sg,
+                        _meas,
+                        _wsum,
+                        jnp.asarray(shared_cells),
+                        int(shared_cells.shape[1]),
+                        dim,
+                    )
+                    _nrx = int(getattr(_cond, "ma_relax", 60) or 60)
+                    _mdt = float(getattr(_cond, "ma_dt", 0.1) or 0.1)
+                    _ma = _ma_round_jitted(shared_cells, n_verts, dim, _nrx, _mdt)
+                    _T_ops = _t.perf_counter() - _T0
+                    _T0 = _t.perf_counter()
+                    _disp = np.asarray(
+                        _ma(_mon, _sg, _meas, _wsum, jnp.asarray(_ops[3]), jnp.asarray(shared_cells))
+                    )
+                    _T_ma = _t.perf_counter() - _T0
+                    _T0 = _t.perf_counter()
+                    _disp = _constrain_boundary_slide(_disp, X_now, shared_cells, dim)
+                    _T_slide = _t.perf_counter() - _T0
+                    _Xr = X_now + _disp
+                    if not np.isfinite(_Xr).all() and not bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
+                        # One degenerate cell is enough to make the Monge-Ampere operator singular. Skipping
+                        # this round leaves the mesh exactly as the march produced it -- valid, just not
+                        # re-equidistributed -- which is a far better failure than losing the run. Set
+                        # JNO_RELOCATE_STRICT=1 to raise instead (the message reports the offending cell).
+                        _lg = getattr(getattr(fem, "domain", None), "log", None)
+                        if _lg is not None:
+                            _lg.warning("jno.solve.relocate: skipped one round -- Monge-Ampere operator not finite.")
+                        history[-1]["relocate_skipped"] = True
+                        continue
+                    if not np.isfinite(_Xr).all():
+                        _ar = _tri_area(X_now, shared_cells)
+                        _a, _b, _c = X_now[shared_cells[:, 0]], X_now[shared_cells[:, 1]], X_now[shared_cells[:, 2]]
+                        _ca = 0.5 * np.abs(
+                            (_b[:, 0] - _a[:, 0]) * (_c[:, 1] - _a[:, 1]) - (_b[:, 1] - _a[:, 1]) * (_c[:, 0] - _a[:, 0])
+                        )
+                        raise FloatingPointError(
+                            "jno.solve.relocate: the Monge-Ampere displacement is not finite. "
+                            f"mesh: {len(X_now)} nodes, {len(shared_cells)} cells, total area {_ar:.3e}, "
+                            f"smallest cell {_ca.min():.3e} ({_ca.min() / max(_ca.mean(), 1e-300):.2e} of mean); "
+                            f"monitor finite={bool(np.isfinite(np.asarray(_mon)).all())} "
+                            f"range [{float(np.asarray(_mon).min()):.3e}, {float(np.asarray(_mon).max()):.3e}]; "
+                            f"field finite={bool(np.isfinite(_u_now[:n_verts]).all())}. "
+                            "A near-degenerate cell makes the barycentric-gradient inverse blow up, which is "
+                            "what `_p1_operators` builds the Monge-Ampere operator from."
+                        )
+                    _T0 = _t.perf_counter()
+                    _u_r = _l2_project_across_meshes(
+                        X_now, shared_cells, _u_now, layout, _Xr, shared_cells, layout, dim, total_dst=int(off[-1])
+                    )
+                    _T_l2 = _t.perf_counter() - _T0
+                    if os.environ.get("JNO_RELOCATE_TIMING", ""):
+                        print(
+                            f"[relocate] pull={_T_pull * 1e3:7.1f}ms ops={_T_ops * 1e3:7.1f}ms "
+                            f"ma={_T_ma * 1e3:7.1f}ms slide={_T_slide * 1e3:7.1f}ms l2={_T_l2 * 1e3:8.1f}ms",
+                            flush=True,
+                        )
+                    move_mesh(d, _Xr - np.asarray(d.mesh.points)[:, :dim], copy=False, check=False)
+                    carry = (jnp.asarray(_u_r), jnp.asarray(_Xr), carry[2], _make_topo(shared_cells, _Xr))
+                    history[-1]["remeshed"] = True
+                    history[-1]["relocated"] = True
+                    history[-1]["rebuilt"] = False
+                    continue
             else:
                 margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
                 if not (margin > 0.0).any():

@@ -1282,6 +1282,7 @@ def relocate(
     quality_floor: float = 0.1,
     relax: int = 60,
     relax_step: float = 0.1,
+    every: int = 5,
 ) -> AdaptSpec:
     """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
 
@@ -1425,6 +1426,7 @@ def relocate(
         quality_floor=quality_floor,
         ma_relax=relax,
         ma_dt=relax_step,
+        every=int(every),
     )
 
 
