@@ -2232,6 +2232,48 @@ def _hold_vertex_budget(domain: Any, size: np.ndarray, *, target: float, hmin: f
     return np.clip(np.sqrt(lo * hi) * size, hmin, hmax)
 
 
+def _per_node_edge_length(domain: Any) -> np.ndarray:
+    """Mean incident edge length PER NODE -- the alpha filter's length scale on a graded mesh.
+
+    `alpha_reconnect` compares each cell's circumradius against `alpha * h`. With one global `h` a
+    graded mesh fails at both ends: in the coarse region every cell exceeds the threshold and its
+    nodes are reported as free particles, and in the fine region the coarse value fuses surfaces that
+    are genuinely apart. Measured on two rod tips graded 50 -> 500 um: a scalar mean h (98 um) drops
+    50 of 363 nodes, while the per-node field reconnects all of them and keeps the two rods separate.
+
+    Taken from the mesh the march STARTS on and carried, not recomputed as the mesh deforms, for the
+    same reason the scalar version was fixed once: a threshold that drifts with the cells it is
+    meant to police stops being a threshold.
+    """
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim]
+    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
+    n_local = tris.shape[1]
+    acc = np.zeros(pts.shape[0])
+    cnt = np.zeros(pts.shape[0])
+    for a in range(n_local):
+        for b in range(a + 1, n_local):
+            ln = np.linalg.norm(pts[tris[:, a]] - pts[tris[:, b]], axis=1)
+            for k in (a, b):
+                np.add.at(acc, tris[:, k], ln)
+                np.add.at(cnt, tris[:, k], 1.0)
+    out = acc / np.maximum(cnt, 1.0)
+    bad = cnt == 0
+    if bad.any():
+        out[bad] = float(out[~bad].mean()) if (~bad).any() else 1.0
+    return out
+
+
+def _resample_h(h_old, pts_old: np.ndarray, pts_new: np.ndarray):
+    """Carry a per-node length scale onto a changed node set by nearest neighbour."""
+    h_old = np.asarray(h_old, dtype=float)
+    if h_old.ndim == 0 or pts_new.shape[0] == pts_old.shape[0]:
+        return h_old
+    from scipy.spatial import cKDTree  # noqa: PLC0415
+
+    return h_old[cKDTree(np.asarray(pts_old)).query(np.asarray(pts_new))[1]]
+
+
 def _mean_edge_length(domain: Any) -> float:
     """Mean triangle-edge length of the current mesh (a size scale for metric clamps)."""
     dim = int(domain.dimension)
@@ -5873,10 +5915,13 @@ def run_mesh_motion(
         # The remesh budget is fixed ONCE, from the mesh the march started on, exactly as the transient
         # remesher fixes it: each remesh redistributes the same vertex count inside the same edge window.
         if _resume is None:
-            _h0 = _mean_edge_length(d)
+            # Two different length scales, deliberately. The mmg CLAMPS are global bounds on what the
+            # mesher may produce, so they stay scalars; the ALPHA FILTER's threshold is per-cell and on
+            # a graded mesh has no single value, so slot 3 is a per-node field.
+            _h0 = _per_node_edge_length(d)
             _budget = (
-                _cond.hmin if _cond.hmin is not None else _h0 / 50.0,
-                _cond.hmax if _cond.hmax is not None else 2.0 * _h0,
+                _cond.hmin if _cond.hmin is not None else float(np.min(_h0)) / 50.0,
+                _cond.hmax if _cond.hmax is not None else 2.0 * float(np.max(_h0)),
                 float(_cond.max_dofs) if _cond.max_dofs is not None else float(n_verts),
                 _h0,  # the STARTING length scale: the alpha filter's threshold must not drift as cells stretch
             )
@@ -6185,7 +6230,12 @@ def run_mesh_motion(
                 # `previous=` is what stops the filter FLICKERING: a cell already in use is held until it
                 # exceeds a wider threshold, so the free surface does not lose and regain wedges from one
                 # step to the next (measured: the perimeter swung +22 % and back -18 % without it).
-                new_pts, new_cells, new_bf = alpha_reconnect(X_now, _budget[3], float(_cond.alpha), previous=shared_cells)
+                _halpha = _resample_h(_budget[3], X_now, X_now)
+                new_pts, new_cells, new_bf = alpha_reconnect(
+                    X_now, _halpha, float(_cond.alpha), previous=shared_cells
+                )
+                if np.asarray(_budget[3]).ndim and new_pts.shape[0] != X_now.shape[0]:
+                    _budget = (_budget[0], _budget[1], _budget[2], _resample_h(_budget[3], X_now, new_pts))
                 _nodes_changed = new_pts.shape != X_now.shape or not np.array_equal(new_pts, X_now)
                 _same = (
                     not _nodes_changed
