@@ -220,7 +220,7 @@ cells: the map makes the integrand rational, so no rule is exact.
 the same grid, so an API mistake could not be mistaken for a limitation. Working on both quads and
 hexes: steady linear, Neumann / surface terms, nonlinear (Newton), **vector fields (elasticity)**,
 coupled multifield including **Taylor-Hood Q2/Q1**, transient marches, runtime parameters differentiated with
-`jax.grad`, `u.bounds`, `by_region`, `by_tag`, eigensolves, `fem.eval` readout, and the direct
+`jax.grad`, `u.bounds`, `attach` coefficients, eigensolves, `fem.eval` readout, and the direct
 solver slots. **Whole-domain periodic BCs work on both**, in every direction — matched faces collapse
 onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 
@@ -264,7 +264,8 @@ ui = u.bind(x=xi, y=yi)
 remesh(criterion=jno.np.sqrt(ui.x**2 + ui.y**2))              # gradient / shock detector
 remesh(criterion=phi * (1.0 - phi))                            # phase-field interface
 remesh(criterion=jno.np.abs(uy.x - ux.y))                      # 2-D vorticity
-remesh(criterion=d.by_region({"weld": 1.0, "plate": 0.0}))     # refine one material
+d.attach("weld", refine=1.0).attach("plate", refine=0.0)
+remesh(criterion=d.refine)                                    # refine one material
 ```
 
 ??? note "How the residual estimator is formed"

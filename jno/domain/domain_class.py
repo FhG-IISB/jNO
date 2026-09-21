@@ -219,7 +219,7 @@ def _scalar_float(value: Any) -> float:
 
 
 def _masked_sum(values, mask_cls, default, *, what: str, key: str):
-    """``sum_k mask_cls(k) * values[k]`` — the one desugaring behind ``by_region`` and ``by_tag``.
+    """``sum_k mask_cls(k) * values[k]`` — the one desugaring behind ``_by_region`` and ``_by_tag``.
 
     ``default`` (when nonzero) is added over the *complement* of the listed keys, so a cell/facet in no
     listed region gets it. The two callers differ only in which mask leaf they emit and in what they
@@ -270,6 +270,32 @@ def _is_facet_predicate(where) -> bool:
     except (ValueError, TypeError):
         return False
     return len(params) == 3 and params[1] in ("n", "normal", "normals") and params[2] in ("name", "names")
+
+
+def _describe_constructor(constructor) -> str:
+    """A short description of what a domain was built from.
+
+    The bare ``{constructor}`` interpolation dumped the whole shape dataclass -- ``_node``,
+    ``_mesh_order``, ``_structured``, ``_attach`` and every polygon vertex, ~400 characters of
+    internals to say "a two-region shape". Name the regions instead; that is the part a reader
+    is checking.
+    """
+    try:
+        if isinstance(constructor, (str, bytes)):
+            return str(constructor)
+        items = getattr(constructor, "_region_items", None)
+        if callable(items):
+            names = [str(n) for n, _sub in items() if n]
+            if len(names) > 1:
+                return f"shape with {len(names)} regions {names}"
+            if names:
+                return f"shape region {names[0]!r}"
+        node = getattr(constructor, "_node", None)
+        kind = node[0] if isinstance(node, tuple) and node else type(constructor).__name__
+        dim = getattr(constructor, "dim", None)
+        return f"shape ({kind}{f', dim {dim}' if dim else ''})"
+    except Exception:  # noqa: BLE001 - a log line must never be the thing that fails a build
+        return type(constructor).__name__
 
 
 def _point_normals_from_facets(sub, sub_n, bpts, dim):
@@ -652,7 +678,7 @@ class domain(MeshIOMixin):
                 self.log.info(f"Loaded NPZ coordinate tags from {constructor}")
             else:
                 self._load_mesh(constructor)
-                self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
+                self.log.info(f"Loaded mesh from {_describe_constructor(constructor)}")  # type: ignore[attr-defined]
         elif callable(constructor):
             # A `jno.shape` whose membership and extent are closed-form does NOT get meshed here.
             # It can be tagged and sampled from the geometry, which is everything a PINN needs, and
@@ -697,7 +723,7 @@ class domain(MeshIOMixin):
                 if _why_eager is not None:
                     self.log.info(f"This plan cannot be sampled mesh-free ({_why_eager}); meshing it.")
                 self._generate_mesh(constructor, algorithm)
-                self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
+                self.log.info(f"Loaded mesh from {_describe_constructor(constructor)}")  # type: ignore[attr-defined]
             # A shape.regions() plan carries named sub-region shapes; remember them so jno.fem
             # per-region integration can restrict a term to a region's cells (centroid membership
             # via the region shape's ``contains`` — see ``_cell_region_mask``).
@@ -896,69 +922,6 @@ class domain(MeshIOMixin):
         if inferred_dim is None:
             inferred_dim = 2
         self.dimension = inferred_dim
-
-    def summary(self) -> "domain":
-        """Log a human-readable summary of the domain configuration.
-
-        Returns:
-            Self for method chaining.
-        """
-        lines = ["─── Domain Summary ───"]
-        lines.append(f"  Spatial dimension : {self.dimension}D  ({', '.join(self.spatial)})")
-        lines.append(f"  Time-dependent    : {self._is_time_dependent}")
-        if self._is_time_dependent and self.time is not None:
-            t0, t1, nt = self.time
-            lines.append(f"  Time range        : [{t0}, {t1}]  ({nt} steps)")
-        lines.append(f"  Batch / samples   : {self.total_samples}")
-
-        if self._mesh_pool:
-            lines.append(f"  Mesh tags ({len(self._mesh_pool)}):")
-            for tag, pts in self._mesh_pool.items():
-                lines.append(f"    • {tag:20s}  shape {pts.shape}")
-
-        if self._boundary_registry:
-            lines.append(f"  Boundary tags ({len(self._boundary_registry)}):")
-            coord_labels = self.spatial if self.spatial else [f"x{i}" for i in range(self.dimension)]
-            for tag in sorted(self._boundary_registry):
-                pts = self._boundary_registry[tag].get("points")
-                parts: list = [f"    • {tag}"]
-                if pts is not None and len(pts) > 0:
-                    pts_xy = np.asarray(pts)[:, : self.dimension]
-                    extents = []
-                    for axis, label in enumerate(coord_labels):
-                        lo, hi = float(pts_xy[:, axis].min()), float(pts_xy[:, axis].max())
-                        if hi - lo < 1e-10:
-                            extents.append(f"{label}={lo:.3g}")
-                        else:
-                            extents.append(f"{label}=[{lo:.3g},{hi:.3g}]")
-                    parts.append("  " + "  ".join(extents))
-                normals = self.normals_by_tag.get(tag)
-                if normals is None:
-                    ctx_n = self.context.get(f"n_{tag}")
-                    if ctx_n is not None:
-                        normals = np.asarray(ctx_n).reshape(-1, self.dimension)
-                if normals is not None and len(normals) > 0:
-                    mean_n = np.asarray(normals).mean(axis=0)[: self.dimension]
-                    n_str = "(" + ", ".join(f"{v:+.2f}" for v in mean_n) + ")"
-                    parts.append(f"  n={n_str}")
-                lines.append("".join(parts))
-
-        if self._param_tags:
-            lines.append(f"  Tensor tags ({len(self._param_tags)}):")
-            for tag in sorted(self._param_tags):
-                arr = self.context.get(tag)
-                shape_str = str(arr.shape) if arr is not None else "(not set)"
-                lines.append(f"    • {tag:20s}  shape {shape_str}")
-
-        if self.parameters:
-            lines.append(f"  Scalar parameters ({len(self.parameters)}):")
-            for k, v in self.parameters.items():
-                lines.append(f"    • {k} = {v}")
-
-        lines.append("──────────────────────")
-        msg = "\n".join(lines)
-        self.log.info(msg)
-        return self
 
     def __lt__(self, other: Tuple[str, Any]) -> "domain":
         """Attach parameters or arrays using < operator."""
@@ -2230,21 +2193,21 @@ class domain(MeshIOMixin):
             self.avaiable_mesh_tags.append(name)
         return self
 
-    def by_region(self, values, *, default=None):
+    def _by_region(self, values, *, default=None):
         """A coefficient whose value depends on which region a mesh cell is in.
 
         ``values`` is a ``{region: value}`` mapping; the returned coefficient evaluates, on each cell,
         to the value of the region that cell's **centroid** lies in. Write a multi-region weak form as a
         **single** equation over the whole ``interior`` instead of one term per region::
 
-            k = d.by_region({"steel": 16.0, "air": 0.026})     # per-region conductivity
-            Q = d.by_region(heat_source, default=0.0)          # 0 in any unlisted region
+            k = d._by_region({"steel": 16.0, "air": 0.026})     # per-region conductivity
+            Q = d._by_region(heat_source, default=0.0)          # 0 in any unlisted region
             heat = k * (T.x*s.x + T.y*s.y) - Q * s             # one equation, all regions
 
         It is *general* -- a value can be any coefficient (a python scalar, a ``jno.fn`` field, or a
         trainable ``jno.np.parameter``), so the same primitive expresses conductivity, a source, a
         density, a reaction rate, an elastic modulus, ... and trainable per-region values compose for
-        free (``d.by_region({**k, "air": nu*0.026})``).
+        free (``d._by_region({**k, "air": nu*0.026})``).
 
         Each region must be a geometry part (``from_regions``) or a ``domain.tag`` predicate. ``default``
         is the value for cells in no listed region; ``default=None`` (the strict default) requires the
@@ -2255,7 +2218,7 @@ class domain(MeshIOMixin):
         # ``_shape_regions`` are the named sub-regions of a ``shape.regions`` / ``a.name(..) + b.name(..)``
         # plan. They belong here for the same reason geometry parts do -- ``RegionMask`` resolves them
         # through the same centroid-membership path (``_cell_region_mask``). Without them a
-        # shape-built multi-material domain could not use ``by_region`` at all.
+        # shape-built multi-material domain could not use ``_by_region`` at all.
         # A mesh file declares its materials as gmsh physical volumes, which land in
         # ``mesh.cell_sets``. They are a fourth source of regions, resolved LAST everywhere so a
         # same-named tag predicate keeps winning.
@@ -2269,11 +2232,11 @@ class domain(MeshIOMixin):
         unknown = [r for r in values if r not in valid]
         if unknown:
             raise ValueError(
-                f"domain.by_region: unknown region(s) {sorted(unknown)}; each key must be a geometry part, "
+                f"domain.attach: unknown region(s) {sorted(unknown)}; each must be a geometry part, "
                 f"a shape.regions sub-region, a domain.tag predicate, or a named volume region of the mesh "
                 f"file. Known regions: {sorted(valid)}."
             )
-        # ``by_region`` is ``sum_r RegionMask(r) * values[r]``, so two keys covering the same cell ADD
+        # ``_by_region`` is ``sum_r RegionMask(r) * values[r]``, so two keys covering the same cell ADD
         # there -- and ``default`` is applied over ``1 - sum(masks)``, which goes negative on the
         # overlap and subtracts twice over. A gmsh mesh commonly names both the individual parts and a
         # group spanning them, so this is the ordinary case rather than a pathological one, and
@@ -2289,20 +2252,20 @@ class domain(MeshIOMixin):
                 _n = int((mesh_regions[_a] & mesh_regions[_b]).sum())
                 if _n:
                     raise ValueError(
-                        f"domain.by_region: the mesh regions {_a!r} and {_b!r} overlap on {_n} cell(s), "
+                        f"domain.attach: the mesh regions {_a!r} and {_b!r} overlap on {_n} cell(s), "
                         "so their coefficients would be ADDED there rather than selected between "
                         "(and a `default` subtracted twice). A group that spans other groups cannot be "
                         "mixed with them in one call -- pass the parts, or pass the span, not both."
                     )
-        expr = _masked_sum(values, RegionMask, default, what="by_region", key="region")
+        expr = _masked_sum(values, RegionMask, default, what="attach", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
-        get_logger().info(f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
+        get_logger().debug(f"attach: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
         return expr
 
-    def by_tag(self, values, *, default=None):
+    def _by_tag(self, values, *, default=None):
         """A **surface** coefficient whose value depends on which boundary tag a facet carries — the
-        mirror of :meth:`by_region`, for the boundary rather than the volume.
+        mirror of :meth:`_by_region`, for the boundary rather than the volume.
 
         ``values`` is a ``{tag: value}`` mapping. The returned coefficient evaluates, on each boundary
         facet, to the value of the tag owning it, so a mixed-boundary condition is **one** term over the
@@ -2310,14 +2273,14 @@ class domain(MeshIOMixin):
 
             d.tag("wall", lambda x, y: x < 1e-9)
             d.tag("lid",  lambda x, y: y > 1 - 1e-9)
-            h = d.by_tag({"wall": 25.0, "lid": 5.0})       # per-tag film coefficient
+            h = d._by_tag({"wall": 25.0, "lid": 5.0})       # per-tag film coefficient
             xb, yb, _ = d.variable("boundary", split=True)
             ub, vb = u.bind(x=xb, y=yb), v.bind(x=xb, y=yb)
             robin = h * (ub - T_inf) * vb                   # one equation, both tags
 
         A facet belongs to a tag by the assembler's own facet selection — the same rule that decides
         which facets a Dirichlet condition on that tag pins — so the two can never disagree. As in
-        ``by_region``, a value can be any coefficient (scalar, symbolic expression, trainable
+        ``_by_region``, a value can be any coefficient (scalar, symbolic expression, trainable
         ``jno.np.parameter``, typed view), and ``default`` fills the facets in no listed tag.
 
         Desugars to ``sum_t TagMask(t) * values[t]``. **Surface terms only**: used in a volume term, on
@@ -2328,12 +2291,16 @@ class domain(MeshIOMixin):
         unknown = [t for t in values if t not in valid]
         if unknown:
             raise ValueError(
-                f"domain.by_tag: unknown tag(s) {sorted(unknown)}; each key must be a boundary tag "
+                f"domain.attach: unknown tag(s) {sorted(unknown)}; each must be a boundary tag "
                 f"(``domain.tag(name, where)``). Known tags: {sorted(valid)}."
             )
-        expr = _masked_sum(values, TagMask, default, what="by_tag", key="tag")
-        get_logger().info(f"by_tag: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
+        expr = _masked_sum(values, TagMask, default, what="attach", key="tag")
+        get_logger().debug(f"attach: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
         return expr
+
+    #: Key under which a bare ``attach(**props)`` stores its value. Not a legal region or tag name,
+    #: so it can never collide with one the user wrote.
+    _DEFAULT_TARGET = "\x00default"
 
     def _collect_region_attachments(self, items):
         """Index ``shape.attach(...)`` properties as ``{property: {region: value}}`` for ``__getattr__``."""
@@ -2346,7 +2313,7 @@ class domain(MeshIOMixin):
         self._region_attachments = attached
         self._attachment_kind = kinds
 
-    def attach(self, target: str, **props):
+    def attach(self, target: str | None = None, **props):
         """Declare material properties on an existing **region or boundary tag**, after the domain is built.
 
         The runtime counterpart of :meth:`shape.attach`, and the only way to attach to a
@@ -2360,17 +2327,33 @@ class domain(MeshIOMixin):
         Whether a target is a **volume** or a **surface** quantity is decided here, once, from what the
         target actually owns on this mesh -- a tag owning boundary facets is a surface, a tag owning
         only cells is a volume, and a tag owning both is ambiguous and raises rather than guessing.
-        ``d.<prop>`` then emits the matching coefficient (:meth:`by_region` or :meth:`by_tag`).
+        ``d.<prop>`` then emits the matching coefficient (:meth:`_by_region` or :meth:`_by_tag`).
 
-        Returns ``self`` so declarations chain. Repeated calls merge (last wins).
+        **Omit the target for a default.** ``attach(Q=0.0)`` declares the value for every volume
+        region that does not name one explicitly -- the source that is zero outside one body, the
+        conductivity of "everything else"::
+
+            d.attach("hot", Q=1e6).attach(Q=0.0)          # 1e6 in `hot`, 0 everywhere else
+
+        An explicit target **always** wins over a bare one, whichever order they are written in.
+        Without that rule the two orderings would give different physics under last-wins merging,
+        silently. Repeated calls to the *same* explicit target still merge last-wins.
+
+        A default applies to **volume regions only**. Boundary tags are not a partition of the
+        boundary -- untagged boundary is deliberately natural (do-nothing) in jNO -- so there is
+        nothing for a surface default to mean, and one is refused rather than invented.
+
+        Returns ``self`` so declarations chain.
         """
-        target = str(target)
-        kind = self._attachment_target_kind(target)
         attached = self.__dict__.setdefault("_region_attachments", {})
         kinds = self.__dict__.setdefault("_attachment_kind", {})
+        if target is None:
+            key = self._DEFAULT_TARGET
+        else:
+            key = str(target)
+            kinds[key] = self._attachment_target_kind(key)
         for prop, value in props.items():
-            attached.setdefault(str(prop), {})[target] = value
-        kinds[target] = kind
+            attached.setdefault(str(prop), {})[key] = value
         self._check_attachment_clashes()
         return self
 
@@ -2415,7 +2398,7 @@ class domain(MeshIOMixin):
             raise ValueError(
                 f"domain.attach: tag {target!r} owns both interior cells and boundary facets, so whether "
                 f"its properties are volume or surface quantities is ambiguous. Split it into two tags, "
-                f"or build the coefficient explicitly with d.by_region({{...}}) / d.by_tag({{...}})."
+                f"or build the coefficient explicitly with d._by_region({{...}}) / d._by_tag({{...}})."
             )
         if not has_facets and not has_cells:
             raise ValueError(
@@ -2453,31 +2436,45 @@ class domain(MeshIOMixin):
         # touching another missing attribute would recurse forever.
         attached = self.__dict__.get("_region_attachments") or {}
         if name in attached:
-            values = attached[name]
+            values = dict(attached[name])
+            # A bare `attach(**props)` is the DEFAULT, not a target. Pull it out before anything reads
+            # the target set, so it can never be mistaken for a region or decide the volume/surface kind.
+            has_default = self._DEFAULT_TARGET in values
+            default = values.pop(self._DEFAULT_TARGET, None)
             kinds = self.__dict__.get("_attachment_kind") or {}
             declared = {kinds.get(t, "volume") for t in values}
             if len(declared) > 1:
                 raise AttributeError(
                     f"domain.{name}: declared on both a volume region and a boundary tag "
                     f"({sorted(values)}), so it has no single meaning -- a coefficient is integrated "
-                    f"over cells or over facets, not both. Use d.by_region({{...}}) and "
-                    f"d.by_tag({{...}}) explicitly for the two halves."
+                    f"over cells or over facets, not both. Give the two halves different property "
+                    f"names, or split the tag."
                 )
             resolved = {t: self._resolve_attached(v) for t, v in values.items()}
             if declared == {"surface"}:
                 # No completeness rule on the boundary: tags are not a partition of it, and untagged
                 # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
-                # contribute nothing to this coefficient -- documented, not silently patched.
-                return self.by_tag(resolved)
+                # contribute nothing to this coefficient -- documented, not silently patched. A
+                # default has nothing to mean here, so asking for one is a mistake worth naming.
+                if has_default:
+                    raise AttributeError(
+                        f"domain.{name}: a bare .attach({name}=...) default was declared, but "
+                        f"'{name}' lives on boundary tag(s) {sorted(values)}. Tags are not a "
+                        f"partition of the boundary -- untagged boundary is natural (do-nothing) -- "
+                        f"so a surface default has no meaning. Attach it to each tag instead."
+                    )
+                return self._by_tag(resolved)
             known = set(self.__dict__.get("_shape_regions") or {})
             missing = sorted(known - set(values))
-            if missing:
+            if missing and not has_default:
                 raise AttributeError(
                     f"domain.{name}: region(s) {missing} never attached a '{name}'. Every region must "
-                    f"declare it -- add .attach({name}=...) to each, or use "
-                    f"d.by_region({{...}}, default=...) explicitly if some regions genuinely have none."
+                    f"declare it -- add .attach({name}=...) to each, or declare a default for the rest "
+                    f"with a bare .attach({name}=...)."
                 )
-            return self.by_region(resolved)
+            # The explicit targets already won: `default` only fills what they left, so the two
+            # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
+            return self._by_region(resolved, default=self._resolve_attached(default) if has_default else None)
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def attached(self, name: str) -> dict:

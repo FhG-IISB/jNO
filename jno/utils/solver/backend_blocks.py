@@ -494,7 +494,38 @@ class SemidiscreteTimeBlock:
         params = [self.runtime_parameter_exprs[n] for n in names]
 
         def _solve(*values):
+            import time as _time
+
+            import jax
+
+            from .history_march import LAST_MARCH_STATS
+
+            LAST_MARCH_STATS.clear()
+            _t_eval = _time.perf_counter()
             ys = solve_fn(self, dict(zip(names, values)), save_ts)
+            if not isinstance(ys, jax.core.Tracer):
+                # An EAGER evaluation (`.fn()`): record what it did for `fem.stats["march"]`. Under
+                # jno.core / jit this is a tracer and nothing is recorded -- a step inside the
+                # compiled scan is not a host-visible event.
+                #
+                # NEVER block to get a time: `.fn()` returns asynchronously and must stay that way.
+                # A nonlinear march has ALREADY synchronised (its per-step convergence check reads
+                # the residuals on the host), so its elapsed time is real and free; a linear march
+                # has not, and timing it would mean forcing the very sync this must not add.
+                rec = dict(LAST_MARCH_STATS)
+                synced = rec.get("residual") is not None
+                self._n_evaluations = getattr(self, "_n_evaluations", 0) + 1
+                self._last_evaluation = {
+                    **rec,
+                    "wall_s": (_time.perf_counter() - _t_eval) if synced else None,
+                    "evaluation": self._n_evaluations,
+                    "at": _t_eval,
+                }
+                if not synced:
+                    self._last_evaluation["note"] = (
+                        "not timed: .fn() returns asynchronously, and timing it would force a device "
+                        "sync — wrap it in jax.block_until_ready yourself to time it"
+                    )
             if self.prolongation is not None:
                 # Periodic tie: the block integrates in the reduced main-DOF space. Prolong each saved
                 # step ``u = P·u_red`` back to the full nodal layout, so the returned trajectory lives on the

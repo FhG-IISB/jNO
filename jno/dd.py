@@ -500,17 +500,37 @@ class _Coupled:
         Dirichlet-Neumann vs overlapping Schwarz) is inferred from whether the regions overlap."""
         probs = [p for p, _ in self._subdomains]
         geoms = [g for _, g in self._subdomains]
-        # Overlap vs. single-interface (line-DN) is decided on element CENTROIDS, not nodes: a centroid
-        # never lands exactly on a shared interface line, so a centroid in BOTH regions means a genuine
-        # 2-D overlap band. (Interface nodes lie in both regions under inclusive containment, so a
-        # node-based test would misread a clean partition as an overlap.)
+        # Kept for `jno.info`, which reports the last solve; the parametric branches return a deferred
+        # node and leave only the method, since nothing has iterated yet.
+        method = self._method()
+        self._last_info = {"method": method, "deferred": True}
+        if method == "overlap-Schwarz":
+            out = self._solve_overlap(probs, geoms, tol=tol, max_iter=max_iter, return_info=True)
+        else:
+            out = self._solve_line(probs, geoms, tol=tol, max_iter=max_iter, return_info=True)
+        if isinstance(out, tuple):
+            combined, info = out
+            self._last_info = {"method": info.get("mode"), "tol": tol, "max_iter": max_iter, **info}
+            return (combined, info) if return_info else combined
+        return out
+
+    def _method(self) -> str:
+        """``"overlap-Schwarz"`` or ``"line-DN"`` -- which coupling ``solve()`` will use.
+
+        Decided on element CENTROIDS, not nodes: a centroid never lands exactly on a shared interface
+        line, so a centroid in BOTH regions means a genuine 2-D overlap band. (Interface nodes lie in
+        both regions under inclusive containment, so a node-based test would misread a clean partition
+        as an overlap.)
+        """
+        probs = [p for p, _ in self._subdomains]
+        geoms = [g for _, g in self._subdomains]
         dom = probs[0].domain
         pts = np.asarray(dom.mesh_connectivity["points"])[:, : int(getattr(dom, "dimension", 2))]
         cells = np.asarray(dom.mesh_connectivity["triangles"])
         cent = pts[cells].mean(1)
         if int(np.count_nonzero(_region_mask(cent, geoms[0]) & _region_mask(cent, geoms[1]))) > 0:
-            return self._solve_overlap(probs, geoms, tol=tol, max_iter=max_iter, return_info=return_info)
-        return self._solve_line(probs, geoms, tol=tol, max_iter=max_iter, return_info=return_info)
+            return "overlap-Schwarz"
+        return "line-DN"
 
     # -- non-overlapping: a single interface line, Dirichlet-Neumann -------------------------------
     def _solve_line(self, probs, geoms, *, tol, max_iter, theta=0.5, return_info=False):

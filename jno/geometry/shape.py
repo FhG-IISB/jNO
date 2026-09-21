@@ -801,7 +801,7 @@ class shape:
         """Attach material properties to this region: ``.attach(k=220.0, eps=0.794)``.
 
         The realized domain exposes each attached name as a **per-region coefficient** ready to drop
-        into a weak form -- ``d.k`` is exactly ``d.by_region({"Kristall": 220.0, ...})`` assembled from
+        into a weak form -- ``d.k`` is exactly ``d._by_region({"Kristall": 220.0, ...})`` assembled from
         every region that attached a ``k``::
 
             kri = shape.polygon(v).name("Kristall").attach(k=220.0, eps=0.794)
@@ -809,7 +809,7 @@ class shape:
             d   = (kri + gas).domain()
             heat = d.k * (T.x*s.x + T.y*s.y) - d.q * s
 
-        A value may be anything :meth:`domain.by_region` accepts -- a scalar, a symbolic expression,
+        A value may be anything :meth:`domain.attach` accepts -- a scalar, a symbolic expression,
         or a traced/trainable array -- so an attached property can be fitted or differentiated
         through. A plain **function** is also accepted and is called with the domain's spatial
         coordinates when the property is read (``.attach(k=lambda r, z: 2.0 + 0.5*z)``); it has to be

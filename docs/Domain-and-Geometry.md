@@ -207,12 +207,12 @@ keywords, and the two forms combine (dict entries first).
 ### Material properties — `.attach(...)`
 
 A region can carry its own material properties, read back off the domain as a **per-region
-coefficient** ready to drop into a weak form. `d.k` is exactly the `d.by_region({...})` assembled from
+coefficient** ready to drop into a weak form. `d.k` is exactly the per-region coefficient assembled from
 every region that declared a `k`.
 
 **This is the preferred way to express materials.** It puts each property next to the region it
 describes, lets several properties travel together, and leaves the weak form reading in physical names
-(`d.k`, `d.eps`) instead of coefficients assembled elsewhere. Use `d.by_region({...})` directly when
+(`d.k`, `d.eps`) instead of coefficients assembled elsewhere. Use `attach` for these when
 the mapping is *data* rather than a material — values computed elsewhere, or a case needing an explicit
 `default=` for regions that genuinely have no value.
 
@@ -242,9 +242,9 @@ Rules worth knowing:
 * Repeated calls merge (last wins), so properties can be built up in stages.
 * `d.<name>` raises if **any** region failed to declare that name, listing the ones that did not — a
   forgotten material surfaces at first use rather than as a region that silently conducts nothing. Use
-  `d.by_region({...}, default=...)` explicitly when some regions genuinely have none.
+  a bare `d.attach(name=...)` to declare the default when some regions genuinely have none.
   **This check covers `shape` regions only.** It reads `_shape_regions`, so on a **mesh-file domain**
-  it never fires: a region you forgot to attach falls through to `by_region`'s own default rather than
+  it never fires: a region you forgot to attach falls through to the bare-attach default rather than
   raising. That matters most for a coefficient whose absence changes the operator's character — a
   forgotten reluctivity leaves `nu = 0` and with it no curl-curl term at all — so on a mesh-file domain
   attach **every** region explicitly and do not rely on this guard.
@@ -264,7 +264,7 @@ d.attach("wall", h=25.0).attach("lid", h=5.0)     # a SURFACE property, per boun
 ```
 
 Here the kind is decided once, from what the target owns on this mesh: a tag owning boundary facets
-is a surface quantity (`d.h` becomes a per-facet `by_tag` coefficient, see the `jno.fem` docs), a tag
+is a surface quantity (`d.h` becomes a per-facet coefficient, see the `jno.fem` docs), a tag
 owning only cells is a volume quantity, and a tag owning **both** is ambiguous and raises rather than
 guessing — split it in two, or build the coefficient explicitly.
 

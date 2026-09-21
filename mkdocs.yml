@@ -214,6 +214,7 @@ nav:
     - Hyperparameter Tuning: Hyperparameter-Tuning.md
     - Save, Load and Configuration: Save-Load-and-Configuration.md
     - Weights & Biases: misc/wandb.md
+    - Inspecting objects (jno.info): info.md
     - Troubleshooting: troubleshooting.md
     - Docs style — callouts: misc/callouts.md
     - For LLMs: llm.md

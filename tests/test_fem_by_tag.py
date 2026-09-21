@@ -1,7 +1,7 @@
 """``domain.by_tag`` / ``domain.attach`` on a boundary tag — a per-FACET coefficient.
 
 ``by_region`` exists so a multi-material volume is ONE equation instead of one term per region. This
-is the same thing for the boundary: ``d.by_tag({"wall": 25.0, "lid": 5.0})`` lets a single surface
+is the same thing for the boundary: ``d._by_tag({"wall": 25.0, "lid": 5.0})`` lets a single surface
 term carry a coefficient that varies across tags, instead of a term per tag::
 
     robin = d.h * (ub - T_inf) * vb          # one term, h varies across the boundary
@@ -59,7 +59,7 @@ def test_one_term_over_the_boundary_equals_the_per_tag_loop():
     ul, vl = binds["left"]
     ur, vr = binds["right"]
 
-    one = _A(jno.fem([stiff, d.by_tag({"left": 3.0, "right": 7.0}) * ub * vb]))
+    one = _A(jno.fem([stiff, d._by_tag({"left": 3.0, "right": 7.0}) * ub * vb]))
     loop = _A(jno.fem([stiff, 3.0 * ul * vl, 7.0 * ur * vr]))
     np.testing.assert_allclose(one, loop, rtol=1e-5, atol=1e-5)
     # ...and it is not a no-op: the Robin terms genuinely changed the operator.
@@ -73,7 +73,7 @@ def test_the_load_vector_matches_the_per_tag_loop_too():
     _ul, vl = binds["left"]
     _ur, vr = binds["right"]
 
-    one = _b(jno.fem([stiff, d.by_tag({"left": 2.0, "right": 5.0}) * vb]))
+    one = _b(jno.fem([stiff, d._by_tag({"left": 2.0, "right": 5.0}) * vb]))
     loop = _b(jno.fem([stiff, 2.0 * vl, 5.0 * vr]))
     np.testing.assert_allclose(one, loop, rtol=1e-5, atol=1e-5)
     assert np.abs(one).max() > 0.0
@@ -98,7 +98,7 @@ def test_the_mask_selects_exactly_the_dirichlet_facets():
     }
 
     # Nodes touched by a `left`-only surface load.
-    load = _b(jno.fem([stiff, d.by_tag({"left": 1.0}) * vb]))
+    load = _b(jno.fem([stiff, d._by_tag({"left": 1.0}) * vb]))
     touched = {i for i in range(load.shape[0]) if abs(load[i]) > 1e-9}
 
     assert touched, "the by_tag surface load touched no node at all"
@@ -124,7 +124,7 @@ def test_three_tags_each_keep_their_own_value():
 
     stiff = ui.x * vi.x + ui.y * vi.y
     vals = {"l": 4.0, "r": 0.0, "b": 9.0}
-    one = _A(jno.fem([stiff, d.by_tag(vals) * ub * vb]))
+    one = _A(jno.fem([stiff, d._by_tag(vals) * ub * vb]))
     loop = _A(jno.fem([stiff] + [vals[t] * per[t][0] * per[t][1] for t in ("l", "r", "b")]))
     np.testing.assert_allclose(one, loop, rtol=1e-5, atol=1e-5)
 
@@ -133,8 +133,8 @@ def test_default_fills_the_untagged_boundary():
     """``default=`` covers the facets no listed tag claims -- the same semantics as ``by_region``."""
     d, u, v, binds, stiff = _square()
     ub, vb = binds["boundary"]
-    strict = _A(jno.fem([stiff, d.by_tag({"left": 3.0}) * ub * vb]))
-    filled = _A(jno.fem([stiff, d.by_tag({"left": 3.0}, default=1.0) * ub * vb]))
+    strict = _A(jno.fem([stiff, d._by_tag({"left": 3.0}) * ub * vb]))
+    filled = _A(jno.fem([stiff, d._by_tag({"left": 3.0}, default=1.0) * ub * vb]))
     assert not np.allclose(strict, filled, atol=1e-4), "default= reached no extra facet"
 
 
@@ -144,7 +144,7 @@ def test_a_view_typed_value_survives_by_tag():
 
     d, _u, _v, _binds, _stiff = _square()
     xb, _yb, _ = d.variable("boundary", split=True)
-    out = d.by_tag({"left": ScalarView(2.0 + 0.0 * xb), "right": ScalarView(1.0 + 0.0 * xb)})
+    out = d._by_tag({"left": ScalarView(2.0 + 0.0 * xb), "right": ScalarView(1.0 + 0.0 * xb)})
     assert type(out).__name__ == "ScalarView"
 
 
@@ -157,7 +157,7 @@ def test_mixed_view_types_across_tags_raise():
     m = MatrixView(vec(1.0 + 0.0 * xb, 0.0 * yb, 0.0 * xb, 1.0 + 0.0 * yb).expr).from_flat(2, 2)
     w = VectorView(vec(1.0 + 0.0 * xb, 0.0 * yb).expr)
     with pytest.raises(ValueError, match="mix view types"):
-        d.by_tag({"left": m, "right": w})
+        d._by_tag({"left": m, "right": w})
 
 
 # --------------------------------------------------------------------------------------
@@ -236,7 +236,7 @@ def test_a_tag_mask_in_a_volume_term_raises():
     domain and defaulting to 0 would drop the term -- both silent."""
     d, _u, _v, _binds, stiff = _square()
     with pytest.raises(NotImplementedError, match="per-tag surface integration"):
-        jno.fem([d.by_tag({"left": 3.0}) * stiff]).A
+        jno.fem([d._by_tag({"left": 3.0}) * stiff]).A
 
 
 def test_a_tag_owning_no_facet_raises_rather_than_integrating_over_nothing():
@@ -244,13 +244,13 @@ def test_a_tag_owning_no_facet_raises_rather_than_integrating_over_nothing():
     ub, vb = binds["boundary"]
     d.tag("interior_blob", lambda x, y: (x > 0.4) & (x < 0.6) & (y > 0.4) & (y < 0.6))
     with pytest.raises(ValueError, match="owns no boundary facet"):
-        jno.fem([stiff, d.by_tag({"interior_blob": 1.0}) * ub * vb]).A
+        jno.fem([stiff, d._by_tag({"interior_blob": 1.0}) * ub * vb]).A
 
 
 def test_by_tag_rejects_an_unknown_tag():
     d, *_ = _square()
     with pytest.raises(ValueError, match="unknown tag"):
-        d.by_tag({"nope": 1.0})
+        d._by_tag({"nope": 1.0})
 
 
 def test_by_tag_in_1d_raises():
@@ -263,7 +263,7 @@ def test_by_tag_in_1d_raises():
     ui, vi = u.bind(x=xi), v.bind(x=xi)
     ub, vb = u.bind(x=xb), v.bind(x=xb)
     with pytest.raises(NotImplementedError, match="per-tag surface integration"):
-        jno.fem([ui.x * vi.x, d.by_tag({"lo": 3.0}) * ub * vb]).A
+        jno.fem([ui.x * vi.x, d._by_tag({"lo": 3.0}) * ub * vb]).A
 
 
 def test_by_tag_on_a_non_nodal_space_raises():
@@ -280,4 +280,4 @@ def test_by_tag_on_a_non_nodal_space_raises():
     ub, vb = u.bind(x=cb[0], y=cb[1], z=cb[2]), v.bind(x=cb[0], y=cb[1], z=cb[2])
     cu, cv = u.vector.curl(c[0], c[1], c[2]), v.vector.curl(c[0], c[1], c[2])
     with pytest.raises(NotImplementedError, match="not supported on a non-nodal space"):
-        jno.fem([inner(cu, cv), d.by_tag({"x0": 2.0}) * inner(ub, vb)]).A
+        jno.fem([inner(cu, cv), d._by_tag({"x0": 2.0}) * inner(ub, vb)]).A

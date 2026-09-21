@@ -1,5 +1,51 @@
 from __future__ import annotations
 
+
+def _mesh_quality(points, elements, element_type: str) -> str:
+    """A one-line quality summary for the connectivity log: size range, worst aspect, inverted count.
+
+    Aspect is the Shewchuk length/inradius ratio, normalised so a REGULAR simplex is 1.0 -- the same
+    definition :meth:`domain.cell_aspect` uses, so the log and the adaptivity criterion cannot
+    disagree. `inverted` counts cells whose signed measure is <= 0; that is not a quality complaint
+    but a correctness one, and it is the thing worth seeing before a solve rather than after.
+    """
+    import numpy as _np
+
+    try:
+        v = _np.asarray(points, dtype=float)[_np.asarray(elements, dtype=_np.int64)]
+        if element_type.startswith("triangle") and v.shape[1] >= 3:
+            v = v[:, :3, :2]
+            e0, e1 = v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]
+            signed = 0.5 * (e0[:, 0] * e1[:, 1] - e0[:, 1] * e1[:, 0])
+            a = _np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
+            b = _np.linalg.norm(v[:, 2] - v[:, 1], axis=1)
+            c = _np.linalg.norm(v[:, 0] - v[:, 2], axis=1)
+            area = _np.abs(signed)
+            inradius = 2.0 * area / _np.maximum(a + b + c, 1e-300)
+            aspect = _np.maximum.reduce([a, b, c]) / _np.maximum(inradius, 1e-300) / (2.0 * _np.sqrt(3.0))
+            size = _np.sqrt(_np.maximum(area, 0.0))
+        elif element_type.startswith("tetra") and v.shape[1] >= 4:
+            v = v[:, :4, :3]
+            e1, e2, e3 = v[:, 1] - v[:, 0], v[:, 2] - v[:, 0], v[:, 3] - v[:, 0]
+            signed = _np.einsum("ij,ij->i", e1, _np.cross(e2, e3)) / 6.0
+            pairs = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+            edges = _np.stack([_np.linalg.norm(v[:, i] - v[:, j], axis=1) for i, j in pairs])
+            faces = ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
+            surf = sum(0.5 * _np.linalg.norm(_np.cross(v[:, j] - v[:, i], v[:, k] - v[:, i]), axis=1) for i, j, k in faces)
+            vol = _np.abs(signed)
+            inradius = 3.0 * vol / _np.maximum(surf, 1e-300)
+            aspect = edges.max(axis=0) / _np.maximum(inradius, 1e-300) / (2.0 * _np.sqrt(6.0))
+            size = _np.cbrt(_np.maximum(vol, 0.0))
+        else:
+            return ""
+        bad = int((signed <= 0).sum())
+        return (
+            f" · h {size.min():.3g}–{size.max():.3g} · worst aspect {aspect.max():.2f}{f' · INVERTED {bad}' if bad else ''}"
+        )
+    except Exception:  # noqa: BLE001 - a log line must never be what fails a mesh build
+        return ""
+
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -293,7 +339,9 @@ class MeshUtils:
             mesh_connectivity["p1_area"] = np.array(area)
             mesh_connectivity["p1_grad_phi"] = np.array(grad_phi)
 
-        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
+        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}" + _mesh_quality(
+            points, elements, str(element_type)
+        )
 
         mesh_connectivity["nodal_ds"] = MeshUtils.compute_nodal_ds(mesh_connectivity)
         mesh_connectivity["nodal_volumes"] = MeshUtils.compute_nodal_volumes(mesh_connectivity)
@@ -338,7 +386,9 @@ class MeshUtils:
             n_bp = len(bp)
             mesh_connectivity.defer("VM", lambda: np.ones((n_bp, n_bp), dtype=np.float32) - np.eye(n_bp, dtype=np.float32))
 
-        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
+        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}" + _mesh_quality(
+            points, elements, str(element_type)
+        )
 
         return mesh_connectivity, msg
 

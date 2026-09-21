@@ -87,6 +87,22 @@ places:
 - Normals — `domain.normals_by_tag[tag]` holds outward unit normals for
   boundary tags.
 
+### Attached property (`attach`)
+
+A value — a coefficient, a source, a trainable parameter — declared per region with
+`d.attach("steel", k=16.0)` and read back as `d.k`: one coefficient whose value is chosen, per cell,
+by the region the cell lies in, so a multi-material weak form is one equation. A bare
+`d.attach(k=1.0)` is the default for every volume region that names none; an explicit region wins
+whichever order they are written in. Replaces the retired `by_region` / `by_tag`. See
+[`domain.attach`](fem/geometry.md).
+
+### `jno.info`
+
+One front door for "what is this, and is it what I meant?": pass any jNO object — a shape, domain,
+form, solver spec, expression, network, result, `jno.core`, `jno.dd.couple` — and it reports what it
+knows, including what the last solve did (`fem.stats`). Replaces the retired `domain.summary()`,
+`core.print_tree()` and `core.print_shapes()`. See [`jno.info`](info.md).
+
 ### Crux
 
 The object returned by `jno.core(...)`. Holds the compiled step

@@ -6,7 +6,7 @@
 <text x="54" y="58" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
 <text x="70" y="58" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#1A202C" text-anchor="start" letter-spacing="0.5">GEOMETRY</text>
 <path d="M44 72 h156" stroke="#E2E8F0" stroke-width="1"/>
-<text x="44" y="90" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="600" fill="#0D9488" text-anchor="start">jno.Shape · jno.Path</text>
+<text x="44" y="90" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="600" fill="#0D9488" text-anchor="start">jno.shape · jno.Path</text>
 <text x="44" y="109" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#5B6773" text-anchor="start">CSG solids, boolean ops,</text>
 <text x="44" y="123" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#5B6773" text-anchor="start">multi-material regions,</text>
 <text x="44" y="137" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#5B6773" text-anchor="start">gmsh-OCC meshing</text>

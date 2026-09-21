@@ -232,11 +232,11 @@ def test_by_region_accepts_shape_region_names():
     """Before this, `by_region` validated only against geometry parts and tag predicates, so a
     shape-built multi-material domain could not use it at all."""
     d = _two_named_regions()
-    expr = d.by_region({"a": 1.0, "b": 2.0})
+    expr = d._by_region({"a": 1.0, "b": 2.0})
     assert "RegionMask(a)" in str(expr) and "RegionMask(b)" in str(expr)
 
 
 def test_by_region_still_rejects_an_unknown_region():
     d = _two_named_regions()
     with pytest.raises(ValueError, match="unknown region"):
-        d.by_region({"a": 1.0, "nope": 2.0})
+        d._by_region({"a": 1.0, "nope": 2.0})

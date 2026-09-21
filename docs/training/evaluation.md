@@ -24,18 +24,21 @@ pred = crux.predict(points=points, operation=u, context=test_domain.context)
 
 ## Debugging
 
-### Print Computation Tree
+### Inspect the core — `jno.info`
+
+One entry for everything about a built object: models and their parameter counts, the constraints,
+the optimizer, and — with `deep=True` — the computation tree and the per-node shape trace.
 
 ```python
-crux.print_tree()              # to stdout
-crux.print_tree("tree.txt")    # to file
+print(jno.info(crux))                        # models, constraints, optimizer
+print(jno.info(crux, deep=True))             # + computation tree + tensor shapes
+
+open("tree.txt", "w").write(str(jno.info(crux, deep=True)))   # to a file
 ```
 
-### Print Tensor Shapes
-
-```python
-crux.print_shapes()   # per-node shape trace for all constraints and trackers
-```
+`jno.info` takes any jNO object — a `domain`, a `jno.fem` form, a `jno.fdm` or `jno.rcwa` solver,
+a `core`, or a `jno.solve` / `jno.precond` spec — and `Info.as_dict()` returns the same content as
+data, so a test can assert on it.
 
 ### Debug Print Inside Expressions
 

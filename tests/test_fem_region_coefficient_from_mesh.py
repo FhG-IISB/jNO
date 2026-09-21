@@ -1,6 +1,6 @@
 """A mesh file's named volume regions as a per-region COEFFICIENT.
 
-``domain.by_region({"steel": 16.0, "air": 0.026})`` is the per-region material primitive, and it
+``domain._by_region({"steel": 16.0, "air": 0.026})`` is the per-region material primitive, and it
 resolved a region only from a shapely geometry part, a ``domain.tag`` predicate, or a
 ``shape.regions`` sub-region. A mesh loaded from a ``.msh`` keeps its gmsh physical volumes in
 ``mesh.cell_sets``, which none of those cover -- so the one kind of domain that has materials
@@ -62,14 +62,14 @@ def test_the_fixture_has_the_regions():
 
 def test_by_region_accepts_a_mesh_file_region(tmp_path):
     d = _two_material_square(tmp_path)
-    k = d.by_region({"left": 3.0, "right": 1.0})
+    k = d._by_region({"left": 3.0, "right": 1.0})
     assert k is not None
 
 
 def test_the_per_region_coefficient_integrates_correctly(tmp_path):
     """Each region is half the unit square, so int k dV = 3*0.5 + 1*0.5 = 2."""
     d = _two_material_square(tmp_path)
-    total = _integral_of(d, d.by_region({"left": 3.0, "right": 1.0}))
+    total = _integral_of(d, d._by_region({"left": 3.0, "right": 1.0}))
     assert np.isclose(total, 2.0, rtol=1e-9), f"int k dV = {total}, expected 2.0"
 
 
@@ -80,14 +80,14 @@ def test_overlapping_regions_raise_instead_of_double_counting(tmp_path):
     d = _two_material_square(tmp_path)
     d.mesh.cell_sets["all"] = [np.arange(len(d.mesh.cells_dict["triangle"]), dtype=np.int64)]
     with pytest.raises(ValueError, match="overlap"):
-        d.by_region({"left": 3.0, "all": 1.0})
+        d._by_region({"left": 3.0, "all": 1.0})
 
 
 def test_a_tag_predicate_of_the_same_name_still_wins(tmp_path):
     """Mesh regions resolve LAST, so nothing that worked before changes behaviour."""
     d = _two_material_square(tmp_path)
     d.tag("left", lambda x, y: x > 0.5)  # deliberately the opposite half
-    total = _integral_of(d, d.by_region({"left": 1.0}))
+    total = _integral_of(d, d._by_region({"left": 1.0}))
     assert np.isclose(total, 0.5, rtol=1e-9), f"the tag predicate did not win: {total}"
 
 
@@ -134,7 +134,7 @@ def test_a_mesh_region_coefficient_works_on_a_non_nodal_n1e_form(tmp_path):
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     ci = d.variable("interior", split=True)
     x, y, z = ci[0], ci[1], ci[2]
-    nu = d.by_region({"lower": 2.0, "upper": 1.0})
+    nu = d._by_region({"lower": 2.0, "upper": 1.0})
     fem = jno.fem(
         [
             nu * inner(u.vector.curl(x, y, z), v.vector.curl(x, y, z))
@@ -152,8 +152,8 @@ def test_a_region_touching_the_outer_boundary_still_works(tmp_path):
     term assembling to zero. A `RegionMask` coefficient is not a region-restricted integration
     domain and must be immune, and the outer region of any real device touches the box."""
     d = _two_material_square(tmp_path)
-    assert np.isclose(_integral_of(d, d.by_region({"left": 1.0})), 0.5, rtol=1e-9)
-    assert np.isclose(_integral_of(d, d.by_region({"right": 1.0})), 0.5, rtol=1e-9)
+    assert np.isclose(_integral_of(d, d._by_region({"left": 1.0})), 0.5, rtol=1e-9)
+    assert np.isclose(_integral_of(d, d._by_region({"right": 1.0})), 0.5, rtol=1e-9)
 
 
 def test_the_volume_term_guard_still_refuses_domain_variable(tmp_path):

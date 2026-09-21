@@ -1067,7 +1067,7 @@ _REGION_VOLUME_MSG = (
     "region is not implemented -- the term is instead {how}, with no warning.\n"
     "  Put the per-region material or source in the COEFFICIENT rather than the quadrature domain.\n"
     "  A named region of the mesh file is a valid key, so this reads straight off the physical volumes:\n"
-    '      k = d.by_region({{"steel": 16.0, "air": 0.026}})     # one value per cell, exact membership\n'
+    '      k = d._by_region({{"steel": 16.0, "air": 0.026}})     # one value per cell, exact membership\n'
     '      d.attach("steel", k=16.0)                          # or attach it and use d.k\n'
     "  A shapely sub-region or a d.tag(...) predicate also restricts correctly.\n"
     "  (d.variable(<region>) DOES restrict a SURFACE term; only the volume path is missing.)"
@@ -1240,6 +1240,36 @@ def _tie_phase(bare: Any) -> Optional[complex]:
             if c is not None and getattr(b, "op", None) is None:
                 return c
     return None
+
+
+def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None) -> str:
+    """One line naming the route a ``solve()`` actually took.
+
+    Which solver ran is currently unknowable from the outside, and it is not a detail: the same
+    elasto-plastic march measured 1194 s on the matrix-free default and 14.6 s with a sparse-direct
+    tangent. A user who cannot see which one ran cannot see that difference either.
+    """
+    _DIRECT = {"lu", "dense", "pardiso", "cudss", "sparse_lu", "direct"}
+
+    def _nm(spec, default):
+        return default if spec is None else (getattr(spec, "name", None) or type(spec).__name__.lower())
+
+    def _lin(default="bicgstab (matrix-free)"):
+        """The inner linear solver, and its preconditioner only if it HAS one. A direct factorisation
+        does not, and printing `precond jacobi` beside `lu` states something untrue."""
+        name = _nm(linear, default)
+        if str(name).split("(")[0].strip() in _DIRECT:
+            return str(name)
+        return f"{name} + {_nm(precond, 'jacobi')}"
+
+    mode = fem_obj._mode
+    if mode == "transient":
+        step = _nm(time, "theta(1) backward-Euler")
+        inner = _nm(nonlinear, "newton-krylov") if not fem_obj.is_linear else _lin()
+        return f"solve: transient · {step} · per step {inner}"
+    if mode == "nonlinear":
+        return f"solve: nonlinear · {_nm(nonlinear, 'newton-krylov (JFNK)')} · inner {_lin()}"
+    return f"solve: {mode} · {_lin()}"
 
 
 def _component_index_of(node: Any) -> Optional[int]:
@@ -1810,6 +1840,15 @@ class FEM:
         return self._mode == "transient"
 
     @property
+    def mode(self) -> str:
+        """The route fixed at build: ``"linear"``, ``"nonlinear"``, ``"transient"`` or ``"complex"``.
+
+        Public because it is the first question anyone asks of a built form, and because every
+        ``solve()`` behaviour follows from it -- reading it off ``_mode`` meant reaching for a
+        private attribute to learn the single most load-bearing fact about your own problem."""
+        return self._mode
+
+    @property
     def is_linear(self) -> bool:
         if self._mode == "transient":
             return bool(self._op.is_linear())
@@ -1893,8 +1932,52 @@ class FEM:
         when jaxamg served the solve. Populated on eager paths; a solve wrapped whole in
         ``jit``/``vmap``/``grad`` records the slots but no residuals — the same concrete-only
         self-disabling as the convergence guards.
+
+        ``march`` is the per-step record of a march, or ``None``: ``what``, ``coord``, ``steps``,
+        ``grid`` (the coordinate at each step), ``residual`` / ``bound`` (each step's final residual
+        norm and the tolerance it was judged against — ``None`` for a march that does not judge its
+        steps, e.g. a linear transient) and ``step_s`` (per-step wall time — ``None`` for a march that
+        is one compiled ``lax.scan``, where a step is not a host-visible event and only the mean
+        ``wall_s / steps`` is honest). A transient solve returns a deferred node, so its record says
+        ``deferred=True`` until the node is evaluated eagerly (``.fn()``), which fills in the
+        evaluation's ``wall_s`` and ``evaluation`` count. ``solve_index`` counts solves on this form:
+        the first includes tracing and compilation. ``error`` is set when the solve raised; the rest
+        of the record then describes that failed solve, not an earlier one.
         """
-        return getattr(self, "_stats", None)
+        st = getattr(self, "_stats", None)
+        ev = getattr(getattr(self, "_op", None), "_last_evaluation", None)
+        if st is not None and ev and ev.get("at", -1.0) >= getattr(self, "_stats_at", 0.0):
+            march = {k: v for k, v in (st.get("march") or {}).items() if k != "note"}  # "runs later": it ran
+            march.update({k: v for k, v in ev.items() if k != "at" and v is not None})
+            march["deferred"] = False
+            st = {**st, "march": march}
+        return st
+
+    def _deferred_march_record(self):
+        """What a transient march WILL do, known when ``solve()`` returns its deferred node.
+
+        The march itself runs later, when the node is evaluated, so all that is honest here is the
+        grid: steps, ``dt``, the window. :meth:`SemidiscreteTimeBlock.solve` adds the evaluation's time
+        (and a nonlinear march's per-step residuals) when it is evaluated eagerly.
+        """
+        if not self.is_transient:
+            return None
+        try:
+            from .utils.solver.backend_blocks import _block_time_grid
+
+            grid = np.asarray(_block_time_grid(self._time_block()), dtype=float)
+            return {
+                "what": "transient march",
+                "coord": "t",
+                "steps": int(grid.size - 1),
+                "grid": None,
+                "dt": float(self.dt),
+                "window": (float(self.t0), float(self.t1)),
+                "deferred": True,
+                "note": "the march runs when the returned node is evaluated (.fn() or jno.core)",
+            }
+        except Exception:  # noqa: BLE001 -- observability must never fail a solve
+            return None
 
     def block_index(self, field) -> int:
         """Resolve a trial symbol (or plain index) to its position in :attr:`blocks` /
@@ -1982,7 +2065,82 @@ class FEM:
             u = u - mask * (_weighted(load, u) / total)
         return u
 
-    def solve(
+    def solve(self, *args, **kwargs):
+        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature."""
+        import time as _time
+
+        from .utils.logger import get_logger
+
+        _t0 = _time.perf_counter()
+        out = self._solve_inner(*args, **kwargs)
+        get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
+        return out
+
+    def _march_phrase(self, since: float) -> str:
+        """The march headline for the log line, from THIS solve's stats only (a path that does not
+        record them must not borrow an earlier solve's)."""
+        st = getattr(self, "_stats", None)
+        if not st or not st.get("march") or getattr(self, "_stats_at", -1.0) < since:
+            return ""
+        from .info import _march_rows
+
+        return _march_rows(st["march"], st.get("solve_index"))[0]
+
+    def _solved_line(self, out, wall: float, since: float = float("inf")) -> str:
+        """What the solve actually produced -- the line that says whether to trust it.
+
+        A solve that did not raise can still be wrong in two ways a user cannot see: it can return
+        all zeros (an empty load vector), and it can return a vector that does not solve the system
+        (a stalled Krylov run that squeaked under its gate). The first is caught here, from the
+        SOLUTION RANGE; the second by the solve's own residual gate, which raises -- and
+        ``jno.info(sol, context=fem)`` reports ||Au-b||/||b|| on request. Nothing here forces a lazy
+        result, which would defeat the point of returning a trace node.
+        """
+        import numpy as _np
+
+        try:
+            parts = [f"solved: {self._mode} · {wall:.3g} s"]
+            march = self._march_phrase(since)
+            if march:
+                parts.append(march)
+            if isinstance(out, jax.core.Tracer):
+                # Inside the caller's jit/grad/vmap: nothing has run, and nothing here may run it.
+                return f"solved: {self._mode} · traced (inside jit/grad/vmap) — reported when it runs"
+            if not isinstance(out, (jax.Array, _np.ndarray)) or out.dtype == object or out.ndim == 0:
+                # The work has NOT happened yet: this path returns a node and the march runs at
+                # evaluation. Reporting the elapsed time here as if it were the solve would say a
+                # 200-step transient finished in 6 ms.
+                march = self._march_phrase(since)
+                return (
+                    f"solved: {self._mode} · deferred (trace node) — built in {wall:.3g} s, "
+                    f"the solve runs when you evaluate it through jno.core" + (f" · {march}" if march else "")
+                )
+            # Reduced WHERE THE SOLUTION LIVES; four scalars cross to the host in one transfer.
+            # Measured at 73k dofs on an RTX 3070: 0.32 ms, against a 63 ms solve.
+            #
+            # No residual here, deliberately. ||Au - b|| costs a sparse matvec, and one matvec was
+            # 6.7 ms of that 63 ms solve (6.1 ms even jitted) -- 10 % of every solve, for a log
+            # line. It is also redundant: every linear solve already gates on its own residual and
+            # RAISES when it did not converge. It is computed on request instead, by
+            # `jno.info(sol, context=fem)`. (The first version also copied the whole vector to the
+            # host and back: three full-vector transfers per GPU solve.)
+            flat = jnp.asarray(out).reshape(-1)
+            cplx = bool(jnp.iscomplexobj(flat))
+            mag = jnp.abs(flat) if cplx else flat
+            vals = [jnp.sum(~jnp.isfinite(flat)), jnp.min(mag), jnp.max(mag), jnp.max(jnp.abs(flat))]
+            q = _np.asarray(jnp.stack([jnp.real(jnp.asarray(v)).astype(jnp.real(mag).dtype) for v in vals]))
+            n_bad, lo, hi, amax = int(q[0]), float(q[1]), float(q[2]), float(q[3])
+            if n_bad:
+                parts.append(f"**{n_bad} non-finite entries**")
+            else:
+                parts.append(f"{'|u|' if cplx else 'u'} in [{lo:.4g}, {hi:.4g}]")
+                if amax <= 1e-8:
+                    parts.append("ALL ZERO — is the load term present?")
+            return " · ".join(parts)
+        except Exception:  # noqa: BLE001 - a log line must never be what fails a solve
+            return f"solved: {self._mode} · {wall:.3g} s"
+
+    def _solve_inner(
         self,
         solve_fn=None,
         *,
@@ -2126,6 +2284,13 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
         """
+        # ONE site, in the public entry: the mode-specific paths below return at different points
+        # (nonlinear and transient both bypass `_compose_slots`), so logging inside them left two of
+        # the three modes silent about which solver actually ran.
+        from .utils.logger import get_logger
+
+        get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
+
         # Structural singularity is checked at BUILD and reported HERE. A form whose terms cover only
         # part of the mesh is a legitimate object -- `jno.core([femL, fdmR, ...])` and `jno.dd.couple`
         # are built from exactly those, one per subdomain -- so refusing to construct it is wrong. It
@@ -2195,25 +2360,49 @@ class FEM:
             import sys as _sys
             import time as _time
 
+            from .utils.solver.history_march import LAST_MARCH_STATS
             from .utils.solver.newton_krylov import LAST_NEWTON_STATS
             from .utils.solver.solver_api import clear_gate_failures, raise_if_gate_failed
 
             LAST_NEWTON_STATS.clear()
+            LAST_MARCH_STATS.clear()
             clear_gate_failures()  # so this solve cannot be blamed for an earlier one's failure
             t0 = _time.perf_counter()
-            result = _run()
-            self._stats = {
-                "mode": self._mode,
-                "dofs": self.dofs,
-                # Dispatch time of the solve CALL: JAX is async, so for a compiled eager solve this
-                # includes compute only if something blocked; block on the result for compute time.
-                "wall_s": _time.perf_counter() - t0,
-                "linear": repr(linear) if linear is not None else "default",
-                "precond": repr(precond) if precond is not None else None,
-                # Written by the drivers' eager convergence check; empty under jit/vmap/grad, where
-                # the check self-disables -- the same silence the guard itself has.
-                "nonlinear": dict(LAST_NEWTON_STATS) or None,
-            }
+
+            self._n_solves = getattr(self, "_n_solves", 0) + 1
+
+            def _record(error=None):
+                self._stats_at = t0
+                self._stats = {
+                    # The first solve of a form pays its tracing and compilation, and every time
+                    # below includes it; later solves reuse the compiled program.
+                    "solve_index": self._n_solves,
+                    "mode": self._mode,
+                    "dofs": self.dofs,
+                    # Dispatch time of the solve CALL: JAX is async, so for a compiled eager solve this
+                    # includes compute only if something blocked; block on the result for compute time.
+                    "wall_s": _time.perf_counter() - t0,
+                    "linear": repr(linear) if linear is not None else "default",
+                    "precond": repr(precond) if precond is not None else None,
+                    # Written by the drivers' eager convergence check; empty under jit/vmap/grad, where
+                    # the check self-disables -- the same silence the guard itself has.
+                    "nonlinear": dict(LAST_NEWTON_STATS) or None,
+                    # Per-step record of a march (load path, arc-length, continuation, an eagerly
+                    # evaluated nonlinear transient) -- see `history_march.LAST_MARCH_STATS`.
+                    "march": dict(LAST_MARCH_STATS) or self._deferred_march_record(),
+                }
+                if error is not None:
+                    # A failed solve used to leave the PREVIOUS solve's stats in place, which then read
+                    # as this one's. Record the failure instead -- with the march's per-step record up
+                    # to the failing step, which is what the user needs next to that error.
+                    self._stats["error"] = f"{type(error).__name__}: {str(error).splitlines()[0][:200]}"
+
+            try:
+                result = _run()
+            except Exception as exc:
+                _record(exc)
+                raise
+            _record()
             if "jaxamg" in _sys.modules:  # AmgX solver-cache summary, only if jaxamg is in play
                 try:
                     info = _sys.modules["jaxamg"].get_solver_cache_info()
@@ -2238,6 +2427,12 @@ class FEM:
         from .utils.profiling import profile_solve
 
         return profile_solve(_run_with_stats, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
+
+    # `solve` is a thin timing/logging wrapper, so its own signature is `(*args, **kwargs)` -- which
+    # erased every solver slot from `help(fem.solve)`, IDE completion and `inspect.signature` (a test
+    # asserting `shard=` is accepted failed on exactly that). Point both at the real one.
+    solve.__wrapped__ = _solve_inner
+    solve.__doc__ = _solve_inner.__doc__
 
     #: relative residual of the FULL system above which a ``basis=`` solve is refused. Not a tuning
     #: knob: at this size the basis does not span the solution at all (a modelling error), rather than
@@ -5868,6 +6063,13 @@ def _fem_impl(
                 "subdomain of a coupling, it is not an error: build it, and let `jno.core` / "
                 "`jno.dd.couple` solve it together with its partner."
             )
+        # The one line that says whether jNO understood the problem: the mode it fixed, the dof
+        # count, and how EVERY term was classified. All of it already existed on the object -- it was
+        # only ever visible to someone who typed `fem` in a REPL, so a script showed gmsh progress
+        # and nothing about its own physics.
+        from .utils.logger import get_logger
+
+        get_logger().info(str(out))
         return out
 
     volume_terms: List[Any] = []

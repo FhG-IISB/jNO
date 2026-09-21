@@ -849,7 +849,41 @@ path the `precond` spec is materialized *per Newton/Picard linearization* agains
 all work; only specs that need the assembled matrix (`jacobi`, an unbuilt `amg`) raise.
 
 ## Diagnostics — what the solver actually did
- After any `fem.solve()`, `fem.stats` reports what happened
+
+### What a solve prints
+
+Every build and solve logs one line each for what was built, which solver ran, and what came back:
+
+```text
+INFO: Preprocessed mesh connectivity: 85 points, 133 triangles · h 0.0927–0.141 · worst aspect 1.38
+INFO: FEM(linear, dofs=85, terms=['volume', 'dirichlet@boundary'])
+INFO: solve: linear · bicgstab (matrix-free) + jacobi
+INFO: solved: linear · 0.115 s · u in [0, 0.06101]
+```
+
+- **`FEM(...)`** is the mode fixed at build and every term as jNO classified it. A boundary
+  condition that landed nowhere is missing here.
+- **`solve:`** is the route actually taken, including defaults you did not pass.
+- **`solved:`** is the solution range, with `ALL ZERO — is the load term present?` when the
+  right-hand side was empty. A march adds its steps and the step that came closest to its
+  tolerance:
+
+```text
+INFO: solved: nonlinear · 0.454 s · load-path march · 40 steps over τ ∈ [0, 1] · tightest step 32 (τ=0.7949) at 82.9% of its bound · u in [0, 0.8375]
+```
+
+The lines cost the solve nothing it does not already pay. Nothing is added inside a traced
+computation: a jitted transient march compiles to the same program with or without them. The
+`solved:` line reduces the solution on the device and moves four numbers to the host (0.3 ms
+against a 63 ms solve at 73k dofs on a GPU). It skips itself when the solve is traced
+(`jit`/`grad`/`jno.core`). It does **not** compute ‖Au − b‖: that is a sparse matvec, 10 % of the
+same solve, and the solve already checks its own residual and raises (below). Ask for it with
+[`jno.info(sol, context=fem)`](info.md). gmsh's own progress output is suppressed; its warnings
+are logged as `WARNING: gmsh: …`.
+
+### `fem.stats`
+
+After any `fem.solve()`, `fem.stats` reports what happened
 without changing the solve's return: `mode`, `dofs`, `wall_s` (dispatch time — JAX is async; block on
 the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (driver, final residual
 norm against its bound, converged flag, and the step count where the driver runs its forward loop
@@ -865,6 +899,44 @@ fem.stats
 #  'precond': None, 'nonlinear': {'driver': 'newton_direct', 'residual': 1.6e-07,
 #                                 'bound': 1.7e-06, 'steps': 3, 'converged': True}}
 ```
+
+`solve_index` counts solves on the form (the first one includes tracing and compilation), and a solve
+that **raised** still writes `fem.stats`, with an `error` entry. It used to leave the previous solve's
+stats in place, and those would read as this solve's.
+
+### A march records every step — `fem.stats["march"]`
+
+A march (a `tau=` load path, an arc-length path, `continuation=`, a transient) records what each step
+did. `grid` is the coordinate at each step. `residual` and `bound` are each step's final residual and
+the tolerance it was judged against. `step_s` is each step's wall time:
+
+| march | per-step residual | per-step time |
+|---|---|---|
+| load path, arc-length | ✅ | — one compiled `lax.scan`: only the mean `wall_s / steps` |
+| `continuation=` | ✅ nonlinear | ✅ every rung is materialised, so its time is real compute |
+| transient, nonlinear | ✅ once evaluated | — one compiled `lax.scan` |
+| transient, linear | — | — one compiled `lax.scan` |
+
+A step inside a `lax.scan` is not a host-visible event, so no per-step time is reported for it rather
+than an invented one. A transient solve returns a deferred node: its record says `deferred=True` with
+the step count, `dt` and window until the node is evaluated eagerly (`.fn()`), which adds the
+evaluation's `wall_s` and an `evaluation` count. Under `jno.core` the march runs inside a compiled
+program and nothing is recorded.
+
+A march that fails keeps its record up to and including the failing step, at the same 1-based index
+the error names. `jno.info(fem)` renders it:
+
+```text
+  march
+    kind         load-path march
+    steps        12 over τ ∈ [0, 1]
+    time         542 ms for the solve · mean 45.1 ms/step — includes compilation
+                 one compiled lax.scan: a step has no wall time of its own, only the mean
+    convergence  all 12 steps converged · tightest step 11 (τ=0.9091): residual at 45.6% of its bound
+```
+
+"Tightest" is the step that came closest to its bound, which is the first place to look when a finer
+grid or a harder load is about to break the march. `jno.info(fem, deep=True)` lists every step.
 
 ### A solve that did not converge raises — including the adjoint
 
@@ -924,7 +996,7 @@ them where they *are* concrete, against the driver's own `rtol`/`atol`:
 
 ```python
 fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-6, atol=1e-6))
-# RuntimeError: fem.solve: the transient march did not converge at step 35 of 120 (t=0.00036):
+# RuntimeError: fem.solve: the transient march did not converge at step 36 of 120 (t=0.00036):
 # residual norm 3.658e+02 against the tolerance atol + rtol*||r(u_prev)|| = 1.011e-02
 # (atol=1e-06, rtol=1e-06). That step is NOT a root, and every later step inherited it as its
 # starting state — the whole trajectory past this point is unreliable. Globalize the per-step solve

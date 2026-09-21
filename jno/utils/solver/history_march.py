@@ -508,6 +508,36 @@ def _resolve_limits(limit, fem, n_dofs):
 #: That test tightens as the step shrinks -- see ``_accept_bound`` -- so acceptance now uses the driver's
 #: own ``atol + rtol*r``, which the pilot reads off ``solve_fn.tolerances``.
 
+#: The last eager march's per-step record, written by :func:`_check_march_converged` (every ``lax.scan``
+#: march passes through it) and by the continuation loop, and read by ``fem.solve`` into
+#: ``fem.stats["march"]``. A module-level slot for the same reason as ``newton_krylov.LAST_NEWTON_STATS``:
+#: the marchers' return contracts have many callers, and observability must not alter them.
+#:
+#: Keys: ``what``, ``coord``, ``steps``, ``grid`` (the coordinate at each step), ``residual`` and
+#: ``bound`` (each step's final residual norm and the tolerance it was judged against, or None where the
+#: march does not judge its steps), ``step_s`` (per-step wall time, or None where the march is one
+#: compiled ``lax.scan`` -- a step is not a host-visible event there, so only the mean is honest), and
+#: ``note`` when something could not be recorded.
+LAST_MARCH_STATS: dict = {}
+
+
+def _record_march(*, what, coord, grid, residual=None, bound=None, step_s=None, note=None):
+    """Write one march's record into :data:`LAST_MARCH_STATS` (host arrays only)."""
+    g = np.asarray(grid, dtype=float).reshape(-1)
+    LAST_MARCH_STATS.clear()
+    LAST_MARCH_STATS.update(
+        what=what,
+        coord=coord,
+        steps=int(g.size),
+        grid=g,
+        residual=None if residual is None else np.asarray(residual, dtype=float).reshape(-1),
+        bound=None if bound is None else np.asarray(bound, dtype=float).reshape(-1),
+        step_s=None if step_s is None else np.asarray(step_s, dtype=float).reshape(-1),
+    )
+    if note:
+        LAST_MARCH_STATS["note"] = note
+
+
 #: Fallback tolerances when the composed ``solve_fn`` does not advertise its own (a caller-supplied
 #: driver that is not a ``jno.solve`` spec). Matches the ``newton_krylov``/``newton_direct`` defaults.
 _MARCH_FALLBACK_TOL = (1e-8, 1e-8)
@@ -551,10 +581,17 @@ def _check_march_converged(
     is all there is.
     """
     if any(isinstance(v, jax.core.Tracer) for v in (r_end, r_start)):
+        LAST_MARCH_STATS.clear()
+        LAST_MARCH_STATS.update(
+            what=what, coord=coord, steps=None, note="no per-step record: the march was traced (jit/grad/vmap)"
+        )
         return
     rtol, atol = getattr(solve_fn, "tolerances", None) or _MARCH_FALLBACK_TOL
     r_end = np.asarray(r_end, dtype=float)
     bound = atol + rtol * np.asarray(r_start, dtype=float)
+    # Recorded BEFORE the verdict, so a march that raises below still leaves its per-step record:
+    # which steps were close to their bound is exactly what the user needs after that error.
+    _record_march(what=what, coord=coord, grid=grid, residual=r_end, bound=bound)
     bad = ~np.isfinite(r_end) | (r_end > bound)
     if not bad.any():
         _check_march_moved(r_end, r_start, bound, rtol, atol, states=states, what=what)
@@ -562,7 +599,7 @@ def _check_march_converged(
     k = int(np.argmax(bad))
     tau_k = float(np.asarray(grid)[k]) if np.asarray(grid).size > k else float("nan")
     raise RuntimeError(
-        f"fem.solve: the {what} did not converge at step {k} of {int(r_end.size)} ({coord}={tau_k:.6g}): "
+        f"fem.solve: the {what} did not converge at step {k + 1} of {int(r_end.size)} ({coord}={tau_k:.6g}): "
         f"residual norm {r_end[k]:.3e} against the tolerance atol + rtol*||r(u_prev)|| = {bound[k]:.3e} "
         f"(atol={atol:g}, rtol={rtol:g}). That step is NOT a root, and every later step inherited "
         "it as its starting state — the whole trajectory past this point is unreliable. " + (advice or _LOADPATH_ADVICE)

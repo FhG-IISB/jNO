@@ -21,6 +21,42 @@ from .naming import classify_boundary
 
 _MODEL_SEQ = itertools.count()
 
+
+def _quiet_gmsh():
+    """Turn gmsh's terminal output off, keep its warnings. Returns a ``restore()`` to call before
+    gmsh is finalised.
+
+    Setting ``General.Terminal`` only when *we* start gmsh is not enough: `Domain._generate_mesh`
+    meshes inside a ``pygmsh.geo.Geometry()`` context, whose ``__enter__`` has already started gmsh
+    with the terminal ON. Measured: gmsh's per-curve / per-surface progress printed 11 lines for a
+    rectangle minus a disk, 28 for two adjacent regions and 53 for a box minus a sphere, burying
+    jNO's own build/solve lines. Switching the terminal off
+    wholesale would also swallow gmsh's WARNINGS (a failed surface recovery, an inverted element),
+    so the messages are collected through gmsh's logger instead and the warnings forwarded to jNO's
+    log. Errors need no forwarding: gmsh's Python API raises them. The previous terminal setting is
+    restored, so a caller who opened gmsh with output on gets it back.
+    """
+    import gmsh
+
+    prev = gmsh.option.getNumber("General.Terminal")
+    gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.logger.start()
+
+    def restore():
+        msgs = gmsh.logger.get()
+        gmsh.logger.stop()
+        gmsh.option.setNumber("General.Terminal", prev)
+        warnings = [m.split(":", 1)[1].strip() for m in msgs if m.startswith("Warning")]
+        if warnings:
+            from ..utils.logger import get_logger
+
+            log = get_logger()
+            for w in warnings:
+                log.warning(f"gmsh: {w}")
+
+    return restore
+
+
 # gmsh element type ids
 _TRI = 2
 _QUAD = 3  # 4-node quadrilateral (gmsh element type), from recombining two triangles
@@ -638,7 +674,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
     started = not gmsh.isInitialized()
     if started:
         gmsh.initialize()
-        gmsh.option.setNumber("General.Terminal", 0)
+    restore_output = _quiet_gmsh()
     # Both kernels get jNO's default, then `algorithm` overrides the one for the shape's OWN
     # dimension. A 3-D shape still meshes its surfaces with the 2-D kernel first, so that one stays
     # on the quality default rather than being overridden by a 3-D algorithm number.
@@ -710,6 +746,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
         mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming, order=int(order), cell=_cell)
         return mesh, dim, ds
     finally:
+        restore_output()
         gmsh.model.remove()
         if started:
             gmsh.finalize()
@@ -753,7 +790,7 @@ def _boundary_once(shape, split_full, *, algorithm=None, threads=None):
     started = not gmsh.isInitialized()
     if started:
         gmsh.initialize()
-        gmsh.option.setNumber("General.Terminal", 0)
+    restore_output = _quiet_gmsh()
     gmsh.option.setNumber("Mesh.Algorithm", MESH_ALGORITHM_2D)
     gmsh.option.setNumber("Mesh.Algorithm3D", MESH_ALGORITHM_3D)
     if algorithm is not None:
@@ -795,6 +832,7 @@ def _boundary_once(shape, split_full, *, algorithm=None, threads=None):
             raise RuntimeError(f"the boundary mesher produced no {dim - 1}-D elements for this plan.")
         return pts, np.concatenate(blocks, axis=0)
     finally:
+        restore_output()
         gmsh.model.remove()
         if started:
             gmsh.finalize()

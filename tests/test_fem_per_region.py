@@ -227,31 +227,31 @@ def _two_region():
 
 
 def test_by_region_stiffness_matches_per_region_loop():
-    """``k = d.by_region({L: kL, R: kR})`` used in ONE whole-``interior`` term assembles the identical
+    """``k = d._by_region({L: kL, R: kR})`` used in ONE whole-``interior`` term assembles the identical
     matrix to the per-region loop (two region-bound terms). This is the whole point: one equation, not
     one term per region."""
     d, u, v, (xi, yi), (xl, yl), (xr, yr), (xb, yb) = _two_region()
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     ul, vl = u.bind(x=xl, y=yl), v.bind(x=xl, y=yl)
     ur, vr = u.bind(x=xr, y=yr), v.bind(x=xr, y=yr)
-    k = d.by_region({"L": 3.0, "R": 7.0})
+    k = d._by_region({"L": 3.0, "R": 7.0})
     one_eq = np.asarray(jno.fem([k * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0]).A)
     loop = np.asarray(jno.fem([3.0 * (ul.x * vl.x + ul.y * vl.y), 7.0 * (ur.x * vr.x + ur.y * vr.y), u(xb, yb) - 0.0]).A)
     assert np.allclose(one_eq, loop), "by_region stiffness must equal the per-region loop matrix"
 
 
 def test_by_region_load_and_default():
-    """A source ``d.by_region({L: q}, default=d0)`` integrates ``q`` over L and ``d0`` over the unlisted R
+    """A source ``d._by_region({L: q}, default=d0)`` integrates ``q`` over L and ``d0`` over the unlisted R
     -- matching the explicit two-term loop; ``default=0`` (or absent regions) just contributes nothing."""
     d, u, v, (xi, yi), (xl, yl), (xr, yr), (xb, yb) = _two_region()
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     vl = v.bind(x=xl, y=yl)
     vr = v.bind(x=xr, y=yr)
     stiff = ui.x * vi.x + ui.y * vi.y
-    b0 = np.asarray(jno.fem([stiff, -d.by_region({"L": 2.0}, default=0.0) * vi, u(xb, yb) - 0.0]).b)
+    b0 = np.asarray(jno.fem([stiff, -d._by_region({"L": 2.0}, default=0.0) * vi, u(xb, yb) - 0.0]).b)
     b0_loop = np.asarray(jno.fem([stiff, -2.0 * vl, u(xb, yb) - 0.0]).b)
     assert np.allclose(b0, b0_loop), "by_region load with default=0 must equal the single-region loop load"
-    bd = np.asarray(jno.fem([stiff, -d.by_region({"L": 2.0}, default=5.0) * vi, u(xb, yb) - 0.0]).b)
+    bd = np.asarray(jno.fem([stiff, -d._by_region({"L": 2.0}, default=5.0) * vi, u(xb, yb) - 0.0]).b)
     bd_loop = np.asarray(jno.fem([stiff, -2.0 * vl, -5.0 * vr, u(xb, yb) - 0.0]).b)
     assert np.allclose(bd, bd_loop), "nonzero default must fill the unlisted region"
 
@@ -264,11 +264,11 @@ def test_by_region_trainable_value_recovers():
     d, u, v, (xi, yi), (xl, yl), (xr, yr), (xb, yb) = _two_region()
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     f = 5.0 * (xi * (1 - xi) + yi * (1 - yi))
-    truth = jno.fem([d.by_region({"L": 4.0, "R": 1.0}) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0]).solve()
+    truth = jno.fem([d._by_region({"L": 4.0, "R": 1.0}) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0]).solve()
 
     kL = jno.np.parameter((1,), name="kL", key=jax.random.PRNGKey(0))
     kL.initialize(jax.nn.initializers.constant(1.0))
-    fem = jno.fem([d.by_region({"L": kL, "R": 1.0}) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+    fem = jno.fem([d._by_region({"L": kL, "R": 1.0}) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
     crux = jno.core([(fem.solve() - truth).mse], domain=d)
     kL.optimizer(optax.adam(3e-1))
     crux.solve(250)
@@ -280,7 +280,7 @@ def test_by_region_unknown_region_raises():
     """A region name that is neither a geometry part nor a ``domain.tag`` is a clear error (typo guard)."""
     d, *_ = _two_region()
     with pytest.raises(ValueError, match="unknown region"):
-        d.by_region({"L": 1.0, "nope": 2.0})
+        d._by_region({"L": 1.0, "nope": 2.0})
 
 
 # ==========================================================================

@@ -327,7 +327,8 @@ stats.summary()
 pred = crux.eval(u)                                # on the training domain
 pred = crux.eval(u, domain=fine_domain)            # on any other domain
 a, b = crux.eval([a, b])                           # several nodes at once
-crux.print_tree("tree.txt");  crux.print_shapes()
+print(jno.info(crux, deep=True))                   # models, constraints, expression tree, shapes
+print(jno.info(fem))                               # any object: domain, form, expression, spec, result
 crux.solve(5000, profile=True)                     # Perfetto trace in <run>/traces/
 crux.checkpoints                                    # every solve() call checkpoints
 ```

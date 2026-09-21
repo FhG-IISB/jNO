@@ -1044,7 +1044,7 @@ def remesh(
         remesh(criterion=jno.np.sqrt(ui.x**2 + ui.y**2))   # gradient / shock detector
         remesh(criterion=phi * (1.0 - phi))                # phase-field interface
         remesh(criterion=jno.np.abs(uy.x - ux.y))          # 2-D vorticity, on a vector field
-        remesh(criterion=d.by_region({"weld": 1.0, "plate": 0.0}))   # refine one material
+        remesh(criterion=d._by_region({"weld": 1.0, "plate": 0.0}))   # refine one material
 
     The expression is assembled against this problem's own test function, normalised by the lumped
     mass to a nodal field, and integrated per cell; ``theta``, ``refine_factor`` and the remesh
@@ -1451,7 +1451,7 @@ def enrich(
     Args:
         criterion: **Required.** A traced expression marking where to enrich, exactly as in
             :func:`remesh` -- a field, carrying no test function
-            (``jno.np.sqrt(ui.x**2 + ui.y**2)``, ``phi*(1-phi)``, ``d.by_region({...})``).
+            (``jno.np.sqrt(ui.x**2 + ui.y**2)``, ``phi*(1-phi)``, ``d._by_region({...})``).
         theta: Dörfler bulk-marking fraction, over NODES rather than cells: the fewest nodes whose
             indicator reaches ``theta`` of the total are enriched each round.
         max_iters: Maximum enrich-solve rounds.

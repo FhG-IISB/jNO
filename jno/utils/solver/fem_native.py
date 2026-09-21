@@ -1612,8 +1612,8 @@ def assemble_fem_native(
             _surf_region_faces[_R] = _region_faces(_R)
 
     # ---- per-tag facet masks: the surface twin of `region_mask_arrays` -----------------------------
-    # `domain.by_tag({tag: value})` desugars to `sum_t TagMask(t) * value`, which lets ONE boundary
-    # term carry a coefficient that varies across tags -- the surface mirror of `by_region`.
+    # `domain._by_tag({tag: value})` desugars to `sum_t TagMask(t) * value`, which lets ONE boundary
+    # term carry a coefficient that varies across tags -- the surface mirror of `_by_region`.
     #
     # The mask comes from `_region_faces`, the assembler's OWN facet selection, not from re-evaluating
     # the tag predicate. Two reasons: a `TagMask("wall")` then covers exactly the facets a Dirichlet

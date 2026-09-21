@@ -1634,7 +1634,7 @@ def _refuse_comparison_criterion(criterion: Any) -> None:
 #: Per-cell mesh-geometry nodes (``domain.cell_*``). A criterion built from one of these is already
 #: one value per cell and is EVALUATED; anything else is a field and is ASSEMBLED. Recognised by name
 #: rather than by "carries no trial function", which was the first rule here and was wrong: a field
-#: criterion need not reference the solution at all (`d.by_region({...})`, a coordinate expression, a
+#: criterion need not reference the solution at all (`d._by_region({...})`, a coordinate expression, a
 #: constant), and every one of those was misrouted into the geometry path and died evaluating a weak
 #: form standalone.
 _PER_CELL_NODES = ("cell_volume", "cell_angles", "cell_aspect")
@@ -2565,7 +2565,7 @@ class AdaptSpec:
 
     Any jNO expression of the solution and the coordinates: ``jno.np.abs(ui.x)`` for a gradient
     detector, ``phi * (1 - phi)`` for a phase-field interface, ``jno.np.abs(uy.x - ux.y)`` for 2-D
-    vorticity, ``d.by_region({...})`` to refine a material. It needs **no test function** -- one is
+    vorticity, ``d._by_region({...})`` to refine a material. It needs **no test function** -- one is
     supplied internally (:func:`_criterion_weak_term`), because a criterion is a field, not an equation.
 
     This is how refinement is specified in production AMR codes, which mark on physical quantities
