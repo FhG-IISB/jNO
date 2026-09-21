@@ -272,6 +272,32 @@ def _is_facet_predicate(where) -> bool:
     return len(params) == 3 and params[1] in ("n", "normal", "normals") and params[2] in ("name", "names")
 
 
+def _describe_constructor(constructor) -> str:
+    """A short description of what a domain was built from.
+
+    The bare ``{constructor}`` interpolation dumped the whole shape dataclass -- ``_node``,
+    ``_mesh_order``, ``_structured``, ``_attach`` and every polygon vertex, ~400 characters of
+    internals to say "a two-region shape". Name the regions instead; that is the part a reader
+    is checking.
+    """
+    try:
+        if isinstance(constructor, (str, bytes)):
+            return str(constructor)
+        items = getattr(constructor, "_region_items", None)
+        if callable(items):
+            names = [str(n) for n, _sub in items() if n]
+            if len(names) > 1:
+                return f"shape with {len(names)} regions {names}"
+            if names:
+                return f"shape region {names[0]!r}"
+        node = getattr(constructor, "_node", None)
+        kind = node[0] if isinstance(node, tuple) and node else type(constructor).__name__
+        dim = getattr(constructor, "dim", None)
+        return f"shape ({kind}{f', dim {dim}' if dim else ''})"
+    except Exception:  # noqa: BLE001 - a log line must never be the thing that fails a build
+        return type(constructor).__name__
+
+
 def _point_normals_from_facets(sub, sub_n, bpts, dim):
     """Per-point outward normal for a facet subset: average the incident facet normals at each point.
 
@@ -652,7 +678,7 @@ class domain(MeshIOMixin):
                 self.log.info(f"Loaded NPZ coordinate tags from {constructor}")
             else:
                 self._load_mesh(constructor)
-                self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
+                self.log.info(f"Loaded mesh from {_describe_constructor(constructor)}")  # type: ignore[attr-defined]
         elif callable(constructor):
             # A `jno.shape` whose membership and extent are closed-form does NOT get meshed here.
             # It can be tagged and sampled from the geometry, which is everything a PINN needs, and
@@ -697,7 +723,7 @@ class domain(MeshIOMixin):
                 if _why_eager is not None:
                     self.log.info(f"This plan cannot be sampled mesh-free ({_why_eager}); meshing it.")
                 self._generate_mesh(constructor, algorithm)
-                self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
+                self.log.info(f"Loaded mesh from {_describe_constructor(constructor)}")  # type: ignore[attr-defined]
             # A shape.regions() plan carries named sub-region shapes; remember them so jno.fem
             # per-region integration can restrict a term to a region's cells (centroid membership
             # via the region shape's ``contains`` — see ``_cell_region_mask``).
@@ -2297,7 +2323,7 @@ class domain(MeshIOMixin):
         expr = _masked_sum(values, RegionMask, default, what="attach", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
-        get_logger().info(f"attach: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
+        get_logger().debug(f"attach: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
         return expr
 
     def _by_tag(self, values, *, default=None):
@@ -2332,7 +2358,7 @@ class domain(MeshIOMixin):
                 f"(``domain.tag(name, where)``). Known tags: {sorted(valid)}."
             )
         expr = _masked_sum(values, TagMask, default, what="attach", key="tag")
-        get_logger().info(f"attach: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
+        get_logger().debug(f"attach: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
         return expr
 
     #: Key under which a bare ``attach(**props)`` stores its value. Not a legal region or tag name,

@@ -1242,6 +1242,36 @@ def _tie_phase(bare: Any) -> Optional[complex]:
     return None
 
 
+def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None) -> str:
+    """One line naming the route a ``solve()`` actually took.
+
+    Which solver ran is currently unknowable from the outside, and it is not a detail: the same
+    elasto-plastic march measured 1194 s on the matrix-free default and 14.6 s with a sparse-direct
+    tangent. A user who cannot see which one ran cannot see that difference either.
+    """
+    _DIRECT = {"lu", "dense", "pardiso", "cudss", "sparse_lu", "direct"}
+
+    def _nm(spec, default):
+        return default if spec is None else (getattr(spec, "name", None) or type(spec).__name__.lower())
+
+    def _lin(default="bicgstab (matrix-free)"):
+        """The inner linear solver, and its preconditioner only if it HAS one. A direct factorisation
+        does not, and printing `precond jacobi` beside `lu` states something untrue."""
+        name = _nm(linear, default)
+        if str(name).split("(")[0].strip() in _DIRECT:
+            return str(name)
+        return f"{name} + {_nm(precond, 'jacobi')}"
+
+    mode = fem_obj._mode
+    if mode == "transient":
+        step = _nm(time, "theta(1) backward-Euler")
+        inner = _nm(nonlinear, "newton-krylov") if not fem_obj.is_linear else _lin()
+        return f"solve: transient · {step} · per step {inner}"
+    if mode == "nonlinear":
+        return f"solve: nonlinear · {_nm(nonlinear, 'newton-krylov (JFNK)')} · inner {_lin()}"
+    return f"solve: {mode} · {_lin()}"
+
+
 def _component_index_of(node: Any) -> Optional[int]:
     """If ``node`` is a single component of the trial (``u[..., i]``), return ``i``.
 
@@ -1810,6 +1840,15 @@ class FEM:
         return self._mode == "transient"
 
     @property
+    def mode(self) -> str:
+        """The route fixed at build: ``"linear"``, ``"nonlinear"``, ``"transient"`` or ``"complex"``.
+
+        Public because it is the first question anyone asks of a built form, and because every
+        ``solve()`` behaviour follows from it -- reading it off ``_mode`` meant reaching for a
+        private attribute to learn the single most load-bearing fact about your own problem."""
+        return self._mode
+
+    @property
     def is_linear(self) -> bool:
         if self._mode == "transient":
             return bool(self._op.is_linear())
@@ -1982,7 +2021,56 @@ class FEM:
             u = u - mask * (_weighted(load, u) / total)
         return u
 
-    def solve(
+    def solve(self, *args, **kwargs):
+        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature."""
+        import time as _time
+
+        from .utils.logger import get_logger
+
+        _t0 = _time.perf_counter()
+        out = self._solve_inner(*args, **kwargs)
+        get_logger().info(self._solved_line(out, _time.perf_counter() - _t0))
+        return out
+
+    def _solved_line(self, out, wall: float) -> str:
+        """What the solve actually produced -- the line that says whether to trust it.
+
+        A solve that did not raise can still be wrong in two ways a user cannot see: it can return
+        all zeros (an empty load vector), and it can return a vector that does not solve the system
+        (a stalled Krylov run that squeaked under its gate). So report the SOLUTION RANGE and, when
+        the operator is to hand, the relative residual ||Au-b||/||b||. Both are cheap; neither
+        forces a lazy result, which would defeat the point of returning a trace node.
+        """
+        import numpy as _np
+
+        try:
+            parts = [f"solved: {self._mode} · {wall:.3g} s"]
+            arr = None
+            if isinstance(out, (_np.ndarray, jnp.ndarray)) or hasattr(out, "__array__"):
+                try:
+                    arr = _np.asarray(out)
+                except Exception:  # noqa: BLE001 - a lazy node refuses conversion; that is fine
+                    arr = None
+            if arr is None or arr.dtype == object or arr.ndim == 0:
+                return parts[0] + " · deferred (trace node) — evaluate through jno.core"
+            finite = _np.isfinite(arr)
+            if not finite.all():
+                parts.append(f"**{int((~finite).sum())} non-finite entries**")
+            else:
+                parts.append(f"u in [{arr.min():.4g}, {arr.max():.4g}]")
+                if _np.allclose(arr, 0.0):
+                    parts.append("ALL ZERO — is the load term present?")
+            A, b = getattr(self, "_A", None), getattr(self, "_b", None)
+            if A is not None and b is not None and arr.size == _np.asarray(b).size:
+                bb = _np.asarray(b).reshape(-1)
+                r = _np.asarray(A @ jnp.asarray(arr.reshape(-1))).reshape(-1) - bb
+                den = float(_np.linalg.norm(bb)) or 1.0
+                parts.append(f"rel.residual {float(_np.linalg.norm(r)) / den:.2e}")
+            return " · ".join(parts)
+        except Exception:  # noqa: BLE001 - a log line must never be what fails a solve
+            return f"solved: {self._mode} · {wall:.3g} s"
+
+    def _solve_inner(
         self,
         solve_fn=None,
         *,
@@ -2126,6 +2214,13 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
         """
+        # ONE site, in the public entry: the mode-specific paths below return at different points
+        # (nonlinear and transient both bypass `_compose_slots`), so logging inside them left two of
+        # the three modes silent about which solver actually ran.
+        from .utils.logger import get_logger
+
+        get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
+
         # Structural singularity is checked at BUILD and reported HERE. A form whose terms cover only
         # part of the mesh is a legitimate object -- `jno.core([femL, fdmR, ...])` and `jno.dd.couple`
         # are built from exactly those, one per subdomain -- so refusing to construct it is wrong. It
@@ -5868,6 +5963,13 @@ def _fem_impl(
                 "subdomain of a coupling, it is not an error: build it, and let `jno.core` / "
                 "`jno.dd.couple` solve it together with its partner."
             )
+        # The one line that says whether jNO understood the problem: the mode it fixed, the dof
+        # count, and how EVERY term was classified. All of it already existed on the object -- it was
+        # only ever visible to someone who typed `fem` in a REPL, so a script showed gmsh progress
+        # and nothing about its own physics.
+        from .utils.logger import get_logger
+
+        get_logger().info(str(out))
         return out
 
     volume_terms: List[Any] = []
