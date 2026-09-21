@@ -245,6 +245,19 @@ def _spectral_diff(values_flat, shape, spacing, axis: int, order: int, *, mirror
     return jnp.concatenate([out, first], axis=axis).reshape(-1)
 
 
+def _mesh_points(domain):
+    """The domain's mesh nodes as a JAX array that stays **concrete** under ``jit``.
+
+    ``jnp.asarray`` of a host array inside a trace returns a tracer, and a traced point set sent
+    :meth:`TraceEvaluator._map_mesh_to_sampled` to its in-graph fallback: an ``N × N`` distance
+    reduction on every residual call. Measured in a compiled strong-form solve: 0.2 s per residual at
+    16k nodes and 3.8 s at 66k, while ``origin/main`` was killed at 66k. Built under
+    ``ensure_compile_time_eval`` the constant stays concrete, so the nearest-node map is resolved once
+    on the host. Points that really are traced (a moving mesh) stay traced, and gradients flow as before."""
+    with jax.ensure_compile_time_eval():
+        return jnp.asarray(domain.mesh_connectivity["points"])
+
+
 class _MeshCtx(NamedTuple):
     """What a mesh-field kernel needs from the domain: the nodes, the count, and the domain itself."""
 
@@ -392,6 +405,7 @@ class TraceEvaluator:
         self._logged_schemes: Dict[str, str] = {}
         self._nn_index_cache: Dict = {}  # (mesh, sampled) point-set geometry -> nearest-vertex gather index
         self._mesh_eval_cache: Dict = {}  # (target, tag, points, context) -> target sampled on the mesh
+        self._mesh_points_cache: Dict = {}  # id(domain) -> (domain, its mesh points), per expression
 
     # ------------------------------------------------------------------
     # Evaluation context — lightweight carrier replacing 5 positional args
@@ -428,6 +442,7 @@ class TraceEvaluator:
         # Sharing between FD derivative nodes is scoped to one expression: the cache
         # keys hold identities that only exist inside this call.
         self._mesh_eval_cache.clear()
+        self._mesh_points_cache.clear()
         return self._dispatch(expr, ctx)
 
     # ------------------------------------------------------------------
@@ -716,7 +731,7 @@ class TraceEvaluator:
         domain = getattr(bound_var, "_domain", None)
         if domain is None or getattr(domain, "mesh_connectivity", None) is None:
             raise ValueError(f"scheme={family!r} requires a domain with mesh connectivity.")
-        mesh_points = jnp.array(domain.mesh_connectivity["points"])
+        mesh_points = self._domain_points(domain)
         mesh = _MeshCtx(mesh_points, int(mesh_points.shape[0]), domain, int(domain.mesh_connectivity["dimension"]))
 
         u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
@@ -751,6 +766,14 @@ class TraceEvaluator:
             result = self._map_mesh_to_sampled(mesh_points, points, comps[0])
             return result[:, jnp.newaxis] if result.ndim == 1 else result
         return self._map_mesh_to_sampled(mesh_points, points, jnp.stack(comps, axis=-1))
+
+    def _domain_points(self, domain):
+        """:func:`_mesh_points` for ``domain``, one array per expression: sibling FD derivatives key their
+        shared mesh evaluation (:meth:`_target_on_mesh`) on the identity of this array."""
+        hit = self._mesh_points_cache.get(id(domain))
+        if hit is None:
+            hit = self._mesh_points_cache[id(domain)] = (domain, _mesh_points(domain))
+        return hit[1]
 
     def _target_on_mesh(self, target, tag, mesh_points, ctx):
         """Evaluate ``target`` with the spatial tag ``tag`` bound to the whole mesh point set.
@@ -1330,7 +1353,7 @@ class TraceEvaluator:
             mesh_dim = int(mesh_points.shape[-1])
         else:
             mesh_dim = int(domain.mesh_connectivity["dimension"])
-            mesh_points = jnp.asarray(domain.mesh_connectivity["points"])[:, :mesh_dim]
+            mesh_points = self._domain_points(domain)[:, :mesh_dim]
 
         tag = getattr(expr, "_coord_tag", None)
         pts = ctx.context.get(tag) if tag is not None else None
@@ -1381,7 +1404,7 @@ class TraceEvaluator:
         domain = getattr(normal_var, "_domain", None)
         if domain is None or getattr(domain, "mesh_connectivity", None) is None:
             raise ValueError("normal-derivative eval requires the normal variable to carry a mesh domain.")
-        mesh_points = jnp.asarray(domain.mesh_connectivity["points"])
+        mesh_points = self._domain_points(domain)
         mesh_dim = int(domain.mesh_connectivity["dimension"])
 
         # nodal values of the target over the WHOLE mesh (FD stencils need the full field, not just the

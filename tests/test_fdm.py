@@ -1316,3 +1316,30 @@ def test_upwinding_written_with_cell_size_matches_the_upwind_matrix():
     ref = ref_int[ix[inner] - 1, iy[inner] - 1]
     assert np.allclose(sol[inner], ref, atol=1e-8), np.abs(sol[inner] - ref).max()
     assert sol.max() < 1.0
+
+
+# ---- the compiled steady solve -------------------------------------------------------------------------
+
+
+def _structured_poisson(h=0.05):
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    return d, u, jno.fdm([-(ui.xx + ui.yy) - f, u(xb, yb) - 0.0])
+
+
+def test_compiled_residual_has_no_all_pairs_distance():
+    """Under `jit` the mesh points used to become tracers, which sent every mesh derivative to the
+    in-graph nearest-node fallback: an N×N×dim distance tensor per residual call. That was 0.2 s per
+    residual at 16k nodes and 3.8 s at 66k, and `origin/main` was killed at 66k. No intermediate of the
+    compiled residual may be quadratic in N."""
+    d, _, prob = _structured_poisson(0.05)
+    n = prob._N
+    jaxpr = jax.make_jaxpr(prob._pde_residual_fn())(jnp.ones(n))
+    biggest = max(int(np.prod(v.aval.shape)) for e in jaxpr.jaxpr.eqns for v in e.outvars if hasattr(v.aval, "shape"))
+    assert biggest < 16 * n, f"an intermediate of size {biggest} for N = {n}"
