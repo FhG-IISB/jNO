@@ -15,10 +15,14 @@ The shape is measured as a Fourier mode of ``r(theta)`` and fitted with a damped
 aspect ratio and extremum counting are NOT adequate: on this signal they returned +7.4/s and -1.6/s for
 the SAME run over different spans.
 
-**The stabilisation must be scaled for this regime.** ``tau`` as written for advection-dominated flow
-(the Kovasznay/stabilised-flow recipe) contributes about ten times the physical damping here and drives a
-spurious n = 4 mode, because a capillary drop is nearly inviscid and nearly stagnant. ``TAU_SCALE`` below
-is what makes the physics come out; the second test pins the trap.
+**The stabilisation needs no scaling.** This file used to say the opposite: that the SUPG/PSPG ``tau``
+of the stabilised-flow recipe over-damps a capillary drop tenfold (omega 0.23 against Lamb's 63.91) and
+feeds a spurious n = 4 mode (x9.7), so it had to be scaled by 1e-4. That was an ASSEMBLY defect, not
+physics: the stabilisation products contain ``u_t`` inside the strong residual, and the transient assembler
+routed each such product whole into the mass matrix. #140 splits them by temporal order (and refuses the
+spellings it cannot split). With that, the recipe exactly as written rings at omega within 0.4 % of Lamb,
+decays at 0.89x the viscous rate, and leaves n = 4 at its initial amplitude -- identical to tau x 1e-4.
+Both tests below march the UNSCALED recipe, so they fail if that assembly regresses.
 """
 
 import jax
@@ -30,7 +34,6 @@ import jno
 RHO, SIGMA, ETA, C_I = 1.0, 10.0, 0.01, 36.0
 NU = ETA / RHO
 REQ, K, H, DT, NSTEP, NPTS = 0.2449, 1.05, 0.05, 5e-4, 400, 48
-TAU_SCALE = 1e-4
 W_LAMB = np.sqrt(6.0 * SIGMA / (RHO * REQ**3))  # n = 2
 GAMMA_VISC = 4.0 * NU / REQ**2  # 2n(n-1) nu / R^2 at n = 2
 
@@ -120,21 +123,44 @@ def _fit(t, a2):
     return abs(float(popt[2])), float(popt[1]), resid
 
 
-def test_a_drop_rings_at_lambs_frequency_and_decays_at_the_viscous_rate():
-    w, g, resid = _fit(*_mode2(_march(TAU_SCALE)))
+@pytest.fixture(scope="module")
+def _unscaled():
+    """One march of the stabilised-flow recipe exactly as written (tau scale 1), shared by both tests."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        return _march(1.0)
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def _mode(traj, n):
+    """|n-th Fourier amplitude| of r(theta) on the free surface, frame by frame."""
+    from jno.utils.solver.fem_adapt import _boundary_edges_from_triangles
+
+    bnd = np.unique(np.asarray(_boundary_edges_from_triangles(np.asarray(traj.meshes[0][1]))).reshape(-1))
+    out = []
+    for m in traj.meshes:
+        X = np.asarray(m[0])[bnd]
+        Xc = X - X.mean(0)
+        th = np.arctan2(Xc[:, 1], Xc[:, 0])
+        r = np.hypot(Xc[:, 0], Xc[:, 1])
+        out.append(2.0 * np.hypot(np.mean(r * np.cos(n * th)), np.mean(r * np.sin(n * th))) / r.mean())
+    return np.asarray(out)
+
+
+def test_a_drop_rings_at_lambs_frequency_and_decays_at_the_viscous_rate(_unscaled):
+    w, g, resid = _fit(*_mode2(_unscaled))
     assert resid < 0.05, f"not a damped sinusoid (residual {resid:.3f})"
     assert w == pytest.approx(W_LAMB, rel=0.03), f"omega {w:.2f} against Lamb {W_LAMB:.2f}"
     assert g == pytest.approx(GAMMA_VISC, rel=0.30), f"gamma {g:.3f} against viscous {GAMMA_VISC:.3f}"
 
 
-def test_the_advection_stabilisation_over_damps_a_capillary_drop():
-    """The same drop with the stabilised-flow recipe's ``tau``: it does not ring at all.
+def test_the_stabilisation_does_not_excite_the_n4_mode(_unscaled):
+    """The ellipse is an n = 2 perturbation; n = 4 is present only as its small geometric harmonic.
 
-    Measured here: ``omega`` collapses to 0.23 against Lamb's 63.91 -- the fit degenerates to a pure decay
-    -- and the amplitude creeps through zero (0.0732 -> -0.0099) instead of oscillating about it, at 4.5x
-    the viscous rate. A capillary drop is nearly inviscid and nearly stagnant, the opposite of the regime
-    that ``tau`` was built for. Nothing warns; only the oracle catches it.
+    With the stabilisation products mis-assembled (before #140) that harmonic grew x9.7 over the run and
+    n = 2 stopped oscillating altogether. Assembled correctly it never exceeds its initial amplitude.
     """
-    w, g, _resid = _fit(*_mode2(_march(1.0)))
-    assert w < 0.5 * W_LAMB, f"omega {w:.2f}: the over-damping trap seems gone (Lamb {W_LAMB:.2f})"
-    assert g > 2.0 * GAMMA_VISC, f"gamma {g:.3f} against viscous {GAMMA_VISC:.3f}"
+    a4 = _mode(_unscaled, 4)
+    assert a4.max() <= 1.05 * a4[0], f"n = 4 grew x{a4.max() / a4[0]:.2f}: the stabilisation is feeding it"
