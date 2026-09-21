@@ -154,10 +154,17 @@ def _info_fem(f, deep: bool) -> Info:
         form.append(("time window", f"[{getattr(f, 't0', '?')}, {getattr(f, 't1', '?')}]"))
     if getattr(f, "_periodic", None) is not None:
         form.append(("periodic", "yes — solved in the reduced space, then prolonged"))
+    rpe = getattr(getattr(f, "_op", None), "runtime_parameter_exprs", None)
+    if rpe:
+        form.append(("runtime parameters", ", ".join(sorted(map(str, rpe)))))
     if getattr(f, "_saddle_blocks", None):
         form.append(("saddle blocks", ", ".join(map(str, f._saddle_blocks))))
 
     terms: list = [(f"[{i}]", c) for i, c in enumerate(f.classification or [])]
+    given = len(getattr(f, "_constraints", None) or [])
+    if given and given != len(f.classification or []):
+        terms.append(("", f"— {len(f.classification or [])} of {given} terms appear here; the rest "
+                          f"(a periodic tie, a gauge) carry no classification entry"))
 
     blocks: list = []
     offs = list(getattr(f, "offsets", None) or [])
@@ -429,7 +436,11 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
                 nodes.extend(v for v in val.values() if isinstance(v, Variable))
             elif isinstance(val, Variable):
                 nodes.append(val)
-    what: list = [("type", type(e).__name__)]
+    nm = getattr(e, "_name", None) or ""
+    if isinstance(nm, str) and "solve" in nm:
+        what: list = [("type", f"a DEFERRED {nm} — the solve runs when you evaluate it through jno.core")]
+    else:
+        what = [("type", type(e).__name__)]
     op = getattr(e, "op", None)
     if isinstance(op, str):
         what.append(("operator", op))
@@ -448,16 +459,19 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
         reads.append(("regions", ", ".join(sorted(map(str, spatial)))))
     if temporal:
         reads.append(("temporal", "yes"))
-    found = []
+    nets, params = set(), set()
     for n in nodes:
         m = n.model if type(n).__name__ == "ModelCall" and hasattr(n, "model") else (n if isinstance(n, Model) else None)
-        if m is not None:
-            nm = getattr(m, "name", None)
-            arch = type(getattr(m, "module", None)).__name__
-            found.append(f"{arch}" + (f" ({nm})" if isinstance(nm, str) and nm else ""))
-    models = set(found)
-    if models:
-        reads.append(("networks", ", ".join(sorted(map(str, models)))))
+        if m is None:
+            continue
+        nm = getattr(m, "name", None)
+        arch = type(getattr(m, "module", None)).__name__
+        label = arch + (f" ({nm})" if isinstance(nm, str) and nm else "")
+        (params if arch == "_Parameter" else nets).add(label)
+    if nets:
+        reads.append(("networks", ", ".join(sorted(nets))))
+    if params:
+        reads.append(("trainable parameters", ", ".join(sorted(params)).replace("_Parameter ", "")))
     tri = [n for n in nodes if isinstance(n, TrialFunction)]
     tst = [n for n in nodes if isinstance(n, TestFunction)]
     if tri or tst:
@@ -546,7 +560,7 @@ def _info_model(m, deep: bool) -> Info:
         val = getattr(m, attr, None)
         if isinstance(val, (str, int, float, bool)) and str(val):
             rows.append((label, str(val)))
-    if getattr(m, "frozen", None):
+    if getattr(m, "_frozen", False):
         rows.append(("frozen", "yes — excluded from the optimizer"))
     return Info(f"model · {nm if isinstance(nm, str) and nm else type(mod).__name__}", [("", rows)])
 
@@ -631,6 +645,14 @@ def _info_result(r, deep: bool, context=None) -> Info:
     offs = list(getattr(context, "offsets", None) or [])
     keys = list(getattr(context, "_block_field_keys", None) or [])
     flat = a.reshape(-1)
+    if len(offs) > 1 and a.ndim == 2 and a.shape[-1] == offs[-1]:
+        blocks.append(("", f"{a.shape[0]} time steps x {a.shape[1]} dofs"))
+        for i in range(len(offs) - 1):
+            seg = a[:, offs[i]:offs[i + 1]]
+            nm2 = f"field {keys[i]}" if i < len(keys) else f"block {i}"
+            rng = f"[{seg.min():.6g}, {seg.max():.6g}]" if seg.size else "(empty)"
+            blocks.append((nm2, f"{_fmt_n(seg.shape[1])} dofs · {rng}  (over all steps)"))
+        return Info("result", [("array", rows), ("by field block", blocks)])
     if len(offs) > 1 and offs[-1] == flat.size:
         for i in range(len(offs) - 1):
             seg = flat[offs[i]:offs[i + 1]]

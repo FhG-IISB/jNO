@@ -389,3 +389,70 @@ def test_core_finds_an_optimizer_attached_to_the_net():
 def test_replicated_domain_reports_its_sample_count():
     dom, *_rest = _deeponet_problem(n_samples=4)
     assert jno.info(dom).as_dict()["geometry"]["samples"] == "4"
+
+
+# ---------------------------------------------------------------------------
+# Composed scenarios: a FEM solve inside a core, a periodic tie, a frozen model,
+# a trajectory. These break assumptions that any single subsystem satisfies.
+# ---------------------------------------------------------------------------
+
+
+def test_a_deferred_fem_solve_says_it_is_one():
+    """`fem.solve()` inside a core returns a FunctionCall. Reported as an anonymous expression it
+    said nothing; it is the whole inverse-problem path."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.fem_symbols()
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    kappa = 1.0 + jno.np.parameter((), name="kappa")
+    node = jno.fem([kappa * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0]).solve()
+    data = jno.info(node).as_dict()
+    assert "DEFERRED" in data["what"]["type"] and "fem_solve" in data["what"]["type"]
+    # a trainable parameter is NOT a network, and calling it one hides what it is
+    assert "kappa" in data["reads"]["trainable parameters"]
+    assert "networks" not in data["reads"]
+
+
+def test_classification_admits_when_it_does_not_cover_every_term():
+    """A periodic tie carries no classification entry, so the section listed 2 of the 3 terms given
+    while implying it listed them all."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
+    x, y, _ = d.variable("interior", split=True)
+    l = d.variable("left", split=True)
+    r = d.variable("right", split=True)
+    b = d.variable("bottom", split=True)
+    u, v = d.fem_symbols()
+    a, t = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    f = jno.fem([a.x * t.x + a.y * t.y - 1.0 * t,
+                 u(l[0], l[1]) - u(r[0], r[1]), u(b[0], b[1]) - 0.0])
+    rep = jno.info(f)
+    assert "periodic" in rep.as_dict()["form"]
+    assert "2 of 3 terms appear here" in str(rep)
+
+
+def test_a_frozen_model_is_marked_frozen():
+    """The flag is `_frozen`; there is no public `frozen`, so the check never fired."""
+    import foundax
+
+    net = jno.nn(foundax.mlp(2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
+    net.freeze()
+    assert "frozen" in jno.info(net).as_dict()[""]
+
+
+def test_a_transient_trajectory_splits_along_the_dof_axis():
+    """A trajectory is (n_steps, n_dofs) — splitting the FLATTENED vector on the form's offsets
+    does not line up, and the first version simply gave up on it."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain(time=(0.0, 0.4, 4))
+    x, y, t = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    c = d.variable("initial", split=True)
+    u, v = d.fem_symbols()
+    a, w = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    f = jno.fem([a.t * w + 0.1 * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0,
+                 u(c[0], c[1], c[2]) - jno.np.sin(np.pi * c[0])])
+    node = f.solve()
+    traj = np.asarray(jno.core([node.mse]).eval([node]))
+    blocks = jno.info(traj, context=f).as_dict()["by field block"]
+    assert any("time steps" in v for v in blocks.values())
+    assert any("over all steps" in v for v in blocks.values())
