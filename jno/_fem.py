@@ -2091,9 +2091,10 @@ class FEM:
 
         A solve that did not raise can still be wrong in two ways a user cannot see: it can return
         all zeros (an empty load vector), and it can return a vector that does not solve the system
-        (a stalled Krylov run that squeaked under its gate). So report the SOLUTION RANGE and, when
-        the operator is to hand, the relative residual ||Au-b||/||b||. Both are cheap; neither
-        forces a lazy result, which would defeat the point of returning a trace node.
+        (a stalled Krylov run that squeaked under its gate). The first is caught here, from the
+        SOLUTION RANGE; the second by the solve's own residual gate, which raises -- and
+        ``jno.info(sol, context=fem)`` reports ||Au-b||/||b|| on request. Nothing here forces a lazy
+        result, which would defeat the point of returning a trace node.
         """
         import numpy as _np
 
@@ -2115,19 +2116,19 @@ class FEM:
                     f"the solve runs when you evaluate it through jno.core"
                     + (f" · {march}" if march else "")
                 )
-            # Everything is reduced WHERE THE SOLUTION LIVES and only six scalars cross to the host,
-            # in one transfer. The first version copied the whole vector to the host, back to the
-            # device for the residual matvec, and the residual back again -- three full-vector
-            # transfers per solve on a GPU, for a log line.
+            # Reduced WHERE THE SOLUTION LIVES; four scalars cross to the host in one transfer.
+            # Measured at 73k dofs on an RTX 3070: 0.32 ms, against a 63 ms solve.
+            #
+            # No residual here, deliberately. ||Au - b|| costs a sparse matvec, and one matvec was
+            # 6.7 ms of that 63 ms solve (6.1 ms even jitted) -- 10 % of every solve, for a log
+            # line. It is also redundant: every linear solve already gates on its own residual and
+            # RAISES when it did not converge. It is computed on request instead, by
+            # `jno.info(sol, context=fem)`. (The first version also copied the whole vector to the
+            # host and back: three full-vector transfers per GPU solve.)
             flat = jnp.asarray(out).reshape(-1)
             cplx = bool(jnp.iscomplexobj(flat))
             mag = jnp.abs(flat) if cplx else flat
             vals = [jnp.sum(~jnp.isfinite(flat)), jnp.min(mag), jnp.max(mag), jnp.max(jnp.abs(flat))]
-            A, b = getattr(self, "_A", None), getattr(self, "_b", None)
-            has_res = A is not None and b is not None and int(jnp.size(b)) == int(flat.size)
-            if has_res:
-                bb = jnp.asarray(b).reshape(-1)
-                vals += [jnp.linalg.norm(A @ flat - bb), jnp.linalg.norm(bb)]
             q = _np.asarray(jnp.stack([jnp.real(jnp.asarray(v)).astype(jnp.real(mag).dtype) for v in vals]))
             n_bad, lo, hi, amax = int(q[0]), float(q[1]), float(q[2]), float(q[3])
             if n_bad:
@@ -2136,8 +2137,6 @@ class FEM:
                 parts.append(f"{'|u|' if cplx else 'u'} in [{lo:.4g}, {hi:.4g}]")
                 if amax <= 1e-8:
                     parts.append("ALL ZERO — is the load term present?")
-            if has_res:
-                parts.append(f"rel.residual {float(q[4]) / (float(q[5]) or 1.0):.2e}")
             return " · ".join(parts)
         except Exception:  # noqa: BLE001 - a log line must never be what fails a solve
             return f"solved: {self._mode} · {wall:.3g} s"

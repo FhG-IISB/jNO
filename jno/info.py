@@ -1030,6 +1030,20 @@ def _info_result(r, deep: bool, context=None) -> Info:
             rows.append(("note", "ALL ZERO"))
     rows.append(("norm", f"{np.linalg.norm(a.reshape(-1)):.6g}"))
 
+    # ||Au - b|| / ||b||, on request. It costs a sparse matvec (6.7 ms against a 63 ms solve at 73k
+    # dofs on a GPU), which is why the per-solve log line no longer computes it.
+    A, b = getattr(context, "_A", None), getattr(context, "_b", None)
+    if A is not None and b is not None and np.size(b) == a.size:
+        try:
+            import jax.numpy as jnp
+
+            bb = jnp.asarray(b).reshape(-1)
+            num = float(jnp.linalg.norm(A @ jnp.asarray(a).reshape(-1) - bb))
+            den = float(jnp.linalg.norm(bb)) or 1.0
+            rows.append(("rel. residual", f"{num / den:.3e}   ‖Au − b‖ / ‖b‖ against the form's operator"))
+        except Exception as e:  # noqa: BLE001
+            rows.append(("rel. residual", f"unavailable ({type(e).__name__})"))
+
     blocks: list = []
     offs = list(getattr(context, "offsets", None) or [])
     labels = _block_labels(context) if context is not None else []

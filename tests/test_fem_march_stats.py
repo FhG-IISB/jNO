@@ -183,3 +183,39 @@ def test_a_steady_solve_has_no_march_record():
     fem.solve()
     assert fem.stats["march"] is None
     assert "march" not in [s for s, _ in jno.info(fem).sections]
+
+
+# --------------------------------------------------------------------------------------------------
+# Reporting must not cost the solve anything it did not already pay.
+# --------------------------------------------------------------------------------------------------
+def _poisson():
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
+    x, y, _ = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    u, v = d.fem_symbols()
+    a, t = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    return jno.fem([a.x * t.x + a.y * t.y - 1.0 * t, u(b[0], b[1]) - 0.0])
+
+
+def test_the_post_solve_line_does_no_matvec():
+    """A residual matvec in the log line was 10 % of every GPU solve (6.7 of 63 ms at 73k dofs), and
+    redundant with the solve's own residual gate. The line must work with no operator products."""
+    fem = _poisson()
+    out = fem.solve()
+
+    class NoMatvec:
+        def __matmul__(self, other):
+            raise AssertionError("the post-solve log line computed a matvec")
+
+    fem._A = NoMatvec()
+    line = fem._solved_line(out, 0.1)
+    assert "u in [0, " in line  # the range survived: nothing in the line touched the operator
+
+
+def test_the_residual_is_reported_on_request():
+    fem = _poisson()
+    sol = fem.solve()
+    b = np.asarray(fem._b)
+    oracle = np.linalg.norm(np.asarray(fem._A @ sol) - b) / np.linalg.norm(b)
+    row = dict(jno.info(sol, context=fem).sections[0][1])["rel. residual"]
+    assert float(row.split()[0]) == pytest.approx(oracle, rel=1e-3)
