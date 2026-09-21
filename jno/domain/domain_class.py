@@ -2294,10 +2294,10 @@ class domain(MeshIOMixin):
                         "(and a `default` subtracted twice). A group that spans other groups cannot be "
                         "mixed with them in one call -- pass the parts, or pass the span, not both."
                     )
-        expr = _masked_sum(values, RegionMask, default, what="by_region", key="region")
+        expr = _masked_sum(values, RegionMask, default, what="attach", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
-        get_logger().info(f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
+        get_logger().info(f"attach: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
         return expr
 
     def _by_tag(self, values, *, default=None):
@@ -2331,8 +2331,8 @@ class domain(MeshIOMixin):
                 f"domain.attach: unknown tag(s) {sorted(unknown)}; each must be a boundary tag "
                 f"(``domain.tag(name, where)``). Known tags: {sorted(valid)}."
             )
-        expr = _masked_sum(values, TagMask, default, what="by_tag", key="tag")
-        get_logger().info(f"by_tag: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
+        expr = _masked_sum(values, TagMask, default, what="attach", key="tag")
+        get_logger().info(f"attach: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
         return expr
 
     #: Key under which a bare ``attach(**props)`` stores its value. Not a legal region or tag name,
