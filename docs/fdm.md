@@ -83,6 +83,22 @@ views therefore default to **finite differences**:
     near 1e-05 and broke the adjoint Krylov solve outright (a gradient wrong by twenty orders). The
     dtype now follows `jax_enable_x64`, and every stencil above is linear to 2e-16.
 
+### Variable coefficients — `(κ * ui.x).x`
+
+The partials `ui.x`, `ui.y`, `ui.z` of the bound field compose, so a divergence-form operator
+−∇·(κ∇u) is written exactly as on paper. κ can depend on the coordinates or on `u` itself:
+
+```python
+κ = 1.0 + x                      # or 1.0 + ui for a nonlinear diffusivity
+jno.fdm([-(κ * ui.x).x - (κ * ui.y).y - f, u(xb, yb) - 0.0]).solve()
+```
+
+!!! measured "Manufactured u = sin(πx)sin(πy), unstructured mesh, h = 0.1 → 0.05 → 0.025"
+    κ = 1 + x: 4.9e-2 → 1.2e-2 → 3.1e-3. κ = 1 + u: 5.1e-2 → 1.2e-2 → 3.0e-3. Both second order.
+
+Use `.x`, not `.d(x)`, on an expression like `κ * ui.x`: `.d(x)` asks for an autodiff derivative, which a
+nodal field cannot provide, so it raises.
+
 ### Choosing the stencil
 
 Every derivative view takes an optional `scheme=` — the *config stays on the operator it describes*.

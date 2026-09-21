@@ -1166,3 +1166,36 @@ def test_wave_guards(case):
     }[case]
     with pytest.raises((ValueError, NotImplementedError), match=match):
         jno.fdm(terms + [u(xb, yb) - 0.0]).solve()
+
+
+# ---- variable coefficients in divergence form: `(κ * ui.x).x` ------------------------------------------
+
+
+@pytest.mark.parametrize("nonlinear", [False, True])
+def test_divergence_form_coefficient_converges(nonlinear):
+    """−∇·(κ∇u) = f is written with the bound field's partials, `(κ * ui.x).x + (κ * ui.y).y`, for a
+    coordinate coefficient κ = 1 + x and for a nonlinear κ = 1 + u. Manufactured u = sin(πx)sin(πy);
+    both converge at second order (measured 4.9e-2 → 1.2e-2 → 3.1e-3 and 5.1e-2 → 1.2e-2 → 3.0e-3)."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    errs = []
+    for h in (0.1, 0.05):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        ue = jnn.sin(π * x) * jnn.sin(π * y)
+        if nonlinear:  # −∇·((1+u)∇u) = −(1+u)Δu − |∇u|²
+            κ = 1.0 + ui
+            grad2 = π**2 * ((jnn.cos(π * x) * jnn.sin(π * y)) ** 2 + (jnn.sin(π * x) * jnn.cos(π * y)) ** 2)
+            f = (1.0 + ue) * 2 * π**2 * ue - grad2
+        else:  # −∇·((1+x)∇u) = −u_x − (1+x)Δu
+            κ = 1.0 + x
+            f = -π * jnn.cos(π * x) * jnn.sin(π * y) + κ * 2 * π**2 * ue
+        sol = np.asarray(jno.fdm([-(κ * ui.x).x - (κ * ui.y).y - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+        p = _nodes(d)
+        exact = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+        errs.append(float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)))
+    assert errs[1] < 2e-2 and errs[0] / errs[1] > 3.0, f"expected O(h²): {errs}"
