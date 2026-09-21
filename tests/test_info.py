@@ -117,8 +117,7 @@ def test_env_info_x64_row_carries_the_remedy_when_it_is_off():
         assert "jax_enable_x64" in row and "before the first array" in row
 
 
-def test_fem_blocks_report_element_order():
-    """A Taylor-Hood pair is P2/P1, and which block is which is the assembler's order, not yours."""
+def _taylor_hood(p_first=False):
     d = jno.shape.rect(0, 0, 4, 1, size=0.5).domain()
     x, y, _ = d.variable("interior", split=True)
     l = d.variable("left", split=True)
@@ -126,11 +125,39 @@ def test_fem_blocks_report_element_order():
     p_, q_ = d.fem_symbols(names=("p", "q"))
     eu, ev = jno.np.symgrad(u, [x, y]), jno.np.symgrad(v, [x, y])
     pp, qq = p_.bind(x=x, y=y), q_.bind(x=x, y=y)
-    f = jno.fem([jno.np.inner(eu, ev, n_contract=2) - pp * jno.np.trace(ev), -qq * jno.np.trace(eu),
-                 u(l[0], l[1]) - (0.0, 0.0), p_.pin()])
-    blocks = list(jno.info(f).as_dict()["field blocks"].values())
-    assert any("P2" in b and "value_shape (2,)" in b for b in blocks)
-    assert any("P1" in b for b in blocks)
+    mom = (-pp * jno.np.trace(ev) + jno.np.inner(eu, ev, n_contract=2)) if p_first else \
+          (jno.np.inner(eu, ev, n_contract=2) - pp * jno.np.trace(ev))
+    return jno.fem([mom, -qq * jno.np.trace(eu), u(l[0], l[1]) - (0.0, 0.0), p_.pin()])
+
+
+def test_fem_blocks_are_named_by_their_trial_field_and_report_element_order():
+    """A Taylor-Hood pair is P2/P1. Blocks carry the TRIAL symbol's name -- they used to read
+    "field 1" / "field 3", internal op ids -- and never the test function's, which shares its key."""
+    blocks = jno.info(_taylor_hood()).as_dict()["field blocks"]
+    assert list(blocks) == ["u", "p"]
+    assert "P2" in blocks["u"] and "value_shape (2,)" in blocks["u"] and "P1" in blocks["p"]
+
+
+def test_fem_block_order_is_first_appearance_even_inside_a_term():
+    """What the docs claim: `-p*tr(ev) + ...` puts p first, and the report follows the offsets."""
+    f = _taylor_hood(p_first=True)
+    blocks = jno.info(f).as_dict()["field blocks"]
+    assert list(blocks) == ["p", "u"]
+    assert blocks["p"].startswith(f"dofs 0:{f.offsets[1]} ")
+
+
+def test_fields_sharing_a_name_keep_their_key():
+    d = _rect()
+    x, y, _ = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    T, s_ = d.fem_symbols()          # both default-named
+    C, r_ = d.fem_symbols()
+    Tb, sb = T.bind(x=x, y=y), s_.bind(x=x, y=y)
+    Cb, rb = C.bind(x=x, y=y), r_.bind(x=x, y=y)
+    f = jno.fem([Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb,
+                 T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0])
+    labels = list(jno.info(f).as_dict()["field blocks"])
+    assert len(set(labels)) == 2 and all("(field " in lab for lab in labels)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +284,7 @@ def test_coupled_form_reports_one_block_per_field():
     Cb, rb = C.bind(x=x, y=y), r_.bind(x=x, y=y)
     f = jno.fem([Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb,
                  T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0])
-    assert len(jno.info(f).as_dict()["field blocks"]) == 2
+    assert list(jno.info(f).as_dict()["field blocks"]) == ["T", "C"]
 
 
 @pytest.mark.parametrize("structured", [True, False])
@@ -704,3 +731,27 @@ def test_posterior_reports_rhat_ess_and_divergences():
     assert "divergences" in post
     # the true value is 3.14; a short chain is noisy, so this is a loose sanity bound only
     assert abs(float(post["mean / sd"].split("/")[0]) - 3.14) < 1.0
+
+
+def test_domain_tags_are_listed_once():
+    """The domain's own tag list repeats every tag on a shape-built domain; the report must not."""
+    d = (jno.shape.rect(0, 0, 2, 1, size=0.3) - jno.shape.disk(1, 0.5, 0.2)).domain()
+    d.variable("interior")
+    rep = jno.info(d)
+    names = [k for k, _ in next(rows for n, rows in rep.sections if n == "tags")]
+    assert len(names) == len(set(names))
+    assert {"interior", "boundary", "arc", "left", "right", "top", "bottom"} <= set(names)
+
+
+def test_an_unclassified_evolves_term_is_named_as_one():
+    """The note used to guess "(a periodic tie, a gauge)" for a form whose missing term was `.evolves`."""
+    grad, inner = jno.np.grad, jno.np.inner
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 3))
+    d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
+    co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    s, _ = d.fem_symbols(value_shape=())
+    f = jno.fem([inner(grad(u, X), grad(phi, X), 1) - 1.0 * phi + 0.0 * s.i(-1) * phi, s.evolves(s.i(-1)), u(*cb) - 0.0])
+    note = [v for k, v in next(rows for n, rows in jno.info(f).sections if n == "terms (as classified)") if k == ""]
+    assert note and note[0].endswith("1 state update (.evolves)")

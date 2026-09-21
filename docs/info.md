@@ -27,7 +27,7 @@ The small parts matter more than the assembled ones: the assembled object is whe
 something was wrong, and the small ones are where it went wrong. `Info.as_dict()` returns the same content as data, so a test can
 assert on structure rather than on formatted text.
 
-Two rules it keeps:
+Three rules it keeps:
 
 * **Cheap by default.** Anything costing an assembly sits behind `deep=True` — and `deep` itself
   stays **sparse**: symmetry and the empty-row count are computed from the operator's indices, not
@@ -85,29 +85,36 @@ Tag extents are the check that `lambda x, y: y > 1 - 1e-9` caught the edge you m
 
 ## A form
 
+A Taylor–Hood Stokes cavity (P2 velocity `u`, P1 pressure `p`, pinned):
+
 ```
   form
     mode           linear
-    dofs           374
+    dofs           350
     saddle blocks  p
   terms (as classified)
-    [0] volume   [1] volume   [2] dirichlet@left   [3] dirichlet@_gauge_pin_p
+    [0]  volume
+    [1]  volume
+    [2]  dirichlet@boundary[x]
+    [3]  dirichlet@boundary[y]
+    [4]  dirichlet@_gauge_pin_p
   field blocks
-    field 1  dofs 0:326  (326) · value_shape (2,) · P2
-    field 3  dofs 326:374  (48) · P1
+    u  dofs 0:306  (306) · value_shape (2,) · P2
+    p  dofs 306:350  (44) · P1
   operator
-    nnz               8,979  ·  fill 6.42e-02  ·  ~24.0/row
-    dense equivalent  1.1 MB
+    nnz               4,237  ·  fill 3.46e-02  ·  ~12.1/row
+    dense equivalent  957.0 kB
     dtype             float64
-    load ‖b‖          0   ← ALL ZERO
+    load ‖b‖          5.519
 ```
 
 **`terms (as classified)` is the important one.** It names every term by how jNO recognised it, so a
 boundary condition that landed nowhere is visible here rather than as a wrong answer later.
 
-**Field-block order is the assembler's, not yours.** Above, the pressure is block *3* even though
-the momentum term was written first — `offsets` indexes this order, so read it here before slicing a
-solution vector.
+**Field-block order is first appearance — including inside a term.** Blocks are numbered in the
+order each trial field first appears in the term list. Writing the momentum equation above as
+`-p*trace(grad v) + inner(grad u, grad v)` instead makes `p` block 0 (dofs 0:44) and `u` block 1.
+`offsets` indexes this order, so read it here before slicing a solution vector.
 
 `load ‖b‖ = 0` means the right-hand side is identically zero: the solve will return zeros with a
 *perfect* residual. A missing source term looks exactly like a converged solve without this line.
@@ -184,14 +191,17 @@ say.
 
 ```
   array
-    shape  (224,)   range [-6.90236, 1.19927]   norm 36.2271
+    shape  (350,)
+    dtype  float64
+    range  [-9.64035, 10.2115]
+    norm   22.7794
   by field block
-    field 1  194 dofs · [-6.90236, 1.19927]
-    field 3  30 dofs · [-1.05379, 0.524342]
+    u  306 dofs · [-0.246683, 1]
+    p  44 dofs · [-9.64035, 10.2115]
 ```
 
-`context=` splits the vector by the form's **own** `offsets`, which are the assembler's order and
-not the order you wrote the terms in. An adaptive transient returns a trajectory instead, and that
+`context=` splits the vector by the form's **own** `offsets` — first-appearance order, as above —
+and labels each block with its trial field's name. An adaptive transient returns a trajectory instead, and that
 reports frames, the time span, and the per-frame dof range.
 
 ## A Bayesian model — `jno.info(a)`

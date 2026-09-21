@@ -138,7 +138,8 @@ def _info_domain(d, deep: bool) -> Info:
     # is sampled lazily and never enters `_mesh_pool`, and the auto-created `interface_A_B` tags live
     # only in the boundary registry -- both were missing from this section, measured, on exactly the
     # domain-decomposition domains where they are the point.
-    listed = list(getattr(d, "avaiable_mesh_tags", None) or []) or list(pool)
+    # `avaiable_mesh_tags` lists every tag TWICE on a shape-built domain (measured); keep first order.
+    listed = list(dict.fromkeys(getattr(d, "avaiable_mesh_tags", None) or [])) or list(pool)
     seen_pairs = set()
     for tag in listed + [t for t in pool if t not in listed]:
         entry = breg.get(tag) if isinstance(breg.get(tag), dict) else {}
@@ -304,6 +305,40 @@ def _last_solve_rows(st):
     return rows
 
 
+def _block_labels(f) -> list:
+    """One label per field block: the TRIAL symbol's own name (``u``, ``p``), not the internal key.
+
+    The key is an op id -- "field 14" for the only field of a problem is noise. Test and trial
+    functions share a key, so only ``TrialFunction`` nodes are read (the first version of this
+    lookup labelled the unknown with its TEST function's name). Two fields with the same name keep
+    the key to stay distinguishable; a key no trial node names falls back to it.
+    """
+    keys = list(getattr(f, "_block_field_keys", None) or [])
+    names: dict = {}
+    try:
+        for c in getattr(f, "_constraints", None) or []:
+            for node in _walk(getattr(c, "expr", c)):
+                if type(node).__name__ != "TrialFunction":
+                    continue
+                k, nm = getattr(node, "field_key", None), getattr(node, "name", None)
+                if k is not None and isinstance(nm, str) and nm:
+                    names.setdefault(k, nm)
+    except Exception:  # noqa: BLE001 -- a label must never fail the report
+        pass
+    counts: dict = {}
+    for k in keys:
+        counts[names.get(k)] = counts.get(names.get(k), 0) + 1
+    out = []
+    for i in range(max(0, len(list(getattr(f, "offsets", None) or [])) - 1)):
+        k = keys[i] if i < len(keys) else None
+        nm = names.get(k)
+        if nm is None:
+            out.append(f"field {k}" if k is not None else f"block {i}")
+        else:
+            out.append(f"{nm} (field {k})" if counts.get(nm, 0) > 1 else nm)
+    return out
+
+
 # ---------------------------------------------------------------------------------------------
 # fem
 # ---------------------------------------------------------------------------------------------
@@ -333,18 +368,23 @@ def _info_fem(f, deep: bool) -> Info:
     terms: list = [(f"[{i}]", c) for i, c in enumerate(f.classification or [])]
     given = len(getattr(f, "_constraints", None) or [])
     if given and given != len(f.classification or []):
-        terms.append(("", f"— {len(f.classification or [])} of {given} terms appear here; the rest "
-                          f"(a periodic tie, a gauge) carry no classification entry"))
+        # Name what is missing where it is recognisable. The first version always said "(a periodic
+        # tie, a gauge)" -- on a load-path march the missing term was the `.evolves` state update.
+        n_upd = sum(1 for c in f._constraints if type(c).__name__ == "StateUpdate")
+        rest = given - len(f.classification or [])
+        what = (f"{n_upd} state update{'s' if n_upd > 1 else ''} (.evolves)" if n_upd == rest
+                else "e.g. a state update (.evolves), a periodic tie, a gauge")
+        terms.append(("", f"— {len(f.classification or [])} of {given} terms appear here; the rest carry "
+                          f"no classification entry: {what}"))
 
     blocks: list = []
     offs = list(getattr(f, "offsets", None) or [])
-    keys = list(getattr(f, "_block_field_keys", None) or [])
     shapes = list(getattr(f, "_block_value_shapes", None) or [])
     dom = getattr(f, "domain", None)
     orders = list(getattr(dom, "_fem_native_field_orders", None) or [])
+    labels = _block_labels(f)
     for i in range(max(0, len(offs) - 1)):
-        key = keys[i] if i < len(keys) else None
-        name = f"field {key}" if key is not None else f"block {i}"
+        name = labels[i] if i < len(labels) else f"block {i}"
         vs = f" · value_shape {tuple(shapes[i])}" if i < len(shapes) and shapes[i] else ""
         od = f" · P{orders[i]}" if i < len(orders) else ""
         blocks.append((name, f"dofs {offs[i]}:{offs[i+1]}  ({_fmt_n(offs[i+1]-offs[i])}){vs}{od}"))
@@ -990,20 +1030,20 @@ def _info_result(r, deep: bool, context=None) -> Info:
 
     blocks: list = []
     offs = list(getattr(context, "offsets", None) or [])
-    keys = list(getattr(context, "_block_field_keys", None) or [])
+    labels = _block_labels(context) if context is not None else []
     flat = a.reshape(-1)
     if len(offs) > 1 and a.ndim == 2 and a.shape[-1] == offs[-1]:
         blocks.append(("", f"{a.shape[0]} time steps x {a.shape[1]} dofs"))
         for i in range(len(offs) - 1):
             seg = a[:, offs[i]:offs[i + 1]]
-            nm2 = f"field {keys[i]}" if i < len(keys) else f"block {i}"
+            nm2 = labels[i] if i < len(labels) else f"block {i}"
             rng = f"[{seg.min():.6g}, {seg.max():.6g}]" if seg.size else "(empty)"
             blocks.append((nm2, f"{_fmt_n(seg.shape[1])} dofs · {rng}  (over all steps)"))
         return Info("result", [("array", rows), ("by field block", blocks)])
     if len(offs) > 1 and offs[-1] == flat.size:
         for i in range(len(offs) - 1):
             seg = flat[offs[i]:offs[i + 1]]
-            nm = f"field {keys[i]}" if i < len(keys) else f"block {i}"
+            nm = labels[i] if i < len(labels) else f"block {i}"
             rng = f"[{seg.min():.6g}, {seg.max():.6g}]" if seg.size else "(empty)"
             blocks.append((nm, f"{_fmt_n(seg.size)} dofs · {rng}"))
     elif context is not None:
