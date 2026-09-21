@@ -244,7 +244,9 @@ def _march_rows(m, solve_index=None, deep=False):
             rows.append(("", f"step 1 took {_secs(step_s[0])} and includes tracing/compilation"))
     else:
         wall, ev = m.get("wall_s"), m.get("evaluation")
-        if wall is None and solve_index is not None:
+        if wall is None and solve_index is not None and m.get("window") is None:
+            # A march that runs INSIDE solve(): the solve's time is the march's. Not a transient,
+            # whose solve() only built a node -- that time is the build, not the march.
             wall = m.get("_solve_wall")
         if wall is not None:
             tag = f"evaluation {ev}" if ev else "the solve"

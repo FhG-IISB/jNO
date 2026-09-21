@@ -150,14 +150,27 @@ def test_transient_record_is_deferred_until_evaluated(nonlinear):
     traj = np.asarray(node.fn())
     assert traj.shape[0] == 21
     m = fem.stats["march"]
-    assert m["deferred"] is False and m["evaluation"] == 1 and m["wall_s"] > 0
-    if nonlinear:  # only a nonlinear march judges its steps
+    assert m["deferred"] is False and m["evaluation"] == 1
+    if nonlinear:  # judges its steps, so it has already synchronised: its time is real and free
         assert m["residual"].shape == (20,) and np.all(m["residual"] <= m["bound"])
-    else:
-        assert m.get("residual") is None
+        assert m["wall_s"] > 0
+    else:  # never synchronised, and recording must not force it to: no time, and it says why
+        assert m.get("residual") is None and m.get("wall_s") is None
+        assert "not timed" in m["note"]
     node.fn()
     assert fem.stats["march"]["evaluation"] == 2
-    assert "evaluation 2" in str(jno.info(fem))
+    text = str(jno.info(fem))
+    assert ("evaluation 2" in text) if nonlinear else ("not timed" in text and "for the solve" not in text)
+
+
+def test_evaluating_a_linear_transient_stays_asynchronous(monkeypatch):
+    """Recording must never add a device sync: `.fn()` returns before the march has finished."""
+    fem = _heat(False, nt=11)
+    node = fem.solve()
+    calls = []
+    monkeypatch.setattr(jax, "block_until_ready", lambda x: calls.append(1) or x)
+    node.fn()
+    assert calls == []
 
 
 def test_a_steady_solve_has_no_march_record():

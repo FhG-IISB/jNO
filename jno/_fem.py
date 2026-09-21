@@ -2102,13 +2102,10 @@ class FEM:
             march = self._march_phrase(since)
             if march:
                 parts.append(march)
-            arr = None
-            if isinstance(out, (_np.ndarray, jnp.ndarray)) or hasattr(out, "__array__"):
-                try:
-                    arr = _np.asarray(out)
-                except Exception:  # noqa: BLE001 - a lazy node refuses conversion; that is fine
-                    arr = None
-            if arr is None or arr.dtype == object or arr.ndim == 0:
+            if isinstance(out, jax.core.Tracer):
+                # Inside the caller's jit/grad/vmap: nothing has run, and nothing here may run it.
+                return f"solved: {self._mode} · traced (inside jit/grad/vmap) — reported when it runs"
+            if not isinstance(out, (jax.Array, _np.ndarray)) or out.dtype == object or out.ndim == 0:
                 # The work has NOT happened yet: this path returns a node and the march runs at
                 # evaluation. Reporting the elapsed time here as if it were the solve would say a
                 # 200-step transient finished in 6 ms.
@@ -2118,19 +2115,29 @@ class FEM:
                     f"the solve runs when you evaluate it through jno.core"
                     + (f" · {march}" if march else "")
                 )
-            finite = _np.isfinite(arr)
-            if not finite.all():
-                parts.append(f"**{int((~finite).sum())} non-finite entries**")
-            else:
-                parts.append(f"u in [{arr.min():.4g}, {arr.max():.4g}]")
-                if _np.allclose(arr, 0.0):
-                    parts.append("ALL ZERO — is the load term present?")
+            # Everything is reduced WHERE THE SOLUTION LIVES and only six scalars cross to the host,
+            # in one transfer. The first version copied the whole vector to the host, back to the
+            # device for the residual matvec, and the residual back again -- three full-vector
+            # transfers per solve on a GPU, for a log line.
+            flat = jnp.asarray(out).reshape(-1)
+            cplx = bool(jnp.iscomplexobj(flat))
+            mag = jnp.abs(flat) if cplx else flat
+            vals = [jnp.sum(~jnp.isfinite(flat)), jnp.min(mag), jnp.max(mag), jnp.max(jnp.abs(flat))]
             A, b = getattr(self, "_A", None), getattr(self, "_b", None)
-            if A is not None and b is not None and arr.size == _np.asarray(b).size:
-                bb = _np.asarray(b).reshape(-1)
-                r = _np.asarray(A @ jnp.asarray(arr.reshape(-1))).reshape(-1) - bb
-                den = float(_np.linalg.norm(bb)) or 1.0
-                parts.append(f"rel.residual {float(_np.linalg.norm(r)) / den:.2e}")
+            has_res = A is not None and b is not None and int(jnp.size(b)) == int(flat.size)
+            if has_res:
+                bb = jnp.asarray(b).reshape(-1)
+                vals += [jnp.linalg.norm(A @ flat - bb), jnp.linalg.norm(bb)]
+            q = _np.asarray(jnp.stack([jnp.real(jnp.asarray(v)).astype(jnp.real(mag).dtype) for v in vals]))
+            n_bad, lo, hi, amax = int(q[0]), float(q[1]), float(q[2]), float(q[3])
+            if n_bad:
+                parts.append(f"**{n_bad} non-finite entries**")
+            else:
+                parts.append(f"{'|u|' if cplx else 'u'} in [{lo:.4g}, {hi:.4g}]")
+                if amax <= 1e-8:
+                    parts.append("ALL ZERO — is the load term present?")
+            if has_res:
+                parts.append(f"rel.residual {float(q[4]) / (float(q[5]) or 1.0):.2e}")
             return " · ".join(parts)
         except Exception:  # noqa: BLE001 - a log line must never be what fails a solve
             return f"solved: {self._mode} · {wall:.3g} s"
