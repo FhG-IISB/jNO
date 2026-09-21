@@ -1067,7 +1067,7 @@ _REGION_VOLUME_MSG = (
     "region is not implemented -- the term is instead {how}, with no warning.\n"
     "  Put the per-region material or source in the COEFFICIENT rather than the quadrature domain.\n"
     "  A named region of the mesh file is a valid key, so this reads straight off the physical volumes:\n"
-    '      k = d.by_region({{"steel": 16.0, "air": 0.026}})     # one value per cell, exact membership\n'
+    '      k = d._by_region({{"steel": 16.0, "air": 0.026}})     # one value per cell, exact membership\n'
     '      d.attach("steel", k=16.0)                          # or attach it and use d.k\n'
     "  A shapely sub-region or a d.tag(...) predicate also restricts correctly.\n"
     "  (d.variable(<region>) DOES restrict a SURFACE term; only the volume path is missing.)"

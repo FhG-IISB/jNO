@@ -52,7 +52,7 @@ d = jno.shape.regions(
 
 T, phi = d.fem_symbols()
 # One conduction term per material region -- each integrates over that region's cells only. (The
-# `d.by_region({...})` shorthand is for regions declared as geometry parts or `d.tag` predicates; a
+# the `d.attach(region, k=...)` shorthand is for regions declared as geometry parts or `d.tag` predicates; a
 # `shape.regions` name is not one of those, so with two materials the explicit form is also the
 # clearer one.)
 xs, ys, _ = d.variable("substrate", split=True)

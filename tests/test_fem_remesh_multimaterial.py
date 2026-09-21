@@ -232,7 +232,7 @@ def test_the_region_mask_follows_the_remesh():
     u, v = d.fem_symbols(names=("u", "v"))
     ci = d.variable("interior", split=True)
     bnd = dict(zip("xyz", d.variable("boundary", split=True)[:3]))
-    k = d.by_region({"ball": 2.0, "block": 1.0})
+    k = d._by_region({"ball": 2.0, "block": 1.0})
     fem = jno.fem(
         [
             k * (u.bind(x=ci[0], y=ci[1], z=ci[2]) * v.bind(x=ci[0], y=ci[1], z=ci[2])),

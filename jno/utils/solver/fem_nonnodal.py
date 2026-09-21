@@ -282,7 +282,7 @@ def assemble_fem_nonnodal(
     _bad_tags = sorted({t for _terms in (boundary_terms or {}).values() for bare in _terms for t in _tag_names_nn(bare)})
     if _bad_tags:
         raise NotImplementedError(
-            f"jno.fem: domain.by_tag({_bad_tags}) is not supported on a non-nodal space (N1E / RT / "
+            f"jno.fem: domain._by_tag({_bad_tags}) is not supported on a non-nodal space (N1E / RT / "
             f"Morley / Argyris) -- its per-facet mask is threaded only by the nodal Lagrange surface "
             f"kernel. Write one boundary term per tag instead, or use a Lagrange space."
         )
@@ -330,7 +330,7 @@ def assemble_fem_nonnodal(
             f"jno.fem (non-nodal): the P0 (per-cell) field parameter(s) {_cell_param_names} are not "
             "wired on this assembler -- only nodal P1 field parameters are, and a per-cell array would "
             "be gathered at VERTEX indices and silently give the wrong coefficient. For a per-region "
-            'material use d.by_region({"steel": 16.0, ...}) (or d.attach), which is one value per cell '
+            'material use d._by_region({"steel": 16.0, ...}) (or d.attach), which is one value per cell '
             "and is threaded through the per-cell region masks; for a smooth field, use a P1 "
             "(Lagrange) parameter."
         )

@@ -12,7 +12,7 @@ went one of two ways, both silent:
 
 Measured on a four-material mesh before the guard: a term on ``air`` integrated to the full
 69,694 mm^3 rather than the air's 66,445, and one on ``core`` produced b = 0. Both look like
-answers. Per-region materials belong in the COEFFICIENT -- ``d.by_region({...})``, which takes a
+answers. Per-region materials belong in the COEFFICIENT -- ``d._by_region({...})``, which takes a
 named region of the mesh file and restricts exactly, one value per cell.
 """
 

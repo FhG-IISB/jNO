@@ -40,8 +40,6 @@ sampling, and tensor tags.
         - sample
         - summary
         - tag
-        - by_region
-        - by_tag
         - attach
         - attached
         - line

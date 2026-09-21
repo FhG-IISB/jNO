@@ -1,7 +1,7 @@
 """``shape.attach`` — material properties declared on the region, read back as ``d.<name>``.
 
 ``.attach(k=220.0)`` on a named region makes ``d.k`` the per-region coefficient over every region
-that declared a ``k`` — the same object ``d.by_region({...})`` returns, so it drops straight into a
+that declared a ``k`` — the same object ``d._by_region({...})`` returns, so it drops straight into a
 weak form. A value may be anything the jNO stack treats as a coefficient: a scalar, an array, a
 symbolic expression, a typed view (``ScalarView`` / ``VectorView`` / ``MatrixView``), a trainable
 ``jno.np.parameter``, or a plain function of the coordinates.
@@ -44,13 +44,13 @@ def _poisson(d, k):
 # --------------------------------------------------------------------------------------
 def test_attached_property_is_the_by_region_coefficient():
     d = _two_regions(a={"k": 220.0}, b={"k": 0.186}).domain()
-    assert str(d.k) == str(d.by_region({"a": 220.0, "b": 0.186}))
+    assert str(d.k) == str(d._by_region({"a": 220.0, "b": 0.186}))
 
 
 def test_several_properties_are_independent():
     d = _two_regions(a={"k": 1.0, "eta": 0.44}, b={"k": 2.0, "eta": 0.11}).domain()
-    assert str(d.eta) == str(d.by_region({"a": 0.44, "b": 0.11}))
-    assert str(d.k) == str(d.by_region({"a": 1.0, "b": 2.0}))
+    assert str(d.eta) == str(d._by_region({"a": 0.44, "b": 0.11}))
+    assert str(d.k) == str(d._by_region({"a": 1.0, "b": 2.0}))
 
 
 def test_missing_in_one_region_raises_and_names_it():
@@ -66,7 +66,7 @@ def test_unattached_name_is_a_normal_attribute_error():
         d.nope
 
 
-@pytest.mark.parametrize("clash", ["mesh", "by_region", "tag", "dimension"])
+@pytest.mark.parametrize("clash", ["mesh", "attach", "tag", "dimension"])
 def test_name_colliding_with_a_domain_attribute_raises_at_build(clash):
     """`__getattr__` only fires when normal lookup FAILS, so a colliding name would be silently
     shadowed by the real attribute. It has to be caught when the domain is built."""
@@ -103,7 +103,7 @@ def test_attached_callable_is_resolved_against_the_domain_coordinates():
     the geometry plan is being written — so a plain function is called at read time instead."""
     d = _two_regions(a={"k": lambda x, y: 2.0 + 0.5 * y}, b={"k": 1.0}).domain()
     x, y, _t = d.variable("interior", split=True)
-    assert str(d.k) == str(d.by_region({"a": 2.0 + 0.5 * y, "b": 1.0}))
+    assert str(d.k) == str(d._by_region({"a": 2.0 + 0.5 * y, "b": 1.0}))
 
 
 def test_attached_callable_sees_only_spatial_coordinates():
@@ -116,7 +116,7 @@ def test_attached_value_may_be_a_jax_array():
     jnp = pytest.importorskip("jax.numpy")
     v = jnp.asarray(3.0)
     d = _two_regions(a={"k": v}, b={"k": 1.0}).domain()
-    assert str(d.k) == str(d.by_region({"a": v, "b": 1.0}))
+    assert str(d.k) == str(d._by_region({"a": v, "b": 1.0}))
 
 
 # --------------------------------------------------------------------------------------
@@ -129,7 +129,7 @@ def test_attach_through_the_regions_dict_form():
             "Quartz.2": jno.shape.rect(0, 0, 2, 1, size=0.3).attach(k=2.0),
         }
     ).domain()
-    assert str(d.k) == str(d.by_region({"Quartz.1": 1.0, "Quartz.2": 2.0}))
+    assert str(d.k) == str(d._by_region({"Quartz.1": 1.0, "Quartz.2": 2.0}))
 
 
 # --------------------------------------------------------------------------------------
@@ -177,7 +177,7 @@ def test_a_single_named_region_round_trips_its_attachment():
     its attachment was collected from nowhere and `d.k` reported a bare "no attribute 'k'". Nothing
     told the user the declaration had been ignored."""
     d = jno.shape.rect(0, 0, 1, 1, size=0.4).name("a").attach(k=2.0).domain()
-    assert str(d.k) == str(d.by_region({"a": 2.0}))
+    assert str(d.k) == str(d._by_region({"a": 2.0}))
     assert d.attached("k") == {"a": 2.0}
 
 
@@ -201,7 +201,7 @@ def test_scalar_attachment_assembles_the_per_region_loop_matrix():
     # so the two sums round differently in the last bit or two. Compare at float32 precision, not
     # bitwise (a 1e-6 atol on entries of order 7 is BELOW the float32 rounding of that magnitude).
     d = _two_regions(a={"k": 3.0}, b={"k": 7.0}).domain()
-    np.testing.assert_allclose(_poisson(d, d.k), _poisson(d, d.by_region({"a": 3.0, "b": 7.0})), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(_poisson(d, d.k), _poisson(d, d._by_region({"a": 3.0, "b": 7.0})), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("value", [0.0, -2.5, 1e6])
@@ -210,7 +210,7 @@ def test_extreme_scalar_values_assemble(value):
     d = _two_regions(a={"k": value}, b={"k": 1.0}).domain()
     A = _poisson(d, d.k)
     assert np.all(np.isfinite(A))
-    np.testing.assert_allclose(A, _poisson(d, d.by_region({"a": value, "b": 1.0})), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(A, _poisson(d, d._by_region({"a": value, "b": 1.0})), rtol=1e-5, atol=1e-5)
 
 
 def test_callable_attachment_assembles():
@@ -296,7 +296,7 @@ def test_mixing_view_types_across_regions_raises():
     m = MatrixView(vec(1.0 + 0.0 * x, 0.0 * y, 0.0 * x, 1.0 + 0.0 * y).expr).from_flat(2, 2)
     w = VectorView(vec(1.0 + 0.0 * x, 0.0 * y).expr)
     with pytest.raises(ValueError, match="mix view types"):
-        d.by_region({"a": m, "b": w})
+        d._by_region({"a": m, "b": w})
 
 
 def test_jax_array_attachment_assembles():
@@ -325,3 +325,58 @@ def test_many_regions_all_contribute():
     d = shapes.domain()
     assert d.attached("k") == {f"r{i}": float(i) for i in range(5)}
     assert all(f"RegionMask(r{i})" in str(d.k) for i in range(5))
+
+
+# ---------------------------------------------------------------------------
+# A bare attach(**props) is the DEFAULT for every region that names no value of its own.
+# It replaces `by_region(..., default=...)`, which left the public surface with `by_tag`.
+# ---------------------------------------------------------------------------
+
+
+def _load(d, u, v, xi, yi, xb, yb, coeff):
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    stiff = ui.x * vi.x + ui.y * vi.y
+    return float(np.asarray(jno.fem([stiff, -coeff * vi, u(xb, yb) - 0.0]).b).sum())
+
+
+def _pair():
+    L = jno.shape.rect(0, 0, 1, 1).name("L")
+    R = jno.shape.rect(1, 0, 2, 1).name("R")
+    d = (L + R).sized(0.25).domain()
+    u, v = d.fem_symbols()
+    return d, u, v, *d.variable("interior", split=True)[:2], *d.variable("boundary", split=True)[:2]
+
+
+def test_bare_attach_is_the_default_and_matches_the_explicit_coefficient():
+    """`attach("L", Q=2).attach(Q=0)` must equal the coefficient it replaces, to the last bit."""
+    d, u, v, xi, yi, xb, yb = _pair()
+    got = _load(d.attach("L", Q=2.0).attach(Q=0.0), u, v, xi, yi, xb, yb, d.Q)
+    d2, u2, v2, xi2, yi2, xb2, yb2 = _pair()
+    want = _load(d2, u2, v2, xi2, yi2, xb2, yb2, d2._by_region({"L": 2.0}, default=0.0))
+    assert got == pytest.approx(want, rel=0, abs=0), "the default must reproduce by_region(default=)"
+
+
+def test_explicit_target_beats_a_bare_attach_in_either_order():
+    """Without this the two orderings differ silently under last-wins merging -- wrong physics,
+    no error, decided by the line order of two declarations."""
+    a_d, a_u, a_v, *a_c = _pair()
+    a = _load(a_d.attach(Q=0.0).attach("L", Q=2.0), a_u, a_v, *a_c, a_d.Q)
+    b_d, b_u, b_v, *b_c = _pair()
+    b = _load(b_d.attach("L", Q=2.0).attach(Q=0.0), b_u, b_v, *b_c, b_d.Q)
+    assert a == pytest.approx(b, rel=0, abs=0)
+
+
+def test_missing_region_without_a_default_still_refuses():
+    d, *_ = _pair()
+    d.attach("L", Q=2.0)
+    with pytest.raises(AttributeError, match=r"never attached a 'Q'"):
+        d.Q
+
+
+def test_a_default_on_a_boundary_tag_is_refused():
+    """Tags are not a partition of the boundary, so a surface default has nothing to mean."""
+    d = jno.shape.rect(0, 0, 1, 1).sized(0.3).domain()
+    d.tag("wall", lambda x, y: x < 1e-9)
+    d.attach("wall", h=25.0).attach(h=1.0)
+    with pytest.raises(AttributeError, match="surface default has no meaning"):
+        d.h

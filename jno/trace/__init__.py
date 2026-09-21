@@ -1711,7 +1711,7 @@ class TagMask(Placeholder):
     rounds to ``x > 1.0`` and silently matches nothing (see ``domain.tag_node_mask``).
 
     It is a leaf (no children) and carries no coordinates, so it composes as a plain scalar
-    coefficient: ``TagMask(tag) * surface_term``. Built by :meth:`jno.domain.by_tag`.
+    coefficient: ``TagMask(tag) * surface_term``. Built by :meth:`jno.domain.attach`.
 
     Surface terms only. In a **volume** term there is no facet to indicate, and the evaluator raises
     rather than integrating over the whole boundary or silently contributing nothing.

@@ -475,26 +475,33 @@ sub-region term is recovered **per sub-domain** through `crux`.
     Scope: this finds a DOF that appears in **no term**. It is not a rank test, and does not detect a
     missing pressure gauge or an unrestrained rigid-body mode.
 
-### `domain.by_region` — many materials as one equation
+### `domain.attach` — many materials as one equation
 
-For *many* regions, writing one term per region is noisy. `domain.by_region({region: value})` returns a
-single coefficient whose value is chosen, per cell, by the region the cell's centroid lies in — so the
-whole multi-material weak form is **one equation** over the whole `interior`:
+For *many* regions, writing one term per region is noisy. Declare the property on each region with
+`attach`, then read it back as `d.<name>`: a single coefficient whose value is chosen, per cell, by the
+region the cell's centroid lies in — so the whole multi-material weak form is **one equation** over the
+whole `interior`:
 
 ```python
 xi, yi, _ = d.variable("interior", split=True)        # whole domain, bound once
 ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
 
-k = d.by_region({"steel": 16.0, "air": 0.026, "core": 25.0})   # per-region conductivity
-Q = d.by_region(heat_source, default=0.0)                      # 0 in any unlisted region
-fem = jno.fem([k * (ui.x*vi.x + ui.y*vi.y) - Q * vi, u(xb, yb) - 0.0])
+d.attach("steel", k=16.0).attach("air", k=0.026).attach("core", k=25.0)
+d.attach("core", Q=heat_source).attach(Q=0.0)         # a bare attach = the default for the rest
+fem = jno.fem([d.k * (ui.x*vi.x + ui.y*vi.y) - d.Q * vi, u(xb, yb) - 0.0])
 ```
+
+**Omit the target for a default.** `attach(Q=0.0)` gives the value for every region that names none of
+its own — the source that is zero outside one body. An explicit target always wins over a bare one,
+*whichever order they are written in*: without that rule the two orderings would differ silently.
+A default applies to volume regions only; boundary tags are not a partition of the boundary, so a
+surface default has nothing to mean and is refused.
 
 A value can be a scalar, a `jno.fn` field, or a trainable `jno.np.parameter`, so the same primitive
 expresses conductivity, a source, a density, a reaction rate, an elastic modulus — and trainable
-per-region values compose for free (`d.by_region({**k, "air": nu*0.026})`, calibrated through `crux`).
-Each key must be a geometry part (`from_regions`) or a `domain.tag` predicate; `default` fills cells in
-no listed region. It desugars to `sum_r RegionMask(r)·value_r`, inheriting the centroid classification.
+per-region values compose for free, calibrated through `crux`. Each target must be a geometry part
+(`from_regions`), a `domain.tag`, or a mesh-file region. It desugars to `sum_r RegionMask(r)·value_r`,
+inheriting the centroid classification.
 
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
