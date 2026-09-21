@@ -60,7 +60,7 @@ differentiable end to end.
 | [**FEM**](https://fhg-iisb.github.io/jNO/fem/) · stable | [Elements](https://fhg-iisb.github.io/jNO/fem/elements/) · H(div)/H(curl)/C¹ experimental | [**FDM**](https://fhg-iisb.github.io/jNO/fdm/) · stable |
 | [**RCWA**](https://fhg-iisb.github.io/jNO/rcwa/) · stable | [Solvers & preconditioners](https://fhg-iisb.github.io/jNO/solvers/) · stable | [Eigenproblems](https://fhg-iisb.github.io/jNO/API/#solvers-and-preconditioners) · beta |
 | [Time integration](https://fhg-iisb.github.io/jNO/fdm/) · stable | [Adaptive meshing](https://fhg-iisb.github.io/jNO/fem/geometry/) · beta | [Domain decomposition](https://fhg-iisb.github.io/jNO/domain-decomposition/) · beta |
-| [Geometry — `jno.Shape`](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) · stable | [Inverse & PDE-constrained](https://fhg-iisb.github.io/jNO/inverse-problems/) · stable | [Limits & build time](https://fhg-iisb.github.io/jNO/fem/limitations/) |
+| [Geometry — `jno.shape`](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) · stable | [Inverse & PDE-constrained](https://fhg-iisb.github.io/jNO/inverse-problems/) · stable | [Limits & build time](https://fhg-iisb.github.io/jNO/fem/limitations/) |
 
 **Pillar 2 — scientific machine learning.** All stable, and all composable with any solve above.
 
@@ -98,7 +98,7 @@ PS: I recommend pulling the latest main branch to always be up to date!
 ```python
 import jno
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 
@@ -130,7 +130,7 @@ import jax.numpy as jnp
 import optax
 import jno
 
-d = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 u, v = d.fem_symbols()
@@ -173,7 +173,7 @@ import jno
 Pr, Ra = 1.0, 1.0e4                                 # Ra >> Ra_c ≈ 1708 → vigorous convection
 Lx, Ly, dt, nsteps = 2.0, 1.0, 0.009, 26
 
-d = jno.Shape.rect(0, 0, Lx, Ly, size=0.11).domain(time=(0.0, nsteps * dt, nsteps + 1))
+d = jno.shape.rect(0, 0, Lx, Ly, size=0.11).domain(time=(0.0, nsteps * dt, nsteps + 1))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)   # P2 velocity  ┐ inf-sup
 p, q = d.fem_symbols(names=("p", "q"), order=1)                     # P1 pressure  ┘ stable pair
 T, s = d.fem_symbols(names=("T", "sT"), order=1)                    # P1 temperature
@@ -229,7 +229,7 @@ import jax.numpy as jnp
 
 # A periodic metasurface unit cell — a patterned high-index slab between two ambients.
 K0 = 2 * jnp.pi                                            # vacuum wavenumber (wavelength λ = 1)
-d = jno.Shape.box(0, 0, 0, 0.6, 0.6, 1.0, size=0.12).domain()
+d = jno.shape.box(0, 0, 0, 0.6, 0.6, 1.0, size=0.12).domain()
 d.tag("bottom", lambda x, y, z: z < 0.01);  d.tag("top",   lambda x, y, z: z > 0.99)   # z ambients
 d.tag("left",   lambda x, y, z: x < 0.01);  d.tag("right", lambda x, y, z: x > 0.59)   # x-periodic
 d.tag("front",  lambda x, y, z: y < 0.01);  d.tag("back",  lambda x, y, z: y > 0.59)   # y-periodic
@@ -276,7 +276,7 @@ dir = jno.setup("./runs/pino", diff_type="spectral")
 
 # Solve −Δu = f on the periodic unit square, for a whole DISTRIBUTION of forcings f at once.
 N = 64
-dom = 256 * jno.Shape.rect(0, 0, 1, 1, size=1 / N).domain(structured=True)
+dom = 256 * jno.shape.rect(0, 0, 1, 1, size=1 / N).domain(structured=True)
 x, y, _ = dom.variable("interior", split=True)
 
 # The input function: a fresh Gaussian random field per batch — an operator dataset without a dataset.

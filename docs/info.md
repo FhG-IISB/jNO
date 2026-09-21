@@ -191,17 +191,20 @@ say.
 
 ```
   array
-    shape  (350,)
-    dtype  float64
-    range  [-9.64035, 10.2115]
-    norm   22.7794
+    shape          (350,)
+    dtype          float64
+    range          [-9.64035, 10.2115]
+    norm           22.7794
+    rel. residual  1.403e-09   ‖Au − b‖ / ‖b‖ against the form's operator
   by field block
     u  306 dofs · [-0.246683, 1]
     p  44 dofs · [-9.64035, 10.2115]
 ```
 
 `context=` splits the vector by the form's **own** `offsets` — first-appearance order, as above —
-and labels each block with its trial field's name. An adaptive transient returns a trajectory instead, and that
+and labels each block with its trial field's name. It also computes the relative residual against
+the form's operator. That costs a sparse matvec, which is why it is here, on request, and not in
+the per-solve log line. An adaptive transient returns a trajectory instead, and that
 reports frames, the time span, and the per-frame dof range.
 
 ## A Bayesian model — `jno.info(a)`

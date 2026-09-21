@@ -849,7 +849,41 @@ path the `precond` spec is materialized *per Newton/Picard linearization* agains
 all work; only specs that need the assembled matrix (`jacobi`, an unbuilt `amg`) raise.
 
 ## Diagnostics — what the solver actually did
- After any `fem.solve()`, `fem.stats` reports what happened
+
+### What a solve prints
+
+Every build and solve logs one line each for what was built, which solver ran, and what came back:
+
+```text
+INFO: Preprocessed mesh connectivity: 85 points, 133 triangles · h 0.0927–0.141 · worst aspect 1.38
+INFO: FEM(linear, dofs=85, terms=['volume', 'dirichlet@boundary'])
+INFO: solve: linear · bicgstab (matrix-free) + jacobi
+INFO: solved: linear · 0.115 s · u in [0, 0.06101]
+```
+
+- **`FEM(...)`** is the mode fixed at build and every term as jNO classified it. A boundary
+  condition that landed nowhere is missing here.
+- **`solve:`** is the route actually taken, including defaults you did not pass.
+- **`solved:`** is the solution range, with `ALL ZERO — is the load term present?` when the
+  right-hand side was empty. A march adds its steps and the step that came closest to its
+  tolerance:
+
+```text
+INFO: solved: nonlinear · 0.454 s · load-path march · 40 steps over τ ∈ [0, 1] · tightest step 32 (τ=0.7949) at 82.9% of its bound · u in [0, 0.8375]
+```
+
+The lines cost the solve nothing it does not already pay. Nothing is added inside a traced
+computation: a jitted transient march compiles to the same program with or without them. The
+`solved:` line reduces the solution on the device and moves four numbers to the host (0.3 ms
+against a 63 ms solve at 73k dofs on a GPU). It skips itself when the solve is traced
+(`jit`/`grad`/`jno.core`). It does **not** compute ‖Au − b‖: that is a sparse matvec, 10 % of the
+same solve, and the solve already checks its own residual and raises (below). Ask for it with
+[`jno.info(sol, context=fem)`](info.md). gmsh's own progress output is suppressed; its warnings
+are logged as `WARNING: gmsh: …`.
+
+### `fem.stats`
+
+After any `fem.solve()`, `fem.stats` reports what happened
 without changing the solve's return: `mode`, `dofs`, `wall_s` (dispatch time — JAX is async; block on
 the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (driver, final residual
 norm against its bound, converged flag, and the step count where the driver runs its forward loop
