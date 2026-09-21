@@ -1343,3 +1343,49 @@ def test_compiled_residual_has_no_all_pairs_distance():
     jaxpr = jax.make_jaxpr(prob._pde_residual_fn())(jnp.ones(n))
     biggest = max(int(np.prod(v.aval.shape)) for e in jaxpr.jaxpr.eqns for v in e.outvars if hasattr(v.aval, "shape"))
     assert biggest < 16 * n, f"an intermediate of size {biggest} for N = {n}"
+
+
+def test_steady_solve_is_compiled_once_and_reused():
+    d, _, prob = _structured_poisson(0.05)
+    first = np.asarray(prob.solve())
+    second = np.asarray(prob.solve())
+    assert len(prob._steady_cache) == 1
+    np.testing.assert_array_equal(first, second)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(second - exact) / np.linalg.norm(exact)) < 5e-3
+
+
+def test_compiled_solve_sees_a_changed_data_field():
+    """A known nodal field is baked into the compiled solve, so its values are part of the cache key:
+    changing them must re-solve with the new data, not silently reuse the old."""
+    import equinox as eqx
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    g = jno.np.parameter((p.shape[0],), name="g")  # data: no optimizer
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-ui.d2(x) - ui.d2(y) + 4.0, u(xb, yb) - g])
+    for shift in (0.0, 1.0):
+        exact = p[:, 0] ** 2 + p[:, 1] ** 2 + shift  # −Δu = −4, u = g on ∂Ω
+        g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(exact))
+        sol = np.asarray(prob.solve()).reshape(-1)
+        assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 1e-2, shift
+
+
+def test_compiled_solve_still_raises_on_a_stalled_newton():
+    """Newton's own guard is blind under `jit`; the compiled path re-checks the concrete result against
+    the spec's tolerances and raises, as the uncompiled path did."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - 5.0 * jnn.exp(ui), u(xb, yb) - 0.0])
+    with pytest.raises(RuntimeError, match="did not converge"):
+        prob.solve(nonlinear=jno.solve.newton(max_steps=1))

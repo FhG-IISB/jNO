@@ -100,9 +100,9 @@ def _fd_operator_noise(residual_fn, u0) -> float:
         k1, k2 = jax.random.split(jax.random.PRNGKey(0))
         v1 = jax.random.normal(k1, u0.shape, u0.dtype)
         v2 = jax.random.normal(k2, u0.shape, u0.dtype)
-        a = jax.jvp(residual_fn, (u0,), (v1,))[1]
-        b = jax.jvp(residual_fn, (u0,), (v2,))[1]
-        c = jax.jvp(residual_fn, (u0,), (v1 + v2,))[1]
+        # One compiled call: three separate eager JVPs cost 2 s of dispatch at 16k nodes.
+        tangents = jnp.stack([v1, v2, v1 + v2])
+        a, b, c = jax.jit(lambda u, V: jax.vmap(lambda v: jax.jvp(residual_fn, (u,), (v,))[1])(V))(u0, tangents)
         den = float(jnp.linalg.norm(c))
         if not np.isfinite(den) or den == 0.0:
             return 0.0
@@ -1070,11 +1070,28 @@ class _TraceFDM:
         return profile_solve(_run, label=f"fdm profile · {self._N} nodes · {'transient' if self._transient else 'steady'}")
 
     def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, extra_pins=None):
-        """The eager steady solve: fold the flux and Dirichlet rows into the residual and hand it to the
+        """The steady solve: fold the flux and Dirichlet rows into the residual and hand it to the
         ``jno.solve`` Newton–Krylov driver. ``extra_params`` carries the current values of any trainable
         ``jno.np.parameter`` (from :meth:`_parametric_node`). ``extra_pins`` is an ``(idx, values)`` pair
         of nodes pinned to given values on top of the authored BCs — the interface pin a coupled /
-        domain-decomposition Schwarz step applies (:meth:`solve_pinned`)."""
+        domain-decomposition Schwarz step applies (:meth:`solve_pinned`). The plain eager solve is
+        compiled once per problem (:meth:`_compiled_steady`)."""
+        import jax
+
+        N, single = self._N, self._nf == 1
+        u0 = jnp.zeros(self._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)
+        if extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer):
+            sol = self._compiled_steady(nonlinear, u0)
+        else:
+            residual_with_bc = self._steady_residual(extra_params, extra_pins)
+            driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual_with_bc, u0))
+            sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
+        return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
+
+    def _steady_residual(self, extra_params=None, extra_pins=None):
+        """The steady residual with every boundary row folded in, as a function of the DOF vector."""
+        import jax
+
         N, single = self._N, self._nf == 1
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows()
@@ -1101,11 +1118,72 @@ class _TraceFDM:
                 r = r.at[base + idx].set(u[base + idx] - gvals)
             return r
 
-        u0 = jnp.zeros(self._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)
-        driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual_with_bc, u0))
-        sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
-        out = sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
-        return out
+        # Jitted so the trace evaluator runs once per shape: Newton, the Krylov tangent and the adjoint
+        # all call this, and each un-jitted call re-walked the whole expression tree in Python.
+        return jax.jit(residual_with_bc)
+
+    def _data_fingerprint(self):
+        """Identity and current values of every model in the constraints other than the unknowns — the
+        data a compiled solve bakes in (a known nodal field, a network coefficient). Part of the
+        :meth:`_compiled_steady` cache key, so changing such a value recompiles instead of silently
+        solving with the old one."""
+        import hashlib
+
+        import jax
+
+        from .trace import ModelCall
+
+        seen, parts = set(), []
+
+        def walk(n):
+            n = _unwrap(n)
+            if isinstance(n, ModelCall) and all(n.model is not u for u in self.unknowns) and id(n.model) not in seen:
+                seen.add(id(n.model))
+                digest = hashlib.blake2b(digest_size=16)
+                for leaf in jax.tree_util.tree_leaves(getattr(n.model, "module", None)):
+                    if hasattr(leaf, "shape"):
+                        digest.update(np.asarray(leaf).tobytes())
+                parts.append((id(n.model), digest.hexdigest()))
+            for c in _iter(n):
+                walk(c)
+
+        for c in self._pde + self._dirichlet + self._neumann + self._ic:
+            walk(c)
+        return tuple(sorted(parts))
+
+    def _compiled_steady(self, nonlinear, u0):
+        """The eager steady solve, **compiled once per problem** and reused.
+
+        Uncompiled, every ``.solve()`` re-traced Newton, the Krylov solve and (on a structured grid) the
+        multigrid V-cycle, then ran them one primitive at a time: measured at 16 641 nodes, 4.3 s of
+        tracing and 3.7 s of dispatch for a solve whose arithmetic takes milliseconds. The driver's own
+        convergence guard is blind under ``jit``, so the verdict is taken here on the concrete result,
+        against the tolerances the ``nonlinear=`` spec carries, and a stall raises exactly as before."""
+        import jax
+
+        from .utils.solver.solver_api import record_nonlinear_verdict
+
+        cache = self.__dict__.setdefault("_steady_cache", {})
+        key = (id(nonlinear), self._data_fingerprint())
+        entry = cache.get(key)
+        if entry is None or entry[0] is not nonlinear:
+            residual = self._steady_residual()
+            driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual, u0))
+            linear = _structured_linear_solve(self.domain) if self._nf == 1 else None
+            fn = jax.jit(lambda u_init: driver(residual, u_init, linear_solve=linear))
+            entry = cache[key] = (nonlinear, driver, residual, fn)
+        _, driver, residual, fn = entry
+        sol = fn(u0)
+        who = getattr(driver, "name", None) or "newton"
+        r_end, bound, ok = record_nonlinear_verdict(residual, sol, u0, driver, who)
+        if ok is False:
+            raise RuntimeError(
+                f"jno.fdm: {who} did not converge: residual norm {r_end:.3e} against the tolerance "
+                f"{bound:.3e}. The last iterate is NOT a root -- raise max_steps, loosen atol/rtol, "
+                "globalize the iteration (jno.solve.newton(line_search=True) or damping<1), or start "
+                "from a better x0."
+            )
+        return sol
 
     def pinned_solver(self, node_ids, *, nonlinear=None):
         """A **reusable** ``f(values) -> field`` that solves the subdomain with ``node_ids`` pinned to

@@ -171,6 +171,17 @@ gradients — by array reshaping, with **no per-element assembly**. On a uniform
 see Strang & Fix, *An Analysis of the Finite Element Method*, 1973), so the structured path is the *same
 answer* as the unstructured `cotangent` operator, only cheaper.
 
+!!! measured "Solve time, −Δu = f on the unit square, CPU (machine shared with other jobs)"
+    | nodes | structured, first / repeat solve | unstructured `cotangent`, first / repeat |
+    |---|---|---|
+    | ~17k | 2.8 s / 0.03 s | 2.9 s / 0.17 s |
+    | ~66k–75k | 3.1 s / 0.14 s | 7.8 s / 1.1 s |
+
+    The first solve is mostly compilation. It is compiled once per problem and reused, so a repeat solve
+    is fast. Before 2026-09 both paths re-traced every solve, and a compiled residual built an N×N distance
+    table to map mesh nodes onto themselves. That made the structured path *slower* (7.9 s / 5.0 s at 17k),
+    and both paths ran out of memory at 66k.
+
 The full `jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()` works unchanged and stays
 differentiable — no authoring change from the unstructured case. **Transient** composes too:
 `.structured()` together with `time=(t0, t1, n)` and a `ui.t` term marches by method of lines as usual

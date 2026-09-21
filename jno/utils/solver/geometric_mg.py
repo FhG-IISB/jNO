@@ -149,4 +149,7 @@ def build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: floa
         e_int = _vcycle((r.reshape(shape)) * per[0][2], 0)
         return jnp.where(per[0][2].reshape(-1) > 0.5, e_int.reshape(-1), r)
 
-    return apply, len(levels)
+    # Jitted so the unrolled recursion (levels x smoothing sweeps, all Python) is traced once per shape:
+    # a Krylov solve traces its preconditioner for the forward and the transpose solve, and re-tracing
+    # it every time was most of a structured FDM solve's 8 s.
+    return jax.jit(apply), len(levels)
