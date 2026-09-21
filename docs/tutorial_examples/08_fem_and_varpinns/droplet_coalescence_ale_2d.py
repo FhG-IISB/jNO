@@ -26,9 +26,11 @@ Three details are not optional, and each is measured in the tests:
 
 * the viscous term must be `2 eta D(u):D(v)`; `eta grad u : grad v` is a pseudo-traction that is correct
   only behind Dirichlet walls, and at a free surface it silently destroys the motion;
-* the SUPG/PSPG `tau` must be scaled for this regime. A capillary drop is nearly inviscid and nearly
-  stagnant -- the opposite of the advection-dominated flow that `tau` is built for -- and the unscaled
-  recipe contributes about ten times the physical damping;
+* the SUPG/PSPG products must be written so each one has a single temporal order (a scalar times the
+  strong residual distributes; `inner(a, u.t + ...)` is refused). This file used to also say `tau` must be
+  scaled down, because the unscaled recipe over-damped the drop tenfold -- that was an assembly defect, and
+  the drop now rings at Lamb's frequency either way (tests/test_fem_drop_oscillation.py). TAU_SCALE is
+  kept at 1e-4 below only so this example's recorded output is unchanged;
 * reconnection must run EVERY step (`every=1`). The neck opens fast, and at `every=2` the mesh tangles.
 """
 
@@ -51,7 +53,7 @@ RHO, ETA, SIGMA = 1.0, 0.01, 10.0  # density, viscosity, surface tension
 NU = ETA / RHO
 R, GAP, H = 0.20, 0.02, 0.04  # two drops of radius R, rims GAP apart, element size H
 DT, N_STEPS = 1e-4, 300  # the capillary limit is tighter than sqrt(rho h^3 / 2 pi sigma) suggests
-C_I, TAU_SCALE = 36.0, 1e-4  # ... and tau must be scaled DOWN for a capillary flow (see above)
+C_I, TAU_SCALE = 36.0, 1e-4  # not required for damping (see above); kept so the recorded output is unchanged
 T_CAP = np.sqrt(RHO * R**3 / SIGMA)  # capillary time: 0.0283
 
 cx = R + GAP / 2.0
