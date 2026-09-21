@@ -143,7 +143,13 @@ def _info_fem(f, deep: bool) -> Info:
         ("dofs", _fmt_n(f.dofs)),
     ]
     if getattr(f, "is_complex", False):
-        form.append(("complex", "yes — solved as a real-equivalent 2n block"))
+        cn = getattr(f, "_complex_n", None)
+        form.append((
+            "complex",
+            "yes — solved as a real-equivalent 2n block"
+            + (f"; the field blocks below index the REAL half (n = {_fmt_n(cn)}), the imaginary half follows at +n"
+               if cn else ""),
+        ))
     if f.mode == "transient":
         form.append(("time window", f"[{getattr(f, 't0', '?')}, {getattr(f, 't1', '?')}]"))
     if getattr(f, "_periodic", None) is not None:
@@ -224,27 +230,61 @@ def _info_rcwa(r, deep: bool) -> Info:
 
 
 def _info_fdm(o, deep: bool) -> Info:
+    """A collocation (strong-form) solve. Its state is the PDE list, the unknown(s) and the points --
+    the first report here said only "route", which is true and useless."""
     d = getattr(o, "domain", None)
-    rows: list = [("route", "structured stencil + GMG" if getattr(d, "_structured_grid", None) else "cotangent / P1 operator")]
-    for label, attr in (("dofs", "dofs"), ("mode", "mode")):
-        v = getattr(o, attr, None)
-        if v is not None:
-            rows.append((label, str(v)))
+    structured = bool(getattr(d, "_structured_grid", None))
+    rows: list = [
+        ("route", "structured stencil + GMG preconditioner" if structured else "cotangent / P1 Laplace-Beltrami operator"),
+        ("regime", "transient (method of lines)" if getattr(o, "_transient", False) else "steady"),
+    ]
+    pts = getattr(o, "_pts", None)
+    if pts is not None:
+        q = np.asarray(pts)
+        rows.append(("collocation points", _fmt_n(q.shape[0])))
+        if q.ndim >= 2:
+            rows.append(("extent", " × ".join(f"[{q[:, a].min():.4g}, {q[:, a].max():.4g}]" for a in range(q.shape[1]))))
+    unk = list(getattr(o, "unknowns", None) or [])
+    if unk:
+        rows.append(("unknowns", f"{len(unk)}  ({', '.join(str(getattr(m, 'name', None) or type(m).__name__) for m in unk)})"))
+        if pts is not None and len(unk):
+            rows.append(("dofs", _fmt_n(len(np.asarray(pts)) * len(unk))))
+    terms = list(getattr(o, "_pde", None) or [])
+    if terms:
+        rows.append(("residual terms", _fmt_n(len(terms))))
+    if getattr(o, "_periodic_axes", None):
+        rows.append(("periodic axes", str(o._periodic_axes)))
+    if getattr(o, "region", None) is not None:
+        rows.append(("region", str(o.region)))
     if d is not None and getattr(d, "time", None):
-        rows.append(("time", str(d.time)))
-    return Info("fdm", [("solver", rows)])
+        t0, t1, nt = d.time
+        rows.append(("time", f"[{t0}, {t1}] · {nt} steps"))
+    return Info("fdm (collocation)", [("solver", rows)])
 
 
 def _info_core(c, deep: bool) -> Info:
     import jax
 
     models: list = []
-    for i, m in enumerate(getattr(c, "models", None) or []):
+    # `core.models` is a DICT keyed by model id, not a list -- enumerating it walks the KEYS and
+    # reports every model as `int, 1 parameters`. Measured, and the reason this is spelled out.
+    raw = getattr(c, "models", None) or {}
+    items = raw.items() if isinstance(raw, dict) else enumerate(raw)
+    total = 0
+    for key, m in items:
         try:
-            n = sum(int(np.asarray(x).size) for x in jax.tree_util.tree_leaves(m))
-            models.append((f"[{i}] {type(m).__name__}", f"{_fmt_n(n)} parameters"))
+            n = sum(int(np.asarray(x).size) for x in jax.tree_util.tree_leaves(m) if hasattr(x, "shape") or np.ndim(x))
+            total += n
+            extra = []
+            for attr in ("in_features", "output_dim"):
+                v = getattr(m, attr, None)
+                if v is not None:
+                    extra.append(f"{attr}={v}")
+            models.append((f"[{key}] {type(m).__name__}", f"{_fmt_n(n)} parameters" + (f"  ·  {', '.join(extra)}" if extra else "")))
         except Exception:  # noqa: BLE001
-            models.append((f"[{i}]", type(m).__name__))
+            models.append((f"[{key}]", type(m).__name__))
+    if len(models) > 1:
+        models.append(("total", f"{_fmt_n(total)} parameters"))
     cons: list = []
     try:
         for i, t in enumerate(c.get_constraint_tags(c.constraints)):
@@ -252,10 +292,13 @@ def _info_core(c, deep: bool) -> Info:
     except Exception:  # noqa: BLE001
         cons = [("count", _fmt_n(len(getattr(c, "constraints", []) or [])))]
     training: list = []
-    for label, attr in (("optimizer", "_optimizer"), ("step", "_step"), ("best loss", "_best_loss")):
-        v = getattr(c, attr, None)
-        if v is not None:
-            training.append((label, str(v)[:60]))
+    dom = getattr(c, "domain", None)
+    if dom is not None:
+        training.append(("domain", f"{getattr(dom, 'dimension', '?')}D · {_fmt_n(getattr(dom, 'total_samples', '?'))} samples"))
+    names = list(getattr(c, "_tracker_names", None) or [])
+    if names:
+        training.append(("trackers", ", ".join(map(str, names))))
+    training.append(("optimizer", "set" if getattr(c, "_opt_states", None) else "not set — call .optimizer(...) before .solve()"))
     sections = [("models", models), ("constraints", cons), ("training", training)]
     if deep:
         # What `core.print_tree()` and `core.print_shapes()` used to print. They were two more
@@ -280,6 +323,243 @@ def _info_spec(s, deep: bool) -> Info:
     doc = (type(s).__doc__ or getattr(s, "__doc__", "") or "").strip().split("\n")[0]
     return Info(f"spec · {name}", [("what it does", [("", doc)] if doc else []), ("settings", rows)])
 
+
+
+# ---------------------------------------------------------------------------------------------
+# the small parts: an expression, a variable, a network, a shape, a result
+#
+# These matter MORE than the assembled ones. The assembled object is where you find out something
+# was wrong; the small ones are where it went wrong. They also know less about themselves, so each
+# report says plainly what is not built yet rather than building it to have more to say.
+# ---------------------------------------------------------------------------------------------
+def _walk(node):
+    """Every traced node in the tree, once. Uses jNO's own child iterator so a new node type is
+    picked up here the moment `iter_children` learns about it."""
+    from .utils.solver.solver_helper import iter_children
+
+    seen, stack, out = set(), [node], []
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        out.append(n)
+        try:
+            stack.extend(iter_children(n))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _node_label(n) -> str:
+    for attr in ("name", "_name"):
+        v = getattr(n, attr, None)
+        if isinstance(v, str) and v:          # `name` is a METHOD on a Placeholder, and truthy
+            return v
+    return type(n).__name__
+
+
+def _info_expr(e, deep: bool, outer=None) -> Info:
+    from .trace import Model, TestFunction, TrialFunction, Variable
+
+    nodes = _walk(e)
+    # A bound-but-underived trial function keeps its coordinates on the VIEW (`_coord_vars`), not in
+    # the IR -- `u.bind(x=xb, y=yb) * v.bind(...)` has no Variable anywhere in its tree. Measured:
+    # without this, the region row is simply absent for exactly the terms a weak form is made of.
+    for holder in (outer, e):
+        for val in (vars(holder) if hasattr(holder, "__dict__") else {}).values():
+            if isinstance(val, dict):
+                nodes.extend(v for v in val.values() if isinstance(v, Variable))
+            elif isinstance(val, Variable):
+                nodes.append(val)
+    what: list = [("type", type(e).__name__)]
+    op = getattr(e, "op", None)
+    if isinstance(op, str):
+        what.append(("operator", op))
+    sh = getattr(e, "shape", None)
+    if sh is not None and not callable(sh):
+        what.append(("shape", str(sh)))
+
+    # WHICH REGION it samples. A PDE residual accidentally bound to `boundary` instead of
+    # `interior` is a classic mistake and is invisible everywhere else.
+    spatial, temporal = set(), set()
+    for n in nodes:
+        if isinstance(n, Variable):
+            (temporal if getattr(n, "axis", None) == "temporal" else spatial).add(str(getattr(n, "tag", "?")))
+    reads: list = []
+    if spatial:
+        reads.append(("regions", ", ".join(sorted(map(str, spatial)))))
+    if temporal:
+        reads.append(("temporal", "yes"))
+    models = {getattr(m, "name", None) or _node_label(m) for m in nodes if isinstance(m, Model)}
+    if models:
+        reads.append(("networks", ", ".join(sorted(map(str, models)))))
+    tri = [n for n in nodes if isinstance(n, TrialFunction)]
+    tst = [n for n in nodes if isinstance(n, TestFunction)]
+    if tri or tst:
+        reads.append(("weak form", f"trial {'yes' if tri else 'no'} · test {'yes' if tst else 'no'}"
+                                   + ("   ← a jno.fem term" if tri and tst else "")))
+
+    struct: list = []
+    try:
+        from .utils.solver.solver_helper import max_temporal_derivative_order
+
+        struct.append(("d/dt order", str(max_temporal_derivative_order(e))))
+    except Exception:  # noqa: BLE001
+        pass
+    jac = sum(1 for n in nodes if type(n).__name__ in ("Jacobian", "Hessian"))
+    struct.append(("derivative nodes", str(jac)))
+    struct.append(("tree size", f"{len(nodes)} nodes"))
+
+    tree: list = []
+    if deep:
+        def _render(n, depth=0, out=None):
+            from .utils.solver.solver_helper import iter_children
+
+            out = [] if out is None else out
+            out.append(("", "  " * depth + _node_label(n)))
+            if depth < 6:
+                try:
+                    for c in iter_children(n):
+                        _render(c, depth + 1, out)
+                except Exception:  # noqa: BLE001
+                    pass
+            return out
+
+        tree = _render(e)[:200]
+    return Info(f"expression · {type(e).__name__}", [("what", what), ("reads", reads),
+                                                     ("structure", struct), ("tree", tree)])
+
+
+def _info_variable(v, deep: bool) -> Info:
+    rows: list = [("tag", str(getattr(v, "tag", "?"))), ("axis", str(getattr(v, "axis", "spatial")))]
+    d = getattr(v, "_domain", None)
+    if d is not None:
+        pool = (getattr(d, "_mesh_pool", None) or {}).get(getattr(v, "tag", None))
+        if pool is not None:
+            q = np.asarray(pool)
+            rows.append(("points", _fmt_n(q.shape[0])))
+            if q.ndim >= 2:
+                dim = int(getattr(d, "dimension", q.shape[-1]))
+                rows.append(("extent", " × ".join(f"[{q[..., a].min():.4g}, {q[..., a].max():.4g}]" for a in range(min(dim, q.shape[-1])))))
+        if getattr(d, "normals_by_tag", None) and getattr(v, "tag", None) in d.normals_by_tag:
+            rows.append(("normals", "available — domain.variable(tag, normals=True)"))
+    return Info(f"variable · {getattr(v, 'tag', '?')}", [("", rows)])
+
+
+def _info_model(m, deep: bool) -> Info:
+    import jax
+
+    mod = getattr(m, "module", None)
+    nm = getattr(m, "name", None)
+    rows: list = [("name", str(nm) if isinstance(nm, str) and nm else "(unnamed)"),
+                  ("architecture", type(mod).__name__ if mod is not None else "?")]
+    try:
+        n = sum(int(np.asarray(x).size) for x in jax.tree_util.tree_leaves(mod) if np.ndim(x))
+        rows.append(("parameters", _fmt_n(n)))
+        leaves = [x for x in jax.tree_util.tree_leaves(mod) if np.ndim(x)]
+        if leaves:
+            rows.append(("dtype", str(np.asarray(leaves[0]).dtype)))
+    except Exception:  # noqa: BLE001
+        pass
+    for label, attr in (("input dim", "input_dim"), ("layer id", "layer_id"), ("weight path", "weight_path")):
+        val = getattr(m, attr, None)
+        if isinstance(val, (str, int, float, bool)) and str(val):
+            rows.append((label, str(val)))
+    if getattr(m, "frozen", None):
+        rows.append(("frozen", "yes — excluded from the optimizer"))
+    return Info(f"model · {nm if isinstance(nm, str) and nm else type(mod).__name__}", [("", rows)])
+
+
+def _info_shape(sh, deep: bool) -> Info:
+    """A shape BEFORE `.domain()`. Nothing here is meshed, so nothing here reports mesh quality --
+    what a CSG tree produced is checkable without paying gmsh for it."""
+    geom: list = [("dim", str(getattr(sh, "dim", "?")))]
+    try:
+        lo, hi = sh.bounds()
+        dim = int(getattr(sh, "dim", 2) or 2)
+        geom.append(("bounds", " × ".join(f"[{a:.4g}, {b:.4g}]" for a, b in list(zip(lo, hi))[:dim])))
+    except Exception:  # noqa: BLE001
+        pass
+    if getattr(sh, "_size", None) is not None:
+        geom.append(("mesh size", str(sh._size)))
+    if getattr(sh, "_mesh_order", 1) != 1:
+        geom.append(("geometry order", str(sh._mesh_order) + "  (curved)"))
+    if getattr(sh, "_structured", None):
+        geom.append(("structured", "yes"))
+    geom.append(("meshed", "no — call .domain() (jno.info on the domain then reports quality)"))
+
+    regions: list = []
+    try:
+        for name, sub in sh._region_items():
+            att = getattr(sub, "_attach", None) or {}
+            regions.append((str(name), ", ".join(f"{k}={v!r}" for k, v in att.items()) or "(no attached properties)"))
+    except Exception:  # noqa: BLE001
+        pass
+
+    tree: list = []
+
+    def _csg(node, depth=0, label=None):
+        if not isinstance(node, tuple) or not node:
+            return
+        kind = str(node[0])
+        tree.append(("", "  " * depth + (f"{label}: {kind}" if label else kind)))
+        if kind == "regions":                       # ('regions', ((name, shape), ...), conforming)
+            for name, sub in node[1]:
+                _csg(getattr(sub, "_node", None), depth + 1, label=str(name))
+            return
+        if kind == "leaf":                          # ('leaf', primitive, id)
+            tree.append(("", "  " * (depth + 1) + type(node[1]).__name__))
+            return
+        for child in node[1:]:                      # cut / fuse / inter
+            _csg(getattr(child, "_node", None), depth + 1)
+
+    _csg(getattr(sh, "_node", None))
+    return Info("shape (unmeshed)", [("geometry", geom), ("regions", regions), ("CSG tree", tree[:40])])
+
+
+def _info_result(r, deep: bool, context=None) -> Info:
+    """A solved array, or the per-frame trajectory an adaptive transient returns."""
+    if hasattr(r, "times") and hasattr(r, "states"):
+        rows = [("frames", _fmt_n(len(r.times))),
+                ("time", f"[{float(np.min(r.times)):.4g}, {float(np.max(r.times)):.4g}]"),
+                ("meshes", "one per frame — call .resample() for a uniform array")]
+        try:
+            rows.append(("dofs per frame", f"{min(len(np.asarray(s)) for s in r.states)}–{max(len(np.asarray(s)) for s in r.states)}"))
+        except Exception:  # noqa: BLE001
+            pass
+        return Info("trajectory (adaptive)", [("", rows)])
+
+    a = np.asarray(r)
+    rows = [("shape", str(a.shape)), ("dtype", str(a.dtype))]
+    if a.size == 0:
+        rows.append(("range", "— the array is EMPTY"))
+        return Info("result", [("array", rows), ("by field block", [])])
+    finite = np.isfinite(a)
+    if not finite.all():
+        rows.append(("finite", f"**{int((~finite).sum())} non-finite of {a.size}**"))
+        good = a[finite]
+        if good.size:
+            rows.append(("range (finite part)", f"[{good.min():.6g}, {good.max():.6g}]"))
+    else:
+        rows.append(("range", f"[{a.min():.6g}, {a.max():.6g}]"))
+        if not np.any(a):
+            rows.append(("note", "ALL ZERO"))
+    rows.append(("norm", f"{np.linalg.norm(a.reshape(-1)):.6g}"))
+
+    blocks: list = []
+    offs = list(getattr(context, "offsets", None) or [])
+    keys = list(getattr(context, "_block_field_keys", None) or [])
+    flat = a.reshape(-1)
+    if len(offs) > 1 and offs[-1] == flat.size:
+        for i in range(len(offs) - 1):
+            seg = flat[offs[i]:offs[i + 1]]
+            nm = f"field {keys[i]}" if i < len(keys) else f"block {i}"
+            rng = f"[{seg.min():.6g}, {seg.max():.6g}]" if seg.size else "(empty)"
+            blocks.append((nm, f"{_fmt_n(seg.size)} dofs · {rng}"))
+    elif context is not None:
+        blocks.append(("", "context given but its offsets do not span this array"))
+    return Info("result", [("array", rows), ("by field block", blocks)])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -353,7 +633,7 @@ def _info_env(deep: bool) -> Info:
 REGISTRY: dict = {}
 
 
-def info(obj: Any = None, *, deep: bool = False) -> Info:
+def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
     """Report what ``obj`` is and whether it is what you meant. See the module docstring.
 
     With no argument, reports the **environment** instead: x64, device, memory, versions.
@@ -365,6 +645,40 @@ def info(obj: Any = None, *, deep: bool = False) -> Info:
         return REGISTRY[cls](obj, deep)
     if hasattr(obj, "classification") and hasattr(obj, "offsets"):
         return _info_fem(obj, deep)
+    # The small parts. Dispatch on STRUCTURE, not class names: a Variable and a Model are both
+    # trace nodes, so they are tested before the generic expression handler, and everything else
+    # that walks like a trace node reaches `_info_expr` whatever it is called.
+    from .trace import Model, Placeholder, Variable
+
+    if isinstance(obj, (tuple, list)) and obj and all(isinstance(o, Variable) for o in obj):
+        # `domain.variable(tag)` hands back a tuple (x, y[, z], t) even without split=True.
+        # The components of one tag differ only in which column they read, so reporting each in
+        # full says the same thing three times. Group by tag.
+        seen, secs = set(), []
+        for v in obj:
+            tag = str(getattr(v, "tag", "?"))
+            if tag in seen:
+                continue
+            seen.add(tag)
+            rows = _info_variable(v, deep).sections[0][1]
+            n = sum(1 for o in obj if str(getattr(o, "tag", "?")) == tag)
+            secs.append((f"{tag}  ({n} component{'s' if n > 1 else ''})", rows))
+        return Info(f"variables · {len(obj)} returned by domain.variable(...)", secs)
+    if isinstance(obj, Variable):
+        return _info_variable(obj, deep)
+    if isinstance(obj, Model):
+        return _info_model(obj, deep)
+    if hasattr(obj, "_region_items") and hasattr(obj, "_node"):
+        return _info_shape(obj, deep)
+    inner = getattr(obj, "expr", None)
+    if isinstance(inner, Placeholder):
+        return _info_expr(inner, deep, outer=obj)
+    if isinstance(obj, Placeholder):
+        return _info_expr(obj, deep)
+    if hasattr(obj, "times") and hasattr(obj, "states"):
+        return _info_result(obj, deep, context)
+    if isinstance(obj, np.ndarray) or (hasattr(obj, "shape") and hasattr(obj, "dtype")):
+        return _info_result(obj, deep, context)
     if cls == "domain" or (hasattr(obj, "variable") and hasattr(obj, "dimension")):
         return _info_domain(obj, deep)
     if cls.lower().startswith("rcwa") or hasattr(obj, "efficiency"):

@@ -12,8 +12,19 @@ print(jno.info(fem, deep=True))      # + operator symmetry and empty rows
 print(jno.info(jno.solve.newton(direct=True)))   # what a spec actually does
 ```
 
-It takes a `domain`, a `jno.fem` form, a `jno.fdm` or `jno.rcwa` solver, a `jno.core`, or any
-`jno.solve` / `jno.precond` spec. `Info.as_dict()` returns the same content as data, so a test can
+It takes the assembled things — a `domain`, a `jno.fem` form, a `jno.fdm` or `jno.rcwa` solver, a
+`jno.core`, any `jno.solve` / `jno.precond` spec — and the **smaller parts they are built from**:
+
+```python
+print(jno.info(sh))                  # a shape, before .domain(): regions, bounds, the CSG tree
+print(jno.info(pde))                 # an expression: which region it samples, its derivatives
+print(jno.info(net))                 # a network: architecture, parameters, dtype
+print(jno.info(d.variable("lid")))   # a variable: tag, points, extent, normals
+print(jno.info(sol, context=fem))    # a result, split by the form's own field blocks
+```
+
+The small parts matter more than the assembled ones: the assembled object is where you find out
+something was wrong, and the small ones are where it went wrong. `Info.as_dict()` returns the same content as data, so a test can
 assert on structure rather than on formatted text.
 
 Two rules it keeps:
@@ -101,6 +112,61 @@ solution vector.
 With `deep=True` the operator section also reports `max|A - Aᵀ|` and the count of empty rows — an
 empty row is a singular system, and knowing it before the solver says "may be singular/ill-posed"
 saves guessing which condition is missing.
+
+## The smaller parts
+
+### An expression — `jno.info(pde)`
+
+```
+  reads
+    regions    interior
+    networks   MLP
+    weak form  trial yes · test yes   ← a jno.fem term
+  structure
+    d/dt order        0
+    derivative nodes  2
+    tree size         11 nodes
+```
+
+**`regions` is the one to read.** A PDE residual accidentally bound to `boundary` instead of
+`interior` produces a plausible, wrong answer and is invisible everywhere else. `deep=True` adds the
+node tree.
+
+Works on a bare IR node and on the `ScalarView` / `VectorView` wrappers a weak form is written in —
+including a bound-but-underived term, whose coordinates live on the view rather than in the tree.
+
+### A shape — `jno.info(sh)`
+
+```
+  geometry
+    bounds     [0, 2] × [0, 2]
+    meshed     no — call .domain() (jno.info on the domain then reports quality)
+  regions
+    lo  k=5.0
+    hi  k=1.0
+  CSG tree
+    regions
+      lo: leaf
+        Rect
+```
+
+Checks what your booleans and `.attach` calls actually produced, without paying gmsh for it. An
+unmeshed shape reports **no** mesh facts — `info` never builds something in order to have more to
+say.
+
+### A result — `jno.info(sol, context=fem)`
+
+```
+  array
+    shape  (224,)   range [-6.90236, 1.19927]   norm 36.2271
+  by field block
+    field 1  194 dofs · [-6.90236, 1.19927]
+    field 3  30 dofs · [-1.05379, 0.524342]
+```
+
+`context=` splits the vector by the form's **own** `offsets`, which are the assembler's order and
+not the order you wrote the terms in. An adaptive transient returns a trajectory instead, and that
+reports frames, the time span, and the per-frame dof range.
 
 ## Registering another type
 
