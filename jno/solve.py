@@ -223,6 +223,19 @@ def dense() -> LinearSolver:
     return LinearSolver(_fn, name="dense", direct=True)  # one LAPACK call: no iteration to compile away
 
 
+def _unit_scaled(M, b):
+    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for ``jax.scipy.sparse.linalg.gmres``.
+
+    JAX's GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below ``tol·‖b‖``, an
+    UNpreconditioned norm. A preconditioner far from unit scale moves that test by its scale: with Jacobi
+    on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of 1.5e-4 read as 7.5e-9
+    and was returned without a single iteration. A constant multiple of ``M`` leaves the Krylov iterates
+    unchanged and puts both norms on the same scale, so ``tol`` means what it says."""
+    Mb = jnp.linalg.norm(M(b))
+    scale = jnp.where(Mb > 0, jnp.linalg.norm(b) / jnp.where(Mb > 0, Mb, 1.0), 1.0)
+    return lambda r: scale * M(r)
+
+
 def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed):
     # Routed through `_firewalled` for the same reason the raw solvers are: `jax.scipy.sparse.linalg`
     # wraps itself in `custom_linear_solve`, so its transpose solve is JAX's -- out of reach, and
@@ -232,7 +245,12 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
         method = getattr(jax.scipy.sparse.linalg, name)
-        raw = lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+
+        def raw(mv, rhs, M, x0):
+            if name == "gmres" and M is not None:
+                M = _unit_scaled(M, rhs)
+            return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is

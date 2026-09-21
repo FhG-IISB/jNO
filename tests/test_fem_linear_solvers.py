@@ -458,3 +458,27 @@ def test_lu_host_reuse_false_does_not_retain_a_factorization():
     # ...and the answer is the same one, so this is a memory choice and not a numerical one.
     assert np.abs(x_cached - x_free).max() < 1e-12
     assert np.abs(x_free - 0.5).max() < 1e-12
+
+
+def test_gmres_tolerance_holds_with_a_scaled_preconditioner_and_a_warm_start():
+    """JAX's GMRES stops when the PRECONDITIONED residual falls below tol·‖b‖ (an unpreconditioned norm).
+    With a Jacobi preconditioner on rows of size ~2e4 and a warm start at a true residual of 1e-4, that read
+    as 5e-9 and the guess came back unchanged. jno.solve.gmres rescales the preconditioner to unit gain."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    import jno
+    from jno.utils.solver.solver_api import LinearOperator
+
+    with jax.enable_x64(True):
+        rng = np.random.default_rng(0)
+        n = 200
+        A = 2e4 * (np.eye(n) + 0.01 * rng.standard_normal((n, n)))
+        x_true = rng.standard_normal(n)
+        b = A @ x_true
+        guess = x_true + 1e-4 * np.linalg.norm(x_true) / np.sqrt(n) * rng.standard_normal(n)
+        inv = 1.0 / jnp.asarray(np.diag(A))
+        x = jno.solve.gmres()(LinearOperator(jnp.asarray(A)), jnp.asarray(b), M=lambda r: inv * r, x0=jnp.asarray(guess))
+        rel = float(np.linalg.norm(A @ np.asarray(x) - b) / np.linalg.norm(b))
+    assert rel < 1e-7, f"GMRES stopped at a relative residual of {rel:.1e}"
