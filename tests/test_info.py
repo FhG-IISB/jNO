@@ -120,14 +120,17 @@ def test_env_info_x64_row_carries_the_remedy_when_it_is_off():
 def _taylor_hood(p_first=False):
     d = jno.shape.rect(0, 0, 4, 1, size=0.5).domain()
     x, y, _ = d.variable("interior", split=True)
-    l = d.variable("left", split=True)
+    left = d.variable("left", split=True)
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
     p_, q_ = d.fem_symbols(names=("p", "q"))
     eu, ev = jno.np.symgrad(u, [x, y]), jno.np.symgrad(v, [x, y])
     pp, qq = p_.bind(x=x, y=y), q_.bind(x=x, y=y)
-    mom = (-pp * jno.np.trace(ev) + jno.np.inner(eu, ev, n_contract=2)) if p_first else \
-          (jno.np.inner(eu, ev, n_contract=2) - pp * jno.np.trace(ev))
-    return jno.fem([mom, -qq * jno.np.trace(eu), u(l[0], l[1]) - (0.0, 0.0), p_.pin()])
+    mom = (
+        (-pp * jno.np.trace(ev) + jno.np.inner(eu, ev, n_contract=2))
+        if p_first
+        else (jno.np.inner(eu, ev, n_contract=2) - pp * jno.np.trace(ev))
+    )
+    return jno.fem([mom, -qq * jno.np.trace(eu), u(left[0], left[1]) - (0.0, 0.0), p_.pin()])
 
 
 def test_fem_blocks_are_named_by_their_trial_field_and_report_element_order():
@@ -150,12 +153,13 @@ def test_fields_sharing_a_name_keep_their_key():
     d = _rect()
     x, y, _ = d.variable("interior", split=True)
     b = d.variable("boundary", split=True)
-    T, s_ = d.fem_symbols()          # both default-named
+    T, s_ = d.fem_symbols()  # both default-named
     C, r_ = d.fem_symbols()
     Tb, sb = T.bind(x=x, y=y), s_.bind(x=x, y=y)
     Cb, rb = C.bind(x=x, y=y), r_.bind(x=x, y=y)
-    f = jno.fem([Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb,
-                 T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0])
+    f = jno.fem(
+        [Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb, T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0]
+    )
     labels = list(jno.info(f).as_dict()["field blocks"])
     assert len(set(labels)) == 2 and all("(field " in lab for lab in labels)
 
@@ -167,8 +171,9 @@ def test_fields_sharing_a_name_keep_their_key():
 
 
 def test_shape_info_before_meshing_reports_regions_and_the_csg_tree():
-    sh = (jno.shape.rect(0, 0, 2, 1).name("lo").attach(k=5.0)
-          + jno.shape.rect(0, 1, 2, 2).name("hi").attach(k=1.0)).sized(0.4)
+    sh = (jno.shape.rect(0, 0, 2, 1).name("lo").attach(k=5.0) + jno.shape.rect(0, 1, 2, 2).name("hi").attach(k=1.0)).sized(
+        0.4
+    )
     data = jno.info(sh).as_dict()
     assert "no" in data["geometry"]["meshed"], "an unmeshed shape must not claim mesh facts"
     assert data["regions"]["lo"].startswith("k=5.0")
@@ -210,13 +215,19 @@ def test_variable_info_groups_the_components_of_one_tag():
 def test_result_info_splits_by_the_forms_own_field_blocks():
     d = jno.shape.rect(0, 0, 4, 1, size=0.6).domain()
     x, y, _ = d.variable("interior", split=True)
-    l = d.variable("left", split=True)
+    left = d.variable("left", split=True)
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
     p_, q_ = d.fem_symbols(names=("p", "q"))
     eu, ev = jno.np.symgrad(u, [x, y]), jno.np.symgrad(v, [x, y])
     pp, qq = p_.bind(x=x, y=y), q_.bind(x=x, y=y)
-    f = jno.fem([jno.np.inner(eu, ev, n_contract=2) - pp * jno.np.trace(ev), -qq * jno.np.trace(eu),
-                 u(l[0], l[1]) - (0.0, 0.0), p_.pin()])
+    f = jno.fem(
+        [
+            jno.np.inner(eu, ev, n_contract=2) - pp * jno.np.trace(ev),
+            -qq * jno.np.trace(eu),
+            u(left[0], left[1]) - (0.0, 0.0),
+            p_.pin(),
+        ]
+    )
     sol = np.asarray(f.solve(linear=jno.solve.lu()))
     blocks = jno.info(sol, context=f).as_dict()["by field block"]
     assert len(blocks) == len(f.offsets) - 1
@@ -235,12 +246,15 @@ def test_result_info_without_a_context_still_reports_the_array():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("arr,expect", [
-    (np.zeros(0), "EMPTY"),
-    (np.zeros(5), "ALL ZERO"),
-    (np.array([1.0, np.nan, np.inf, 2.0]), "non-finite"),
-    (np.array(3.0), "()"),
-])
+@pytest.mark.parametrize(
+    "arr,expect",
+    [
+        (np.zeros(0), "EMPTY"),
+        (np.zeros(5), "ALL ZERO"),
+        (np.array([1.0, np.nan, np.inf, 2.0]), "non-finite"),
+        (np.array(3.0), "()"),
+    ],
+)
 def test_result_info_survives_degenerate_arrays(arr, expect):
     txt = str(jno.info(arr))
     assert expect in txt
@@ -282,8 +296,9 @@ def test_coupled_form_reports_one_block_per_field():
     C, r_ = d.fem_symbols(names=("C", "r"))
     Tb, sb = T.bind(x=x, y=y), s_.bind(x=x, y=y)
     Cb, rb = C.bind(x=x, y=y), r_.bind(x=x, y=y)
-    f = jno.fem([Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb,
-                 T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0])
+    f = jno.fem(
+        [Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb, T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0]
+    )
     assert list(jno.info(f).as_dict()["field blocks"]) == ["T", "C"]
 
 
@@ -300,9 +315,19 @@ def test_fdm_info_names_the_route_it_took(structured):
     assert data["regime"] == "steady" and int(data["collocation points"]) > 0
 
 
-@pytest.mark.parametrize("spec", [jno.solve.lu(), jno.solve.cg(), jno.solve.gmres(),
-                                  jno.solve.bicgstab(), jno.solve.newton(), jno.solve.picard(),
-                                  jno.solve.theta(0.5), jno.precond.jacobi()])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        jno.solve.lu(),
+        jno.solve.cg(),
+        jno.solve.gmres(),
+        jno.solve.bicgstab(),
+        jno.solve.newton(),
+        jno.solve.picard(),
+        jno.solve.theta(0.5),
+        jno.precond.jacobi(),
+    ],
+)
 def test_every_solver_spec_reports_something(spec):
     assert len(str(jno.info(spec)).splitlines()) > 1
 
@@ -344,10 +369,13 @@ def test_rcwa_info_before_and_after_solving():
 
         e = jno.fn(lambda x, y, z: jnp.where((z >= Z0) & (z < Z1), 4.0, 1.0), [xi, yi, zi])
         eps = MatrixView(vec(e, e, e).expr).from_diag()
-        cons = [inner(cu, cv) - K0**2 * inner(eps @ ui, vi),
-                1j * K0 * inner(tut, tvt),
-                1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),
-                face("left") - face("right"), face("front") - face("back")]
+        cons = [
+            inner(cu, cv) - K0**2 * inner(eps @ ui, vi),
+            1j * K0 * inner(tut, tvt),
+            1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),
+            face("left") - face("right"),
+            face("front") - face("back"),
+        ]
 
         rc = jno.rcwa(cons, orders=9)
         unsolved = jno.info(rc).as_dict()
@@ -382,8 +410,9 @@ def _deeponet_problem(n_samples=4):
     dom = n_samples * jno.shape.rect(0, 0, 2, 1, size=0.4).domain()
     x, y, _ = dom.variable("interior")
     k = dom.variable("k", jax.random.uniform(key, (n_samples, 1, 1), minval=0.5, maxval=1.5))
-    net = jno.nn(foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=8, hidden_dim=32,
-                                  activation=jax.numpy.tanh, key=key))
+    net = jno.nn(
+        foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=8, hidden_dim=32, activation=jax.numpy.tanh, key=key)
+    )
     net.optimizer(optax.adam(1e-3))
     u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
     pde = k * (u.d2(x) + u.d2(y)) + 1.0
@@ -446,13 +475,12 @@ def test_classification_admits_when_it_does_not_cover_every_term():
     while implying it listed them all."""
     d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
     x, y, _ = d.variable("interior", split=True)
-    l = d.variable("left", split=True)
+    left = d.variable("left", split=True)
     r = d.variable("right", split=True)
     b = d.variable("bottom", split=True)
     u, v = d.fem_symbols()
     a, t = u.bind(x=x, y=y), v.bind(x=x, y=y)
-    f = jno.fem([a.x * t.x + a.y * t.y - 1.0 * t,
-                 u(l[0], l[1]) - u(r[0], r[1]), u(b[0], b[1]) - 0.0])
+    f = jno.fem([a.x * t.x + a.y * t.y - 1.0 * t, u(left[0], left[1]) - u(r[0], r[1]), u(b[0], b[1]) - 0.0])
     rep = jno.info(f)
     assert "periodic" in rep.as_dict()["form"]
     assert "2 of 3 terms appear here" in str(rep)
@@ -476,8 +504,9 @@ def test_a_transient_trajectory_splits_along_the_dof_axis():
     c = d.variable("initial", split=True)
     u, v = d.fem_symbols()
     a, w = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
-    f = jno.fem([a.t * w + 0.1 * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0,
-                 u(c[0], c[1], c[2]) - jno.np.sin(np.pi * c[0])])
+    f = jno.fem(
+        [a.t * w + 0.1 * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0, u(c[0], c[1], c[2]) - jno.np.sin(np.pi * c[0])]
+    )
     node = f.solve()
     traj = np.asarray(jno.core([node.mse]).eval([node]))
     blocks = jno.info(traj, context=f).as_dict()["by field block"]
@@ -494,7 +523,7 @@ def test_a_transient_trajectory_splits_along_the_dof_axis():
 
 def test_an_unregistered_jno_object_reports_instead_of_refusing():
     d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
-    br = d._boundary_regions["boundary"]          # an internal type with no handler
+    br = d._boundary_regions["boundary"]  # an internal type with no handler
     data = jno.info(br).as_dict()
     assert "generic" in data["title"]
     assert "BoundaryRegion" in data["what"]["class"]
@@ -550,8 +579,13 @@ def test_adaptive_trajectory_reports_frames_and_per_frame_dofs():
     c = d.variable("initial", split=True)
     u, v = d.fem_symbols()
     a, w = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
-    f = jno.fem([a.t * w + 0.05 * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0,
-                 u(c[0], c[1], c[2]) - jno.np.sin(np.pi * c[0]) * jno.np.sin(np.pi * c[1])])
+    f = jno.fem(
+        [
+            a.t * w + 0.05 * (a.x * w.x + a.y * w.y),
+            u(b[0], b[1]) - 0.0,
+            u(c[0], c[1], c[2]) - jno.np.sin(np.pi * c[0]) * jno.np.sin(np.pi * c[1]),
+        ]
+    )
     data = jno.info(f.solve(adapt=jno.solve.remesh())).as_dict()[""]
     assert int(data["frames"]) == 4 and "resample" in data["meshes"]
     assert "dofs per frame" in data
@@ -598,7 +632,7 @@ def test_core_with_two_models_reports_a_total():
 
 def test_shape_info_renders_boolean_nodes_and_structured_flag():
     sh = ((jno.shape.rect(0, 0, 4, 4) - jno.shape.disk(2, 2, 1)) | jno.shape.disk(0, 0, 0.5)).sized(0.5)
-    tree = " ".join(jno.info(sh).as_dict()["CSG tree"])   # a repeated-key section is a LIST
+    tree = " ".join(jno.info(sh).as_dict()["CSG tree"])  # a repeated-key section is a LIST
     assert "fuse" in tree and "cut" in tree
     assert "yes" in jno.info(jno.shape.rect(0, 0, 1, 1, size=0.5).structured()).as_dict()["geometry"]["structured"]
 
@@ -677,7 +711,7 @@ def test_complex_results_report_magnitude_not_lexicographic_order():
     z = np.array([1 + 2j, -3 - 1j, 0.5j])
     data = jno.info(z).as_dict()["array"]
     assert "|value|" in data and "range" not in data
-    assert "3.16" in data["|value|"]        # max |z| = |-3-1j|
+    assert "3.16" in data["|value|"]  # max |z| = |-3-1j|
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +743,7 @@ def test_a_bare_parameter_reports_as_a_model_not_an_expression():
     a, _crux, _n = _nuts_problem()
     data = jno.info(a).as_dict()
     assert "model" in data["title"]
-    assert data["inference"]["method"] == "bayesian · nuts"     # not a GenerateSamplingAPI repr
+    assert data["inference"]["method"] == "bayesian · nuts"  # not a GenerateSamplingAPI repr
     assert data["inference"]["warmup"] == "60" and data["inference"]["keep"] == "120"
 
 

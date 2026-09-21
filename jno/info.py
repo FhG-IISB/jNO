@@ -66,7 +66,7 @@ class Info:
 
     def __str__(self) -> str:
         width = 78
-        out = [f"{_RULE*3} {self.title} ".ljust(width, _RULE)]
+        out = [f"{_RULE * 3} {self.title} ".ljust(width, _RULE)]
         for name, rows in self.sections:
             if not rows:
                 continue
@@ -265,8 +265,12 @@ def _march_rows(m, solve_index=None, deep=False):
             headline += f" · FAILED at {at(kb)}"
         else:
             k = int(np.argmax(ratio))
-            rows.append(("convergence", f"all {len(r)} steps converged · tightest {at(k)}: "
-                                        f"residual at {100 * ratio[k]:.3g}% of its bound"))
+            rows.append(
+                (
+                    "convergence",
+                    f"all {len(r)} steps converged · tightest {at(k)}: residual at {100 * ratio[k]:.3g}% of its bound",
+                )
+            )
             headline += f" · tightest {at(k)} at {100 * ratio[k]:.3g}% of its bound"
         if deep:
             for j in range(len(r)):
@@ -300,8 +304,13 @@ def _last_solve_rows(st):
         if nl.get("residual") is not None:
             verdict = "  ✓" if nl.get("converged") else "  ✗ NOT converged"
             steps = f" · {nl['steps']} Newton steps" if nl.get("steps") is not None else ""
-            rows.append(("nonlinear", f"{nl.get('driver')} · residual {nl['residual']:.3e} / bound "
-                                      f"{nl.get('bound', float('nan')):.3e}{verdict}{steps}"))
+            rows.append(
+                (
+                    "nonlinear",
+                    f"{nl.get('driver')} · residual {nl['residual']:.3e} / bound "
+                    f"{nl.get('bound', float('nan')):.3e}{verdict}{steps}",
+                )
+            )
         else:
             rows.append(("nonlinear", f"{nl.get('driver')} · {nl.get('note', 'no verdict')}"))
     return rows
@@ -351,12 +360,17 @@ def _info_fem(f, deep: bool) -> Info:
     ]
     if getattr(f, "is_complex", False):
         cn = getattr(f, "_complex_n", None)
-        form.append((
-            "complex",
-            "yes — solved as a real-equivalent 2n block"
-            + (f"; the field blocks below index the REAL half (n = {_fmt_n(cn)}), the imaginary half follows at +n"
-               if cn else ""),
-        ))
+        form.append(
+            (
+                "complex",
+                "yes — solved as a real-equivalent 2n block"
+                + (
+                    f"; the field blocks below index the REAL half (n = {_fmt_n(cn)}), the imaginary half follows at +n"
+                    if cn
+                    else ""
+                ),
+            )
+        )
     if f.mode == "transient":
         form.append(("time window", f"[{getattr(f, 't0', '?')}, {getattr(f, 't1', '?')}]"))
     if getattr(f, "_periodic", None) is not None:
@@ -374,10 +388,18 @@ def _info_fem(f, deep: bool) -> Info:
         # tie, a gauge)" -- on a load-path march the missing term was the `.evolves` state update.
         n_upd = sum(1 for c in f._constraints if type(c).__name__ == "StateUpdate")
         rest = given - len(f.classification or [])
-        what = (f"{n_upd} state update{'s' if n_upd > 1 else ''} (.evolves)" if n_upd == rest
-                else "e.g. a state update (.evolves), a periodic tie, a gauge")
-        terms.append(("", f"— {len(f.classification or [])} of {given} terms appear here; the rest carry "
-                          f"no classification entry: {what}"))
+        what = (
+            f"{n_upd} state update{'s' if n_upd > 1 else ''} (.evolves)"
+            if n_upd == rest
+            else "e.g. a state update (.evolves), a periodic tie, a gauge"
+        )
+        terms.append(
+            (
+                "",
+                f"— {len(f.classification or [])} of {given} terms appear here; the rest carry "
+                f"no classification entry: {what}",
+            )
+        )
 
     blocks: list = []
     offs = list(getattr(f, "offsets", None) or [])
@@ -389,7 +411,7 @@ def _info_fem(f, deep: bool) -> Info:
         name = labels[i] if i < len(labels) else f"block {i}"
         vs = f" · value_shape {tuple(shapes[i])}" if i < len(shapes) and shapes[i] else ""
         od = f" · P{orders[i]}" if i < len(orders) else ""
-        blocks.append((name, f"dofs {offs[i]}:{offs[i+1]}  ({_fmt_n(offs[i+1]-offs[i])}){vs}{od}"))
+        blocks.append((name, f"dofs {offs[i]}:{offs[i + 1]}  ({_fmt_n(offs[i + 1] - offs[i])}){vs}{od}"))
 
     op: list = []
     A, b = getattr(f, "_A", None), getattr(f, "_b", None)
@@ -397,7 +419,7 @@ def _info_fem(f, deep: bool) -> Info:
         try:
             nnz = int(getattr(A, "nse", None) or np.asarray(A.data).size)
             n = int(f.dofs)
-            op.append(("nnz", f"{_fmt_n(nnz)}  ·  fill {nnz / max(n * n, 1):.2e}  ·  ~{nnz / max(n,1):.1f}/row"))
+            op.append(("nnz", f"{_fmt_n(nnz)}  ·  fill {nnz / max(n * n, 1):.2e}  ·  ~{nnz / max(n, 1):.1f}/row"))
             op.append(("dense equivalent", _bytes(n * n * 8)))
             dt = str(np.asarray(A.data).dtype)
             op.append(("dtype", dt + ("" if "64" in dt else "   ← float32: is jax_enable_x64 set?")))
@@ -422,8 +444,9 @@ def _info_fem(f, deep: bool) -> Info:
             if np.array_equal(k1[o1], k2[o2]):
                 asym = float(np.abs(vals[o1] - vals[o2]).max()) if vals.size else 0.0
                 scale = float(np.abs(vals).max()) or 1.0
-                op.append(("symmetry", f"max|A - Aᵀ| = {asym:.2e}  "
-                                       f"({'symmetric' if asym / scale < 1e-12 else 'NON-symmetric'})"))
+                op.append(
+                    ("symmetry", f"max|A - Aᵀ| = {asym:.2e}  ({'symmetric' if asym / scale < 1e-12 else 'NON-symmetric'})")
+                )
             else:
                 op.append(("symmetry", "NON-symmetric (the sparsity pattern itself is not symmetric)"))
         except Exception as e:  # noqa: BLE001
@@ -458,13 +481,17 @@ def _info_rcwa(r, deep: bool) -> Info:
     `_Sol` does not have -- written from attribute names, never run.
     """
     spec = getattr(r, "spec", None)
-    if spec is not None:                                            # the problem, before solving
+    if spec is not None:  # the problem, before solving
         setup: list = [("orders", str(getattr(r, "orders", "?")))]
         if getattr(r, "formulation", None) is not None:
             setup.append(("formulation", str(r.formulation)))
-        for label, attr in (("period", "period"), ("wavelength", "wavelength"),
-                            ("periodic axes", "periodic_axes"), ("source face", "source_face"),
-                            ("k_in", "k_in")):
+        for label, attr in (
+            ("period", "period"),
+            ("wavelength", "wavelength"),
+            ("periodic axes", "periodic_axes"),
+            ("source face", "source_face"),
+            ("k_in", "k_in"),
+        ):
             v = getattr(spec, attr, None)
             if v is not None:
                 setup.append((label, str(v)[:64]))
@@ -481,8 +508,10 @@ def _info_rcwa(r, deep: bool) -> Info:
                 layers.append((f"[{i}]", f"{tl}  ·  {rng}"))
             except Exception:  # noqa: BLE001
                 layers.append((f"[{i}]", str(lay)[:70]))
-        return Info("rcwa (problem, unsolved)", [("setup", setup), ("layers", layers),
-                                                 ("result", [("", "not solved — call .solve()")])])
+        return Info(
+            "rcwa (problem, unsolved)",
+            [("setup", setup), ("layers", layers), ("result", [("", "not solved — call .solve()")])],
+        )
 
     setup = []
     for label, attr in (("period", "_period"), ("wavelength", "_wl")):
@@ -500,11 +529,13 @@ def _info_rcwa(r, deep: bool) -> Info:
         tot = T + R
         # For a LOSSLESS stack T + R = 1 exactly. That is the energy-conservation oracle, and it is
         # the one number that says whether the truncation order was enough.
-        result.append((
-            "T + R",
-            f"{tot:.6f}" + ("   ✓ energy conserved" if abs(tot - 1.0) < 1e-6
-                            else "   ← not 1: absorbing stack, or too few orders"),
-        ))
+        result.append(
+            (
+                "T + R",
+                f"{tot:.6f}"
+                + ("   ✓ energy conserved" if abs(tot - 1.0) < 1e-6 else "   ← not 1: absorbing stack, or too few orders"),
+            )
+        )
     except Exception as e:  # noqa: BLE001
         result.append(("efficiency", f"unavailable ({type(e).__name__})"))
     return Info("rcwa (solved)", [("setup", setup), ("result", result)])
@@ -527,7 +558,9 @@ def _info_fdm(o, deep: bool) -> Info:
             rows.append(("extent", " × ".join(f"[{q[:, a].min():.4g}, {q[:, a].max():.4g}]" for a in range(q.shape[1]))))
     unk = list(getattr(o, "unknowns", None) or [])
     if unk:
-        rows.append(("unknowns", f"{len(unk)}  ({', '.join(str(getattr(m, 'name', None) or type(m).__name__) for m in unk)})"))
+        rows.append(
+            ("unknowns", f"{len(unk)}  ({', '.join(str(getattr(m, 'name', None) or type(m).__name__) for m in unk)})")
+        )
         if pts is not None and len(unk):
             rows.append(("dofs", _fmt_n(len(np.asarray(pts)) * len(unk))))
     # These came from the generic fallback's attribute dump -- the handler was reporting a
@@ -536,8 +569,10 @@ def _info_fdm(o, deep: bool) -> Info:
         rows.append(("fields", _fmt_n(o._nf)))
     if getattr(o, "_N", None):
         rows.append(("grid", f"N = {_fmt_n(o._N)}" + (f" · {_fmt_n(o._Ntot)} total" if getattr(o, "_Ntot", None) else "")))
-    conds = [(nm, len(getattr(o, a, None) or [])) for nm, a in
-             (("pde", "_pde"), ("dirichlet", "_dirichlet"), ("neumann", "_neumann"), ("initial", "_ic"))]
+    conds = [
+        (nm, len(getattr(o, a, None) or []))
+        for nm, a in (("pde", "_pde"), ("dirichlet", "_dirichlet"), ("neumann", "_neumann"), ("initial", "_ic"))
+    ]
     rows.append(("terms", " · ".join(f"{nm} {k}" for nm, k in conds if k)))
     if getattr(o, "_periodic_axes", None):
         rows.append(("periodic axes", str(o._periodic_axes)))
@@ -551,8 +586,11 @@ def _info_fdm(o, deep: bool) -> Info:
 
 def _subdomain_label(prob, geom=None) -> str:
     """One line for a domain-decomposition subdomain: which solver, which region, how many dofs."""
-    kind = "fem" if (hasattr(prob, "classification") and hasattr(prob, "offsets")) else (
-        "fdm" if hasattr(prob, "solve_pinned") else type(prob).__name__)
+    kind = (
+        "fem"
+        if (hasattr(prob, "classification") and hasattr(prob, "offsets"))
+        else ("fdm" if hasattr(prob, "solve_pinned") else type(prob).__name__)
+    )
     parts = [kind]
     region = getattr(prob, "region", None)
     if region is not None:
@@ -586,7 +624,9 @@ def _coupling_rows(cp) -> list:
         rows.append(("method", f"undetermined ({type(e).__name__})"))
     ifc = getattr(cp, "_interfaces", None) or {}
     if ifc.get("count"):
-        rows.append(("interface conditions", f"{ifc['count']} declared · {ifc.get('value', 0)} value, {ifc.get('flux', 0)} flux"))
+        rows.append(
+            ("interface conditions", f"{ifc['count']} declared · {ifc.get('value', 0)} value, {ifc.get('flux', 0)} flux")
+        )
     else:
         rows.append(("interface conditions", "none declared — value continuity (and flux, across a line) is inferred"))
     return rows
@@ -603,12 +643,24 @@ def _info_coupled(cp, deep: bool) -> Info:
             rows.append(("status", "deferred node (a trainable parameter is in play) — iterates when evaluated"))
         else:
             it, mx = li.get("iterations"), li.get("max_iter")
-            rows.append(("iterations", f"{it}" + (f" of max {mx}" if mx else "")
-                                       + ("   ← hit the cap" if (it is not None and mx and it >= mx) else "")))
+            rows.append(
+                (
+                    "iterations",
+                    f"{it}"
+                    + (f" of max {mx}" if mx else "")
+                    + ("   ← hit the cap" if (it is not None and mx and it >= mx) else ""),
+                )
+            )
             if li.get("overlap_jump") is not None:
                 ok = li.get("tol") is None or li["overlap_jump"] <= li["tol"]
-                rows.append(("overlap jump", f"{li['overlap_jump']:.3e}" + (f" vs tol {li['tol']:.1e}" if li.get("tol") else "")
-                                             + ("  ✓" if ok else "  ✗ above tol")))
+                rows.append(
+                    (
+                        "overlap jump",
+                        f"{li['overlap_jump']:.3e}"
+                        + (f" vs tol {li['tol']:.1e}" if li.get("tol") else "")
+                        + ("  ✓" if ok else "  ✗ above tol"),
+                    )
+                )
             if li.get("interface_step") is not None:
                 rows.append(("last interface step", f"{li['interface_step']:.3e}"))
             if li.get("gamma_nodes") is not None:
@@ -635,7 +687,9 @@ def _info_core(c, deep: bool) -> Info:
                 v = getattr(m, attr, None)
                 if v is not None:
                     extra.append(f"{attr}={v}")
-            models.append((f"[{key}] {type(m).__name__}", f"{_fmt_n(n)} parameters" + (f"  ·  {', '.join(extra)}" if extra else "")))
+            models.append(
+                (f"[{key}] {type(m).__name__}", f"{_fmt_n(n)} parameters" + (f"  ·  {', '.join(extra)}" if extra else ""))
+            )
         except Exception:  # noqa: BLE001
             models.append((f"[{key}]", type(m).__name__))
     if len(models) > 1:
@@ -649,7 +703,9 @@ def _info_core(c, deep: bool) -> Info:
     training: list = []
     dom = getattr(c, "domain", None)
     if dom is not None:
-        training.append(("domain", f"{getattr(dom, 'dimension', '?')}D · {_fmt_n(getattr(dom, 'total_samples', '?'))} samples"))
+        training.append(
+            ("domain", f"{getattr(dom, 'dimension', '?')}D · {_fmt_n(getattr(dom, 'total_samples', '?'))} samples")
+        )
     names = list(getattr(c, "_tracker_names", None) or [])
     if names:
         training.append(("trackers", ", ".join(map(str, names))))
@@ -662,7 +718,7 @@ def _info_core(c, deep: bool) -> Info:
             nm = getattr(fm, "name", None)
             label = str(nm) if isinstance(nm, str) and nm else type(getattr(fm, "module", None)).__name__
             if getattr(fm, "_bayesian_cfg", None):
-                opt_on_models.append(f"{label} (MCMC sampler)")      # a sampler is NOT an optimizer
+                opt_on_models.append(f"{label} (MCMC sampler)")  # a sampler is NOT an optimizer
             elif getattr(fm, "_vi_cfg", None):
                 opt_on_models.append(f"{label} (variational)")
             elif getattr(fm, "_opt_fn", None) is not None:
@@ -674,8 +730,9 @@ def _info_core(c, deep: bool) -> Info:
     elif opt_on_models:
         training.append(("training backend", f"per-model: {', '.join(opt_on_models)}"))
     else:
-        training.append(("training backend", "NONE — call .optimizer(...) / .bayesian(...) on the core or "
-                                              "on each net before .solve()"))
+        training.append(
+            ("training backend", "NONE — call .optimizer(...) / .bayesian(...) on the core or on each net before .solve()")
+        )
     dd = getattr(c, "_dd_subdomains", None)
     if dd:
         # A domain-decomposition core: its constraints are subdomain SOLVES that `.solve()` couples
@@ -717,7 +774,6 @@ def _info_spec(s, deep: bool) -> Info:
     return Info(f"spec · {name}", [("what it does", [("", doc)] if doc else []), ("settings", rows)])
 
 
-
 # ---------------------------------------------------------------------------------------------
 # the small parts: an expression, a variable, a network, a shape, a result
 #
@@ -747,7 +803,7 @@ def _walk(node):
 def _node_label(n) -> str:
     for attr in ("name", "_name"):
         v = getattr(n, attr, None)
-        if isinstance(v, str) and v:          # `name` is a METHOD on a Placeholder, and truthy
+        if isinstance(v, str) and v:  # `name` is a METHOD on a Placeholder, and truthy
             return v
     return type(n).__name__
 
@@ -806,8 +862,13 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
     tri = [n for n in nodes if isinstance(n, TrialFunction)]
     tst = [n for n in nodes if isinstance(n, TestFunction)]
     if tri or tst:
-        reads.append(("weak form", f"trial {'yes' if tri else 'no'} · test {'yes' if tst else 'no'}"
-                                   + ("   ← a jno.fem term" if tri and tst else "")))
+        reads.append(
+            (
+                "weak form",
+                f"trial {'yes' if tri else 'no'} · test {'yes' if tst else 'no'}"
+                + ("   ← a jno.fem term" if tri and tst else ""),
+            )
+        )
 
     struct: list = []
     try:
@@ -822,6 +883,7 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
 
     tree: list = []
     if deep:
+
         def _render(n, depth=0, out=None):
             from .utils.solver.solver_helper import iter_children
 
@@ -836,8 +898,9 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
             return out
 
         tree = _render(e)[:200]
-    return Info(f"expression · {type(e).__name__}", [("what", what), ("reads", reads),
-                                                     ("structure", struct), ("tree", tree)])
+    return Info(
+        f"expression · {type(e).__name__}", [("what", what), ("reads", reads), ("structure", struct), ("tree", tree)]
+    )
 
 
 def _info_tensor_tag(t, deep: bool) -> Info:
@@ -866,7 +929,12 @@ def _info_variable(v, deep: bool) -> Info:
             rows.append(("points", _fmt_n(q.shape[0])))
             if q.ndim >= 2:
                 dim = int(getattr(d, "dimension", q.shape[-1]))
-                rows.append(("extent", " × ".join(f"[{q[..., a].min():.4g}, {q[..., a].max():.4g}]" for a in range(min(dim, q.shape[-1])))))
+                rows.append(
+                    (
+                        "extent",
+                        " × ".join(f"[{q[..., a].min():.4g}, {q[..., a].max():.4g}]" for a in range(min(dim, q.shape[-1]))),
+                    )
+                )
         if getattr(d, "normals_by_tag", None) and getattr(v, "tag", None) in d.normals_by_tag:
             rows.append(("normals", "available — domain.variable(tag, normals=True)"))
     return Info(f"variable · {getattr(v, 'tag', '?')}", [("", rows)])
@@ -877,8 +945,10 @@ def _info_model(m, deep: bool) -> Info:
 
     mod = getattr(m, "module", None)
     nm = getattr(m, "name", None)
-    rows: list = [("name", str(nm) if isinstance(nm, str) and nm else "(unnamed)"),
-                  ("architecture", type(mod).__name__ if mod is not None else "?")]
+    rows: list = [
+        ("name", str(nm) if isinstance(nm, str) and nm else "(unnamed)"),
+        ("architecture", type(mod).__name__ if mod is not None else "?"),
+    ]
     try:
         n = sum(int(np.asarray(x).size) for x in jax.tree_util.tree_leaves(mod) if np.ndim(x))
         rows.append(("parameters", _fmt_n(n)))
@@ -914,13 +984,17 @@ def _info_model(m, deep: bool) -> Info:
         pri = cfg.get("prior")
         inference.append(("prior", getattr(pri, "__name__", None) or (str(pri)[:48] if pri else "default gaussian")))
         for k, v in (cfg.get("kernel_kwargs") or {}).items():
-            inference.append((f"kernel {k}", f"{type(v).__name__} shape {tuple(np.shape(v))}" if hasattr(v, "shape") else str(v)[:40]))
+            inference.append(
+                (f"kernel {k}", f"{type(v).__name__} shape {tuple(np.shape(v))}" if hasattr(v, "shape") else str(v)[:40])
+            )
 
     posterior: list = []
     chain = getattr(m, "posterior_samples", None)
     if chain is not None:
         q = np.asarray(chain)
-        posterior.append(("draws", f"shape {q.shape}" + (f"  ({q.shape[0]} chain(s) x {q.shape[1]} draws)" if q.ndim >= 2 else "")))
+        posterior.append(
+            ("draws", f"shape {q.shape}" + (f"  ({q.shape[0]} chain(s) x {q.shape[1]} draws)" if q.ndim >= 2 else ""))
+        )
         posterior.append(("mean / sd", f"{q.mean():.6g} / {q.std():.6g}"))
         # R-hat and ESS are the Bayesian answer to "did it converge" -- the analogue of the
         # relative residual on a deterministic solve, and the thing a chain must be judged on.
@@ -929,7 +1003,9 @@ def _info_model(m, deep: bool) -> Info:
 
             r = float(np.max(np.asarray(_bay.rhat(chain))))
             e_ = float(np.min(np.asarray(_bay.ess(chain))))
-            posterior.append(("R-hat (max)", f"{r:.4f}" + ("   ✓ < 1.01" if r < 1.01 else "   ← > 1.01: chains disagree, run longer")))
+            posterior.append(
+                ("R-hat (max)", f"{r:.4f}" + ("   ✓ < 1.01" if r < 1.01 else "   ← > 1.01: chains disagree, run longer"))
+            )
             posterior.append(("ESS (min)", f"{e_:.1f}" + ("   ✓" if e_ > 100 else "   ← < 100 effective draws")))
         except Exception as exc:  # noqa: BLE001
             posterior.append(("R-hat / ESS", f"unavailable ({type(exc).__name__})"))
@@ -939,7 +1015,12 @@ def _info_model(m, deep: bool) -> Info:
             q = np.asarray(v)
             if k == "is_divergent":
                 nd = int(q.sum())
-                posterior.append(("divergences", f"{nd} of {q.size}" + ("   ← a divergence invalidates the draws around it" if nd else "   ✓ none")))
+                posterior.append(
+                    (
+                        "divergences",
+                        f"{nd} of {q.size}" + ("   ← a divergence invalidates the draws around it" if nd else "   ✓ none"),
+                    )
+                )
             elif q.size:
                 posterior.append((k, f"mean {q.mean():.4g}"))
     if inference:
@@ -964,7 +1045,7 @@ def _info_shape(sh, deep: bool) -> Info:
     if getattr(sh, "_mesh_order", 1) != 1:
         geom.append(("geometry order", str(sh._mesh_order) + "  (curved)"))
     st = getattr(sh, "_structured", None)
-    if st is not None:                      # `.structured()` stores a TUPLE, and () is falsy
+    if st is not None:  # `.structured()` stores a TUPLE, and () is falsy
         geom.append(("structured", "yes" + (f" · {st}" if st else "")))
     geom.append(("meshed", "no — call .domain() (jno.info on the domain then reports quality)"))
 
@@ -983,14 +1064,14 @@ def _info_shape(sh, deep: bool) -> Info:
             return
         kind = str(node[0])
         tree.append(("", "  " * depth + (f"{label}: {kind}" if label else kind)))
-        if kind == "regions":                       # ('regions', ((name, shape), ...), conforming)
+        if kind == "regions":  # ('regions', ((name, shape), ...), conforming)
             for name, sub in node[1]:
                 _csg(getattr(sub, "_node", None), depth + 1, label=str(name))
             return
-        if kind == "leaf":                          # ('leaf', primitive, id)
+        if kind == "leaf":  # ('leaf', primitive, id)
             tree.append(("", "  " * (depth + 1) + type(node[1]).__name__))
             return
-        for child in node[1:]:                      # cut / fuse / inter
+        for child in node[1:]:  # cut / fuse / inter
             _csg(getattr(child, "_node", None), depth + 1)
 
     _csg(getattr(sh, "_node", None))
@@ -1000,11 +1081,18 @@ def _info_shape(sh, deep: bool) -> Info:
 def _info_result(r, deep: bool, context=None) -> Info:
     """A solved array, or the per-frame trajectory an adaptive transient returns."""
     if hasattr(r, "times") and hasattr(r, "states"):
-        rows = [("frames", _fmt_n(len(r.times))),
-                ("time", f"[{float(np.min(r.times)):.4g}, {float(np.max(r.times)):.4g}]"),
-                ("meshes", "one per frame — call .resample() for a uniform array")]
+        rows = [
+            ("frames", _fmt_n(len(r.times))),
+            ("time", f"[{float(np.min(r.times)):.4g}, {float(np.max(r.times)):.4g}]"),
+            ("meshes", "one per frame — call .resample() for a uniform array"),
+        ]
         try:
-            rows.append(("dofs per frame", f"{min(len(np.asarray(s)) for s in r.states)}–{max(len(np.asarray(s)) for s in r.states)}"))
+            rows.append(
+                (
+                    "dofs per frame",
+                    f"{min(len(np.asarray(s)) for s in r.states)}–{max(len(np.asarray(s)) for s in r.states)}",
+                )
+            )
         except Exception:  # noqa: BLE001
             pass
         return Info("trajectory (adaptive)", [("", rows)])
@@ -1051,14 +1139,14 @@ def _info_result(r, deep: bool, context=None) -> Info:
     if len(offs) > 1 and a.ndim == 2 and a.shape[-1] == offs[-1]:
         blocks.append(("", f"{a.shape[0]} time steps x {a.shape[1]} dofs"))
         for i in range(len(offs) - 1):
-            seg = a[:, offs[i]:offs[i + 1]]
+            seg = a[:, offs[i] : offs[i + 1]]
             nm2 = labels[i] if i < len(labels) else f"block {i}"
             rng = f"[{seg.min():.6g}, {seg.max():.6g}]" if seg.size else "(empty)"
             blocks.append((nm2, f"{_fmt_n(seg.shape[1])} dofs · {rng}  (over all steps)"))
         return Info("result", [("array", rows), ("by field block", blocks)])
     if len(offs) > 1 and offs[-1] == flat.size:
         for i in range(len(offs) - 1):
-            seg = flat[offs[i]:offs[i + 1]]
+            seg = flat[offs[i] : offs[i + 1]]
             nm = labels[i] if i < len(labels) else f"block {i}"
             rng = f"[{seg.min():.6g}, {seg.max():.6g}]" if seg.size else "(empty)"
             blocks.append((nm, f"{_fmt_n(seg.size)} dofs · {rng}"))
@@ -1088,11 +1176,14 @@ def _info_env(deep: bool) -> Info:
         x64 = bool(jax.config.jax_enable_x64)
     except Exception:  # noqa: BLE001
         x64 = None
-    build.append((
-        "float64 (x64)",
-        "ON" if x64 else "**OFF** — jNO assembles in float64; set jax.config.update('jax_enable_x64', True) "
-        "before the first array",
-    ))
+    build.append(
+        (
+            "float64 (x64)",
+            "ON"
+            if x64
+            else "**OFF** — jNO assembles in float64; set jax.config.update('jax_enable_x64', True) before the first array",
+        )
+    )
     build.append(("default dtype", str(np.zeros(1).dtype) + " (numpy) / " + str(jax.numpy.zeros(1).dtype) + " (jax)"))
     try:
         build.append(("backend", jax.default_backend()))
@@ -1107,7 +1198,7 @@ def _info_env(deep: bool) -> Info:
                 st = dev.memory_stats() or {}
                 used, lim = st.get("bytes_in_use"), st.get("bytes_limit")
                 if used is not None and lim:
-                    row += f"   ·   {_bytes(used)} / {_bytes(lim)} used ({100*used/lim:.0f} %)"
+                    row += f"   ·   {_bytes(used)} / {_bytes(lim)} used ({100 * used / lim:.0f} %)"
             except Exception:  # noqa: BLE001 - CPU devices have no memory_stats
                 pass
             devices.append((f"[{i}] {dev}", row))
@@ -1251,7 +1342,9 @@ def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
     # by its class name: they are variously `*Spec`, `_ThetaScheme`, or a plain closure holder, and
     # a name test missed the ones that matter.
     mod = str(getattr(type(obj), "__module__", ""))
-    if hasattr(obj, "__dict__") and (mod.startswith(("jno.solve", "jno.precond", "jno.utils.solver")) or cls.endswith("Spec")):
+    if hasattr(obj, "__dict__") and (
+        mod.startswith(("jno.solve", "jno.precond", "jno.utils.solver")) or cls.endswith("Spec")
+    ):
         return _guarded(_info_spec, obj, deep, "spec")
     # Anything from the jno namespace gets the generic report rather than a refusal: a type this
     # file has never heard of is exactly the case a fixed handler list cannot serve, and something

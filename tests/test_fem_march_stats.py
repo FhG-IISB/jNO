@@ -41,11 +41,13 @@ def _load_path(nstep=12):
     X, tau = [co[0], co[1]], co[-1]
     u, phi = d.fem_symbols()
     s, _ = d.fem_symbols(value_shape=())
-    return jno.fem([
-        (1.0 + u * u) * inner(grad(u, X), grad(phi, X), 1) - 14.0 * tau**8 * phi + 0.0 * s.i(-1) * phi,
-        s.evolves(s.i(-1)),
-        u(*cb) - 0.0,
-    ])
+    return jno.fem(
+        [
+            (1.0 + u * u) * inner(grad(u, X), grad(phi, X), 1) - 14.0 * tau**8 * phi + 0.0 * s.i(-1) * phi,
+            s.evolves(s.i(-1)),
+            u(*cb) - 0.0,
+        ]
+    )
 
 
 def _parametric():
@@ -66,8 +68,13 @@ def _heat(nonlinear, nt=21):
     u, v = d.fem_symbols()
     a, w = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
     k = (1.0 + a * a) if nonlinear else 1.0
-    return jno.fem([a.t * w + 0.1 * k * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0,
-                    u(c[0], c[1], c[2]) - n.sin(np.pi * c[0]) * n.sin(np.pi * c[1])])
+    return jno.fem(
+        [
+            a.t * w + 0.1 * k * (a.x * w.x + a.y * w.y),
+            u(b[0], b[1]) - 0.0,
+            u(c[0], c[1], c[2]) - n.sin(np.pi * c[0]) * n.sin(np.pi * c[1]),
+        ]
+    )
 
 
 CAPPED = dict(max_steps=1, rtol=1e-14, atol=1e-14)  # one Newton step at an unreachable tolerance

@@ -2113,8 +2113,7 @@ class FEM:
                 march = self._march_phrase(since)
                 return (
                     f"solved: {self._mode} · deferred (trace node) — built in {wall:.3g} s, "
-                    f"the solve runs when you evaluate it through jno.core"
-                    + (f" · {march}" if march else "")
+                    f"the solve runs when you evaluate it through jno.core" + (f" · {march}" if march else "")
                 )
             # Reduced WHERE THE SOLUTION LIVES; four scalars cross to the host in one transfer.
             # Measured at 73k dofs on an RTX 3070: 0.32 ms, against a 63 ms solve.

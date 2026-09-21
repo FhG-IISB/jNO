@@ -27,8 +27,9 @@ def _fem(kind):
     if kind == "transient":
         a, w = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
         c = d.variable("initial", split=True)
-        return jno.fem([a.t * w + 0.1 * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0,
-                        u(c[0], c[1], c[2]) - n.sin(np.pi * c[0])])
+        return jno.fem(
+            [a.t * w + 0.1 * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0, u(c[0], c[1], c[2]) - n.sin(np.pi * c[0])]
+        )
     a, t_ = u.bind(x=x, y=y), v.bind(x=x, y=y)
     base = a.x * t_.x + a.y * t_.y
     if kind == "linear":
@@ -48,8 +49,9 @@ def _coupled():
     C, r_ = d.fem_symbols(names=("C", "r"))
     Tb, sb = T.bind(x=x, y=y), s_.bind(x=x, y=y)
     Cb, rb = C.bind(x=x, y=y), r_.bind(x=x, y=y)
-    return jno.fem([Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb,
-                    T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0])
+    return jno.fem(
+        [Tb.x * sb.x + Tb.y * sb.y - Cb * sb, Cb.x * rb.x + Cb.y * rb.y - Tb * rb, T(b[0], b[1]) - 0.0, C(b[0], b[1]) - 1.0]
+    )
 
 
 def _fdm(structured):
@@ -82,8 +84,10 @@ CASES = [
     ("domain structured", lambda: jno.shape.rect(0, 0, 1, 1, size=0.34).structured().domain()),
     ("shape primitive", lambda: jno.shape.rect(0, 0, 1, 1)),
     ("shape nested CSG", lambda: (jno.shape.rect(0, 0, 4, 4) - jno.shape.disk(2, 2, 1)) | jno.shape.disk(0, 0, 0.5)),
-    ("shape regions + attach", lambda: jno.shape.rect(0, 0, 1, 1).name("a").attach(k=1.0)
-                                       + jno.shape.rect(1, 0, 2, 1).name("b").attach(k=2.0)),
+    (
+        "shape regions + attach",
+        lambda: jno.shape.rect(0, 0, 1, 1).name("a").attach(k=1.0) + jno.shape.rect(1, 0, 2, 1).name("b").attach(k=2.0),
+    ),
     ("shape 3-D", lambda: jno.shape.box(0, 0, 0, 1, 1, 1) - jno.shape.sphere(0.5, 0.5, 0.5, 0.2)),
     ("fem linear", lambda: _fem("linear")),
     ("fem nonlinear", lambda: _fem("nonlinear")),
@@ -115,8 +119,7 @@ CASES = [
 ]
 
 # deep=True only differs for the forms and the expression tree.
-DEEP = {"fem linear", "fem nonlinear", "fem transient", "fem complex", "fem coupled",
-        "expr weak-form term"}
+DEEP = {"fem linear", "fem nonlinear", "fem transient", "fem complex", "fem coupled", "expr weak-form term"}
 
 
 def _check(label, rep):

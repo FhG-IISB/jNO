@@ -31,9 +31,7 @@ def _mesh_quality(points, elements, element_type: str) -> str:
             pairs = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
             edges = _np.stack([_np.linalg.norm(v[:, i] - v[:, j], axis=1) for i, j in pairs])
             faces = ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
-            surf = sum(
-                0.5 * _np.linalg.norm(_np.cross(v[:, j] - v[:, i], v[:, k] - v[:, i]), axis=1) for i, j, k in faces
-            )
+            surf = sum(0.5 * _np.linalg.norm(_np.cross(v[:, j] - v[:, i], v[:, k] - v[:, i]), axis=1) for i, j, k in faces)
             vol = _np.abs(signed)
             inradius = 3.0 * vol / _np.maximum(surf, 1e-300)
             aspect = edges.max(axis=0) / _np.maximum(inradius, 1e-300) / (2.0 * _np.sqrt(6.0))
@@ -42,12 +40,10 @@ def _mesh_quality(points, elements, element_type: str) -> str:
             return ""
         bad = int((signed <= 0).sum())
         return (
-            f" · h {size.min():.3g}–{size.max():.3g} · worst aspect {aspect.max():.2f}"
-            f"{f' · INVERTED {bad}' if bad else ''}"
+            f" · h {size.min():.3g}–{size.max():.3g} · worst aspect {aspect.max():.2f}{f' · INVERTED {bad}' if bad else ''}"
         )
     except Exception:  # noqa: BLE001 - a log line must never be what fails a mesh build
         return ""
-
 
 
 import jax
@@ -343,9 +339,8 @@ class MeshUtils:
             mesh_connectivity["p1_area"] = np.array(area)
             mesh_connectivity["p1_grad_phi"] = np.array(grad_phi)
 
-        msg = (
-            f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
-            + _mesh_quality(points, elements, str(element_type))
+        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}" + _mesh_quality(
+            points, elements, str(element_type)
         )
 
         mesh_connectivity["nodal_ds"] = MeshUtils.compute_nodal_ds(mesh_connectivity)
@@ -391,9 +386,8 @@ class MeshUtils:
             n_bp = len(bp)
             mesh_connectivity.defer("VM", lambda: np.ones((n_bp, n_bp), dtype=np.float32) - np.eye(n_bp, dtype=np.float32))
 
-        msg = (
-            f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
-            + _mesh_quality(points, elements, str(element_type))
+        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}" + _mesh_quality(
+            points, elements, str(element_type)
         )
 
         return mesh_connectivity, msg

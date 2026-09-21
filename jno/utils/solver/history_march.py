@@ -582,8 +582,9 @@ def _check_march_converged(
     """
     if any(isinstance(v, jax.core.Tracer) for v in (r_end, r_start)):
         LAST_MARCH_STATS.clear()
-        LAST_MARCH_STATS.update(what=what, coord=coord, steps=None,
-                                note="no per-step record: the march was traced (jit/grad/vmap)")
+        LAST_MARCH_STATS.update(
+            what=what, coord=coord, steps=None, note="no per-step record: the march was traced (jit/grad/vmap)"
+        )
         return
     rtol, atol = getattr(solve_fn, "tolerances", None) or _MARCH_FALLBACK_TOL
     r_end = np.asarray(r_end, dtype=float)

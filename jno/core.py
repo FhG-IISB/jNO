@@ -5064,14 +5064,14 @@ class core:
         for i, expr in enumerate(all_exprs):
             try:
                 tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                _out.append(f"═══ Constraint {i} ═══"); _out.append(str(tree))
+                _out += [f"═══ Constraint {i} ═══", str(tree)]
             except Exception as exc:
                 _out.append(f"═══ Constraint {i} ═══  FAILED: {exc}")
 
         for i, expr in enumerate(all_tracker_exprs):
             try:
                 tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                _out.append(f"═══ Tracker {i} ═══"); _out.append(str(tree))
+                _out += [f"═══ Tracker {i} ═══", str(tree)]
             except Exception as exc:
                 _out.append(f"═══ Tracker {i} ═══  FAILED: {exc}")
 
