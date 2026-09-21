@@ -339,8 +339,45 @@ traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # step-doubling adaptiv
 
 `jno.solve.theta(θ)` (θ = 1 backward Euler, 0.5 Crank–Nicolson, 0 forward Euler) and
 `jno.solve.adaptive(…)` compose onto the method-of-lines march. The **exponential** integrator is *not*
-available for `jno.fdm`: it needs a linear operator `A` (for `e^{AΔt}`), which the strong-form
-matrix-free residual does not assemble, so it fails loud pointing you to a θ-scheme.
+available for `jno.fdm`, and it raises. It forms `exp(−Δt M⁻¹A)`, and a strong-form march is a DAE: the
+Dirichlet and flux rows are algebraic constraints with zero mass. Measured with an assembled operator, it
+ran but came back 4.8e-3 off a converged reference, where Crank–Nicolson at the same step was 2.0e-5.
+
+## Solver slots — `linear=` and `precond=`
+
+`jno.fdm(...).solve()` takes the same solver slots as `fem.solve()`: any `jno.solve` linear solver
+(`cg`, `bicgstab`, `gmres`, `lu`, …) and any `jno.precond` spec (`jacobi`, `amg`, `gmg`, …).
+
+```python
+sol = jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.amg())       # steady or transient
+sol = jno.fdm([...]).solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())    # structured grid
+```
+
+Setting either assembles the strong-form operator as a sparse matrix once: one JVP per colour of the
+stencil pattern, checked against the matrix-free action before use. What happens next depends on the
+problem:
+
+- **Linear, steady:** one `(A, b)` solve, composed exactly as `jno.fem` composes it.
+- **Linear, transient:** a linear time block. Every step is one preconditioned solve, and an AMG setup is
+  built once before the march.
+- **Nonlinear:** Newton with the assembled tangent. A preconditioner that needs a matrix (`amg`, `gmg`) is
+  set up once on the tangent at the initial guess.
+
+Left unset, the matrix-free default is unchanged. The assembled operator stays differentiable, so a
+crux-driven inverse runs through the slots too.
+
+!!! measured "100 heat steps, unstructured `cotangent`, CPU, repeat solve (machine under load ≈ 5)"
+    | nodes | default | `bicgstab` + `jacobi` | `cg` + `amg` | `lu` |
+    |---|---|---|---|---|
+    | 19k | 5.8 s | 4.4 s | 3.9 s | 6.1 s |
+    | 76k | 40 s | 28 s | **15 s** | 38 s |
+
+    The default's inner Krylov is unpreconditioned, so its iteration count grows with Δt and with mesh
+    refinement. AMG holds it at 6–8 per step. Every column gives the same answer to every printed digit.
+
+Scope: `gmg` preconditions one scalar field on a structured grid, so it refuses a coupled system and the
+`[u; v]` state of a `u.tt` problem; use `amg` there. That augmented system is not symmetric, so `cg` does
+not apply to it; use `gmres` or `bicgstab`.
 
 ---
 

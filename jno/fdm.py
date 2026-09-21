@@ -172,7 +172,7 @@ def _structured_linear_solve(domain):
     return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs, M=precond)
 
 
-def _integrate_transient(block, ts, time):
+def _integrate_transient(block, ts, time, linear_solve=None, nonlinear_solve=None):
     """March the semidiscrete ``block`` over the save-times ``ts`` with the chosen **time scheme** — a
     ``jno.solve.theta`` / ``adaptive`` / ``exponential`` slot, via its ``.integrate`` — or the default
     backward-Euler ``lax.scan`` when ``time is None``. This is the FDM analogue of ``fem.solve(time=…)``:
@@ -181,8 +181,8 @@ def _integrate_transient(block, ts, time):
     from .utils.solver.backend_blocks import _default_transient_integrate
 
     if time is None:
-        return _default_transient_integrate(block, {}, ts)
-    return time.integrate(block, {}, ts, linear_solve=None, nonlinear_solve=None)
+        return _default_transient_integrate(block, {}, ts, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
+    return time.integrate(block, {}, ts, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
 
 
 def _mesh(domain):
@@ -235,6 +235,70 @@ def _quadratic_gradient(u, pts, idx, nbrs):
     du = (u[nb] - u[idx][:, None]) * mask
     coef = jnp.einsum("bij,bj->bi", jnp.linalg.pinv(V), du)
     return coef[:, :dim] / scale[:, 0]
+
+
+def _stencil_pattern(cells, n_nodes, radius, n_fields=1, extra_pairs=()):
+    """Host-side sparsity candidate: node pairs within ``radius`` mesh edges of each other (plus any
+    ``extra_pairs``, e.g. periodic partners), expanded to every field pair of a coupled system."""
+    import scipy.sparse as sp
+
+    cells = np.asarray(cells)
+    k = cells.shape[1]
+    rows = [np.repeat(cells, k, axis=1).ravel()]
+    cols = [np.tile(cells, (1, k)).ravel()]
+    for a, b in extra_pairs:
+        a, b = np.asarray(a).ravel(), np.asarray(b).ravel()
+        rows += [a, b]
+        cols += [b, a]
+    rows, cols = np.concatenate(rows), np.concatenate(cols)
+    adj = sp.csr_matrix((np.ones(rows.size, dtype=np.int32), (rows, cols)), shape=(n_nodes, n_nodes))
+    adj.data[:] = 1
+    pattern = adj
+    for _ in range(radius - 1):
+        pattern = (pattern @ adj).tocsr()
+        pattern.data[:] = 1
+    if n_fields > 1:
+        pattern = sp.kron(np.ones((n_fields, n_fields), dtype=np.int32), pattern)
+    pattern = pattern.tocsr()
+    pattern.data[:] = 1
+    pattern.sort_indices()
+    return pattern
+
+
+def _color_columns(pattern):
+    """Greedy colouring of the columns of ``pattern`` such that no two columns of one colour share a
+    row, so one JVP per colour recovers every entry (Curtis, Powell & Reid, IMA J. Appl. Math. 13,
+    1974). Host-side and structural."""
+    conflict = (pattern.T @ pattern).tocsr()
+    n = pattern.shape[1]
+    color = np.full(n, -1, dtype=int)
+    indptr, indices = conflict.indptr, conflict.indices
+    for j in range(n):
+        taken = color[indices[indptr[j] : indptr[j + 1]]]
+        taken = taken[taken >= 0]
+        if taken.size == 0:
+            color[j] = 0
+            continue
+        free = np.ones(taken.max() + 2, dtype=bool)
+        free[taken] = False
+        color[j] = int(np.argmax(free))
+    return color, int(color.max()) + 1
+
+
+def _assemble_sparse(fun, u, pattern, color, n_colors):
+    """The Jacobian of ``fun`` at ``u`` as a BCOO on ``pattern``: one JVP per colour, batched.
+    Traceable and differentiable in whatever ``fun`` closes over (the pattern is a host constant)."""
+    import jax
+    import jax.experimental.sparse as jsp
+
+    coo = pattern.tocoo()
+    rows, cols = coo.row, coo.col
+    u = jnp.asarray(u)
+    seeds = jnp.asarray((color[None, :] == np.arange(n_colors)[:, None]).astype(np.float64), dtype=u.dtype)
+    _, lin = jax.linearize(fun, u)
+    products = jax.vmap(lin)(seeds)  # (n_colors, n)
+    data = products[jnp.asarray(color[cols]), jnp.asarray(rows)]
+    return jsp.BCOO((data, jnp.asarray(np.stack([rows, cols], axis=1))), shape=pattern.shape)
 
 
 def laplacian(u, domain, method: str = "cotangent"):
@@ -703,6 +767,58 @@ class _TraceFDM:
         count = jnp.zeros(self._N).at[cells.reshape(-1)].add(1.0)
         return total / jnp.maximum(count, 1.0)
 
+    def _sparsity(self, key, fun, u):
+        """``(pattern, colour, n_colours)`` for assembling ``fun``'s Jacobian, found once per problem.
+
+        The stencil width depends on the operators (one ring for ``cotangent`` and the structured grid,
+        two for a gradient of a gradient or the quadratic flux fit), so candidate patterns of growing
+        radius are tried and each is **verified**: the assembled matrix must reproduce the matrix-free
+        JVP on a random vector to 1e-10. Raises if none does, rather than solving with a wrong matrix."""
+        cache = self.__dict__.setdefault("_sparsity_cache", {})
+        if key in cache:
+            return cache[key]
+        import jax
+
+        cells = _mesh(self.domain)[1]
+        extra = [(np.asarray(sec), np.asarray(main)) for sec, main in self._periodic_rows()]
+        n = int(np.asarray(u).size)
+        n_fields = n // self._N
+        v = jnp.asarray(np.random.default_rng(0).standard_normal(n), dtype=jnp.asarray(u).dtype)
+        ref = jax.jvp(fun, (jnp.asarray(u),), (v,))[1]
+        scale = float(jnp.linalg.norm(ref)) or 1.0
+        for radius in (1, 2, 3):
+            pattern = _stencil_pattern(cells, self._N, radius, n_fields=n_fields, extra_pairs=extra)
+            color, n_colors = _color_columns(pattern)
+            A = _assemble_sparse(fun, u, pattern, color, n_colors)
+            if float(jnp.linalg.norm(A @ v - ref)) <= 1e-10 * scale:
+                cache[key] = (pattern, color, n_colors)
+                return cache[key]
+        raise ValueError(
+            "jno.fdm: could not assemble this strong-form operator as a sparse matrix (no stencil radius up "
+            "to 3 reproduces its matrix-free action), so the linear=/precond= slots that need a matrix "
+            "cannot be used. Leave linear=/precond= unset to keep the matrix-free default."
+        )
+
+    def _sparse_operator(self, key, fun, u):
+        """``fun``'s Jacobian at ``u`` as a sparse BCOO (see :meth:`_sparsity`)."""
+        pattern, color, n_colors = self._sparsity(key, fun, u)
+        return _assemble_sparse(fun, u, pattern, color, n_colors)
+
+    def _is_affine(self, key, fun, n):
+        """Is ``fun`` affine in the DOF vector? Its JVP must be the same at two different states.
+        Decided once per problem, eagerly, with the parameters at their current values."""
+        cache = self.__dict__.setdefault("_affine_cache", {})
+        if key not in cache:
+            import jax
+
+            rng = np.random.default_rng(1)
+            v = jnp.asarray(rng.standard_normal(n))
+            w = jnp.asarray(rng.standard_normal(n))
+            j0 = jax.jvp(fun, (jnp.zeros(n),), (v,))[1]
+            j1 = jax.jvp(fun, (w,), (v,))[1]
+            cache[key] = bool(jnp.linalg.norm(j1 - j0) <= 1e-10 * (float(jnp.linalg.norm(j0)) or 1.0))
+        return cache[key]
+
     def _mass_coefficient(self):
         """Per-node coefficient ``c`` on ``u.t`` (the diagonal mass ``M = diag(c)``), via the two-probe
         ``c = F(u.t=1) − F(u.t=0)`` (:func:`_set_temporal`) — the spatial residual cancels between the
@@ -1040,13 +1156,20 @@ class _TraceFDM:
             v0 = v0.at[jnp.asarray(idx)].set(self._eval_g(g_node, idx))
         return v0
 
-    def solve(self, nonlinear=None, x0=None, profile=False, time=None):
+    def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
         machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
         **Transient** problems (an ``u(initial) - u0`` condition is present) march by method-of-lines —
         ``t_span`` and the step count come from ``domain.time`` and the initial state from the IC — and
         return the trajectory (``(n_save, N)``); ``x0`` is rejected (the IC owns the initial state).
+
+        ``linear=`` and ``precond=`` are the same solver slots as ``fem.solve``'s: any ``jno.solve``
+        linear solver (``cg``, ``bicgstab``, ``gmres``, ``lu``, …) and any ``jno.precond`` spec (``jacobi``,
+        ``amg``, ``gmg``, …). Setting either assembles the operator as a sparse matrix once — for a linear
+        problem the whole system, for a nonlinear one the tangent — so matrix-based solvers and
+        preconditioners apply, in steady solves and in every time step. Left unset, the matrix-free
+        default is unchanged.
 
         ``time=`` selects the time scheme exactly as ``fem.solve(time=…)`` does — ``jno.solve.theta(θ)``
         (Crank–Nicolson at θ=0.5), ``jno.solve.adaptive(…)`` (step-doubling adaptive step size), or
@@ -1057,19 +1180,32 @@ class _TraceFDM:
             if self._transient:
                 if x0 is not None:
                     raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
-                return self._march(nonlinear=nonlinear, time=time)
+                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
             trainable = self._trainable_params()
             if trainable:
-                return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0)
-            return self._steady_solve(nonlinear=nonlinear, x0=x0)
+                return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
+            return self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
 
         if not profile:
-            return _run()
+            import jax
+
+            from .utils.solver.solver_api import clear_gate_failures, raise_if_gate_failed
+
+            # A linear solve inside a compiled march or Newton loop refuses non-convergence through a
+            # callback, whose raise can be lost; it is also recorded, and drained here once the result is
+            # concrete — the same boundary fem.solve drains at. A deferred (crux) node is drained by the
+            # caller that evaluates it.
+            clear_gate_failures()
+            result = _run()
+            if isinstance(result, jax.Array):
+                jax.block_until_ready(result)
+                raise_if_gate_failed()
+            return result
         from .utils.profiling import profile_solve
 
         return profile_solve(_run, label=f"fdm profile · {self._N} nodes · {'transient' if self._transient else 'steady'}")
 
-    def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, extra_pins=None):
+    def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, extra_pins=None, linear=None, precond=None):
         """The steady solve: fold the flux and Dirichlet rows into the residual and hand it to the
         ``jno.solve`` Newton–Krylov driver. ``extra_params`` carries the current values of any trainable
         ``jno.np.parameter`` (from :meth:`_parametric_node`). ``extra_pins`` is an ``(idx, values)`` pair
@@ -1080,13 +1216,89 @@ class _TraceFDM:
 
         N, single = self._N, self._nf == 1
         u0 = jnp.zeros(self._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)
-        if extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer):
+        if linear is not None or precond is not None:
+            sol = self._slot_steady(nonlinear, linear, precond, x0, u0, extra_params, extra_pins)
+        elif extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer):
             sol = self._compiled_steady(nonlinear, u0)
         else:
             residual_with_bc = self._steady_residual(extra_params, extra_pins)
             driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual_with_bc, u0))
             sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
         return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
+
+    def _slot_steady(self, nonlinear, linear, precond, x0, u0, extra_params, extra_pins):
+        """The steady solve through ``fem.solve``'s ``linear=`` / ``precond=`` slots, on the assembled
+        sparse operator. A linear problem is one ``(A, b)`` solve composed exactly as ``jno.fem`` composes
+        it; a nonlinear one runs the composed Newton, whose direct variant gets the assembled tangent."""
+        import jax
+
+        from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
+
+        self._check_precond_shape(precond, self._Ntot)
+        residual = self._steady_residual(extra_params, extra_pins)
+        zeros = jnp.zeros(self._Ntot)
+        # Structure (linearity, sparsity) is decided on a CONCRETE residual: the trainable parameters at
+        # their current values, so this works when the solve itself runs inside a crux trace.
+        with jax.ensure_compile_time_eval():
+            probe = self._steady_residual({lid: n.model.module for lid, n in self._trainable_params().items()})
+            linear_problem = self._is_affine("steady", probe, self._Ntot)
+            self._sparsity("steady", probe, jnp.zeros(self._Ntot))  # the pattern search needs values
+        if linear_problem:
+            if nonlinear is not None:
+                raise ValueError(
+                    "jno.fdm: nonlinear= given, but this problem is linear — there is no Newton loop to "
+                    "configure. Drop nonlinear=, or pick the linear solver with linear=."
+                )
+            A = self._sparse_operator("steady", residual, zeros)
+            return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, -residual(zeros))
+        tangent = lambda w: self._sparse_operator("steady", residual, w)  # noqa: E731
+        if nonlinear is None:
+            # FDM can always assemble its tangent, so the Newton that uses it is the default here: it is
+            # what lets jacobi / amg / gmg precondition a nonlinear strong-form solve at all (the
+            # matrix-free JVP has no diagonal or matrix to give them).
+            nonlinear = _solve.newton(direct=True)
+        precond = self._frozen_precond(precond, lambda: tangent(u0 if not isinstance(u0, jax.core.Tracer) else zeros))
+        driver = compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self)
+        return driver(residual, u0, jacobian=tangent)
+
+    def _frozen_precond(self, precond, representative):
+        """A preconditioner that must see a concrete matrix (amg, gmg, ilu) cannot be set up inside the
+        traced Newton loop, so it is set up once, here, on the assembled tangent at the initial guess —
+        the frozen-preconditioner trade the transient march makes too (it changes how fast Krylov
+        converges, never what it converges to). Traceable ones (jacobi) are left per-linearization."""
+        if precond is None:
+            return None
+        from .utils.solver.solver_api import (
+            LinearOperator,
+            PrecondContext,
+            _FrozenMarchPrecond,
+            _specs_in,
+            materialize_precond,
+            prepare_precond,
+        )
+
+        leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
+        if all(bool(getattr(s, "traceable", True)) for s in leaves):
+            return precond
+        prepare_precond(precond, self)
+        return _FrozenMarchPrecond(
+            materialize_precond(precond, PrecondContext(LinearOperator(representative()), self)), precond
+        )
+
+    def _check_precond_shape(self, precond, n):
+        """``gmg`` is a V-cycle on ONE scalar grid field. A coupled system or the augmented ``[u; v]`` state
+        of a ``u.tt`` problem is several fields long, and the V-cycle would reshape it onto the grid."""
+        if precond is None:
+            return
+        from .precond import _GMG
+        from .utils.solver.solver_api import _specs_in
+
+        if n != self._N and any(isinstance(s, _GMG) for s in _specs_in(precond)):
+            raise ValueError(
+                f"jno.precond.gmg() preconditions a single scalar field on the grid ({self._N} nodes), but "
+                f"this system has {n} unknowns (a coupled system, or the [u; v] state of a u.tt problem). "
+                "Use jno.precond.amg(), which works on any assembled operator."
+            )
 
     def _steady_residual(self, extra_params=None, extra_pins=None):
         """The steady residual with every boundary row folded in, as a function of the DOF vector."""
@@ -1223,7 +1435,7 @@ class _TraceFDM:
         Schwarz driver builds once and reuses)."""
         return self.pinned_solver(node_ids, nonlinear=nonlinear)(values)
 
-    def _parametric_node(self, trainable, *, nonlinear=None, x0=None):
+    def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None):
         """When the constraints carry a trainable ``jno.np.parameter`` (an inverse parameter), return the
         solve as a **trace node** instead of an array — exactly as ``fem.solve()`` does — so it composes
         into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with the parameter's
@@ -1242,13 +1454,13 @@ class _TraceFDM:
                 lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
                 for lid, v in zip(lids, values)
             }
-            return self._steady_solve(nonlinear=nonlinear, x0=x0, extra_params=extra)
+            return self._steady_solve(nonlinear=nonlinear, x0=x0, extra_params=extra, linear=linear, precond=precond)
 
         node = FunctionCall(_solve, param_nodes, name="fdm_solve")
         node._domain = self.domain  # so jno.core infers the domain from the graph (no explicit domain= needed)
         return node
 
-    def _march(self, *, nonlinear=None, save_ts=None, time=None):
+    def _march(self, *, nonlinear=None, save_ts=None, time=None, linear=None, precond=None):
         """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic
         :class:`SemidiscreteTimeBlock` integrator (``custom_root`` differentiable). ``M = I`` on interior
         nodes; **Dirichlet and Neumann/Robin flux nodes carry a zero mass row** — Dirichlet pins to ``g``,
@@ -1258,7 +1470,6 @@ class _TraceFDM:
         by default)."""
         import jax.experimental.sparse as jsparse
 
-        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
         from .utils.solver.time_route import _infer_time_window
 
         t0, t1, dt = _infer_time_window(self.domain)
@@ -1287,8 +1498,9 @@ class _TraceFDM:
                 r = r.at[idx].set(a[idx] * flux + b[idx])
             return jnp.where(bmask, wn - bvals, r)  # Dirichlet wins over flux on an overlapping node
 
+        slots = dict(nonlinear=nonlinear, linear=linear, precond=precond)
         if self._time_order == 2:
-            return self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time)
+            return self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots)
 
         c_nodes = self._mass_coefficient()  # u.t coefficient: 1 for a plain u.t, c(x) for ρcₚ(x)·u.t
         diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
@@ -1297,18 +1509,65 @@ class _TraceFDM:
         def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
             return boundary_rows(wn, spatial_res(wn))
 
-        block = SemidiscreteTimeBlock(
-            mass=lambda t, args: M,
-            residual=residual,
-            state0=self._initial_state(),
-            t0=float(t0),
-            t1=float(t1),
-            dt=float(dt),
-        )
-        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
-        return _integrate_transient(block, ts, time)
+        return self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots)
 
-    def _march_second_order(self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time):
+    def _run_block(self, M, residual, state0, window, metadata, save_ts, time, slots):
+        """Build the semidiscrete block ``M ẏ + R(y) = 0`` and march it.
+
+        With no solver slots it is a residual block, stepped by the matrix-free Newton–Krylov (the
+        historic default). With ``linear=`` / ``precond=`` it is composed exactly as ``fem.solve`` composes
+        a transient: an affine ``R`` becomes a **linear** block (``A`` assembled once as a sparse matrix,
+        ``c = −R(0)``), so every step is one preconditioned linear solve and an AMG or LU setup is built
+        once before the march; a nonlinear ``R`` keeps the Newton step, with the assembled tangent
+        available to a direct solver. A ``nonlinear=`` slot configures the per-step Newton."""
+        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
+        from .utils.solver.solver_api import compose_transient_step_solvers
+
+        t0, t1, dt = window
+        nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
+        common = dict(state0=state0, t0=float(t0), t1=float(t1), dt=float(dt), metadata=dict(metadata))
+        frozen = lambda y: residual(y, float(t0), {})  # noqa: E731  (R does not depend on t)
+        n = int(state0.size)
+        self._check_precond_shape(precond, n)
+        if linear is not None or precond is not None:
+            import jax
+
+            zeros = jnp.zeros(n)
+            with jax.ensure_compile_time_eval():  # structure is decided on concrete values
+                self._sparsity("march", frozen, jnp.zeros(n))
+                linear_problem = self._is_affine("march", frozen, n)
+            if linear_problem:
+                A = self._sparse_operator("march", frozen, zeros)
+                block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=-frozen(zeros), **common)
+            else:
+                block = SemidiscreteTimeBlock(
+                    mass=lambda t, args: M,
+                    residual=residual,
+                    jacobian=lambda w, t, args: self._sparse_operator("march", lambda y: residual(y, t, args), w),
+                    **common,
+                )
+        else:
+            block = SemidiscreteTimeBlock(mass=lambda t, args: M, residual=residual, **common)
+        from .utils.solver.timeschemes import _ExponentialScheme
+
+        if isinstance(time, _ExponentialScheme):
+            # Measured: with a slot set the block is linear and the exponential scheme RUNS, but it came
+            # back 4.8e-3 off a converged reference where Crank-Nicolson at the same step was 2.0e-5. It
+            # forms exp(-dt M⁻¹A), and an FDM block is a DAE: its Dirichlet and flux rows are algebraic,
+            # with a zero mass. Refused rather than returned.
+            raise NotImplementedError(
+                "jno.fdm: the exponential time scheme integrates a LINEAR block with an invertible mass "
+                "matrix, and a strong-form "
+                "march is a DAE — its boundary rows are algebraic constraints with zero mass. Use a "
+                "θ-scheme: jno.solve.theta(0.5) (Crank–Nicolson) or the backward-Euler default."
+            )
+        steppers = (None, None)
+        if linear is not None or precond is not None or nonlinear is not None:
+            steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
+        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
+        return _integrate_transient(block, ts, time, *steppers)
+
+    def _march_second_order(self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots):
         """March ``m·u_tt + c·u_t + R_spatial(u) = 0`` as the first-order augmented system in
         ``y = [u; v]`` with ``v = u_t`` — the same reduction :func:`jno.fem` makes for ``u_tt``:
 
@@ -1321,8 +1580,6 @@ class _TraceFDM:
         which conserves the energy of an undamped linear wave — backward Euler would damp it. Returns the
         ``u`` trajectory ``(n_save, N)``."""
         import jax.experimental.sparse as jsparse
-
-        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
 
         N = self._N
         m_nodes = self._time_coefficient(0.0, 1.0, "`u.tt` inertia coefficient", "nonlinear inertia `m(u)·u.tt`")
@@ -1338,17 +1595,9 @@ class _TraceFDM:
             return jnp.concatenate([ru, rv])
 
         v0 = jnp.where(algebraic, 0.0, self._initial_velocity())
-        block = SemidiscreteTimeBlock(
-            mass=lambda t, args: M,
-            residual=residual,
-            state0=jnp.concatenate([self._initial_state(), v0]),
-            t0=float(t0),
-            t1=float(t1),
-            dt=float(dt),
-            metadata={"theta": 0.5, "second_order": True},
-        )
-        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
-        return _integrate_transient(block, ts, time)[:, :N]
+        state0 = jnp.concatenate([self._initial_state(), v0])
+        metadata = {"theta": 0.5, "second_order": True}
+        return self._run_block(M, residual, state0, (t0, t1, dt), metadata, save_ts, time, slots)[:, :N]
 
 
 def fdm(constraints):

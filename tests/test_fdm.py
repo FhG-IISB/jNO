@@ -1389,3 +1389,131 @@ def test_compiled_solve_still_raises_on_a_stalled_newton():
     prob = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - 5.0 * jnn.exp(ui), u(xb, yb) - 0.0])
     with pytest.raises(RuntimeError, match="did not converge"):
         prob.solve(nonlinear=jno.solve.newton(max_steps=1))
+
+
+# ---- fem.solve's solver slots on jno.fdm: linear= / precond= --------------------------------------------
+# Setting either assembles the strong-form operator as a sparse matrix once (coloured JVPs, verified
+# against the matrix-free action), then composes exactly as `fem.solve` does. The oracle throughout is
+# the unchanged matrix-free default: every slot must reach the same answer.
+
+
+def _slot_problem(kind="unstructured", time=None, order=1, nonlinear=False):
+    import jno.jnp_ops as jnn
+
+    kw = {} if time is None else {"time": time}
+    if kind == "structured":
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), **kw)
+    else:
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05, **kw)
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t) if time else u.bind(x=x, y=y)
+    Δu = ui.d2(x) + ui.d2(y) if kind == "structured" else ui.laplacian(x, y, scheme=_COT)
+    if time:
+        xi, yi, _ = d.variable("initial", split=True)
+        u0 = 16 * xi * (1 - xi) * yi * (1 - yi) * jnn.exp(3 * xi)
+        return lambda: jno.fdm([(ui.tt if order == 2 else ui.t) - Δu, u(xb, yb) - 0.0, u(xi, yi) - u0])
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    return lambda: jno.fdm([-Δu - f - (jnn.exp(ui) if nonlinear else 0.0), u(xb, yb) - 0.0])
+
+
+_SLOTS = {
+    "lu": lambda: dict(linear=jno.solve.lu()),
+    "cg+jacobi": lambda: dict(linear=jno.solve.cg(), precond=jno.precond.jacobi()),
+    "gmres+amg": lambda: dict(linear=jno.solve.gmres(), precond=jno.precond.amg()),
+}
+
+
+def _max_rel(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    return float(np.abs(a - b).max() / np.abs(b).max())
+
+
+@pytest.mark.parametrize("slot", list(_SLOTS))
+@pytest.mark.parametrize("case", ["steady", "steady-nonlinear", "heat", "wave"])
+def test_solver_slots_reach_the_default_answer(slot, case):
+    if slot == "gmres+amg":
+        pytest.importorskip("pyamg")
+    if slot == "cg+jacobi" and case == "wave":
+        pytest.skip("the [u; v] system of a u.tt problem is not symmetric; CG does not apply (tested below)")
+    time = None if case.startswith("steady") else (0.0, 0.1, 21)
+    make = _slot_problem(time=time, order=2 if case == "wave" else 1, nonlinear=case == "steady-nonlinear")
+    kw = _SLOTS[slot]()
+    ref = make().solve()
+    assert _max_rel(make().solve(**kw), ref) < 1e-7
+
+
+def test_gmg_slot_on_a_structured_grid():
+    for case, time in (("steady", None), ("heat", (0.0, 0.1, 21))):
+        make = _slot_problem("structured", time=time)
+        got = make().solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())
+        assert _max_rel(got, make().solve()) < 1e-7, case
+
+
+def test_gmg_refuses_the_augmented_wave_state():
+    make = _slot_problem("structured", time=(0.0, 0.1, 21), order=2)
+    with pytest.raises(ValueError, match="single scalar field"):
+        make().solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())
+
+
+def test_cg_on_the_nonsymmetric_wave_system_raises():
+    make = _slot_problem(time=(0.0, 0.1, 21), order=2)
+    with pytest.raises(Exception, match="did not solve"):
+        make().solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
+
+
+def test_nonlinear_slot_on_a_linear_problem_raises():
+    with pytest.raises(ValueError, match="this problem is linear"):
+        _slot_problem()().solve(linear=jno.solve.lu(), nonlinear=jno.solve.newton())
+
+
+def test_transient_nonlinear_slot_is_used():
+    """`nonlinear=` on a transient FDM problem used to be accepted and silently ignored. One Newton step
+    cannot converge a cubic reaction, so the march must now refuse."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, 0.1, 6))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    prob = jno.fdm(
+        [ui.t - ui.laplacian(x, y, scheme=_COT) - 5.0 * ui**3, u(xb, yb) - 0.0, u(xi, yi) - 2.0 * jnn.sin(np.pi * xi)]
+    )
+    with pytest.raises(RuntimeError, match="did not converge"):
+        prob.solve(nonlinear=jno.solve.newton(max_steps=1))
+
+
+def test_inverse_through_a_solver_slot():
+    """The assembled operator is traceable, so a crux-driven inverse runs through `linear=` too."""
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    Δu = ui.laplacian(x, y, scheme=_COT)
+    observed = jnp.asarray(jno.fdm([-Δu - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(2.5))
+    s.optimizer(optax.adam(1e-1))
+    node = jno.fdm([-Δu - s * f, u(xb, yb) - 0.0]).solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
+    crux = jno.core([(node - observed).mse])
+    crux.solve(120)
+    assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - 1.0) < 2e-2
+
+
+def test_exponential_scheme_refused_even_with_a_linear_slot():
+    """With a slot the block is linear and the exponential scheme used to run, 4.8e-3 off a converged
+    reference (Crank-Nicolson at the same step: 2.0e-5): an FDM march is a DAE whose boundary rows have
+    zero mass, and the scheme forms M⁻¹A. It now refuses in both cases."""
+    make = _slot_problem(time=(0.0, 0.1, 21))
+    with pytest.raises(NotImplementedError, match="invertible mass"):
+        make().solve(time=jno.solve.exponential(), linear=jno.solve.gmres())
