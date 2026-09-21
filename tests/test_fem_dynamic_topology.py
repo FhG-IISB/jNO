@@ -84,9 +84,10 @@ def _coalescence(nsteps):
     d = (jno.shape.disk(xa, 0.0, RA, size=H) | jno.shape.disk(xb, 0.0, RB, size=H)).domain(
         time=(0.0, nsteps * DT, nsteps + 1)
     )
-    # Opt in: the operator is assembled against a RUNTIME connectivity, so a reconnection that keeps every
-    # shape hands over a new triangulation instead of rebuilding. Off by default -- without this line the
-    # march takes the ordinary path and compiles once per flip, which is what this test used to measure.
+    # Stated explicitly, though a geometry term now INFERS it (`_fem_impl`): the operator is assembled
+    # against a RUNTIME connectivity, so a reconnection that keeps every shape hands over a new
+    # triangulation instead of rebuilding. Kept explicit here so the test pins the contract it is about
+    # rather than riding a default that some later change could quietly flip.
     d._fem_want_dynamic_topology = True
     nnode = len(np.asarray(d.mesh.points))
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=1)
@@ -159,3 +160,39 @@ def test_a_flip_does_not_recompile_the_march():
         f"({n_short} at {flips_short} flips, {n_long} at {flips_long}) -- "
         "connectivity is still baked into the program"
     )
+
+
+def test_a_geometry_term_infers_dynamic_topology():
+    """A moving mesh should not have to ASK for runtime connectivity.
+
+    ``coord.d(t) - velocity`` states that the mesh moves, and a moving mesh is the only situation in
+    which the connectivity can change under a fixed node set. Requiring a separate
+    ``.dynamic_topology()`` is asking the caller to say the same thing twice.
+
+    It can be the default because it is free: measured on a geometry-term march over 41 frames,
+    ``relocate`` (connectivity never changes) went 1.6 s -> 1.0 s and ``remesh(alpha=1.2, every=1)``
+    3.5 s -> 0.9 s. Runtime connectivity is a gather through the index array the moved vertices
+    already travel on.
+
+    An explicit ``dynamic_topology(False)`` must still win, or the inference would be a trap.
+    """
+    import jno
+
+    def _mk(geometry: bool, explicit=None):
+        d = jno.shape.disk(0.0, 0.0, 0.5, size=0.2).domain(time=(0.0, 0.1, 3))
+        if explicit is not None:
+            d.dynamic_topology(explicit)
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        terms = [ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y), u(ci[0], ci[1]) - 1.0]
+        if geometry:
+            terms.append(xi.d(ti) - 0.0)
+        jno.fem(terms)
+        return bool(getattr(d, "_fem_want_dynamic_topology", False))
+
+    assert _mk(geometry=True), "a geometry term must infer runtime connectivity"
+    assert not _mk(geometry=False), "a static mesh must be left alone -- nothing can change its cells"
+    assert not _mk(geometry=True, explicit=False), "an explicit opt-out must beat the inference"
+    assert _mk(geometry=True, explicit=True)

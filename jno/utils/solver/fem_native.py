@@ -1133,6 +1133,10 @@ def assemble_fem_native(
     # several `_fem.py` entry points (single-field, multifield steady, multifield transient), and threading
     # a keyword through all of them buys nothing over one attribute the driver already owns.
     dynamic_topology = bool(dynamic_topology or getattr(domain, "_fem_want_dynamic_topology", False))
+    if dynamic_topology and _nonaffine and getattr(domain, "_fem_auto_dynamic_topology", False):
+        # Inferred from a geometry term, not asked for. This mesh cannot take the runtime-connectivity
+        # path, so fall back to the baked one rather than raising at a caller who never requested it.
+        dynamic_topology = False
     if dynamic_topology and _nonaffine:
         raise NotImplementedError(
             "assemble_fem_native(dynamic_topology=True): only affine simplices are supported -- a curved "

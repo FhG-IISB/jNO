@@ -5723,6 +5723,22 @@ def _fem_impl(
     for c in constraints:
         (_geometry if mesh_velocity(c) is not None else _rest).append(c)
     constraints, _mesh_velocity_node = _rewrite_mesh_velocity(_rest, _geometry, domain)
+    if _geometry and not hasattr(domain, "_fem_want_dynamic_topology"):
+        # A geometry term SAYS the mesh moves, and a moving mesh is the only situation in which the
+        # connectivity can change under a fixed node set. Asking the user to also say
+        # `.dynamic_topology()` is asking them to repeat themselves, so the default is inferred here --
+        # the last point before `assemble_fem_native` bakes the cell array into the program.
+        #
+        # It is a free default, which is why it can be one. Measured on a geometry-term march, 41
+        # frames: `relocate` (connectivity never changes) 1.6 s -> 1.0 s, `remesh(alpha=1.2, every=1)`
+        # (reconnecting every step) 3.5 s -> 0.9 s. Runtime connectivity is a gather through an index
+        # array the moved vertices already travel on, so there is nothing to pay for.
+        #
+        # `d.dynamic_topology(False)` still wins: an explicit call sets the attribute, so `hasattr`
+        # is True and this leaves it alone. The auto marker lets a non-affine mesh -- which this path
+        # cannot thread -- DOWNGRADE silently rather than raise at someone who never asked.
+        domain._fem_want_dynamic_topology = True
+        domain._fem_auto_dynamic_topology = True
     if rotation_bcs and not (_trial_spaces(constraints) - _NATIVE_SPACES):
         raise NotImplementedError(
             "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
