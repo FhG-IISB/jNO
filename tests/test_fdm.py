@@ -1542,3 +1542,27 @@ def test_exponential_scheme_refused_even_with_a_linear_slot():
     make = _slot_problem(time=(0.0, 0.1, 21))
     with pytest.raises(NotImplementedError, match="invertible mass"):
         make().solve(time=jno.solve.exponential(), linear=jno.solve.gmres())
+
+
+def test_coupled_fields_return_in_declaration_order():
+    """The fields come back in the order they were declared, whatever order the equations are listed in.
+    They used to come back in first-appearance order, so listing the v-equation first swapped u and v."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    U, V = jnn.sin(π * x) * jnn.sin(π * y) + x, x * y + jnn.cos(x)
+    eu = -(ui.xx + ui.yy) + vi - (2 * π**2 * jnn.sin(π * x) * jnn.sin(π * y) + V)
+    ev = -(vi.xx + vi.yy) + ui - (jnn.cos(x) + U)
+    bcs = [u(xb, yb) - (jnn.sin(π * xb) * jnn.sin(π * yb) + xb), v(xb, yb) - (xb * yb + jnn.cos(xb))]
+    p = _nodes(d)
+    Ue = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1]) + p[:, 0]
+    Ve = p[:, 0] * p[:, 1] + np.cos(p[:, 0])
+    for order in ([eu, ev], [ev, eu]):
+        uh, vh = np.asarray(jno.fdm(order + bcs).solve())
+        assert np.linalg.norm(uh - Ue) / np.linalg.norm(Ue) < 5e-3
+        assert np.linalg.norm(vh - Ve) / np.linalg.norm(Ve) < 5e-3

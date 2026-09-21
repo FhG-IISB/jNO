@@ -368,9 +368,11 @@ def _find_unknown(constraints):
 
 def _find_unknowns(constraints):
     """All ``domain.unknown()`` fields (nodal-field-parameter ModelCalls' Models) in the constraints, in
-    first-appearance order — a **coupled** system has several. At least one is required. The k-th PDE
-    equation (constraint order) drives the k-th unknown's DOF block; a ``u_k(region) - g`` BC is folded
-    into that block by whichever unknown it contains."""
+    **declaration** order — a **coupled** system has several, and ``.solve()`` returns one row per field in
+    this order. (It used to be first-appearance order: listing the v-equation first silently swapped the
+    returned ``u`` and ``v``.) At least one is required. The k-th PDE equation fills the k-th DOF block's
+    interior rows, and each ``u_k(region) - g`` BC the boundary rows of its own field's block; the joint
+    system is the same whichever order the equations are listed in."""
     from .trace import ModelCall
 
     seen, order = set(), []
@@ -390,7 +392,7 @@ def _find_unknowns(constraints):
             "jno.fdm([...]): expected at least one domain.unknown() field. Author the strong form with "
             "`u = domain.unknown()` (declare several for a coupled system)."
         )
-    return order
+    return sorted(order, key=lambda m: m.layer_id)  # layer ids come from a global, increasing counter
 
 
 def _periodic_axis(tag_a, tag_b):
