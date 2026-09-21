@@ -711,9 +711,14 @@ def _poisson3d(mesh_size, method="cotangent"):
     u = d.unknown()
     ui = u.bind(x=x, y=y, z=z)
     f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
-    # "cotangent" is the whole-Laplacian stencil (one term); "gradient_of_gradient" is the nested
-    # per-axis default, which is what summing d2 gives.
-    lap = ui.laplacian(x, y, z, scheme=_COT) if method == "cotangent" else ui.d2(x) + ui.d2(y) + ui.d2(z)
+    # "cotangent" is the whole-Laplacian stencil (one term); "gradient_of_gradient" is the nested per-axis
+    # stencil, named explicitly — the plain default sum is now fused into the cotangent Laplacian.
+    gog = "finite_difference:area_weighted"
+    lap = (
+        ui.laplacian(x, y, z, scheme=_COT)
+        if method == "cotangent"
+        else ui.d2(x, scheme=gog) + ui.d2(y, scheme=gog) + ui.d2(z, scheme=gog)
+    )
     sol = jno.fdm([-lap - f, u(xb, yb, zb) - 0.0]).solve()
     return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
 
@@ -800,7 +805,8 @@ def test_unknown_fd_subscheme_raises(structured, sub):
 
 def test_whole_laplacian_subscheme_allowed_on_laplacian():
     """The same sub-scheme is legitimate on `.laplacian`, which takes every coordinate at once so it
-    cannot be double-counted — and it is markedly more accurate than the nested-stencil default."""
+    cannot be double-counted — and it is markedly more accurate than the nested gradient-of-gradient
+    stencil (named explicitly: the plain default sum is fused into the cotangent Laplacian)."""
     import jno.jnp_ops as jnn
 
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
@@ -813,8 +819,11 @@ def test_whole_laplacian_subscheme_allowed_on_laplacian():
     f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
     rel = lambda sol: float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
     cot = rel(jno.fdm([-ui.laplacian(x, y, scheme="finite_difference:cotangent") - f, u(xb, yb) - 0.0]).solve())
-    nested = rel(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve())
+    gog = "finite_difference:area_weighted"
+    nested = rel(jno.fdm([-ui.d2(x, scheme=gog) - ui.d2(y, scheme=gog) - f, u(xb, yb) - 0.0]).solve())
     assert cot < nested / 3, f"cotangent should be several times better: {cot:.3e} vs {nested:.3e}"
+    default = rel(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve())
+    assert abs(default - cot) < 1e-8, "the default ui.d2(x) + ui.d2(y) must be fused into the cotangent Laplacian"
 
 
 def test_every_stencil_adjoint_matches_the_closed_form():
@@ -1586,3 +1595,32 @@ def test_structured_box_faces_are_named_like_shape_box():
             d.variable(face, split=True)
             face_pts = pts[prob._region_nodes(face)]
             assert np.allclose(face_pts[:, axis], value), (structured, face)
+
+
+@pytest.mark.parametrize("spelling", ["d2", "xx", "laplacian", "scaled"])
+def test_default_laplacian_is_fused_into_cotangent(spelling):
+    """On an unstructured mesh the per-axis default (a gradient of the area-weighted gradient) has a
+    spurious oscillating mode: its lowest Dirichlet eigenvalue on the unit square is ~5.4, not 2π², and it
+    does not refine away. An advection–diffusion solve came out 2.09 off, and Helmholtz at c = 5.41 blew up.
+    Every spelling of the plain Laplacian now fuses into the cotangent one, which has no such mode.
+    Oracle: −Δu − 5.41 u = f with u = sin(πx) sin(πy), sitting right on the old spurious eigenvalue."""
+    import jno.jnp_ops as jnn
+
+    π, c = np.pi, 5.4126
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    Δu = {
+        "d2": ui.d2(x) + ui.d2(y),
+        "xx": ui.xx + ui.yy,
+        "laplacian": ui.laplacian(x, y),
+        "scaled": None,
+    }[spelling]
+    f = (2 * π**2 - c) * jnn.sin(π * x) * jnn.sin(π * y)
+    pde = (-2.0 * ui.xx - 2.0 * ui.yy) / 2.0 - c * ui - f if spelling == "scaled" else -Δu - c * ui - f
+    sol = np.asarray(jno.fdm([pde, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    p = _nodes(d)
+    exact = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 1e-2

@@ -160,7 +160,13 @@ def _structured_linear_solve(domain):
     V-cycle is a fixed linear operator, so standard GMRES (not FGMRES) suffices. Returns ``None`` for an
     unstructured mesh, so the driver keeps its (BiCGStab) default there."""
     if getattr(domain, "mesh_connectivity", None) is None or domain.mesh_connectivity.get("grid") is None:
-        return None
+        # Unstructured: GMRES too. The strong-form operator is not symmetric, and the driver's BiCGStab broke
+        # down on it: a linear 3-D cotangent problem with one Neumann face diverged to a Newton residual of
+        # 5e24, where a direct solve gives 2.4e-3.
+        gmres = _solve.gmres()
+        from .utils.solver.solver_api import LinearOperator
+
+        return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
     from .utils.solver.geometric_mg import build_vcycle
     from .utils.solver.solver_api import LinearOperator
 
@@ -364,6 +370,90 @@ def _find_unknown(constraints):
             f"{len(models)}. Author the strong form with a single `u = domain.unknown()`."
         )
     return next(iter(models.values()))
+
+
+def _fuse_fd_laplacian(expr, dim):
+    """Rewrite ``c·(∂²u/∂x² + ∂²u/∂y² [+ ∂²u/∂z²])`` spelled with plain per-axis finite-difference second
+    derivatives (``ui.xx + ui.yy``, ``-ui.d2(x) - ui.d2(y)``) into ONE cotangent Laplacian.
+
+    On an unstructured mesh the per-axis default is a gradient of the area-weighted gradient, and that
+    operator has a spurious oscillating mode (its lowest Dirichlet eigenvalue on the unit square is ~5.4,
+    not 2π², and it does not refine away): advection–diffusion came out 2.09 off and Helmholtz near 5.4
+    blew up. The cotangent Laplacian has no such mode. A sum is fused only when it names every spatial
+    axis exactly once, with the same target and the same coefficient on each term; anything else (an
+    anisotropic ``a·u_xx + b·u_yy``, a partial sum in 3-D, an explicit sub-scheme) is left as written."""
+    from .trace import BinaryOp, Hessian, Literal
+
+    def atom(node):  # (coefficient, target, variable) of `c * ∂²u/∂v²`, else None
+        coef = 1.0
+        n = _unwrap(node)
+        if isinstance(n, BinaryOp) and n.op == "*":
+            if isinstance(n.left, Literal) and isinstance(_unwrap(n.right), Hessian):
+                coef, n = float(n.left.value), _unwrap(n.right)
+            elif isinstance(n.right, Literal) and isinstance(_unwrap(n.left), Hessian):
+                coef, n = float(n.right.value), _unwrap(n.left)
+        if not isinstance(n, Hessian) or len(n.variables) != 1 or (n.scheme or "finite_difference") != "finite_difference":
+            return None
+        var = n.variables[0]
+        if getattr(var, "axis", "spatial") != "spatial":
+            return None
+        return coef, n.target, var
+
+    def signed_terms(node, sign=1.0):
+        n = _unwrap(node)
+        if isinstance(n, BinaryOp) and n.op in ("+", "-"):
+            return signed_terms(n.left, sign) + signed_terms(n.right, sign if n.op == "+" else -sign)
+        return [(sign, n)]
+
+    def fuse_chain(node):
+        terms = signed_terms(node)
+        if len(terms) < dim:
+            return node
+        groups = {}
+        for i, (sign, term) in enumerate(terms):
+            a = atom(term)
+            if a is not None:
+                coef, target, var = a
+                groups.setdefault((id(target), sign * coef, getattr(var, "tag", None)), []).append((i, target, var))
+        replace, drop = {}, set()
+        for (_tid, coef, _tag), members in groups.items():
+            axes = [int(v.dim[0]) for _i, _t, v in members]
+            if sorted(axes) != list(range(dim)):
+                continue
+            lap = Hessian(members[0][1], [v for _i, _t, v in members], "finite_difference:cotangent", trace=True)
+            replace[members[0][0]] = (1.0, lap if coef == 1.0 else BinaryOp("*", Literal(coef), lap))
+            drop.update(i for i, _t, _v in members[1:])
+        if not replace:
+            return node
+        kept = [replace.get(i, t) for i, t in enumerate(terms) if i not in drop]
+        sign0, out = kept[0]
+        out = out if sign0 > 0 else BinaryOp("*", Literal(-1.0), out)
+        for sign, term in kept[1:]:
+            out = BinaryOp("+" if sign > 0 else "-", out, term)
+        return out
+
+    def visit(node):
+        n = _unwrap(node)
+        if (
+            isinstance(n, Hessian)
+            and getattr(n, "trace", False)
+            and (n.scheme or "finite_difference") == "finite_difference"
+            and sorted(int(v.dim[0]) for v in n.variables if getattr(v, "axis", "spatial") == "spatial") == list(range(dim))
+            and len(n.variables) == dim
+        ):
+            # `ui.laplacian(x, y)` with the default scheme: the same operator, already in one node.
+            return Hessian(n.target, list(n.variables), "finite_difference:cotangent", trace=True)
+        if isinstance(n, BinaryOp):
+            if n.op in ("+", "-"):
+                fused = fuse_chain(n)
+                if fused is not n:
+                    return fused
+            left, right = visit(n.left), visit(n.right)
+            if left is not n.left or right is not n.right:
+                return BinaryOp(n.op, left, right)
+        return n
+
+    return visit(expr)
 
 
 def _find_unknowns(constraints):
@@ -700,6 +790,25 @@ class _TraceFDM:
             return _mesh_nodes_in(np.asarray(self._pts), ptags[tag][1])
         return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
 
+    def _pde_exprs(self):
+        """The PDE residual expressions as solved, one per field: summed for a single field, and with the
+        per-axis default Laplacian fused into the cotangent one on an unstructured mesh
+        (:func:`_fuse_fd_laplacian`)."""
+        if self._nf == 1:
+            expr = self._pde[0]
+            for c in self._pde[1:]:
+                expr = expr + c
+            exprs = [_unwrap(expr)]
+        else:
+            exprs = [_unwrap(self._pde[k]) for k in range(self._nf)]
+        # Not on a sub-region: a domain-decomposition subdomain exports its interface flux from the
+        # area-weighted gradient, which is consistent with the per-axis stencil but not the cotangent one;
+        # fused, the FEM/FDM Dirichlet–Neumann iteration diverged (1e103). A cotangent-consistent interface
+        # flux (the P1 reaction, as for a FEM subdomain) would lift this.
+        if self.domain.mesh_connectivity.get("grid") is None and getattr(self, "region", None) is None:
+            exprs = [_fuse_fd_laplacian(e, int(self.domain.dimension)) for e in exprs]
+        return exprs
+
     def _pde_residual_fn(self, *, spatial=False, extra_params=None):
         """Differentiable residual over the nodal DOF vector, collocated at the mesh nodes. With
         ``spatial=True`` the ``u.t`` terms are dropped (:func:`_zero_temporal`) to give the
@@ -710,13 +819,7 @@ class _TraceFDM:
 
         from .trace_evaluator import TraceEvaluator
 
-        if self._nf == 1:  # single field: sum all PDE terms into the one equation (historic behaviour)
-            expr = self._pde[0]
-            for c in self._pde[1:]:
-                expr = expr + c
-            exprs = [_unwrap(expr)]
-        else:  # coupled: one equation per field, order-paired (equation k → block k → unknown k)
-            exprs = [_unwrap(self._pde[k]) for k in range(self._nf)]
+        exprs = self._pde_exprs()  # one equation per field (summed for a single field)
         if spatial:
             exprs = [_zero_temporal(e) for e in exprs]
         spatial_tags = {  # collocate every spatial term at the mesh nodes (temporal tags carry no field)
@@ -910,10 +1013,7 @@ class _TraceFDM:
 
         from .trace_evaluator import TraceEvaluator
 
-        expr = self._pde[0]
-        for c in self._pde[1:]:
-            expr = expr + c
-        expr = _unwrap(expr)
+        expr = self._pde_exprs()[0]
         spatial_tags = {
             v.tag
             for c in self._pde
@@ -1029,11 +1129,8 @@ class _TraceFDM:
         each segment's exact perpendicular is averaged over the (two) segments meeting at a node, so an
         axis-aligned edge yields an exact ``(±1, 0)`` / ``(0, ±1)`` — much cleaner than the domain's
         smoothed per-point normal, which bleeds a tangential component near corners and would spoil the
-        flux. Outward orientation is taken (sign only) from ``domain.variable(region, normals=True)``. A
-        **corner** node averages two differently-oriented segment normals, so the averaged magnitude
-        drops (≈0.71 at a right angle): the outward normal is undefined there, so corners are **dropped**
-        from the flux row and keep their interior PDE residual (give a corner an explicit Dirichlet
-        condition if it needs one).
+        flux. Each segment is oriented outward by its owning triangle, and only the region's own segments
+        are averaged, so a corner shared with another flux region carries both conditions (summed).
 
         **3-D** — see :meth:`_node_normals_3d`: the region's boundary triangles are oriented outward
         exactly via each face's owning-tet apex, so no corner heuristic is needed.
@@ -1052,26 +1149,39 @@ class _TraceFDM:
         tang = pts[edges[:, 1]] - pts[edges[:, 0]]
         seg_n = np.stack([tang[:, 1], -tang[:, 0]], axis=1)  # 2-D perpendicular of each segment
         seg_n /= np.linalg.norm(seg_n, axis=1, keepdims=True) + 1e-30
+        # Orient every segment OUTWARD, away from the opposite vertex of the triangle that owns it. The
+        # boundary segments are not stored with a consistent orientation, so two collinear segments
+        # could get opposite perpendiculars, average to zero, and have their shared node dropped as a
+        # "corner": a Neumann node at (1, 0.9) then kept its PDE row, and a linear solution that should be
+        # exact came back 5e-3 off.
+        apex_of = {}
+        for tri in np.asarray(_mesh(self.domain)[1], dtype=int):
+            for a, b, c in ((tri[0], tri[1], tri[2]), (tri[1], tri[2], tri[0]), (tri[2], tri[0], tri[1])):
+                apex_of[(min(a, b), max(a, b))] = c
+        apex = np.array([apex_of[(min(a, b), max(a, b))] for a, b in edges])
+        inward = np.sum(seg_n * (pts[apex] - pts[edges[:, 0]]), axis=1) > 0
+        seg_n[inward] *= -1
+        # Average only this region's own segments. A node where two regions meet (a corner between a
+        # Neumann and a Robin edge) then gets each region's own normal, and both flux conditions are
+        # imposed there, summed (see :meth:`_apply_flux_rows`). The normal is NOT renormalised: on a
+        # straight edge it is the unit normal, and at a corner inside one region it is the average of the
+        # two edge normals, which makes the row the average of the two edge conditions. Corners used to be
+        # dropped and keep their PDE row, which is not a boundary condition at all (all-Neumann problems
+        # stalled at 0.12; a structured transient march with such a corner blew up to 1e33).
+        idx = np.asarray(self._region_nodes(region), dtype=int)
+        in_region = np.zeros(self._N, dtype=bool)
+        in_region[idx] = True
+        own = in_region[edges[:, 0]] & in_region[edges[:, 1]]
         node_n = np.zeros((self._N, dim))
         cnt = np.zeros(self._N)
-        for e, (i, j) in enumerate(edges):
-            node_n[i] += seg_n[e]
-            node_n[j] += seg_n[e]
+        for (i, j), n_e in zip(edges[own], seg_n[own]):
+            node_n[i] += n_e
+            node_n[j] += n_e
             cnt[i] += 1
             cnt[j] += 1
-        node_n /= np.maximum(cnt, 1)[:, None]  # average incident segment normals (unit on a flat edge)
-
-        self.domain.variable(region, normals=True, split=True)  # domain's (oriented) normals for the sign
-        bpts = np.asarray(self.domain.context[region]).reshape(-1, dim)
-        dom_n = np.asarray(self.domain.context[f"n_{region}"]).reshape(-1, dim)
-        idx = np.asarray(self._region_nodes(region), dtype=int)
-        order = [int(np.argmin(np.sum((bpts - p) ** 2, axis=1))) for p in pts[idx]]
-        raw = node_n[idx]
-        flip = np.sum(raw * dom_n[order], axis=1) < 0  # orient outward to match the domain normal
-        raw[flip] *= -1
-        smooth = np.linalg.norm(raw, axis=1) > 0.9  # a corner has averaged magnitude ≈0.71 ≪ 1 → drop it
-        idx, raw = idx[smooth], raw[smooth]
-        n = raw / (np.linalg.norm(raw, axis=1, keepdims=True) + 1e-30)
+        keep = cnt[idx] > 0
+        idx = idx[keep]
+        n = node_n[idx] / cnt[idx][:, None]
         return idx, jnp.asarray(n)
 
     def _node_normals_3d(self, region):
@@ -1190,9 +1300,23 @@ class _TraceFDM:
             n = _unwrap(node)
             return isinstance(n, Jacobian) or any(_has_jacobian(c) for c in _iter(n))
 
-        for c in self._pde:
-            walk(c)
+        for e in self._pde_exprs():
+            walk(e)
         return not other and (five_point or structured)
+
+    @staticmethod
+    def _apply_flux_rows(u, r, flux_rows):
+        """Replace the flux nodes' rows of ``r`` by their conditions ``a·(∇u·n) + b``, SUMMING where several
+        flux regions share a node (a corner), so every condition is imposed there rather than the last one."""
+        acc = jnp.zeros_like(r)
+        hit = jnp.zeros(r.shape[0], dtype=bool)
+        for idx, nrm, grad_fn, v0, v1 in flux_rows:
+            flux = jnp.sum(grad_fn(u) * nrm, axis=1)  # ∇u·n at the region's nodes, differentiable
+            b = v0(u)
+            a = v1(u) - b
+            acc = acc.at[idx].add(a[idx] * flux + b[idx])
+            hit = hit.at[idx].set(True)
+        return jnp.where(hit, acc, r)
 
     def _flux_gradient_fn(self, idx, scheme, grad_method):
         """``u ↦ ∇u`` at the flux nodes ``idx``, chosen to match the interior stencil (see
@@ -1291,6 +1415,13 @@ class _TraceFDM:
 
         N, single = self._N, self._nf == 1
         u0 = jnp.zeros(self._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)
+        if linear is None and precond is None and nonlinear is None and self._default_is_assembled():
+            defaults = self.__dict__.setdefault("_default_slots", (_solve.bicgstab(), jno_precond.jacobi()))
+            linear, precond = defaults  # the same spec objects every call, so the assembled cache is reused
+            # A LINEAR problem on an unstructured mesh gets jno.fem's linear default: Jacobi-preconditioned
+            # BiCGStab on the assembled operator. Matrix-free and unpreconditioned, BiCGStab broke down on a
+            # 3-D cotangent problem with a Neumann face (Newton residual 5e24) and GMRES stalled at 1.6e-2;
+            # its flux rows (~1/h) and Laplacian rows (~1/h²) differ in scale, and Jacobi is what evens them.
         if linear is not None or precond is not None:
             sol = self._slot_steady(nonlinear, linear, precond, x0, u0, extra_params, extra_pins)
         elif extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer):
@@ -1300,6 +1431,18 @@ class _TraceFDM:
             driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual_with_bc, u0))
             sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
         return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
+
+    def _default_is_assembled(self):
+        """Does the default steady solve go through the assembled operator? For a linear, single-field
+        problem on an unstructured mesh, yes; a structured grid keeps its matrix-free GMRES + multigrid,
+        and a nonlinear problem its matrix-free Newton."""
+        if self._nf != 1 or self.domain.mesh_connectivity.get("grid") is not None:
+            return False
+        import jax
+
+        with jax.ensure_compile_time_eval():
+            probe = self._steady_residual({lid: n.model.module for lid, n in self._trainable_params().items()})
+            return self._is_affine("steady", probe, self._Ntot)
 
     def _slot_steady(self, nonlinear, linear, precond, x0, u0, extra_params, extra_pins):
         """The steady solve through ``fem.solve``'s ``linear=`` / ``precond=`` slots, on the assembled
@@ -1328,8 +1471,17 @@ class _TraceFDM:
                 self._require_symmetric(
                     linear, self._dirichlet_lift("steady", self._sparse_operator("steady", probe, jnp.zeros(self._Ntot)))[0]
                 )
-            A, lift_rhs = self._dirichlet_lift("steady", self._sparse_operator("steady", residual, zeros))
-            return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, lift_rhs(-residual(zeros)))
+            eager = extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer)
+            cache = self.__dict__.setdefault("_assembled_cache", {})
+            key = (id(linear), id(precond), self._data_fingerprint())
+            if eager and key in cache and cache[key][0] is linear and cache[key][1] is precond:
+                A, rhs = cache[key][2], cache[key][3]  # a repeat solve: the operator is a constant of the problem
+            else:
+                A, lift_rhs = self._dirichlet_lift("steady", self._sparse_operator("steady", residual, zeros))
+                rhs = lift_rhs(-residual(zeros))
+                if eager:
+                    cache[key] = (linear, precond, A, rhs)
+            return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, rhs)
         tangent = lambda w: self._sparse_operator("steady", residual, w)  # noqa: E731
         if nonlinear is None:
             # FDM can always assemble its tangent, so the Newton that uses it is the default here: it is
@@ -1394,11 +1546,7 @@ class _TraceFDM:
             # Flux rows first (`a·(∇u·n) + b`, with a = F(1)-F(0), b = F(0) — Neumann/Robin/etc.), then
             # the periodic ties, then Dirichlet: a node carrying several (a 2-D corner, or a 3-D edge)
             # resolves to the essential Dirichlet value — the Dirichlet row is set last.
-            for idx, nrm, grad_fn, v0, v1 in flux_rows:
-                flux = jnp.sum(grad_fn(u) * nrm, axis=1)  # ∇u·n at the edge nodes, differentiable
-                b = v0(u)
-                a = v1(u) - b
-                r = r.at[idx].set(a[idx] * flux + b[idx])
+            r = self._apply_flux_rows(u, r, flux_rows) if flux_rows else r
             for secondary, main in periodic_rows:  # periodic: the redundant secondary face ≡ the main face
                 r = r.at[secondary].set(u[secondary] - u[main])
             if extra_pins is not None:  # interface pin (a coupled subdomain's complement) — before the
@@ -1495,11 +1643,7 @@ class _TraceFDM:
 
             def residual_with_bc(u):
                 r = residual_fn(u)
-                for idx, nrm, grad_fn, v0, v1 in flux_rows:
-                    flux = jnp.sum(grad_fn(u) * nrm, axis=1)
-                    b = v0(u)
-                    a = v1(u) - b
-                    r = r.at[idx].set(a[idx] * flux + b[idx])
+                r = self._apply_flux_rows(u, r, flux_rows) if flux_rows else r
                 r = r.at[pin_idx].set(u[pin_idx] - pv)  # interface pin — before the authored Dirichlet
                 for _k, idx, gvals in rows:  # single-field (domain-decomposition) path ⇒ block 0
                     r = r.at[idx].set(u[idx] - gvals)
@@ -1570,11 +1714,7 @@ class _TraceFDM:
         spatial_res = self._pde_residual_fn(spatial=True)
 
         def boundary_rows(wn, r):  # overwrite the flux and Dirichlet rows of r with their algebraic constraints
-            for idx, nrm, grad_fn, v0, v1 in flux_rows:  # a·(∇u·n) + b — the same folding as _steady_solve
-                flux = jnp.sum(grad_fn(wn) * nrm, axis=1)
-                b = v0(wn)
-                a = v1(wn) - b
-                r = r.at[idx].set(a[idx] * flux + b[idx])
+            r = self._apply_flux_rows(wn, r, flux_rows) if flux_rows else r  # the same folding as the steady solve
             return jnp.where(bmask, wn - bvals, r)  # Dirichlet wins over flux on an overlapping node
 
         slots = dict(nonlinear=nonlinear, linear=linear, precond=precond)

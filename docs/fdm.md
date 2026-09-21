@@ -126,7 +126,7 @@ The built-in stencils (parsed from the scheme string) are:
 
 | `scheme=`                              | gradient stencil     | Laplacian stencil        |
 | -------------------------------------- | -------------------- | ------------------------ |
-| `"finite_difference"` (default)        | area-weighted        | gradient-of-gradient     |
+| `"finite_difference"` (default)        | area-weighted        | gradient-of-gradient (a full Laplacian fuses to cotangent, below) |
 | `"finite_difference:lsq"`              | least-squares        | lsq-of-gradient          |
 | `"finite_difference:cotangent"`        | area-weighted        | cotangent (whole-Δ)      |
 | `"finite_difference:uniform"`          | uniform              | gradient-of-gradient     |
@@ -139,8 +139,19 @@ The built-in stencils (parsed from the scheme string) are:
     | 0.06 | **4.058e-03** | 1.674e-02 |
     | 0.035 | **1.417e-03** | 5.780e-03 |
 
-    A stable ~4× at every resolution — the same convergence *rate*, a better constant. Worth the one
-    extra word on the term whenever the mesh is unstructured.
+    A stable ~4× at every resolution — the same convergence *rate*, a better constant.
+
+!!! note "The plain Laplacian is the cotangent one on an unstructured mesh"
+    The per-axis default above (a gradient of the area-weighted gradient) has a spurious oscillating
+    mode on an unstructured mesh. Its lowest Dirichlet eigenvalue on the unit square is about 5.4, not
+    2π², and refinement does not remove it. Measured: an advection–diffusion solve came out 2.09 off, and
+    Helmholtz at c = 5.41 was 19.6 off. So `ui.xx + ui.yy`, `ui.d2(x) + ui.d2(y)`, `-ui.d2(x) - ui.d2(y)`
+    and `ui.laplacian(x, y)` with the default scheme all become the cotangent Laplacian (0.047 and 0.004 on
+    the same two problems). The fusion needs every spatial axis once, with one shared coefficient.
+    `a·ui.xx + b·ui.yy`, a partial sum in 3-D, and an explicit sub-scheme are left as written, and
+    `scheme="finite_difference:area_weighted"` still gives the gradient-of-gradient stencil. One exception:
+    an FDM problem posed on a named sub-region (a domain-decomposition subdomain) keeps the per-axis
+    stencil for now, because its interface flux is only consistent with that stencil.
 
 An unknown sub-scheme (a typo, or one jNO does not have, such as `":upwind"`) raises. It used to fall
 through silently to the default area-weighted stencil.
