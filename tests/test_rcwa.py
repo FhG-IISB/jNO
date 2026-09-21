@@ -7,6 +7,7 @@ Two layers:
 
 import importlib.util
 
+import jax
 import numpy as np
 import pytest
 
@@ -17,6 +18,24 @@ needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend)
 
 WL = 1.0
 INF = np.inf
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """Every test here runs in float64, and leaves the flag as it found it.
+
+    Before this, precision depended on test ORDER: `_build_periodic_problem` switched x64 on globally and
+    never switched it back, while the session default (tests/conftest.py) is float32. So a gradient check
+    ran in float32 whenever it came before that helper. On CPU float32 still met the finite-difference
+    tolerances. On a GPU, whose float32 eigen/matmul kernels differ, four checks missed them by 3-6x
+    (e.g. dT/deps 0.455 vs FD 0.468 against a 5e-3 bound), identically on main.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 # ------------------------------------------------------------------------------------
