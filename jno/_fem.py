@@ -1932,8 +1932,52 @@ class FEM:
         when jaxamg served the solve. Populated on eager paths; a solve wrapped whole in
         ``jit``/``vmap``/``grad`` records the slots but no residuals — the same concrete-only
         self-disabling as the convergence guards.
+
+        ``march`` is the per-step record of a march, or ``None``: ``what``, ``coord``, ``steps``,
+        ``grid`` (the coordinate at each step), ``residual`` / ``bound`` (each step's final residual
+        norm and the tolerance it was judged against — ``None`` for a march that does not judge its
+        steps, e.g. a linear transient) and ``step_s`` (per-step wall time — ``None`` for a march that
+        is one compiled ``lax.scan``, where a step is not a host-visible event and only the mean
+        ``wall_s / steps`` is honest). A transient solve returns a deferred node, so its record says
+        ``deferred=True`` until the node is evaluated eagerly (``.fn()``), which fills in the
+        evaluation's ``wall_s`` and ``evaluation`` count. ``solve_index`` counts solves on this form:
+        the first includes tracing and compilation. ``error`` is set when the solve raised; the rest
+        of the record then describes that failed solve, not an earlier one.
         """
-        return getattr(self, "_stats", None)
+        st = getattr(self, "_stats", None)
+        ev = getattr(getattr(self, "_op", None), "_last_evaluation", None)
+        if st is not None and ev and ev.get("at", -1.0) >= getattr(self, "_stats_at", 0.0):
+            march = {k: v for k, v in (st.get("march") or {}).items() if k != "note"}  # "runs later": it ran
+            march.update({k: v for k, v in ev.items() if k != "at" and v is not None})
+            march["deferred"] = False
+            st = {**st, "march": march}
+        return st
+
+    def _deferred_march_record(self):
+        """What a transient march WILL do, known when ``solve()`` returns its deferred node.
+
+        The march itself runs later, when the node is evaluated, so all that is honest here is the
+        grid: steps, ``dt``, the window. :meth:`SemidiscreteTimeBlock.solve` adds the evaluation's time
+        (and a nonlinear march's per-step residuals) when it is evaluated eagerly.
+        """
+        if not self.is_transient:
+            return None
+        try:
+            from .utils.solver.backend_blocks import _block_time_grid
+
+            grid = np.asarray(_block_time_grid(self._time_block()), dtype=float)
+            return {
+                "what": "transient march",
+                "coord": "t",
+                "steps": int(grid.size - 1),
+                "grid": None,
+                "dt": float(self.dt),
+                "window": (float(self.t0), float(self.t1)),
+                "deferred": True,
+                "note": "the march runs when the returned node is evaluated (.fn() or jno.core)",
+            }
+        except Exception:  # noqa: BLE001 -- observability must never fail a solve
+            return None
 
     def block_index(self, field) -> int:
         """Resolve a trial symbol (or plain index) to its position in :attr:`blocks` /
@@ -2029,10 +2073,20 @@ class FEM:
 
         _t0 = _time.perf_counter()
         out = self._solve_inner(*args, **kwargs)
-        get_logger().info(self._solved_line(out, _time.perf_counter() - _t0))
+        get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
         return out
 
-    def _solved_line(self, out, wall: float) -> str:
+    def _march_phrase(self, since: float) -> str:
+        """The march headline for the log line, from THIS solve's stats only (a path that does not
+        record them must not borrow an earlier solve's)."""
+        st = getattr(self, "_stats", None)
+        if not st or not st.get("march") or getattr(self, "_stats_at", -1.0) < since:
+            return ""
+        from .info import _march_rows
+
+        return _march_rows(st["march"], st.get("solve_index"))[0]
+
+    def _solved_line(self, out, wall: float, since: float = float("inf")) -> str:
         """What the solve actually produced -- the line that says whether to trust it.
 
         A solve that did not raise can still be wrong in two ways a user cannot see: it can return
@@ -2045,6 +2099,9 @@ class FEM:
 
         try:
             parts = [f"solved: {self._mode} · {wall:.3g} s"]
+            march = self._march_phrase(since)
+            if march:
+                parts.append(march)
             arr = None
             if isinstance(out, (_np.ndarray, jnp.ndarray)) or hasattr(out, "__array__"):
                 try:
@@ -2055,9 +2112,11 @@ class FEM:
                 # The work has NOT happened yet: this path returns a node and the march runs at
                 # evaluation. Reporting the elapsed time here as if it were the solve would say a
                 # 200-step transient finished in 6 ms.
+                march = self._march_phrase(since)
                 return (
                     f"solved: {self._mode} · deferred (trace node) — built in {wall:.3g} s, "
                     f"the solve runs when you evaluate it through jno.core"
+                    + (f" · {march}" if march else "")
                 )
             finite = _np.isfinite(arr)
             if not finite.all():
@@ -2296,25 +2355,49 @@ class FEM:
             import sys as _sys
             import time as _time
 
+            from .utils.solver.history_march import LAST_MARCH_STATS
             from .utils.solver.newton_krylov import LAST_NEWTON_STATS
             from .utils.solver.solver_api import clear_gate_failures, raise_if_gate_failed
 
             LAST_NEWTON_STATS.clear()
+            LAST_MARCH_STATS.clear()
             clear_gate_failures()  # so this solve cannot be blamed for an earlier one's failure
             t0 = _time.perf_counter()
-            result = _run()
-            self._stats = {
-                "mode": self._mode,
-                "dofs": self.dofs,
-                # Dispatch time of the solve CALL: JAX is async, so for a compiled eager solve this
-                # includes compute only if something blocked; block on the result for compute time.
-                "wall_s": _time.perf_counter() - t0,
-                "linear": repr(linear) if linear is not None else "default",
-                "precond": repr(precond) if precond is not None else None,
-                # Written by the drivers' eager convergence check; empty under jit/vmap/grad, where
-                # the check self-disables -- the same silence the guard itself has.
-                "nonlinear": dict(LAST_NEWTON_STATS) or None,
-            }
+
+            self._n_solves = getattr(self, "_n_solves", 0) + 1
+
+            def _record(error=None):
+                self._stats_at = t0
+                self._stats = {
+                    # The first solve of a form pays its tracing and compilation, and every time
+                    # below includes it; later solves reuse the compiled program.
+                    "solve_index": self._n_solves,
+                    "mode": self._mode,
+                    "dofs": self.dofs,
+                    # Dispatch time of the solve CALL: JAX is async, so for a compiled eager solve this
+                    # includes compute only if something blocked; block on the result for compute time.
+                    "wall_s": _time.perf_counter() - t0,
+                    "linear": repr(linear) if linear is not None else "default",
+                    "precond": repr(precond) if precond is not None else None,
+                    # Written by the drivers' eager convergence check; empty under jit/vmap/grad, where
+                    # the check self-disables -- the same silence the guard itself has.
+                    "nonlinear": dict(LAST_NEWTON_STATS) or None,
+                    # Per-step record of a march (load path, arc-length, continuation, an eagerly
+                    # evaluated nonlinear transient) -- see `history_march.LAST_MARCH_STATS`.
+                    "march": dict(LAST_MARCH_STATS) or self._deferred_march_record(),
+                }
+                if error is not None:
+                    # A failed solve used to leave the PREVIOUS solve's stats in place, which then read
+                    # as this one's. Record the failure instead -- with the march's per-step record up
+                    # to the failing step, which is what the user needs next to that error.
+                    self._stats["error"] = f"{type(error).__name__}: {str(error).splitlines()[0][:200]}"
+
+            try:
+                result = _run()
+            except Exception as exc:
+                _record(exc)
+                raise
+            _record()
             if "jaxamg" in _sys.modules:  # AmgX solver-cache summary, only if jaxamg is in play
                 try:
                     info = _sys.modules["jaxamg"].get_solver_cache_info()

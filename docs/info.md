@@ -116,6 +116,29 @@ With `deep=True` the operator section also reports `max|A - Aᵀ|` and the count
 empty row is a singular system, and knowing it before the solver says "may be singular/ill-posed"
 saves guessing which condition is missing.
 
+### After a solve
+
+Once the form has been solved, two more sections come from [`fem.stats`](solvers.md#diagnostics-what-the-solver-actually-did):
+`last solve` (wall time, the slots, the nonlinear verdict, and `FAILED` with the error if the solve
+raised) and, for a march, `march`:
+
+```
+  last solve
+    wall       1.13 s  (first solve of this form: includes tracing/compilation)
+    linear     default
+    nonlinear  continuation/newton · residual 1.039e-09 / bound 1.000e-08  ✓
+  march
+    kind           continuation
+    steps          5 over k ∈ [0, 2]
+    time per step  median 75.5 ms · slowest step 1 (k=0) 840 ms
+                   step 1 took 840 ms and includes tracing/compilation
+    convergence    all 5 steps converged · tightest step 5 (k=2): residual at 10.4% of its bound
+```
+
+A load-path or transient march is one compiled `lax.scan`, so it reports a mean time per step and
+says so, rather than per-step times it cannot see. A transient solve returns a deferred node: its
+`march` section says *not run yet* until the node is evaluated with `.fn()`.
+
 ## The smaller parts
 
 ### An expression — `jno.info(pde)`

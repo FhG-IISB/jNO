@@ -494,7 +494,28 @@ class SemidiscreteTimeBlock:
         params = [self.runtime_parameter_exprs[n] for n in names]
 
         def _solve(*values):
+            import time as _time
+
+            import jax
+
+            from .history_march import LAST_MARCH_STATS
+
+            LAST_MARCH_STATS.clear()
+            _t_eval = _time.perf_counter()
             ys = solve_fn(self, dict(zip(names, values)), save_ts)
+            if not isinstance(ys, jax.core.Tracer):
+                # An EAGER evaluation (`.fn()`): the march has run, so record what it did for
+                # `fem.stats["march"]`. Blocking costs nothing here -- the caller is about to read the
+                # trajectory. Under jno.core / jit this is a tracer and nothing is recorded: a step
+                # inside the compiled scan is not a host-visible event.
+                ys = jax.block_until_ready(ys)
+                self._n_evaluations = getattr(self, "_n_evaluations", 0) + 1
+                self._last_evaluation = {
+                    **dict(LAST_MARCH_STATS),
+                    "wall_s": _time.perf_counter() - _t_eval,
+                    "evaluation": self._n_evaluations,
+                    "at": _t_eval,
+                }
             if self.prolongation is not None:
                 # Periodic tie: the block integrates in the reduced main-DOF space. Prolong each saved
                 # step ``u = P·u_red`` back to the full nodal layout, so the returned trajectory lives on the

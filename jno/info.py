@@ -154,6 +154,114 @@ def _info_domain(d, deep: bool) -> Info:
     )
 
 
+def _secs(t) -> str:
+    t = float(t)
+    return f"{t * 1e3:.3g} ms" if t < 1.0 else f"{t:.3g} s"
+
+
+def _march_rows(m, solve_index=None, deep=False):
+    """``(headline, rows)`` for one ``fem.stats["march"]`` record.
+
+    Shared by ``jno.info(fem)`` and the post-solve log line, so the two cannot disagree. Says which
+    per-step facts exist and, where one does not, why: a ``lax.scan`` march is one compiled program,
+    so its steps have no individual wall times -- only the mean is honest, and on the first solve of
+    a form it includes compilation.
+    """
+    what, coord, steps = m.get("what", "march"), m.get("coord", "step"), m.get("steps")
+    grid = m.get("grid")
+    rows: list = []
+    if steps is None:
+        note = m.get("note", "no record")
+        return f"{what}: {note}", [("record", note)]
+
+    span = ""
+    if m.get("window") is not None:  # a time march: the window and dt, before AND after it has run
+        a, b = m["window"]
+        span = f" over {coord} ∈ [{a:.4g}, {b:.4g}]" + (f", dt = {m['dt']:.4g}" if m.get("dt") else "")
+    elif grid is not None and len(grid):
+        span = f" over {coord} ∈ [{grid[0]:.4g}, {grid[-1]:.4g}]"
+    headline = f"{what} · {steps} steps{span}"
+    rows.append(("kind", what))
+    rows.append(("steps", f"{steps}{span}"))
+    if steps == 0:
+        rows.append(("", "no step completed — the first step failed before it could be recorded"))
+        return headline, rows
+
+    def at(k):
+        return f"step {k + 1}" + (f" ({coord}={grid[k]:.4g})" if grid is not None and k < len(grid) else "")
+
+    step_s = m.get("step_s")
+    if m.get("deferred"):
+        rows.append(("time", "not run yet — the march runs when the node is evaluated (.fn() or jno.core)"))
+        headline += " · runs when evaluated"
+    elif step_s is not None and len(step_s):
+        ks = int(np.argmax(step_s))
+        rows.append(("time per step", f"median {_secs(np.median(step_s))} · slowest {at(ks)} {_secs(step_s[ks])}"))
+        if len(step_s) > 1 and solve_index == 1:
+            rows.append(("", f"step 1 took {_secs(step_s[0])} and includes tracing/compilation"))
+    else:
+        wall, ev = m.get("wall_s"), m.get("evaluation")
+        if wall is None and solve_index is not None:
+            wall = m.get("_solve_wall")
+        if wall is not None:
+            tag = f"evaluation {ev}" if ev else "the solve"
+            comp = " — includes compilation" if (ev == 1 or (ev is None and solve_index == 1)) else ""
+            rows.append(("time", f"{_secs(wall)} for {tag} · mean {_secs(wall / max(steps, 1))}/step{comp}"))
+        rows.append(("", "one compiled lax.scan: a step has no wall time of its own, only the mean"))
+
+    r, b = m.get("residual"), m.get("bound")
+    if r is not None and b is not None and len(r):
+        r, b = np.asarray(r, dtype=float), np.asarray(b, dtype=float)
+        ratio = np.where(b > 0, r / np.where(b > 0, b, 1.0), np.inf)
+        bad = ~np.isfinite(r) | (r > b)
+        if bad.any():
+            kb = int(np.argmax(bad))
+            rows.append(("convergence", f"FAILED at {at(kb)}: residual {r[kb]:.3e} > bound {b[kb]:.3e}"))
+            headline += f" · FAILED at {at(kb)}"
+        else:
+            k = int(np.argmax(ratio))
+            rows.append(("convergence", f"all {len(r)} steps converged · tightest {at(k)}: "
+                                        f"residual at {100 * ratio[k]:.3g}% of its bound"))
+            headline += f" · tightest {at(k)} at {100 * ratio[k]:.3g}% of its bound"
+        if deep:
+            for j in range(len(r)):
+                where = f"{coord}={grid[j]:.4g} · " if grid is not None and j < len(grid) else ""
+                t = f" · {_secs(step_s[j])}" if step_s is not None and j < len(step_s) else ""
+                rows.append((f"step {j + 1}", f"{where}residual {r[j]:.2e} ({100 * ratio[j]:.3g}% of bound){t}"))
+    elif not m.get("deferred"):
+        rows.append(("convergence", "no per-step residual recorded (only a nonlinear march records one)"))
+    if m.get("note") and not m.get("deferred"):
+        rows.append(("note", m["note"]))
+    return headline, rows
+
+
+def _last_solve_rows(st):
+    """The ``last solve`` section of ``jno.info(fem)``, from ``fem.stats``."""
+    rows: list = []
+    if st.get("error"):
+        rows.append(("FAILED", st["error"]))
+    if (st.get("march") or {}).get("window") is not None:
+        # A transient solve returns a deferred node: this is how long BUILDING it took. The march's
+        # own time is in the march section, once the node has been evaluated.
+        rows.append(("build", f"{_secs(st.get('wall_s', 0.0))}  (deferred node — the march time is below)"))
+    else:
+        first = "  (first solve of this form: includes tracing/compilation)" if st.get("solve_index") == 1 else ""
+        rows.append(("wall", f"{_secs(st.get('wall_s', 0.0))}{first}"))
+    rows.append(("linear", str(st.get("linear"))))
+    if st.get("precond"):
+        rows.append(("precond", str(st["precond"])))
+    nl = st.get("nonlinear")
+    if nl:
+        if nl.get("residual") is not None:
+            verdict = "  ✓" if nl.get("converged") else "  ✗ NOT converged"
+            steps = f" · {nl['steps']} Newton steps" if nl.get("steps") is not None else ""
+            rows.append(("nonlinear", f"{nl.get('driver')} · residual {nl['residual']:.3e} / bound "
+                                      f"{nl.get('bound', float('nan')):.3e}{verdict}{steps}"))
+        else:
+            rows.append(("nonlinear", f"{nl.get('driver')} · {nl.get('note', 'no verdict')}"))
+    return rows
+
+
 # ---------------------------------------------------------------------------------------------
 # fem
 # ---------------------------------------------------------------------------------------------
@@ -240,10 +348,18 @@ def _info_fem(f, deep: bool) -> Info:
         bb = np.asarray(b).reshape(-1)
         op.append(("load ‖b‖", f"{np.linalg.norm(bb):.4g}" + ("   ← ALL ZERO" if not np.any(bb) else "")))
 
-    return Info(
-        f"fem · {f.mode}",
-        [("form", form), ("terms (as classified)", terms), ("field blocks", blocks), ("operator", op)],
-    )
+    sections = [("form", form), ("terms (as classified)", terms), ("field blocks", blocks), ("operator", op)]
+    st = getattr(f, "stats", None)
+    if st:
+        sections.append(("last solve", _last_solve_rows(st)))
+        if st.get("march"):
+            m = {**st["march"], "_solve_wall": st.get("wall_s")}
+            sections.append(("march", _march_rows(m, st.get("solve_index"), deep)[1]))
+    elif f.mode == "transient":
+        m = f._deferred_march_record()
+        if m:
+            sections.append(("march", _march_rows(m, None, deep)[1]))
+    return Info(f"fem · {f.mode}", sections)
 
 
 # ---------------------------------------------------------------------------------------------

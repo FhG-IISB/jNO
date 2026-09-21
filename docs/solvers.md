@@ -866,6 +866,44 @@ fem.stats
 #                                 'bound': 1.7e-06, 'steps': 3, 'converged': True}}
 ```
 
+`solve_index` counts solves on the form (the first one includes tracing and compilation), and a solve
+that **raised** still writes `fem.stats`, with an `error` entry. It used to leave the previous solve's
+stats in place, and those would read as this solve's.
+
+### A march records every step — `fem.stats["march"]`
+
+A march (a `tau=` load path, an arc-length path, `continuation=`, a transient) records what each step
+did. `grid` is the coordinate at each step. `residual` and `bound` are each step's final residual and
+the tolerance it was judged against. `step_s` is each step's wall time:
+
+| march | per-step residual | per-step time |
+|---|---|---|
+| load path, arc-length | ✅ | — one compiled `lax.scan`: only the mean `wall_s / steps` |
+| `continuation=` | ✅ nonlinear | ✅ every rung is materialised, so its time is real compute |
+| transient, nonlinear | ✅ once evaluated | — one compiled `lax.scan` |
+| transient, linear | — | — one compiled `lax.scan` |
+
+A step inside a `lax.scan` is not a host-visible event, so no per-step time is reported for it rather
+than an invented one. A transient solve returns a deferred node: its record says `deferred=True` with
+the step count, `dt` and window until the node is evaluated eagerly (`.fn()`), which adds the
+evaluation's `wall_s` and an `evaluation` count. Under `jno.core` the march runs inside a compiled
+program and nothing is recorded.
+
+A march that fails keeps its record up to and including the failing step, at the same 1-based index
+the error names. `jno.info(fem)` renders it:
+
+```text
+  march
+    kind         load-path march
+    steps        12 over τ ∈ [0, 1]
+    time         542 ms for the solve · mean 45.1 ms/step — includes compilation
+                 one compiled lax.scan: a step has no wall time of its own, only the mean
+    convergence  all 12 steps converged · tightest step 11 (τ=0.9091): residual at 45.6% of its bound
+```
+
+"Tightest" is the step that came closest to its bound, which is the first place to look when a finer
+grid or a harder load is about to break the march. `jno.info(fem, deep=True)` lists every step.
+
 ### A solve that did not converge raises — including the adjoint
 
 Every linear solve is residual-checked against its own operator before it returns, and **so is its
@@ -924,7 +962,7 @@ them where they *are* concrete, against the driver's own `rtol`/`atol`:
 
 ```python
 fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-6, atol=1e-6))
-# RuntimeError: fem.solve: the transient march did not converge at step 35 of 120 (t=0.00036):
+# RuntimeError: fem.solve: the transient march did not converge at step 36 of 120 (t=0.00036):
 # residual norm 3.658e+02 against the tolerance atol + rtol*||r(u_prev)|| = 1.011e-02
 # (atol=1e-06, rtol=1e-06). That step is NOT a root, and every later step inherited it as its
 # starting state — the whole trajectory past this point is unreliable. Globalize the per-step solve

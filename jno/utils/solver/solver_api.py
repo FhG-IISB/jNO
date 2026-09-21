@@ -1595,62 +1595,88 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
         prev = x0
 
     outs = []
-    for k in range(n_steps):
-        vals = {**fixed, **{name: _step_value(s, k) for name, s in seqs.items()}}
-        at = ", ".join(f"{name}={np.asarray(s[k])!r}" for name, s in seqs.items())
-        try:
-            if mode == "nonlinear":
-                step = _step(vals, prev)
-                # The in-driver guard is blind under jit; judge this rung's solve out here, where the
-                # residual is concrete, and record it so `fem.stats` describes the step just taken.
-                # Verdict is computed inside the try (it forces the sync) but RAISED below, next to
-                # the finiteness check, so a stalled rung reports as itself rather than being
-                # re-wrapped as the surrounding "failed to converge".
-                _r_end, _bound, _conv = record_nonlinear_verdict(
-                    lambda uu: _residual_at(vals, uu), step, prev, nonlinear, _who
-                )
-                # `None` means the rung was TRACED, so no verdict could be made -- that is not a stall.
-                _stalled = _conv is False
-                if periodic is None:
-                    u = step
-                else:
-                    prev_red, u = step, prolong_periodic(periodic, step)
-            else:
-                A, b = op.evaluate(vals)
-                b = jnp.asarray(b).reshape(-1)
-                if use_slots or not prefer_direct:
-                    solve = compose_linear_solve_fn(linear, precond, prev, fem)  # per step: x0 changes
-                    u = solve(A, b)
-                else:
-                    from .linear import sparse_lu_solve
+    # Per-step record for `fem.stats["march"]`. Every rung is materialised (`u_host` below), so its wall
+    # time is compute, not dispatch -- unlike a `lax.scan` march, a step here IS a host-visible event.
+    # Written in `finally`, so a sweep that fails at rung k still reports rungs 1..k-1.
+    import time as _time
 
-                    u = sparse_lu_solve(A, b)  # direct: warm start is meaningless, robustness is not
-            # Materialize INSIDE the try: dispatch is async, so a GPU-side failure (cuSolver raises on
-            # a singular matrix where the CPU path returns NaN) surfaces at the first host read -- which
-            # must be here, where the step context exists, not at the caller's first use.
-            u_host = np.asarray(u)
-        except RuntimeError as e:
-            raise RuntimeError(
-                f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} failed to converge. "
-                f"Refine the value sequence around this point, or pass "
-                f"nonlinear=jno.solve.newton(line_search=True). Original error: {e}"
-            ) from e
-        if mode == "nonlinear" and _stalled:
-            raise RuntimeError(
-                f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} did not converge: "
-                f"residual norm {_r_end:.3e} against the tolerance atol + rtol*||r(x0)|| = "
-                f"{_bound:.3e}. The rung's iterate is NOT a root -- the march would carry it into "
-                "every later step as a warm start. Refine the value sequence around this point, "
-                "raise max_steps, or pass nonlinear=jno.solve.newton(line_search=True)."
-            )
-        if not bool(np.isfinite(u_host).all()):
-            raise RuntimeError(
-                f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} produced a non-finite "
-                "solution (a singular or diverging system). Refine the value sequence around this point."
-            )
-        prev = prev_red if periodic is not None and mode == "nonlinear" else u
-        if spec.keep == "all":
-            outs.append(_fin(u))
+    from .history_march import _record_march
+
+    _step_s, _res, _bnd = [], [], []
+    try:
+        for k in range(n_steps):
+            _t_step = _time.perf_counter()
+            vals = {**fixed, **{name: _step_value(s, k) for name, s in seqs.items()}}
+            at = ", ".join(f"{name}={np.asarray(s[k])!r}" for name, s in seqs.items())
+            try:
+                if mode == "nonlinear":
+                    step = _step(vals, prev)
+                    # The in-driver guard is blind under jit; judge this rung's solve out here, where the
+                    # residual is concrete, and record it so `fem.stats` describes the step just taken.
+                    # Verdict is computed inside the try (it forces the sync) but RAISED below, next to
+                    # the finiteness check, so a stalled rung reports as itself rather than being
+                    # re-wrapped as the surrounding "failed to converge".
+                    _r_end, _bound, _conv = record_nonlinear_verdict(
+                        lambda uu: _residual_at(vals, uu), step, prev, nonlinear, _who
+                    )
+                    # `None` means the rung was TRACED, so no verdict could be made -- that is not a stall.
+                    _stalled = _conv is False
+                    if periodic is None:
+                        u = step
+                    else:
+                        prev_red, u = step, prolong_periodic(periodic, step)
+                else:
+                    A, b = op.evaluate(vals)
+                    b = jnp.asarray(b).reshape(-1)
+                    if use_slots or not prefer_direct:
+                        solve = compose_linear_solve_fn(linear, precond, prev, fem)  # per step: x0 changes
+                        u = solve(A, b)
+                    else:
+                        from .linear import sparse_lu_solve
+
+                        u = sparse_lu_solve(A, b)  # direct: warm start is meaningless, robustness is not
+                # Materialize INSIDE the try: dispatch is async, so a GPU-side failure (cuSolver raises on
+                # a singular matrix where the CPU path returns NaN) surfaces at the first host read -- which
+                # must be here, where the step context exists, not at the caller's first use.
+                u_host = np.asarray(u)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} failed to converge. "
+                    f"Refine the value sequence around this point, or pass "
+                    f"nonlinear=jno.solve.newton(line_search=True). Original error: {e}"
+                ) from e
+            # Recorded BEFORE the verdicts below, so a rung that is refused still appears in the record.
+            _step_s.append(_time.perf_counter() - _t_step)
+            _res.append(_r_end if mode == "nonlinear" else None)
+            _bnd.append(_bound if mode == "nonlinear" else None)
+            if mode == "nonlinear" and _stalled:
+                raise RuntimeError(
+                    f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} did not converge: "
+                    f"residual norm {_r_end:.3e} against the tolerance atol + rtol*||r(x0)|| = "
+                    f"{_bound:.3e}. The rung's iterate is NOT a root -- the march would carry it into "
+                    "every later step as a warm start. Refine the value sequence around this point, "
+                    "raise max_steps, or pass nonlinear=jno.solve.newton(line_search=True)."
+                )
+            if not bool(np.isfinite(u_host).all()):
+                raise RuntimeError(
+                    f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} produced a non-finite "
+                    "solution (a singular or diverging system). Refine the value sequence around this point."
+                )
+            prev = prev_red if periodic is not None and mode == "nonlinear" else u
+            if spec.keep == "all":
+                outs.append(_fin(u))
+    finally:
+        _done = len(_step_s)
+        _grid = np.asarray(next(iter(seqs.values()))) if seqs else np.arange(n_steps)
+        _judged = mode == "nonlinear" and _done and all(r is not None for r in _res)
+        _record_march(
+            what="continuation",
+            coord=", ".join(seqs) or "step",
+            grid=np.asarray(_grid, dtype=float).reshape(n_steps, -1)[:_done, 0],
+            residual=_res if _judged else None,
+            bound=_bnd if _judged else None,
+            step_s=_step_s,
+        )
     if spec.keep == "all":
         return jnp.stack(outs)
     return _fin(u)  # `prev` may be the REDUCED iterate; `u` is always the full-space solution
