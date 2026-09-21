@@ -277,11 +277,48 @@ def test_neumann_linear_exact():
 
 
 def test_neumann_convergence_harmonic():
-    """u = x² − y² is harmonic (−Δu = 0), ∂u/∂n = 2x = 2 on the right edge. The boundary-flux stencil
-    is O(h), so the error decreases under refinement."""
+    """u = x² − y² is harmonic (−Δu = 0), ∂u/∂n = 2x = 2 on the right edge; the error decreases under
+    refinement."""
     errs = [_mixed_dirichlet_neumann(h, lambda x, y: x**2 - y**2, du_dn_right=2.0) for h in (0.1, 0.06, 0.035)]
     assert errs[0] > errs[1] > errs[2], f"not converging: {errs}"
     assert errs[2] < 5e-3
+
+
+def _sin_neumann(h, interior):
+    """−Δu = f with u = sin(πx/2) sin(πy): Dirichlet 0 on left/bottom/top, ∂u/∂n = 0 on the right."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    if interior == "structured":
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+    else:
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+    x, y, _ = d.variable("interior", split=True)
+    (xl, yl, _), (xo, yo, _), (xt, yt, _), (xr, yr, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "top", "right")
+    )
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui, ur = u.bind(x=x, y=y), u.bind(x=xr, y=yr)
+    Δu = ui.laplacian(x, y, scheme=_COT) if interior == "cotangent" else ui.d2(x) + ui.d2(y)
+    f = 1.25 * π**2 * jnn.sin(π * x / 2) * jnn.sin(π * y)
+    sol = jno.fdm([-Δu - f, u(xl, yl) - 0.0, u(xo, yo) - 0.0, u(xt, yt) - 0.0, ur.d(nr) - 0.0]).solve()
+    p = _nodes(d)
+    exact = np.sin(π * p[:, 0] / 2) * np.sin(π * p[:, 1])
+    return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+
+
+@pytest.mark.parametrize("interior", ["d2", "cotangent", "structured"])
+def test_neumann_is_second_order(interior):
+    """The flux row's gradient matches the interior stencil. The cotangent Laplacian never reads the
+    area-weighted boundary gradient, so a flux row built on it (first order at a boundary node) capped the
+    solve at first order: 2.2e-3 at h = 0.025, rate 0.7. It now uses a quadratic least-squares fit over
+    the node's two-ring: 2.3e-3 → 7.4e-4. The default `.d2` (a gradient of that same gradient) keeps it,
+    because there it is the consistent closure: 7.5e-3 → 1.8e-3. The structured grid, which used to drop
+    the flux row altogether, gives 1.6e-3 → 4.1e-4."""
+    e = [_sin_neumann(h, interior) for h in (0.05, 0.025)]
+    assert e[1] < 2e-3, f"error at h = 0.025: {e[1]:.2e}"
+    assert e[0] / e[1] > 2.8, f"expected close to O(h²): {e}"
 
 
 def test_robin_linear_exact():
@@ -520,6 +557,35 @@ def test_nonlinear_mass_rejected():
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("flux", [2.0, 5.0])
+def test_structured_grid_flux_value_is_applied(flux):
+    """`boundary_edges` indexes the boundary-node list, but the flux normals read it as global node
+    numbers. A gmsh mesh numbers its boundary nodes first, so it worked there by accident; on a structured
+    grid no edge node got a normal, and the flux row was silently dropped: ∂u/∂n = 2 and ∂u/∂n = 5 gave
+    bit-identical answers. Oracle: u = x² + y + (g − 2)·x, with −Δu = −2 and ∂u/∂n = g at x = 1."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    (xl, yl, _), (xo, yo, _), (xt, yt, _), (xr, yr, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "top", "right")
+    )
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui, ur = u.bind(x=x, y=y), u.bind(x=xr, y=yr)
+    exact = lambda x, y: x**2 + y + (flux - 2.0) * x  # noqa: E731
+    sol = jno.fdm(
+        [
+            -(ui.d2(x) + ui.d2(y)) + 2.0,
+            u(xl, yl) - exact(xl, yl),
+            u(xo, yo) - exact(xo, yo),
+            u(xt, yt) - exact(xt, yt),
+            ur.d(nr) - flux,
+        ]
+    ).solve()
+    p = _nodes(d)
+    ref = exact(p[:, 0], p[:, 1])
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - ref) / np.linalg.norm(ref)) < 1e-8
+
+
 def test_periodic_poisson():
     """A periodic tie `u(left) - u(right)` wraps the structured x-axis (the Nx-node periodic 5-point
     stencil), authored exactly as in jno.fem. MMS: -Δu = 5π²·sin(2πx)sin(πy), periodic in x with

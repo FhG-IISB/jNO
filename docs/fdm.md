@@ -231,6 +231,23 @@ jno.fdm([
     row is applied last). A condition that is *not* affine in `∂u/∂n` raises rather than returning a
     wrong answer.
 
+!!! measured "The flux closure follows the interior stencil — both stay second order"
+    The gradient used for `∂u/∂n` must match the stencil the PDE uses, and `jno.fdm` picks it for you.
+    The default `.d2` is a gradient of the area-weighted gradient, so imposing the flux on that same
+    gradient is its consistent closure. The `cotangent` Laplacian, and any second derivative on a
+    structured grid, never read it; they get a quadratic least-squares fit over the node's two-ring
+    instead. Unit square, `sin(πx/2) sin(πy)`, Neumann on the right edge, rel. error at h = 0.1 / 0.05 / 0.025:
+
+    | interior | area-weighted closure | quadratic closure |
+    |---|---|---|
+    | `.d2` (default) | **2.9e-2 / 7.5e-3 / 1.8e-3** | 3.6e-2 / 1.5e-2 / 5.7e-3 |
+    | `cotangent` | 8.2e-3 / 3.6e-3 / 2.2e-3 | **5.1e-3 / 2.3e-3 / 7.4e-4** |
+
+    The bold column is what you get. Before this, `cotangent` was paired with the first-order column and
+    stalled. A structured grid is 6.9e-3 / 1.6e-3 / 4.1e-4; there a flux condition used to be dropped
+    altogether (∂u/∂n = 2 and ∂u/∂n = 5 gave identical answers). Naming a sub-scheme on the flux term,
+    `ur.d(nr, scheme="finite_difference:lsq")`, overrides the choice.
+
 ### Periodic
 
 Tie two opposite faces with a `u(A) - u(B)` constraint — exactly as `jno.fem`:
