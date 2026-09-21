@@ -456,6 +456,18 @@ def _fuse_fd_laplacian(expr, dim):
     return visit(expr)
 
 
+def _has_time_variable(node):
+    """Does a value expression use the temporal Variable (``tb`` in ``g(xb, yb, tb)``)?"""
+    from .trace import Variable
+
+    n = _unwrap(node) if not isinstance(node, (int, float)) else None
+    if n is None:
+        return False
+    if isinstance(n, Variable):
+        return getattr(n, "axis", None) == "temporal"
+    return any(_has_time_variable(c) for c in _iter(n))
+
+
 def _find_unknowns(constraints):
     """All ``domain.unknown()`` fields (nodal-field-parameter ModelCalls' Models) in the constraints, in
     **declaration** order — a **coupled** system has several, and ``.solve()`` returns one row per field in
@@ -831,14 +843,17 @@ class _TraceFDM:
         context = self._eval_context(spatial_tags)
         N, unknowns = self._N, self.unknowns
 
-        def residual_fn(dofs):
+        def residual_fn(dofs, t=None):
+            """``t``: the time a source ``f(x, t)`` is evaluated at (the march passes each step's own
+            time); ``None`` keeps the start time."""
             dofs = jnp.asarray(dofs)
             params = dict(extra_params or {})
             for k, unk in enumerate(unknowns):  # inject each field's DOF slice into its module
                 slice_k = dofs[k * N : (k + 1) * N] if len(unknowns) > 1 else dofs
                 params[unk.layer_id] = eqx.tree_at(lambda m: m.value, unk.module, slice_k.astype(unk.module.value.dtype))
             ev = TraceEvaluator(params=params)
-            blocks = [jnp.asarray(ev.evaluate(e, context=context, var_bindings={})).reshape(-1) for e in exprs]
+            ctx = context if t is None else {**context, "__time__": jnp.full((N, 1), t, dtype=dofs.dtype)}
+            blocks = [jnp.asarray(ev.evaluate(e, context=ctx, var_bindings={})).reshape(-1) for e in exprs]
             return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
 
         return residual_fn
@@ -848,7 +863,37 @@ class _TraceFDM:
         ``domain.cell_size`` resolves to the per-node spacing :meth:`_node_spacing`."""
         context = {t: self._pts for t in spatial_tags}
         context["cell_size"] = self._node_spacing()[:, None]
+        # The temporal Variable reads `__time__`. A source `f(x, t)` used to raise KeyError here; it now
+        # sees the start time unless the march passes the step's own (see `residual_fn(dofs, t)`).
+        context["__time__"] = jnp.full((self._N, 1), self._start_time())
         return context
+
+    def _start_time(self):
+        window = getattr(self.domain, "time", None)
+        return float(window[0]) if window is not None and self._transient else 0.0
+
+    def _dirichlet_values_at(self, t):
+        """``(mask, values)`` of the Dirichlet rows at time ``t``. A value written with the time variable,
+        ``u(xb, yb) - g(xb, yb, tb)``, is evaluated at ``t``; it used to be evaluated once with the time
+        column read from the coordinates, and the march then held the boundary fixed (a heat solve with
+        g = e^{-π² t} cos(πx) stayed at 1.0 on the boundary; error 3.5 at T)."""
+        from ._fem import _eval_value_node_at_time
+
+        mask = np.zeros(self._N, dtype=bool)
+        vals = jnp.zeros(self._N)
+        for c in self._dirichlet:
+            idx = np.asarray(self._region_nodes(_region_tag(c)), dtype=int)
+            mask[idx] = True
+            inner = _unwrap(c)
+            g_node = 0.0
+            if getattr(inner, "op", None) == "-":
+                g_node = inner.right if any(_contains_unknown(inner.left, u) for u in self.unknowns) else inner.left
+            if _has_time_variable(g_node):
+                g = _eval_value_node_at_time(g_node, self._pts[jnp.asarray(idx)], t)
+            else:
+                g = self._eval_g(g_node, idx)
+            vals = vals.at[jnp.asarray(idx)].set(jnp.asarray(g).reshape(-1))
+        return mask, vals
 
     def _node_spacing(self):
         """``domain.cell_size`` in the strong form: the **node spacing** ``h``, per node the mean over its
@@ -981,6 +1026,18 @@ class _TraceFDM:
                 f"(wᵀKv = {a:.6e} vs vᵀKw = {b:.6e}). Unstructured FDM stencils are divided by nodal areas, "
                 "and flux rows are one-sided. Use jno.solve.gmres() or jno.solve.bicgstab()."
             )
+
+    @staticmethod
+    def _operator_varies_in_time(residual, n, t0, t1):
+        """Does the Jacobian of ``residual(y, t)`` change between ``t0`` and ``t1`` (a coefficient κ(t))?
+        Then the operator cannot be assembled once. Time-dependent DATA alone does not count."""
+        import jax
+
+        v = jnp.asarray(np.random.default_rng(3).standard_normal(n))
+        z = jnp.zeros(n)
+        a = jax.jvp(lambda y: residual(y, t0, {}), (z,), (v,))[1]
+        b = jax.jvp(lambda y: residual(y, t1, {}), (z,), (v,))[1]
+        return bool(jnp.linalg.norm(a - b) > 1e-10 * (float(jnp.linalg.norm(a)) or 1.0))
 
     def _is_affine(self, key, fun, n):
         """Is ``fun`` affine in the DOF vector? Its JVP must be the same at two different states.
@@ -1699,23 +1756,18 @@ class _TraceFDM:
         if dt is None:
             raise ValueError("jno.fdm([...]): domain.time must specify n_steps >= 2 for a transient march.")
 
-        rows = self._dirichlet_rows()
         flux_rows = self._flux_rows()
-        bmask = np.zeros(self._N, dtype=bool)
-        bvals = np.zeros(self._N)
-        for _k, idx, gv in rows:  # single-field transient ⇒ block 0
-            bmask[np.asarray(idx)] = True
-            bvals[np.asarray(idx)] = np.asarray(gv)
-        algebraic = bmask.copy()  # Dirichlet + flux nodes are algebraic (zero mass row)
+        bmask_np, _ = self._dirichlet_values_at(float(t0))
+        algebraic = bmask_np.copy()  # Dirichlet + flux nodes are algebraic (zero mass row)
         for row in flux_rows:
             algebraic[np.asarray(row[0])] = True
-        bmask, bvals, algebraic = jnp.asarray(bmask), jnp.asarray(bvals), jnp.asarray(algebraic)
+        bmask, algebraic = jnp.asarray(bmask_np), jnp.asarray(algebraic)
 
         spatial_res = self._pde_residual_fn(spatial=True)
 
-        def boundary_rows(wn, r):  # overwrite the flux and Dirichlet rows of r with their algebraic constraints
+        def boundary_rows(wn, r, t):  # overwrite the flux and Dirichlet rows of r with their algebraic constraints
             r = self._apply_flux_rows(wn, r, flux_rows) if flux_rows else r  # the same folding as the steady solve
-            return jnp.where(bmask, wn - bvals, r)  # Dirichlet wins over flux on an overlapping node
+            return jnp.where(bmask, wn - self._dirichlet_values_at(t)[1], r)  # Dirichlet wins over flux
 
         slots = dict(nonlinear=nonlinear, linear=linear, precond=precond)
         if self._time_order == 2:
@@ -1726,7 +1778,7 @@ class _TraceFDM:
         M = jsparse.BCOO((jnp.where(algebraic, 0.0, c_nodes), diag), shape=(self._N, self._N))  # 0: Dirichlet+flux
 
         def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
-            return boundary_rows(wn, spatial_res(wn))
+            return boundary_rows(wn, spatial_res(wn, t), t)
 
         return self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots)
 
@@ -1745,7 +1797,7 @@ class _TraceFDM:
         t0, t1, dt = window
         nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
         common = dict(state0=state0, t0=float(t0), t1=float(t1), dt=float(dt), metadata=dict(metadata))
-        frozen = lambda y: residual(y, float(t0), {})  # noqa: E731  (R does not depend on t)
+        frozen = lambda y: residual(y, float(t0), {})  # noqa: E731  (the operator at the start time)
         n = int(state0.size)
         self._check_precond_shape(precond, n)
         if linear is not None or precond is not None:
@@ -1754,15 +1806,23 @@ class _TraceFDM:
             zeros = jnp.zeros(n)
             with jax.ensure_compile_time_eval():  # structure is decided on concrete values
                 self._sparsity("march", frozen, jnp.zeros(n))
-                linear_problem = self._is_affine("march", frozen, n)
+                linear_problem = self._is_affine("march", frozen, n) and not self._operator_varies_in_time(
+                    residual, n, float(t0), float(t1)
+                )
             if linear_problem:
+                # Time-dependent DATA (a source f(x, t), a boundary value g(x, t)) rides the block's forcing
+                # f(t) = −R(0, t); only the operator must be constant, which was just checked. Freezing
+                # −R(0, t0) as a constant bias silently held the data at the start time.
                 A, lift_rhs = self._dirichlet_lift("march", self._sparse_operator("march", frozen, zeros))
                 if n == self._N:  # the lift knows the scalar field's Dirichlet rows, not the [u; v] layout
                     self._require_symmetric(linear, A)
-                    block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=lift_rhs(-frozen(zeros)), **common)
+                    forcing = lambda t, args: lift_rhs(-residual(jnp.zeros(n), t, args))  # noqa: E731
                 else:
                     A = self._sparse_operator("march", frozen, zeros)
-                    block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=-frozen(zeros), **common)
+                    forcing = lambda t, args: -residual(jnp.zeros(n), t, args)  # noqa: E731
+                block = SemidiscreteTimeBlock(
+                    M=M, A=A, affine_bias=jnp.zeros(n), forcing_vector_fn=forcing, forcing_mode="user_callback", **common
+                )
             else:
                 block = SemidiscreteTimeBlock(
                     mass=lambda t, args: M,
@@ -1770,6 +1830,9 @@ class _TraceFDM:
                     jacobian=lambda w, t, args: self._sparse_operator("march", lambda y: residual(y, t, args), w),
                     **common,
                 )
+                # The block carries its assembled tangent, so the per-step Newton uses it (as the steady
+                # solve does): a matrix-free JVP has no diagonal for jacobi, nor a matrix for amg or lu.
+                nonlinear = nonlinear or _solve.newton(direct=True)
         else:
             block = SemidiscreteTimeBlock(mass=lambda t, args: M, residual=residual, **common)
         from .utils.solver.timeschemes import _ExponentialScheme
@@ -1814,8 +1877,8 @@ class _TraceFDM:
 
         def residual(y, t, args):
             u, v = y[:N], y[N:]
-            ru = boundary_rows(u, -v)  # interior: u̇ = v; boundary: the algebraic constraint on u
-            rv = jnp.where(algebraic, v, c_nodes * v + spatial_res(u))
+            ru = boundary_rows(u, -v, t)  # interior: u̇ = v; boundary: the algebraic constraint on u
+            rv = jnp.where(algebraic, v, c_nodes * v + spatial_res(u, t))
             return jnp.concatenate([ru, rv])
 
         v0 = jnp.where(algebraic, 0.0, self._initial_velocity())
@@ -1850,7 +1913,7 @@ class _TraceFDM:
         alpha = jnp.where(algebraic, 0.0, 2.0 * m_nodes / dt**2 + c_nodes / dt)
         beta = jnp.where(algebraic, 0.0, 2.0 * m_nodes / dt)
         u0 = self._initial_state()
-        r0 = spatial_res(u0)
+        r0 = spatial_res(u0, t0)
 
         # The interior rows carry 2m/Δt² (~1e4–1e5); the boundary constraint rows are O(1). Left as is, a
         # Jacobi-preconditioned GMRES stops on the preconditioned residual while the true one sits at 1e-4
@@ -1858,17 +1921,24 @@ class _TraceFDM:
         # constraint row does not move its solution, so the rows are brought to the interior's scale.
         row_scale = jnp.where(algebraic, jnp.max(alpha), 1.0)
 
-        def step_residual(w, u, v, r_now):
-            return row_scale * boundary_rows(w, alpha * (w - u) - beta * v + 0.5 * (spatial_res(w) + r_now))
+        def step_residual(w, u, v, r_now, t_next):
+            g = alpha * (w - u) - beta * v + 0.5 * (spatial_res(w, t_next) + r_now)
+            return row_scale * boundary_rows(w, g, t_next)
 
         nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
         self._check_precond_shape(precond, self._N)
-        probe = lambda w: step_residual(w, u0, v0, r0)  # noqa: E731
+        probe = lambda w: step_residual(w, u0, v0, r0, t0 + dt)  # noqa: E731
         with jax.ensure_compile_time_eval():
-            linear_problem = nonlinear is None and self._is_affine("newmark", probe, self._N)
+            linear_problem = (
+                nonlinear is None
+                and self._is_affine("newmark", probe, self._N)
+                and not self._operator_varies_in_time(
+                    lambda w, t, args: step_residual(w, u0, v0, r0, t), self._N, t0 + dt, t1
+                )
+            )
         if linear_problem:
             return self._newmark_linear(
-                step_residual, probe, algebraic, u0, v0, r0, spatial_res, dt, n_steps, linear, precond
+                step_residual, probe, algebraic, u0, v0, r0, spatial_res, t0, dt, n_steps, linear, precond
             )
         if linear is not None or precond is not None:
             with jax.ensure_compile_time_eval():
@@ -1889,15 +1959,17 @@ class _TraceFDM:
                 return spec(G, guess, linear_solve=inner)
 
         def body(carry, _):
-            u, v, r_now = carry
-            G = lambda w: step_residual(w, u, v, r_now)  # noqa: E731
+            u, v, r_now, t = carry
+            t_next = t + dt
+            G = lambda w: step_residual(w, u, v, r_now, t_next)  # noqa: E731
             guess = u + dt * v
             u_next = solve_step(G, guess)
             v_next = jnp.where(algebraic, 0.0, 2.0 * (u_next - u) / dt - v)
             norms = (jnp.linalg.norm(G(u_next)), jnp.linalg.norm(G(guess)))
-            return (u_next, v_next, spatial_res(u_next)), (u_next, *norms)
+            return (u_next, v_next, spatial_res(u_next, t_next), t_next), (u_next, *norms)
 
-        _, (traj, r_end, r_start) = jax.lax.scan(body, (u0, v0, r0), None, length=n_steps)
+        carry0 = (u0, v0, r0, jnp.asarray(t0, dtype=u0.dtype))
+        _, (traj, r_end, r_start) = jax.lax.scan(body, carry0, None, length=n_steps)
 
         class _Tolerances:  # what the march check judges against: the tolerances the Newton spec carries
             tolerances = (float(spec.traits.get("rtol", 1e-8)), float(spec.traits.get("atol", 1e-8)))
@@ -1906,7 +1978,7 @@ class _TraceFDM:
         _check_march_converged(r_end, r_start, grid, _Tolerances, what="u_tt march", coord="t")
         return jnp.concatenate([u0[None], traj])
 
-    def _newmark_linear(self, step_residual, probe, algebraic, u0, v0, r0, spatial_res, dt, n_steps, linear, precond):
+    def _newmark_linear(self, step_residual, probe, algebraic, u0, v0, r0, spatial_res, t0, dt, n_steps, linear, precond):
         """The Newmark march for a LINEAR problem: the step operator ``K = diag(2m/Δt² + c/Δt) + ½A`` does
         not change, so it is assembled once and its preconditioner set up once, and every step is one
         linear solve for the correction to the predictor ``u + Δt·v``. The nonlinear route re-linearised
@@ -1950,18 +2022,19 @@ class _TraceFDM:
             M = materialize_precond(spec, PrecondContext(LinearOperator(K), self))
 
         def body(carry, _):
-            u, v, r_now = carry
+            u, v, r_now, t = carry
+            t_next = t + dt
             guess = u + dt * v
             # Solve for the CORRECTION to the predictor, K·Δ = −G(guess): the solver's relative tolerance
             # then applies to the step residual itself, not to a right-hand side dominated by (2m/Δt²)·u,
             # where 1e-8 of it let different solvers drift apart by ~3e-6 over 20 steps.
-            rhs = lift_rhs(-step_residual(guess, u, v, r_now))
+            rhs = lift_rhs(-step_residual(guess, u, v, r_now, t_next))
             delta = solver(op, rhs) if direct else solver(op, rhs, M=M)
             u_next = guess + delta
             v_next = jnp.where(algebraic, 0.0, 2.0 * (u_next - u) / dt - v)
-            return (u_next, v_next, spatial_res(u_next)), u_next
+            return (u_next, v_next, spatial_res(u_next, t_next), t_next), u_next
 
-        _, traj = jax.lax.scan(body, (u0, v0, r0), None, length=n_steps)
+        _, traj = jax.lax.scan(body, (u0, v0, r0, jnp.asarray(t0, dtype=u0.dtype)), None, length=n_steps)
         return jnp.concatenate([u0[None], traj])
 
 

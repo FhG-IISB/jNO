@@ -1624,3 +1624,88 @@ def test_default_laplacian_is_fused_into_cotangent(spelling):
     p = _nodes(d)
     exact = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
     assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 1e-2
+
+
+# ---- time-dependent data: sources f(x, t), boundary values g(x, t), coefficients κ(t) ------------------
+# A source containing t raised KeyError('__time__'); a boundary value containing t was accepted and then
+# held at its start value (the boundary stayed at 1.0 while g decayed to 0.14; error 3.5 at T).
+
+
+def _heat_with_time_data(n_steps, *, kind, slots=None, structured=True):
+    """u_t − κ(t)Δu = f(x, t) with an exact solution, every datum written with the time variable."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05)
+    d = jno.domain(shape.structured() if structured else shape, time=(0.0, 0.2, n_steps))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    Δu = ui.xx + ui.yy
+    if kind == "source":  # u = e^{-t} sin πx sin πy
+        terms = [
+            ui.t - Δu - (2 * π**2 - 1) * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y),
+            u(xb, yb) - 0.0,
+            u(xi, yi) - jnn.sin(π * xi) * jnn.sin(π * yi),
+        ]
+        exact = lambda p, T: np.exp(-T) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])  # noqa: E731
+    elif kind == "dirichlet":  # u = e^{-π² t} cos πx
+        terms = [ui.t - Δu, u(xb, yb) - jnn.exp(-(π**2) * tb) * jnn.cos(π * xb), u(xi, yi) - jnn.cos(π * xi)]
+        exact = lambda p, T: np.exp(-(π**2) * T) * np.cos(π * p[:, 0])  # noqa: E731
+    else:  # "coefficient": κ(t) = 1 + t, u = e^{-t} sin πx sin πy
+        terms = [
+            ui.t - (1.0 + t) * Δu - (2 * π**2 * (1.0 + t) - 1) * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y),
+            u(xb, yb) - 0.0,
+            u(xi, yi) - jnn.sin(π * xi) * jnn.sin(π * yi),
+        ]
+        exact = lambda p, T: np.exp(-T) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])  # noqa: E731
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5), **(slots or {})))
+    p = _nodes(d)
+    ref = exact(p, 0.2)
+    return float(np.linalg.norm(traj[-1] - ref) / np.linalg.norm(ref))
+
+
+@pytest.mark.parametrize("kind", ["source", "dirichlet", "coefficient"])
+def test_time_dependent_data_converges(kind):
+    """Crank–Nicolson, h = 0.05: the error falls under Δt refinement to the spatial floor."""
+    coarse, fine = _heat_with_time_data(11, kind=kind), _heat_with_time_data(41, kind=kind)
+    # Both sit at or near the spatial error floor (the Dirichlet case is already there at 11 steps).
+    assert fine < 5e-3 and coarse < 2e-2, (coarse, fine)
+
+
+@pytest.mark.parametrize("kind", ["source", "dirichlet", "coefficient"])
+def test_time_dependent_data_through_the_solver_slots(kind):
+    """With linear=/precond= the operator is assembled once: time-dependent data must ride the forcing
+    (it used to be frozen as a constant bias), and a time-varying κ(t) must fall back to the Newton step."""
+    ref = _heat_with_time_data(21, kind=kind, structured=False)
+    got = _heat_with_time_data(
+        21, kind=kind, structured=False, slots=dict(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi())
+    )
+    assert abs(got - ref) < 1e-6 * max(1.0, ref) and got < 1e-2, (got, ref)
+
+
+def test_forced_wave_with_time_dependent_source():
+    """u_tt − Δu = f(x, t) with u = sin(t) sin πx sin πy (u0 = 0, v0 = sin πx sin πy), Newmark default."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    errs = []
+    for n in (21, 41):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 1.0, n))
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, ti = d.variable("initial", split=True)
+        u = d.unknown()
+        ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
+        f = (2 * π**2 - 1) * jnn.sin(t) * jnn.sin(π * x) * jnn.sin(π * y)
+        traj = np.asarray(
+            jno.fdm(
+                [ui.tt - ui.xx - ui.yy - f, u(xb, yb) - 0.0, u(xi, yi) - 0.0, ui0.t - jnn.sin(π * xi) * jnn.sin(π * yi)]
+            ).solve()
+        )
+        p = _nodes(d)
+        ref = np.sin(1.0) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+        errs.append(float(np.linalg.norm(traj[-1] - ref) / np.linalg.norm(ref)))
+    assert errs[1] < errs[0] and errs[1] < 1e-2, errs

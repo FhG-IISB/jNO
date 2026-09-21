@@ -358,6 +358,30 @@ The `u.t` term carries a **unit or a general `c(x)·u.t` mass coefficient** (var
 no structural parsing is needed; a nonlinear `c(u)·u.t` fails loud. Nonlinear transient residuals are
 handled the same way (the march reuses the Newton driver).
 
+### Time-dependent data
+
+Write a source, a boundary value or a coefficient with the time variable, and the march evaluates it at
+each step's own time:
+
+```python
+x, y, t    = d.variable("interior", split=True)
+xb, yb, tb = d.variable("boundary", split=True)
+
+jno.fdm([
+    ui.t - (1 + t) * Δu - f(x, y, t),       # coefficient κ(t) and source f(x, t)
+    u(xb, yb) - jnn.exp(-tb) * jnn.cos(xb), # boundary value g(x, t)
+    u(xi, yi) - u0,
+]).solve()
+```
+
+!!! measured "Heat on the unit square with exact solutions, Crank–Nicolson, h = 0.05"
+    A source f(x, t), a boundary value g(x, t), and a coefficient κ(t) = 1 + t each reach the spatial
+    error floor (about 2e-3) and agree between the default path and `linear=` / `precond=` slots.
+    Before this, a source written with t raised `KeyError('__time__')`, and a boundary value written
+    with t was accepted but held at its start value (error 3.5 at T). With a slot set, data that
+    depends on time rides the assembled time block's forcing; an operator that changes in time (κ(t))
+    is detected and stepped by Newton on the assembled tangent instead.
+
 ### Time schemes
 
 The march is **backward Euler** by default. Pass a `jno.solve` time scheme to `.solve(time=…)` — exactly
