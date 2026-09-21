@@ -1566,3 +1566,23 @@ def test_coupled_fields_return_in_declaration_order():
         uh, vh = np.asarray(jno.fdm(order + bcs).solve())
         assert np.linalg.norm(uh - Ue) / np.linalg.norm(Ue) < 5e-3
         assert np.linalg.norm(vh - Ve) / np.linalg.norm(Ve) < 5e-3
+
+
+def test_structured_box_faces_are_named_like_shape_box():
+    """front/back at y = 0/1 and bottom/top at z = 0/1, on the tet mesh and the structured grid alike.
+    The structured grid used to swap the two pairs, so a condition on "top" moved faces with `.structured()`."""
+    import importlib
+
+    fdm_mod = importlib.import_module("jno.fdm")
+    expected = {"front": (1, 0.0), "back": (1, 1.0), "bottom": (2, 0.0), "top": (2, 1.0)}
+    for structured in (False, True):
+        shape = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.25)
+        d = shape.structured().domain() if structured else shape.domain()
+        x, y, z, _ = d.variable("interior", split=True)
+        u = d.unknown()
+        prob = fdm_mod._TraceFDM([-u.bind(x=x, y=y, z=z).d2(x) - 1.0, u(*d.variable("boundary", split=True)[:3]) - 0.0])
+        pts = np.asarray(d.mesh_connectivity["points"])[:, :3]
+        for face, (axis, value) in expected.items():
+            d.variable(face, split=True)
+            face_pts = pts[prob._region_nodes(face)]
+            assert np.allclose(face_pts[:, axis], value), (structured, face)

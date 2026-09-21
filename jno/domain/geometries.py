@@ -273,10 +273,13 @@ class Geometries:
             faces = {
                 "left": quad_tris(lambda j, k: idx(0, j, k), ny, nz),
                 "right": quad_tris(lambda j, k: idx(nx, j, k), ny, nz),
-                "bottom": quad_tris(lambda i, k: idx(i, 0, k), nx, nz),
-                "top": quad_tris(lambda i, k: idx(i, ny, k), nx, nz),
-                "front": quad_tris(lambda i, j: idx(i, j, 0), nx, ny),
-                "back": quad_tris(lambda i, j: idx(i, j, nz), nx, ny),
+                # Named as `jno.shape.box` names them (front/back at y, bottom/top at z). This grid used to
+                # swap the two pairs, so a condition on "top" landed on a different face once `.structured()`
+                # was added (a 3-D Poisson solve then stalled at 3e-2 instead of converging).
+                "front": quad_tris(lambda i, k: idx(i, 0, k), nx, nz),
+                "back": quad_tris(lambda i, k: idx(i, ny, k), nx, nz),
+                "bottom": quad_tris(lambda i, j: idx(i, j, 0), nx, ny),
+                "top": quad_tris(lambda i, j: idx(i, j, nz), nx, ny),
             }
             all_tris = []
             face_ranges = {}

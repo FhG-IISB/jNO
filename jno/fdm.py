@@ -395,12 +395,19 @@ def _find_unknowns(constraints):
     return sorted(order, key=lambda m: m.layer_id)  # layer ids come from a global, increasing counter
 
 
-def _periodic_axis(tag_a, tag_b):
-    """The grid axis a periodic tie ``u(A) - u(B)`` wraps, from its two opposite-face tags:
-    ``left``/``right`` → 0 (x), ``bottom``/``top`` → 1 (y), ``front``/``back`` → 2 (z). ``None`` if the
-    two tags are not an opposite-face pair."""
-    faces = {frozenset(("left", "right")): 0, frozenset(("bottom", "top")): 1, frozenset(("front", "back")): 2}
-    return faces.get(frozenset((tag_a, tag_b)))
+def _periodic_axis(points_a, points_b):
+    """The grid axis a periodic tie ``u(A) - u(B)`` wraps, read from the geometry of its two faces: the
+    coordinate that is constant over each face, and different between them. ``None`` if the two regions
+    are not a pair of opposite axis-aligned faces. (It used to be read from the face NAMES, which silently
+    depended on which naming convention the grid used.)"""
+    pa, pb = np.asarray(points_a), np.asarray(points_b)
+    if pa.size == 0 or pb.size == 0:
+        return None
+    ax_a, ax_b = int(np.argmin(np.ptp(pa, axis=0))), int(np.argmin(np.ptp(pb, axis=0)))
+    flat = np.ptp(pa[:, ax_a]) < 1e-9 and np.ptp(pb[:, ax_b]) < 1e-9
+    if not flat or ax_a != ax_b or abs(pa[0, ax_a] - pb[0, ax_b]) < 1e-9:
+        return None
+    return ax_a
 
 
 def _contains_unknown(node, model):
@@ -586,7 +593,7 @@ class _TraceFDM:
             #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
             tie = getattr(c, "_periodic_tie", None)
             if tie is not None:
-                ax = _periodic_axis(*tie)
+                ax = _periodic_axis(*(np.asarray(self._pts)[self._region_nodes(t)] for t in tie))
                 if ax is None:
                     raise ValueError(
                         f"jno.fdm([...]): a periodic tie `u(A) - u(B)` must connect two OPPOSITE faces "

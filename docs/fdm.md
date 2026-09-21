@@ -306,7 +306,7 @@ Tie two opposite faces with a `u(A) - u(B)` constraint — exactly as `jno.fem`:
 ```python
 jno.fdm([
     -ui.d2(x) - ui.d2(y) - f,
-    u(xl, yl) - u(xr, yr),          # periodic in x  (left/right; bottom/top → y, front/back → z)
+    u(xl, yl) - u(xr, yr),          # periodic in x  (left/right; 2-D bottom/top → y; a box: front/back → y, bottom/top → z)
     u(xb, yb) - 0.0, u(xt, yt) - 0.0,  # Dirichlet in y
 ]).solve()
 ```
