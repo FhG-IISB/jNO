@@ -182,6 +182,26 @@ answer* as the unstructured `cotangent` operator, only cheaper.
     table to map mesh nodes onto themselves. That made the structured path *slower* (7.9 s / 5.0 s at 17k),
     and both paths ran out of memory at 66k.
 
+!!! measured "Parallelism: XLA does it, and the stencil runs at memory bandwidth"
+    You write no parallel code. XLA spreads the fused stencil over the CPU cores and compiles it to one
+    GPU kernel. i5-13600K (20 threads) and RTX 3070, float64:
+
+    | 5-point Laplacian, 4096² grid | CPU, 1 core | CPU, all cores | GPU |
+    |---|---|---|---|
+    | jNO structured stencil | 18.5 ms | 6.8 ms (40 GB/s) | 1.6 ms (172 GB/s) |
+    | plain copy `2*u` (the bandwidth ceiling) | 13.1 ms | 5.9 ms | 0.7 ms |
+
+    On CPU the stencil sits at DRAM bandwidth. On GPU it is within 8% of a hand-written single-pass
+    stencil. Whole steady solve (GMRES + multigrid), repeat call:
+
+    | nodes | CPU | GPU |
+    |---|---|---|
+    | 1M | 1.6 s | 0.12 s |
+    | 4M | 6.3 s | 0.57 s |
+
+    The GPU loses below about 100k nodes, where kernel launches (about 20 µs each) dominate. GMRES keeps
+    its restart vectors, so an 8 GB card runs out of memory near 16M nodes in float64.
+
 The full `jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()` works unchanged and stays
 differentiable — no authoring change from the unstructured case. **Transient** composes too:
 `.structured()` together with `time=(t0, t1, n)` and a `ui.t` term marches by method of lines as usual

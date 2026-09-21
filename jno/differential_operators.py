@@ -56,6 +56,7 @@ The default ``"finite_difference"`` (no suffix) keeps the existing
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -208,11 +209,29 @@ class DifferentialOperators:
             uu = u[:-1]  # the N unique nodes (drop the redundant x=L ≡ x=0)
             d2u = (jnp.roll(uu, -1, 0) + jnp.roll(uu, 1, 0) - 2.0 * uu) * inv  # wrap-central
             return jnp.moveaxis(jnp.concatenate([d2u, d2u[:1]], axis=0), 0, axis)  # node N ≡ node 0
-        d2 = jnp.zeros_like(u)
-        d2 = d2.at[1:-1].set((u[2:] - 2.0 * u[1:-1] + u[:-2]) * inv)  # central interior
-        d2 = d2.at[0].set((u[0] - 2.0 * u[1] + u[2]) * inv)  # forward one-sided
-        d2 = d2.at[-1].set((u[-1] - 2.0 * u[-2] + u[-3]) * inv)  # backward one-sided
-        return jnp.moveaxis(d2, 0, axis)
+        f = jnp.asarray(field)
+
+        def _scatter(f):  # CPU: XLA multithreads this form (44 GB/s on a 4096² grid, i.e. DRAM bandwidth)
+            u = jnp.moveaxis(f, axis, 0)
+            d2 = jnp.zeros_like(u)
+            d2 = d2.at[1:-1].set((u[2:] - 2.0 * u[1:-1] + u[:-2]) * inv)  # central interior
+            d2 = d2.at[0].set((u[0] - 2.0 * u[1] + u[2]) * inv)  # forward one-sided
+            d2 = d2.at[-1].set((u[-1] - 2.0 * u[-2] + u[-3]) * inv)  # backward one-sided
+            return jnp.moveaxis(d2, 0, axis)
+
+        def _edge_pad(f):  # GPU: fuses into one kernel (172 GB/s vs 127 for the scatter form, RTX 3070)
+            # The one-sided difference at an end node IS the central difference at its neighbour
+            # ((u0 − 2u1 + u2) either way), so the result is the central interior with its edges repeated.
+            sl = lambda a, b: jax.lax.slice_in_dim(f, a, b, axis=axis)  # noqa: E731
+            n = f.shape[axis]
+            interior = (sl(2, n) - 2.0 * sl(1, n - 1) + sl(0, n - 2)) * inv
+            pad = [(0, 0)] * f.ndim
+            pad[axis] = (1, 1)
+            return jnp.pad(interior, pad, mode="edge")
+
+        # Same stencil, two spellings: each backend fuses a different one. On CPU the edge pad ran on one
+        # thread (14.5 GB/s); on GPU the scatters did not fuse. The results agree to rounding.
+        return jax.lax.platform_dependent(f, cpu=_scatter, default=_edge_pad)
 
     @staticmethod
     def compute_fd_gradient_2d_simple(
