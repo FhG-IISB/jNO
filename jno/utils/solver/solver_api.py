@@ -1307,19 +1307,27 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
             _build(float(_k))
 
     def _static_for(scale):
+        """``(operator, preconditioner)`` pre-built for this step scale. A scale that was NOT pre-built (a
+        traced adaptive step, or a scheme that did not declare it) gets no operator — the step then uses
+        its own true matvec — but may keep the default scale's preconditioner, which only affects speed.
+        It used to return the default scale's OPERATOR, so the step solved the wrong system."""
         if not _constant_operator:
             return None, None
         try:
             key = float(scale) if scale is not None else _default_scale
         except (TypeError, ValueError):
-            key = _default_scale  # a TRACED step size (an adaptive march): keep the previous behaviour
-        return _static.get(key) or _static.get(_default_scale) or (None, None)
+            key = None  # a TRACED step size (an adaptive march)
+        hit = _static.get(key) if key is not None else None
+        if hit is not None:
+            return hit
+        return None, (_static.get(_default_scale) or (None, None))[1]
 
     def step_solve(matvec, rhs, x0, diag_fn, scale=None):
         op, M = _static_for(scale)
         if op is None:
             op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
-            M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+            if M is None:
+                M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         if getattr(solver, "direct", False):
             # A DIRECT solver (lu/dense) factorizes the step operator itself — it takes no preconditioner,
             # so don't synthesize the Jacobi one below (which it would reject). Needs a materializable
