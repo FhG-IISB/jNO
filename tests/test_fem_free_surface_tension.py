@@ -67,12 +67,16 @@ def _drop(shape, *, n_steps=3, ic=None, viscous="symgrad"):
     G = d.cell_metric
     gG = lambda a: inner(a, inner(G, a, n_contract=1), n_contract=1)  # noqa: E731
     tau = jno.lag(((2.0 / DT) ** 2 + gG(ub) + C_I * NU**2 * inner(G, G, n_contract=2)) ** -0.5)
-    r_m = ub.t + adv(gu, ub) - NU * lap(u, [xi, yi]) + gp / RHO
+    # The strong residual r_m = u_t + (u.grad)u - nu lap u + grad p / rho enters the SUPG/PSPG terms
+    # SPLIT by temporal order: `tau*(a . r_m)` as one term would put r_m's spatial part in the mass
+    # matrix, which the transient assembler refuses (weak_form_helpers.refuse_mixed_temporal_group).
+    r_sp = adv(gu, ub) - NU * lap(u, [xi, yi]) + gp / RHO  # r_m without its u_t
     # The free-surface viscous term is 2*eta*D(u):D(v); `gradgrad` is the pseudo-traction this test
     # measures as wrong. Everything else is identical between the two.
     visc = 2.0 * ETA * ddot(D(ub), D(vv)) if viscous == "symgrad" else ETA * ddot(gu, gv)
-    momentum = RHO * dot(ub.t, vv) + RHO * dot(adv(gu, ub), vv) + visc - pp * trace(gv) + tau * dot(adv(gv, ub), r_m)
-    continuity = -qq * trace(gu) - tau * dot(gq, r_m)
+    supg = tau * dot(adv(gv, ub), ub.t) + tau * dot(adv(gv, ub), r_sp)
+    momentum = RHO * dot(ub.t, vv) + RHO * dot(adv(gu, ub), vv) + visc - pp * trace(gv) + supg
+    continuity = -qq * trace(gu) - tau * dot(gq, ub.t) - tau * dot(gq, r_sp)
     capillary = SIGMA * div_G(vs)  # T n = -sigma H n, moved to the left-hand side
     u0 = (0.0, 0.0) if ic is None else ic(x0, y0)
     fem = jno.fem([momentum, continuity, capillary, u(x0, y0)[0] - u0[0], u(x0, y0)[1] - u0[1]])
