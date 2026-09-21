@@ -210,23 +210,64 @@ def _info_fem(f, deep: bool) -> Info:
 # rcwa / fdm / core / solver specs
 # ---------------------------------------------------------------------------------------------
 def _info_rcwa(r, deep: bool) -> Info:
-    setup: list = []
-    for label, attr in (("orders", "orders"), ("period", "period"), ("wavelength", "wavelength")):
+    """`jno.rcwa` has TWO objects and neither matched what this first reported.
+
+    An UNSOLVED `_RcwaProblem` keeps everything on `.spec` (period, wavelength, layers, source),
+    and a SOLVED `_Sol` keeps it privately (`_period`, `_wl`, `_layers`). The first version read
+    `orders` / `period` / `wavelength` straight off the object and called `r.power(...)`, which
+    `_Sol` does not have -- written from attribute names, never run.
+    """
+    spec = getattr(r, "spec", None)
+    if spec is not None:                                            # the problem, before solving
+        setup: list = [("orders", str(getattr(r, "orders", "?")))]
+        if getattr(r, "formulation", None) is not None:
+            setup.append(("formulation", str(r.formulation)))
+        for label, attr in (("period", "period"), ("wavelength", "wavelength"),
+                            ("periodic axes", "periodic_axes"), ("source face", "source_face"),
+                            ("k_in", "k_in")):
+            v = getattr(spec, attr, None)
+            if v is not None:
+                setup.append((label, str(v)[:64]))
+        layers: list = []
+        for i, lay in enumerate(getattr(spec, "layers", None) or []):
+            # A layer is (thickness, permittivity...) and the permittivity is a full grid. Dumping
+            # it prints a few thousand numbers to say "this layer is glass"; report its range.
+            try:
+                thick = lay[0]
+                eps = np.asarray(lay[1][0] if isinstance(lay[1], (tuple, list)) else lay[1])
+                tl = "semi-infinite ambient" if not np.isfinite(thick) else f"thickness {float(thick):.4g}"
+                lo, hi = float(np.real(eps).min()), float(np.real(eps).max())
+                rng = f"eps {lo:.4g}" if abs(hi - lo) < 1e-12 else f"eps {lo:.4g}–{hi:.4g}  (patterned, {eps.shape} grid)"
+                layers.append((f"[{i}]", f"{tl}  ·  {rng}"))
+            except Exception:  # noqa: BLE001
+                layers.append((f"[{i}]", str(lay)[:70]))
+        return Info("rcwa (problem, unsolved)", [("setup", setup), ("layers", layers),
+                                                 ("result", [("", "not solved — call .solve()")])])
+
+    setup = []
+    for label, attr in (("period", "_period"), ("wavelength", "_wl")):
         v = getattr(r, attr, None)
         if v is not None:
-            setup.append((label, str(v)))
-    layers: list = []
-    for i, lay in enumerate(getattr(r, "layers", None) or []):
-        layers.append((f"[{i}]", str(lay)[:70]))
+            setup.append((label, str(v)[:64]))
+    th = getattr(r, "_thick", None)
+    if th is not None:
+        setup.append(("layers", f"{len(np.atleast_1d(th))}  ·  thicknesses {np.round(np.atleast_1d(th), 4).tolist()}"))
+
     result: list = []
     try:
-        up, down = float(r.power("up")), float(r.power("down"))
-        result.append(("power up / down", f"{up:.6f} / {down:.6f}"))
-        result.append(("balance", f"{up + down:.6f}" + ("   ✓ energy conserved" if abs(up + down - 1) < 1e-6
-                                                        else "   ← does NOT sum to 1 (absorbing, or wrong)")))
-    except Exception:  # noqa: BLE001 - not solved yet, or a lossy stack with no such readout
-        pass
-    return Info("rcwa", [("setup", setup), ("layers", layers), ("result", result)])
+        T, R = float(r.efficiency("T")), float(r.efficiency("R"))
+        result.append(("efficiency T / R", f"{T:.6f} / {R:.6f}"))
+        tot = T + R
+        # For a LOSSLESS stack T + R = 1 exactly. That is the energy-conservation oracle, and it is
+        # the one number that says whether the truncation order was enough.
+        result.append((
+            "T + R",
+            f"{tot:.6f}" + ("   ✓ energy conserved" if abs(tot - 1.0) < 1e-6
+                            else "   ← not 1: absorbing stack, or too few orders"),
+        ))
+    except Exception as e:  # noqa: BLE001
+        result.append(("efficiency", f"unavailable ({type(e).__name__})"))
+    return Info("rcwa (solved)", [("setup", setup), ("result", result)])
 
 
 def _info_fdm(o, deep: bool) -> Info:
@@ -681,7 +722,7 @@ def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
         return _info_result(obj, deep, context)
     if cls == "domain" or (hasattr(obj, "variable") and hasattr(obj, "dimension")):
         return _info_domain(obj, deep)
-    if cls.lower().startswith("rcwa") or hasattr(obj, "efficiency"):
+    if str(getattr(type(obj), "__module__", "")) == "jno.rcwa" or hasattr(obj, "efficiency"):
         return _info_rcwa(obj, deep)
     if hasattr(obj, "solve_pinned") or cls.lower().startswith("fdm"):
         return _info_fdm(obj, deep)

@@ -168,6 +168,34 @@ say.
 not the order you wrote the terms in. An adaptive transient returns a trajectory instead, and that
 reports frames, the time span, and the per-frame dof range.
 
+## An `rcwa` problem, and its energy check
+
+```
+─── rcwa (problem, unsolved) ─────────────────────────────────
+  setup
+    orders         9
+    formulation    JONES_DIRECT_FOURIER
+    period         (0.6, 0.6)      wavelength  1.0
+    source face    bottom
+  layers
+    [0]  semi-infinite ambient  ·  eps 1
+    [1]  thickness 0.3048  ·  eps 4
+    [2]  semi-infinite ambient  ·  eps 1
+```
+
+and after `.solve()`:
+
+```
+  result
+    efficiency T / R  0.815064 / 0.184936
+    T + R             1.000000   ✓ energy conserved
+```
+
+**`T + R` is the oracle.** For a lossless stack it is exactly 1, so a value below it means either a
+genuinely absorbing stack or too few retained `orders` — which is the one number that says whether
+the truncation was enough. A patterned layer reports its permittivity *range* and grid shape rather
+than the grid itself.
+
 ## Registering another type
 
 ```python

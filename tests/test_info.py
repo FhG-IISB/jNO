@@ -7,6 +7,9 @@ still reachable, and the second is that the cheap/deep split is real.
 
 from __future__ import annotations
 
+import importlib.util
+
+import jax
 import numpy as np
 import pytest
 
@@ -275,3 +278,62 @@ def test_fdm_info_names_the_route_it_took(structured):
                                   jno.solve.theta(0.5), jno.precond.jacobi()])
 def test_every_solver_spec_reports_something(spec):
     assert len(str(jno.info(spec)).splitlines()) > 1
+
+
+# ---------------------------------------------------------------------------
+# jno.rcwa. This handler was written from attribute names and had NEVER been run;
+# every one of its assumptions turned out wrong (see the commit). Hence a test.
+# ---------------------------------------------------------------------------
+
+_HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
+
+
+@pytest.mark.skipif(not _HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
+def test_rcwa_info_before_and_after_solving():
+    import jax.numpy as jnp
+
+    from jno.trace.views import MatrixView
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        inner, vec = jno.np.inner, jno.np.vector
+        K0, P, LZ, Z0, Z1 = 2 * jnp.pi, 0.6, 3.2, 0.8, 1.15
+        d = jno.domain(jno.shape.box(0, 0, 0, P, P, LZ, size=0.3))
+        u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+        c = d.variable("interior", split=True)
+        xi, yi, zi = c[0], c[1], c[2]
+        ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+        cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+        nt, nb = d.variable("top", normals=True), d.variable("bottom", normals=True)
+        cb = d.variable("bottom", split=True)
+        tut, tvt = u.vector.cross(nt), v.vector.cross(nt)
+        tub, tvb = u.vector.cross(nb), v.vector.cross(nb)
+        einc = vec(1.0 + 0.0 * cb[0], 0.0 * cb[1], 0.0 * cb[2])
+
+        def face(nm):
+            cc = d.variable(nm, split=True)
+            return u.bind(x=cc[0], y=cc[1], z=cc[2])
+
+        e = jno.fn(lambda x, y, z: jnp.where((z >= Z0) & (z < Z1), 4.0, 1.0), [xi, yi, zi])
+        eps = MatrixView(vec(e, e, e).expr).from_diag()
+        cons = [inner(cu, cv) - K0**2 * inner(eps @ ui, vi),
+                1j * K0 * inner(tut, tvt),
+                1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),
+                face("left") - face("right"), face("front") - face("back")]
+
+        rc = jno.rcwa(cons, orders=9)
+        unsolved = jno.info(rc).as_dict()
+        assert unsolved["setup"]["orders"] == "9"
+        # the stack read back: vacuum ambient / eps-4 slab / vacuum ambient
+        lay = list(unsolved["layers"].values())
+        assert len(lay) == 3 and "semi-infinite" in lay[0] and "eps 4" in lay[1]
+        assert "not solved" in str(unsolved["result"])
+
+        solved = jno.info(rc.solve()).as_dict()["result"]
+        # T + R = 1 for a lossless stack: the energy-conservation oracle, and the one number that
+        # says whether the truncation order was enough.
+        assert "energy conserved" in solved["T + R"]
+        assert abs(float(solved["T + R"].split()[0]) - 1.0) < 1e-6
+    finally:
+        jax.config.update("jax_enable_x64", prev)
