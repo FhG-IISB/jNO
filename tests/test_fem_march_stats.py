@@ -219,3 +219,14 @@ def test_the_residual_is_reported_on_request():
     oracle = np.linalg.norm(np.asarray(fem._A @ sol) - b) / np.linalg.norm(b)
     row = dict(jno.info(sol, context=fem).sections[0][1])["rel. residual"]
     assert float(row.split()[0]) == pytest.approx(oracle, rel=1e-3)
+
+
+def test_the_logging_wrapper_keeps_the_solve_signature_and_docs():
+    """`solve` wraps `_solve_inner` for timing/logging; `(*args, **kwargs)` hid every solver slot."""
+    import inspect
+
+    from jno._fem import FEM
+
+    assert inspect.signature(FEM.solve) == inspect.signature(FEM._solve_inner)
+    assert {"linear", "precond", "nonlinear", "time", "adapt", "shard"} <= set(inspect.signature(FEM.solve).parameters)
+    assert FEM.solve.__doc__ == FEM._solve_inner.__doc__ and FEM.solve.__name__ == "solve"

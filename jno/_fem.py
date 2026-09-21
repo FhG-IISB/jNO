@@ -2429,6 +2429,12 @@ class FEM:
 
         return profile_solve(_run_with_stats, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
 
+    # `solve` is a thin timing/logging wrapper, so its own signature is `(*args, **kwargs)` -- which
+    # erased every solver slot from `help(fem.solve)`, IDE completion and `inspect.signature` (a test
+    # asserting `shard=` is accepted failed on exactly that). Point both at the real one.
+    solve.__wrapped__ = _solve_inner
+    solve.__doc__ = _solve_inner.__doc__
+
     #: relative residual of the FULL system above which a ``basis=`` solve is refused. Not a tuning
     #: knob: at this size the basis does not span the solution at all (a modelling error), rather than
     #: merely resolving it coarsely — which is the legitimate use of a reduced basis.
