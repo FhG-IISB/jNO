@@ -99,6 +99,26 @@ jno.fdm([-(κ * ui.x).x - (κ * ui.y).y - f, u(xb, yb) - 0.0]).solve()
 Use `.x`, not `.d(x)`, on an expression like `κ * ui.x`: `.d(x)` asks for an autodiff derivative, which a
 nodal field cannot provide, so it raises.
 
+### Convection — upwinding is a formula
+
+Central differences for `b·∇u` oscillate once the cell Péclet number `|b|h/2ε` exceeds 1. First-order
+upwinding is the central difference plus the numerical diffusion `|b|h/2`, an exact identity on a grid,
+so it is written as that math. `domain.cell_size` is the node spacing `h`:
+
+```python
+h = d.cell_size
+jno.fdm([-ε*Δu + b*ui.x - jnn.abs(b)*h/2*ui.xx - f, u(xb, yb) - 0.0]).solve()
+```
+
+!!! measured "−εΔu + u_x = 1, structured grid h = 0.05, exact solution ≤ 1"
+    ε = 1e-2 (Péclet 2.5): central peaks at 1.38; upwind peaks at 0.87 and equals the hand-assembled
+    upwind system to 1e-8. ε = 1e-3: central 2.36, upwind 0.93. Upwinding is first order and smears
+    boundary layers; where Péclet < 1 the central form is more accurate.
+
+In `jno.fdm`, `cell_size` at a node is the mean of `(d!·|K|)^(1/d)` over its cells: exactly the grid
+spacing on a structured grid in 2-D and 3-D. This differs from `jno.fem`, where it is `|K|^(1/d)`, which is
+`h/√2` on the same right triangles.
+
 ### Choosing the stencil
 
 Every derivative view takes an optional `scheme=` — the *config stays on the operator it describes*.

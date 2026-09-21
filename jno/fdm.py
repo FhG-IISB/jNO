@@ -651,7 +651,7 @@ class _TraceFDM:
             for v in (getattr(c, "_coord_vars", None) or {}).values()
             if getattr(v, "axis", None) != "temporal"
         }
-        context = {t: self._pts for t in spatial_tags}
+        context = self._eval_context(spatial_tags)
         N, unknowns = self._N, self.unknowns
 
         def residual_fn(dofs):
@@ -665,6 +665,34 @@ class _TraceFDM:
             return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
 
         return residual_fn
+
+    def _eval_context(self, spatial_tags):
+        """Evaluation context for a strong-form term: every spatial tag collocates at the mesh nodes, and
+        ``domain.cell_size`` resolves to the per-node spacing :meth:`_node_spacing`."""
+        context = {t: self._pts for t in spatial_tags}
+        context["cell_size"] = self._node_spacing()[:, None]
+        return context
+
+    def _node_spacing(self):
+        """``domain.cell_size`` in the strong form: the **node spacing** ``h``, per node the mean over its
+        incident cells of ``(d!·|K|)^(1/d)``.
+
+        On a structured grid this is exactly the grid spacing, in 2-D (right triangles, ``|K| = h²/2``) and
+        3-D (Kuhn tetrahedra, ``|K| = h³/6``), so textbook stencil identities hold as written: first-order
+        upwinding is ``b*ui.x - abs(b)*h/2*ui.xx`` with ``h = domain.cell_size``. On an unstructured mesh
+        it is the leg of the right simplex with the same size (0.93·a for an equilateral triangle of side
+        ``a``); on an anisotropic grid it is the geometric mean ``(hx·hy)^(1/2)``. **Differs from
+        ``jno.fem``**, where ``cell_size`` is ``|K|^(1/d)`` at each quadrature point (``h/√2`` on the same
+        right triangles). Differentiable in the mesh coordinates."""
+        if getattr(self, "_h_nodes", None) is None:
+            pts, cells = _mesh(self.domain)
+            dim = pts.shape[1]
+            e = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim) edge vectors from vertex 0
+            size = (jnp.abs(jnp.linalg.det(e))) ** (1.0 / dim)  # (d!·|K|)^(1/d), since |det| = d!·|K|
+            total = jnp.zeros(self._N).at[cells.reshape(-1)].add(jnp.repeat(size, cells.shape[1]))
+            count = jnp.zeros(self._N).at[cells.reshape(-1)].add(1.0)
+            self._h_nodes = total / jnp.maximum(count, 1.0)
+        return self._h_nodes
 
     def _mass_coefficient(self):
         """Per-node coefficient ``c`` on ``u.t`` (the diagonal mass ``M = diag(c)``), via the two-probe
@@ -692,7 +720,7 @@ class _TraceFDM:
             for v in (getattr(c, "_coord_vars", None) or {}).values()
             if getattr(v, "axis", None) != "temporal"
         }
-        context = {t: self._pts for t in spatial_tags}
+        context = self._eval_context(spatial_tags)
         lid, base = self.unknown.layer_id, self.unknown.module
 
         def probe(u_val):
@@ -884,7 +912,7 @@ class _TraceFDM:
             for v in (getattr(constraint, "_coord_vars", None) or {}).values()
             if getattr(v, "axis", None) != "temporal" and not str(getattr(v, "tag", "")).startswith("n_")
         }
-        context = {t: self._pts for t in spatial_tags}
+        context = self._eval_context(spatial_tags)
         lid, base = self.unknown.layer_id, self.unknown.module
 
         def value_fn(dofs):

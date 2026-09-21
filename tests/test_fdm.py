@@ -1265,3 +1265,54 @@ def test_divergence_form_coefficient_converges(nonlinear):
         exact = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
         errs.append(float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)))
     assert errs[1] < 2e-2 and errs[0] / errs[1] > 3.0, f"expected O(h²): {errs}"
+
+
+# ---- `domain.cell_size` in the strong form: the node spacing, so upwinding is written as math ----------
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_cell_size_is_the_grid_spacing_on_a_structured_grid(dim):
+    """FDM resolves `cell_size` per node as the mean of (d!·|K|)^(1/d) over incident cells: exactly the
+    grid spacing on the 2-D right-triangulation and the 3-D Kuhn tets (FEM's |K|^(1/d) is h/√2 in 2-D)."""
+    import importlib
+
+    fdm_mod = importlib.import_module("jno.fdm")
+    h = 0.05 if dim == 2 else 0.25
+    shape = jno.shape.rect(0, 0, 1, 1, size=h) if dim == 2 else jno.shape.box(0, 0, 0, 1, 1, 1, size=h)
+    d = shape.structured().domain()
+    coords = d.variable("interior", split=True)[:dim]
+    u = d.unknown()
+    ui = u.bind(**dict(zip("xyz", coords)))
+    prob = fdm_mod._TraceFDM([-ui.d2(coords[0]) - 1.0, u(*d.variable("boundary", split=True)[:dim]) - 0.0])
+    assert np.allclose(np.asarray(prob._node_spacing()), h, rtol=1e-12)
+
+
+def test_upwinding_written_with_cell_size_matches_the_upwind_matrix():
+    """−εΔu + b·u_x = 1 at cell Péclet bh/2ε = 2.5. Upwinding is the identity
+    (u_i − u_{i−1})/h = central − (h/2)·(second difference), so it is written as the math,
+    `b*ui.x - abs(b)*h/2*ui.xx` with h = d.cell_size. Oracle: the upwind system assembled by hand
+    with numpy. Central differences alone overshoot the exact bound u ≤ 1 (max 1.38 here)."""
+    import jno.jnp_ops as jnn
+
+    ε, b, h = 1e-2, 1.0, 0.05
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    Δu = ui.xx + ui.yy
+    sol = np.asarray(jno.fdm([-ε * Δu + b * ui.x - jnn.abs(b) * d.cell_size / 2 * ui.xx - 1.0, u(xb, yb) - 0.0]).solve())
+
+    n = round(1 / h) - 1  # interior nodes per axis
+    eye = np.eye(n)
+    D2 = (np.diag(-2 * np.ones(n)) + np.diag(np.ones(n - 1), 1) + np.diag(np.ones(n - 1), -1)) / h**2
+    Dm = (np.eye(n) - np.diag(np.ones(n - 1), -1)) / h  # backward difference: the upwind side for b > 0
+    A = -ε * (np.kron(D2, eye) + np.kron(eye, D2)) + b * np.kron(Dm, eye)  # x is the first (slow) index
+    ref_int = np.linalg.solve(A, np.ones(n * n)).reshape(n, n)
+
+    p = _nodes(d)
+    ix, iy = np.rint(p[:, 0] / h).astype(int), np.rint(p[:, 1] / h).astype(int)
+    inner = (ix > 0) & (ix < n + 1) & (iy > 0) & (iy < n + 1)
+    ref = ref_int[ix[inner] - 1, iy[inner] - 1]
+    assert np.allclose(sol[inner], ref, atol=1e-8), np.abs(sol[inner] - ref).max()
+    assert sol.max() < 1.0

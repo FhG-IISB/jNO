@@ -3611,6 +3611,10 @@ class domain(MeshIOMixin):
         trial/test gradient, so a stabilized term still classifies (``term_kind``) by its u/v
         gradient structure, and ``h`` is geometry (constant w.r.t. the unknown) so differentiable
         assembly is unaffected. (Not meaningful for PINN / boundary-facet terms.)
+
+        In ``jno.fdm`` it is the per-node **spacing** ``h`` instead — the mean of ``(d!·|K|)^(1/d)`` over
+        the node's cells, exactly the grid spacing on a structured grid (``h/√2`` here would break
+        stencil identities such as upwinding, ``b*ui.x - abs(b)*h/2*ui.xx``).
         """
         if "cell_size" not in self.context:
             # Placeholder so the Variable constructs; the real per-cell h is packed at assembly time
