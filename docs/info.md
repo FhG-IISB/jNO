@@ -224,6 +224,37 @@ behind it, so asking about a parameter gives you its inference settings rather t
 expression. And a sampler is reported as a **sampler** — `training backend: a (MCMC sampler)` —
 not as an optimizer.
 
+## Domain decomposition — `jno.info(d)`, `jno.info(jno.core([a, b]))`, `jno.info(jno.dd.couple(...))`
+
+A domain's `tags` section lists every `domain.region(...)` (with its bounds) and every
+auto-created `interface_A_B` tag (with its node count). The reversed spelling `interface_B_A` is
+shown as an alias. A region added after the mesh was built and sampled with no count is **one point,
+redrawn every step** (Monte-Carlo mode), and its row says so: pass `sample=(n, None)` for a fixed set.
+
+A `jno.core` whose items are subdomain solves reports them as solves, not as losses. The coupling
+method comes from the same geometric test the driver uses (overlapping regions → Schwarz, a
+partition → Dirichlet–Neumann on the line):
+
+```
+  subdomain solves
+    [0]  fdm · on region A · owns 80 of 142 nodes · [0, 0.6] × [0, 1]
+    [1]  fdm · on region B · owns 87 of 142 nodes · [0.4, 1] × [0, 1]
+  coupling
+    method                overlap-Schwarz  (the regions overlap)
+    interface conditions  none declared — value continuity (and flux, across a line) is inferred
+  training
+    training backend  not needed — .solve() couples the subdomain solves (jno.dd)
+```
+
+Each subdomain solve spans the whole mesh with its complement pinned, so the useful count is how many
+nodes each one **owns**. `jno.dd.couple(...)` reports the same, and after `.solve()` its last run:
+
+```
+  last solve
+    iterations    8 of max 60
+    overlap jump  4.840e-07 vs tol 1.0e-06  ✓
+```
+
 ## An `rcwa` problem, and its energy check
 
 ```

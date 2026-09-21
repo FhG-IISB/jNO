@@ -126,14 +126,56 @@ def _info_domain(d, deep: bool) -> Info:
     tags: list = []
     dim = int(d.dimension)
     breg = getattr(d, "_boundary_registry", None) or {}
-    for tag, pts in (getattr(d, "_mesh_pool", None) or {}).items():
-        row = f"{_fmt_n(np.asarray(pts).shape[0])} points"
+    pool = getattr(d, "_mesh_pool", None) or {}
+    regions = getattr(d, "_source_regions", None) or {}
+    ifaces = getattr(d, "_interface_pairs", None) or {}
+
+    def _extent(q):
+        q = np.asarray(q)[:, :dim]
+        return " × ".join(f"[{q[:, a].min():.4g}, {q[:, a].max():.4g}]" for a in range(dim))
+
+    # The domain's OWN tag list, not just the sampled pool: a `domain.region(...)` added after the mesh
+    # is sampled lazily and never enters `_mesh_pool`, and the auto-created `interface_A_B` tags live
+    # only in the boundary registry -- both were missing from this section, measured, on exactly the
+    # domain-decomposition domains where they are the point.
+    listed = list(getattr(d, "avaiable_mesh_tags", None) or []) or list(pool)
+    seen_pairs = set()
+    for tag in listed + [t for t in pool if t not in listed]:
+        entry = breg.get(tag) if isinstance(breg.get(tag), dict) else {}
+        if tag in ifaces:
+            a, b = ifaces[tag]
+            if frozenset((a, b)) in seen_pairs:
+                tags.append((tag, f"alias of interface_{b}_{a}"))
+                continue
+            seen_pairs.add(frozenset((a, b)))
+        ctx = getattr(d, "context", None) or {}
+        if tag in pool:
+            row = f"{_fmt_n(np.asarray(pool[tag]).shape[0])} points"
+        elif entry.get("point_indices") is not None:
+            row = f"{_fmt_n(len(entry['point_indices']))} points"
+        elif tag in ctx and np.ndim(ctx[tag]) >= 2:
+            # A region added after the mesh is sampled into `context` on first use, not into the pool.
+            row = f"{_fmt_n(np.shape(ctx[tag])[-2])} points"
+        else:
+            row = "not sampled yet"
         # Extents for a boundary tag -- the check that `lambda x, y: y > 1-1e-9` actually caught the
         # edge you meant. `domain.summary()` showed these and it was the most useful thing it did.
-        bp = (breg.get(tag) or {}).get("points") if isinstance(breg.get(tag), dict) else None
+        bp = entry.get("points")
         if bp is not None and len(bp):
-            q = np.asarray(bp)[:, :dim]
-            row += "   " + " × ".join(f"[{q[:, a].min():.4g}, {q[:, a].max():.4g}]" for a in range(dim))
+            row += "   " + _extent(bp)
+        elif tag in regions and hasattr(regions[tag], "bounds"):
+            lo_hi = regions[tag].bounds  # shapely (minx, miny, maxx, maxy)
+            row += "   " + " × ".join(f"[{lo_hi[a]:.4g}, {lo_hi[a + 2]:.4g}]" for a in range(min(dim, 2)))
+        if tag in ifaces:
+            row += f"   interface between regions {ifaces[tag][0]} and {ifaces[tag][1]}"
+        elif tag in regions:
+            row += "   region"
+        rs = (getattr(d, "_resampling_strategies", None) or {}).get(tag)
+        if rs is not None:
+            # A lazy polygon tag sampled with no count is ONE point, redrawn every training step
+            # (Monte-Carlo mode, polygon_domain.variable). "1 points" alone reads as a bug; say what it is.
+            every = getattr(rs, "resample_every", None)
+            row += f"   · resampled{f' every {every} step(s)' if every else ''} ({type(rs).__name__})"
         tags.append((tag, row))
 
     attached: list = []
@@ -465,6 +507,74 @@ def _info_fdm(o, deep: bool) -> Info:
     return Info("fdm (collocation)", [("solver", rows)])
 
 
+def _subdomain_label(prob, geom=None) -> str:
+    """One line for a domain-decomposition subdomain: which solver, which region, how many dofs."""
+    kind = "fem" if (hasattr(prob, "classification") and hasattr(prob, "offsets")) else (
+        "fdm" if hasattr(prob, "solve_pinned") else type(prob).__name__)
+    parts = [kind]
+    region = getattr(prob, "region", None)
+    if region is not None:
+        parts.append(f"on region {region}")
+    try:
+        # Each subdomain solve spans the WHOLE mesh with its complement pinned, so its dof count is
+        # the mesh's; what distinguishes subdomains is how many nodes each OWNS -- counted with the
+        # driver's own region test, so this is the partition the solve will actually use.
+        from .dd import _region_mask
+
+        dom = prob.domain
+        pts = np.asarray(dom.mesh_connectivity["points"])[:, : int(getattr(dom, "dimension", 2))]
+        if geom is not None:
+            parts.append(f"owns {_fmt_n(int(np.count_nonzero(_region_mask(pts, geom))))} of {_fmt_n(len(pts))} nodes")
+    except Exception:  # noqa: BLE001
+        pass
+    b = getattr(geom, "bounds", None)
+    if b is not None and not callable(b) and len(b) == 4:
+        parts.append(f"[{b[0]:.4g}, {b[2]:.4g}] × [{b[1]:.4g}, {b[3]:.4g}]")
+    return " · ".join(parts)
+
+
+def _coupling_rows(cp) -> list:
+    """The coupling a `jno.dd` problem WILL use, and what the user declared about its interfaces."""
+    rows: list = []
+    try:
+        m = cp._method()
+        why = "the regions overlap" if m == "overlap-Schwarz" else "the regions meet on a line"
+        rows.append(("method", f"{m}  ({why})"))
+    except Exception as e:  # noqa: BLE001
+        rows.append(("method", f"undetermined ({type(e).__name__})"))
+    ifc = getattr(cp, "_interfaces", None) or {}
+    if ifc.get("count"):
+        rows.append(("interface conditions", f"{ifc['count']} declared · {ifc.get('value', 0)} value, {ifc.get('flux', 0)} flux"))
+    else:
+        rows.append(("interface conditions", "none declared — value continuity (and flux, across a line) is inferred"))
+    return rows
+
+
+def _info_coupled(cp, deep: bool) -> Info:
+    """``jno.dd.couple([...])`` — subdomains, the coupling it will use, and its last solve."""
+    subs = [(f"[{i}]", _subdomain_label(p, g)) for i, (p, g) in enumerate(cp._subdomains)]
+    sections = [("subdomains", subs), ("coupling", _coupling_rows(cp))]
+    li = getattr(cp, "_last_info", None)
+    if li:
+        rows: list = []
+        if li.get("deferred"):
+            rows.append(("status", "deferred node (a trainable parameter is in play) — iterates when evaluated"))
+        else:
+            it, mx = li.get("iterations"), li.get("max_iter")
+            rows.append(("iterations", f"{it}" + (f" of max {mx}" if mx else "")
+                                       + ("   ← hit the cap" if (it is not None and mx and it >= mx) else "")))
+            if li.get("overlap_jump") is not None:
+                ok = li.get("tol") is None or li["overlap_jump"] <= li["tol"]
+                rows.append(("overlap jump", f"{li['overlap_jump']:.3e}" + (f" vs tol {li['tol']:.1e}" if li.get("tol") else "")
+                                             + ("  ✓" if ok else "  ✗ above tol")))
+            if li.get("interface_step") is not None:
+                rows.append(("last interface step", f"{li['interface_step']:.3e}"))
+            if li.get("gamma_nodes") is not None:
+                rows.append(("interface nodes", _fmt_n(li["gamma_nodes"])))
+        sections.append(("last solve", rows))
+    return Info("dd · coupled subdomains", sections)
+
+
 def _info_core(c, deep: bool) -> Info:
     import jax
 
@@ -524,7 +634,23 @@ def _info_core(c, deep: bool) -> Info:
     else:
         training.append(("training backend", "NONE — call .optimizer(...) / .bayesian(...) on the core or "
                                               "on each net before .solve()"))
-    sections = [("models", models), ("constraints", cons), ("training", training)]
+    dd = getattr(c, "_dd_subdomains", None)
+    if dd:
+        # A domain-decomposition core: its constraints are subdomain SOLVES that `.solve()` couples
+        # through jno.dd -- not losses. Nothing is trained, so "call .optimizer(...)" (what the
+        # generic branch above says) was false advice, measured on `jno.core([fdm_A, fdm_B])`.
+        cons = [(f"[{i}]", _subdomain_label(s, getattr(s, "region_geometry", None))) for i, s in enumerate(dd)]
+        training = [r for r in training if r[0] == "domain"]
+        training.append(("training backend", "not needed — .solve() couples the subdomain solves (jno.dd)"))
+        try:
+            from .dd import couple
+
+            coupling = _coupling_rows(couple([(s, s.region_geometry) for s in dd], getattr(c, "_dd_interfaces", None)))
+        except Exception as e:  # noqa: BLE001
+            coupling = [("method", f"undetermined ({type(e).__name__}: {e})")]
+        sections = [("models", models), ("subdomain solves", cons), ("coupling", coupling), ("training", training)]
+    else:
+        sections = [("models", models), ("constraints", cons), ("training", training)]
     if deep:
         # What `core.print_tree()` and `core.print_shapes()` used to print. They were two more
         # spellings to know about; as text builders they become sections of the one report.
@@ -1057,6 +1183,8 @@ def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
         return _info_result(obj, deep, context)
     if cls == "domain" or (hasattr(obj, "variable") and hasattr(obj, "dimension")):
         return _guarded(_info_domain, obj, deep, "domain")
+    if hasattr(obj, "_subdomains") and hasattr(obj, "_method"):
+        return _guarded(_info_coupled, obj, deep, "domain-decomposition")
     if str(getattr(type(obj), "__module__", "")) == "jno.rcwa" or hasattr(obj, "efficiency"):
         return _guarded(_info_rcwa, obj, deep, "rcwa")
     if hasattr(obj, "solve_pinned") or cls.lower().startswith("fdm"):
