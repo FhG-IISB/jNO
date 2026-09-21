@@ -16,7 +16,7 @@ import jno
 domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _ = domain.variable("interior")
 
-domain.summary()
+print(jno.info(domain))
 
 # ── Forcing term  f(x) = sin(πx) − x/π ───────────────────────────────────────
 pi_val = float(jnp.pi)
@@ -56,7 +56,7 @@ residual = u - f - x * C
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
 EPOCHS = 50_000
-crux = jno.core([residual.mse]).print_shapes()
+crux = jno.core([residual.mse])
 _history = crux.solve(EPOCHS)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────

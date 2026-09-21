@@ -23,7 +23,6 @@ domain, compiles them once, then exposes `solve()` / `eval()`.
         - solve
         - eval
         - sweep
-        - print_shapes
 
 ---
 

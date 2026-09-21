@@ -1737,7 +1737,7 @@ class core:
 
         return apply_fn
 
-    def print_tree(self, file: Optional[str] = None):
+    def _tree_text(self) -> str:
         """Print the computation tree for every constraint and tracker.
 
         Call this **after** constructing the ``core`` object (which calls
@@ -1745,12 +1745,7 @@ class core:
 
         Args:
             file: Optional path.  When given the tree is written to that
-                file; otherwise it is printed to stdout.
-
-        Example::
-
-            crux = jno.core([pde.mse, ini.mse])
-            crux.print_tree("tree.txt")
+        Text builder behind ``jno.info(crux, deep=True)``; not a public entry of its own.
         """
         constraints = self.wrap_constraints(self.constraints)
         parts: list[str] = []
@@ -1766,17 +1761,7 @@ class core:
                 parts.append(dump_tree(expr))
             parts.append("")
 
-        text = "\n".join(parts)
-        if file is not None:
-            from pathlib import Path as _P
-
-            _P(file).parent.mkdir(parents=True, exist_ok=True)
-            _P(file).write_text(text)
-            self.log.info(f"Computation tree written to {file}")
-        else:
-            self.log.info(text)
-
-        return self
+        return "\n".join(parts)
 
     def compile(self, mesh: Optional[Tuple[int, ...]] = (1, 1)):
         # === Parallelism ===
@@ -5041,8 +5026,7 @@ class core:
     def _log_shape_traces(self, min_consecutive: Optional[int] = 1):
         """Emit per-node shape trees for constraints and trackers.
 
-        Called automatically when log level is DEBUG, or on demand via
-        ``core.print_shapes()``.
+        Called automatically when log level is DEBUG, and by ``jno.info(crux, deep=True)``.
         """
         ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
         evaluator = TraceEvaluator(self._unwrapped_models)
@@ -5064,15 +5048,13 @@ class core:
             except Exception as exc:
                 self.log.debug(f"Tracker {i} shape trace failed: {exc}")
 
-    def print_shapes(self, min_consecutive: Optional[int] = 1):
+    def _shapes_text(self, min_consecutive: Optional[int] = 1) -> str:
         """Print shape-annotated expression trees to stdout.
 
-        Can be called any time after ``compile()`` or ``solve()`` has
-        run.  Useful for troubleshooting shape mismatches::
-
-            crux = jno.core([pde.mse, ini.mse])
-            crux.print_shapes()
+        Can be called any time after ``compile()`` or ``solve()`` has run. Reachable as
+        ``print(jno.info(crux, deep=True))`` -- useful for troubleshooting shape mismatches.
         """
+        _out: list[str] = []
         ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
         evaluator = TraceEvaluator(self._unwrapped_models)
 
@@ -5082,22 +5064,18 @@ class core:
         for i, expr in enumerate(all_exprs):
             try:
                 tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                self.log.info(f"═══ Constraint {i} ═══")
-                self.log.info(tree)
-                self.log.info("")
+                _out.append(f"═══ Constraint {i} ═══"); _out.append(str(tree))
             except Exception as exc:
-                self.log.info(f"═══ Constraint {i} ═══  FAILED: {exc}")
+                _out.append(f"═══ Constraint {i} ═══  FAILED: {exc}")
 
         for i, expr in enumerate(all_tracker_exprs):
             try:
                 tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                self.log.info(f"═══ Tracker {i} ═══")
-                self.log.info(tree)
-                self.log.info("")
+                _out.append(f"═══ Tracker {i} ═══"); _out.append(str(tree))
             except Exception as exc:
-                self.log.info(f"═══ Tracker {i} ═══  FAILED: {exc}")
+                _out.append(f"═══ Tracker {i} ═══  FAILED: {exc}")
 
-        return self
+        return "\n".join(_out)
 
     def sweep(
         self,

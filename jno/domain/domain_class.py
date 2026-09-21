@@ -923,69 +923,6 @@ class domain(MeshIOMixin):
             inferred_dim = 2
         self.dimension = inferred_dim
 
-    def summary(self) -> "domain":
-        """Log a human-readable summary of the domain configuration.
-
-        Returns:
-            Self for method chaining.
-        """
-        lines = ["─── Domain Summary ───"]
-        lines.append(f"  Spatial dimension : {self.dimension}D  ({', '.join(self.spatial)})")
-        lines.append(f"  Time-dependent    : {self._is_time_dependent}")
-        if self._is_time_dependent and self.time is not None:
-            t0, t1, nt = self.time
-            lines.append(f"  Time range        : [{t0}, {t1}]  ({nt} steps)")
-        lines.append(f"  Batch / samples   : {self.total_samples}")
-
-        if self._mesh_pool:
-            lines.append(f"  Mesh tags ({len(self._mesh_pool)}):")
-            for tag, pts in self._mesh_pool.items():
-                lines.append(f"    • {tag:20s}  shape {pts.shape}")
-
-        if self._boundary_registry:
-            lines.append(f"  Boundary tags ({len(self._boundary_registry)}):")
-            coord_labels = self.spatial if self.spatial else [f"x{i}" for i in range(self.dimension)]
-            for tag in sorted(self._boundary_registry):
-                pts = self._boundary_registry[tag].get("points")
-                parts: list = [f"    • {tag}"]
-                if pts is not None and len(pts) > 0:
-                    pts_xy = np.asarray(pts)[:, : self.dimension]
-                    extents = []
-                    for axis, label in enumerate(coord_labels):
-                        lo, hi = float(pts_xy[:, axis].min()), float(pts_xy[:, axis].max())
-                        if hi - lo < 1e-10:
-                            extents.append(f"{label}={lo:.3g}")
-                        else:
-                            extents.append(f"{label}=[{lo:.3g},{hi:.3g}]")
-                    parts.append("  " + "  ".join(extents))
-                normals = self.normals_by_tag.get(tag)
-                if normals is None:
-                    ctx_n = self.context.get(f"n_{tag}")
-                    if ctx_n is not None:
-                        normals = np.asarray(ctx_n).reshape(-1, self.dimension)
-                if normals is not None and len(normals) > 0:
-                    mean_n = np.asarray(normals).mean(axis=0)[: self.dimension]
-                    n_str = "(" + ", ".join(f"{v:+.2f}" for v in mean_n) + ")"
-                    parts.append(f"  n={n_str}")
-                lines.append("".join(parts))
-
-        if self._param_tags:
-            lines.append(f"  Tensor tags ({len(self._param_tags)}):")
-            for tag in sorted(self._param_tags):
-                arr = self.context.get(tag)
-                shape_str = str(arr.shape) if arr is not None else "(not set)"
-                lines.append(f"    • {tag:20s}  shape {shape_str}")
-
-        if self.parameters:
-            lines.append(f"  Scalar parameters ({len(self.parameters)}):")
-            for k, v in self.parameters.items():
-                lines.append(f"    • {k} = {v}")
-
-        lines.append("──────────────────────")
-        msg = "\n".join(lines)
-        self.log.info(msg)
-        return self
-
     def __lt__(self, other: Tuple[str, Any]) -> "domain":
         """Attach parameters or arrays using < operator."""
         if not isinstance(other, tuple) or len(other) != 2:

@@ -2052,7 +2052,13 @@ class FEM:
                 except Exception:  # noqa: BLE001 - a lazy node refuses conversion; that is fine
                     arr = None
             if arr is None or arr.dtype == object or arr.ndim == 0:
-                return parts[0] + " · deferred (trace node) — evaluate through jno.core"
+                # The work has NOT happened yet: this path returns a node and the march runs at
+                # evaluation. Reporting the elapsed time here as if it were the solve would say a
+                # 200-step transient finished in 6 ms.
+                return (
+                    f"solved: {self._mode} · deferred (trace node) — built in {wall:.3g} s, "
+                    f"the solve runs when you evaluate it through jno.core"
+                )
             finite = _np.isfinite(arr)
             if not finite.all():
                 parts.append(f"**{int((~finite).sum())} non-finite entries**")
