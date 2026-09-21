@@ -383,7 +383,7 @@ def test_core_finds_an_optimizer_attached_to_the_net():
     """`core.models` holds the UNWRAPPED module; `_opt_fn` lives on the Model wrapper. Looking in
     the wrong place told a user to call `.optimizer(...)` they had already called."""
     *_rest, crux = _deeponet_problem()
-    assert "per-model" in jno.info(crux).as_dict()["training"]["optimizer"]
+    assert "per-model" in jno.info(crux).as_dict()["training"]["training backend"]
 
 
 def test_replicated_domain_reports_its_sample_count():
@@ -651,3 +651,56 @@ def test_complex_results_report_magnitude_not_lexicographic_order():
     data = jno.info(z).as_dict()["array"]
     assert "|value|" in data and "range" not in data
     assert "3.16" in data["|value|"]        # max |z| = |-3-1j|
+
+
+# ---------------------------------------------------------------------------
+# jno.bayesian. A sampler is not an optimizer, and a chain is not judged by a
+# residual — R-hat and ESS are the "did it converge" question here.
+# ---------------------------------------------------------------------------
+
+_HAS_BLACKJAX = importlib.util.find_spec("blackjax") is not None
+needs_blackjax = pytest.mark.skipif(not _HAS_BLACKJAX, reason="blackjax not installed")
+
+
+def _nuts_problem(warmup=60, keep=120):
+    import blackjax
+    import jax.numpy as jnp
+
+    dom = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+    x, _ = dom.variable("interior")
+    target = 3.14 * jno.np.sin(jno.np.pi * x)
+    a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+    a.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=warmup, keep=keep)
+    crux = jno.core([(a * jno.np.sin(jno.np.pi * x) - target).mse])
+    return a, crux, warmup + keep
+
+
+@needs_blackjax
+def test_a_bare_parameter_reports_as_a_model_not_an_expression():
+    """`jno.np.parameter(...)` returns a ModelCall, so asking about a parameter reported an
+    anonymous expression -- no kernel, no prior, no posterior."""
+    a, _crux, _n = _nuts_problem()
+    data = jno.info(a).as_dict()
+    assert "model" in data["title"]
+    assert data["inference"]["method"] == "bayesian · nuts"     # not a GenerateSamplingAPI repr
+    assert data["inference"]["warmup"] == "60" and data["inference"]["keep"] == "120"
+
+
+@needs_blackjax
+def test_a_sampler_is_not_reported_as_an_optimizer():
+    _a, crux, _n = _nuts_problem()
+    assert "MCMC sampler" in jno.info(crux).as_dict()["training"]["training backend"]
+
+
+@needs_blackjax
+def test_posterior_reports_rhat_ess_and_divergences():
+    """The Bayesian analogue of the relative residual: a chain that has not mixed is not an answer,
+    and nothing else in the report would say so."""
+    a, crux, n = _nuts_problem()
+    crux.solve(n)
+    post = jno.info(a).as_dict()["posterior"]
+    assert "chain(s)" in post["draws"]
+    assert "R-hat (max)" in post and "ESS (min)" in post
+    assert "divergences" in post
+    # the true value is 3.14; a short chain is noisy, so this is a loose sanity bound only
+    assert abs(float(post["mean / sd"].split("/")[0]) - 3.14) < 1.0

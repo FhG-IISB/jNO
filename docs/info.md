@@ -171,6 +171,36 @@ say.
 not the order you wrote the terms in. An adaptive transient returns a trajectory instead, and that
 reports frames, the time span, and the per-frame dof range.
 
+## A Bayesian model — `jno.info(a)`
+
+```
+─── model · a ────────────────────────────────────────────────
+    architecture  _Parameter      parameters  1
+  inference
+    method     bayesian · nuts
+    warmup     100    keep  200    thin  1
+    prior      default gaussian
+    kernel step_size            0.01
+    kernel inverse_mass_matrix  ArrayImpl shape (1,)
+  posterior
+    draws            shape (1, 200, 1)  (1 chain(s) x 200 draws)
+    mean / sd        3.23926 / 1.04949
+    R-hat (max)      0.9963   ✓ < 1.01
+    ESS (min)        42.2   ← < 100 effective draws
+    divergences      0 of 200   ✓ none
+    acceptance_rate  mean 0.9064
+```
+
+**R-hat and ESS are the Bayesian answer to "did it converge"** — the analogue of the relative
+residual on a deterministic solve. A chain that has not mixed is not a posterior, and nothing else
+in the report would say so. Divergences matter separately: a divergence invalidates the draws
+around it regardless of what R-hat says.
+
+Note that `jno.np.parameter(...)` returns a `ModelCall`; `jno.info` unwraps a bare one to the model
+behind it, so asking about a parameter gives you its inference settings rather than a one-node
+expression. And a sampler is reported as a **sampler** — `training backend: a (MCMC sampler)` —
+not as an optimizer.
+
 ## An `rcwa` problem, and its energy check
 
 ```

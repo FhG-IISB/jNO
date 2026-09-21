@@ -391,17 +391,23 @@ def _info_core(c, deep: bool) -> Info:
     opt_on_models = []
     try:
         for _lid, fm in (c._collect_flax_modules() or {}).items():
-            if getattr(fm, "_opt_fn", None) is not None or getattr(fm, "_bayesian_cfg", None) is not None:
-                nm = getattr(fm, "name", None)
-                opt_on_models.append(str(nm) if isinstance(nm, str) and nm else type(getattr(fm, "module", None)).__name__)
+            nm = getattr(fm, "name", None)
+            label = str(nm) if isinstance(nm, str) and nm else type(getattr(fm, "module", None)).__name__
+            if getattr(fm, "_bayesian_cfg", None):
+                opt_on_models.append(f"{label} (MCMC sampler)")      # a sampler is NOT an optimizer
+            elif getattr(fm, "_vi_cfg", None):
+                opt_on_models.append(f"{label} (variational)")
+            elif getattr(fm, "_opt_fn", None) is not None:
+                opt_on_models.append(label)
     except Exception:  # noqa: BLE001
         pass
     if getattr(c, "_opt_states", None):
-        training.append(("optimizer", "set on the core"))
+        training.append(("training backend", "optimizer set on the core"))
     elif opt_on_models:
-        training.append(("optimizer", f"set per-model on {', '.join(opt_on_models)}  (net.optimizer(...))"))
+        training.append(("training backend", f"per-model: {', '.join(opt_on_models)}"))
     else:
-        training.append(("optimizer", "not set — call .optimizer(...) on the core or on each net before .solve()"))
+        training.append(("training backend", "NONE — call .optimizer(...) / .bayesian(...) on the core or "
+                                              "on each net before .solve()"))
     sections = [("models", models), ("constraints", cons), ("training", training)]
     if deep:
         # What `core.print_tree()` and `core.print_shapes()` used to print. They were two more
@@ -466,6 +472,8 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
     from .trace import Model, TestFunction, TrialFunction, Variable
 
     nodes = _walk(e)
+    if type(e).__name__ == "ModelCall" and getattr(e, "model", None) is not None and len(nodes) <= 2:
+        return _info_model(e.model, deep)
     # A bound-but-underived trial function keeps its coordinates on the VIEW (`_coord_vars`), not in
     # the IR -- `u.bind(x=xb, y=yb) * v.bind(...)` has no Variable anywhere in its tree. Measured:
     # without this, the region row is simply absent for exactly the terms a weak form is made of.
@@ -601,7 +609,60 @@ def _info_model(m, deep: bool) -> Info:
             rows.append((label, str(val)))
     if getattr(m, "_frozen", False):
         rows.append(("frozen", "yes — excluded from the optimizer"))
-    return Info(f"model · {nm if isinstance(nm, str) and nm else type(mod).__name__}", [("", rows)])
+
+    sections = [("", rows)]
+    inference: list = []
+    for cfg_name, cfg in (("bayesian", getattr(m, "_bayesian_cfg", None)), ("vi", getattr(m, "_vi_cfg", None))):
+        if not cfg:
+            continue
+        fac = cfg.get("factory")
+        # A blackjax kernel is a `GenerateSamplingAPI` whose repr is three nested function objects.
+        # Its identity is in the module path of the callable it carries: blackjax.mcmc.nuts -> nuts.
+        name = getattr(fac, "__name__", None)
+        if not name:
+            inner = getattr(fac, "differentiable", None) or getattr(fac, "build_kernel", None)
+            mod = str(getattr(inner, "__module__", "") or "")
+            name = mod.rsplit(".", 1)[-1] if mod else type(fac).__name__
+        inference.append(("method", f"{cfg_name} · {name}"))
+        for key in ("warmup", "keep", "thin", "num_samples", "posterior_draws"):
+            if cfg.get(key) is not None:
+                inference.append((key, str(cfg[key])))
+        pri = cfg.get("prior")
+        inference.append(("prior", getattr(pri, "__name__", None) or (str(pri)[:48] if pri else "default gaussian")))
+        for k, v in (cfg.get("kernel_kwargs") or {}).items():
+            inference.append((f"kernel {k}", f"{type(v).__name__} shape {tuple(np.shape(v))}" if hasattr(v, "shape") else str(v)[:40]))
+
+    posterior: list = []
+    chain = getattr(m, "posterior_samples", None)
+    if chain is not None:
+        q = np.asarray(chain)
+        posterior.append(("draws", f"shape {q.shape}" + (f"  ({q.shape[0]} chain(s) x {q.shape[1]} draws)" if q.ndim >= 2 else "")))
+        posterior.append(("mean / sd", f"{q.mean():.6g} / {q.std():.6g}"))
+        # R-hat and ESS are the Bayesian answer to "did it converge" -- the analogue of the
+        # relative residual on a deterministic solve, and the thing a chain must be judged on.
+        try:
+            from . import bayesian as _bay
+
+            r = float(np.max(np.asarray(_bay.rhat(chain))))
+            e_ = float(np.min(np.asarray(_bay.ess(chain))))
+            posterior.append(("R-hat (max)", f"{r:.4f}" + ("   ✓ < 1.01" if r < 1.01 else "   ← > 1.01: chains disagree, run longer")))
+            posterior.append(("ESS (min)", f"{e_:.1f}" + ("   ✓" if e_ > 100 else "   ← < 100 effective draws")))
+        except Exception as exc:  # noqa: BLE001
+            posterior.append(("R-hat / ESS", f"unavailable ({type(exc).__name__})"))
+    diag = getattr(m, "posterior_diagnostics", None)
+    if diag:
+        for k, v in diag.items():
+            q = np.asarray(v)
+            if k == "is_divergent":
+                nd = int(q.sum())
+                posterior.append(("divergences", f"{nd} of {q.size}" + ("   ← a divergence invalidates the draws around it" if nd else "   ✓ none")))
+            elif q.size:
+                posterior.append((k, f"mean {q.mean():.4g}"))
+    if inference:
+        sections.append(("inference", inference))
+    if posterior:
+        sections.append(("posterior", posterior))
+    return Info(f"model · {nm if isinstance(nm, str) and nm else type(mod).__name__}", sections)
 
 
 def _info_shape(sh, deep: bool) -> Info:
