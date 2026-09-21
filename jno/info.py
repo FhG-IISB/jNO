@@ -42,7 +42,14 @@ class Info:
         self.sections = sections
 
     def as_dict(self) -> dict:
-        return {"title": self.title, **{s: dict(rows) for s, rows in self.sections}}
+        """Sections with unique keys become a dict; sections whose rows share a key (a rendered
+        tree, a note -- every row keyed ``""``) become a LIST, because ``dict(rows)`` silently kept
+        only the last of them and a four-node CSG tree reported as one node."""
+        out: dict = {"title": self.title}
+        for name, rows in self.sections:
+            keys = [k for k, _v in rows]
+            out[name] = dict(rows) if len(set(keys)) == len(keys) else [v for _k, v in rows]
+        return out
 
     def __str__(self) -> str:
         width = 78
@@ -297,9 +304,15 @@ def _info_fdm(o, deep: bool) -> Info:
         rows.append(("unknowns", f"{len(unk)}  ({', '.join(str(getattr(m, 'name', None) or type(m).__name__) for m in unk)})"))
         if pts is not None and len(unk):
             rows.append(("dofs", _fmt_n(len(np.asarray(pts)) * len(unk))))
-    terms = list(getattr(o, "_pde", None) or [])
-    if terms:
-        rows.append(("residual terms", _fmt_n(len(terms))))
+    # These came from the generic fallback's attribute dump -- the handler was reporting a
+    # strict subset of what the object actually knows.
+    if getattr(o, "_nf", None):
+        rows.append(("fields", _fmt_n(o._nf)))
+    if getattr(o, "_N", None):
+        rows.append(("grid", f"N = {_fmt_n(o._N)}" + (f" · {_fmt_n(o._Ntot)} total" if getattr(o, "_Ntot", None) else "")))
+    conds = [(nm, len(getattr(o, a, None) or [])) for nm, a in
+             (("pde", "_pde"), ("dirichlet", "_dirichlet"), ("neumann", "_neumann"), ("initial", "_ic"))]
+    rows.append(("terms", " · ".join(f"{nm} {k}" for nm, k in conds if k)))
     if getattr(o, "_periodic_axes", None):
         rows.append(("periodic axes", str(o._periodic_axes)))
     if getattr(o, "region", None) is not None:
@@ -579,8 +592,9 @@ def _info_shape(sh, deep: bool) -> Info:
         geom.append(("mesh size", str(sh._size)))
     if getattr(sh, "_mesh_order", 1) != 1:
         geom.append(("geometry order", str(sh._mesh_order) + "  (curved)"))
-    if getattr(sh, "_structured", None):
-        geom.append(("structured", "yes"))
+    st = getattr(sh, "_structured", None)
+    if st is not None:                      # `.structured()` stores a TUPLE, and () is falsy
+        geom.append(("structured", "yes" + (f" · {st}" if st else "")))
     geom.append(("meshed", "no — call .domain() (jno.info on the domain then reports quality)"))
 
     regions: list = []
@@ -728,11 +742,62 @@ def _info_env(deep: bool) -> Info:
 
 
 # ---------------------------------------------------------------------------------------------
+# the generic fallback
+# ---------------------------------------------------------------------------------------------
+def _info_generic(obj, deep: bool, why: str = "") -> Info:
+    """What can be said about ANY object without knowing what it is.
+
+    This exists because of how every specific handler in this file first failed. Each was written
+    by reading attribute names out of the source, and each was wrong -- `core.models` was a dict,
+    the rcwa attributes lived on `.spec`, a network in an expression was a `ModelCall`. The shared
+    symptom was a report that came back EMPTY or nearly so, and looked like a finding rather than
+    a miss. So: a handler that produces nothing falls through to here, and here says plainly that
+    it fell through. A moved attribute becomes visible instead of silent.
+    """
+    rows: list = [("class", f"{type(obj).__module__}.{type(obj).__name__}")]
+    for attr in ("shape", "dtype", "dim", "dimension", "name", "tag", "mode", "dofs", "size"):
+        v = getattr(obj, attr, None)
+        if isinstance(v, (str, int, float, bool, tuple)) and str(v):
+            rows.append((attr, str(v)[:60]))
+    fields: list = []
+    for k, v in sorted((vars(obj) if hasattr(obj, "__dict__") else {}).items()):
+        if k.startswith("__") or callable(v):
+            continue
+        kind = type(v).__name__
+        extra = ""
+        if hasattr(v, "shape"):
+            extra = f" shape {tuple(np.shape(v))}"
+        elif isinstance(v, (list, tuple, dict, set)):
+            extra = f" ({len(v)})"
+        elif isinstance(v, (str, int, float, bool)):
+            extra = f" = {str(v)[:34]}"
+        fields.append((k.lstrip("_"), kind + extra))
+    note = [("", why)] if why else []
+    return Info(f"{type(obj).__name__} (generic)", [("note", note), ("what", rows), ("attributes", fields[:40])])
+
+
+def _is_empty(rep: Info) -> bool:
+    """A report whose every section is empty told the caller nothing and looked like an answer."""
+    return not any(rows for _name, rows in rep.sections)
+
+
+# ---------------------------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------------------------
 #: Extra handlers, keyed by class name. A module that lives on another branch (``jno.peec``) can
 #: register itself here at import time rather than this file having to import it.
 REGISTRY: dict = {}
+
+
+def _guarded(fn, obj, deep, label):
+    """Run a handler; if it comes back empty, say so and fall back rather than print a blank report."""
+    try:
+        rep = fn(obj, deep)
+    except Exception as e:  # noqa: BLE001 - a handler reading a moved attribute must not be fatal
+        return _info_generic(obj, deep, f"the {label} handler raised {type(e).__name__}: {e}")
+    if _is_empty(rep):
+        return _info_generic(obj, deep, f"the {label} handler found nothing — its attributes have probably moved")
+    return rep
 
 
 def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
@@ -746,7 +811,7 @@ def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
     if cls in REGISTRY:
         return REGISTRY[cls](obj, deep)
     if hasattr(obj, "classification") and hasattr(obj, "offsets"):
-        return _info_fem(obj, deep)
+        return _guarded(_info_fem, obj, deep, "fem")
     # The small parts. Dispatch on STRUCTURE, not class names: a Variable and a Model are both
     # trace nodes, so they are tested before the generic expression handler, and everything else
     # that walks like a trace node reaches `_info_expr` whatever it is called.
@@ -767,36 +832,41 @@ def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
             secs.append((f"{tag}  ({n} component{'s' if n > 1 else ''})", rows))
         return Info(f"variables · {len(obj)} returned by domain.variable(...)", secs)
     if type(obj).__name__ == "TensorTag":
-        return _info_tensor_tag(obj, deep)
+        return _guarded(_info_tensor_tag, obj, deep, "parameter")
     if isinstance(obj, Variable):
-        return _info_variable(obj, deep)
+        return _guarded(_info_variable, obj, deep, "variable")
     if isinstance(obj, Model):
-        return _info_model(obj, deep)
+        return _guarded(_info_model, obj, deep, "model")
     if hasattr(obj, "_region_items") and hasattr(obj, "_node"):
-        return _info_shape(obj, deep)
+        return _guarded(_info_shape, obj, deep, "shape")
     inner = getattr(obj, "expr", None)
     if isinstance(inner, Placeholder):
-        return _info_expr(inner, deep, outer=obj)
+        return _guarded(lambda o, d: _info_expr(inner, d, outer=o), obj, deep, "expression")
     if isinstance(obj, Placeholder):
-        return _info_expr(obj, deep)
+        return _guarded(_info_expr, obj, deep, "expression")
     if hasattr(obj, "times") and hasattr(obj, "states"):
         return _info_result(obj, deep, context)
     if isinstance(obj, np.ndarray) or (hasattr(obj, "shape") and hasattr(obj, "dtype")):
         return _info_result(obj, deep, context)
     if cls == "domain" or (hasattr(obj, "variable") and hasattr(obj, "dimension")):
-        return _info_domain(obj, deep)
+        return _guarded(_info_domain, obj, deep, "domain")
     if str(getattr(type(obj), "__module__", "")) == "jno.rcwa" or hasattr(obj, "efficiency"):
-        return _info_rcwa(obj, deep)
+        return _guarded(_info_rcwa, obj, deep, "rcwa")
     if hasattr(obj, "solve_pinned") or cls.lower().startswith("fdm"):
-        return _info_fdm(obj, deep)
+        return _guarded(_info_fdm, obj, deep, "fdm")
     if hasattr(obj, "get_constraint_tags"):
-        return _info_core(obj, deep)
+        return _guarded(_info_core, obj, deep, "core")
     # A solver / preconditioner / time-scheme spec, identified by WHERE IT COMES FROM rather than
     # by its class name: they are variously `*Spec`, `_ThetaScheme`, or a plain closure holder, and
     # a name test missed the ones that matter.
     mod = str(getattr(type(obj), "__module__", ""))
     if hasattr(obj, "__dict__") and (mod.startswith(("jno.solve", "jno.precond", "jno.utils.solver")) or cls.endswith("Spec")):
-        return _info_spec(obj, deep)
+        return _guarded(_info_spec, obj, deep, "spec")
+    # Anything from the jno namespace gets the generic report rather than a refusal: a type this
+    # file has never heard of is exactly the case a fixed handler list cannot serve, and something
+    # is always better than nothing. A genuinely foreign object still raises.
+    if str(getattr(type(obj), "__module__", "")).split(".")[0] == "jno":
+        return _info_generic(obj, deep, "no specific handler — register one via jno.info.REGISTRY")
     raise TypeError(
         f"jno.info: nothing to report for {cls!r}. Handled: a domain, a jno.fem form, a jno.fdm or "
         f"jno.rcwa solver, a jno.core, and the jno.solve / jno.precond specs. Register another with "

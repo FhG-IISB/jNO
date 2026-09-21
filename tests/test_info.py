@@ -145,7 +145,7 @@ def test_shape_info_before_meshing_reports_regions_and_the_csg_tree():
     data = jno.info(sh).as_dict()
     assert "no" in data["geometry"]["meshed"], "an unmeshed shape must not claim mesh facts"
     assert data["regions"]["lo"].startswith("k=5.0")
-    assert any("Rect" in v for v in data["CSG tree"].values())
+    assert any("Rect" in v for v in data["CSG tree"])
 
 
 def test_expression_info_names_the_region_it_samples():
@@ -456,3 +456,126 @@ def test_a_transient_trajectory_splits_along_the_dof_axis():
     blocks = jno.info(traj, context=f).as_dict()["by field block"]
     assert any("time steps" in v for v in blocks.values())
     assert any("over all steps" in v for v in blocks.values())
+
+
+# ---------------------------------------------------------------------------
+# Generality. Every specific handler in info.py was wrong the first time, and the
+# shared symptom was a report that came back EMPTY and looked like a finding. These
+# pin the two mechanisms that make the next such miss visible instead of silent.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unregistered_jno_object_reports_instead_of_refusing():
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
+    br = d._boundary_regions["boundary"]          # an internal type with no handler
+    data = jno.info(br).as_dict()
+    assert "generic" in data["title"]
+    assert "BoundaryRegion" in data["what"]["class"]
+    assert data["attributes"], "the generic report must list what the object actually carries"
+
+
+def test_a_handler_that_finds_nothing_says_so_and_falls_back():
+    """This is the antidote to how every handler here first failed: attributes not where assumed,
+    an empty report, and nothing to distinguish that from a real answer."""
+    import importlib
+
+    mod = importlib.import_module("jno.info")
+    d = jno.shape.rect(0, 0, 1, 1, size=0.34).structured().domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=xi, y=yi)
+    obj = jno.fdm([-ui.d2(xi) - ui.d2(yi) - 1.0, u(xb, yb) - 0.0])
+    orig = mod._info_fdm
+    mod._info_fdm = lambda o, deep: mod.Info("fdm", [("solver", [])])
+    try:
+        rep = jno.info(obj)
+    finally:
+        mod._info_fdm = orig
+    assert "found nothing" in str(rep) and "moved" in str(rep)
+    assert rep.as_dict()["attributes"], "it must still show what the object really has"
+
+
+def test_a_handler_that_raises_does_not_take_the_caller_down():
+    import importlib
+
+    mod = importlib.import_module("jno.info")
+    d = jno.shape.rect(0, 0, 1, 1, size=0.5).domain()
+    orig = mod._info_domain
+    mod._info_domain = lambda o, deep: (_ for _ in ()).throw(KeyError("moved"))
+    try:
+        rep = jno.info(d)
+    finally:
+        mod._info_domain = orig
+    assert "raised KeyError" in str(rep)
+
+
+def test_a_foreign_object_still_refuses():
+    with pytest.raises(TypeError, match="Handled: a domain"):
+        jno.info({"not": "a jno object"})
+
+
+def test_adaptive_trajectory_reports_frames_and_per_frame_dofs():
+    """An adaptive transient returns one mesh per frame, so it is not an (n_save, n_dofs) array."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0.0, 0.2, 4))
+    x, y, t = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    c = d.variable("initial", split=True)
+    u, v = d.fem_symbols()
+    a, w = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    f = jno.fem([a.t * w + 0.05 * (a.x * w.x + a.y * w.y), u(b[0], b[1]) - 0.0,
+                 u(c[0], c[1], c[2]) - jno.np.sin(np.pi * c[0]) * jno.np.sin(np.pi * c[1])])
+    data = jno.info(f.solve(adapt=jno.solve.remesh())).as_dict()[""]
+    assert int(data["frames"]) == 4 and "resample" in data["meshes"]
+    assert "dofs per frame" in data
+
+
+def test_deep_reports_add_their_extra_sections():
+    d = jno.shape.rect(0, 0, 1, 1, size=0.5).domain()
+    x, y, _ = d.variable("interior", split=True)
+    u, v = d.fem_symbols()
+    e = u.bind(x=x, y=y).x * v.bind(x=x, y=y).x
+    assert not jno.info(e).as_dict()["tree"], "the tree costs a walk: not in the cheap report"
+    assert jno.info(e, deep=True).as_dict()["tree"], "deep must render it"
+
+
+def test_registry_lets_another_module_register_its_own_type():
+    """The extension point: a module that lives on another branch (jno.peec) registers itself at
+    import time rather than this file importing it."""
+    import importlib
+
+    mod = importlib.import_module("jno.info")
+
+    class Thing:
+        pass
+
+    mod.REGISTRY["Thing"] = lambda obj, deep: mod.Info("thing", [("", [("k", 1)])])
+    try:
+        assert jno.info(Thing()).as_dict()[""]["k"] == 1
+    finally:
+        del mod.REGISTRY["Thing"]
+
+
+def test_core_with_two_models_reports_a_total():
+    import foundax
+
+    a = jno.nn(foundax.mlp(2, hidden_dims=16, num_layers=2, key=jax.random.PRNGKey(1)))
+    b = jno.nn(foundax.mlp(2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(2)))
+    d = jno.shape.rect(0, 0, 1, 1, size=0.5).domain()
+    x, y, _ = d.variable("interior", split=True)
+    models = jno.info(jno.core([(a(x, y) + b(x, y)).mse])).as_dict()["models"]
+    assert "total" in models
+    counts = [int(v.split()[0].replace(",", "")) for k, v in models.items() if k != "total"]
+    assert int(models["total"].split()[0].replace(",", "")) == sum(counts)
+
+
+def test_shape_info_renders_boolean_nodes_and_structured_flag():
+    sh = ((jno.shape.rect(0, 0, 4, 4) - jno.shape.disk(2, 2, 1)) | jno.shape.disk(0, 0, 0.5)).sized(0.5)
+    tree = " ".join(jno.info(sh).as_dict()["CSG tree"])   # a repeated-key section is a LIST
+    assert "fuse" in tree and "cut" in tree
+    assert "yes" in jno.info(jno.shape.rect(0, 0, 1, 1, size=0.5).structured()).as_dict()["geometry"]["structured"]
+
+
+def test_transient_domain_and_form_report_their_time_window():
+    d = jno.shape.rect(0, 0, 1, 1, size=0.5).domain(time=(0.0, 2.5, 6))
+    assert "2.5" in jno.info(d).as_dict()["geometry"]["time"]

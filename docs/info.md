@@ -196,6 +196,31 @@ genuinely absorbing stack or too few retained `orders` — which is the one numb
 the truncation was enough. A patterned layer reports its permittivity *range* and grid shape rather
 than the grid itself.
 
+## When it does not know the object
+
+`jno.info` never returns a blank report and never refuses a jNO object it has not met:
+
+* **No handler** → a generic report: the class, the recognisable attributes, and every field the
+  object carries with its type and shape.
+* **A handler that finds nothing** → the same generic report, prefixed with
+  *"the `<x>` handler found nothing — its attributes have probably moved"*.
+* **A handler that raises** → the generic report, naming the exception.
+* **A genuinely foreign object** (a `dict`, a string) → a `TypeError` listing what *is* handled.
+
+The middle two exist because of how every handler in this file first failed. Each was written by
+reading attribute names out of the source, and each was wrong — `core.models` is a dict keyed by
+model id, the `rcwa` attributes live on `.spec`, a network inside an expression is a `ModelCall`
+wrapping the `Model`. The shared symptom was a report that came back **empty and looked like a
+finding**. A moved attribute is now visible rather than silent — and the generic dump is what
+tells you where the attribute went.
+
+## Reading the result as data
+
+`Info.as_dict()` gives the same content as data. A section whose rows have unique keys is a
+`dict`; a section whose rows share a key (a rendered tree, a note — every row keyed `""`) is a
+**list**, because collapsing it to a dict kept only the last row and a four-node CSG tree reported
+as one.
+
 ## Registering another type
 
 ```python
