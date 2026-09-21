@@ -280,6 +280,38 @@ matrix-free residual does not assemble, so it fails loud pointing you to a θ-sc
 
 ---
 
+### Second order in time — `u.tt`
+
+A `ui.tt` term makes the problem second order in time: waves, vibrating membranes, elastodynamics.
+Give the initial displacement as usual and, optionally, the initial velocity as `ui0.t - v0` on the
+`initial` region (it defaults to zero), exactly as in `jno.fem`:
+
+```python
+xi, yi, ti = d.variable("initial", split=True)
+ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
+Δu = ui.d2(x) + ui.d2(y)
+
+traj = jno.fdm([
+    ui.tt + c * ui.t - Δu,     # damped wave; drop c * ui.t for the undamped one
+    u(xb, yb) - 0.0,
+    u(xi, yi) - u0,            # initial displacement
+    ui0.t - v0,                # initial velocity (optional, default 0)
+]).solve()
+```
+
+It marches the augmented state `[u; v]` with `v = u_t`: `u̇ = v`, `m·v̇ + c·v + R(u) = 0`. The inertia `m(x)`
+and damping `c(x)` may vary in space; if either depends on `u`, the solve raises. The default scheme is
+θ = ½ (trapezoidal, Newmark average acceleration), which does not damp an undamped wave. `time=` swaps in
+another θ; backward Euler visibly damps it, and BDF2 refuses. `.solve()` returns the `u` trajectory.
+
+!!! measured "Standing wave on the structured grid, h = 0.1, T = 0.5"
+    Against the exact semidiscrete mode `cos(ω_h t)·sin(πx)sin(πy)`, the error at T is 1.2e-3 → 2.9e-4 →
+    7.3e-5 for 25 → 50 → 100 steps (h = 0.05), so it is second order in Δt. The damped and
+    initial-velocity cases match their closed forms to below 1e-3.
+
+    Before this was wired, `ui.tt` was silently read as `ui.t`: the wave equation was solved as a heat
+    equation.
+
 ## Differentiable inverse problems
 
 When the constraint list carries a **trainable** `jno.np.parameter` — a source amplitude, a
@@ -345,8 +377,9 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
 Dirichlet, one PDE equation per unknown; `.solve()` returns `(nf, N)`) — on a **2-D triangular or 3-D
 tetrahedral** mesh; any mix of Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in
 `∂u/∂n`) boundary conditions, in 2-D and 3-D, **steady or transient** (a transient flux node is an
-algebraic zero-mass-row constraint); transient problems by the method of lines (a `u.t` term with a unit or a general `c(x)·u.t` mass
-coefficient, `M = diag(c)`) with a selectable [time scheme](#time-schemes); linear and nonlinear
+algebraic zero-mass-row constraint); transient problems by the method of lines, first order (a `u.t` term with a unit or a general `c(x)·u.t` mass
+coefficient, `M = diag(c)`) or second order ([`u.tt`](#second-order-in-time-utt), with optional damping and
+initial velocity), with a selectable [time scheme](#time-schemes); linear and nonlinear
 residuals; differentiable inverse problems.
 
 Author a coupled system as one PDE equation per unknown, in declaration order (equation *k* drives

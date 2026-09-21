@@ -1040,3 +1040,129 @@ def test_fdm_poisson_converges_without_raising_on_the_default_stencil():
     sol = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()  # must not raise
     rel = float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
     assert rel < 3e-2, f"the answer must still be accurate: rel {rel:.3e}"
+
+
+# ---- second order in time: `ui.tt` -------------------------------------------------------------------
+# `u.tt` used to be probed as if it were `u.t`, so a wave equation was silently solved as a heat equation
+# (the centre of a standing wave decayed to 8e-5 by t = 0.5 instead of swinging to -0.61). The oracle for
+# the structured 5-point grid is the SEMIDISCRETE mode: sin(πx)sin(πy) is an exact eigenvector with
+# λ_h = 2·(4/h²)·sin²(πh/2), so the spatial error drops out and only the time integration is tested.
+
+_H = 0.1
+
+
+def _wave(n_steps, T=0.5, *, damping=None, velocity=False, time=None):
+    """u_tt [+ c u_t] = Δu on the unit square, u = 0 on ∂Ω, returns (nodes, trajectory)."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=_H).structured(), time=(0.0, T, n_steps))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, ti = d.variable("initial", split=True)
+    u = d.unknown()
+    ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
+    Δu = ui.d2(x) + ui.d2(y)
+    mode0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+
+    pde = ui.tt - Δu if damping is None else ui.tt + damping * ui.t - Δu
+    terms = [pde, u(xb, yb) - 0.0]
+    terms += [u(xi, yi) - 0.0, ui0.t - mode0] if velocity else [u(xi, yi) - mode0]
+    prob = jno.fdm(terms)
+    return _nodes(d), np.asarray(prob.solve() if time is None else prob.solve(time=time))
+
+
+def _mode(p):
+    return np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+
+
+_OMEGA_H = np.sqrt(2 * (4 / _H**2) * np.sin(np.pi * _H / 2) ** 2)  # semidiscrete frequency of the mode
+
+
+def _err(sol, amplitude, p):
+    return float(np.linalg.norm(sol - amplitude * _mode(p)) / np.linalg.norm(_mode(p)))
+
+
+def test_wave_standing_mode_oscillates():
+    p, traj = _wave(51)
+    assert traj.shape == (51, len(p))
+    ts = np.linspace(0.0, 0.5, 51)
+    worst = max(_err(traj[k], np.cos(_OMEGA_H * ts[k]), p) for k in range(len(ts)))
+    assert worst < 1e-3, f"standing wave off the exact cos(ω_h t) mode by {worst:.2e}"
+    assert traj[-1][np.argmax(_mode(p))] < -0.5, "the centre must swing negative, not decay like heat"
+
+
+def test_wave_time_error_is_second_order():
+    """θ = ½ (trapezoidal / Newmark average acceleration) is the default: halving dt quarters the error."""
+    e = [_err(traj[-1], np.cos(_OMEGA_H * 0.5), p) for p, traj in (_wave(n) for n in (26, 51))]
+    assert e[0] / e[1] > 3.5, f"expected O(dt²): errors {e}"
+
+
+def test_wave_initial_velocity():
+    p, traj = _wave(51, velocity=True)
+    assert _err(traj[-1], np.sin(_OMEGA_H * 0.5) / _OMEGA_H, p) < 1e-3
+
+
+def test_wave_damped():
+    c, T = 2.0, 0.5
+    wd = np.sqrt(_OMEGA_H**2 - c**2 / 4)
+    amplitude = np.exp(-c * T / 2) * (np.cos(wd * T) + c / (2 * wd) * np.sin(wd * T))
+    p, traj = _wave(51, damping=c)
+    assert _err(traj[-1], amplitude, p) < 1e-3
+
+
+def test_wave_time_scheme_slot_composes():
+    """`time=jno.solve.theta(1.0)` swaps in backward Euler, which visibly damps an undamped wave."""
+    p, traj = _wave(51, time=jno.solve.theta(1.0))
+    exact = abs(np.cos(_OMEGA_H * 0.5))
+    assert np.abs(traj[-1]).max() < 0.99 * exact
+
+
+def test_wave_neumann_edge():
+    """A flux edge composes with u_tt: u0 = sin(πx/2) sin(πy), insulated at x = 1."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.5, 101))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    (xl, yl, _), (xo, yo, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("left", "bottom", "top"))
+    xr, yr, _ = d.variable("right", split=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui, ur = u.bind(x=x, y=y, t=t), u.bind(x=xr, y=yr)
+    traj = np.asarray(
+        jno.fdm(
+            [
+                ui.tt - ui.d2(x) - ui.d2(y),
+                u(xl, yl) - 0.0,
+                u(xo, yo) - 0.0,
+                u(xt, yt) - 0.0,
+                ur.d(nr) - 0.0,
+                u(xi, yi) - jnn.sin(np.pi * xi / 2) * jnn.sin(np.pi * yi),
+            ]
+        ).solve()
+    )
+    p = _nodes(d)
+    mode = np.sin(np.pi * p[:, 0] / 2) * np.sin(np.pi * p[:, 1])
+    exact = np.cos(np.pi * np.sqrt(1.25) * 0.5) * mode
+    assert float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(mode)) < 1e-2
+
+
+@pytest.mark.parametrize(
+    "case", ["velocity_on_first_order", "velocity_without_displacement", "nonlinear_inertia", "third_order"]
+)
+def test_wave_guards(case):
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).structured(), time=(0.0, 0.1, 5))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, ti = d.variable("initial", split=True)
+    u = d.unknown()
+    ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
+    Δu = ui.d2(x) + ui.d2(y)
+    terms, match = {
+        "velocity_on_first_order": ([ui.t - Δu, u(xi, yi) - 1.0, ui0.t - 1.0], "no `u.tt` term"),
+        "velocity_without_displacement": ([ui.tt - Δu, ui0.t - 1.0], "without an initial displacement"),
+        "nonlinear_inertia": ([(1.0 + ui) * ui.tt - Δu, u(xi, yi) - 1.0], "nonlinear inertia"),
+        "third_order": ([ui.tt.t - Δu, u(xi, yi) - 1.0], "order 3"),
+    }[case]
+    with pytest.raises((ValueError, NotImplementedError), match=match):
+        jno.fdm(terms + [u(xb, yb) - 0.0]).solve()

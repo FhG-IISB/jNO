@@ -33,7 +33,9 @@ residual) and boundary **faces in 3-D** (each oriented outward exactly via its o
 flat face gives an exact axis normal, no corner heuristic). Plus **transient** problems by
 method-of-lines with a ``u.t`` term carrying a **unit or a general ``c(x)·u.t`` mass coefficient** (e.g.
 ``ρcₚ(x)·ui.t - νΔu``; the coefficient is extracted by a two-probe ``c = F(u.t=1) − F(u.t=0)`` and carried
-as ``M = diag(c)``, a nonlinear ``c(u)`` fails loud) — all with linear + nonlinear residuals, and with
+as ``M = diag(c)``, a nonlinear ``c(u)`` fails loud), and **second order in time** with a ``u.tt`` term
+(the augmented ``[u; v]`` march, θ = ½ by default; optional damping ``c(x)·u.t`` and initial velocity
+``ui0.t - v0``) — all with linear + nonlinear residuals, and with
 the time scheme selectable via ``.solve(time=…)`` exactly as ``fem.solve(time=…)`` (``jno.solve.theta``
 for backward Euler / Crank–Nicolson, ``jno.solve.adaptive``; backward Euler by default — the exponential
 integrator needs a linear block the matrix-free residual doesn't assemble, so it fails loud). **Flux BCs
@@ -351,24 +353,37 @@ def _mesh_nodes_in(pts, geom):
     return np.nonzero(mask)[0].astype(int)
 
 
-def _set_temporal(node, val):
-    """Replace every ``u.t`` (:class:`TemporalDerivative`) in ``node`` with the constant ``val``, leaving
-    the rest of the expression intact. Two probes recover, for a residual ``F(u.t, u) = c·u.t + R_spatial``
-    affine in the time derivative, the **spatial** residual ``R_spatial = F(u.t=0)`` and the **mass
-    coefficient** ``c = F(u.t=1) − F(u.t=0)`` — so a general ``c(x)·u.t`` term (variable material, e.g.
-    ``ρcₚ(x)·u.t``) is handled without parsing its structure, exactly as ``_set_normal`` handles a flux."""
+def _temporal_order(node):
+    """Highest order of time derivative in ``node``: ``u.t`` is 1, ``u.tt`` (a chained
+    :class:`TemporalDerivative`) is 2."""
+    from .trace import TemporalDerivative
+
+    n = _unwrap(node)
+    if isinstance(n, TemporalDerivative):
+        return 1 + _temporal_order(n.target)
+    return max((_temporal_order(c) for c in _iter(n)), default=0)
+
+
+def _set_temporal(node, val, val_tt=0.0):
+    """Replace every ``u.t`` (:class:`TemporalDerivative`) in ``node`` with the constant ``val`` and every
+    ``u.tt`` with ``val_tt``, leaving the rest of the expression intact. Probes recover, for a residual
+    ``F = m·u.tt + c·u.t + R_spatial`` affine in the time derivatives, the **spatial** residual
+    ``R_spatial = F(0, 0)`` and the coefficients ``c = F(u.t=1) − F(0, 0)`` and ``m = F(u.tt=1) − F(0, 0)``
+    — so a general ``c(x)·u.t`` term (variable material, e.g. ``ρcₚ(x)·u.t``) is handled without parsing
+    its structure, exactly as ``_set_normal`` handles a flux. (``u.tt`` used to be replaced by ``val`` as
+    if it were ``u.t``, which silently solved a wave equation as a heat equation.)"""
     from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, TemporalDerivative
 
     if isinstance(node, TemporalDerivative):
-        return Literal(float(val))
+        return Literal(float(val_tt if _temporal_order(node) >= 2 else val))
     if isinstance(node, BinaryOp):
-        return BinaryOp(node.op, _set_temporal(node.left, val), _set_temporal(node.right, val))
+        return BinaryOp(node.op, _set_temporal(node.left, val, val_tt), _set_temporal(node.right, val, val_tt))
     if isinstance(node, FunctionCall):
-        return node.copy_with_args([_set_temporal(a, val) if isinstance(a, Placeholder) else a for a in node.args])
+        return node.copy_with_args([_set_temporal(a, val, val_tt) if isinstance(a, Placeholder) else a for a in node.args])
     if isinstance(node, Jacobian):
-        return Jacobian(_set_temporal(node.target, val), node.variables, node.scheme)
+        return Jacobian(_set_temporal(node.target, val, val_tt), node.variables, node.scheme)
     if isinstance(node, Hessian):
-        return Hessian(_set_temporal(node.target, val), node.variables, node.scheme, node.trace)
+        return Hessian(_set_temporal(node.target, val, val_tt), node.variables, node.scheme, node.trace)
     return node
 
 
@@ -451,7 +466,7 @@ class _TraceFDM:
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])  # nodes per field
         self._Ntot = self._nf * self._N  # blocked DOF vector [field_0 (N), …, field_{nf-1} (N)]
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
-        self._pde, self._dirichlet, self._neumann, self._ic = [], [], [], []
+        self._pde, self._dirichlet, self._neumann, self._ic, self._vel_ic = [], [], [], [], []
         self._periodic_axes = []  # grid axes tied by a `u(A) - u(B)` periodic constraint (structured only)
         for c in constraints:
             # Classify by structure (not by which region tag), so a value-only pin works on ANY region —
@@ -459,6 +474,7 @@ class _TraceFDM:
             # domain-decomposition solves to pin a subdomain's complement to a neighbour's field):
             #   * a periodic tie `u(A) - u(B)` (opposite faces)  → wrap the grid axis (check first);
             #   * a normal derivative `ui.d(n, ...)`           → a Neumann/Robin flux row;
+            #   * `u.t` on the `initial` region                → the initial velocity (u_tt problems);
             #   * a derivative of the unknown (Laplacian, u.t) → the PDE residual;
             #   * the `initial` region, value-only            → the initial condition;
             #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
@@ -473,6 +489,8 @@ class _TraceFDM:
                 self._periodic_axes.append(ax)
             elif _normal_jacobian(c) is not None:
                 self._neumann.append(c)
+            elif _region_tag(c) == "initial" and _has_temporal(c):
+                self._vel_ic.append(c)
             elif any(_has_unknown_derivative(c, u) for u in self.unknowns):
                 self._pde.append(c)
             elif _region_tag(c) == "initial":
@@ -483,6 +501,22 @@ class _TraceFDM:
             raise ValueError("jno.fdm([...]): no PDE residual found (a term with a derivative of the unknown).")
         self._transient = bool(self._ic)
         pde_has_dt = any(_has_temporal(c) for c in self._pde)
+        self._time_order = max(_temporal_order(c) for c in self._pde)
+        if self._time_order > 2:
+            raise NotImplementedError(
+                f"jno.fdm([...]): a time derivative of order {self._time_order} was found; only `u.t` "
+                "(first order) and `u.tt` (second order) are supported."
+            )
+        if self._vel_ic and self._time_order != 2:
+            raise ValueError(
+                "jno.fdm([...]): an initial velocity `ui0.t - v0` was given, but the PDE has no `u.tt` "
+                "term. An initial velocity only belongs to a second-order-in-time problem."
+            )
+        if self._vel_ic and not self._ic:
+            raise ValueError(
+                "jno.fdm([...]): an initial velocity `ui0.t - v0` was given without an initial displacement "
+                "`u(xi, yi) - u0` — a second-order-in-time problem needs both (the velocity defaults to 0)."
+            )
         if self._transient:
             if not (getattr(self.domain, "_is_time_dependent", False) and self.domain.time is not None):
                 raise ValueError(
@@ -599,6 +633,12 @@ class _TraceFDM:
         probes, leaving ``c``. A plain ``ui.t - 𝒩(u)`` gives ``c = 1``; a ``ρcₚ(x)·ui.t`` term gives the
         node values of ``ρcₚ(x)``. ``c`` must be constant in ``u`` (a nonlinear mass ``c(u)·u.t`` raises).
         Single-field only (the transient march is)."""
+        return self._time_coefficient(1.0, 0.0, "`u.t` mass coefficient", "nonlinear mass `c(u)·u.t`")
+
+    def _time_coefficient(self, t_val, tt_val, what, example):
+        """Per-node coefficient of the time derivative selected by the probe ``(u.t, u.tt) = (t_val,
+        tt_val)``: ``F(t_val, tt_val) − F(0, 0)``. Raises if it depends on ``u`` (probed at two constant
+        states), because the diagonal-mass march cannot carry a state-dependent coefficient."""
         import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
@@ -617,18 +657,18 @@ class _TraceFDM:
         lid, base = self.unknown.layer_id, self.unknown.module
 
         def probe(u_val):
-            def at(temporal):
+            def at(tv, ttv):
                 mod = eqx.tree_at(lambda m: m.value, base, jnp.full(self._N, u_val, base.value.dtype))
                 ev = TraceEvaluator(params={lid: mod})
-                return jnp.asarray(ev.evaluate(_set_temporal(expr, temporal), context=context, var_bindings={})).reshape(-1)
+                return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=context, var_bindings={})).reshape(-1)
 
-            return at(1.0) - at(0.0)
+            return at(t_val, tt_val) - at(0.0, 0.0)
 
         c0 = probe(0.0)
         if not bool(jnp.allclose(c0, probe(1.0), atol=1e-6, rtol=1e-6)):  # u-dependence ⇒ nonlinear mass
             raise ValueError(
-                "jno.fdm([...]): the `u.t` mass coefficient depends on u (a nonlinear mass `c(u)·u.t`) — v1 "
-                "supports a constant or coordinate-dependent `c(x)·u.t` only."
+                f"jno.fdm([...]): the {what} depends on u (a {example}) — only a constant "
+                "or coordinate-dependent coefficient is supported."
             )
         return c0
 
@@ -848,6 +888,19 @@ class _TraceFDM:
             u0 = u0.at[jnp.asarray(idx if len(idx) else allnodes)].set(vals)
         return u0
 
+    def _initial_velocity(self):
+        """Initial velocity ``v0`` (shape ``(N,)``) from the ``ui0.t - v0`` condition(s) on the ``initial``
+        region, as :func:`jno.fem` reads it for ``u_tt``; zero when none is given."""
+        v0 = jnp.zeros(self._N)
+        for c in self._vel_ic:
+            idx = self._region_nodes(_region_tag(c))
+            inner = _unwrap(c)
+            if getattr(inner, "op", None) != "-":
+                raise ValueError(f"jno.fdm([...]): write an initial velocity as `ui0.t - v0`; got {c!r}.")
+            g_node = inner.right if _has_temporal(inner.left) else inner.left  # v0 is the side without u.t
+            v0 = v0.at[jnp.asarray(idx)].set(self._eval_g(g_node, idx))
+        return v0
+
     def solve(self, nonlinear=None, x0=None, profile=False, time=None):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
@@ -1010,12 +1063,8 @@ class _TraceFDM:
         bmask, bvals, algebraic = jnp.asarray(bmask), jnp.asarray(bvals), jnp.asarray(algebraic)
 
         spatial_res = self._pde_residual_fn(spatial=True)
-        c_nodes = self._mass_coefficient()  # u.t coefficient: 1 for a plain u.t, c(x) for ρcₚ(x)·u.t
-        diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
-        M = jsparse.BCOO((jnp.where(algebraic, 0.0, c_nodes), diag), shape=(self._N, self._N))  # 0: Dirichlet+flux
 
-        def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
-            r = spatial_res(wn)
+        def boundary_rows(wn, r):  # overwrite the flux and Dirichlet rows of r with their algebraic constraints
             for idx, nrm, method, v0, v1 in flux_rows:  # a·(∇u·n) + b — the same folding as _steady_solve
                 grad = gradient(wn, self.domain, method=method)
                 flux = jnp.sum(grad[idx] * nrm, axis=1)
@@ -1023,6 +1072,16 @@ class _TraceFDM:
                 a = v1(wn) - b
                 r = r.at[idx].set(a[idx] * flux + b[idx])
             return jnp.where(bmask, wn - bvals, r)  # Dirichlet wins over flux on an overlapping node
+
+        if self._time_order == 2:
+            return self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time)
+
+        c_nodes = self._mass_coefficient()  # u.t coefficient: 1 for a plain u.t, c(x) for ρcₚ(x)·u.t
+        diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
+        M = jsparse.BCOO((jnp.where(algebraic, 0.0, c_nodes), diag), shape=(self._N, self._N))  # 0: Dirichlet+flux
+
+        def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
+            return boundary_rows(wn, spatial_res(wn))
 
         block = SemidiscreteTimeBlock(
             mass=lambda t, args: M,
@@ -1034,6 +1093,48 @@ class _TraceFDM:
         )
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
         return _integrate_transient(block, ts, time)
+
+    def _march_second_order(self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time):
+        """March ``m·u_tt + c·u_t + R_spatial(u) = 0`` as the first-order augmented system in
+        ``y = [u; v]`` with ``v = u_t`` — the same reduction :func:`jno.fem` makes for ``u_tt``:
+
+            u̇ − v = 0,        m·v̇ + c·v + R_spatial(u) = 0.
+
+        ``m`` (inertia) and ``c`` (damping) are per-node coefficients found by probing (:func:`_set_temporal`).
+        Dirichlet and flux nodes stay algebraic: their ``u`` row is the boundary constraint and their ``v``
+        row pins ``v = 0`` (``v`` there feeds no other equation, and only ``u`` is returned). The default
+        scheme is θ = ½ (trapezoidal, Newmark average acceleration; Newmark 1959, J. Eng. Mech. Div. 85),
+        which conserves the energy of an undamped linear wave — backward Euler would damp it. Returns the
+        ``u`` trajectory ``(n_save, N)``."""
+        import jax.experimental.sparse as jsparse
+
+        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
+
+        N = self._N
+        m_nodes = self._time_coefficient(0.0, 1.0, "`u.tt` inertia coefficient", "nonlinear inertia `m(u)·u.tt`")
+        c_nodes = self._time_coefficient(1.0, 0.0, "`u.t` damping coefficient", "nonlinear damping `c(u)·u.t`")
+        mass = jnp.concatenate([jnp.where(algebraic, 0.0, 1.0), jnp.where(algebraic, 0.0, m_nodes)])
+        diag = jnp.stack([jnp.arange(2 * N), jnp.arange(2 * N)], axis=1)
+        M = jsparse.BCOO((mass, diag), shape=(2 * N, 2 * N))
+
+        def residual(y, t, args):
+            u, v = y[:N], y[N:]
+            ru = boundary_rows(u, -v)  # interior: u̇ = v; boundary: the algebraic constraint on u
+            rv = jnp.where(algebraic, v, c_nodes * v + spatial_res(u))
+            return jnp.concatenate([ru, rv])
+
+        v0 = jnp.where(algebraic, 0.0, self._initial_velocity())
+        block = SemidiscreteTimeBlock(
+            mass=lambda t, args: M,
+            residual=residual,
+            state0=jnp.concatenate([self._initial_state(), v0]),
+            t0=float(t0),
+            t1=float(t1),
+            dt=float(dt),
+            metadata={"theta": 0.5, "second_order": True},
+        )
+        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
+        return _integrate_transient(block, ts, time)[:, :N]
 
 
 def fdm(constraints):
