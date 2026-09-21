@@ -1420,7 +1420,7 @@ def _slot_problem(kind="unstructured", time=None, order=1, nonlinear=False):
 
 _SLOTS = {
     "lu": lambda: dict(linear=jno.solve.lu()),
-    "cg+jacobi": lambda: dict(linear=jno.solve.cg(), precond=jno.precond.jacobi()),
+    "bicgstab+jacobi": lambda: dict(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi()),
     "gmres+amg": lambda: dict(linear=jno.solve.gmres(), precond=jno.precond.amg()),
 }
 
@@ -1435,8 +1435,6 @@ def _max_rel(a, b):
 def test_solver_slots_reach_the_default_answer(slot, case):
     if slot == "gmres+amg":
         pytest.importorskip("pyamg")
-    if slot == "cg+jacobi" and case == "wave":
-        pytest.skip("the [u; v] system of a u.tt problem is not symmetric; CG does not apply (tested below)")
     time = None if case.startswith("steady") else (0.0, 0.1, 21)
     make = _slot_problem(time=time, order=2 if case == "wave" else 1, nonlinear=case == "steady-nonlinear")
     kw = _SLOTS[slot]()
@@ -1451,16 +1449,43 @@ def test_gmg_slot_on_a_structured_grid():
         assert _max_rel(got, make().solve()) < 1e-7, case
 
 
+def test_wave_slots_on_the_newmark_step():
+    """The default u.tt march solves for the new displacement alone (Newmark), a single scalar field. So
+    gmg now preconditions it, and cg applies: both used to be refused or fail on the non-symmetric,
+    twice-as-large [u; v] system."""
+    make = _slot_problem("structured", time=(0.0, 0.1, 21), order=2)
+    ref = make().solve()
+    for kw in (
+        dict(linear=jno.solve.gmres(), precond=jno.precond.gmg()),
+        dict(linear=jno.solve.cg(), precond=jno.precond.jacobi()),
+    ):
+        assert _max_rel(make().solve(**kw), ref) < 1e-7, kw
+
+
 def test_gmg_refuses_the_augmented_wave_state():
+    """An explicit time scheme keeps the augmented [u; v] march, which gmg cannot precondition."""
     make = _slot_problem("structured", time=(0.0, 0.1, 21), order=2)
     with pytest.raises(ValueError, match="single scalar field"):
-        make().solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())
+        make().solve(linear=jno.solve.gmres(), precond=jno.precond.gmg(), time=jno.solve.theta(0.5))
 
 
-def test_cg_on_the_nonsymmetric_wave_system_raises():
-    make = _slot_problem(time=(0.0, 0.1, 21), order=2)
-    with pytest.raises(Exception, match="did not solve"):
+@pytest.mark.parametrize("case", ["steady", "heat", "wave"])
+def test_cg_refuses_a_nonsymmetric_operator(case):
+    """Unstructured FDM operators are not symmetric (cotangent rows are divided by nodal areas), and CG on
+    them converged to an answer ~2e-6 off, inside the residual gate. It now refuses up front."""
+    time = None if case == "steady" else (0.0, 0.1, 21)
+    make = _slot_problem(time=time, order=2 if case == "wave" else 1)
+    with pytest.raises(ValueError, match="needs a symmetric operator"):
         make().solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
+
+
+def test_cg_on_a_structured_grid_after_the_dirichlet_lift():
+    """On a structured grid the operator is symmetric once the Dirichlet columns are lifted to the
+    right-hand side, so CG applies and reaches the default answer."""
+    for case, time in (("steady", None), ("heat", (0.0, 0.1, 21))):
+        make = _slot_problem("structured", time=time)
+        got = make().solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
+        assert _max_rel(got, make().solve()) < 1e-7, case
 
 
 def test_nonlinear_slot_on_a_linear_problem_raises():
@@ -1504,7 +1529,7 @@ def test_inverse_through_a_solver_slot():
     s.dtype(jnp.float64)
     s.initialize(jax.nn.initializers.constant(2.5))
     s.optimizer(optax.adam(1e-1))
-    node = jno.fdm([-Δu - s * f, u(xb, yb) - 0.0]).solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
+    node = jno.fdm([-Δu - s * f, u(xb, yb) - 0.0]).solve(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi())
     crux = jno.core([(node - observed).mse])
     crux.solve(120)
     assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - 1.0) < 2e-2

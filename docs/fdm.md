@@ -420,10 +420,23 @@ traj = jno.fdm([
 ]).solve()
 ```
 
-It marches the augmented state `[u; v]` with `v = u_t`: `u̇ = v`, `m·v̇ + c·v + R(u) = 0`. The inertia `m(x)`
-and damping `c(x)` may vary in space; if either depends on `u`, the solve raises. The default scheme is
-θ = ½ (trapezoidal, Newmark average acceleration), which does not damp an undamped wave. `time=` swaps in
-another θ; backward Euler visibly damps it, and BDF2 refuses. `.solve()` returns the `u` trajectory.
+By default it takes the trapezoidal step (Newmark average acceleration; Newmark 1959, *J. Eng. Mech.
+Div.* 85), which does not damp an undamped wave, and solves it for the new displacement alone:
+`(2m/Δt² + c/Δt)(u⁺ − u) − (2m/Δt)·v + ½(R(u⁺) + R(u)) = 0`, then `v⁺ = 2(u⁺ − u)/Δt − v`. The inertia
+`m(x)` and damping `c(x)` may vary in space; if either depends on `u`, the solve raises. For a linear
+problem the step matrix is assembled once. Each step then solves for the correction to the predictor
+`u + Δt·v`, with CG where the step matrix is verified symmetric (a structured grid, with the Dirichlet
+columns moved to the right-hand side) and GMRES otherwise. The Krylov iterations apply the stencil
+matrix-free. An explicit `time=` scheme marches the augmented `[u; v]` state instead: backward Euler
+visibly damps the wave, and BDF2 refuses. `.solve()` returns the `u` trajectory.
+
+!!! measured "Gaussian pulse in a closed box, 300 steps to t = 1.5, RTX 3070, float64"
+    | nodes | augmented `[u; v]`, `gmres` | Newmark default |
+    |---|---|---|
+    | 263k | 22 s first / 16 s repeat | 3.9 s / 1.7 s |
+    | 1M | out of memory | 12.5 s / 7.1 s |
+
+    The whole trajectory is kept (`(n_steps, N)`), which is what limits the grid on an 8 GB card.
 
 !!! measured "Standing wave on the structured grid, h = 0.1, T = 0.5"
     Against the exact semidiscrete mode `cos(ω_h t)·sin(πx)sin(πy)`, the error at T is 1.2e-3 → 2.9e-4 →

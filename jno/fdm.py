@@ -65,6 +65,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 
+from . import precond as jno_precond
 from . import solve as _solve
 from .differential_operators import DifferentialOperators as _D
 
@@ -804,6 +805,71 @@ class _TraceFDM:
         pattern, color, n_colors = self._sparsity(key, fun, u)
         return _assemble_sparse(fun, u, pattern, color, n_colors)
 
+    def _dirichlet_lift(self, key, K):
+        """Symmetric Dirichlet elimination on an assembled operator: ``(K_lifted, lift_rhs)``.
+
+        A Dirichlet row is a pure constraint ``s·(u_j − g_j)``, so ``u_j = rhs_j / K_jj`` is known, and its
+        column can move to the right-hand side: ``rhs_i −= K_ij·u_j`` and ``K_ij = 0`` for every other row.
+        The solution is unchanged, and the operator becomes symmetric wherever the stencil is (a structured
+        grid). Without it the interior rows referenced the boundary while the boundary rows did not
+        reference them back, and CG converged to an answer 2e-6 off, inside the residual gate. The pattern
+        is the host one cached by :meth:`_sparsity`, so this also works on a traced operator."""
+        import jax
+
+        pattern = self._sparsity_cache[key][0].tocoo()
+        rows, cols = pattern.row, pattern.col
+        n = K.shape[0]
+        is_d = self._dirichlet_mask() if n == self._Ntot else np.zeros(n, dtype=bool)
+        if not is_d.any():
+            return K, lambda rhs: rhs
+        moved = jnp.asarray(is_d[cols] & ~is_d[rows])
+        diag_pos = np.nonzero(is_d[rows] & (rows == cols))[0]
+        d_nodes = jnp.asarray(rows[diag_pos])
+        d_diag = K.data[jnp.asarray(diag_pos)]
+        jrows, jcols = jnp.asarray(rows), jnp.asarray(cols)
+        moved_data = jnp.where(moved, K.data, 0.0)
+        K_lifted = type(K)((jnp.where(moved, 0.0, K.data), K.indices), shape=K.shape)
+
+        def lift_rhs(rhs):
+            known = jnp.zeros(n, dtype=rhs.dtype).at[d_nodes].set(rhs[d_nodes] / d_diag)
+            return rhs - jax.ops.segment_sum(moved_data * known[jcols], jrows, num_segments=n)
+
+        return K_lifted, lift_rhs
+
+    def _dirichlet_mask(self):
+        """Boolean mask of the Dirichlet DOFs (host-side indices, so it also works inside a trace)."""
+        is_d = np.zeros(self._Ntot, dtype=bool)
+        for c in self._dirichlet:
+            is_d[self._field_index(c) * self._N + np.asarray(self._region_nodes(_region_tag(c)))] = True
+        return is_d
+
+    @staticmethod
+    def _symmetry_probe(K):
+        """``(wᵀKv, vᵀKw)`` for random ``v, w``: equal (to rounding) iff ``K`` is symmetric, almost surely."""
+        rng = np.random.default_rng(2)
+        v = jnp.asarray(rng.standard_normal(K.shape[0]))
+        w = jnp.asarray(rng.standard_normal(K.shape[0]))
+        return float(w @ (K @ v)), float(v @ (K @ w))
+
+    def _is_symmetric(self, K):
+        a, b = self._symmetry_probe(K)
+        return abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1e-300)
+
+    def _require_symmetric(self, linear, K):
+        """``cg`` and ``minres`` assume a symmetric operator; on a non-symmetric one they return a wrong answer
+        that can still pass the residual gate. FDM operators are symmetric on a structured grid (after the
+        Dirichlet lift) but not on an unstructured mesh, whose cotangent rows are divided by nodal areas."""
+        name = getattr(linear, "name", "")
+        if name not in ("cg", "minres"):
+            return
+        a, b = self._symmetry_probe(K)
+        if abs(a - b) > 1e-9 * max(abs(a), abs(b), 1e-300):
+            raise ValueError(
+                f"jno.solve.{name} needs a symmetric operator, and this strong-form operator is not "
+                f"(wᵀKv = {a:.6e} vs vᵀKw = {b:.6e}). Unstructured FDM stencils are divided by nodal areas, "
+                "and flux rows are one-sided. Use jno.solve.gmres() or jno.solve.bicgstab()."
+            )
+
     def _is_affine(self, key, fun, n):
         """Is ``fun`` affine in the DOF vector? Its JVP must be the same at two different states.
         Decided once per problem, eagerly, with the parameters at their current values."""
@@ -1249,8 +1315,12 @@ class _TraceFDM:
                     "jno.fdm: nonlinear= given, but this problem is linear — there is no Newton loop to "
                     "configure. Drop nonlinear=, or pick the linear solver with linear=."
                 )
-            A = self._sparse_operator("steady", residual, zeros)
-            return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, -residual(zeros))
+            with jax.ensure_compile_time_eval():
+                self._require_symmetric(
+                    linear, self._dirichlet_lift("steady", self._sparse_operator("steady", probe, jnp.zeros(self._Ntot)))[0]
+                )
+            A, lift_rhs = self._dirichlet_lift("steady", self._sparse_operator("steady", residual, zeros))
+            return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, lift_rhs(-residual(zeros)))
         tangent = lambda w: self._sparse_operator("steady", residual, w)  # noqa: E731
         if nonlinear is None:
             # FDM can always assemble its tangent, so the Newton that uses it is the default here: it is
@@ -1537,8 +1607,13 @@ class _TraceFDM:
                 self._sparsity("march", frozen, jnp.zeros(n))
                 linear_problem = self._is_affine("march", frozen, n)
             if linear_problem:
-                A = self._sparse_operator("march", frozen, zeros)
-                block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=-frozen(zeros), **common)
+                A, lift_rhs = self._dirichlet_lift("march", self._sparse_operator("march", frozen, zeros))
+                if n == self._N:  # the lift knows the scalar field's Dirichlet rows, not the [u; v] layout
+                    self._require_symmetric(linear, A)
+                    block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=lift_rhs(-frozen(zeros)), **common)
+                else:
+                    A = self._sparse_operator("march", frozen, zeros)
+                    block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=-frozen(zeros), **common)
             else:
                 block = SemidiscreteTimeBlock(
                     mass=lambda t, args: M,
@@ -1595,9 +1670,150 @@ class _TraceFDM:
             return jnp.concatenate([ru, rv])
 
         v0 = jnp.where(algebraic, 0.0, self._initial_velocity())
+        if time is None and save_ts is None:
+            return self._newmark(spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, (t0, t1, dt), slots)
         state0 = jnp.concatenate([self._initial_state(), v0])
         metadata = {"theta": 0.5, "second_order": True}
         return self._run_block(M, residual, state0, (t0, t1, dt), metadata, save_ts, time, slots)[:, :N]
+
+    def _newmark(self, spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, window, slots):
+        """The default ``u.tt`` march: Newmark average acceleration (Newmark 1959, J. Eng. Mech. Div. 85),
+        solved for the new displacement ALONE.
+
+        It is the same trapezoidal step as the augmented ``[u; v]`` march — ``u⁺ = u + Δt(v + v⁺)/2`` and
+        ``m(v⁺ − v)/Δt + c(v + v⁺)/2 + (R(u⁺) + R(u))/2 = 0`` — with ``v⁺`` eliminated, which leaves one
+        equation of the original size per step:
+
+            (2m/Δt² + c/Δt)(u⁺ − u) − (2m/Δt)·v + ½(R(u⁺) + R(u)) = 0,      v⁺ = 2(u⁺ − u)/Δt − v.
+
+        Half the unknowns, and with Δt ≈ h the step operator ``2m/Δt² + ½∂R`` is well conditioned (its
+        spectrum spans a small factor), so a Krylov solve converges in a few iterations. The augmented
+        system was twice the size and non-symmetric: BiCGStab broke down on it (NaN at step 0, 263k nodes)
+        and GMRES took 53 ms/step. Boundary rows stay algebraic constraints on ``u⁺``. The per-step Newton
+        runs inside one ``lax.scan``; its convergence is judged after the scan, where it is concrete."""
+        import jax
+
+        from .utils.solver.history_march import _check_march_converged
+        from .utils.solver.solver_api import LinearOperator, compose_nonlinear_solve_fn
+
+        t0, t1, dt = (float(w) for w in window)
+        n_steps = int(round((t1 - t0) / dt))
+        alpha = jnp.where(algebraic, 0.0, 2.0 * m_nodes / dt**2 + c_nodes / dt)
+        beta = jnp.where(algebraic, 0.0, 2.0 * m_nodes / dt)
+        u0 = self._initial_state()
+        r0 = spatial_res(u0)
+
+        # The interior rows carry 2m/Δt² (~1e4–1e5); the boundary constraint rows are O(1). Left as is, a
+        # Jacobi-preconditioned GMRES stops on the preconditioned residual while the true one sits at 1e-4
+        # (measured: every damped / flux wave test tripped the solver's residual gate). Scaling a
+        # constraint row does not move its solution, so the rows are brought to the interior's scale.
+        row_scale = jnp.where(algebraic, jnp.max(alpha), 1.0)
+
+        def step_residual(w, u, v, r_now):
+            return row_scale * boundary_rows(w, alpha * (w - u) - beta * v + 0.5 * (spatial_res(w) + r_now))
+
+        nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
+        self._check_precond_shape(precond, self._N)
+        probe = lambda w: step_residual(w, u0, v0, r0)  # noqa: E731
+        with jax.ensure_compile_time_eval():
+            linear_problem = nonlinear is None and self._is_affine("newmark", probe, self._N)
+        if linear_problem:
+            return self._newmark_linear(
+                step_residual, probe, algebraic, u0, v0, r0, spatial_res, dt, n_steps, linear, precond
+            )
+        if linear is not None or precond is not None:
+            with jax.ensure_compile_time_eval():
+                self._sparsity("newmark", probe, u0)
+            spec = nonlinear or _solve.newton(direct=True)
+            precond = self._frozen_precond(precond, lambda: self._sparse_operator("newmark", probe, u0))
+            composed = compose_nonlinear_solve_fn(spec, linear, precond, fem=self)
+
+            def solve_step(G, guess):
+                return composed(G, guess, jacobian=lambda w: self._sparse_operator("newmark", G, w))
+
+        else:
+            spec = nonlinear or _solve.newton()
+            gmres = _solve.gmres()
+            inner = lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)  # noqa: E731
+
+            def solve_step(G, guess):
+                return spec(G, guess, linear_solve=inner)
+
+        def body(carry, _):
+            u, v, r_now = carry
+            G = lambda w: step_residual(w, u, v, r_now)  # noqa: E731
+            guess = u + dt * v
+            u_next = solve_step(G, guess)
+            v_next = jnp.where(algebraic, 0.0, 2.0 * (u_next - u) / dt - v)
+            norms = (jnp.linalg.norm(G(u_next)), jnp.linalg.norm(G(guess)))
+            return (u_next, v_next, spatial_res(u_next)), (u_next, *norms)
+
+        _, (traj, r_end, r_start) = jax.lax.scan(body, (u0, v0, r0), None, length=n_steps)
+
+        class _Tolerances:  # what the march check judges against: the tolerances the Newton spec carries
+            tolerances = (float(spec.traits.get("rtol", 1e-8)), float(spec.traits.get("atol", 1e-8)))
+
+        grid = t0 + dt * np.arange(1, n_steps + 1)
+        _check_march_converged(r_end, r_start, grid, _Tolerances, what="u_tt march", coord="t")
+        return jnp.concatenate([u0[None], traj])
+
+    def _newmark_linear(self, step_residual, probe, algebraic, u0, v0, r0, spatial_res, dt, n_steps, linear, precond):
+        """The Newmark march for a LINEAR problem: the step operator ``K = diag(2m/Δt² + c/Δt) + ½A`` does
+        not change, so it is assembled once and its preconditioner set up once, and every step is one
+        linear solve for the correction to the predictor ``u + Δt·v``. The nonlinear route re-linearised
+        the same matrix inside a Newton loop at every step (measured, 1M nodes: 43 ms/step before).
+        Default solver: CG with Jacobi when ``K`` is verified symmetric (a structured grid, after the
+        Dirichlet lift), else GMRES with Jacobi; a ``linear=`` / ``precond=`` slot replaces either. A failed step is caught by the solver's residual
+        gate, drained in :meth:`solve`."""
+        import jax
+
+        from .utils.solver.solver_api import LinearOperator, PrecondContext, materialize_precond, prepare_precond
+
+        with jax.ensure_compile_time_eval():
+            self._sparsity("newmark", probe, u0)
+            K, lift_rhs = self._dirichlet_lift("newmark", self._sparse_operator("newmark", probe, u0))
+            self._require_symmetric(linear, K)
+            symmetric = self._is_symmetric(K)
+            coo = self._sparsity_cache["newmark"][0].tocoo()
+            on_diag = np.nonzero(coo.row == coo.col)[0]
+            diag = jnp.zeros(K.shape[0]).at[jnp.asarray(coo.row[on_diag])].add(K.data[jnp.asarray(on_diag)])
+        is_d = jnp.asarray(self._dirichlet_mask())
+        # The Krylov iterations use the STENCIL, not the assembled matrix: on a 1M-node structured grid a
+        # BCOO matvec cost 1.12 ms on GPU against 0.12 ms for the stencil's JVP (the assembled pattern also
+        # carries structural zeros). The lifted operator acts as K on v with its Dirichlet entries zeroed,
+        # plus K's diagonal on the Dirichlet rows. The assembled K stays for what needs a matrix: the
+        # preconditioner setup and a direct solver.
+        _, jvp = jax.linearize(probe, u0)
+        fast = LinearOperator.from_matvec(
+            jax.jit(lambda w: jvp(jnp.where(is_d, 0.0, w)) + jnp.where(is_d, diag * w, 0.0)),
+            diag_fn=lambda: diag,
+            shape=K.shape,
+        )
+        # Default: CG where the step operator is verified symmetric (a structured grid, after the lift) —
+        # measured 7.1 s against 27 s for GMRES on 1M nodes x 300 steps, same answer — else GMRES.
+        solver = linear or (_solve.cg() if symmetric else _solve.gmres())
+        direct = bool(getattr(solver, "direct", False))
+        op = LinearOperator(K) if direct else fast
+        spec = precond if precond is not None else (None if direct else jno_precond.jacobi())
+        M = None
+        if spec is not None:
+            prepare_precond(spec, self)
+            M = materialize_precond(spec, PrecondContext(LinearOperator(K), self))
+
+        def body(carry, _):
+            u, v, r_now = carry
+            guess = u + dt * v
+            # Solve for the CORRECTION to the predictor, K·Δ = −G(guess): the solver's relative tolerance
+            # then applies to the step residual itself, not to a right-hand side dominated by (2m/Δt²)·u,
+            # where 1e-8 of it let different solvers drift apart by ~3e-6 over 20 steps.
+            rhs = lift_rhs(-step_residual(guess, u, v, r_now))
+            delta = solver(op, rhs) if direct else solver(op, rhs, M=M)
+            u_next = guess + delta
+            v_next = jnp.where(algebraic, 0.0, 2.0 * (u_next - u) / dt - v)
+            return (u_next, v_next, spatial_res(u_next)), u_next
+
+        _, traj = jax.lax.scan(body, (u0, v0, r0), None, length=n_steps)
+        return jnp.concatenate([u0[None], traj])
 
 
 def fdm(constraints):
