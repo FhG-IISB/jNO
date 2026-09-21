@@ -685,14 +685,23 @@ class _TraceFDM:
         ``jno.fem``**, where ``cell_size`` is ``|K|^(1/d)`` at each quadrature point (``h/√2`` on the same
         right triangles). Differentiable in the mesh coordinates."""
         if getattr(self, "_h_nodes", None) is None:
-            pts, cells = _mesh(self.domain)
-            dim = pts.shape[1]
-            e = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim) edge vectors from vertex 0
-            size = (jnp.abs(jnp.linalg.det(e))) ** (1.0 / dim)  # (d!·|K|)^(1/d), since |det| = d!·|K|
-            total = jnp.zeros(self._N).at[cells.reshape(-1)].add(jnp.repeat(size, cells.shape[1]))
-            count = jnp.zeros(self._N).at[cells.reshape(-1)].add(1.0)
-            self._h_nodes = total / jnp.maximum(count, 1.0)
+            import jax
+
+            # A constant of the mesh: computed concretely even when first asked for inside a trace (the
+            # parametric solve), or the cached value would be a leaked tracer.
+            with jax.ensure_compile_time_eval():
+                self._h_nodes = self._node_spacing_now()
         return self._h_nodes
+
+    def _node_spacing_now(self):
+        """Per-node mean of ``(d!·|K|)^(1/d)`` over incident cells (see :meth:`_node_spacing`)."""
+        pts, cells = _mesh(self.domain)
+        dim = pts.shape[1]
+        e = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim) edge vectors from vertex 0
+        size = (jnp.abs(jnp.linalg.det(e))) ** (1.0 / dim)  # (d!·|K|)^(1/d), since |det| = d!·|K|
+        total = jnp.zeros(self._N).at[cells.reshape(-1)].add(jnp.repeat(size, cells.shape[1]))
+        count = jnp.zeros(self._N).at[cells.reshape(-1)].add(1.0)
+        return total / jnp.maximum(count, 1.0)
 
     def _mass_coefficient(self):
         """Per-node coefficient ``c`` on ``u.t`` (the diagonal mass ``M = diag(c)``), via the two-probe
