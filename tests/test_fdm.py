@@ -523,7 +523,7 @@ def test_general_mass_coefficient():
     ui = u.bind(x=x, y=y, t=t)
     u0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
     s = jno.fdm([(1.0 + 0.5 * jnn.sin(np.pi * x)) * ui.t - nu * (ui.d2(x) + ui.d2(y)), u(xb, yb) - 0.0, u(xi, yi) - u0])
-    assert np.max(np.abs(np.asarray(s._mass_coefficient()) - (1.0 + 0.5 * np.sin(np.pi * p[:, 0])))) < 1e-9
+    assert np.max(np.abs(np.asarray(s._mass_coefficient()()) - (1.0 + 0.5 * np.sin(np.pi * p[:, 0])))) < 1e-9
 
     # constant a=2, ν=0.1 ⇒ effective diffusivity ν/a = 0.05
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, T, 60))
@@ -1709,3 +1709,52 @@ def test_forced_wave_with_time_dependent_source():
         ref = np.sin(1.0) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
         errs.append(float(np.linalg.norm(traj[-1] - ref) / np.linalg.norm(ref)))
     assert errs[1] < errs[0] and errs[1] < 1e-2, errs
+
+
+def _time_everywhere(kind, h):
+    """u_t − Δu = f with a datum written with t in a flux condition or on the mass; exact solutions:
+    u = e^{-t} x² sin πy (flux on the right edge), u = e^{-t} sin πx sin πy (mass (1 + t)·u_t)."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured(), time=(0.0, 0.2, 41))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    p = _nodes(d)
+    if kind == "mass":
+        xb, yb, _ = d.variable("boundary", split=True)
+        f = (2 * π**2 - (1 + t)) * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y)
+        terms = [(1 + t) * ui.t - ui.xx - ui.yy - f, u(xb, yb) - 0.0, u(xi, yi) - jnn.sin(π * xi) * jnn.sin(π * yi)]
+        exact = np.exp(-0.2) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+    else:
+        (xl, yl, _), (xo, yo, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("left", "bottom", "top"))
+        xr, yr, tr = d.variable("right", split=True)
+        nr = d.variable("right", normals=True)
+        ur = u.bind(x=xr, y=yr)
+        f = jnn.exp(-t) * ((π**2 - 1) * x**2 - 2) * jnn.sin(π * y)
+        flux = {  # ∂u/∂n = u_x = 2 e^{-t} sin πy at x = 1
+            "neumann": ur.d(nr) - 2 * jnn.exp(-tr) * jnn.sin(π * yr),
+            "robin": ur.d(nr) + (1 + tr) * ur - (3 + tr) * jnn.exp(-tr) * jnn.sin(π * yr),
+        }[kind]
+        terms = [
+            ui.t - ui.xx - ui.yy - f,
+            u(xl, yl) - 0.0,
+            u(xo, yo) - 0.0,
+            u(xt, yt) - 0.0,
+            flux,
+            u(xi, yi) - xi**2 * jnn.sin(π * yi),
+        ]
+        exact = np.exp(-0.2) * p[:, 0] ** 2 * np.sin(π * p[:, 1])
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5)))
+    return float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact))
+
+
+@pytest.mark.parametrize("kind", ["neumann", "robin", "mass"])
+def test_time_dependent_flux_data_and_mass_coefficient(kind):
+    """A datum written with t works wherever it appears: a Neumann value h(t), a Robin α(t), a mass
+    (1 + t)·u_t. They were evaluated once at the start and held: 0.10, 0.12 and 5.8e-3 at T, against
+    8.8e-3, 6.6e-3 and 2.2e-3 now at h = 0.05 — and second order under refinement."""
+    e = [_time_everywhere(kind, h) for h in (0.1, 0.05)]
+    assert e[1] < 1e-2 and e[0] / e[1] > 3.0, e

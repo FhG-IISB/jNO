@@ -1064,8 +1064,9 @@ class _TraceFDM:
 
     def _time_coefficient(self, t_val, tt_val, what, example):
         """Per-node coefficient of the time derivative selected by the probe ``(u.t, u.tt) = (t_val,
-        tt_val)``: ``F(t_val, tt_val) − F(0, 0)``. Raises if it depends on ``u`` (probed at two constant
-        states), because the diagonal-mass march cannot carry a state-dependent coefficient."""
+        tt_val)``: ``F(t_val, tt_val) − F(0, 0)``, returned as a function of time ``c(t)``. Raises if it
+        depends on ``u`` (probed at two constant states), because the diagonal-mass march cannot carry a
+        state-dependent coefficient."""
         import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
@@ -1080,21 +1081,24 @@ class _TraceFDM:
         context = self._eval_context(spatial_tags)
         lid, base = self.unknown.layer_id, self.unknown.module
 
-        def probe(u_val):
+        def probe(u_val, t=None):
+            ctx = context if t is None else {**context, "__time__": jnp.full((self._N, 1), t)}
+
             def at(tv, ttv):
                 mod = eqx.tree_at(lambda m: m.value, base, jnp.full(self._N, u_val, base.value.dtype))
                 ev = TraceEvaluator(params={lid: mod})
-                return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=context, var_bindings={})).reshape(-1)
+                return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={})).reshape(-1)
 
-            return at(t_val, tt_val) - at(0.0, 0.0)
+            return jnp.broadcast_to(at(t_val, tt_val) - at(0.0, 0.0), (self._N,))
 
-        c0 = probe(0.0)
-        if not bool(jnp.allclose(c0, probe(1.0), atol=1e-6, rtol=1e-6)):  # u-dependence ⇒ nonlinear mass
+        if not bool(jnp.allclose(probe(0.0), probe(1.0), atol=1e-6, rtol=1e-6)):  # u-dependence ⇒ nonlinear mass
             raise ValueError(
-                f"jno.fdm([...]): the {what} depends on u (a {example}) — only a constant "
-                "or coordinate-dependent coefficient is supported."
+                f"jno.fdm([...]): the {what} depends on u (a {example}) — only a coefficient of the "
+                "coordinates and time is supported."
             )
-        return c0
+        # A function of TIME: `c(x, t)·u.t` and `m(t)·u.tt` are evaluated at each step's own time. They used
+        # to be probed once at the start and then held (measured: (1 + t)·u.t stayed at 1·u.t).
+        return lambda t=None: probe(0.0, t)
 
     def _trainable_params(self):
         """**Trainable** ``jno.np.parameter`` fields in the constraints — a parameter with an attached
@@ -1282,10 +1286,12 @@ class _TraceFDM:
         context = self._eval_context(spatial_tags)
         lid, base = self.unknown.layer_id, self.unknown.module
 
-        def value_fn(dofs):
+        def value_fn(dofs, t=None):
+            """``t``: the time a flux value ``h(x, t)`` or ``α(t)`` is evaluated at (``None``: the start)."""
             mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
             ev = TraceEvaluator(params={lid: mod, **(extra_params or {})})
-            out = jnp.asarray(ev.evaluate(expr, context=context, var_bindings={})).reshape(-1)
+            ctx = context if t is None else {**context, "__time__": jnp.full((self._N, 1), t)}
+            out = jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1)
             return jnp.broadcast_to(out, (self._N,)) if out.shape[0] == 1 else out  # a constant `-h` → per-node
 
         return value_fn
@@ -1362,15 +1368,15 @@ class _TraceFDM:
         return not other and (five_point or structured)
 
     @staticmethod
-    def _apply_flux_rows(u, r, flux_rows):
+    def _apply_flux_rows(u, r, flux_rows, t=None):
         """Replace the flux nodes' rows of ``r`` by their conditions ``a·(∇u·n) + b``, SUMMING where several
         flux regions share a node (a corner), so every condition is imposed there rather than the last one."""
         acc = jnp.zeros_like(r)
         hit = jnp.zeros(r.shape[0], dtype=bool)
         for idx, nrm, grad_fn, v0, v1 in flux_rows:
             flux = jnp.sum(grad_fn(u) * nrm, axis=1)  # ∇u·n at the region's nodes, differentiable
-            b = v0(u)
-            a = v1(u) - b
+            b = v0(u, t)
+            a = v1(u, t) - b
             acc = acc.at[idx].add(a[idx] * flux + b[idx])
             hit = hit.at[idx].set(True)
         return jnp.where(hit, acc, r)
@@ -1766,16 +1772,18 @@ class _TraceFDM:
         spatial_res = self._pde_residual_fn(spatial=True)
 
         def boundary_rows(wn, r, t):  # overwrite the flux and Dirichlet rows of r with their algebraic constraints
-            r = self._apply_flux_rows(wn, r, flux_rows) if flux_rows else r  # the same folding as the steady solve
+            r = self._apply_flux_rows(wn, r, flux_rows, t) if flux_rows else r  # the same folding as the steady solve
             return jnp.where(bmask, wn - self._dirichlet_values_at(t)[1], r)  # Dirichlet wins over flux
 
         slots = dict(nonlinear=nonlinear, linear=linear, precond=precond)
         if self._time_order == 2:
             return self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots)
 
-        c_nodes = self._mass_coefficient()  # u.t coefficient: 1 for a plain u.t, c(x) for ρcₚ(x)·u.t
+        c_of = self._mass_coefficient()  # u.t coefficient c(x, t): 1 for a plain u.t, ρcₚ(x) for ρcₚ(x)·u.t
         diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
-        M = jsparse.BCOO((jnp.where(algebraic, 0.0, c_nodes), diag), shape=(self._N, self._N))  # 0: Dirichlet+flux
+
+        def M(t=None):  # 0 on Dirichlet + flux rows
+            return jsparse.BCOO((jnp.where(algebraic, 0.0, c_of(t)), diag), shape=(self._N, self._N))
 
         def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
             return boundary_rows(wn, spatial_res(wn, t), t)
@@ -1797,6 +1805,8 @@ class _TraceFDM:
         t0, t1, dt = window
         nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
         common = dict(state0=state0, t0=float(t0), t1=float(t1), dt=float(dt), metadata=dict(metadata))
+        mass_of = M if callable(M) else (lambda t=None: M)  # the mass may carry a time-dependent coefficient
+        M = mass_of(float(t0))
         frozen = lambda y: residual(y, float(t0), {})  # noqa: E731  (the operator at the start time)
         n = int(state0.size)
         self._check_precond_shape(precond, n)
@@ -1806,8 +1816,10 @@ class _TraceFDM:
             zeros = jnp.zeros(n)
             with jax.ensure_compile_time_eval():  # structure is decided on concrete values
                 self._sparsity("march", frozen, jnp.zeros(n))
-                linear_problem = self._is_affine("march", frozen, n) and not self._operator_varies_in_time(
-                    residual, n, float(t0), float(t1)
+                linear_problem = (
+                    self._is_affine("march", frozen, n)
+                    and not self._operator_varies_in_time(residual, n, float(t0), float(t1))
+                    and bool(jnp.allclose(mass_of(float(t0)).data, mass_of(float(t1)).data))
                 )
             if linear_problem:
                 # Time-dependent DATA (a source f(x, t), a boundary value g(x, t)) rides the block's forcing
@@ -1825,7 +1837,7 @@ class _TraceFDM:
                 )
             else:
                 block = SemidiscreteTimeBlock(
-                    mass=lambda t, args: M,
+                    mass=lambda t, args: mass_of(t),
                     residual=residual,
                     jacobian=lambda w, t, args: self._sparse_operator("march", lambda y: residual(y, t, args), w),
                     **common,
@@ -1834,7 +1846,7 @@ class _TraceFDM:
                 # solve does): a matrix-free JVP has no diagonal for jacobi, nor a matrix for amg or lu.
                 nonlinear = nonlinear or _solve.newton(direct=True)
         else:
-            block = SemidiscreteTimeBlock(mass=lambda t, args: M, residual=residual, **common)
+            block = SemidiscreteTimeBlock(mass=lambda t, args: mass_of(t), residual=residual, **common)
         from .utils.solver.timeschemes import _ExponentialScheme
 
         if isinstance(time, _ExponentialScheme):
@@ -1871,14 +1883,16 @@ class _TraceFDM:
         N = self._N
         m_nodes = self._time_coefficient(0.0, 1.0, "`u.tt` inertia coefficient", "nonlinear inertia `m(u)·u.tt`")
         c_nodes = self._time_coefficient(1.0, 0.0, "`u.t` damping coefficient", "nonlinear damping `c(u)·u.t`")
-        mass = jnp.concatenate([jnp.where(algebraic, 0.0, 1.0), jnp.where(algebraic, 0.0, m_nodes)])
         diag = jnp.stack([jnp.arange(2 * N), jnp.arange(2 * N)], axis=1)
-        M = jsparse.BCOO((mass, diag), shape=(2 * N, 2 * N))
+
+        def M(t=None):
+            mass = jnp.concatenate([jnp.where(algebraic, 0.0, 1.0), jnp.where(algebraic, 0.0, m_nodes(t))])
+            return jsparse.BCOO((mass, diag), shape=(2 * N, 2 * N))
 
         def residual(y, t, args):
             u, v = y[:N], y[N:]
             ru = boundary_rows(u, -v, t)  # interior: u̇ = v; boundary: the algebraic constraint on u
-            rv = jnp.where(algebraic, v, c_nodes * v + spatial_res(u, t))
+            rv = jnp.where(algebraic, v, c_nodes(t) * v + spatial_res(u, t))
             return jnp.concatenate([ru, rv])
 
         v0 = jnp.where(algebraic, 0.0, self._initial_velocity())
@@ -1910,8 +1924,13 @@ class _TraceFDM:
 
         t0, t1, dt = (float(w) for w in window)
         n_steps = int(round((t1 - t0) / dt))
-        alpha = jnp.where(algebraic, 0.0, 2.0 * m_nodes / dt**2 + c_nodes / dt)
-        beta = jnp.where(algebraic, 0.0, 2.0 * m_nodes / dt)
+
+        def alpha(t):  # inertia m(x, t) and damping c(x, t) at the step time
+            return jnp.where(algebraic, 0.0, 2.0 * m_nodes(t) / dt**2 + c_nodes(t) / dt)
+
+        def beta(t):
+            return jnp.where(algebraic, 0.0, 2.0 * m_nodes(t) / dt)
+
         u0 = self._initial_state()
         r0 = spatial_res(u0, t0)
 
@@ -1919,10 +1938,10 @@ class _TraceFDM:
         # Jacobi-preconditioned GMRES stops on the preconditioned residual while the true one sits at 1e-4
         # (measured: every damped / flux wave test tripped the solver's residual gate). Scaling a
         # constraint row does not move its solution, so the rows are brought to the interior's scale.
-        row_scale = jnp.where(algebraic, jnp.max(alpha), 1.0)
+        row_scale = jnp.where(algebraic, jnp.max(alpha(t0)), 1.0)
 
         def step_residual(w, u, v, r_now, t_next):
-            g = alpha * (w - u) - beta * v + 0.5 * (spatial_res(w, t_next) + r_now)
+            g = alpha(t_next) * (w - u) - beta(t_next) * v + 0.5 * (spatial_res(w, t_next) + r_now)
             return row_scale * boundary_rows(w, g, t_next)
 
         nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
