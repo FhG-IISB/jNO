@@ -29,8 +29,11 @@ assert on structure rather than on formatted text.
 
 Two rules it keeps:
 
-* **Cheap by default.** Anything costing an assembly or a dense factorisation sits behind
-  `deep=True`. A default `info` is reads and arithmetic on what is already built.
+* **Cheap by default.** Anything costing an assembly sits behind `deep=True` — and `deep` itself
+  stays **sparse**: symmetry and the empty-row count are computed from the operator's indices, not
+  from `A.todense()`, which at the 90,814 dofs of an ordinary 3-D solve would be 66 GB.
+* **Bounded output.** Every section caps at `jno.info.MAX_ROWS` (24) and says how many rows it
+  dropped. A device mesh can carry hundreds of tags; silent truncation would be worse than either.
 * **Never force a lazy result.** A transient `solve()` returns a trace node on purpose; `info`
   reports that it is one rather than evaluating it.
 

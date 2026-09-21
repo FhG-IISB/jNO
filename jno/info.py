@@ -34,12 +34,25 @@ __all__ = ["Info", "info"]
 _RULE = "─"
 
 
+#: Rows shown per section before the rest are summarised. A device mesh can carry hundreds of tags
+#: and a Shape hundreds of primitives; an unbounded report is one nobody reads. Truncating SILENTLY
+#: would be worse than either, so the cap always announces itself.
+MAX_ROWS = 24
+
+
 class Info:
     """A printable report. ``str(...)`` renders it; :meth:`as_dict` returns the same content."""
 
-    def __init__(self, title: str, sections: list[tuple[str, list[tuple[str, Any]]]]):
+    def __init__(self, title: str, sections: list[tuple[str, list[tuple[str, Any]]]], *, cap: int | None = None):
         self.title = title
-        self.sections = sections
+        cap = MAX_ROWS if cap is None else cap
+        self.sections = [(name, self._cap(rows, cap)) for name, rows in sections]
+
+    @staticmethod
+    def _cap(rows, cap: int):
+        if cap <= 0 or len(rows) <= cap:
+            return rows
+        return list(rows[:cap]) + [("", f"… and {len(rows) - cap} more (jno.info.MAX_ROWS = {cap})")]
 
     def as_dict(self) -> dict:
         """Sections with unique keys become a dict; sections whose rows share a key (a rendered
@@ -199,15 +212,28 @@ def _info_fem(f, deep: bool) -> Info:
         except Exception:  # noqa: BLE001
             pass
     if deep and A is not None:
+        # SPARSE. The first version called `A.todense()`, which is O(n^2) memory: at the 90,814 dofs
+        # of an ordinary 3-D solve that is 66 GB, i.e. `deep=True` would take the machine down on
+        # exactly the problems big enough to want it. Neither quantity needs a dense matrix.
         try:
-            import jax.numpy as jnp
-
-            dense = np.asarray(jnp.asarray(A.todense()))
-            asym = float(np.abs(dense - dense.T).max())
-            scale = float(np.abs(dense).max()) or 1.0
-            op.append(("symmetry", f"max|A - Aᵀ| = {asym:.2e}  ({'symmetric' if asym / scale < 1e-12 else 'NON-symmetric'})"))
-            empty = int((np.abs(dense).max(axis=1) == 0).sum())
-            op.append(("empty rows", f"{empty}" + ("  ← singular" if empty else "")))
+            idx = np.asarray(A.indices)
+            dat = np.asarray(A.data)
+            n = int(f.dofs)
+            nz = np.abs(dat) > 0
+            rows_i, cols_i, vals = idx[nz, 0], idx[nz, 1], dat[nz]
+            empty = n - len(np.unique(rows_i))
+            op.append(("empty rows", f"{_fmt_n(empty)}" + ("  ← SINGULAR: those dofs sit in no equation" if empty else "")))
+            # A vs A^T by matching (i,j) against (j,i) on a sorted key -- O(nnz log nnz), no fill.
+            k1 = rows_i.astype(np.int64) * n + cols_i
+            k2 = cols_i.astype(np.int64) * n + rows_i
+            o1, o2 = np.argsort(k1), np.argsort(k2)
+            if np.array_equal(k1[o1], k2[o2]):
+                asym = float(np.abs(vals[o1] - vals[o2]).max()) if vals.size else 0.0
+                scale = float(np.abs(vals).max()) or 1.0
+                op.append(("symmetry", f"max|A - Aᵀ| = {asym:.2e}  "
+                                       f"({'symmetric' if asym / scale < 1e-12 else 'NON-symmetric'})"))
+            else:
+                op.append(("symmetry", "NON-symmetric (the sparsity pattern itself is not symmetric)"))
         except Exception as e:  # noqa: BLE001
             op.append(("deep", f"unavailable ({type(e).__name__})"))
     if b is not None:
@@ -650,7 +676,11 @@ def _info_result(r, deep: bool, context=None) -> Info:
         if good.size:
             rows.append(("range (finite part)", f"[{good.min():.6g}, {good.max():.6g}]"))
     else:
-        rows.append(("range", f"[{a.min():.6g}, {a.max():.6g}]"))
+        if np.iscomplexobj(a):
+            m = np.abs(a)
+            rows.append(("|value|", f"[{m.min():.6g}, {m.max():.6g}]   (complex: min/max would be lexicographic)"))
+        else:
+            rows.append(("range", f"[{a.min():.6g}, {a.max():.6g}]"))
         if not np.any(a):
             rows.append(("note", "ALL ZERO"))
     rows.append(("norm", f"{np.linalg.norm(a.reshape(-1)):.6g}"))

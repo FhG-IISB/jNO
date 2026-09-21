@@ -579,3 +579,75 @@ def test_shape_info_renders_boolean_nodes_and_structured_flag():
 def test_transient_domain_and_form_report_their_time_window():
     d = jno.shape.rect(0, 0, 1, 1, size=0.5).domain(time=(0.0, 2.5, 6))
     assert "2.5" in jno.info(d).as_dict()["geometry"]["time"]
+
+
+# ---------------------------------------------------------------------------
+# Scale and cost. A report is reached when something is already wrong, so it must
+# not itself be the thing that hangs, OOMs, or floods the terminal.
+# ---------------------------------------------------------------------------
+
+
+def _poisson_at(size):
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.fem_symbols()
+    a, t = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    return jno.fem([a.x * t.x + a.y * t.y - 1.0 * t, u(xb, yb) - 0.0])
+
+
+def test_deep_does_not_densify_the_operator():
+    """`A.todense()` is O(n^2): at the 90,814 dofs of an ordinary 3-D solve that is 66 GB, so
+    `deep=True` would take the machine down on exactly the problems big enough to want it."""
+    import tracemalloc
+
+    f = _poisson_at(0.02)
+    n = int(f.dofs)
+    tracemalloc.start()
+    jno.info(f, deep=True)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 0.25 * n * n * 8, f"peak {peak / 1e6:.1f} MB vs dense {n * n * 8 / 1e6:.0f} MB"
+
+
+def test_sparse_symmetry_agrees_with_the_dense_answer():
+    """Making it fast is worthless if it now always says 'symmetric'."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.fem_symbols()
+    a, t = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    sym = jno.fem([a.x * t.x + a.y * t.y - 1.0 * t, u(xb, yb) - 0.0])
+    adv = jno.fem([a.x * t.x + a.y * t.y + 5.0 * a.x * t - 1.0 * t, u(xb, yb) - 0.0])
+    assert "(symmetric)" in jno.info(sym, deep=True).as_dict()["operator"]["symmetry"]
+    row = jno.info(adv, deep=True).as_dict()["operator"]["symmetry"]
+    assert "NON-symmetric" in row
+    dense = np.asarray(jax.numpy.asarray(adv._A.todense()))
+    # the row is formatted to 3 significant figures, so compare at that precision, not at 1e-9
+    assert float(row.split("=")[1].split()[0]) == pytest.approx(float(np.abs(dense - dense.T).max()), rel=1e-2)
+
+
+def test_a_report_with_many_rows_is_capped_and_says_so():
+    d = jno.shape.rect(0, 0, 1, 1, size=0.25).domain()
+    for i in range(60):
+        d.tag(f"strip_{i:02d}", lambda x, y, i=i: (x > i / 60) & (x <= (i + 1) / 60) & (y < 1e-9))
+    rep = jno.info(d)
+    tags = rep.as_dict()["tags"]
+    assert len(tags) <= 25, "an unbounded report is one nobody reads"
+    assert any("and" in str(v) and "more" in str(v) for v in tags.values()), "silent truncation is worse"
+
+
+def test_info_on_a_lazy_domain_does_not_build_its_mesh():
+    """Reading `.mesh` BUILDS it. A report that silently meshes is a report with a side effect."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
+    assert d.__dict__.get("_mesh") is None
+    rep = jno.info(d)
+    assert d.__dict__.get("_mesh") is None, "jno.info must not mesh the domain"
+    assert "lazy" in rep.as_dict()["mesh"]["built"]
+
+
+def test_complex_results_report_magnitude_not_lexicographic_order():
+    z = np.array([1 + 2j, -3 - 1j, 0.5j])
+    data = jno.info(z).as_dict()["array"]
+    assert "|value|" in data and "range" not in data
+    assert "3.16" in data["|value|"]        # max |z| = |-3-1j|
