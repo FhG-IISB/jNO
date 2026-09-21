@@ -67,13 +67,44 @@ def _apply_axis(M: jnp.ndarray, X: jnp.ndarray, axis: int) -> jnp.ndarray:
     return jnp.moveaxis(Y, 0, axis)
 
 
+def _restrict_axis(X: jnp.ndarray, axis: int) -> jnp.ndarray:
+    """Full-weighting restriction ``½Pᵀ`` along ``axis`` as a stencil: coarse node ``i`` takes
+    ``½·x[2i] + ¼·(x[2i−1] + x[2i+1])``. Identical to ``_apply_axis(0.5 * P.T, X, axis)`` with ``P`` from
+    :func:`_prolong_matrix`, but O(N) instead of a dense ``(n_c × n_f)`` product along the axis."""
+    X = jnp.moveaxis(X, axis, 0)
+    even, odd = X[0::2], X[1::2]  # n_c and n_c − 1 entries
+    pad = [(0, 0)] * (X.ndim - 1)
+    out = 0.5 * even + 0.25 * (jnp.pad(odd, [(0, 1)] + pad) + jnp.pad(odd, [(1, 0)] + pad))
+    return jnp.moveaxis(out, 0, axis)
+
+
+def _prolong_axis(X: jnp.ndarray, axis: int) -> jnp.ndarray:
+    """Linear-interpolation prolongation ``P`` along ``axis`` as a stencil: fine node ``2i`` is coarse
+    node ``i`` and fine node ``2i+1`` is the mean of coarse nodes ``i`` and ``i+1``. Identical to
+    ``_apply_axis(P, X, axis)``, O(N)."""
+    X = jnp.moveaxis(X, axis, 0)
+    mids = 0.5 * (X[:-1] + X[1:])
+    pairs = jnp.stack([X[:-1], mids], axis=1).reshape((2 * (X.shape[0] - 1),) + X.shape[1:])
+    return jnp.moveaxis(jnp.concatenate([pairs, X[-1:]], axis=0), 0, axis)
+
+
 def _neg_laplacian(u_grid: jnp.ndarray, spacing, interior: jnp.ndarray) -> jnp.ndarray:
-    """``(-Δu)`` via the roll 5-/7-point stencil, zeroed on the boundary (homogeneous-Dirichlet rows)."""
+    """``(-Δu)`` via the 5-/7-point stencil, zeroed on the boundary (homogeneous-Dirichlet rows).
+
+    One pass over the interior block, then a single zero pad for the boundary ring, which the mask
+    zeroes anyway. It used to be written with ``jnp.roll``, whose wrap-around only ever reached the masked
+    ring, so the result is bit-identical; but XLA fuses slices, and on CPU the rolls' concatenations were
+    not fused: 1.64 ms against 0.11 ms for a plain copy of the same 1M-node grid."""
     u = u_grid * interior
-    lap = jnp.zeros_like(u)
+    dim = u.ndim
+    core = tuple(slice(1, -1) for _ in range(dim))
+    centre = u[core]
+    lap = jnp.zeros_like(centre)
     for ax, h in enumerate(spacing):
-        lap = lap + (jnp.roll(u, -1, ax) + jnp.roll(u, 1, ax) - 2.0 * u) / (h * h)
-    return (-lap) * interior
+        plus = tuple(slice(2, None) if a == ax else slice(1, -1) for a in range(dim))
+        minus = tuple(slice(None, -2) if a == ax else slice(1, -1) for a in range(dim))
+        lap = lap + (u[plus] + u[minus] - 2.0 * centre) / (h * h)
+    return jnp.pad(-lap, 1) * interior
 
 
 def build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int = 5):
@@ -121,16 +152,19 @@ def build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: floa
             u = u + omega * inv_diag * (r - _neg_laplacian(u, sp, interior)) * interior
         return u
 
+    # The transfers used to be dense 1-D matrices applied with `tensordot`: a (n_c × n_f) product along
+    # each axis, O(n³) in 2-D rather than O(n²). On a 2049² grid that was ~17 GFLOP per V-cycle against
+    # ~40 MFLOP for the smoothing, and a solve cost ~4000 residual evaluations instead of ~100.
     def _restrict(r_grid, Rs):
         out = r_grid
-        for ax, R in enumerate(Rs):
-            out = _apply_axis(R, out, ax)
+        for ax in range(len(Rs)):
+            out = _restrict_axis(out, ax)
         return out
 
     def _prolong(e_grid, Ps):
         out = e_grid
-        for ax, P in enumerate(Ps):
-            out = _apply_axis(P, out, ax)
+        for ax in range(len(Ps)):
+            out = _prolong_axis(out, ax)
         return out
 
     def _vcycle(r_grid, lev):

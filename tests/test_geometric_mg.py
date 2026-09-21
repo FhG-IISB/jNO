@@ -128,3 +128,44 @@ def test_gmg_rejects_uncoarsenable_grid():
     op = LinearOperator.from_matvec(lambda v: v, shape=(26 * 26, 26 * 26))
     with pytest.raises(ValueError, match="coarsen"):
         jno.precond.gmg().materialize(PrecondContext(op, grid=grid))
+
+
+@pytest.mark.parametrize("shape", [(9,), (17, 9), (9, 17, 5)])
+def test_stencil_transfers_equal_the_dense_operators(shape):
+    """Restriction and prolongation are strided stencils, O(N). They used to be dense 1-D matrices
+    applied with `tensordot`, O(n³) in 2-D: ~17 GFLOP per V-cycle on a 2049² grid, and ~4000 residual
+    evaluations per solve instead of ~100 (GPU, 4M nodes: 3.85 s → 0.65 s once replaced)."""
+    import jax.numpy as jnp
+
+    from jno.utils.solver import geometric_mg as G
+
+    rng = np.random.default_rng(0)
+    X = jnp.asarray(rng.standard_normal(shape))
+    for ax in range(len(shape)):
+        nc = (shape[ax] - 1) // 2 + 1
+        P = jnp.asarray(G._prolong_matrix(nc))
+        np.testing.assert_allclose(G._restrict_axis(X, ax), G._apply_axis(0.5 * P.T, X, ax), atol=1e-14)
+        C = jnp.asarray(rng.standard_normal(tuple(nc if a == ax else n for a, n in enumerate(shape))))
+        np.testing.assert_allclose(G._prolong_axis(C, ax), G._apply_axis(P, C, ax), atol=1e-14)
+
+
+def test_vcycle_has_no_dense_transfer():
+    """No matrix product in a compiled V-cycle may be as large as a dense transfer matrix."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.utils.solver.geometric_mg import build_vcycle
+
+    def eqns(jaxpr):
+        for e in jaxpr.eqns:
+            yield e
+            for sub in jax.core.jaxprs_in_params(e.params):
+                yield from eqns(sub)
+
+    vcycle, _ = build_vcycle((65, 65), (1 / 64, 1 / 64))
+    closed = jax.make_jaxpr(vcycle)(jnp.ones(65 * 65))
+    widest = max(
+        (max(v.aval.shape, default=0) for e in eqns(closed.jaxpr) if e.primitive.name == "dot_general" for v in e.invars),
+        default=0,
+    )
+    assert widest < 33, f"a dot_general over an axis of {widest}: a dense grid transfer is back"
