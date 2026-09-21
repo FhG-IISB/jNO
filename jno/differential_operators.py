@@ -1015,5 +1015,11 @@ class DifferentialOperators:
             return main, "area_weighted", "cotangent"
         if sub in ("lsq", "least_squares"):
             return main, "least_squares", "lsq_of_gradient"
-        # uniform / inverse_distance / area_weighted
-        return main, sub, "gradient_of_gradient"
+        if sub in ("uniform", "inverse_distance", "area_weighted") or main != "finite_difference":
+            return main, sub, "gradient_of_gradient"
+        # An unknown sub-scheme used to reach the kernel as `method=sub`, whose final `else` branch is
+        # area-weighted -- so `":upwind"` or a typo silently gave the default stencil.
+        raise ValueError(
+            f"Unknown finite-difference sub-scheme {sub!r} (from scheme={scheme!r}). Known: 'cotangent', "
+            "'lsq' (or 'least_squares'), 'uniform', 'inverse_distance', 'area_weighted'."
+        )

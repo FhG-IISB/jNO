@@ -106,6 +106,9 @@ The built-in stencils (parsed from the scheme string) are:
     A stable ~4× at every resolution — the same convergence *rate*, a better constant. Worth the one
     extra word on the term whenever the mesh is unstructured.
 
+An unknown sub-scheme (a typo, or one jNO does not have, such as `":upwind"`) raises. It used to fall
+through silently to the default area-weighted stencil.
+
 The `cotangent` Laplacian is the most accurate and is symmetric; the gradient methods trade accuracy
 for locality. The scheme stays on the operator it describes — `ui.d2(x, scheme=…)` — so different
 terms in the same residual can use different stencils. (`cotangent` is the accurate default in 2-D

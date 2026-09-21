@@ -714,6 +714,24 @@ def test_whole_laplacian_subscheme_rejected_on_per_axis_derivative(method):
         getattr(ui, method)(x, scheme="finite_difference:cotangent")
 
 
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("sub", ["upwind", "bogus"])
+def test_unknown_fd_subscheme_raises(structured, sub):
+    """An unknown `finite_difference:<sub>` used to reach the gradient kernel as `method=sub`, whose
+    final branch is area-weighted: `":upwind"` silently solved with the central default (bit-identical
+    answers on both grids). It now raises and lists the known sub-schemes."""
+    if structured:
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    else:
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    with pytest.raises(ValueError, match=f"Unknown finite-difference sub-scheme '{sub}'"):
+        jno.fdm([-ui.d2(x) - ui.d2(y) + ui.d(x, scheme=f"finite_difference:{sub}") - 1.0, u(xb, yb) - 0.0]).solve()
+
+
 def test_whole_laplacian_subscheme_allowed_on_laplacian():
     """The same sub-scheme is legitimate on `.laplacian`, which takes every coordinate at once so it
     cannot be double-counted — and it is markedly more accurate than the nested-stencil default."""
