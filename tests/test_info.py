@@ -337,3 +337,55 @@ def test_rcwa_info_before_and_after_solving():
         assert abs(float(solved["T + R"].split()[0]) - 1.0) < 1e-6
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+# ---------------------------------------------------------------------------
+# A NEURAL OPERATOR (DeepONet) exercises four things a PINN does not: a replicated
+# parametric domain, a parameter tag that is not a coordinate, a ModelCall rather
+# than a bare Model, and an optimizer attached per-net instead of on the core.
+# All four were wrong.
+# ---------------------------------------------------------------------------
+
+
+def _deeponet_problem(n_samples=4):
+    import foundax
+    import optax
+
+    key = jax.random.PRNGKey(0)
+    dom = n_samples * jno.shape.rect(0, 0, 2, 1, size=0.4).domain()
+    x, y, _ = dom.variable("interior")
+    k = dom.variable("k", jax.random.uniform(key, (n_samples, 1, 1), minval=0.5, maxval=1.5))
+    net = jno.nn(foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=8, hidden_dim=32,
+                                  activation=jax.numpy.tanh, key=key))
+    net.optimizer(optax.adam(1e-3))
+    u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
+    pde = k * (u.d2(x) + u.d2(y)) + 1.0
+    return dom, k, net, pde, jno.core(constraints=[pde.mse])
+
+
+def test_operator_residual_reports_the_network():
+    """`net(...)` builds a ModelCall wrapping the Model -- an isinstance(Model) walk finds nothing,
+    so a neural-operator residual reported no network at all."""
+    _dom, _k, _net, pde, _crux = _deeponet_problem()
+    assert "DeepONet" in jno.info(pde).as_dict()["reads"]["networks"]
+
+
+def test_parameter_tag_is_not_reported_as_a_coordinate():
+    """`dom.variable("k", values)` is a TensorTag with no mesh pool -- the coordinate report said
+    nothing about it, and the generic expression report almost nothing."""
+    _dom, k, _net, _pde, _crux = _deeponet_problem(n_samples=4)
+    data = jno.info(k).as_dict()[""]
+    assert "parameter" in data["kind"]
+    assert data["samples"] == "4" and "shape (4, 1, 1)" in data["values"]
+
+
+def test_core_finds_an_optimizer_attached_to_the_net():
+    """`core.models` holds the UNWRAPPED module; `_opt_fn` lives on the Model wrapper. Looking in
+    the wrong place told a user to call `.optimizer(...)` they had already called."""
+    *_rest, crux = _deeponet_problem()
+    assert "per-model" in jno.info(crux).as_dict()["training"]["optimizer"]
+
+
+def test_replicated_domain_reports_its_sample_count():
+    dom, *_rest = _deeponet_problem(n_samples=4)
+    assert jno.info(dom).as_dict()["geometry"]["samples"] == "4"

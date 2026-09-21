@@ -339,7 +339,23 @@ def _info_core(c, deep: bool) -> Info:
     names = list(getattr(c, "_tracker_names", None) or [])
     if names:
         training.append(("trackers", ", ".join(map(str, names))))
-    training.append(("optimizer", "set" if getattr(c, "_opt_states", None) else "not set — call .optimizer(...) before .solve()"))
+    # `core.models` holds the UNWRAPPED modules; the optimizer lives on the `Model` WRAPPER, which
+    # the core reaches through `_collect_flax_modules()`. Checking `core.models` found nothing and
+    # told a user to call `.optimizer(...)` they had already called.
+    opt_on_models = []
+    try:
+        for _lid, fm in (c._collect_flax_modules() or {}).items():
+            if getattr(fm, "_opt_fn", None) is not None or getattr(fm, "_bayesian_cfg", None) is not None:
+                nm = getattr(fm, "name", None)
+                opt_on_models.append(str(nm) if isinstance(nm, str) and nm else type(getattr(fm, "module", None)).__name__)
+    except Exception:  # noqa: BLE001
+        pass
+    if getattr(c, "_opt_states", None):
+        training.append(("optimizer", "set on the core"))
+    elif opt_on_models:
+        training.append(("optimizer", f"set per-model on {', '.join(opt_on_models)}  (net.optimizer(...))"))
+    else:
+        training.append(("optimizer", "not set — call .optimizer(...) on the core or on each net before .solve()"))
     sections = [("models", models), ("constraints", cons), ("training", training)]
     if deep:
         # What `core.print_tree()` and `core.print_shapes()` used to print. They were two more
@@ -432,7 +448,14 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
         reads.append(("regions", ", ".join(sorted(map(str, spatial)))))
     if temporal:
         reads.append(("temporal", "yes"))
-    models = {getattr(m, "name", None) or _node_label(m) for m in nodes if isinstance(m, Model)}
+    found = []
+    for n in nodes:
+        m = n.model if type(n).__name__ == "ModelCall" and hasattr(n, "model") else (n if isinstance(n, Model) else None)
+        if m is not None:
+            nm = getattr(m, "name", None)
+            arch = type(getattr(m, "module", None)).__name__
+            found.append(f"{arch}" + (f" ({nm})" if isinstance(nm, str) and nm else ""))
+    models = set(found)
     if models:
         reads.append(("networks", ", ".join(sorted(map(str, models)))))
     tri = [n for n in nodes if isinstance(n, TrialFunction)]
@@ -470,6 +493,22 @@ def _info_expr(e, deep: bool, outer=None) -> Info:
         tree = _render(e)[:200]
     return Info(f"expression · {type(e).__name__}", [("what", what), ("reads", reads),
                                                      ("structure", struct), ("tree", tree)])
+
+
+def _info_tensor_tag(t, deep: bool) -> Info:
+    """`dom.variable("k", values)` returns a TensorTag -- a PARAMETER, not a coordinate. It has no
+    mesh pool, so the coordinate report said nothing about it at all."""
+    d = getattr(t, "_domain", None)
+    tag = str(getattr(t, "tag", "?"))
+    rows: list = [("tag", tag), ("kind", "parameter tag (a per-sample value, not a coordinate)")]
+    if getattr(t, "dim_index", None) is not None:
+        rows.append(("component", str(t.dim_index)))
+    vals = (getattr(d, "context", None) or {}).get(tag)
+    if vals is not None:
+        q = np.asarray(vals)
+        rows.append(("values", f"shape {q.shape} · [{q.min():.6g}, {q.max():.6g}]"))
+        rows.append(("samples", _fmt_n(q.shape[0])))
+    return Info(f"parameter · {tag}", [("", rows)])
 
 
 def _info_variable(v, deep: bool) -> Info:
@@ -705,6 +744,8 @@ def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
             n = sum(1 for o in obj if str(getattr(o, "tag", "?")) == tag)
             secs.append((f"{tag}  ({n} component{'s' if n > 1 else ''})", rows))
         return Info(f"variables · {len(obj)} returned by domain.variable(...)", secs)
+    if type(obj).__name__ == "TensorTag":
+        return _info_tensor_tag(obj, deep)
     if isinstance(obj, Variable):
         return _info_variable(obj, deep)
     if isinstance(obj, Model):
