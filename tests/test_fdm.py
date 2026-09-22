@@ -626,6 +626,39 @@ def test_periodic_poisson():
     assert float(np.max(np.abs(grid_sol[0, :] - grid_sol[-1, :]))) < 1e-9
 
 
+def test_a_periodic_problem_does_not_leak_into_the_next_one():
+    """A periodic tie belongs to its problem, not to the domain. It used to be written into the domain's shared
+    grid descriptor, so a Dirichlet problem built afterwards on the same grid wrapped its stencils too: with
+    u = x on the boundary (0 on the left face, 1 on the right) its max error went from 2.1e-3 to 0.90, silently.
+    Oracle: -Δu = 2π² sin(πx) sin(πy), u = x on the boundary ⇒ u = sin(πx) sin(πy) + x."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured())
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xa, ya, _ = d.variable("boundary", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+
+    def dirichlet_error():
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = np.asarray(jno.fdm([-ui.xx - ui.yy - f, u(xa, ya) - xa]).solve()).reshape(-1)
+        return float(np.abs(sol - (np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) + p[:, 0])).max())
+
+    before = dirichlet_error()
+    w = d.unknown()
+    wi = w.bind(x=x, y=y)
+    f = 5 * np.pi**2 * jnn.sin(2 * np.pi * x) * jnn.sin(np.pi * y)
+    jno.fdm([-wi.xx - wi.yy - f, w(xl, yl) - w(xr, yr), w(xb, yb) - 0.0, w(xt, yt) - 0.0]).solve()
+    assert not any(d.mesh_connectivity["grid"].get("periodic") or ())
+    assert before < 5e-3
+    assert dirichlet_error() == pytest.approx(before, rel=1e-9)
+
+
 def test_periodic_requires_structured():
     """A periodic tie on an unstructured mesh raises — the FD stencil must wrap the grid, which only a
     structured grid can do."""

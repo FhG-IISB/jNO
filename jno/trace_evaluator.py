@@ -1,5 +1,7 @@
 """CORE solver using new tracing system - NO INNER VMAPS version."""
 
+import contextlib
+import contextvars
 import functools
 import inspect
 from typing import Any, Dict, List, NamedTuple, Tuple
@@ -42,6 +44,34 @@ from .trace import (
 def _default_float_dtype():
     """Return JAX's current default floating dtype (float32 or float64)."""
     return jnp.asarray(0.0).dtype
+
+
+#: The periodic axes of the strong-form problem being evaluated, as ``(grid descriptor, (bool, ...))``. A periodic
+#: tie ``u(A) - u(B)`` belongs to one PROBLEM, not to its domain. It used to be written into the domain's shared
+#: grid descriptor, so every later problem on that domain wrapped its stencils too: a Dirichlet problem built after
+#: a periodic one on the same grid went from a max error of 2.1e-3 to 0.90, silently.
+_FD_PERIODIC = contextvars.ContextVar("jno_fd_periodic", default=None)
+
+
+@contextlib.contextmanager
+def fd_periodic(grid, periodic):
+    """Evaluate finite differences on the structured grid ``grid`` (a domain's ``mesh_connectivity["grid"]``)
+    with the axes flagged in ``periodic`` wrapped. See :func:`fd_grid`."""
+    token = _FD_PERIODIC.set((grid, tuple(bool(p) for p in periodic)))
+    try:
+        yield
+    finally:
+        _FD_PERIODIC.reset(token)
+
+
+def fd_grid(domain):
+    """The structured-grid descriptor the finite-difference kernels use on ``domain`` (``None`` off a grid): the
+    domain's own, plus the periodic axes of the problem being evaluated on it (:func:`fd_periodic`)."""
+    grid = (getattr(domain, "mesh_connectivity", None) or {}).get("grid")
+    active = _FD_PERIODIC.get()
+    if grid is None or active is None or active[0] is not grid:
+        return grid
+    return {**grid, "periodic": active[1]}
 
 
 @functools.lru_cache(maxsize=1024)
@@ -295,8 +325,8 @@ def _fd_gradient(mesh, scheme):
 
     def _k(u_1d, axis):
         if mesh.dim == 1:
-            return fn(u_1d, mesh.points, mc[cells], method=grad_method, grid=mc.get("grid"))
-        return fn(u_1d, mesh.points, mc[cells], axis, method=grad_method, grid=mc.get("grid"))
+            return fn(u_1d, mesh.points, mc[cells], method=grad_method, grid=fd_grid(mesh.domain))
+        return fn(u_1d, mesh.points, mc[cells], axis, method=grad_method, grid=fd_grid(mesh.domain))
 
     return _k
 
@@ -323,8 +353,8 @@ def _fd_laplacian(mesh, scheme, dims):
 
     def _k(u_1d):
         if mesh.dim == 1:
-            return fn(u_1d, mesh.points, mc[cells], grid=mc.get("grid"))
-        return fn(u_1d, mesh.points, mc[cells], dims, method=lap_method, grid=mc.get("grid"))
+            return fn(u_1d, mesh.points, mc[cells], grid=fd_grid(mesh.domain))
+        return fn(u_1d, mesh.points, mc[cells], dims, method=lap_method, grid=fd_grid(mesh.domain))
 
     return _k
 
@@ -348,7 +378,7 @@ def _fd_hessian(mesh, scheme, var_dims):
     def _k(u_1d):
         if mesh.dim == 1:
             return fn(u_1d, mesh.points, mc[cells])
-        return fn(u_1d, mesh.points, mc[cells], var_dims, grid=mc.get("grid"), method=_stencil_or_none(scheme))
+        return fn(u_1d, mesh.points, mc[cells], var_dims, grid=fd_grid(mesh.domain), method=_stencil_or_none(scheme))
 
     return _k
 
@@ -798,7 +828,7 @@ class TraceEvaluator:
         from .stencils import FDStencil
         from .trace import Placeholder
 
-        grid = mesh.domain.mesh_connectivity.get("grid")
+        grid = fd_grid(mesh.domain)
         if grid is None:
             raise NotImplementedError(
                 f"scheme={str(scheme)!r}: jno.fd(upwind=...) needs a structured grid "
@@ -846,7 +876,7 @@ class TraceEvaluator:
         from .trace import BinaryOp, Jacobian
         from .trace.views import _unwrap
 
-        grid = mesh.domain.mesh_connectivity.get("grid")
+        grid = fd_grid(mesh.domain)
         axis = int(var.dim[0])
         if grid is None or any((grid.get("periodic") or (False,) * 3)[: len(grid["shape"])]):
             return None
@@ -1584,7 +1614,7 @@ class TraceEvaluator:
             ]
         elif mesh_dim == 2:
             cells = domain.mesh_connectivity["triangles"]
-            _grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (else None)
+            _grid = fd_grid(domain)  # structured-grid fast path (else None)
             grads = [
                 DifferentialOperators.compute_fd_gradient_2d_simple(
                     u_full, mesh_points, cells, i, method=grad_method, grid=_grid
@@ -1593,7 +1623,7 @@ class TraceEvaluator:
             ]
         else:
             cells = domain.mesh_connectivity["tetrahedra"]
-            _grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (else None)
+            _grid = fd_grid(domain)  # structured-grid fast path (else None)
             grads = [
                 DifferentialOperators.compute_fd_gradient_3d_simple(
                     u_full, mesh_points, cells, i, method=grad_method, grid=_grid

@@ -68,6 +68,7 @@ import numpy as np
 from . import precond as jno_precond
 from . import solve as _solve
 from .differential_operators import DifferentialOperators as _D
+from .trace_evaluator import fd_grid
 
 __all__ = ["fdm", "laplacian", "gradient"]
 
@@ -181,7 +182,7 @@ def _gmres_incremental(matvec, b, precond, tol, restart=30, maxiter=50):
     return x, jnp.linalg.norm(b - matvec(x))
 
 
-def _structured_linear_solve(domain):
+def _structured_linear_solve(domain, periodic=False):
     """Inner linear solve for the matrix-free Newton–Krylov on a **structured grid**: GMRES rather than
     the driver's default BiCGStab. The reduced-Dirichlet 5-/7-point operator is nonsymmetric, and BiCGStab
     can break down on it (a strong-form ``u.d2(x)+u.d2(y)`` returns NaN), whereas GMRES is robust for
@@ -206,7 +207,7 @@ def _structured_linear_solve(domain):
 
     grid = domain.mesh_connectivity["grid"]
     gmres = _solve.gmres()
-    if any(grid.get("periodic") or ()):  # the GMG V-cycle assumes Dirichlet boundaries; skip it (plain GMRES)
+    if periodic:  # the GMG V-cycle assumes Dirichlet boundaries; skip it (plain GMRES)
         return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
     vcycle, n_levels = build_vcycle(grid["shape"], grid["spacing"])
     precond = vcycle if n_levels >= 2 else None  # skip GMG when the grid can't be coarsened
@@ -352,7 +353,7 @@ def laplacian(u, domain, method: str = "cotangent"):
     3-D."""
     pts, cells = _mesh(domain)
     dim = int(getattr(domain, "dimension", 2))
-    grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (2-D), else None
+    grid = fd_grid(domain)  # structured-grid fast path, with the evaluated problem's periodic axes; else None
     if dim == 3:
         return _D.compute_fd_laplacian_3d_simple(u, pts, cells, dims=(0, 1, 2), method=method, grid=grid)
     return _D.compute_fd_laplacian_2d_simple(u, pts, cells, dims=(0, 1), method=method, grid=grid)
@@ -364,7 +365,7 @@ def gradient(u, domain, method: str = "area_weighted"):
     names apply on a 2-D triangular or 3-D tetrahedral mesh."""
     pts, cells = _mesh(domain)
     dim = int(getattr(domain, "dimension", 2))
-    grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (2-D), else None
+    grid = fd_grid(domain)  # structured-grid fast path, with the evaluated problem's periodic axes; else None
     if dim == 3:
         comps = [_D.compute_fd_gradient_3d_simple(u, pts, cells, d, method=method, grid=grid) for d in range(3)]
         return jnp.stack(comps, axis=1)
@@ -872,14 +873,27 @@ class _TraceFDM:
                     "domain with `jno.shape.rect(...).structured().domain()`. Periodic on an unstructured mesh is "
                     "not supported (the FD stencil must wrap the grid, which a boundary tie alone cannot)."
                 )
-            per = list(grid.get("periodic") or (False,) * len(grid["shape"]))
+            per = [False] * len(grid["shape"])
             for ax in self._periodic_axes:
                 per[ax] = True
-            grid["periodic"] = tuple(per)  # the FD kernels read this to wrap those axes
-            self._grid = grid
+            # This problem's own view of the grid. The domain's descriptor is shared by every problem built on
+            # it, so the wrap is applied only while this problem is evaluated (`_fd_scope`); writing it into the
+            # domain made every later problem there wrap too.
+            self._grid = {**grid, "periodic": tuple(per)}
         # The sub-domain this problem owns, if its PDE coordinates carry a named region
         # (`domain.region(name, poly)`). Used by `jno.core([...])` to couple subdomains automatically.
         self.region, self.region_geometry = self._pde_region()
+
+    def _fd_scope(self):
+        """Context under which this problem's terms are evaluated: the finite-difference kernels wrap its
+        periodic axes (:func:`jno.trace_evaluator.fd_periodic`), and no others."""
+        import contextlib
+
+        from .trace_evaluator import fd_periodic
+
+        if self._grid is None:
+            return contextlib.nullcontext()
+        return fd_periodic(self.domain.mesh_connectivity["grid"], self._grid["periodic"])
 
     def _pde_region(self):
         """``(region_tag, geometry)`` of the named sub-region carried by the PDE's coordinate variables
@@ -1008,12 +1022,13 @@ class _TraceFDM:
             dofs = jnp.asarray(dofs)
             ev = TraceEvaluator(params={**scope, **self._inject(dofs)})
             ctx = context if t is None else {**context, "__time__": jnp.full((N, 1), t, dtype=dofs.dtype)}
-            blocks = [
-                self._as_blocks(
-                    ev.evaluate(e, context=ctx, var_bindings={}), self._ncomp[k] if len(exprs) > 1 else self._nf
-                )
-                for k, e in enumerate(exprs)
-            ]
+            with self._fd_scope():
+                blocks = [
+                    self._as_blocks(
+                        ev.evaluate(e, context=ctx, var_bindings={}), self._ncomp[k] if len(exprs) > 1 else self._nf
+                    )
+                    for k, e in enumerate(exprs)
+                ]
             return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
 
         return residual_fn
@@ -1409,7 +1424,8 @@ class _TraceFDM:
                     for w in self.unknowns
                 }
                 ev = TraceEvaluator(params={**scope, **states})
-                return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={}))
+                with self._fd_scope():
+                    return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={}))
 
             ncomp = self._ncomp[k] if len(self.unknowns) > 1 else self._nf
             diff = jnp.asarray(at(t_val, tt_val) - at(0.0, 0.0))
@@ -1569,7 +1585,8 @@ class _TraceFDM:
 
         walk(g_node)
         params.update(extra_params or {})
-        out = jnp.asarray(TraceEvaluator(params=params).evaluate(_unwrap(g_node), context=ctx, var_bindings={}))
+        with self._fd_scope():
+            out = jnp.asarray(TraceEvaluator(params=params).evaluate(_unwrap(g_node), context=ctx, var_bindings={}))
         return jnp.broadcast_to(out.reshape(-1), (len(idx),)) if out.size == 1 else out.reshape(-1)
 
     def _periodic_rows(self):
@@ -1738,6 +1755,10 @@ class _TraceFDM:
         N, dim, jidx = self._N, int(self._pts.shape[1]), jnp.asarray(idx)
 
         def row(dofs, t=None):
+            with self._fd_scope():
+                return _row(dofs, t)
+
+        def _row(dofs, t=None):
             ev = TraceEvaluator(params={**scope, **self._inject(jnp.asarray(dofs))})
             ctx = dict(context) if t is None else {**context, "__time__": jnp.full((N, 1), t)}
             for i, (j, g) in enumerate(zip(jacs, grads)):
@@ -1913,7 +1934,7 @@ class _TraceFDM:
         idx = np.asarray(idx)
         if ":" in scheme or not self._interior_is_five_point():
             return lambda u: gradient(u, self.domain, method=grad_method)[idx]
-        grid = self.domain.mesh_connectivity.get("grid")
+        grid = self._grid or self.domain.mesh_connectivity.get("grid")  # the problem's periodic axes, if any
         if grid is not None:
             return self._grid_boundary_gradient(idx, grid)
         cells = _mesh(self.domain)[1]
@@ -2076,7 +2097,11 @@ class _TraceFDM:
         else:
             residual_with_bc = self._steady_residual(extra_params, extra_pins)
             driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual_with_bc, u0))
-            sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
+            sol = driver(
+                residual_with_bc,
+                u0,
+                linear_solve=_structured_linear_solve(self.domain, bool(self._periodic_axes)) if single else None,
+            )
         return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
 
     def _default_is_assembled(self):
@@ -2258,7 +2283,7 @@ class _TraceFDM:
         if entry is None or entry[0] is not nonlinear:
             residual = self._steady_residual()
             driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual, u0))
-            linear = _structured_linear_solve(self.domain) if self._nf == 1 else None
+            linear = _structured_linear_solve(self.domain, bool(self._periodic_axes)) if self._nf == 1 else None
             fn = jax.jit(lambda u_init: driver(residual, u_init, linear_solve=linear))
             entry = cache[key] = (nonlinear, driver, residual, fn)
         _, driver, residual, fn = entry
@@ -2290,7 +2315,7 @@ class _TraceFDM:
             self._nf == 1
             and not self._transient
             and grid is not None
-            and not any(grid.get("periodic") or ())
+            and not self._periodic_axes
             and self._nodes_are_the_grid(grid)
             and not self._flux_rows()
             and not self._periodic_rows()
