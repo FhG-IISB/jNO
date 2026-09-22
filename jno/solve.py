@@ -244,7 +244,9 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
     # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
-        method = getattr(jax.scipy.sparse.linalg, name)
+        from .utils.solver.krylov import gmres as _scaled_gmres
+
+        method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
 
         def raw(mv, rhs, M, x0):
             if name == "gmres" and M is not None:

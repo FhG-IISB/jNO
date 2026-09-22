@@ -24,6 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .krylov import gmres as _scaled_gmres
+
 __all__ = ["newton_krylov", "newton_direct", "staggered_newton", "bicgstab"]
 
 _EPS = 1e-300
@@ -297,7 +299,7 @@ def _with_gmres_rescue(mv, rhs, x, *, tol):
     return jax.lax.cond(
         rel < max(10.0 * tol, 1e4 * eps),
         lambda: x,
-        lambda: jax.scipy.sparse.linalg.gmres(mv, rhs, tol=tol, atol=0.0, restart=30)[0],
+        lambda: _scaled_gmres(mv, rhs, tol=tol, atol=0.0, restart=30)[0],
     )
 
 

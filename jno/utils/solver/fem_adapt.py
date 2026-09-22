@@ -5379,13 +5379,14 @@ def run_mesh_motion(
         residual check here would be traced away, since this runs inside the jitted step. The march's
         accuracy is covered instead by the first-order convergence test against the analytic domain.
         """
-        import jax
 
         dd = diag_fn()
         inv = 1.0 / jnp.where(jnp.abs(dd) > 1e-30, dd, 1.0)
         n = int(jnp.asarray(rhs).shape[0])
         eps = float(jnp.finfo(jnp.asarray(rhs).dtype).eps)
-        out, _ = jax.scipy.sparse.linalg.gmres(
+        from .krylov import gmres as _scaled_gmres
+
+        out, _ = _scaled_gmres(
             step_op,
             rhs,
             x0=u0,

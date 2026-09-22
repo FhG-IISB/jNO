@@ -552,3 +552,19 @@ def chebyshev_apply(matvec, v, *, lmin, lmax, degree, M=None):
 
 
 __all__.append("chebyshev_apply")
+
+
+def gmres(A, b, x0=None, **kwargs):
+    """``jax.scipy.sparse.linalg.gmres``, made invariant to the scale of ``b``. Returns ``(x, info)``.
+
+    JAX's Arnoldi treats a vector whose norm is below machine epsilon *in absolute terms* as zero
+    (``_safe_normalize``). With ``‖b‖ < 2.2e-16`` the whole Krylov basis vanishes and GMRES returns
+    ``x = 0``, a relative residual of 1.0, with no error. Measured: a diagonal system solves to 3e-12 at
+    ‖b‖ ~ 1 and fails at ‖b‖ ~ 1e-17, and a heat march failed once its decaying state reached 1e-20.
+    BiCGStab and CG have no such threshold. Solving ``A y = b/‖b‖`` and returning ``‖b‖·y`` is exact for
+    a linear system and keeps every relative tolerance meaning what it says."""
+    s = jnp.linalg.norm(b)
+    scale = jnp.where(s > 0, s, 1.0)
+    y0 = None if x0 is None else x0 / scale
+    y, info = jax.scipy.sparse.linalg.gmres(A, b / scale, x0=y0, **kwargs)
+    return y * scale, info

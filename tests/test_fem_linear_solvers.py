@@ -482,3 +482,16 @@ def test_gmres_tolerance_holds_with_a_scaled_preconditioner_and_a_warm_start():
         x = jno.solve.gmres()(LinearOperator(jnp.asarray(A)), jnp.asarray(b), M=lambda r: inv * r, x0=jnp.asarray(guess))
         rel = float(np.linalg.norm(A @ np.asarray(x) - b) / np.linalg.norm(b))
     assert rel < 1e-7, f"GMRES stopped at a relative residual of {rel:.1e}"
+
+
+@pytest.mark.parametrize("scale", [1.0, 1e-17, 1e-30])
+def test_gmres_is_invariant_to_the_scale_of_the_data(scale):
+    """JAX's GMRES treats a Krylov vector below machine epsilon in ABSOLUTE norm as zero, so with ‖b‖ < 2.2e-16
+    it returned x = 0 (relative residual 1.0) without an error; a heat march failed once its decaying state
+    reached 1e-20. jno.solve.gmres solves the unit-scaled system and scales back."""
+    import jax.experimental.sparse as jsp
+
+    A = jnp.diag(jnp.linspace(1.0, 10.0, 50))
+    b = scale * jnp.ones(50)
+    x = jno.solve.gmres(tol=1e-10)(jsp.BCOO.fromdense(A), b)
+    assert float(jnp.linalg.norm(A @ x - b) / jnp.linalg.norm(b)) < 1e-9

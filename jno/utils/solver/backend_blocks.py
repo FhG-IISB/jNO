@@ -413,6 +413,7 @@ class SemidiscreteTimeBlock:
                 return _verdict(G, u, nonlinear_solve(G, u), report)
             return _verdict(G, u, newton_krylov(G, u), report)
 
+        from .krylov import gmres as _scaled_gmres
         from .linear import matrix_diagonal
 
         th = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
@@ -478,9 +479,7 @@ class SemidiscreteTimeBlock:
             # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
             # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
             ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
-            wn, _ = jax.scipy.sparse.linalg.gmres(
-                step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
-            )
+            wn, _ = _scaled_gmres(step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)
             return wn
         # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
         # its breakdown test fires once the residual stalls at the float32 noise floor, so the effect is
@@ -510,9 +509,7 @@ class SemidiscreteTimeBlock:
         return jax.lax.cond(
             r_rel < max(1e-9, 1e4 * eps),
             lambda: wn,
-            lambda: jax.scipy.sparse.linalg.gmres(
-                step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
-            )[0],
+            lambda: _scaled_gmres(step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)[0],
         )
 
     def solve(self, solve_fn=None, *, save_ts=None):
