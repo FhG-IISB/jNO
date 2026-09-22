@@ -607,6 +607,40 @@ class TestInequalityConstraints:
         losses, total = jnp.asarray(logs["losses"])[0], jnp.asarray(logs["total_loss"])[0]
         assert total == pytest.approx(float(losses.mean()), rel=1e-6)
 
+    def test_the_jit_warm_up_never_evaluates_parameters_the_hooks_forbid(self):
+        """The warm-up compiles; it must not step. A hook-owned parameter stays where its hook holds it.
+
+        ``a`` is trained by ``sgd(1.0)`` and its hook zeroes the gradient, so the real loop never moves
+        it off 1.0. The warm-up cannot run host-side hooks, and it used to apply the RAW gradient
+        anyway, so the model was next evaluated at a value no real step produces. On the
+        topology-optimisation tutorial that was penal 3 -> -568.7 and an Inf stiffness that SuperLU
+        refused, killing solve() before training began. Every value the model is evaluated at
+        (warm-up included) is recorded, and all must be the held one.
+        """
+
+        from jno.utils.adaptive.callbacks import Callback
+
+        seen = []
+
+        class Hold(Callback):
+            def on_before_update(self, *, grads, trainable, context, rng, epoch, **kw):
+                return jax.tree_util.tree_map(jnp.zeros_like, grads)
+
+        def recorded(v):
+            jax.debug.callback(lambda q: seen.append(float(np.asarray(q).reshape(-1)[0])), v)
+            return v
+
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(lambda k, sh, dtype=None: jnp.full(sh, 1.0))
+        a.optimizer(optax.sgd(1.0))
+        a_seen = jno.fn(recorded, [a])
+        jno.core([(a_seen * x - 5.0).mse], domain=d).solve(2, callbacks=[Hold()])
+
+        assert seen, "the model was never evaluated"
+        assert set(seen) == {1.0}, f"the model was evaluated at a={sorted(set(seen))}, not only the held 1.0"
+
     def test_constraint_values_reach_the_optimiser_hook(self):
         """A constrained optimiser reads ``g_j`` off ``on_before_update`` rather than recomputing."""
         from jno.utils.adaptive.callbacks import Callback

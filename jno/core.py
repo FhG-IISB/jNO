@@ -3627,15 +3627,27 @@ class core:
             else:
                 _ow = jax.tree_util.tree_map(jnp.copy, opt_states)
                 _pl = jax.device_put(jnp.zeros(self.n_constraints), replicated)
+                # The warm-up COMPILES; it must not also WALK the parameters. On these two paths the
+                # real loop hands the optimizer gradients the host-side `on_before_update` hooks have
+                # rewritten (MMA's bounded move, a continuation's override of `penal`), and the warm-up
+                # cannot run those hooks -- so applying its raw gradients moved the throwaway copy
+                # somewhere the real loop never goes. Measured on the topology-optimisation tutorial:
+                # after one warm-up step penal 3 -> -568.7, rho 0.33..1 -> -17..2923, mesh coordinates
+                # into the thousands; the next warm-up gradient assembled an Inf stiffness, SuperLU
+                # raised inside its host callback, and solve() died before training began. So every
+                # warm-up call reads the SAME, valid copy: the programs compile on the same shapes and
+                # the updated values are discarded. (`jit_*apply` donate only the gradients, so the
+                # copy survives the call.) The plain `jit_step` path below keeps stepping: with no
+                # hooks, its updates are exactly the ones the real loop makes.
                 if _use_accumulation:
                     for _ in range(3):
                         _gw, _rw, _, _ = jit_grad(_tw, _rw, trace_context)
-                        _tw, _ow = jit_apply(_tw, _ow, _gw, _ew, _pl)
+                        _, _ow = jit_apply(_tw, _ow, _gw, _ew, _pl)
                     del _gw
                 elif _has_before_update_hooks:
                     for _ in range(3):
                         _gw, _rw, _, _ = jit_hook_grad(_tw, _rw, trace_context)
-                        _tw, _ow = jit_hook_apply(_tw, _ow, _gw, _ew, _pl)
+                        _, _ow = jit_hook_apply(_tw, _ow, _gw, _ew, _pl)
                     del _gw
                 else:
                     for _ in range(3):
