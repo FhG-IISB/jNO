@@ -370,6 +370,9 @@ def _spectral_hessian(mesh, scheme, var_dims):
     return _k
 
 
+#: ``image_shape`` marker for a per-node vector field ``(N, c)`` (see ``_mesh_field_values``).
+_NODAL_VECTOR = object()
+
 #: Families that differentiate stored values on the mesh. A new one is an entry here plus its
 #: kernels; neither `_eval_jacobian` nor `_eval_hessian` changes. (Automatic differentiation is
 #: deliberately absent -- it differentiates a FUNCTION per point and never touches the mesh.)
@@ -754,10 +757,18 @@ class TraceEvaluator:
             return mesh, u_squeezed.reshape(mesh.n), u_full.shape, 1
         if u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == mesh.n:
             return mesh, u_full.reshape(mesh.n, u_full.shape[-1]), u_full.shape, u_full.shape[-1]
+        if u_full.ndim == 2 and u_full.shape[0] == mesh.n and u_full.shape[1] > 1:
+            # A per-node VECTOR field (`domain.unknown(value_shape=(2,))`): one channel per component. It was
+            # flattened to one (c·N,) array, and the stencil then failed to reshape it onto the grid.
+            return mesh, u_full, _NODAL_VECTOR, int(u_full.shape[1])
         return mesh, (u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()), None, 1
 
     def _finish_mesh_jacobian(self, comps, image_shape, n_vars, mesh_points, points):
-        """Shape a mesh-field gradient back to the caller's convention."""
+        """Shape a mesh-field gradient back to the caller's convention. A per-node vector field gives
+        ``(N, c)`` for one variable and ``(N, c, n_vars)`` for several."""
+        if image_shape is _NODAL_VECTOR:
+            out = comps[0] if n_vars == 1 else jnp.stack(comps, axis=-1)
+            return self._map_mesh_to_sampled(mesh_points, points, out)
         if image_shape is not None:
             if n_vars == 1:
                 return comps[0].reshape(image_shape)
@@ -1934,6 +1945,8 @@ class TraceEvaluator:
             if compute_trace:
                 lap = backend.laplacian(mesh, scheme, dims)
                 lap_full = jax.vmap(lap)(u_flat.T).T if multi else lap(u_flat)
+                if image_shape is _NODAL_VECTOR:  # (N, c): the component-wise Laplacian
+                    return self._map_mesh_to_sampled(mesh.points, points, lap_full) if points is not None else lap_full
                 if image_shape is not None:
                     return lap_full.reshape(image_shape)
                 if points is not None:
@@ -1943,6 +1956,8 @@ class TraceEvaluator:
 
             hess = backend.hessian(mesh, scheme, var_dims)
             hess_full = jnp.moveaxis(jax.vmap(hess)(u_flat.T), 0, 1) if multi else hess(u_flat)
+            if image_shape is _NODAL_VECTOR:  # (N, c, n, n)
+                return self._map_mesh_to_sampled(mesh.points, points, hess_full)
             if image_shape is not None:
                 if n_channels > 1:
                     return hess_full.reshape(*image_shape[:-1], n_channels, n, n)

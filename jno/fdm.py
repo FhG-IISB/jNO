@@ -643,19 +643,31 @@ def _is_normal_jacobian(node):
 
 
 def _spatial_tags(c):
-    """The spatial coordinate tags a constraint is bound to."""
-    return {v.tag for v in (getattr(c, "_coord_vars", None) or {}).values() if getattr(v, "axis", None) != "temporal"}
+    """The spatial coordinate tags a constraint is bound to: those of its bound views, and of every
+    coordinate Variable inside it. Vector-view arithmetic (``Ui.div()``, ``Ui.grad() @ Ui``) does not carry
+    the views' bindings, so reading them alone left ``interior`` out of the evaluation context (a
+    ``KeyError`` deep in a derivative). Normal tags ``n_*`` are left to the flux machinery."""
+    tags = {v.tag for v in (getattr(c, "_coord_vars", None) or {}).values() if getattr(v, "axis", None) != "temporal"}
+    tags |= {
+        v.tag
+        for v in _iter_variables(c)
+        if getattr(v, "axis", "spatial") == "spatial"
+        and not str(v.tag).startswith(("n_", "fdm_bgrad_"))
+        and v.tag not in ("cell_size", "__time__")
+    }
+    return tags
 
 
 def _context_leaf(tag, component, domain):
-    """A :class:`Variable` reading column ``component`` of the per-node array ``context[tag]`` — how a
-    rewritten boundary condition reads a value the solver supplies (a boundary gradient, a normal)."""
+    """A :class:`Variable` reading column ``component`` of the per-node array ``context[tag]`` (all columns
+    when ``component`` is ``None``) — how a rewritten boundary condition reads a value the solver supplies
+    (a boundary gradient, a normal)."""
     from .trace import Variable
 
     leaf = Variable.__new__(Variable)
     leaf.tag, leaf.dim, leaf.axis, leaf.fem_meta, leaf.size, leaf._domain = (
         tag,
-        [component, component + 1],
+        [0, None] if component is None else [component, component + 1],
         "spatial",
         None,
         1,
@@ -720,10 +732,14 @@ class _TraceFDM:
         self._constraints = list(constraints)  # kept verbatim so a coupled solve can re-author with an interface pin
         self.unknowns = _find_unknowns(constraints)  # coupled system ⇒ several, in declaration order
         self.unknown = self.unknowns[0]  # the single-field paths (transient/flux/parametric) use this
-        self._nf = len(self.unknowns)
         self.domain = self.unknown._fem_field_domain
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])  # nodes per field
-        self._Ntot = self._nf * self._N  # blocked DOF vector [field_0 (N), …, field_{nf-1} (N)]
+        # A vector unknown (`domain.unknown(value_shape=(2,))`) is one DOF block per component, so the DOF
+        # vector is [u_0 components…, u_1 components…] in declaration order; `_nf` counts BLOCKS.
+        self._ncomp = [int(np.prod(np.shape(w.module.value)[1:], dtype=int)) for w in self.unknowns]
+        self._block0 = [int(b) for b in np.cumsum([0] + self._ncomp)[:-1]]
+        self._nf = int(sum(self._ncomp))
+        self._Ntot = self._nf * self._N  # blocked DOF vector [block_0 (N), …, block_{nf-1} (N)]
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
         self._pde, self._dirichlet, self._neumann, self._ic, self._vel_ic = [], [], [], [], []
         self._periodic_axes = []  # grid axes tied by a `u(A) - u(B)` periodic constraint (structured only)
@@ -792,11 +808,11 @@ class _TraceFDM:
                 "jno.fdm([...]): the PDE residual has a time derivative `u.t` but no initial condition — "
                 "add `u(xi, yi) - u0` (with `xi, yi = domain.variable('initial', split=True)`)."
             )
-        if self._nf > 1:  # coupled (multi-field): v1 is STEADY + Dirichlet only
-            if len(self._pde) != self._nf:
+        if len(self.unknowns) > 1:  # coupled (multi-field)
+            if len(self._pde) != len(self.unknowns):
                 raise ValueError(
                     f"jno.fdm([...]): a coupled system needs exactly one PDE equation per unknown — got "
-                    f"{self._nf} unknowns but {len(self._pde)} PDE equation(s). Author one equation per "
+                    f"{len(self.unknowns)} unknowns but {len(self._pde)} PDE equation(s). Author one equation per "
                     "field, in the order the unknowns are declared (equation k drives unknown k)."
                 )
             if self._transient and self._time_order == 2:
@@ -857,13 +873,14 @@ class _TraceFDM:
             return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
         pool = getattr(self.domain, "_mesh_pool", {}).get(tag)
         if pool is not None:  # a region sampled at mesh nodes (`domain.point_region(name, xy)`, …)
-            pts = np.asarray(pool).reshape(-1, np.asarray(pool).shape[-1])[:, : self._pts.shape[1]]
-            mesh = np.asarray(self._pts)
-            dist = ((pts[:, None, :] - mesh[None, :, :]) ** 2).sum(-1) if len(pts) < 64 else None
-            if dist is not None:
-                nodes = np.unique(dist.argmin(axis=1))
-                if np.allclose(dist.min(axis=1), 0.0, atol=1e-18):
-                    return nodes.astype(int)
+            from scipy.spatial import cKDTree
+
+            dim = self._pts.shape[1]
+            # A time-dependent domain stores the pool once per time step, (n_time, n, D): the same points.
+            pts = np.unique(np.asarray(pool).reshape(-1, np.asarray(pool).shape[-1])[:, :dim], axis=0)
+            dist, nodes = cKDTree(np.asarray(self._pts)).query(pts)
+            if len(pts) and np.allclose(dist, 0.0, atol=1e-9):
+                return np.unique(nodes).astype(int)
         # An unknown tag used to fall through to the WHOLE boundary: `p(xg, yg) - 0` on a
         # `domain.point_region` pinned p on every wall node, and a lid-driven cavity came out 0.016 off
         # Ghia et al. instead of 0.0019 — plausible, and wrong. Refused instead.
@@ -877,13 +894,13 @@ class _TraceFDM:
         """The PDE residual expressions as solved, one per field: summed for a single field, and with the
         per-axis default Laplacian fused into the cotangent one on an unstructured mesh
         (:func:`_fuse_fd_laplacian`)."""
-        if self._nf == 1:
+        if len(self.unknowns) == 1:
             expr = self._pde[0]
             for c in self._pde[1:]:
                 expr = expr + c
             exprs = [_unwrap(expr)]
         else:
-            exprs = [_unwrap(self._pde[k]) for k in range(self._nf)]
+            exprs = [_unwrap(self._pde[k]) for k in range(len(self.unknowns))]
         # Not on a sub-region: a domain-decomposition subdomain exports its interface flux from the
         # area-weighted gradient, which is consistent with the per-axis stencil but not the cotangent one;
         # fused, the FEM/FDM Dirichlet–Neumann iteration diverged (1e103). A cotangent-consistent interface
@@ -908,37 +925,75 @@ class _TraceFDM:
         method-of-lines spatial residual ``R_spatial`` for the semidiscrete march. ``extra_params``
         (``{layer_id: module}``) injects the current value of any **trainable** ``jno.np.parameter`` in
         the residual — how a ``crux``-driven inverse reaches the solve (see :meth:`_parametric_node`)."""
-        import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
 
         exprs = self._pde_exprs()  # one equation per field (summed for a single field)
         if spatial:
             exprs = [_zero_temporal(e) for e in exprs]
-        spatial_tags = {  # collocate every spatial term at the mesh nodes (temporal tags carry no field)
-            v.tag
-            for c in self._pde
-            for v in (getattr(c, "_coord_vars", None) or {}).values()
-            if getattr(v, "axis", None) != "temporal"
-        }
+        spatial_tags = set().union(*(_spatial_tags(c) for c in self._pde))  # collocated at the mesh nodes
         context = self._eval_context(spatial_tags)
-        N, unknowns = self._N, self.unknowns
+        N = self._N
         scope = self._params_scope(extra_params)
 
         def residual_fn(dofs, t=None):
             """``t``: the time a source ``f(x, t)`` is evaluated at (the march passes each step's own
             time); ``None`` keeps the start time."""
             dofs = jnp.asarray(dofs)
-            params = dict(scope)
-            for k, unk in enumerate(unknowns):  # inject each field's DOF slice into its module
-                slice_k = dofs[k * N : (k + 1) * N] if len(unknowns) > 1 else dofs
-                params[unk.layer_id] = eqx.tree_at(lambda m: m.value, unk.module, slice_k.astype(unk.module.value.dtype))
-            ev = TraceEvaluator(params=params)
+            ev = TraceEvaluator(params={**scope, **self._inject(dofs)})
             ctx = context if t is None else {**context, "__time__": jnp.full((N, 1), t, dtype=dofs.dtype)}
-            blocks = [jnp.asarray(ev.evaluate(e, context=ctx, var_bindings={})).reshape(-1) for e in exprs]
+            blocks = [
+                self._as_blocks(
+                    ev.evaluate(e, context=ctx, var_bindings={}), self._ncomp[k] if len(exprs) > 1 else self._nf
+                )
+                for k, e in enumerate(exprs)
+            ]
             return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
 
         return residual_fn
+
+    def _inject(self, dofs):
+        """``{layer_id: module}`` with every unknown holding its slice of the blocked DOF vector — a scalar
+        field its ``(N,)`` block, a vector field its ``(N, c)`` components."""
+        import equinox as eqx
+
+        out, N = {}, self._N
+        for w, b0, c in zip(self.unknowns, self._block0, self._ncomp):
+            sl = dofs[b0 * N : (b0 + c) * N]
+            value = sl if c == 1 and np.ndim(w.module.value) == 1 else sl.reshape(c, N).T.reshape(w.module.value.shape)
+            out[w.layer_id] = eqx.tree_at(lambda m: m.value, w.module, value.astype(w.module.value.dtype))
+        return out
+
+    def _as_blocks(self, value, ncomp):
+        """An equation's value at every node, laid out component by component (``(N,)`` or ``(N, c)`` →
+        ``(c·N,)``), checked against the number of components it has to drive."""
+        v = jnp.asarray(value)
+        v = jnp.broadcast_to(v.reshape(-1), (self._N,)) if v.size in (1, self._N) else v.reshape(self._N, -1)
+        c = 1 if v.ndim == 1 else int(v.shape[1])
+        if c != ncomp:
+            raise ValueError(
+                f"jno.fdm([...]): an equation has {c} component(s) but drives an unknown with {ncomp}. A vector "
+                "unknown (`domain.unknown(value_shape=(2,))`) needs a vector equation, and a scalar one a scalar."
+            )
+        return v if v.ndim == 1 else v.T.reshape(-1)
+
+    def _blocks_of(self, k):
+        """The DOF blocks of unknown ``k`` (one per component)."""
+        return list(range(self._block0[k], self._block0[k] + self._ncomp[k]))
+
+    def _split_components(self, k, vals, n_nodes):
+        """A value for unknown ``k`` at ``n_nodes`` nodes, one ``(n_nodes,)`` array per component."""
+        v = jnp.asarray(vals)
+        c = self._ncomp[k]
+        if c == 1:
+            return [jnp.broadcast_to(v.reshape(-1), (n_nodes,)) if v.size in (1, n_nodes) else v.reshape(n_nodes)]
+        v = jnp.broadcast_to(v, (n_nodes, c)) if v.size == c else v.reshape(n_nodes, -1)
+        if v.shape[1] != c:
+            raise ValueError(
+                f"jno.fdm([...]): a condition on a {c}-component unknown gives {v.shape[1]} value(s) per node. Give "
+                "every component, e.g. `U(xb, yb) - jnn.stack([gx, gy], axis=-1)`."
+            )
+        return [v[:, j] for j in range(c)]
 
     def _eval_context(self, spatial_tags):
         """Evaluation context for a strong-form term: every spatial tag collocates at the mesh nodes, and
@@ -963,8 +1018,9 @@ class _TraceFDM:
         vals = jnp.zeros(self._Ntot)
         for c in self._dirichlet:
             nodes = np.asarray(self._region_nodes(_region_tag(c)), dtype=int)
-            idx = self._field_index(c) * self._N + nodes
-            mask[idx] = True
+            k = self._field_index(c)
+            for b in self._blocks_of(k):
+                mask[b * self._N + nodes] = True
             inner = _unwrap(c)
             g_node = 0.0
             if getattr(inner, "op", None) == "-":
@@ -973,7 +1029,8 @@ class _TraceFDM:
                 g = self._eval_g(g_node, nodes)  # a known nodal field: gathered at the region's nodes
             else:
                 g = self._eval_value(g_node, nodes, getattr(self, "_override", None), t)
-            vals = vals.at[jnp.asarray(idx)].set(jnp.asarray(g).reshape(-1))
+            for b, gb in zip(self._blocks_of(k), self._split_components(k, g, len(nodes))):
+                vals = vals.at[jnp.asarray(b * self._N + nodes)].set(gb)
         return mask, vals
 
     def _node_spacing(self):
@@ -1144,7 +1201,9 @@ class _TraceFDM:
         """Boolean mask of the Dirichlet DOFs (host-side indices, so it also works inside a trace)."""
         is_d = np.zeros(self._Ntot, dtype=bool)
         for c in self._dirichlet:
-            is_d[self._field_index(c) * self._N + np.asarray(self._region_nodes(_region_tag(c)))] = True
+            nodes = np.asarray(self._region_nodes(_region_tag(c)))
+            for b in self._blocks_of(self._field_index(c)):
+                is_d[b * self._N + nodes] = True
         return is_d
 
     @staticmethod
@@ -1229,7 +1288,7 @@ class _TraceFDM:
         equation without a time derivative, whose field is then algebraic)."""
         coefs = [
             self._time_coefficient(1.0, 0.0, "`u.t` mass coefficient", "nonlinear mass `c(u)·u.t`", k=k)
-            for k in range(self._nf)
+            for k in range(len(self._pde_exprs()))  # one per equation; a vector one spans its components
         ]
         if len(coefs) == 1:
             return coefs[0]
@@ -1245,12 +1304,7 @@ class _TraceFDM:
         from .trace_evaluator import TraceEvaluator
 
         expr = self._pde_exprs()[k]
-        spatial_tags = {
-            v.tag
-            for c in self._pde
-            for v in (getattr(c, "_coord_vars", None) or {}).values()
-            if getattr(v, "axis", None) != "temporal"
-        }
+        spatial_tags = set().union(*(_spatial_tags(c) for c in self._pde))
         context = self._eval_context(spatial_tags)
         scope = self._params_scope()
 
@@ -1259,13 +1313,19 @@ class _TraceFDM:
 
             def at(tv, ttv):
                 states = {  # every field at the same constant state
-                    w.layer_id: eqx.tree_at(lambda m: m.value, w.module, jnp.full(self._N, u_val, w.module.value.dtype))
+                    w.layer_id: eqx.tree_at(
+                        lambda m: m.value, w.module, jnp.full(w.module.value.shape, u_val, w.module.value.dtype)
+                    )
                     for w in self.unknowns
                 }
                 ev = TraceEvaluator(params={**scope, **states})
-                return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={})).reshape(-1)
+                return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={}))
 
-            return jnp.broadcast_to(at(t_val, tt_val) - at(0.0, 0.0), (self._N,))
+            ncomp = self._ncomp[k] if len(self.unknowns) > 1 else self._nf
+            diff = jnp.asarray(at(t_val, tt_val) - at(0.0, 0.0))
+            if diff.size == 1:  # a constant coefficient, the same on every node and component
+                return jnp.broadcast_to(diff.reshape(()), (ncomp * self._N,))
+            return self._as_blocks(diff, ncomp)
 
         checked = self.__dict__.setdefault("_coefficient_checked", set())  # decided once, on concrete values
         if (t_val, tt_val, k) not in checked and not bool(jnp.allclose(probe(0.0), probe(1.0), atol=1e-6, rtol=1e-6)):
@@ -1338,8 +1398,8 @@ class _TraceFDM:
         return 0
 
     def _dirichlet_rows(self, extra_params=None):
-        """Per-field Dirichlet rows ``(field_index, node_indices, values)``: ``field_index`` selects the
-        DOF block (0 for a single field), ``node_indices`` the region's nodes, ``values`` the pinned g.
+        """Per-block Dirichlet rows ``(block, node_indices, values)``: ``block`` selects the DOF block (a
+        field, or one component of a vector field; 0 for a single scalar field), ``node_indices`` the region's nodes, ``values`` the pinned g.
         With ``extra_params`` a trainable parameter in ``g`` takes its injected (possibly traced) value."""
         rows = []
         extra_params = {**(getattr(self, "_override", None) or {}), **(extra_params or {})}
@@ -1349,7 +1409,9 @@ class _TraceFDM:
                 vals = self._eval_value(self._value_side(c), idx, extra_params)
             else:
                 vals = self._condition_value(c, idx)
-            rows.append((self._field_index(c), jnp.asarray(idx), vals))
+            k = self._field_index(c)
+            for b, vb in zip(self._blocks_of(k), self._split_components(k, vals, len(np.asarray(idx)))):
+                rows.append((b, jnp.asarray(idx), vb))  # one row set per DOF block (component)
         return rows
 
     def _is_nodal_data(self, g_node):
@@ -1544,7 +1606,9 @@ class _TraceFDM:
         ``u = 0``, ``v = 0`` and ``∂p/∂n = n·(νΔu − u·∇u)``, which differentiates all three, and is p's row."""
         fields = [k for k, w in enumerate(self.unknowns) if _has_unknown_derivative(c, w)]
         pinned = self._dirichlet_mask()
-        free = [k for k in fields if not pinned[k * self._N + np.asarray(idx, dtype=int)].all()]
+        free = [
+            k for k in fields if not all(pinned[b * self._N + np.asarray(idx, dtype=int)].all() for b in self._blocks_of(k))
+        ]
         normal = {k for j in _normal_jacobians(c) for k, w in enumerate(self.unknowns) if _contains_unknown(j.target, w)}
         if len(free) == 1:
             return free[0]
@@ -1562,27 +1626,26 @@ class _TraceFDM:
     def _flux_row_fn(self, skeleton, extra_params=None):
         """``(dofs, t) ↦ residual`` of a boundary condition at every node, from its eagerly built
         :meth:`_flux_skeleton`; ``extra_params`` injects trainable-parameter values."""
-        import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
 
         expr, context, jacs, grads, idx = skeleton
         scope = self._params_scope(extra_params)
-        N, dim, unknowns, jidx = self._N, int(self._pts.shape[1]), self.unknowns, jnp.asarray(idx)
+        N, dim, jidx = self._N, int(self._pts.shape[1]), jnp.asarray(idx)
 
         def row(dofs, t=None):
-            dofs = jnp.asarray(dofs)
-            fields = {
-                w.layer_id: eqx.tree_at(lambda m: m.value, w.module, dofs[k * N : (k + 1) * N].astype(w.module.value.dtype))
-                for k, w in enumerate(unknowns)
-            }
-            ev = TraceEvaluator(params={**scope, **fields})
+            ev = TraceEvaluator(params={**scope, **self._inject(jnp.asarray(dofs))})
             ctx = dict(context) if t is None else {**context, "__time__": jnp.full((N, 1), t)}
             for i, (j, g) in enumerate(zip(jacs, grads)):
-                target = jnp.broadcast_to(
-                    jnp.asarray(ev.evaluate(j.target, context=ctx, var_bindings={})).reshape(-1), (N,)
+                target = jnp.asarray(ev.evaluate(j.target, context=ctx, var_bindings={}))
+                # A scalar target is (N,) or (N, 1); a vector one (the velocity in a wall pressure) is (N, c)
+                # and is differentiated component by component.
+                target = (
+                    jnp.broadcast_to(target.reshape(-1), (N,))[:, None] if target.size in (1, N) else target.reshape(N, -1)
                 )
-                ctx[f"fdm_bgrad_{i}"] = jnp.zeros((N, dim), target.dtype).at[jidx].set(g(target))
+                G = jnp.stack([g(target[:, k]) for k in range(target.shape[1])], axis=1)  # (len(idx), c, dim)
+                for a in range(dim):
+                    ctx[f"fdm_bgrad_{i}_{a}"] = jnp.zeros((N, target.shape[1]), target.dtype).at[jidx].set(G[:, :, a])
             out = jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1)
             return jnp.broadcast_to(out, (N,)) if out.shape[0] == 1 else out
 
@@ -1622,7 +1685,8 @@ class _TraceFDM:
             if spatial_jacobian(n):
                 i = len(jacs)
                 jacs.append(n)
-                comp = lambda a: _context_leaf(f"fdm_bgrad_{i}", a, self.domain)  # noqa: E731
+                # ∂target/∂x_a for every component of the target: `fdm_bgrad_{i}_{a}` is (N, c)
+                comp = lambda a: _context_leaf(f"fdm_bgrad_{i}_{a}", None, self.domain)  # noqa: E731
                 var = n.variables[0]
                 if is_normal(var):  # ∂/∂n = ∇·n with the region's normals
                     out = comp(0) * _context_leaf(var.tag, 0, self.domain)
@@ -1654,7 +1718,7 @@ class _TraceFDM:
         :meth:`_flux_row_fn`. ``extra_params`` (a trainable α, say) enters the row functions; the structure
         comes from :meth:`_flux_structure`, built once on concrete values."""
         return [
-            (k * self._N + idx, idx, self._flux_row_fn(skeleton, extra_params))
+            (self._block0[k] * self._N + idx, idx, self._flux_row_fn(skeleton, extra_params))
             for _c, idx, k, skeleton in self._flux_structure()
         ]
 
@@ -1671,7 +1735,14 @@ class _TraceFDM:
             for c in self._neumann:
                 idx, _ = self._node_normals(self._flux_region(c))
                 idx = np.asarray(idx, dtype=int)
-                out.append((c, idx, self._flux_owner(c, idx), self._flux_skeleton(c, idx)))
+                owner = self._flux_owner(c, idx)
+                if self._ncomp[owner] != 1:
+                    raise NotImplementedError(
+                        "jno.fdm([...]): a derivative boundary condition on a vector unknown (a traction on U, "
+                        "say) is not supported yet. Give the vector field Dirichlet values, or write it as "
+                        "scalar unknowns."
+                    )
+                out.append((c, idx, owner, self._flux_skeleton(c, idx)))
         self._flux_struct = out
         return out
 
@@ -1791,8 +1862,9 @@ class _TraceFDM:
                 if self._uses_params(c, scope)
                 else self._condition_value(c, idx)
             )
-            offset = self._field_index(c) * self._N
-            u0 = u0.at[jnp.asarray(offset + (idx if len(idx) else allnodes))].set(vals)
+            k, nodes = self._field_index(c), np.asarray(idx if len(idx) else allnodes)
+            for b, vb in zip(self._blocks_of(k), self._split_components(k, vals, len(nodes))):
+                u0 = u0.at[jnp.asarray(b * self._N + nodes)].set(vb)
         return u0
 
     def _initial_velocity(self):

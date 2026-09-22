@@ -2407,3 +2407,169 @@ def test_a_direction_needs_one_component_per_coordinate():
     xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)
     with pytest.raises(ValueError, match="one component"):
         d.unknown().bind(x=xr, y=yr).d((nx,))
+
+
+# Vector unknowns: `domain.unknown(value_shape=(2,))` is one field with two components, differentiated
+# with the vector views (`.grad()`, `.div()`, `.laplacian()`, `@`). It used to allocate one value per node
+# (silently scalar-sized), and every vector-view derivative of a nodal field took automatic
+# differentiation and came back as zeros.
+
+
+def test_vector_nodal_field_derivatives():
+    """Every vector-view derivative of a nodal field, on U = (x², xy), against its exact value."""
+    from jno.fdm import _unwrap
+    from jno.trace_evaluator import TraceEvaluator
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    U, p = d.unknown(value_shape=(2,)), d.unknown()
+    assert np.shape(U.model.module.value) == (25, 2)
+    Ui, pb = U.vector.bind(x=x, y=y), p.bind(x=x, y=y)
+    f = jno.fdm([Ui.laplacian(), pb.laplacian()])
+    P = _nodes(d)
+    X, Y = P[:, 0], P[:, 1]
+    dofs = jnp.concatenate([jnp.asarray(X**2), jnp.asarray(X * Y), jnp.asarray(X + 2 * Y)])
+    ev = TraceEvaluator(params={**f._params_scope(), **f._inject(dofs)})
+    ctx = f._eval_context({"interior"})
+    at = lambda e: np.asarray(ev.evaluate(_unwrap(e), context=ctx, var_bindings={})).reshape(25, -1)[12]  # (0.5, 0.5)
+    np.testing.assert_allclose(at(Ui.x), [1.0, 0.5], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.xx), [2.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.grad()), [1.0, 0.0, 0.5, 0.5], atol=1e-12)  # J[i, j] = ∂u_i/∂x_j
+    np.testing.assert_allclose(at(Ui.div()), [1.5], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.laplacian()), [2.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.grad() @ Ui), [0.25, 0.25], atol=1e-12)  # (u·∇)u
+    np.testing.assert_allclose(at(Ui[0].x), [1.0], atol=1e-12)
+    # a component of a nodal vector field keeps its axis, (N, 1), so `u[0] * x` stays (N, 1), not (N, N)
+    assert np.asarray(ev.evaluate(_unwrap(Ui[0] * x), context=ctx, var_bindings={})).shape == (25, 1)
+    np.testing.assert_allclose(at(pb.grad()), [1.0, 2.0], atol=1e-12)
+
+
+def _kovasznay_vector(h):
+    import jno.jnp_ops as jnn
+
+    Re, π = 40.0, np.pi
+    nu, lam = 1.0 / Re, Re / 2 - np.sqrt(Re**2 / 4 + 4 * π**2)
+    Ux = lambda x, y, m: 1 - m.exp(lam * x) * m.cos(2 * π * y)  # noqa: E731
+    Uy = lambda x, y, m: lam / (2 * π) * m.exp(lam * x) * m.sin(2 * π * y)  # noqa: E731
+    P = lambda x, y, m: 0.5 * (1 - m.exp(2 * lam * x))  # noqa: E731
+    d = jno.shape.rect(-0.5, -0.5, 1.0, 1.5, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    U, p = d.unknown(value_shape=(2,)), d.unknown()
+    Ui, pi = U.vector.bind(x=x, y=y), p.bind(x=x, y=y)
+    sol = np.asarray(
+        jno.fdm(
+            [
+                Ui.grad() @ Ui + pi.grad() - nu * Ui.laplacian(),  # (u·∇)u + ∇p − νΔu
+                Ui.div() - 0.05 * d.cell_size**2 * pi.laplacian(),
+                U(xb, yb) - jnn.stack([Ux(xb, yb, jnn), Uy(xb, yb, jnn)], axis=-1),
+                p(xb, yb) - P(xb, yb, jnn),
+            ]
+        ).solve()
+    )
+    pts = _nodes(d)
+    return sol, (Ux(pts[:, 0], pts[:, 1], np), Uy(pts[:, 0], pts[:, 1], np), P(pts[:, 0], pts[:, 1], np))
+
+
+def test_navier_stokes_with_a_vector_velocity():
+    """The vector form is the same discretisation as three scalar unknowns, written once: it converges the
+    same way (u 8.1e-3 → 2.1e-3, p 3.4e-2 → 1.0e-2), and the solution rows are [u_x, u_y, p]."""
+    rel = lambda a, b: float(np.linalg.norm(a - b) / np.linalg.norm(b))  # noqa: E731
+    (s0, e0), (s1, e1) = _kovasznay_vector(0.1), _kovasznay_vector(0.05)
+    assert s1.shape == (3, len(e1[0]))
+    u0, u1, p0, p1 = rel(s0[0], e0[0]), rel(s1[0], e1[0]), rel(s0[2], e0[2]), rel(s1[2], e1[2])
+    assert u1 < 3e-3 and u0 / u1 > 3.4 and p1 < 2e-2 and p0 / p1 > 2.3, (u0, u1, p0, p1)
+    assert rel(s1[1], e1[1]) < 2e-2
+
+
+def test_vector_taylor_green_march():
+    """A vector unknown in a march: Taylor–Green with BDF2, second order in the velocity."""
+    import jno.jnp_ops as jnn
+
+    nu, T = 0.1, 1.0
+
+    def run(n):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, np.pi, np.pi, size=np.pi / n).structured(), time=(0.0, T, n + 1))
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, tb = d.variable("boundary", split=True)
+        x0, y0, _ = d.variable("initial", split=True)
+        U, p = d.unknown(value_shape=(2,)), d.unknown()
+        Ui, pi = U.vector.bind(x=x, y=y, t=t), p.bind(x=x, y=y, t=t)
+        E = lambda s, k=2: jnn.exp(-k * nu * s)  # noqa: E731
+        Uex = lambda X, Y, s: jnn.stack([-jnn.cos(X) * jnn.sin(Y) * E(s), jnn.sin(X) * jnn.cos(Y) * E(s)], axis=-1)  # noqa: E731
+        Pex = lambda X, Y, s: -0.25 * (jnn.cos(2 * X) + jnn.cos(2 * Y)) * E(s, 4)  # noqa: E731
+        traj = np.asarray(
+            jno.fdm(
+                [
+                    Ui.t + Ui.grad() @ Ui + pi.grad() - nu * Ui.laplacian(),
+                    Ui.div() - 0.05 * d.cell_size**2 * pi.laplacian(),
+                    U(xb, yb) - Uex(xb, yb, tb),
+                    p(xb, yb) - Pex(xb, yb, tb),
+                    U(x0, y0) - Uex(x0, y0, 0.0),
+                ]
+            ).solve(time=jno.solve.bdf2())
+        )
+        P = _nodes(d)
+        exact = -np.cos(P[:, 0]) * np.sin(P[:, 1]) * np.exp(-2 * nu * T)
+        assert traj.shape == (n + 1, 3, len(P))
+        return float(np.linalg.norm(traj[-1, 0] - exact) / np.linalg.norm(exact))
+
+    e0, e1 = run(10), run(20)
+    assert e1 < 2e-3 and e0 / e1 > 3.4, (e0, e1)
+
+
+def test_vector_equation_component_mismatch_raises():
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    U = d.unknown(value_shape=(2,))
+    Ui = U.vector.bind(x=x, y=y)
+    with pytest.raises(ValueError, match="component"):  # a scalar equation for a 2-component unknown
+        jno.fdm([Ui.div(), U(xb, yb) - jno.np.stack([0.0 * xb, 0.0 * xb], axis=-1)]).solve()
+
+
+def test_vector_attribute_form_equals_the_shorthand():
+    """The term-by-term spelling and the vector-calculus shorthand are the same stencils: (u·∇)u, ∇p, Δu
+    and ∇·u agree exactly on the Kovasznay field. `u.xx` on a vector field used to chain two first
+    derivatives (the wide stencil, 24 off the Laplacian at the boundary) and Newton diverged."""
+    import jno.jnp_ops as jnn
+    from jno.fdm import _unwrap
+    from jno.trace_evaluator import TraceEvaluator
+
+    lam = 20.0 - np.sqrt(400.0 + 4 * np.pi**2)
+    d = jno.shape.rect(-0.5, -0.5, 1.0, 1.5, size=0.1).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    U, p = d.unknown(value_shape=(2,)), d.unknown()
+    u, pi = U.vector.bind(x=x, y=y), p.bind(x=x, y=y)
+    ux, uy = u[0], u[1]
+    f = jno.fdm([u.laplacian(), pi.laplacian()])
+    P = _nodes(d)
+    X, Y = P[:, 0], P[:, 1]
+    fields = [1 - np.exp(lam * X) * np.cos(2 * np.pi * Y), lam / (2 * np.pi) * np.exp(lam * X) * np.sin(2 * np.pi * Y)]
+    dofs = jnp.concatenate([jnp.asarray(fields[0]), jnp.asarray(fields[1]), jnp.asarray(0.5 * (1 - np.exp(2 * lam * X)))])
+    ev = TraceEvaluator(params={**f._params_scope(), **f._inject(dofs)})
+    ctx = f._eval_context({"interior"})
+    val = lambda e: np.asarray(ev.evaluate(_unwrap(e), context=ctx, var_bindings={}))  # noqa: E731
+    pairs = [
+        (ux * u.x + uy * u.y, u.grad() @ u),
+        (jnn.stack([pi.x, pi.y], axis=-1), pi.grad()),
+        (u.xx + u.yy, u.laplacian()),
+        (ux.x + uy.y, u.div()),
+    ]
+    for full, short in pairs:
+        a, b = val(full), val(short)
+        assert np.abs(a.reshape(b.shape) - b).max() < 1e-12
+
+
+def test_point_region_on_a_long_time_dependent_domain():
+    """A time-dependent domain stores a `point_region` once per time step; with 101 steps the node match
+    used to give up (it only handled pools under 64 points) and the gauge raised "no mesh nodes"."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured(), time=(0.0, 1.0, 101))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    d.point_region("pin", (0.5, 0.5))
+    xp, yp, _ = d.variable("pin", split=True)
+    f = jno.fdm([ui.t - (ui.xx + ui.yy), u(xp, yp) - 0.0, u(xi, yi) - 1.0])
+    assert list(f._region_nodes("pin")) == [int(np.argmin(np.linalg.norm(_nodes(d) - [0.5, 0.5], axis=1)))]

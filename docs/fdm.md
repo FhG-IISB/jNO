@@ -666,17 +666,33 @@ Not supported on a coupled system, and each raises: `u.tt` (write it as a first-
 
 #### Incompressible Navier–Stokes
 
-Velocity and pressure are three coupled fields, and the equations are written as they are:
+The velocity is one vector unknown and the pressure a scalar one, both bound to the coordinates, and the
+equations are written term by term, as on paper:
 
 ```python
 h = d.cell_size
-jno.fdm([
-    ui.t + ui*ui.x + vi*ui.y + pi.x - nu*(ui.xx + ui.yy),
-    vi.t + ui*vi.x + vi*vi.y + pi.y - nu*(vi.xx + vi.yy),
-    ui.x + vi.y - 0.05*h**2*(pi.xx + pi.yy),        # continuity, pressure-stabilised
-    u(xb, yb) - U, v(xb, yb) - V, p(xb, yb) - P, u(xi, yi) - U0, v(xi, yi) - V0,
-]).solve(time=jno.solve.bdf2())
+U, p = d.unknown(value_shape=(2,)), d.unknown()
+u, pi = U.vector.bind(x=x, y=y, t=t), p.bind(x=x, y=y, t=t)
+ux, uy = u[0], u[1]
+
+traj = jno.fdm([
+    u.t + ux*u.x + uy*u.y + jnn.stack([pi.x, pi.y], axis=-1) - nu*(u.xx + u.yy),   # ∂u/∂t + (u·∇)u + ∇p − νΔu
+    ux.x + uy.y - 0.05*h**2*(pi.xx + pi.yy),                                        # ∇·u = 0, pressure-stabilised
+    U(xb, yb) - Ub, p(xb, yb) - Pb, U(xi, yi) - U0,        # Ub, U0: (N, 2) values, jnn.stack([gx, gy], axis=-1)
+]).solve(time=jno.solve.bdf2())                           # (steps, 3, N): rows u_x, u_y, p
 ```
+
+`u.x` is the vector `∂u/∂x`, `u[0]` the scalar `u_x`, and `u.xx + u.yy` the component-wise Laplacian on the
+compact stencil. A vector unknown is one DOF block per component, so a solve returns the components as
+rows, in declaration order. It is the same discretisation as writing `u`, `v` and `p` as three scalar
+unknowns: on Kovasznay flow the two agree to 8e-15. A vector equation must drive a vector unknown with the
+same number of components, and a mismatch raises. Derivative boundary conditions on a vector unknown (a
+traction) are not supported yet and raise. Give the velocity Dirichlet values, and put flux conditions on
+the pressure.
+
+The vector-calculus operators are shorthand for the same terms, giving identical values:
+`u.grad() @ u` is `(u·∇)u`, `pi.grad()` is `∇p`, `u.laplacian()` is `u.xx + u.yy` and `u.div()` is
+`ux.x + uy.y`.
 
 Two things decide whether the pressure is right. Both were measured against exact solutions.
 

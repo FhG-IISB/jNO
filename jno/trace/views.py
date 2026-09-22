@@ -116,6 +116,30 @@ def _is_periodic_tie_combination(expr_a, expr_b) -> bool:
     return _has_unknown(expr_a) and _has_unknown(expr_b)
 
 
+def _nodal_scheme(expr, scheme=None):
+    """The derivative scheme to use when none is given: finite differences if ``expr`` contains a nodal
+    field (``domain.unknown()`` / ``jno.np.parameter(<fem symbol>)``), which has no function to
+    auto-differentiate, else automatic differentiation. An explicit ``scheme`` is returned unchanged.
+
+    The scalar bound view already defaulted this way, but only for the bare field: ``Ui.div()``,
+    ``Ui.grad()``, ``Ui[0].x``, ``(κ*u).x`` and a vector field's partials took automatic differentiation
+    and came back as zeros."""
+    if scheme is not None:
+        return scheme
+    from ..utils.solver.solver_helper import iter_children
+
+    seen, stack = set(), [_unwrap(expr)]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if getattr(getattr(n, "model", None), "_fem_field", None) == "node":
+            return "finite_difference"
+        stack.extend(iter_children(n) or ())
+    return "automatic_differentiation"
+
+
 def _directional(view, components, scheme):
     """``Σ c_i ∂view/∂x_i`` over the spatial coordinates bound to ``view`` (in axis order)."""
     cv = getattr(view, "_coord_vars", None) or {}
@@ -335,7 +359,7 @@ class ScalarView(_DelegatesToPlaceholder):
         """Block gradient flow through this view, preserving the ScalarView type."""
         return self._rewrap(self._expr.stop_gradient)
 
-    def d(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
+    def d(self, v, scheme: str | None = None) -> "ScalarView":
         """``∂self/∂v`` — same view type.
 
         ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
@@ -352,15 +376,39 @@ class ScalarView(_DelegatesToPlaceholder):
         """
         if isinstance(v, (tuple, list)):
             return _directional(self, v, scheme)
-        return self._rewrap(self._expr.d(v, scheme=scheme))
+        return self._rewrap(self._expr.d(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def d2(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
+    def grad(self, *args):
+        """Spatial gradient ``(∂/∂x, ∂/∂y[, ∂/∂z])`` → VectorView, over the coordinates bound with
+        ``.bind(x=.., y=..)`` when none are given (as ``VectorView.grad`` does); finite differences by
+        default for a nodal field. ``grad(model)`` is the parameter gradient, unchanged."""
+        from . import Variable
+
+        if args and not all(isinstance(a, Variable) for a in args):
+            return self._expr.grad(*args)
+        cv = getattr(self, "_coord_vars", None) or {}
+        vars = args or tuple(
+            sorted(
+                (v for v in cv.values() if getattr(v, "axis", "spatial") != "temporal"),
+                key=lambda v: int(getattr(v, "dim", [0])[0]),
+            )
+        )
+        if not vars:
+            raise TypeError("grad() needs spatial coordinate Variables: pass them (u.grad(x, y)) or bind them first.")
+        comps = [self._expr.d(v, scheme=_nodal_scheme(self._expr)) for v in vars]
+        return VectorView(
+            FunctionCall(
+                lambda *cs: jnp.concatenate([jnp.reshape(c, c.shape[:1] + (-1,)) for c in cs], axis=-1), comps, "grad"
+            )
+        )
+
+    def d2(self, v, scheme: str | None = None) -> "ScalarView":
         """``∂²self/∂v²`` — same view type."""
-        return self._rewrap(self._expr.d2(v, scheme=scheme))
+        return self._rewrap(self._expr.d2(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "ScalarView":
+    def dd(self, v, w=None, scheme: str | None = None) -> "ScalarView":
         """Mixed second derivative ``∂²self/∂v∂w`` — same view type."""
-        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+        return self._rewrap(self._expr.dd(v, w, scheme=_nodal_scheme(self._expr, scheme)))
 
     def partials(self, **named_vars):
         """Bind Variables to names for partial-derivative-by-attribute access.
@@ -588,18 +636,18 @@ class VectorView(_DelegatesToPlaceholder):
         """Block gradient flow component-wise, preserving the VectorView type."""
         return self._rewrap(self._expr.stop_gradient)
 
-    def d(self, v, scheme: str = "automatic_differentiation") -> "VectorView":
+    def d(self, v, scheme: str | None = None) -> "VectorView":
         """Component-wise ``∂self/∂v`` — same view type. A vector ``v = (c_x, c_y[, c_z])`` gives the
         component-wise directional derivative ``Σ c_i ∂self/∂x_i``, as for a scalar view."""
         if isinstance(v, (tuple, list)):
             return _directional(self, v, scheme)
-        return self._rewrap(self._expr.d(v, scheme=scheme))
+        return self._rewrap(self._expr.d(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def d2(self, v, scheme: str = "automatic_differentiation") -> "VectorView":
-        return self._rewrap(self._expr.d2(v, scheme=scheme))
+    def d2(self, v, scheme: str | None = None) -> "VectorView":
+        return self._rewrap(self._expr.d2(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "VectorView":
-        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+    def dd(self, v, w=None, scheme: str | None = None) -> "VectorView":
+        return self._rewrap(self._expr.dd(v, w, scheme=_nodal_scheme(self._expr, scheme)))
 
     def partials(self, **named_vars):
         """Bind Variables to names for component-wise partial-derivative-by-attribute access.
@@ -622,7 +670,17 @@ class VectorView(_DelegatesToPlaceholder):
 
     # -- component access --
     def _c(self, i: int) -> "ScalarView":
-        comp = ScalarView(self._expr[..., i])
+        # The node records the integer key `(..., i)`, which the FEM lowering pattern-matches (`u(region)[i]`
+        # rollers, component gradients), but its value keeps the component axis, (…, 1), like every scalar.
+        # A bare `x[..., i]` gave (N,), so `u[0] * x` against an (N, 1) coordinate broadcast to (N, N).
+        # Only for a NODAL field (strong form: `domain.unknown()`): the FEM weak-form paths evaluate
+        # components of symbols and frozen fields with the bare `[..., i]` and would break.
+        if _nodal_scheme(self._expr) == "finite_difference":
+            fc = FunctionCall(lambda a, _i=i: a[..., _i : _i + 1], [self._expr], name="getitem")
+            fc.getitem_key = (Ellipsis, i)
+            comp = ScalarView(fc)
+        else:
+            comp = ScalarView(self._expr[..., i])
         # Preserve the region binding so a bound view's component
         # (e.g. ``u.bind(x=xr, y=yr)[1]``) still carries ``_coord_vars`` — needed
         # for per-component (roller) Dirichlet and vector boundary terms.
@@ -661,7 +719,7 @@ class VectorView(_DelegatesToPlaceholder):
         Number of variables must equal the last dimension of the vector.
         """
         vars = self._ops_coords(vars)
-        terms = [self._c(i).expr.d(v) for i, v in enumerate(vars)]
+        terms = [self._c(i).expr.d(v, scheme=_nodal_scheme(self._expr)) for i, v in enumerate(vars)]
         total = terms[0]
         for t in terms[1:]:
             total = total + t
@@ -677,12 +735,21 @@ class VectorView(_DelegatesToPlaceholder):
         vars = self._ops_coords(vars)
         if len(vars) == 2:
             x, y = vars
-            return ScalarView(self._c(1).expr.d(x) - self._c(0).expr.d(y))
+            return ScalarView(
+                self._c(1).expr.d(x, scheme=_nodal_scheme(self._expr))
+                - self._c(0).expr.d(y, scheme=_nodal_scheme(self._expr))
+            )
         if len(vars) == 3:
             x, y, z = vars
-            cx = self._c(2).expr.d(y) - self._c(1).expr.d(z)
-            cy = self._c(0).expr.d(z) - self._c(2).expr.d(x)
-            cz = self._c(1).expr.d(x) - self._c(0).expr.d(y)
+            cx = self._c(2).expr.d(y, scheme=_nodal_scheme(self._expr)) - self._c(1).expr.d(
+                z, scheme=_nodal_scheme(self._expr)
+            )
+            cy = self._c(0).expr.d(z, scheme=_nodal_scheme(self._expr)) - self._c(2).expr.d(
+                x, scheme=_nodal_scheme(self._expr)
+            )
+            cz = self._c(1).expr.d(x, scheme=_nodal_scheme(self._expr)) - self._c(0).expr.d(
+                y, scheme=_nodal_scheme(self._expr)
+            )
             # Stack the three scalar components onto a NEW last axis (like ``jacobian``), not ``concat``
             # (concatenate-on-last): for an FEM test function each component is per-DOF ``(n_quad, n_dof)``,
             # which concat would merge into ``(n_quad, 3·n_dof)``; stacking gives the correct
@@ -733,7 +800,7 @@ class VectorView(_DelegatesToPlaceholder):
         coordinates bound by ``.bind(x=.., y=..)``.
         """
         vars = self._ops_coords(vars)
-        cols = [self._expr.d(v) for v in vars]
+        cols = [self._expr.d(v, scheme=_nodal_scheme(self._expr)) for v in vars]
         return MatrixView(
             FunctionCall(
                 lambda *cs: jnp.stack(cs, axis=-1),
@@ -749,6 +816,12 @@ class VectorView(_DelegatesToPlaceholder):
         scalar ``u.grad(x, y) → VectorView`` pattern in dimension.
         """
         return self.jacobian(*vars)
+
+    def laplacian(self, *vars, scheme: str | None = None) -> "VectorView":
+        """Component-wise Laplacian ``Σ_j ∂²u_i/∂x_j²`` → VectorView. With no arguments, uses the
+        coordinates bound by ``.bind(x=.., y=..)``; finite differences by default for a nodal field."""
+        vars = self._ops_coords(vars)
+        return self._rewrap(self._expr.laplacian(*vars, scheme=_nodal_scheme(self._expr, scheme)))
 
     # -- arithmetic — all paths go through _rewrap so subclasses keep state --
     def __add__(self, other):
@@ -839,17 +912,17 @@ class ComplexView(_DelegatesToPlaceholder):
         """Block gradient flow through the [re, im] pair, preserving ComplexView."""
         return self._rewrap(self._expr.stop_gradient)
 
-    def d(self, v, scheme: str = "automatic_differentiation") -> "ComplexView":
+    def d(self, v, scheme: str | None = None) -> "ComplexView":
         """Component-wise ``∂self/∂v`` — same view type."""
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
-        return self._rewrap(self._expr.d(v, scheme=scheme))
+        return self._rewrap(self._expr.d(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def d2(self, v, scheme: str = "automatic_differentiation") -> "ComplexView":
-        return self._rewrap(self._expr.d2(v, scheme=scheme))
+    def d2(self, v, scheme: str | None = None) -> "ComplexView":
+        return self._rewrap(self._expr.d2(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "ComplexView":
-        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+    def dd(self, v, w=None, scheme: str | None = None) -> "ComplexView":
+        return self._rewrap(self._expr.dd(v, w, scheme=_nodal_scheme(self._expr, scheme)))
 
     def partials(self, **named_vars):
         """Bind Variables to names for partial-derivative-by-attribute access.
@@ -1015,10 +1088,10 @@ class ComplexVectorView(_DelegatesToPlaceholder):
     def integrate(self, **kwargs) -> "ComplexVectorView":
         return self._rewrap(self._expr.integrate(**kwargs))
 
-    def d(self, v, scheme: str = "automatic_differentiation") -> "ComplexVectorView":
+    def d(self, v, scheme: str | None = None) -> "ComplexVectorView":
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
-        return self._rewrap(self._expr.d(v, scheme=scheme))
+        return self._rewrap(self._expr.d(v, scheme=_nodal_scheme(self._expr, scheme)))
 
     def partials(self, **named_vars):
         """Bind Variables for partial-by-attribute access; partials are component-wise over [re, im]."""
@@ -1303,17 +1376,17 @@ class MatrixView(_DelegatesToPlaceholder):
         """Block gradient flow element-wise, preserving the MatrixView type."""
         return self._rewrap(self._expr.stop_gradient)
 
-    def d(self, v, scheme: str = "automatic_differentiation") -> "MatrixView":
+    def d(self, v, scheme: str | None = None) -> "MatrixView":
         """Element-wise ``∂self/∂v`` — same view type."""
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
-        return self._rewrap(self._expr.d(v, scheme=scheme))
+        return self._rewrap(self._expr.d(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def d2(self, v, scheme: str = "automatic_differentiation") -> "MatrixView":
-        return self._rewrap(self._expr.d2(v, scheme=scheme))
+    def d2(self, v, scheme: str | None = None) -> "MatrixView":
+        return self._rewrap(self._expr.d2(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "MatrixView":
-        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+    def dd(self, v, w=None, scheme: str | None = None) -> "MatrixView":
+        return self._rewrap(self._expr.dd(v, w, scheme=_nodal_scheme(self._expr, scheme)))
 
     # ------------------------------------------------------------------
     # Basic matrix operations
@@ -1617,17 +1690,17 @@ class VoigtView(_DelegatesToPlaceholder):
         """Block gradient flow component-wise, preserving the VoigtView type."""
         return self._rewrap(self._expr.stop_gradient)
 
-    def d(self, v, scheme: str = "automatic_differentiation") -> "VoigtView":
+    def d(self, v, scheme: str | None = None) -> "VoigtView":
         """Component-wise ``∂self/∂v`` — same view type."""
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
-        return self._rewrap(self._expr.d(v, scheme=scheme))
+        return self._rewrap(self._expr.d(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def d2(self, v, scheme: str = "automatic_differentiation") -> "VoigtView":
-        return self._rewrap(self._expr.d2(v, scheme=scheme))
+    def d2(self, v, scheme: str | None = None) -> "VoigtView":
+        return self._rewrap(self._expr.d2(v, scheme=_nodal_scheme(self._expr, scheme)))
 
-    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "VoigtView":
-        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+    def dd(self, v, w=None, scheme: str | None = None) -> "VoigtView":
+        return self._rewrap(self._expr.dd(v, w, scheme=_nodal_scheme(self._expr, scheme)))
 
     def partials(self, **named_vars):
         """Bind Variables to names for component-wise partial-derivative access.
@@ -2050,9 +2123,7 @@ class FieldViewWithPartials(ScalarView):
     # forcing an explicit ``scheme="finite_difference"`` (see ``TestFieldViewADGuard``).
 
     def _default_deriv_scheme(self) -> str:
-        expr = object.__getattribute__(self, "_expr")
-        model = getattr(expr, "model", None)
-        return "finite_difference" if getattr(model, "_fem_field", None) == "node" else "automatic_differentiation"
+        return _nodal_scheme(object.__getattribute__(self, "_expr"))
 
     def d(self, v, scheme: str | None = None) -> "ScalarView":
         """``∂self/∂v`` — finite differences by default for a nodal field (pass ``scheme=`` to override)."""
@@ -2080,6 +2151,14 @@ class FieldViewWithPartials(ScalarView):
         branch has no ``points`` to differentiate at, so it failed with an opaque ``AttributeError``
         instead of doing the finite-difference thing ``.d`` / ``.d2`` / ``.dd`` already do here.
         """
+        if not variables:  # the coordinates bound with `.bind(x=.., y=..)`, as `grad()` and `div()` use
+            cv = getattr(self, "_coord_vars", None) or {}
+            variables = tuple(
+                sorted(
+                    (v for v in cv.values() if getattr(v, "axis", "spatial") != "temporal"),
+                    key=lambda v: int(getattr(v, "dim", [0])[0]),
+                )
+            )
         return self._rewrap(self._expr.laplacian(*variables, scheme=scheme or self._default_deriv_scheme()))
 
     # ------------------------------------------------------------------
@@ -2247,9 +2326,31 @@ def _make_named_with_partials_cls(view_cls):
             cv = object.__getattribute__(self, "_coord_vars")
             seq = _parse_partial_sequence(key, cv)
             if seq is not None:
-                result = self._expr
-                for name in seq:
-                    result = result.d(cv[name])
+                from . import Hessian, TemporalDerivative
+
+                result, i = self._expr, 0
+                while i < len(seq):
+                    var, scheme = cv[seq[i]], _nodal_scheme(result)
+                    if getattr(var, "axis", None) == "temporal" and scheme == "finite_difference":
+                        # `u.t` of a nodal field is the strong-form time derivative (as the scalar view builds
+                        # it), which a march recognises; a Jacobian in the time coordinate is not.
+                        result = TemporalDerivative(result, var)
+                        i += 1
+                        continue
+                    if (
+                        scheme == "finite_difference"
+                        and i + 1 < len(seq)
+                        and seq[i + 1] == seq[i]
+                        and getattr(var, "axis", None) != "temporal"
+                    ):
+                        # `.xx` on a nodal field: the compact second difference, as the scalar view builds
+                        # it. Chaining two first derivatives gave the wide gradient-of-gradient stencil
+                        # (24 off the Laplacian at the boundary of a Kovasznay grid), and Newton diverged.
+                        result = Hessian(result, [var], scheme, trace=True)
+                        i += 2
+                        continue
+                    result = result.d(var, scheme=scheme)
+                    i += 1
                 return type(self)._base_view(result)
             return getattr(object.__getattribute__(self, "_expr"), key)
 
