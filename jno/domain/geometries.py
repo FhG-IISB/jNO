@@ -82,21 +82,16 @@ class Geometries:
             # =========================================================================
             # Create volume cells (2D): two triangles per rectangle, or one quad
             # =========================================================================
-            volume_cells = []
-            for i in range(nx):
-                for j in range(ny):
-                    p0 = idx(i, j)
-                    p1 = idx(i + 1, j)
-                    p2 = idx(i + 1, j + 1)
-                    p3 = idx(i, j + 1)
-
-                    if cell == "quad":
-                        volume_cells.append([p0, p1, p2, p3])  # ccw from lower-left
-                    else:
-                        volume_cells.append([p0, p1, p2])
-                        volume_cells.append([p0, p2, p3])
-
-            vcells = np.array(volume_cells, dtype=np.int64)
+            # Vectorised over the rectangles, in the (i, j) order and per-cell vertex order of the loop it
+            # replaced: quads ccw from lower-left, or the triangles (p0, p1, p2), (p0, p2, p3).
+            ii, jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+            ii, jj = ii.ravel(), jj.ravel()
+            p0, p1, p2, p3 = idx(ii, jj), idx(ii + 1, jj), idx(ii + 1, jj + 1), idx(ii, jj + 1)
+            if cell == "quad":
+                vcells = np.stack([p0, p1, p2, p3], axis=1).astype(np.int64)
+            else:
+                vcells = np.stack([np.stack([p0, p1, p2], 1), np.stack([p0, p2, p3], 1)], axis=1).reshape(-1, 3)
+                vcells = vcells.astype(np.int64)
 
             # =========================================================================
             # Create boundary edges (1D cells)
@@ -245,17 +240,15 @@ class Geometries:
             # VTK hexahedron order in the same local-corner encoding: the z=0 face counterclockwise
             # (as seen from +z) then the z=1 face directly above it.
             vtk_hex = (0, 4, 6, 2, 1, 5, 7, 3)
-            tets = []
-            for i in range(nx):
-                for j in range(ny):
-                    for k in range(nz):
-                        corner = [idx(i + ((c >> 2) & 1), j + ((c >> 1) & 1), k + (c & 1)) for c in range(8)]
-                        if cell == "hex":
-                            tets.append([corner[c] for c in vtk_hex])
-                        else:
-                            for a, b, cc, dd in kuhn:
-                                tets.append([corner[a], corner[b], corner[cc], corner[dd]])
-            tets = np.array(tets, dtype=np.int64)
+            # Vectorised over the voxels (a Python loop took 7 s at 96³); same voxel order (i, j, k) and the
+            # same local order inside each voxel as the loop it replaces.
+            ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+            ii, jj, kk = ii.ravel(), jj.ravel(), kk.ravel()
+            corner = np.stack([idx(ii + ((c >> 2) & 1), jj + ((c >> 1) & 1), kk + (c & 1)) for c in range(8)], axis=1)
+            if cell == "hex":
+                tets = corner[:, list(vtk_hex)].astype(np.int64)
+            else:
+                tets = corner[:, np.asarray(kuhn)].reshape(-1, 4).astype(np.int64)
 
             # Boundary faces: each box face is a quad grid. A tet mesh splits every quad into two
             # triangles; a hex mesh keeps it, since a hexahedron's facet IS a quadrilateral.
