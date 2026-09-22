@@ -34,6 +34,7 @@ path is unaffected.
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | `jno.derived` nonlocal fields | nodal Lagrange `on=` only; no chained derived fields; host geometry closed over by the rule is **frozen at build**, so it goes stale on a moving mesh | raises, except the moving mesh — **silent** |
 | Plasticity | small-strain, isotropic, linear-hardening | raises |
+| Adapting a moving mesh | `relocate` fails on two separate bodies (use `alpha`); `enrich()` (p) is not wired; `checkpoint=` needs `adapt=`; runtime connectivity is affine-simplex only | raises |
 | Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
 | FEM functionals (`fem.eval(F, u)` with a test-free `F`, `expr.integrate(fem)`) | steady, native Lagrange; the whole volume or a tagged boundary region — not a sub-region; not transient, complex, 1-D, non-nodal or VPINN (use `sum(fem.eval(F * phi, u))` there) | raises |
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |

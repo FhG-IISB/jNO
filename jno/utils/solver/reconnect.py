@@ -58,7 +58,9 @@ def _manage_nodes(
 
     edges = np.unique(np.sort(np.concatenate([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]), axis=1), axis=0)
     length = np.linalg.norm(X[edges[:, 0]] - X[edges[:, 1]], axis=1)
-    too_long = np.flatnonzero(length > long_f * h)
+    hv = np.broadcast_to(np.asarray(h, dtype=float).reshape(-1), (X.shape[0],)) if np.asarray(h).ndim else None
+    he = 0.5 * (hv[edges[:, 0]] + hv[edges[:, 1]]) if hv is not None else float(h)
+    too_long = np.flatnonzero(length > long_f * he)
     if too_long.size:
         budget = max(1, int(max_growth * X.shape[0]))
         if too_long.size > budget:  # serve the worst offenders first
@@ -67,9 +69,12 @@ def _manage_nodes(
 
     drop: set[int] = set()
     if short_f > 0.0:
-        for i, j in cKDTree(X).query_pairs(short_f * h, output_type="ndarray"):
+        _hmax = float(np.max(hv)) if hv is not None else float(h)
+        for i, j in cKDTree(X).query_pairs(short_f * _hmax, output_type="ndarray"):
             if i in drop or j in drop:
                 continue
+            if hv is not None and np.linalg.norm(X[i] - X[j]) > short_f * 0.5 * (hv[i] + hv[j]):
+                continue  # the KD-tree query used the GLOBAL max; re-test against the local scale
             if not on_bnd[i]:
                 drop.add(int(i))
             elif not on_bnd[j]:
@@ -77,7 +82,30 @@ def _manage_nodes(
     keep = np.ones(X.shape[0], dtype=bool)
     if drop:
         keep[list(drop)] = False
-    return np.concatenate([X[keep], fresh]) if fresh.size else X[keep], int(fresh.shape[0]), len(drop)
+    out = np.concatenate([X[keep], fresh]) if fresh.size else X[keep]
+    # The length scale rides the nodes: a kept node keeps its own, and an inserted MIDPOINT takes the
+    # mean of the two it splits. Without this the field is stale the moment management fires, and the
+    # filter indexes it with the new cell array -- an IndexError at best, the wrong threshold at worst.
+    if hv is None:
+        h_out = h
+    else:
+        h_new = 0.5 * (hv[edges[too_long, 0]] + hv[edges[too_long, 1]]) if fresh.size else hv[:0]
+        h_out = np.concatenate([hv[keep], h_new]) if fresh.size else hv[keep]
+    return out, int(fresh.shape[0]), len(drop), h_out
+
+
+def _h_at(h, pts: np.ndarray, cells: np.ndarray):
+    """Per-cell length scale: the mean of its vertices' sizes, or the scalar if ``h`` is one.
+
+    A GRADED mesh has no single length scale, and forcing one breaks the filter at both ends: with the
+    mean, coarse-region cells exceed ``alpha*h`` and their nodes are reported as free particles; with
+    the coarse value, the fine region fuses surfaces that are genuinely apart. Both thresholds the
+    filter applies are per-cell or per-edge quantities already, so they take a per-node ``h`` directly.
+    """
+    h = np.asarray(h, dtype=float)
+    if h.ndim == 0:
+        return float(h)
+    return h[cells].mean(axis=1)
 
 
 def alpha_reconnect(
@@ -125,7 +153,12 @@ def alpha_reconnect(
             f"alpha reconnection is 2-D only; got points of shape {X.shape}. In 3-D the Delaunay + alpha "
             "filter leaves sliver tetrahedra, a known PFEM problem that needs its own treatment."
         )
-    if not (h > 0.0 and alpha > 0.0):
+    h = np.asarray(h, dtype=float)
+    if h.ndim not in (0, 1) or (h.ndim == 1 and h.shape[0] != X.shape[0]):
+        raise ValueError(
+            f"alpha reconnection: h must be a scalar or one value PER POINT ({X.shape[0]}); got shape {h.shape}."
+        )
+    if not (np.all(h > 0.0) and alpha > 0.0):
         raise ValueError(f"alpha reconnection needs h > 0 and alpha > 0; got h={h}, alpha={alpha}.")
     if hysteresis < 1.0:
         raise ValueError(
@@ -135,17 +168,18 @@ def alpha_reconnect(
     def _filter(pts: np.ndarray, prev: np.ndarray | None) -> np.ndarray:
         cells = Delaunay(pts).simplices
         radius = _circumradius_2d(pts[cells])
-        keep = radius < alpha * h
+        hc = _h_at(h, pts, cells)  # per-cell length scale: a GRADED mesh has no single one
+        keep = radius < alpha * hc
         if prev is not None and np.asarray(prev).size:
             # A cell already in use survives up to the wider threshold -- see the docstring on flicker.
             held = {tuple(c) for c in np.sort(np.asarray(prev, dtype=np.int64), axis=1)}
             existing = np.fromiter((tuple(c) in held for c in np.sort(cells, axis=1)), dtype=bool, count=cells.shape[0])
-            keep |= existing & (radius < hysteresis * alpha * h)
+            keep |= existing & (radius < hysteresis * alpha * hc)
         return cells[keep]
 
     cells = _filter(X, previous)
     if manage:
-        moved, n_new, n_gone = _manage_nodes(X, cells, h, long_f=long_f, short_f=short_f, max_growth=max_growth)
+        moved, n_new, n_gone, h = _manage_nodes(X, cells, h, long_f=long_f, short_f=short_f, max_growth=max_growth)
         if n_new or n_gone:
             # The node numbering has changed, so `previous` no longer names the same cells: this pass runs
             # on the plain threshold. Node management is occasional, so the hysteresis that steadies the

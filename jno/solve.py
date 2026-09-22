@@ -29,6 +29,7 @@ import numpy as _np
 
 if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
     from .utils.solver.fem_adapt import AdaptSpec
+    from .utils.solver.march_checkpoint import CheckpointSpec
 
 from .utils.solver.solver_api import (
     ContinuationSpec,
@@ -69,6 +70,7 @@ __all__ = [
     "adaptive",
     "arclength",
     "remesh",
+    "checkpoint",
     "enrich",
     "refine",
     "relocate",
@@ -1017,6 +1019,53 @@ def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, ma
     return _lstsq(A, b, damp=damp, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
 
 
+def checkpoint(
+    path: str,
+    *,
+    every: int = 500,
+    keep: str = "last",
+    resume: bool = True,
+) -> CheckpointSpec:
+    """**Checkpoint a moving-mesh march** to disk: ``fem.solve(adapt=..., checkpoint=...)``.
+
+    A march holds every frame in memory and returns them only when ``solve()`` returns, so a run
+    that dies -- OOM, a kill, a power cut -- yields **nothing**, however far it got. This writes
+    frames to ``path`` as they are produced and records what the march needs to restart, so a dead
+    run costs the last partial chunk instead of everything.
+
+    The restart is not new machinery: a topology rebuild already re-enters the march with
+    ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``. That tuple is the
+    checkpoint; this only writes it down.
+
+    ``every`` -- steps between writes. A write also happens at every rebuild, which is where the
+    field layout changes and therefore where a restart has to begin anyway.
+
+    ``keep`` -- ``"last"`` (default) flushes each chunk and **drops it from memory**; the returned
+    trajectory loads frames from disk on demand, so a march no longer has to fit in RAM. ``"all"``
+    keeps everything resident as before, and checkpoints purely for crash-resilience.
+
+    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over.
+    A finished run (``complete`` in its manifest) is never resumed; delete the directory to redo it.
+
+    Note this is about the TRAJECTORY, not the solver's working set: per-step memory is already flat
+    (measured: 752 steps added 2 MB). What grows a long adaptive march is the rebuild path.
+
+    Example::
+
+        traj = fem.solve(
+            nonlinear=jno.solve.newton(direct=True),
+            adapt=jno.solve.remesh(alpha=1.2, every=1),
+            checkpoint=jno.solve.checkpoint("runs/ball", every=500),
+        )
+
+    Returns:
+        CheckpointSpec: pass as ``fem.solve(checkpoint=...)``.
+    """
+    from .utils.solver.march_checkpoint import CheckpointSpec
+
+    return CheckpointSpec(path=str(path), every=int(every), keep=str(keep), resume=bool(resume))
+
+
 def remesh(
     *,
     criterion: Any = None,
@@ -1234,138 +1283,167 @@ def relocate(
     quality_floor: float = 0.1,
     relax: int = 60,
     relax_step: float = 0.1,
+    every: int = 5,
+    escalate: float | None = None,
+    escalate_growth: float = 1.2,
 ) -> AdaptSpec:
     """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
 
-    Moves the vertices tagged ``domain.variable(region)[i].trainable()`` so the mesh **equidistributes**
-    the solution's features, at fixed connectivity and no new DOFs::
+        Moves the vertices tagged ``domain.variable(region)[i].trainable()`` so the mesh **equidistributes**
+        the solution's features, at fixed connectivity and no new DOFs::
 
-        xm, ym, _ = domain.variable("core", where=interior, split=True)
-        xm.trainable(); ym.trainable()                  # BEFORE jno.fem(...)
-        u = fem.solve(adapt=jno.solve.relocate())
+            xm, ym, _ = domain.variable("core", where=interior, split=True)
+            xm.trainable(); ym.trainable()                  # BEFORE jno.fem(...)
+            u = fem.solve(adapt=jno.solve.relocate())
 
-    Requires at least one coordinate tagged ``.trainable()`` before ``jno.fem`` (else it raises).
-    Tagging is **literal and per-axis**: ``xm.trainable()`` frees only the x column. That is the lever for
-    boundary vertices — free an edge's *along-edge* axis and its nodes slide within the wall; leave the
-    normal axis untagged and the domain shape is preserved exactly.
+        Requires at least one coordinate tagged ``.trainable()`` before ``jno.fem`` (else it raises).
+        Tagging is **literal and per-axis**: ``xm.trainable()`` frees only the x column. That is the lever for
+        boundary vertices — free an edge's *along-edge* axis and its nodes slide within the wall; leave the
+        normal axis untagged and the domain shape is preserved exactly.
 
-    **Two objectives, and the choice is the problem's, not a preference.** ``objective=`` picks *what*
-    descent minimises:
+        **Two objectives, and the choice is the problem's, not a preference.** ``objective=`` picks *what*
+        descent minimises:
 
-    - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
-      and wins where a feature is under-resolved or moving.
-    - ``"energy"`` descends the **FE Dirichlet energy**, and it is the error norm **only on a
-      SOURCE-FREE problem**. The Ritz functional is ``J(v) = 1/2 a(v,v) - (f,v)``, and it is ``J`` that
-      satisfies ``J_h - J_exact = 1/2 ||u - u_h||_E^2``. With no body load ``J = E``, so descending the
-      energy descends the error -- that is the L-shape column below. Add a source and ``J_h = -E_h`` at
-      the discrete solution, so minimising the error means **maximising** ``E``: descending it walks
-      away from the solution, and squashing elements is the cheapest way to lower ``∫|∇u|²``. Measured
-      on an L-shape driven by a compact bump: the optimiser duly cut ``E`` from 0.12252 to 0.10788
-      while the true error ROSE 3.6x and the mesh's smallest angle collapsed 40.8° -> 3.2°. Until this
-      is fixed, use the default on any problem carrying a source or reaction term. For a Ritz method
-      ``E_h - E_exact = 1/2 ||u - u_h||_E^2`` (source-free), so there the energy *is* the error norm and
-      descending it minimises the error directly.
-    - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
+        - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
+          and wins where a feature is under-resolved or moving.
+        - ``"energy"`` descends the **FE Dirichlet energy**, and it is the error norm **only on a
+          SOURCE-FREE problem**. The Ritz functional is ``J(v) = 1/2 a(v,v) - (f,v)``, and it is ``J`` that
+          satisfies ``J_h - J_exact = 1/2 ||u - u_h||_E^2``. With no body load ``J = E``, so descending the
+          energy descends the error -- that is the L-shape column below. Add a source and ``J_h = -E_h`` at
+          the discrete solution, so minimising the error means **maximising** ``E``: descending it walks
+          away from the solution, and squashing elements is the cheapest way to lower ``∫|∇u|²``. Measured
+          on an L-shape driven by a compact bump: the optimiser duly cut ``E`` from 0.12252 to 0.10788
+          while the true error ROSE 3.6x and the mesh's smallest angle collapsed 40.8° -> 3.2°. Until this
+          is fixed, use the default on any problem carrying a source or reaction term. For a Ritz method
+          ``E_h - E_exact = 1/2 ||u - u_h||_E^2`` (source-free), so there the energy *is* the error norm and
+          descending it minimises the error directly.
+        - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
 
-    **Or a weak-form expression**, when the mesh has a job the three functionals cannot state. They are
-    mesh-*quality* measures: they see the solution only through a monitor, so they can ask for
-    resolution but not for a physical condition. An expression is assembled exactly as ``criterion=``
-    is and summed to a scalar, over a **volume or a boundary** region::
+        **Or a weak-form expression**, when the mesh has a job the three functionals cannot state. They are
+        mesh-*quality* measures: they see the solution only through a monitor, so they can ask for
+        resolution but not for a physical condition. An expression is assembled exactly as ``criterion=``
+        is and summed to a scalar, over a **volume or a boundary** region::
 
-        xs, ys, ns = domain.variable("side", normals=True, split=True)
-        ys.trainable()                                   # the wall may move along y only
-        us = u.bind(x=xs, y=ys)
-        fem.solve(adapt=jno.solve.relocate(objective=jno.np.inner(us, ns) ** 2))
+            xs, ys, ns = domain.variable("side", normals=True, split=True)
+            ys.trainable()                                   # the wall may move along y only
+            us = u.bind(x=xs, y=ys)
+            fem.solve(adapt=jno.solve.relocate(objective=jno.np.inner(us, ns) ** 2))
 
-    That is a **free surface**: the wall is moved until the flow through it vanishes. The facet normals
-    are rebuilt from the moving vertices, so ``n`` is the current mesh's normal, not the initial one.
-    The gradient runs through the solve, as it does for the strings — matched to central differences at
-    7.5e-09 on a Stokes channel whose no-slip bottom couples the flow to the wall's position, where the
-    through-flow falls 11.4x over 60 rounds (12.5x at 120: this is a descent, not a root-find).
+        That is a **free surface**: the wall is moved until the flow through it vanishes. The facet normals
+        are rebuilt from the moving vertices, so ``n`` is the current mesh's normal, not the initial one.
+        The gradient runs through the solve, as it does for the strings — matched to central differences at
+        7.5e-09 on a Stokes channel whose no-slip bottom couples the flow to the wall's position, where the
+        through-flow falls 11.4x over 60 rounds (12.5x at 120: this is a descent, not a root-find).
 
-    Two things to know. The objective is a **scalar**, so it needs a scalar test function: on a
-    velocity/pressure saddle the pressure test is picked automatically. And when the expression reaches
-    its region only through a **bound view** (``u.bind(x=xr, y=yr)``, which absorbs its coordinates),
-    the test function cannot be auto-bound — carry it yourself, ``objective=<expr> * v_r[0]``. That
-    case raises with this instruction rather than a trace-level binding error.
+    **h-adaptivity only when r-adaptivity is not enough.** ``escalate=tol`` adds a fallback: after each
+        relocation the **P1 interpolation error** of the relocated mesh is measured, and if its p90 exceeds
+        ``tol`` (relative to the field's range) the march stops moving nodes and adds some, via the
+        anisotropic ``mmg`` path so the new elements are stretched along the feature::
 
-    The region's facet quadrature tables are built only when the **form** carries a surface term, so a
-    surface objective needs the boundary term to be in the ``jno.fem([...])`` list (a traction-free
-    wall, ``0.0 * v_r[0]``, is enough).
+            fem.solve(adapt=jno.solve.relocate(method="monge_ampere", every=20, escalate=0.5))
 
-    Neither dominates, measured on the two problem types the test suite pins:
+        Relocation gets first refusal because it costs ~0.4 ms against the 8-15 s a node-set change costs,
+        and escalation then *measures* whether that was enough instead of assuming it. The vertex budget
+        grows by ``escalate_growth`` each time, capped by ``max_dofs``; the loop is self-limiting, since
+        more vertices lower the indicator and the gate stops tripping.
 
-    ==========================  =========================  =========================
-    objective                   L-shape corner (fixed)     Allen–Cahn front (moving)
-    ==========================  =========================  =========================
-    ``"energy"``                **55 % error cut**         10.7x WORSE than uniform
-    ``"equidistribution"``      12 % worse                 **0.51x uniform**
-    ==========================  =========================  =========================
+        The trigger is deliberately **not** a shape-quality floor. On an anisotropically adapted mesh an
+        isotropic quality measure is anti-correlated with the mesh being good: measured on the 600 W melt
+        ball at 26 / 74 / 163 nodes, the interpolation error's p90 falls 0.306 -> 0.172 -> 0.078 while the
+        number of cells rejected by ``4 sqrt(3) A / sum l^2 < 0.2`` RISES 1 -> 5 -> 8. Triggering on the
+        latter refines a mesh that is already right -- and at the final frame it flagged 5 cells of which
+        **none** was genuinely bad (stretched *and* across the feature), while 1 truly bad cell went
+        unflagged.
 
-    So: a **fixed singularity** wants ``"energy"``; an **under-resolved or moving front** wants the
-    default. The energy is also not scale-free — a vector field carries the energy of all its components,
-    so ``lr`` is problem-scaled — where the monitor functionals are.
+            Two things to know. The objective is a **scalar**, so it needs a scalar test function: on a
+        velocity/pressure saddle the pressure test is picked automatically. And when the expression reaches
+        its region only through a **bound view** (``u.bind(x=xr, y=yr)``, which absorbs its coordinates),
+        the test function cannot be auto-bound — carry it yourself, ``objective=<expr> * v_r[0]``. That
+        case raises with this instruction rather than a trace-level binding error.
 
-    **Two methods.** ``"descent"`` (default) walks the vertices down the equidistribution defect of an
-    arclength monitor, evaluated *through the differentiable solve*, with a backtracking ``det J`` line
-    search — on a stiff problem neither a stock optimiser nor an energy barrier can guarantee validity from
-    outside the step control. ``"monge_ampere"`` instead solves ``m·det(I + H(φ)) = θ`` for a mesh potential
-    and takes ``x = ξ + ∇φ`` (McRae, Cotter & Budd, *Optimal-transport-based mesh adaptivity on the plane
-    and sphere using finite elements*, SIAM J. Sci. Comput. **40**(2) (2018) A1121–A1148, arXiv:1612.08077,
-    §3.1); the displacement is a gradient, so the *whole* map cannot fold and no line search is needed.
+        The region's facet quadrature tables are built only when the **form** carries a surface term, so a
+        surface objective needs the boundary term to be in the ``jno.fem([...])`` list (a traction-free
+        wall, ``0.0 * v_r[0]``, is enough).
 
-    Measured on the Allen–Cahn front the suite uses (``h = 0.06``, ``eps = 0.03``, 377 nodes), error on a
-    common fine grid so the comparison does not depend on where each mesh puts its nodes:
+        Neither dominates, measured on the two problem types the test suite pins:
 
-    ==================  ===========  ============  ==================
-    method              rel-L2       vs uniform    min element quality
-    ==================  ===========  ============  ==================
-    uniform             1.096e-01    1.000         0.834
-    ``"descent"``       3.951e-02    **0.361**     0.503
-    ``"monge_ampere"``  8.879e-02    0.811         0.160
-    ==================  ===========  ============  ==================
+        ==========================  =========================  =========================
+        objective                   L-shape corner (fixed)     Allen–Cahn front (moving)
+        ==========================  =========================  =========================
+        ``"energy"``                **55 % error cut**         10.7x WORSE than uniform
+        ``"equidistribution"``      12 % worse                 **0.51x uniform**
+        ==========================  =========================  =========================
 
-    So descent stays the default: Monge–Ampère converges in far fewer rounds (3–6 against 30) and reaches a
-    comparable equidistribution defect, but it degrades element quality badly here and the answer with it.
-    Lowering ``relax_step`` recovers part of the gap (0.811 → 0.633 at ``relax_step=0.02``).
+        So: a **fixed singularity** wants ``"energy"``; an **under-resolved or moving front** wants the
+        default. The energy is also not scale-free — a vector field carries the energy of all its components,
+        so ``lr`` is problem-scaled — where the monitor functionals are.
 
-    Works in **2D and 3D**, on a scalar or vector field of **any nodal-Lagrange order**, and across linear,
-    nonlinear, transient, periodic and complex problems (all but complex-*transient*). It does not compose
-    with a moving mesh (``coord.d(t) - v``) — that driver owns the march.
+        **Two methods.** ``"descent"`` (default) walks the vertices down the equidistribution defect of an
+        arclength monitor, evaluated *through the differentiable solve*, with a backtracking ``det J`` line
+        search — on a stiff problem neither a stock optimiser nor an energy barrier can guarantee validity from
+        outside the step control. ``"monge_ampere"`` instead solves ``m·det(I + H(φ)) = θ`` for a mesh potential
+        and takes ``x = ξ + ∇φ`` (McRae, Cotter & Budd, *Optimal-transport-based mesh adaptivity on the plane
+        and sphere using finite elements*, SIAM J. Sci. Comput. **40**(2) (2018) A1121–A1148, arXiv:1612.08077,
+        §3.1); the displacement is a gradient, so the *whole* map cannot fold and no line search is needed.
 
-    Further limits, measured rather than argued:
+        Measured on the Allen–Cahn front the suite uses (``h = 0.06``, ``eps = 0.03``, 377 nodes), error on a
+        common fine grid so the comparison does not depend on where each mesh puts its nodes:
 
-    - **The monitor reads vertex values only**, whatever the element order, so at P2 and above it adapts to
-      the P1 sub-sampling of the field rather than to everything the field resolves. Higher order still
-      relocates correctly; it just does not get a sharper monitor for the extra DOFs.
-    - **Monge–Ampère's non-folding is a property of the whole map.** Holding a subset of vertices truncates
-      it, and the truncation is what can tangle: on a 21² square with a diagonal front, freezing the whole
-      boundary reached ``min det J = -1.2e-03`` where the full map stayed positive throughout. Freeing
-      tangential axes recovers nearly all of it. Either method checks ``det J`` each round and keeps the
-      last valid mesh, so a bad tagging costs accuracy, not correctness.
-    - Its relaxation is explicit in ``relax_step``: past the stability limit more iterations make things
-      *worse* (spread 0.111 → 0.292 going from ``relax=40`` to ``300`` at ``relax_step=0.2``).
-    - The monitor is arclength-based, which suits an **under-resolved** feature; on an already
-      well-resolved mesh a curvature monitor wins. Not yet selectable.
-    - Relocation beats :func:`remesh` when features are few and sharp; loses when they are spread through
-      the domain (with four separated fronts the crossover moved below one element per feature width) or
-      when the mesh already over-resolves them. The two **compose** — remesh, then relocate on the result.
+        ==================  ===========  ============  ==================
+        method              rel-L2       vs uniform    min element quality
+        ==================  ===========  ============  ==================
+        uniform             1.096e-01    1.000         0.834
+        ``"descent"``       3.951e-02    **0.361**     0.503
+        ``"monge_ampere"``  8.879e-02    0.811         0.160
+        ==================  ===========  ============  ==================
 
-    Args:
-        method: ``"descent"`` or ``"monge_ampere"``.
-        max_iters: Outer relocation rounds.
-        lr: ``"descent"`` only — base step for the RMS-normalised descent.
-        quality_floor: ``"descent"`` only — a step is halved until no element's ``|det J|`` falls below this
-            fraction of the initial worst element.
-        relax: ``"monge_ampere"`` only — relaxation iterations per round (McRae et al. eq. (3.7)). Each is
-            one Poisson solve against a matrix factorized once for the whole run, so these are cheap.
-        relax_step: ``"monge_ampere"`` only — the relaxation pseudo-step ``Δt``.
+        So descent stays the default: Monge–Ampère converges in far fewer rounds (3–6 against 30) and reaches a
+        comparable equidistribution defect, but it degrades element quality badly here and the answer with it.
+        Lowering ``relax_step`` recovers part of the gap (0.811 → 0.633 at ``relax_step=0.02``).
 
-    Returns:
-        AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
+        Works in **2D and 3D**, on a scalar or vector field of **any nodal-Lagrange order**, and across linear,
+        nonlinear, transient, periodic and complex problems (all but complex-*transient*). It does not compose
+        with a moving mesh (``coord.d(t) - v``) — that driver owns the march.
+
+        Further limits, measured rather than argued:
+
+        - **The monitor reads vertex values only**, whatever the element order, so at P2 and above it adapts to
+          the P1 sub-sampling of the field rather than to everything the field resolves. Higher order still
+          relocates correctly; it just does not get a sharper monitor for the extra DOFs.
+        - **Monge–Ampère's non-folding is a property of the whole map.** Holding a subset of vertices truncates
+          it, and the truncation is what can tangle: on a 21² square with a diagonal front, freezing the whole
+          boundary reached ``min det J = -1.2e-03`` where the full map stayed positive throughout. Freeing
+          tangential axes recovers nearly all of it. Either method checks ``det J`` each round and keeps the
+          last valid mesh, so a bad tagging costs accuracy, not correctness.
+        - Its relaxation is explicit in ``relax_step``: past the stability limit more iterations make things
+          *worse* (spread 0.111 → 0.292 going from ``relax=40`` to ``300`` at ``relax_step=0.2``).
+        - The monitor is arclength-based, which suits an **under-resolved** feature; on an already
+          well-resolved mesh a curvature monitor wins. Not yet selectable.
+        - Relocation beats :func:`remesh` when features are few and sharp; loses when they are spread through
+          the domain (with four separated fronts the crossover moved below one element per feature width) or
+          when the mesh already over-resolves them. The two **compose** — remesh, then relocate on the result.
+
+        Args:
+            method: ``"descent"`` or ``"monge_ampere"``.
+            max_iters: Outer relocation rounds.
+            lr: ``"descent"`` only — base step for the RMS-normalised descent.
+            quality_floor: ``"descent"`` only — a step is halved until no element's ``|det J|`` falls below this
+                fraction of the initial worst element.
+            relax: ``"monge_ampere"`` only — relaxation iterations per round (McRae et al. eq. (3.7)). Each is
+                one Poisson solve against a matrix factorized once for the whole run, so these are cheap.
+            relax_step: ``"monge_ampere"`` only — the relaxation pseudo-step ``Δt``.
+
+        Returns:
+            AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
     """
     if method not in ("descent", "monge_ampere"):
         raise ValueError(f"jno.solve.relocate(method={method!r}): expected 'descent' or 'monge_ampere'.")
+    if escalate is not None and not (float(escalate) > 0.0):
+        raise ValueError(f"jno.solve.relocate(escalate={escalate!r}): a relative error tolerance must be > 0.")
+    if not (float(escalate_growth) > 1.0):
+        raise ValueError(
+            f"jno.solve.relocate(escalate_growth={escalate_growth!r}): must be > 1.0 — an escalation adds vertices."
+        )
     from .utils.solver.fem_adapt import AdaptSpec
 
     return AdaptSpec(
@@ -1377,6 +1455,9 @@ def relocate(
         quality_floor=quality_floor,
         ma_relax=relax,
         ma_dt=relax_step,
+        every=int(every),
+        escalate=None if escalate is None else float(escalate),
+        escalate_growth=float(escalate_growth),
     )
 
 
