@@ -1918,7 +1918,9 @@ def test_forward_euler_matches_the_discrete_decay(k, slots):
     mode = np.sin(k * np.pi * p[:, 0]) * np.sin(k * np.pi * p[:, 1])
     factor = (1.0 - T / (n - 1) * 8.0 / h**2 * np.sin(k * np.pi * h / 2) ** 2) ** np.arange(n)
     for i in (10, 50, n - 1):
-        assert np.abs(traj[i] - factor[i] * mode).max() < 1e-8 * abs(factor[i]), (i, factor[i])
+        # the step's Newton converges to an absolute tolerance, so a state decayed to 1e-7 is exact to
+        # ~1e-15 absolutely, not to 1e-8 relative to itself
+        assert np.abs(traj[i] - factor[i] * mode).max() < 1e-8 * abs(factor[i]) + 1e-12, (i, factor[i])
 
 
 @pytest.mark.parametrize("theta", [0.0, 0.5])
