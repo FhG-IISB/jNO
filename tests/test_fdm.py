@@ -2004,3 +2004,25 @@ def test_cg_on_a_nonlinear_unstructured_problem_refuses():
     """The cotangent rows are divided by nodal areas, so the eliminated tangent is still not symmetric."""
     with pytest.raises(ValueError, match="needs a symmetric operator"):
         _bratu(jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)).solve(linear=jno.solve.cg())
+
+
+@pytest.mark.parametrize("linear", ["lu", "gmres", "bicgstab", "cg"])
+def test_gradient_through_a_nonlinear_solve_with_any_linear_slot(linear):
+    """d(mean u²)/dg for a Dirichlet value g·xy on Bratu, against a central difference. With an iterative
+    slot `jax.grad` raised "Reverse-mode differentiation does not work for lax.while_loop": the direct
+    Newton's forward loop closed over the parameter, and the Krylov residual gate kept its tangents alive."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured().domain()
+
+    def solve(g, **slots):
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        S = jno.np.sin(np.pi * x) * jno.np.sin(np.pi * y)
+        f = 2 * np.pi**2 * S - 2.0 * jno.np.exp(S + 0.5 * x * y)
+        terms = [-(ui.xx + ui.yy) - 2.0 * jno.np.exp(ui) - f, u(xb, yb) - g * xb * yb]
+        return jnp.mean(jnp.asarray(jno.fdm(terms).solve(**slots)).reshape(-1) ** 2)
+
+    fd = (float(solve(0.5 + 1e-5)) - float(solve(0.5 - 1e-5))) / 2e-5
+    got = float(jax.grad(lambda g: solve(g, linear=getattr(jno.solve, linear)()))(0.5))
+    assert abs(got - fd) < 1e-8 * abs(fd), (got, fd)

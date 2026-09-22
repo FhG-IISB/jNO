@@ -53,8 +53,11 @@ def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None):
     """
     if any(isinstance(v, jax.core.Tracer) for v in (u, u0)):
         return u
-    rn = float(jnp.linalg.norm(f0(u)))
-    bound = atol + rtol * float(jnp.linalg.norm(f0(u0)))
+    r, r0 = f0(u), f0(u0)
+    if any(isinstance(v, jax.core.Tracer) for v in (r, r0)):  # a concrete root of a residual under `grad`
+        return u
+    rn = float(jnp.linalg.norm(r))
+    bound = atol + rtol * float(jnp.linalg.norm(r0))
     LAST_NEWTON_STATS.clear()
     LAST_NEWTON_STATS.update(
         driver=who,
@@ -442,11 +445,22 @@ def newton_direct(
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
     u0 = jnp.asarray(u0).reshape(-1)
 
+    # The forward loop must carry no tangents: the gradient comes from `custom_root` below, never from
+    # the loop. Closed over directly, the residual's parameters made `jax.grad` trace the loop, which it
+    # cannot transpose ("Reverse-mode differentiation does not work for lax.while_loop"). `lu` got away
+    # with it because those tangents were dead code; a Krylov slot's residual gate keeps them alive, so
+    # every iterative `linear=` on this path was not differentiable.
+    f_c, f_consts = jax.closure_convert(f0, u0)
+    J_c, J_consts = jax.closure_convert(jacobian_fn, u0)
+    f_consts, J_consts = jax.lax.stop_gradient((f_consts, J_consts))
+    f_fwd = lambda u: f_c(u, *f_consts)  # noqa: E731
+    J_fwd = lambda u: J_c(u, *J_consts)  # noqa: E731
+
     def _backtrack(u, delta, rn):  # residual-norm Armijo -- the same retreat newton_krylov uses
-        return _retreat(_armijo(f0, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
+        return _retreat(_armijo(f_fwd, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
     def _forward(x0):
-        r0n = jnp.linalg.norm(f0(x0))
+        r0n = jnp.linalg.norm(f_fwd(x0))
 
         def cond(state):
             _u, r, k = state
@@ -454,13 +468,13 @@ def newton_direct(
 
         def body(state):
             u, _r, k = state
-            r = f0(u)
-            delta = linear_solve(jacobian_fn(u), -r)  # DIRECT solve of the assembled tangent
+            r = f_fwd(u)
+            delta = linear_solve(J_fwd(u), -r)  # DIRECT solve of the assembled tangent
             alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
             u = u + alpha * delta
-            return u, f0(u), k + 1
+            return u, f_fwd(u), k + 1
 
-        u, _r, k = jax.lax.while_loop(cond, body, (x0, f0(x0), 0))
+        u, _r, k = jax.lax.while_loop(cond, body, (x0, f_fwd(x0), 0))
         return u, k
 
     root, _steps = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
