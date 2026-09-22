@@ -775,7 +775,16 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # this library targets (an un-checkpointed 6000-step × 18k-DOF case failed to allocate 5.72 GiB
     # on an 8 GB card — see the sampling note below). A pure forward solve pays nothing — checkpoint
     # is the identity outside differentiation.
-    ys = _cached_march(block, (linear_solve, nonlinear_solve, theta, dt), march, s0, grid_ts, args)
+    from .sharding import element_devices
+
+    # A nonlinear march may split its element loops over devices (`_element_split_devices`): the split is
+    # read while the march is TRACED, so it is active around the (cached) trace and part of the cache key --
+    # a program traced for one device must not be reused for a split run, or the reverse.
+    split = _element_split_devices(block, args)
+    with element_devices(split):
+        ys = _cached_march(
+            block, (linear_solve, nonlinear_solve, theta, dt, tuple(d.id for d in split)), march, s0, grid_ts, args
+        )
     if _judge:
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -954,6 +963,27 @@ def _block_fingerprint(block):
         else:
             out.append((k, id(v)))
     return tuple(out)
+
+
+def _element_split_devices(block, args):
+    """The devices a NONLINEAR march splits its cells over, or ``[]`` to stay on one.
+
+    A Newton step has no assembled operator to partition, so each residual (and each ``J.v``) is
+    evaluated per device on a share of the elements, with one all-reduce -- the steady nonlinear route,
+    applied inside the scan (:func:`jno.utils.solver.sharding.sharded_element_add`). Taken for a march the
+    FEM dispatch marked plain (``split_cells``: no ``adapt=``, no moving geometry), evaluated eagerly:
+    under a trace the constraint would have to agree with the device commitments of the caller's ``jit``,
+    which cannot be known here (``docs/fem/inverse.md``)."""
+    import jax
+
+    from .sharding import resolve_devices
+
+    md = getattr(block, "metadata", None) or {}
+    if not (block.is_nonlinear() and md.get("split_cells")):
+        return []
+    if any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(args)):
+        return []
+    return resolve_devices(md.get("shard"))
 
 
 class _TripletOperator:

@@ -89,6 +89,10 @@ from .fem_utils import (
     elem_map,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
+from .sharding import element_mesh as _element_mesh
+from .sharding import element_partials as _element_partials
+from .sharding import reduce_partials as _reduce_partials
+from .sharding import sharded_element_add as _sharded_element_add
 from .small_linalg import small_det, small_inv
 from .weak_form import (
     _apply_sign,
@@ -3131,15 +3135,32 @@ def assemble_fem_native(
             local_all = u_flat[cad_d]  # (n_cell, n_local_all)
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
+            _emesh = _element_mesh()  # an eager multi-device solve splits the cells (sharding.py)
+            Rp = None if _emesh is None else _element_partials(_emesh, total, u_flat.dtype)
             for coeff, tfi, rnames in typed_with_masks:
-                R = _elem_map(
-                    lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(
-                        c, la, _e, _t, _r, t, args, pts_dyn, cl_d, clf_d
-                    ),
-                    (jnp.arange(n_cells), local_all),
-                    _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
-                    scatter=(R, cd_d[tfi]),
+                kernel = lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(  # noqa: E731
+                    c, la, _e, _t, _r, t, args, pts_dyn, cl_d, clf_d
                 )
+                if _emesh is None:
+                    R = _elem_map(
+                        kernel,
+                        (jnp.arange(n_cells), local_all),
+                        _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
+                        scatter=(R, cd_d[tfi]),
+                    )
+                else:
+                    Rp = _sharded_element_add(
+                        Rp,
+                        cd_d[tfi],
+                        # indices, not gathered values: each device gathers only its own cells' DOFs
+                        lambda xs, _k=kernel, _t=tfi: _elem_map(
+                            _k, (xs[0], u_flat[xs[1]]), _cell_chunk(int(xs[0].shape[0]), cd_d[_t].shape[1], cad_d.shape[1])
+                        ),
+                        (jnp.arange(n_cells), cad_d),
+                        _emesh,
+                    )
+            if Rp is not None:
+                R = _reduce_partials(R, Rp)  # the evaluation's one all-reduce
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the

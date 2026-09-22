@@ -2291,8 +2291,11 @@ class FEM:
         default because the alternative on a multi-device box is idle silicon. On a single-device host
         it resolves to the untouched single-device path. ``shard=False`` (or ``1``) opts out,
         ``shard=N`` pins a device count, and a device list pins exactly; over-requesting fails loud.
-        Only the default steady-linear path shards today: sparse-direct branches (periodic, 1-D,
-        fused-complex) cannot, and slot-composed / transient / nonlinear paths are not yet wired.
+        What shards: the steady-linear solve (default or a Krylov slot with Jacobi or no preconditioner), a
+        linear transient march, and a NONLINEAR solve or march -- which has no operator to partition, so
+        its cells are split instead (one all-reduce per residual or ``J.v``). Sparse-direct branches
+        (periodic, 1-D, fused-complex, ``lu``) cannot; ``adapt=``, moving geometry and a deferred node
+        evaluated by ``crux`` are not wired. ``docs/fem/inverse.md`` has the full table.
 
         ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
         count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
@@ -2332,21 +2335,29 @@ class FEM:
                     self._periodic = reduction
             try:
                 self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond)
-                result = self._solve_dispatch(
-                    solve_fn,
-                    adapt=adapt,
-                    checkpoint=checkpoint,
-                    contact=contact,
-                    continuation=continuation,
-                    x0=x0,
-                    nonlinear=nonlinear,
-                    linear=linear,
-                    precond=precond,
-                    time=time,
-                    tau=tau,
-                    shard=shard,
-                    **kwargs,
-                )
+                # A steady NONLINEAR solve has no assembled operator to partition, so its CELLS are split
+                # instead: the residual (and so every Jacobian-free J.v) is evaluated per device on a share
+                # of the elements, one all-reduce per evaluation. Read while the solve traces; a deferred
+                # node that `crux` evaluates later is traced outside this block and stays on one device.
+                from .utils.solver.sharding import element_devices, resolve_devices
+
+                _edev = resolve_devices(shard) if self._mode == "nonlinear" and adapt is None else []
+                with element_devices(_edev):
+                    result = self._solve_dispatch(
+                        solve_fn,
+                        adapt=adapt,
+                        checkpoint=checkpoint,
+                        contact=contact,
+                        continuation=continuation,
+                        x0=x0,
+                        nonlinear=nonlinear,
+                        linear=linear,
+                        precond=precond,
+                        time=time,
+                        tau=tau,
+                        shard=shard,
+                        **kwargs,
+                    )
             finally:
                 # the basis is per-CALL; neither the reduction nor the reduced block sticks to the object.
                 # ONLY when this call installed one, though. Restoring unconditionally also undid a
@@ -2581,8 +2592,10 @@ class FEM:
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
         if self._mode in ("transient", "complex_transient") and isinstance(getattr(self._op, "metadata", None), dict):
-            # the linear march reads its device placement from the block (see `_sharded_transient`)
+            # the linear march reads its device placement from the block (see `_sharded_transient`), and a
+            # nonlinear one splits its cells only when it is a plain march (`_element_split_devices`)
             self._op.metadata["shard"] = shard
+            self._op.metadata["split_cells"] = adapt is None and not getattr(self, "_geometry", None)
         if contact is None and not getattr(self, "_in_contact_loop", False):
             # ... and NOT when the contact driver is re-entering this method for one of its own rounds:
             # it dispatches with `contact=None` by design, so an unguarded check would refuse the very

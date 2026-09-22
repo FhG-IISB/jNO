@@ -32,6 +32,7 @@ build through scipy/pyamg). Those refuse rather than silently gathering the oper
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, Tuple
 
 import jax
@@ -50,6 +51,12 @@ __all__ = [
     "constrain_operator",
     "jacobi_from_diagonal",
     "describe",
+    "element_devices",
+    "element_mesh",
+    "element_token",
+    "element_partials",
+    "reduce_partials",
+    "sharded_element_add",
 ]
 
 #: Mesh axis name for the partitioned triplet dimension. Deliberately *not* ``"batch"``/``"model"``
@@ -247,3 +254,97 @@ def describe(A, devices) -> str:
     nnz = int(A.nse) if hasattr(A, "nse") else int(A.data.shape[0])
     per = -(-nnz // nd)
     return f"{nnz} nonzeros over {nd} device(s) ~ {per} each ({A.data.nbytes / 2**20 / nd:.1f} MiB of data per device)"
+
+
+# --------------------------------------------------------------------------------------------------
+# The ELEMENT axis: a matrix-free residual has no operator to partition, so its cells are partitioned
+# instead. Each device evaluates the element kernel on its share of the cells and scatter-adds into its
+# own copy of the (replicated) residual; one all-reduce combines them. A Jacobian-free Newton's J.v is
+# the linearisation of that same map, so it partitions the same way -- the Krylov vectors stay
+# replicated exactly as they do around a sharded operator, and the solver is untouched.
+
+#: The devices the element loops split over while an eager solve TRACES them; ``None`` outside one.
+#: Read at trace time, so it must never be captured by a compiled program that outlives the solve --
+#: every cache a residual trace can land in keys on :func:`element_token`.
+_ELEMENT_DEVICES: list = [None]
+
+
+@contextlib.contextmanager
+def element_devices(devices):
+    """Split the FEM element loops traced inside this block over ``devices`` (``[]``: do not split)."""
+    prev = _ELEMENT_DEVICES[0]
+    _ELEMENT_DEVICES[0] = list(devices) if devices else None
+    try:
+        yield
+    finally:
+        _ELEMENT_DEVICES[0] = prev
+
+
+def element_mesh():
+    """The mesh of the active :func:`element_devices` block, or ``None``."""
+    d = _ELEMENT_DEVICES[0]
+    return operator_mesh(d) if d else None
+
+
+def element_token():
+    """A hashable stand-in for the active element sharding, for cache keys (``None`` when off)."""
+    d = _ELEMENT_DEVICES[0]
+    return tuple(int(x.id) for x in d) if d else None
+
+
+def element_partials(mesh, total, dtype):
+    """Zeroed per-device partial residuals, ``(nd, total)`` with the device axis sharded.
+
+    Each device scatter-adds its cells into ITS OWN row, so no term needs a collective; one sum over the
+    device axis at the end (:func:`reduce_partials`) is the single all-reduce of the whole evaluation.
+    Scatter-adding straight into a replicated ``R`` instead costs one all-reduce PER TERM (measured: 10
+    in a three-term ``J.v`` on 4 devices, against 2 this way)."""
+    from jax.lax import with_sharding_constraint
+
+    nd = int(mesh.devices.size)
+    return with_sharding_constraint(jnp.zeros((nd, int(total)), dtype), NamedSharding(mesh, P(SHARD_AXIS)))
+
+
+def reduce_partials(R, Rp):
+    """``R`` plus the per-device partials of :func:`element_partials`: the one all-reduce."""
+    return R + jnp.sum(Rp, axis=0)
+
+
+def sharded_element_add(Rp, rows, run, xs, mesh):
+    """Scatter-add ``run(xs)`` at ``rows`` into the partials ``Rp``, the element axis split over ``mesh``.
+
+    ``run(xs) -> (n_items, n_test)`` evaluates the element kernel on a block of items (the caller's
+    chunked ``elem_map``); ``rows`` is the matching ``(n_items, n_test)`` scatter index and ``Rp`` the
+    per-device partials of :func:`element_partials` -- each device adds into its own row.
+
+    Every item is reached through ONE host-built ``(nd, ceil(n / nd))`` index table. Where ``n`` does not
+    divide, the table's spare slots repeat the last item and scatter to row ``total``, which
+    ``mode="drop"`` discards: they cost a duplicate evaluation and contribute nothing, to the value or
+    to any derivative. Neither obvious alternative is clean, both measured on the compiled program:
+    padding by ``concatenate`` ahead of the constraint makes XLA all-gather the source (the trap
+    :func:`constrain_operator` records), and splitting a divisible prefix from a replicated tail makes it
+    shift every block boundary with small collective-permutes. The table is a compile-time constant, so
+    each device gathers exactly its own items and the only collective left is :func:`reduce_partials`.
+
+    Pass indices rather than gathered values as ``xs`` where possible: the gather then runs on each
+    device's share instead of on the whole array first.
+    """
+    from jax.lax import with_sharding_constraint
+
+    nd = int(mesh.devices.size)
+    n = int(rows.shape[0])
+    per = -(-n // nd)
+    table = np.minimum(np.arange(nd * per), n - 1).reshape(nd, per)
+    live = (np.arange(nd * per) < n).reshape(nd, per)
+    spec, repl = NamedSharding(mesh, P(SHARD_AXIS)), NamedSharding(mesh, P())
+
+    def split(a):
+        return with_sharding_constraint(with_sharding_constraint(a, repl)[table], spec)
+
+    blocks = jax.tree_util.tree_map(split, xs)
+    elem = with_sharding_constraint(jax.vmap(run)(blocks), spec)  # (nd, per, n_test)
+    total = Rp.shape[1]
+    idx = split(rows)
+    idx = jnp.where(jnp.asarray(live)[..., None], idx, total)  # spare slots -> dropped
+    Rp = jax.vmap(lambda r, i, e: r.at[i.reshape(-1)].add(e.reshape(-1), mode="drop"))(Rp, idx, elem)
+    return with_sharding_constraint(Rp, spec)
