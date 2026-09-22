@@ -1002,6 +1002,72 @@ class _TraceFDM:
 
         return K_lifted, lift_rhs
 
+    @staticmethod
+    def _eliminate(A, is_d):
+        """Split an assembled BCOO ``A`` at the Dirichlet DOFs ``is_d``: ``(A_s, solve)``.
+
+        ``A_s`` keeps the interior block and the Dirichlet diagonal ``d`` and drops the couplings between
+        them, so it is symmetric wherever the interior stencil is. ``solve(inner, b)`` returns the exact
+        ``A⁻¹b`` from one ``inner(A_s, rhs)`` call, provided the Dirichlet rows **or** the Dirichlet
+        columns of ``A`` are pure (``A_DI = 0`` or ``A_ID = 0``):
+
+            x_I = A_II⁻¹ (b_I − A_ID b_D/d),    x_D = (b_D − A_DI x_I)/d
+
+        A Newton tangent ``J`` has pure Dirichlet rows and its transpose pure columns, so the same split
+        serves the forward step and the adjoint. Pure JAX on the BCOO values (the mask is host-side)."""
+        import jax
+        import jax.experimental.sparse as jsp
+
+        n = A.shape[0]
+        r, c = A.indices[:, 0], A.indices[:, 1]
+        mask = jnp.asarray(is_d)
+        dr, dc = mask[r], mask[c]
+        d = jnp.where(mask, jax.ops.segment_sum(jnp.where(dr & (r == c), A.data, 0.0), r, num_segments=n), 1.0)
+        A_s = jsp.BCOO((jnp.where(dr ^ dc, 0.0, A.data), A.indices), shape=A.shape)
+        to_d, from_d = jnp.where(dr & ~dc, A.data, 0.0), jnp.where(~dr & dc, A.data, 0.0)
+
+        def solve(inner, b):
+            known = jnp.where(mask, b / d, 0.0)
+            z = inner(A_s, b - jax.ops.segment_sum(from_d * known[c], r, num_segments=n))
+            back = jax.ops.segment_sum(to_d * z[c], r, num_segments=n)
+            return jnp.where(mask, (b - back) / d, z)
+
+        return A_s, solve
+
+    def _eliminating(self, linear):
+        """``cg`` / ``minres`` wrapped to solve an assembled Newton tangent through :meth:`_eliminate`.
+
+        The tangent's Dirichlet rows are identity rows whose columns the interior rows still reference,
+        so it is not symmetric and CG on it returned NaN (the steady linear path lifts those columns out,
+        the Newton path did not). Other solvers, and a matrix-free tangent, are returned untouched."""
+        if getattr(linear, "name", "") not in ("cg", "minres"):
+            return linear
+        from .utils.solver.solver_api import LinearOperator, LinearSolver
+
+        is_d = self._dirichlet_mask()
+
+        def fn(op, b, *, M, x0):
+            A = op.bcoo
+            if A is None or A.shape[0] != is_d.size:
+                return linear(op, b, M=M, x0=x0)
+            _, solve = self._eliminate(A, is_d)
+            return solve(lambda A_s, rhs: linear(LinearOperator(A_s), rhs, M=M, x0=x0), b)
+
+        key = None if linear.key is None else ("dirichlet-eliminated", linear.key)
+        return LinearSolver(fn, name=linear.name, traits=linear.traits, key=key)
+
+    def _newton_linear(self, linear, key, residual, at):
+        """The ``linear=`` slot for a Newton on an assembled tangent: ``cg`` / ``minres`` go through the
+        Dirichlet elimination, after the eliminated tangent at ``at`` passes the symmetry guard."""
+        if getattr(linear, "name", "") not in ("cg", "minres"):
+            return linear
+        import jax
+
+        with jax.ensure_compile_time_eval():
+            A_s, _ = self._eliminate(self._sparse_operator(key, residual, at), self._dirichlet_mask())
+            self._require_symmetric(linear, A_s, key=key + "-newton")
+        return self._eliminating(linear)
+
     def _dirichlet_mask(self):
         """Boolean mask of the Dirichlet DOFs (host-side indices, so it also works inside a trace)."""
         is_d = np.zeros(self._Ntot, dtype=bool)
@@ -1676,6 +1742,7 @@ class _TraceFDM:
             # matrix-free JVP has no diagonal or matrix to give them).
             nonlinear = _solve.newton(direct=True)
         precond = self._frozen_precond(precond, lambda: tangent(u0 if not isinstance(u0, jax.core.Tracer) else zeros))
+        linear = self._newton_linear(linear, "steady", probe, u0 if not isinstance(u0, jax.core.Tracer) else zeros)
         driver = compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self)
         return driver(residual, u0, jacobian=tangent)
 
@@ -1983,6 +2050,9 @@ class _TraceFDM:
                 # The block carries its assembled tangent, so the per-step Newton uses it (as the steady
                 # solve does): a matrix-free JVP has no diagonal for jacobi, nor a matrix for amg or lu.
                 nonlinear = nonlinear or _solve.newton(direct=True)
+                if n == self._Ntot:
+                    with jax.ensure_compile_time_eval():
+                        linear = self._newton_linear(linear, "march", frozen, state0)
         else:
             block = SemidiscreteTimeBlock(mass=lambda t, args: mass_of(t), residual=residual, **common)
         from .utils.solver.timeschemes import _ExponentialScheme

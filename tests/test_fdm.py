@@ -1942,3 +1942,65 @@ def test_nonlinear_crank_nicolson_assembled_tangent():
         return np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5), **slots))[-1]
 
     assert np.abs(solve(linear=jno.solve.lu()) - solve()).max() < 1e-13
+
+
+# cg / minres on a Newton path: the assembled tangent keeps the Dirichlet identity rows, whose columns the
+# interior rows still reference, so it is not symmetric and CG returned NaN. The Newton path now solves
+# through the same Dirichlet elimination the linear path uses, exactly, for J and for Jᵀ (the adjoint).
+
+
+def test_dirichlet_elimination_is_exact_for_the_tangent_and_its_transpose():
+    import jax.experimental.sparse as jsp
+
+    from jno.fdm import _TraceFDM
+
+    rng = np.random.default_rng(0)
+    n, is_d = 12, np.zeros(12, dtype=bool)
+    is_d[[0, 5, 11]] = True
+    J = rng.standard_normal((n, n)) + 8.0 * np.eye(n)
+    J[is_d] = 0.0
+    J[is_d, is_d] = rng.uniform(1.0, 3.0, 3)  # pure constraint rows
+    b = rng.standard_normal(n)
+    dense = lambda A_s, rhs: jnp.linalg.solve(A_s.todense(), rhs)  # noqa: E731
+    for A in (J, J.T):
+        _, solve = _TraceFDM._eliminate(jsp.BCOO.fromdense(jnp.asarray(A)), is_d)
+        assert np.abs(np.asarray(solve(dense, jnp.asarray(b))) - np.linalg.solve(A, b)).max() < 1e-12
+
+
+def _bratu(d):
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    S = jno.np.sin(np.pi * x) * jno.np.sin(np.pi * y)
+    f = 2 * np.pi**2 * S - 2.0 * jno.np.exp(S + 0.5 * x * y)
+    return jno.fdm([-(ui.xx + ui.yy) - 2.0 * jno.np.exp(ui) - f, u(xb, yb) - 0.5 * xb * yb])
+
+
+def test_cg_on_a_nonlinear_structured_problem():
+    """Bratu MMS, u = sin πx sin πy + xy/2 on the structured grid: cg matches lu (it returned NaN)."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured().domain()
+    got = np.asarray(_bratu(d).solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())).reshape(-1)
+    ref = np.asarray(_bratu(d).solve(linear=jno.solve.lu())).reshape(-1)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) + 0.5 * p[:, 0] * p[:, 1]
+    assert np.abs(got - ref).max() < 1e-12 and np.abs(got - exact).max() < 5e-3
+
+
+def test_cg_on_a_nonlinear_march():
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ic = jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi) + 0.2
+    terms = [ui.t - ui.xx - ui.yy + ui**3, u(xb, yb) - 0.2, u(xi, yi) - ic]
+    got = np.asarray(jno.fdm(terms).solve(linear=jno.solve.cg()))
+    assert np.abs(got - np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))).max() < 1e-12
+
+
+def test_cg_on_a_nonlinear_unstructured_problem_refuses():
+    """The cotangent rows are divided by nodal areas, so the eliminated tangent is still not symmetric."""
+    with pytest.raises(ValueError, match="needs a symmetric operator"):
+        _bratu(jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)).solve(linear=jno.solve.cg())
