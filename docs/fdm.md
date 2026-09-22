@@ -579,8 +579,9 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
 
 ## Scope and limitations
 
-**Supported:** scalar fields — or a **coupled system** of several `domain.unknown()` fields (steady +
-Dirichlet, one PDE equation per unknown; `.solve()` returns `(nf, N)`) — on a **2-D triangular or 3-D
+**Supported:** scalar fields — or a **coupled system** of several `domain.unknown()` fields (Dirichlet
+conditions, one PDE equation per unknown, steady or first order in time; `.solve()` returns `(nf, N)`, a
+march `(n_steps, nf, N)`) — on a **2-D triangular or 3-D
 tetrahedral** mesh; any mix of Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in
 `∂u/∂n`) boundary conditions, in 2-D and 3-D, **steady or transient** (a transient flux node is an
 algebraic zero-mass-row constraint); transient problems by the method of lines, first order (a `u.t` term with a unit or a general `c(x)·u.t` mass
@@ -601,7 +602,24 @@ uh, vh = jno.fdm([
 ]).solve()                              # returns (2, N): uh = row 0, vh = row 1
 ```
 
-Coupled fields are v1-limited to steady + Dirichlet (transient / flux on coupled fields are planned). A
+A coupled system marches like a scalar one: give each field its `u(xi, yi) - u0` (a field without one
+starts at 0) and write equation *k* with its own unknown's `u.t`. An equation with no time derivative makes
+its field **algebraic**: a constraint solved at every step (a DAE), such as an elliptic potential driven by
+a diffusing field. The time scheme, solver slots and trainable parameters work as for one field:
+
+```python
+traj = jno.fdm([
+    ui.t - (ui.xx + ui.yy) + ui * vi**2 - F * (1 - ui),   # Gray–Scott reaction–diffusion
+    vi.t - 0.5 * (vi.xx + vi.yy) - ui * vi**2 + (F + k) * vi,
+    u(xb, yb) - 1.0, v(xb, yb) - 0.0, u(xi, yi) - u0, v(xi, yi) - v0,
+]).solve(time=jno.solve.theta(0.5))      # (n_steps, 2, N)
+```
+
+Measured on `u_t = Δu − v`, `v_t = Δv + u` (exact `e^{−2π²t} S (cos t, sin t)`), Crank–Nicolson with
+Δt ∝ h: 1.0e-2 / 2.5e-3 / 6.2e-4 structured, 1.7e-2 / 4.4e-3 / 1.1e-3 unstructured at h = 0.1 / 0.05 / 0.025.
+Not supported on a coupled system, and each raises: flux conditions, `u.tt` (write it as a first-order
+system in `(u, v = u.t)`), and the time derivative of another field inside equation *k* (a non-diagonal
+mass). A
 `jno.fdm` problem can also be **one subdomain of a larger solve** — coupled to a FEM or PINN region by
 overlapping Schwarz or Dirichlet–Neumann, and differentiable through the converged fixed point. See
 [Domain decomposition](domain-decomposition.md).
@@ -614,8 +632,8 @@ A periodic tie `u(left) - u(right)` (opposite faces) wraps that axis on a
 
 **Planned:** periodic on unstructured meshes and periodic geometric multigrid (a periodic structured solve
 is currently un-preconditioned, so it is slow on fine grids); composite / cut-cell structured geometry
-(axis-aligned rectangles and boxes are supported, above); 1-D meshes; transient / flux BCs on coupled
-multi-field systems. Authoring a `jno.shape` sub-region
+(axis-aligned rectangles and boxes are supported, above); 1-D meshes; flux BCs on coupled multi-field
+systems. Authoring a `jno.shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive

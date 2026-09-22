@@ -537,6 +537,16 @@ def _has_temporal(node):
     return any(_has_temporal(c) for c in _iter(n))
 
 
+def _has_temporal_of(node, unknown):
+    """Does ``node`` contain a time derivative ``u.t`` of this ``unknown``?"""
+    from .trace import TemporalDerivative
+
+    n = _unwrap(node)
+    if isinstance(n, TemporalDerivative) and _contains_unknown(n.target, unknown):
+        return True
+    return any(_has_temporal_of(c, unknown) for c in _iter(n))
+
+
 def _has_unknown_derivative(node, unknown):
     """Does the expression contain a **derivative of the unknown** (a Jacobian/Hessian/TemporalDerivative
     whose target is the unknown)? This is what distinguishes a **PDE** residual from a value-only
@@ -755,11 +765,25 @@ class _TraceFDM:
                     f"{self._nf} unknowns but {len(self._pde)} PDE equation(s). Author one equation per "
                     "field, in the order the unknowns are declared (equation k drives unknown k)."
                 )
-            if self._transient or self._neumann:
+            if self._neumann:
                 raise NotImplementedError(
-                    "jno.fdm([...]): a coupled (multi-field) system is v1-limited to a STEADY problem with "
-                    "Dirichlet BCs — transient / flux BCs on coupled fields are not yet supported."
+                    "jno.fdm([...]): flux (Neumann/Robin) conditions on a coupled (multi-field) system are not "
+                    "supported yet — a coupled system takes Dirichlet conditions only."
                 )
+            if self._transient and self._time_order == 2:
+                raise NotImplementedError(
+                    "jno.fdm([...]): a coupled system is marched to first order in time only (`u.t`); a coupled "
+                    "`u.tt` system is not supported. Write it as a first-order system in (u, v = u.t)."
+                )
+            for k, (eq, own) in enumerate(zip(self._pde, self.unknowns)):
+                other = [j for j, w in enumerate(self.unknowns) if w is not own and _has_temporal_of(eq, w)]
+                if other:
+                    raise NotImplementedError(
+                        f"jno.fdm([...]): equation {k} of the coupled system carries the time derivative of "
+                        f"unknown {other[0]}, not of its own unknown {k}. Equation k drives unknown k and may only "
+                        "carry that unknown's `u.t` (a diagonal mass); reorder the equations, or solve for the "
+                        "combination that appears differentiated."
+                    )
         self._grid = None
         if self._periodic_axes:  # mark the grid axes the wrap stencil must handle (structured only)
             grid = self.domain.mesh_connectivity.get("grid")
@@ -888,19 +912,20 @@ class _TraceFDM:
         ``u(xb, yb) - g(xb, yb, tb)``, is evaluated at ``t``; it used to be evaluated once with the time
         column read from the coordinates, and the march then held the boundary fixed (a heat solve with
         g = e^{-π² t} cos(πx) stayed at 1.0 on the boundary; error 3.5 at T)."""
-        mask = np.zeros(self._N, dtype=bool)
-        vals = jnp.zeros(self._N)
+        mask = np.zeros(self._Ntot, dtype=bool)  # over the blocked DOF vector (field k at k·N …)
+        vals = jnp.zeros(self._Ntot)
         for c in self._dirichlet:
-            idx = np.asarray(self._region_nodes(_region_tag(c)), dtype=int)
+            nodes = np.asarray(self._region_nodes(_region_tag(c)), dtype=int)
+            idx = self._field_index(c) * self._N + nodes
             mask[idx] = True
             inner = _unwrap(c)
             g_node = 0.0
             if getattr(inner, "op", None) == "-":
                 g_node = inner.right if any(_contains_unknown(inner.left, u) for u in self.unknowns) else inner.left
             if self._is_nodal_data(g_node):
-                g = self._eval_g(g_node, idx)  # a known nodal field: gathered at the region's nodes
+                g = self._eval_g(g_node, nodes)  # a known nodal field: gathered at the region's nodes
             else:
-                g = self._eval_value(g_node, idx, getattr(self, "_override", None), t)
+                g = self._eval_value(g_node, nodes, getattr(self, "_override", None), t)
             vals = vals.at[jnp.asarray(idx)].set(jnp.asarray(g).reshape(-1))
         return mask, vals
 
@@ -1153,10 +1178,17 @@ class _TraceFDM:
         ``c = F(u.t=1) − F(u.t=0)`` (:func:`_set_temporal`) — the spatial residual cancels between the
         probes, leaving ``c``. A plain ``ui.t - 𝒩(u)`` gives ``c = 1``; a ``ρcₚ(x)·ui.t`` term gives the
         node values of ``ρcₚ(x)``. ``c`` must be constant in ``u`` (a nonlinear mass ``c(u)·u.t`` raises).
-        Single-field only (the transient march is)."""
-        return self._time_coefficient(1.0, 0.0, "`u.t` mass coefficient", "nonlinear mass `c(u)·u.t`")
+        A coupled system stacks one block per field: equation k's coefficient of ``u_k.t`` (zero for an
+        equation without a time derivative, whose field is then algebraic)."""
+        coefs = [
+            self._time_coefficient(1.0, 0.0, "`u.t` mass coefficient", "nonlinear mass `c(u)·u.t`", k=k)
+            for k in range(self._nf)
+        ]
+        if len(coefs) == 1:
+            return coefs[0]
+        return lambda t=None: jnp.concatenate([c(t) for c in coefs])
 
-    def _time_coefficient(self, t_val, tt_val, what, example):
+    def _time_coefficient(self, t_val, tt_val, what, example, k=0):
         """Per-node coefficient of the time derivative selected by the probe ``(u.t, u.tt) = (t_val,
         tt_val)``: ``F(t_val, tt_val) − F(0, 0)``, returned as a function of time ``c(t)``. Raises if it
         depends on ``u`` (probed at two constant states), because the diagonal-mass march cannot carry a
@@ -1165,7 +1197,7 @@ class _TraceFDM:
 
         from .trace_evaluator import TraceEvaluator
 
-        expr = self._pde_exprs()[0]
+        expr = self._pde_exprs()[k]
         spatial_tags = {
             v.tag
             for c in self._pde
@@ -1173,26 +1205,28 @@ class _TraceFDM:
             if getattr(v, "axis", None) != "temporal"
         }
         context = self._eval_context(spatial_tags)
-        lid, base = self.unknown.layer_id, self.unknown.module
         scope = self._params_scope()
 
         def probe(u_val, t=None):
             ctx = context if t is None else {**context, "__time__": jnp.full((self._N, 1), t)}
 
             def at(tv, ttv):
-                mod = eqx.tree_at(lambda m: m.value, base, jnp.full(self._N, u_val, base.value.dtype))
-                ev = TraceEvaluator(params={**scope, lid: mod})
+                states = {  # every field at the same constant state
+                    w.layer_id: eqx.tree_at(lambda m: m.value, w.module, jnp.full(self._N, u_val, w.module.value.dtype))
+                    for w in self.unknowns
+                }
+                ev = TraceEvaluator(params={**scope, **states})
                 return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={})).reshape(-1)
 
             return jnp.broadcast_to(at(t_val, tt_val) - at(0.0, 0.0), (self._N,))
 
         checked = self.__dict__.setdefault("_coefficient_checked", set())  # decided once, on concrete values
-        if (t_val, tt_val) not in checked and not bool(jnp.allclose(probe(0.0), probe(1.0), atol=1e-6, rtol=1e-6)):
+        if (t_val, tt_val, k) not in checked and not bool(jnp.allclose(probe(0.0), probe(1.0), atol=1e-6, rtol=1e-6)):
             raise ValueError(
                 f"jno.fdm([...]): the {what} depends on u (a {example}) — only a coefficient of the "
                 "coordinates and time is supported."
             )
-        checked.add((t_val, tt_val))
+        checked.add((t_val, tt_val, k))
         # A function of TIME: `c(x, t)·u.t` and `m(t)·u.tt` are evaluated at each step's own time. They used
         # to be probed once at the start and then held (measured: (1 + t)·u.t stayed at 1·u.t).
         return lambda t=None: probe(0.0, t)
@@ -1611,7 +1645,7 @@ class _TraceFDM:
     def _initial_state(self):
         """Initial nodal state ``u0`` (shape ``(N,)``) from the ``u(initial) - u0`` condition(s), the
         same way :func:`jno.fem` reads its IC — the IC is data found from the constraints, never a flag."""
-        u0 = jnp.zeros(self._N)
+        u0 = jnp.zeros(self._Ntot)  # a coupled field without an initial condition starts at 0
         allnodes = np.arange(self._N, dtype=int)
         for c in self._ic:
             idx = self._region_nodes(_region_tag(c))  # "initial" → all nodes
@@ -1621,7 +1655,8 @@ class _TraceFDM:
                 if self._uses_params(c, scope)
                 else self._condition_value(c, idx)
             )
-            u0 = u0.at[jnp.asarray(idx if len(idx) else allnodes)].set(vals)
+            offset = self._field_index(c) * self._N
+            u0 = u0.at[jnp.asarray(offset + (idx if len(idx) else allnodes))].set(vals)
         return u0
 
     def _initial_velocity(self):
@@ -2020,15 +2055,17 @@ class _TraceFDM:
             return self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots)
 
         c_of = self._mass_coefficient()  # u.t coefficient c(x, t): 1 for a plain u.t, ρcₚ(x) for ρcₚ(x)·u.t
-        diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
+        n = self._Ntot  # a coupled system marches the blocked vector [u_0; …; u_{nf-1}]
+        diag = jnp.stack([jnp.arange(n), jnp.arange(n)], axis=1)
 
-        def M(t=None):  # 0 on Dirichlet + flux rows
-            return jsparse.BCOO((jnp.where(algebraic, 0.0, c_of(t)), diag), shape=(self._N, self._N))
+        def M(t=None):  # 0 on Dirichlet + flux rows, and on a field whose equation has no u.t
+            return jsparse.BCOO((jnp.where(algebraic, 0.0, c_of(t)), diag), shape=(n, n))
 
         def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
             return boundary_rows(wn, spatial_res(wn, t), t)
 
-        return self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots)
+        traj = self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots)
+        return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)  # (steps, field, node)
 
     def _run_block(self, M, residual, state0, window, metadata, save_ts, time, slots):
         """Build the semidiscrete block ``M ẏ + R(y) = 0`` and march it.
@@ -2066,7 +2103,7 @@ class _TraceFDM:
                 # f(t) = −R(0, t); only the operator must be constant, which was just checked. Freezing
                 # −R(0, t0) as a constant bias silently held the data at the start time.
                 A, lift_rhs = self._dirichlet_lift("march", self._sparse_operator("march", frozen, zeros))
-                if n == self._N:  # the lift knows the scalar field's Dirichlet rows, not the [u; v] layout
+                if self._time_order == 1:  # the lift knows the fields' Dirichlet rows, not the [u; v] layout
                     self._require_symmetric(linear, A, key="march")
                     forcing = lambda t, args: lift_rhs(-residual(jnp.zeros(n), t, args))  # noqa: E731
                 else:
@@ -2085,7 +2122,7 @@ class _TraceFDM:
                 # The block carries its assembled tangent, so the per-step Newton uses it (as the steady
                 # solve does): a matrix-free JVP has no diagonal for jacobi, nor a matrix for amg or lu.
                 nonlinear = nonlinear or _solve.newton(direct=True)
-                if n == self._Ntot:
+                if self._time_order == 1:
                     with jax.ensure_compile_time_eval():
                         linear = self._newton_linear(linear, "march", frozen, state0)
         else:

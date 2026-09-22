@@ -476,7 +476,8 @@ def test_coupled_two_field():
 
 
 def test_coupled_guards():
-    """A coupled system is v1-limited to STEADY + Dirichlet with exactly one PDE equation per unknown."""
+    """A coupled system needs one PDE equation per unknown, takes Dirichlet conditions only, and marches
+    first order in time with equation k carrying only its own unknown's `u.t`."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -494,13 +495,18 @@ def test_coupled_guards():
     vt = dt.unknown()
     uit = ut.bind(x=xt, y=yt, t=tt)
     vit = vt.bind(x=xt, y=yt, t=tt)
-    with pytest.raises(NotImplementedError, match="coupled"):  # coupled + transient not yet supported
+    with pytest.raises(NotImplementedError, match="time derivative of unknown 1"):  # off-diagonal mass
+        jno.fdm([vit.t - (uit.d2(xt) + uit.d2(yt)), uit.t - (vit.d2(xt) + vit.d2(yt)), ut(xit, yit) - 0.0])
+    with pytest.raises(NotImplementedError, match="first order in time"):  # coupled u.tt
+        jno.fdm([uit.t.t - (uit.d2(xt) + uit.d2(yt)) + vit, vit.t - uit, ut(xit, yit) - 0.0, vt(xit, yit) - 0.0])
+    xr, yr, _ = d.variable("right", split=True)
+    with pytest.raises(NotImplementedError, match="flux"):  # a flux condition on a coupled system
         jno.fdm(
             [
-                uit.t - (uit.d2(xt) + uit.d2(yt)) + vit,
-                vit.t - (vit.d2(xt) + vit.d2(yt)) + uit,
-                ut(xit, yit) - 0.0,
-                vt(xit, yit) - 0.0,
+                -ui.d2(x) - ui.d2(y) + vi,
+                -vi.d2(x) - vi.d2(y) + ui,
+                u(xb, yb) - 0.0,
+                u.bind(x=xr, y=yr).d(d.variable("right", normals=True)) - 1.0,
             ]
         )
 
@@ -2053,3 +2059,121 @@ def test_all_neumann_structured_grid_keeps_the_mean():
         assert abs(np.mean(sol - exact)) < 1e-3
         errs.append(float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)))
     assert errs[0] < 5e-3 and errs[0] / errs[1] > 3.5, errs
+
+
+# Coupled time-dependent systems: the march works on the blocked vector [u_0; …; u_{nf-1}], equation k
+# carrying u_k.t (a diagonal mass); an equation without a time derivative makes its field algebraic.
+
+
+def _coupled_rotation(h, n, *, structured=True, T=0.1, **slots):
+    """u_t = Δu − v, v_t = Δv + u: u = e^{−2π²t} S cos t, v = e^{−2π²t} S sin t, S = sin πx sin πy."""
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h)
+    d = jno.domain(shape.structured() if structured else shape, time=(0.0, T, n))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    terms = [
+        ui.t - (ui.xx + ui.yy) + vi,
+        vi.t - (vi.xx + vi.yy) - ui,
+        u(xb, yb) - 0.0,
+        v(xb, yb) - 0.0,
+        u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+        v(xi, yi) - 0.0,
+    ]
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5), **slots))
+    p = _nodes(d)
+    S = np.exp(-2 * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    exact = np.stack([S * np.cos(T), S * np.sin(T)])
+    assert traj.shape == (n, 2, len(p))  # (step, field, node), fields in declaration order
+    return float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact))
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_coupled_march_converges(structured):
+    """Crank–Nicolson with Δt ∝ h: 1.0e-2 → 2.5e-3 structured, 1.7e-2 → 4.4e-3 unstructured (rate 2)."""
+    e = [_coupled_rotation(h, n, structured=structured) for h, n in ((0.1, 11), (0.05, 21))]
+    assert e[1] < 5e-3 and e[0] / e[1] > 3.5, e
+
+
+def test_coupled_march_through_the_solver_slots():
+    ref = _coupled_rotation(0.1, 11)
+    assert abs(_coupled_rotation(0.1, 11, linear=jno.solve.gmres(), precond=jno.precond.jacobi()) - ref) < 1e-10
+
+
+def test_coupled_march_with_an_algebraic_field():
+    """u_t = Δu + w with −Δw = 2π²u: w has no time derivative, so it is a constraint at every step (a
+    DAE). u = w = e^{(1−2π²)t} S. Crank–Nicolson, 1.7e-3 at h = 0.05."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.1, 21))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, w = d.unknown(), d.unknown()
+    ui, wi = u.bind(x=x, y=y, t=t), w.bind(x=x, y=y, t=t)
+    terms = [
+        ui.t - (ui.xx + ui.yy) - wi,
+        -(wi.xx + wi.yy) - 2 * np.pi**2 * ui,
+        u(xb, yb) - 0.0,
+        w(xb, yb) - 0.0,
+        u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+    ]
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5)))
+    p = _nodes(d)
+    exact = np.exp((1 - 2 * np.pi**2) * 0.1) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert np.abs(traj[-1] - exact).max() / np.abs(exact).max() < 3e-3
+
+
+def test_coupled_nonlinear_march():
+    """A Gray–Scott reaction–diffusion pair: the matrix-free Newton march and the lu slot agree."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.5, 26))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    bump = jno.np.exp(-40.0 * ((xi - 0.5) ** 2 + (yi - 0.5) ** 2))
+    terms = [
+        ui.t - 0.02 * (ui.xx + ui.yy) + ui * vi**2 - 0.04 * (1.0 - ui),
+        vi.t - 0.01 * (vi.xx + vi.yy) - ui * vi**2 + 0.1 * vi,
+        u(xb, yb) - 1.0,
+        v(xb, yb) - 0.0,
+        u(xi, yi) - (1.0 - 0.5 * bump),
+        v(xi, yi) - 0.25 * bump,
+    ]
+    a = np.asarray(jno.fdm(terms).solve())
+    b = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    assert np.isfinite(a).all() and np.abs(a - b).max() < 1e-12
+
+
+def test_coupled_march_inverse_recovers_the_coupling():
+    """A trainable coupling strength ω in u_t = Δu − ωv, v_t = Δv + ωu, recovered through jno.core."""
+    import optax
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+
+    def problem(omega):
+        return jno.fdm(
+            [
+                ui.t - (ui.xx + ui.yy) + omega * vi,
+                vi.t - (vi.xx + vi.yy) - omega * ui,
+                u(xb, yb) - 0.0,
+                v(xb, yb) - 0.0,
+                u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+                v(xi, yi) - 0.0,
+            ]
+        )
+
+    observed = jnp.asarray(problem(6.0).solve())
+    w = jno.np.parameter((1,), name="omega")
+    w.dtype(jnp.float64)
+    w.initialize(jax.nn.initializers.constant(4.0))
+    w.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(w).solve() - observed).mse])
+    crux.solve(300)
+    assert abs(float(np.asarray(crux.eval([w])).reshape(-1)[0]) - 6.0) < 1e-2
