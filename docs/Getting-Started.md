@@ -47,7 +47,7 @@ net.optimizer(optax.adam(1e-3))
 ## 4. Write the PDE residual
 
 Call the network on the coordinates and take derivatives with the [differential
-operators](operations.md#differentiation) — here the concise `u.dd(x)` (second derivative). Multiplying by
+operators](operations.md#differentiation): bind the expression to its coordinates, then `u.xx` is ∂²u/∂x². Multiplying by
 `x(1-x)y(1-y)` makes the ansatz vanish on `∂Ω`, so the Dirichlet BC is enforced **exactly** with no loss
 term:
 
@@ -55,9 +55,9 @@ term:
 import jno.numpy as jnn
 
 pi = jnn.pi
-u = net(jnn.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)   # hard u = 0 on ∂Ω
+u = (net(jnn.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)   # hard u = 0 on ∂Ω
 f = 2 * pi**2 * jnn.sin(pi * x) * jnn.sin(pi * y)
-pde = u.dd(x) + u.dd(y) + f                                        # −∇²u = f  ⇒  residual = ∇²u + f
+pde = u.xx + u.yy + f                                              # −∇²u = f  ⇒  residual = ∇²u + f
 ```
 
 ## 5. Solve
@@ -109,7 +109,7 @@ u_fem = jno.fem([Ui.x * Vi.x + Ui.y * Vi.y - fq * Vi,    # ∫∇u·∇v − ∫
 # FDM — the strong form, collocated at the nodes, no test function
 w  = dom.unknown()
 wi = w.bind(x=xi, y=yi)
-u_fdm = jno.fdm([-wi.d2(xi) - wi.d2(yi) - fq,            # −Δu = f
+u_fdm = jno.fdm([-wi.xx - wi.yy - fq,                    # −Δu = f
                  w(xb, yb) - 0.0]).solve()
 ```
 

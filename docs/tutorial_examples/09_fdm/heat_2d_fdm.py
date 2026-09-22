@@ -30,7 +30,7 @@ ui = u.bind(x=x, y=y, t=t)
 
 traj = jno.fdm(
     [
-        ui.t - nu * (ui.d2(x) + ui.d2(y)),  # u_t = nu * Delta u
+        ui.t - nu * (ui.xx + ui.yy),  # u_t = nu * Delta u
         u(xb, yb) - 0.0,  # Dirichlet u = 0
         u(xi, yi) - jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi),  # initial condition u0
     ]
@@ -99,7 +99,7 @@ def _final_rel_l2(size):
     uui = uu.bind(x=xx, y=yy, t=tt)
     tr = jno.fdm(
         [
-            uui.t - nu * (uui.d2(xx) + uui.d2(yy)),
+            uui.t - nu * (uui.xx + uui.yy),
             uu(xxb, yyb) - 0.0,
             uu(xxi, yyi) - jnn.sin(np.pi * xxi) * jnn.sin(np.pi * yyi),
         ]

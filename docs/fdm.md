@@ -20,11 +20,11 @@ d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
 x, y, _  = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 u  = d.unknown()               # a valued P1 nodal field — the strong-form counterpart of fem_symbols()
-ui = u.bind(x=x, y=y)          # bound view with .d / .d2 (finite differences by default)
+ui = u.bind(x=x, y=y)          # bound view: ui.x, ui.xx, ui.xy, … (finite differences by default)
 
 f = 2.0 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
 sol = jno.fdm([
-    -ui.d2(x) - ui.d2(y) - f,  # -Delta u = f   (collocated at the mesh nodes)
+    -ui.xx - ui.yy - f,        # -Delta u = f   (collocated at the mesh nodes)
     u(xb, yb) - 0.0,           # Dirichlet u = 0
 ]).solve()                     # -> the nodal solution vector
 ```
@@ -43,9 +43,14 @@ views therefore default to **finite differences**:
 
 | you write        | meaning                                                        |
 | ---------------- | ------------------------------------------------------------- |
-| `ui.d(x)`        | `∂u/∂x` by finite differences (no `scheme=` needed)           |
-| `ui.d2(x)`       | `∂²u/∂x²` by finite differences                               |
-| `ui.d2(x) + ui.d2(y)` | the FD Laplacian, one direction at a time               |
+| `ui.x`           | `∂u/∂x` by finite differences (no `scheme=` needed)           |
+| `ui.xx`, `ui.xy` | `∂²u/∂x²`, `∂²u/∂x∂y` by finite differences                   |
+| `ui.xx + ui.yy`  | the FD Laplacian (fused into one stencil, see below)          |
+| `ui.d(n)`        | the normal derivative, `n` from `d.variable(region, normals=True)` |
+
+The older method spellings (`ui.d(x)`, `ui.d2(x)`, `ui.laplacian(x, y)`) are the same operators; this
+page writes the bound attribute form throughout. `ui.d(x, scheme=…)` and `ui.laplacian(x, y, scheme=…)`
+remain the way to put an explicit stencil on a single term.
 
 !!! danger "`:cotangent` is a whole-Laplacian stencil — and `.d2` now refuses it"
     `"finite_difference:cotangent"` computes the **whole** Laplacian `Δu` for any dimension you ask
@@ -74,7 +79,7 @@ views therefore default to **finite differences**:
     | stencil | `d(Σu)/ds` (AD) | closed form |
     |---|---|---|
     | `.laplacian(x, y, ":cotangent")` | +8.171969e+01 | +8.171969e+01 |
-    | `.d2(x) + .d2(y)` (default) | +8.336520e+01 | +8.336520e+01 |
+    | per-axis `:area_weighted` (the default before fusion) | +8.336520e+01 | +8.336520e+01 |
     | `.laplacian(x, y, ":lsq")` | +8.334671e+01 | +8.334671e+01 |
 
     This needed a fix: `jno.np.parameter` hardcoded `float32`, and `jno.fdm` casts the DOF vector to
@@ -171,7 +176,7 @@ The built-in stencils (parsed from the scheme string) are:
 | `"finite_difference:inverse_distance"` | inverse-distance     | gradient-of-gradient     |
 
 !!! measured "How much the cotangent stencil buys — unit square, −Δu = f, float64"
-    | mesh `h` | `.laplacian(x, y, scheme=":cotangent")` | `.d2(x) + .d2(y)` (default) |
+    | mesh `h` | `.laplacian(x, y, scheme=":cotangent")` (now also the default for `ui.xx + ui.yy`) | per-axis `:area_weighted` (the default before fusion) |
     |---|---|---|
     | 0.10 | **1.164e-02** | 4.942e-02 |
     | 0.06 | **4.058e-03** | 1.674e-02 |
@@ -195,7 +200,7 @@ An unknown sub-scheme (a typo, or one jNO does not have, such as `":upwind"`) ra
 through silently to the default area-weighted stencil.
 
 The `cotangent` Laplacian is the most accurate and is symmetric; the gradient methods trade accuracy
-for locality. The scheme stays on the operator it describes — `ui.d2(x, scheme=…)` — so different
+for locality. The scheme stays on the operator it describes — `ui.laplacian(x, y, scheme=…)`, or `jno.fd(...)` on the binding — so different
 terms in the same residual can use different stencils. (`cotangent` is the accurate default in 2-D
 **and** 3-D — the cotangent-weight operator on triangles, and its exact analogue the P1 finite-element
 Laplace–Beltrami operator on tetrahedra; see [3-D tetrahedral meshes](#3-d-tetrahedral-meshes).)
@@ -215,6 +220,7 @@ u.d(x, scheme=jno.fd(weights={-1: -0.5, 1: 0.5}))  # explicit weights, first der
 jno.fd(order=4, boundary=2)                        # the order of the one-sided stencil at the edges
 jno.fd(upwind=b, order=2)                          # upwinding (see Convection, above)
 jno.fd(average="harmonic")                         # the coefficient between nodes in (κ·u.x).x
+jno.fd(fit=3, rings=2)                             # unstructured mesh: the polynomial fit, explicitly
 ```
 
 The weights are exact on polynomials of the highest degree the points allow (B. Fornberg, *Math.
@@ -231,9 +237,26 @@ Measured:
   to the network's exact derivative at rate 4.1. The same stencil works on any field, not only on a
   `jno.fdm` unknown.
 
-A contradictory spec raises: `order=` together with `points=`, an odd order, or weights that do not sum
-to zero. So does `jno.fd(...)` on an unstructured mesh, until the mesh form exists; use the built-in
-strings there.
+On an **unstructured mesh** the same `jno.fd(order=k)` reads the derivatives off a local polynomial
+least-squares fit (a generalised finite difference). A first derivative uses a degree-k fit and a second a
+degree-(k+1) one, so both are accurate to about order k, as on a grid. `jno.fd(fit=p, rings=r)` sets the
+degree and the neighbourhood explicitly. By default each node uses the fewest rings of neighbours that give
+it 1.5× as many points as the fit has coefficients, so interior nodes stay compact and only nodes near a
+boundary reach further. The fit is exact on polynomials of its degree, in 2-D and 3-D.
+
+Measured on a triangle mesh, Poisson with u = sin πx sin πy, max error at h = 0.1 / 0.05 / 0.025:
+- the default cotangent Laplacian: 1.2e-2 / 3.1e-3 / 7.8e-4;
+- `order=2`: 4.5e-2 / 1.1e-2 / 2.7e-3;
+- `order=4`: 2.3e-3 / 1.5e-4 / 9.6e-6 (rate 4.0).
+
+At second order the cotangent default is the better stencil; the fit is for higher order. A network field on
+the mesh differentiated with `order=4` converges toward 4th order (rates 3.3 and 3.6) against its exact
+derivative.
+
+A contradictory spec raises: `order=` together with `points=`, an odd central order, weights that do not
+sum to zero, `fit=` with `points=`, or a fit that its rings cannot determine. `points=`, `weights=`,
+`upwind=` and the conservative-form `average=` are defined on structured grids. On a mesh the first three
+raise; `average=` has no effect there, because the mesh stencil is already the default one.
 
 ## Structured grid (fast stencils)
 
@@ -248,7 +271,7 @@ d = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.05).structured().domain()
 This meshes the rectangle as a uniform right-triangulation — or, in 3-D, the box as a Kuhn
 6-tets-per-voxel grid — (spacing from the shape's `size=`) and records a grid descriptor on
 `d.mesh_connectivity["grid"]`. The interior operators (`jno.fdm.laplacian` / `gradient`, and the
-constraint-list `ui.d2(x)` authoring) then detect the grid and apply the **direct finite-difference
+constraint-list `ui.xx` authoring) then detect the grid and apply the **direct finite-difference
 stencils** — the 5-point (2-D) / 7-point (3-D) Laplacian `Σ (u₊ − 2u + u₋)/hₖ²` and central-difference
 gradients — by array reshaping, with **no per-element assembly**. On a uniform 2-D right-triangulation the
 5-point stencil coincides *exactly* with the cotangent P1 finite-element Laplacian (a classical result —
@@ -286,17 +309,16 @@ answer* as the unstructured `cotangent` operator, only cheaper.
     The GPU loses below about 100k nodes, where kernel launches (about 20 µs each) dominate. GMRES keeps
     its restart vectors, so an 8 GB card runs out of memory near 16M nodes in float64.
 
-The full `jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()` works unchanged and stays
+The full `jno.fdm([-ui.xx - ui.yy - f, u(bnd) - g]).solve()` works unchanged and stays
 differentiable — no authoring change from the unstructured case. **Transient** composes too:
 `.structured()` together with `time=(t0, t1, n)` and a `ui.t` term marches by method of lines as usual
 (its backward-Euler operator is diagonally dominant, so it stays on the default inner solve). **Periodic**
-boundaries and **complex** fields are *not* supported — they are absent from `jno.fdm` in general (see
-[Scope](#scope-and-limitations)), not just on a structured grid; a regular grid is the natural home for
-periodic wrap-around stencils, so that is a planned extension. (The grid operator does preserve a complex
-field rather than silently dropping the imaginary part, matching the unstructured cotangent path.)
+boundaries wrap on a structured grid (see [Periodic](#periodic)). **Complex** fields are *not* supported
+by `jno.fdm` (see [Scope](#scope-and-limitations)); the grid operator itself preserves a complex field
+rather than silently dropping the imaginary part, matching the unstructured cotangent path.
 
 !!! note "Inner solver on a structured grid"
-    The strong-form `−u.d2(x) − u.d2(y)` with row-replaced Dirichlet gives a **nonsymmetric**
+    The strong-form `−ui.xx − ui.yy` with row-replaced Dirichlet gives a **nonsymmetric**
     reduced operator, on which the default matrix-free BiCGStab can break down. A structured solve
     therefore defaults its inner Krylov to **GMRES** (robust for nonsymmetric systems, still matrix-free
     and differentiable via `custom_linear_solve`), **preconditioned by a geometric-multigrid V-cycle**
@@ -360,7 +382,7 @@ Dirichlet, Neumann and Robin on different edges composes:
 
 ```python
 jno.fdm([
-    -ui.d2(x) - ui.d2(y) + 2.0,     # -Delta u = -2
+    -ui.xx - ui.yy + 2.0,           # -Delta u = -2
     u(xbo, ybo) - 0.0,              # Dirichlet (bottom)
     ul.d(nl) - 0.0,                 # Neumann   (left, insulated)
     ur.d(nr) - 0.0,                 # Neumann   (right, insulated)
@@ -409,7 +431,7 @@ Tie two opposite faces with a `u(A) - u(B)` constraint — exactly as `jno.fem`:
 
 ```python
 jno.fdm([
-    -ui.d2(x) - ui.d2(y) - f,
+    -ui.xx - ui.yy - f,
     u(xl, yl) - u(xr, yr),          # periodic in x  (left/right; 2-D bottom/top → y; a box: front/back → y, bottom/top → z)
     u(xb, yb) - 0.0, u(xt, yt) - 0.0,  # Dirichlet in y
 ]).solve()
@@ -440,7 +462,7 @@ xi, yi, _ = d.variable("initial",  split=True)     # the t = t0 slice
 ui = u.bind(x=x, y=y, t=t)
 
 traj = jno.fdm([
-    ui.t - nu * (ui.d2(x) + ui.d2(y)),                 # u_t = nu * Delta u
+    ui.t - nu * (ui.xx + ui.yy),                       # u_t = nu * Delta u
     u(xb, yb) - 0.0,                                   # Dirichlet
     u(xi, yi) - jnn.sin(np.pi*xi) * jnn.sin(np.pi*yi), # initial condition
 ]).solve()
@@ -554,7 +576,7 @@ Give the initial displacement as usual and, optionally, the initial velocity as 
 ```python
 xi, yi, ti = d.variable("initial", split=True)
 ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
-Δu = ui.d2(x) + ui.d2(y)
+Δu = ui.xx + ui.yy
 
 traj = jno.fdm([
     ui.tt + c * ui.t - Δu,     # damped wave; drop c * ui.t for the undamped one
@@ -602,7 +624,7 @@ s = jno.np.parameter((1,), name="s")            # the unknown to recover
 s.optimizer(optax.adam(1e-1))
 u = d.unknown(); ui = u.bind(x=x, y=y)
 
-solve = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()   # a trace node
+solve = jno.fdm([-ui.xx - ui.yy - s * f_base, u(xb, yb) - 0.0]).solve()   # a trace node
 crux  = jno.core([(solve - u_obs).mse])          # domain inferred from the graph
 crux.solve(150)                                  # recovers s from the observation
 ```
@@ -657,7 +679,7 @@ ui = u.bind(x=x, y=y, z=z)
 
 f = 3.0 * np.pi**2 * jnn.sin(np.pi*x) * jnn.sin(np.pi*y) * jnn.sin(np.pi*z)
 sol = jno.fdm([
-    -ui.d2(x) - ui.d2(y) - ui.d2(z) - f,                   # -Delta u = f on the cube
+    -ui.xx - ui.yy - ui.zz - f,                            # -Delta u = f on the cube
     u(xb, yb, zb) - 0.0,                                   # Dirichlet u = 0
 ]).solve()
 ```
@@ -672,8 +694,9 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
     for the Galerkin solve. `gradient_of_gradient` (first-order, local) is the alternative;
     `lsq_of_gradient` is unstable for a *second* derivative on tets (the nested least-squares amplifies)
     and is not recommended in 3-D. As in 2-D, the whole-Laplacian `cotangent` stencil **cannot be split**
-    across directions — write it as the single term `ui.d2(x, scheme="finite_difference:cotangent")`,
-    not summed; the plain `−d2(x) − d2(y) − d2(z)` uses the per-direction `gradient_of_gradient`.
+    across directions — write it as the single term `ui.laplacian(x, y, z, scheme="finite_difference:cotangent")`,
+    not summed. The plain `−ui.xx − ui.yy − ui.zz` names every axis once, so it is fused into that same
+    cotangent operator (see the note above).
 
 ---
 
@@ -696,8 +719,8 @@ unknown *k*), plus each field's BCs:
 u = d.unknown(); v = d.unknown()
 ui = u.bind(x=x, y=y); vi = v.bind(x=x, y=y)
 uh, vh = jno.fdm([
-    -ui.d2(x) - ui.d2(y) + vi - f_u,   # equation for u
-    -vi.d2(x) - vi.d2(y) + ui - f_v,   # equation for v
+    -ui.xx - ui.yy + vi - f_u,         # equation for u
+    -vi.xx - vi.yy + ui - f_v,         # equation for v
     u(xb, yb) - 0.0, v(xb, yb) - 0.0,  # Dirichlet per field
 ]).solve()                              # returns (2, N): uh = row 0, vh = row 1
 ```
