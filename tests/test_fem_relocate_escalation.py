@@ -137,6 +137,7 @@ def _melt(adapt, *, n=41, T=0.06):
 
 def test_escalation_adds_nodes_only_when_the_tolerance_is_exceeded():
     """The same march, two tolerances: a loose one never escalates, a tight one does."""
+    pytest.importorskip("mmgpy")  # an escalation adds nodes through the mmg remesher
     fem_hi, hi = _melt(jno.solve.relocate(method="monge_ampere", every=5, relax=10, escalate=50.0))
     fem_lo, lo = _melt(jno.solve.relocate(method="monge_ampere", every=5, relax=10, escalate=0.02))
 
