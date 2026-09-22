@@ -503,6 +503,34 @@ At each `crux` step the parameter node resolves to its current value, the solve 
 the optimizer — no adjoint code. With **no** trainable parameter, `.solve()` returns the solution
 array eagerly, as in every section above.
 
+A trainable parameter can appear **anywhere** in the constraint list, and it can be a **time-dependent**
+problem:
+- in the PDE (a coefficient, a source);
+- in a Dirichlet value, a Neumann value or a Robin coefficient;
+- in a time coefficient (`ρ·u.t`, a wave speed);
+- in an initial value.
+
+```python
+alpha = jno.np.parameter((1,), name="alpha")
+node  = jno.fdm([-Δu - f, u(xl, yl) - 0.0, ut.d(nt) + alpha * (ut - 0.5)]).solve()        # Robin α
+nu    = jno.np.parameter((1,), name="nu")
+traj  = jno.fdm([ui.t - nu * Δu, u(xb, yb) - 0.0, u(xi, yi) - u0]).solve()                 # heat: ν from a trajectory
+```
+
+!!! measured "Recovered through jno.core, 300 Adam steps"
+    Robin α (steady, structured and unstructured), and, in time-dependent problems, a diffusivity, a source
+    amplitude, a time-dependent boundary amplitude, a Robin coefficient, a wave speed, and a diffusivity
+    through `linear=` / `precond=` slots. Each comes back to within 1e-3 of the value that produced the
+    observations.
+
+    Before this, a Robin parameter crashed, a time-dependent inverse raised "No model for Model N", and a
+    parameter in a Dirichlet value was read from its stored value, so its gradient was zero and the
+    inverse silently never moved.
+
+    A time-dependent inverse runs one forward solve at the parameters' current values when it is built.
+    That warm-up makes the solver's structural decisions (linearity, sparsity, symmetry, what varies in
+    time) on concrete values; the traced solve reuses them.
+
 ---
 
 ## 3-D tetrahedral meshes

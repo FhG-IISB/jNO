@@ -1758,3 +1758,126 @@ def test_time_dependent_flux_data_and_mass_coefficient(kind):
     8.8e-3, 6.6e-3 and 2.2e-3 now at h = 0.05 — and second order under refinement."""
     e = [_time_everywhere(kind, h) for h in (0.1, 0.05)]
     assert e[1] < 1e-2 and e[0] / e[1] > 3.0, e
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_inverse_recovers_a_robin_coefficient(structured):
+    """A trainable α inside a Robin condition, ∂u/∂n + α(u − 0.5) = 0, recovered through jno.core from the
+    field it produces. It crashed: the flux rows' host-side mesh work and their affine check ran inside the
+    crux trace (and on a structured grid, the multigrid setup too)."""
+    import optax
+
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1)
+    d = shape.structured().domain() if structured else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    (xl, yl, _), (xo, yo, _), (xr, yr, _), (xt, yt, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "right", "top")
+    )
+    nt = d.variable("top", normals=True)
+    u = d.unknown()
+    ui, ut = u.bind(x=x, y=y), u.bind(x=xt, y=yt)
+
+    def problem(alpha):
+        return jno.fdm(
+            [-(ui.xx + ui.yy) - 1.0, u(xl, yl) - 0.0, u(xo, yo) - 1.0, u(xr, yr) - 0.0, ut.d(nt) + alpha * (ut - 0.5)]
+        )
+
+    observed = jnp.asarray(problem(2.0).solve()).reshape(-1)
+    a = jno.np.parameter((1,), name="alpha")
+    a.dtype(jnp.float64)
+    a.initialize(jax.nn.initializers.constant(0.5))
+    a.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(a).solve() - observed).mse])
+    crux.solve(300)
+    recovered = float(np.asarray(crux.eval([a])).reshape(-1)[0])
+    assert abs(recovered - 2.0) < 5e-2, recovered
+
+
+@pytest.mark.parametrize("where", ["source", "dirichlet", "neumann"])
+def test_a_trainable_parameter_is_differentiable_wherever_it_appears(where):
+    """Recover s = 1.5 from the field it produces, with s in the source, a Dirichlet value, or a Neumann
+    value. The Dirichlet value used to be read from the parameter's STORED value, so its gradient was zero
+    and the inverse never moved (0.5 stayed 0.5), with no error."""
+    import optax
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    (xl, yl, _), (xo, yo, _), (xr, yr, _), (xt, yt, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "right", "top")
+    )
+    nt = d.variable("top", normals=True)
+    u = d.unknown()
+    ui, ut = u.bind(x=x, y=y), u.bind(x=xt, y=yt)
+    Δu = ui.xx + ui.yy
+
+    def problem(s):
+        if where == "source":
+            return jno.fdm([-Δu - s, u(xb, yb) - 0.0])
+        if where == "dirichlet":
+            return jno.fdm([-Δu - 1.0, u(xb, yb) - s])
+        return jno.fdm([-Δu - 1.0, u(xl, yl) - 0.0, u(xo, yo) - 0.0, u(xr, yr) - 0.0, ut.d(nt) - s])
+
+    observed = jnp.asarray(problem(1.5).solve()).reshape(-1)
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(0.5))
+    s.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(s).solve() - observed).mse])
+    crux.solve(300)
+    assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - 1.5) < 1e-3
+
+
+@pytest.mark.parametrize("kind", ["diffusivity", "source", "dirichlet", "robin", "wave_speed", "slots"])
+def test_transient_inverse_recovers_the_parameter(kind):
+    """A trainable parameter in a TIME-DEPENDENT problem, recovered through jno.core from the trajectory it
+    produces — in the diffusivity, a source f(x, t), a boundary value g(x, t), a Robin coefficient, a wave
+    speed (the Newmark march), and through linear=/precond= slots. This raised "No model for Model N": the
+    march evaluated the residual without the parameter. Every evaluator in the march now reads the injected
+    value, and the march's structural decisions are made once on concrete values."""
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    if kind == "slots":
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, 0.1, 11))
+    else:
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    (xl, yl, _), (xo, yo, _), (xr, yr, _), (xt, yt, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "right", "top")
+    )
+    nt = d.variable("top", normals=True)
+    u = d.unknown()
+    ui, ut = u.bind(x=x, y=y, t=t), u.bind(x=xt, y=yt)
+    Δu = ui.xx + ui.yy
+    u0 = 16 * xi * (1 - xi) * yi * (1 - yi)
+
+    def problem(s):
+        if kind in ("diffusivity", "slots"):
+            return jno.fdm([ui.t - s * Δu, u(xb, yb) - 0.0, u(xi, yi) - u0])
+        if kind == "source":
+            return jno.fdm(
+                [ui.t - Δu - s * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y), u(xb, yb) - 0.0, u(xi, yi) - 0.0]
+            )
+        if kind == "dirichlet":
+            return jno.fdm([ui.t - Δu, u(xb, yb) - s * jnn.exp(-tb) * xb, u(xi, yi) - s * xi])
+        if kind == "robin":
+            return jno.fdm(
+                [ui.t - Δu, u(xl, yl) - 0.0, u(xo, yo) - 0.0, u(xr, yr) - 0.0, ut.d(nt) + s * (ut - 1.0), u(xi, yi) - u0]
+            )
+        return jno.fdm([ui.tt - s * Δu, u(xb, yb) - 0.0, u(xi, yi) - u0])
+
+    slots = dict(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi()) if kind == "slots" else {}
+    true = 3.0 if kind == "robin" else 1.5
+    observed = jnp.asarray(problem(true).solve(**slots))
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(1.0))
+    s.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(s).solve(**slots) - observed).mse])
+    crux.solve(300)
+    assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - true) < 1e-3

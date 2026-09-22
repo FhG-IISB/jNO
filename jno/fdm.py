@@ -821,6 +821,16 @@ class _TraceFDM:
             exprs = [_fuse_fd_laplacian(e, int(self.domain.dimension)) for e in exprs]
         return exprs
 
+    def _params_scope(self, extra_params=None):
+        """The module every trainable parameter resolves to in an evaluation: its current value, then the
+        values a traced solve injects (:attr:`_override`, set while a crux-driven march is traced), then
+        ``extra_params``. Every evaluator this solver builds reads it, so a parameter works wherever it is
+        written — in the PDE, a boundary value, a flux condition, a time coefficient, an initial value."""
+        scope = {lid: n.model.module for lid, n in self._trainable_params().items()}
+        scope.update(getattr(self, "_override", None) or {})
+        scope.update(extra_params or {})
+        return scope
+
     def _pde_residual_fn(self, *, spatial=False, extra_params=None):
         """Differentiable residual over the nodal DOF vector, collocated at the mesh nodes. With
         ``spatial=True`` the ``u.t`` terms are dropped (:func:`_zero_temporal`) to give the
@@ -842,12 +852,13 @@ class _TraceFDM:
         }
         context = self._eval_context(spatial_tags)
         N, unknowns = self._N, self.unknowns
+        scope = self._params_scope(extra_params)
 
         def residual_fn(dofs, t=None):
             """``t``: the time a source ``f(x, t)`` is evaluated at (the march passes each step's own
             time); ``None`` keeps the start time."""
             dofs = jnp.asarray(dofs)
-            params = dict(extra_params or {})
+            params = dict(scope)
             for k, unk in enumerate(unknowns):  # inject each field's DOF slice into its module
                 slice_k = dofs[k * N : (k + 1) * N] if len(unknowns) > 1 else dofs
                 params[unk.layer_id] = eqx.tree_at(lambda m: m.value, unk.module, slice_k.astype(unk.module.value.dtype))
@@ -877,8 +888,6 @@ class _TraceFDM:
         ``u(xb, yb) - g(xb, yb, tb)``, is evaluated at ``t``; it used to be evaluated once with the time
         column read from the coordinates, and the march then held the boundary fixed (a heat solve with
         g = e^{-π² t} cos(πx) stayed at 1.0 on the boundary; error 3.5 at T)."""
-        from ._fem import _eval_value_node_at_time
-
         mask = np.zeros(self._N, dtype=bool)
         vals = jnp.zeros(self._N)
         for c in self._dirichlet:
@@ -888,10 +897,10 @@ class _TraceFDM:
             g_node = 0.0
             if getattr(inner, "op", None) == "-":
                 g_node = inner.right if any(_contains_unknown(inner.left, u) for u in self.unknowns) else inner.left
-            if _has_time_variable(g_node):
-                g = _eval_value_node_at_time(g_node, self._pts[jnp.asarray(idx)], t)
+            if self._is_nodal_data(g_node):
+                g = self._eval_g(g_node, idx)  # a known nodal field: gathered at the region's nodes
             else:
-                g = self._eval_g(g_node, idx)
+                g = self._eval_value(g_node, idx, getattr(self, "_override", None), t)
             vals = vals.at[jnp.asarray(idx)].set(jnp.asarray(g).reshape(-1))
         return mask, vals
 
@@ -1008,27 +1017,46 @@ class _TraceFDM:
         w = jnp.asarray(rng.standard_normal(K.shape[0]))
         return float(w @ (K @ v)), float(v @ (K @ w))
 
-    def _is_symmetric(self, K):
+    def _is_symmetric(self, K, key=None):
+        cache = self.__dict__.setdefault("_symmetric_cache", {})
+        if key is not None and key in cache:
+            return cache[key]
         a, b = self._symmetry_probe(K)
-        return abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1e-300)
+        out = abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1e-300)
+        if key is not None:
+            cache[key] = out
+        return out
 
-    def _require_symmetric(self, linear, K):
+    def _require_symmetric(self, linear, K, key=None):
         """``cg`` and ``minres`` assume a symmetric operator; on a non-symmetric one they return a wrong answer
         that can still pass the residual gate. FDM operators are symmetric on a structured grid (after the
         Dirichlet lift) but not on an unstructured mesh, whose cotangent rows are divided by nodal areas."""
         name = getattr(linear, "name", "")
-        if name not in ("cg", "minres"):
+        if name not in ("cg", "minres") or self._is_symmetric(K, key):
             return
         a, b = self._symmetry_probe(K)
-        if abs(a - b) > 1e-9 * max(abs(a), abs(b), 1e-300):
-            raise ValueError(
-                f"jno.solve.{name} needs a symmetric operator, and this strong-form operator is not "
-                f"(wᵀKv = {a:.6e} vs vᵀKw = {b:.6e}). Unstructured FDM stencils are divided by nodal areas, "
-                "and flux rows are one-sided. Use jno.solve.gmres() or jno.solve.bicgstab()."
-            )
+        raise ValueError(
+            f"jno.solve.{name} needs a symmetric operator, and this strong-form operator is not "
+            f"(wᵀKv = {a:.6e} vs vᵀKw = {b:.6e}). Unstructured FDM stencils are divided by nodal areas, "
+            "and flux rows are one-sided. Use jno.solve.gmres() or jno.solve.bicgstab()."
+        )
+
+    def _mass_varies_in_time(self, mass_of, t0, t1):
+        """Does the ``u.t`` coefficient change in time? Cached like the other structural decisions."""
+        cache = self.__dict__.setdefault("_varies_cache", {})
+        if "mass" not in cache:
+            cache["mass"] = not bool(jnp.allclose(mass_of(t0).data, mass_of(t1).data))
+        return cache["mass"]
+
+    def _operator_varies_in_time(self, residual, n, t0, t1, key="march"):
+        """Cached per ``key``: decided on concrete values (a warm-up solve) and reused inside a traced one."""
+        cache = self.__dict__.setdefault("_varies_cache", {})
+        if key not in cache:
+            cache[key] = self._operator_varies_now(residual, n, t0, t1)
+        return cache[key]
 
     @staticmethod
-    def _operator_varies_in_time(residual, n, t0, t1):
+    def _operator_varies_now(residual, n, t0, t1):
         """Does the Jacobian of ``residual(y, t)`` change between ``t0`` and ``t1`` (a coefficient κ(t))?
         Then the operator cannot be assembled once. Time-dependent DATA alone does not count."""
         import jax
@@ -1080,22 +1108,25 @@ class _TraceFDM:
         }
         context = self._eval_context(spatial_tags)
         lid, base = self.unknown.layer_id, self.unknown.module
+        scope = self._params_scope()
 
         def probe(u_val, t=None):
             ctx = context if t is None else {**context, "__time__": jnp.full((self._N, 1), t)}
 
             def at(tv, ttv):
                 mod = eqx.tree_at(lambda m: m.value, base, jnp.full(self._N, u_val, base.value.dtype))
-                ev = TraceEvaluator(params={lid: mod})
+                ev = TraceEvaluator(params={**scope, lid: mod})
                 return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={})).reshape(-1)
 
             return jnp.broadcast_to(at(t_val, tt_val) - at(0.0, 0.0), (self._N,))
 
-        if not bool(jnp.allclose(probe(0.0), probe(1.0), atol=1e-6, rtol=1e-6)):  # u-dependence ⇒ nonlinear mass
+        checked = self.__dict__.setdefault("_coefficient_checked", set())  # decided once, on concrete values
+        if (t_val, tt_val) not in checked and not bool(jnp.allclose(probe(0.0), probe(1.0), atol=1e-6, rtol=1e-6)):
             raise ValueError(
                 f"jno.fdm([...]): the {what} depends on u (a {example}) — only a coefficient of the "
                 "coordinates and time is supported."
             )
+        checked.add((t_val, tt_val))
         # A function of TIME: `c(x, t)·u.t` and `m(t)·u.tt` are evaluated at each step's own time. They used
         # to be probed once at the start and then held (measured: (1 + t)·u.t stayed at 1·u.t).
         return lambda t=None: probe(0.0, t)
@@ -1159,14 +1190,74 @@ class _TraceFDM:
                 return k
         return 0
 
-    def _dirichlet_rows(self):
+    def _dirichlet_rows(self, extra_params=None):
         """Per-field Dirichlet rows ``(field_index, node_indices, values)``: ``field_index`` selects the
-        DOF block (0 for a single field), ``node_indices`` the region's nodes, ``values`` the pinned g."""
+        DOF block (0 for a single field), ``node_indices`` the region's nodes, ``values`` the pinned g.
+        With ``extra_params`` a trainable parameter in ``g`` takes its injected (possibly traced) value."""
         rows = []
+        extra_params = {**(getattr(self, "_override", None) or {}), **(extra_params or {})}
         for c in self._dirichlet:
             idx = self._region_nodes(_region_tag(c))
-            rows.append((self._field_index(c), jnp.asarray(idx), self._condition_value(c, idx)))
+            if extra_params and self._uses_params(c, extra_params):
+                vals = self._eval_value(self._value_side(c), idx, extra_params)
+            else:
+                vals = self._condition_value(c, idx)
+            rows.append((self._field_index(c), jnp.asarray(idx), vals))
         return rows
+
+    def _is_nodal_data(self, g_node):
+        """A value that is a known nodal field (a ``jno.np.parameter`` of one value per node, no optimizer)."""
+        from .trace import ModelCall
+
+        n = _unwrap(g_node) if not isinstance(g_node, (int, float)) else None
+        return (
+            isinstance(n, ModelCall)
+            and getattr(n.model, "_is_parameter", False)
+            and n.model.layer_id not in self._trainable_params()
+        )
+
+    def _value_side(self, constraint):
+        """``g`` of a condition ``u(region) - g``: the side without the unknown."""
+        inner = _unwrap(constraint)
+        if getattr(inner, "op", None) != "-":
+            return 0.0
+        return inner.right if any(_contains_unknown(inner.left, u) for u in self.unknowns) else inner.left
+
+    @staticmethod
+    def _uses_params(node, params):
+        from .trace import ModelCall
+
+        n = _unwrap(node)
+        if isinstance(n, ModelCall) and n.model.layer_id in params:
+            return True
+        return any(_TraceFDM._uses_params(c, params) for c in _iter(n))
+
+    def _eval_value(self, g_node, idx, extra_params=None, t=None):
+        """``g`` at the nodes ``idx``, evaluated by the trace evaluator with ``extra_params`` injected, so a
+        trainable parameter in a Dirichlet value is differentiable. (It used to be read from the stored
+        value: a crux inverse on a Dirichlet value never moved, 0.5 stayed 0.5 against a true 1.5.)"""
+        from .trace import ModelCall, Variable
+        from .trace_evaluator import TraceEvaluator
+
+        if isinstance(g_node, (int, float)):
+            return jnp.full((len(idx),), float(g_node))
+        pts = self._pts[jnp.asarray(np.asarray(idx, dtype=int))]
+        params, ctx = {}, {}
+
+        def walk(n):
+            n = _unwrap(n)
+            if isinstance(n, ModelCall):
+                params.setdefault(n.model.layer_id, n.model.module)
+            if isinstance(n, Variable):
+                temporal = getattr(n, "axis", None) == "temporal"
+                ctx[n.tag] = jnp.full((pts.shape[0], 1), self._start_time() if t is None else t) if temporal else pts
+            for c in _iter(n):
+                walk(c)
+
+        walk(g_node)
+        params.update(extra_params or {})
+        out = jnp.asarray(TraceEvaluator(params=params).evaluate(_unwrap(g_node), context=ctx, var_bindings={}))
+        return jnp.broadcast_to(out.reshape(-1), (len(idx),)) if out.size == 1 else out.reshape(-1)
 
     def _periodic_rows(self):
         """``(secondary_idx, main_idx)`` per periodic axis: the secondary (last-index) face DOFs tied to the
@@ -1285,11 +1376,12 @@ class _TraceFDM:
         }
         context = self._eval_context(spatial_tags)
         lid, base = self.unknown.layer_id, self.unknown.module
+        scope = self._params_scope(extra_params)
 
         def value_fn(dofs, t=None):
             """``t``: the time a flux value ``h(x, t)`` or ``α(t)`` is evaluated at (``None``: the start)."""
             mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
-            ev = TraceEvaluator(params={lid: mod, **(extra_params or {})})
+            ev = TraceEvaluator(params={**scope, lid: mod})
             ctx = context if t is None else {**context, "__time__": jnp.full((self._N, 1), t)}
             out = jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1)
             return jnp.broadcast_to(out, (self._N,)) if out.shape[0] == 1 else out  # a constant `-h` → per-node
@@ -1302,26 +1394,47 @@ class _TraceFDM:
         edge equation with that edge's boundary tags (``xr, yr, nr = domain.variable(region, ...)``). Per
         row: node indices, unit normals, the FD stencil, and the two-probe value functions ``F(0)`` and
         ``F(1)`` (see :meth:`_flux_value_fn`) — the residual is ``(F(1) - F(0))·(∇u·n) + F(0)``. A
-        condition that is **not** affine in ``∂u/∂n`` (a third probe ``F(2)`` disagrees) raises."""
+        condition that is **not** affine in ``∂u/∂n`` (a third probe ``F(2)`` disagrees) raises.
+
+        ``extra_params`` (a trainable α, say) only enters the value functions; the structure comes from
+        :meth:`_flux_structure`, built once on concrete values. Building it inside a crux trace used to fail:
+        the host-side mesh work saw traced arrays, and the affine check called ``bool`` on a tracer."""
         rows = []
-        probe = jnp.zeros(self._N)
-        for c in self._neumann:
-            jac = _normal_jacobian(c)
-            nvar = next(v for v in jac.variables if str(getattr(v, "tag", "")).startswith("n_"))
-            region = nvar.tag[len("n_") :]  # `n_right` → `right`
-            idx, nrm = self._node_normals(region)
-            scheme = getattr(jac, "scheme", None) or "finite_difference"
-            _, grad_method, _ = _D.parse_fd_scheme(scheme)
+        for c, idx, nrm, grad_fn in self._flux_structure():
             v0, v1 = self._flux_value_fn(c, 0.0, extra_params), self._flux_value_fn(c, 1.0, extra_params)
-            f0, f1, f2 = v0(probe), v1(probe), self._flux_value_fn(c, 2.0, extra_params)(probe)
-            if not bool(jnp.allclose(f2 - f0, 2.0 * (f1 - f0), atol=1e-6)):
-                raise ValueError(
-                    "jno.fdm([...]): a flux boundary condition must be affine in the normal derivative "
-                    "∂u/∂n — e.g. Neumann `ui.d(n) - h` or Robin `ui.d(n) + α*(u - u∞)`. A condition "
-                    "nonlinear in ∂u/∂n is not supported."
-                )
-            rows.append((jnp.asarray(idx), nrm, self._flux_gradient_fn(idx, scheme, grad_method), v0, v1))
+            rows.append((idx, nrm, grad_fn, v0, v1))
         return rows
+
+    def _flux_structure(self):
+        """``[(constraint, node_indices, normals, gradient_fn)]`` for the flux conditions, and the check
+        that each is affine in ``∂u/∂n`` — structural, so computed once, eagerly, with any trainable
+        parameters at their current values (it is the same structure at every value)."""
+        if getattr(self, "_flux_struct", None) is not None:
+            return self._flux_struct
+        import jax
+
+        concrete = {lid: n.model.module for lid, n in self._trainable_params().items()}
+        out = []
+        with jax.ensure_compile_time_eval():
+            probe = jnp.zeros(self._N)
+            for c in self._neumann:
+                jac = _normal_jacobian(c)
+                nvar = next(v for v in jac.variables if str(getattr(v, "tag", "")).startswith("n_"))
+                region = nvar.tag[len("n_") :]  # `n_right` → `right`
+                idx, nrm = self._node_normals(region)
+                scheme = getattr(jac, "scheme", None) or "finite_difference"
+                _, grad_method, _ = _D.parse_fd_scheme(scheme)
+                f0, f1, f2 = (self._flux_value_fn(c, val, concrete)(probe) for val in (0.0, 1.0, 2.0))
+                if not bool(jnp.allclose(f2 - f0, 2.0 * (f1 - f0), atol=1e-6)):
+                    raise ValueError(
+                        "jno.fdm([...]): a flux boundary condition must be affine in the normal derivative "
+                        "∂u/∂n — e.g. Neumann `ui.d(n) - h` or Robin `ui.d(n) + α*(u - u∞)`. A condition "
+                        "nonlinear in ∂u/∂n is not supported."
+                    )
+                idx = np.asarray(idx, dtype=int)
+                out.append((c, idx, jnp.asarray(nrm), self._flux_gradient_fn(idx, scheme, grad_method)))
+        self._flux_struct = out
+        return out
 
     def _interior_is_five_point(self):
         """Does every second derivative in the PDE use a five-point-type stencil — the ``cotangent``
@@ -1401,7 +1514,12 @@ class _TraceFDM:
         allnodes = np.arange(self._N, dtype=int)
         for c in self._ic:
             idx = self._region_nodes(_region_tag(c))  # "initial" → all nodes
-            vals = self._condition_value(c, idx)
+            scope = self._params_scope()
+            vals = (
+                self._eval_value(self._value_side(c), idx, scope)
+                if self._uses_params(c, scope)
+                else self._condition_value(c, idx)
+            )
             u0 = u0.at[jnp.asarray(idx if len(idx) else allnodes)].set(vals)
         return u0
 
@@ -1415,7 +1533,9 @@ class _TraceFDM:
             if getattr(inner, "op", None) != "-":
                 raise ValueError(f"jno.fdm([...]): write an initial velocity as `ui0.t - v0`; got {c!r}.")
             g_node = inner.right if _has_temporal(inner.left) else inner.left  # v0 is the side without u.t
-            v0 = v0.at[jnp.asarray(idx)].set(self._eval_g(g_node, idx))
+            scope = self._params_scope()
+            vals = self._eval_value(g_node, idx, scope) if self._uses_params(g_node, scope) else self._eval_g(g_node, idx)
+            v0 = v0.at[jnp.asarray(idx)].set(vals)
         return v0
 
     def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None):
@@ -1439,11 +1559,13 @@ class _TraceFDM:
         non-parametric) solve inside a JAX Perfetto trace and writes it to ``./jno_traces``."""
 
         def _run():
+            trainable = self._trainable_params()
             if self._transient:
                 if x0 is not None:
                     raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
+                if trainable:
+                    return self._parametric_node(trainable, nonlinear=nonlinear, linear=linear, precond=precond, time=time)
                 return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
-            trainable = self._trainable_params()
             if trainable:
                 return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
             return self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
@@ -1532,7 +1654,9 @@ class _TraceFDM:
                 )
             with jax.ensure_compile_time_eval():
                 self._require_symmetric(
-                    linear, self._dirichlet_lift("steady", self._sparse_operator("steady", probe, jnp.zeros(self._Ntot)))[0]
+                    linear,
+                    self._dirichlet_lift("steady", self._sparse_operator("steady", probe, jnp.zeros(self._Ntot)))[0],
+                    key="steady",
                 )
             eager = extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer)
             cache = self.__dict__.setdefault("_assembled_cache", {})
@@ -1600,7 +1724,7 @@ class _TraceFDM:
 
         N, single = self._N, self._nf == 1
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
-        rows = self._dirichlet_rows()
+        rows = self._dirichlet_rows(extra_params)
         flux_rows = self._flux_rows(extra_params) if single else []  # flux is single-field (guarded at build)
         periodic_rows = self._periodic_rows()  # (secondary, main) face DOF pairs per periodic axis
 
@@ -1721,7 +1845,7 @@ class _TraceFDM:
         Schwarz driver builds once and reuses)."""
         return self.pinned_solver(node_ids, nonlinear=nonlinear)(values)
 
-    def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None):
+    def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None):
         """When the constraints carry a trainable ``jno.np.parameter`` (an inverse parameter), return the
         solve as a **trace node** instead of an array — exactly as ``fem.solve()`` does — so it composes
         into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with the parameter's
@@ -1735,12 +1859,26 @@ class _TraceFDM:
         param_nodes = [trainable[lid] for lid in lids]  # the parameter ModelCalls -> FunctionCall args
         modules = {lid: trainable[lid].model.module for lid in lids}
 
+        if self._transient:
+            # A warm-up march at the parameters' current values makes every STRUCTURAL decision on concrete
+            # values (linearity, sparsity pattern, symmetry, time-variance, the u-independence of the time
+            # coefficients); each is cached, so the traced march below only reuses them. Costs one solve.
+            self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
+
         def _solve(*values):  # values = the parameters' current (crux-trained) values
             extra = {
                 lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
                 for lid, v in zip(lids, values)
             }
-            return self._steady_solve(nonlinear=nonlinear, x0=x0, extra_params=extra, linear=linear, precond=precond)
+            if not self._transient:
+                return self._steady_solve(nonlinear=nonlinear, x0=x0, extra_params=extra, linear=linear, precond=precond)
+            # A transient solve reads the parameters through `_override`, which every evaluator in the march
+            # consults (the PDE, boundary and flux values, time coefficients, initial values).
+            self._override = extra
+            try:
+                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
+            finally:
+                self._override = None
 
         node = FunctionCall(_solve, param_nodes, name="fdm_solve")
         node._domain = self.domain  # so jno.core infers the domain from the graph (no explicit domain= needed)
@@ -1818,8 +1956,8 @@ class _TraceFDM:
                 self._sparsity("march", frozen, jnp.zeros(n))
                 linear_problem = (
                     self._is_affine("march", frozen, n)
-                    and not self._operator_varies_in_time(residual, n, float(t0), float(t1))
-                    and bool(jnp.allclose(mass_of(float(t0)).data, mass_of(float(t1)).data))
+                    and not self._operator_varies_in_time(residual, n, float(t0), float(t1), key="march")
+                    and not self._mass_varies_in_time(mass_of, float(t0), float(t1))
                 )
             if linear_problem:
                 # Time-dependent DATA (a source f(x, t), a boundary value g(x, t)) rides the block's forcing
@@ -1827,7 +1965,7 @@ class _TraceFDM:
                 # −R(0, t0) as a constant bias silently held the data at the start time.
                 A, lift_rhs = self._dirichlet_lift("march", self._sparse_operator("march", frozen, zeros))
                 if n == self._N:  # the lift knows the scalar field's Dirichlet rows, not the [u; v] layout
-                    self._require_symmetric(linear, A)
+                    self._require_symmetric(linear, A, key="march")
                     forcing = lambda t, args: lift_rhs(-residual(jnp.zeros(n), t, args))  # noqa: E731
                 else:
                     A = self._sparse_operator("march", frozen, zeros)
@@ -1952,7 +2090,7 @@ class _TraceFDM:
                 nonlinear is None
                 and self._is_affine("newmark", probe, self._N)
                 and not self._operator_varies_in_time(
-                    lambda w, t, args: step_residual(w, u0, v0, r0, t), self._N, t0 + dt, t1
+                    lambda w, t, args: step_residual(w, u0, v0, r0, t), self._N, t0 + dt, t1, key="newmark"
                 )
             )
         if linear_problem:
@@ -2012,8 +2150,8 @@ class _TraceFDM:
         with jax.ensure_compile_time_eval():
             self._sparsity("newmark", probe, u0)
             K, lift_rhs = self._dirichlet_lift("newmark", self._sparse_operator("newmark", probe, u0))
-            self._require_symmetric(linear, K)
-            symmetric = self._is_symmetric(K)
+            self._require_symmetric(linear, K, key="newmark")
+            symmetric = self._is_symmetric(K, key="newmark")
             coo = self._sparsity_cache["newmark"][0].tocoo()
             on_diag = np.nonzero(coo.row == coo.col)[0]
             diag = jnp.zeros(K.shape[0]).at[jnp.asarray(coo.row[on_diag])].add(K.data[jnp.asarray(on_diag)])

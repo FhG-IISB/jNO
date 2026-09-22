@@ -107,7 +107,15 @@ def _neg_laplacian(u_grid: jnp.ndarray, spacing, interior: jnp.ndarray) -> jnp.n
     return jnp.pad(-lap, 1) * interior
 
 
-def build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int = 5):
+def build_vcycle(shape, spacing, **kwargs):
+    """Build a one-V-cycle applier; see :func:`_build_vcycle`. The setup depends only on the grid, so it
+    runs on concrete values even when called inside a trace (a crux-driven inverse solve used to hit a
+    traced coarse matrix here)."""
+    with jax.ensure_compile_time_eval():
+        return _build_vcycle(shape, spacing, **kwargs)
+
+
+def _build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int = 5):
     """Build a one-V-cycle applier ``M⁻¹: r_flat → e_flat`` for ``-Δ`` (homogeneous Dirichlet interior) on
     the structured grid ``(shape, spacing)``. Returns ``(apply, n_levels)``; ``n_levels == 1`` means the
     grid can't be coarsened (the caller should skip GMG). Damped-Jacobi smoothing (``omega`` defaults to
