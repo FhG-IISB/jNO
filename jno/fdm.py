@@ -1031,7 +1031,8 @@ class _TraceFDM:
         """Evaluation context for a strong-form term: every spatial tag collocates at the mesh nodes, and
         ``domain.cell_size`` resolves to the per-node spacing :meth:`_node_spacing`."""
         context = {t: self._pts for t in spatial_tags}
-        context["cell_size"] = self._node_spacing()[:, None]
+        if self._uses_cell_size():  # built on demand: on a mesh it walks every cell (1.8 GB at 0.9M nodes)
+            context["cell_size"] = self._node_spacing()[:, None]
         # The temporal Variable reads `__time__`. A source `f(x, t)` used to raise KeyError here; it now
         # sees the start time unless the march passes the step's own (see `residual_fn(dofs, t)`).
         context["__time__"] = jnp.full((self._N, 1), self._start_time())
@@ -1076,11 +1077,37 @@ class _TraceFDM:
         if getattr(self, "_h_nodes", None) is None:
             import jax
 
+            grid = self.domain.mesh_connectivity.get("grid") if self.domain.mesh_connectivity else None
+            if grid is not None and self._nodes_are_the_grid(grid):
+                # The cell formula gives exactly the geometric mean of the axis spacings on this lattice; read
+                # it off the grid instead of walking its 6 tetrahedra per voxel (1.8 GB transient at 0.9M
+                # nodes, measured). A structured grid's nodes are not design variables, so no gradient is lost.
+                h = float(np.prod(np.asarray(grid["spacing"], float)) ** (1.0 / len(grid["spacing"])))
+                self._h_nodes = jnp.full(self._N, h)
+                return self._h_nodes
             # A constant of the mesh: computed concretely even when first asked for inside a trace (the
             # parametric solve), or the cached value would be a leaked tracer.
             with jax.ensure_compile_time_eval():
                 self._h_nodes = self._node_spacing_now()
         return self._h_nodes
+
+    def _nodes_are_the_grid(self, grid):
+        """The structured shortcut applies only while the nodes still sit on the lattice (a moved or
+        relocated structured mesh falls back to the cell formula)."""
+        shape = tuple(int(s) for s in grid["shape"])
+        if int(np.prod(shape)) != self._N or "origin" not in grid:
+            return False
+        pts = np.asarray(self._pts)[:, : len(shape)]
+        k = (pts - np.asarray(grid["origin"], float)) / np.asarray(grid["spacing"], float)
+        return bool(np.max(np.abs(k - np.round(k))) < 1e-6)
+
+    def _uses_cell_size(self):
+        """Does any constraint read ``domain.cell_size``?"""
+        if getattr(self, "_cell_size_used", None) is None:
+            self._cell_size_used = any(
+                getattr(v, "tag", None) == "cell_size" for c in self._constraints for v in _iter_variables(c)
+            )
+        return self._cell_size_used
 
     def _node_spacing_now(self):
         """Per-node mean of ``(d!·|K|)^(1/d)`` over incident cells (see :meth:`_node_spacing`)."""
