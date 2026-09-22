@@ -909,7 +909,7 @@ def _normalize_quad_tag(tag: Any, boundary_regions: Any) -> Any:
     return tag
 
 
-def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
+def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False) -> Tuple[str, str]:
     """Return ``(support, region_id)`` for a constraint.
 
     ``support`` is ``"volume"`` or ``"boundary"``; ``region_id`` is ``"volume"``
@@ -1010,7 +1010,10 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     # boundary term -> b == 0. But a TRIAL-ONLY Dirichlet `u(interior_<name>) - g` legitimately pins
     # that region's *node set* (a volumetric hard constraint), so there the boundary/node-set
     # classification is exactly what we want -- keep it.
-    has_test = _contains(constraint, TestFunction)
+    # A FUNCTIONAL is the third kind of entry: test-free like a Dirichlet constraint, but volumetric
+    # like a weak term. The node-set reading below is right for `u(interior_<name>) - g` and wrong for
+    # `∫ F dΩ`, and the test function cannot tell them apart -- so `integrand=True` says which it is.
+    has_test = _contains(constraint, TestFunction) or integrand
     if has_test:
         # The whole-domain interior ("interior") is never a boundary -- even if a coarse mesh left every
         # interior node lying on the boundary and so registered "interior" in `_boundary_regions`. A
@@ -3418,8 +3421,16 @@ class FEM:
         raise AttributeError(f"FEM is {self._mode}; .residual is for a steady (linear or nonlinear) or transient problem.")
 
     def eval(self, term, u, *, args=None):
-        """Assemble one **weak term** at the solution ``u`` — the free ``(n_dofs,)`` vector, with **no**
-        essential elimination applied.
+        """Read a term back at the solution ``u``. What comes out depends on the KIND of expression.
+
+        A **weak term** (one carrying the test function) assembles to the free ``(n_dofs,)`` vector, with
+        **no** essential elimination applied. An expression with **no** test function is an integrand — an
+        energy or stress density — and reduces instead to the scalar ``∫ F dΩ`` over its region, which is
+        how an objective (compliance, a volume fraction, a stress p-norm, a mechanism output) is written.
+        The two are described in turn below; a list mixing them is refused, since they have no common
+        return shape.
+
+        **The weak term: a free residual.**
 
         This is the readout primitive. The conjugate quantity on a constrained region — **reaction
         force** in mechanics, **total heat flux** through a Dirichlet wall, **current** in
@@ -3436,11 +3447,29 @@ class FEM:
         correct for solving and both return **exactly zero** at the DOFs a reaction readout is asking
         about — so reading it off ``fem.A``/``fem.b``/``fem.residual`` gives a plausible, silent zero.
 
-        ``term`` is any weak term built from this domain's symbols (it carries the test function); it does
-        **not** have to be one of the terms this FEM was built from, so a diagnostic form — a sub-term, a
-        different stress measure — can be assembled against an existing solution. A term with no test
-        function is a field readout rather than an assembly and is refused by name. On a transient problem
-        the term is assembled at ``t = 0``.
+        ``term`` is any weak term built from this domain's symbols; it does **not** have to be one of the
+        terms this FEM was built from, so a diagnostic form — a sub-term, a different stress measure — can
+        be assembled against an existing solution. On a transient problem a weak term is assembled at
+        ``t = 0``.
+
+        **The integrand: a domain integral.** Drop the test function and the same call returns a scalar::
+
+            C = fem.eval(sig(u, rho) @ eps(u), sol, args=design)   # ∫ σ(u):ε(u) dΩ — the compliance
+            V = fem.eval(rho, sol, args=design)                    # ∫ ρ dΩ — the material volume
+            g = fem.eval(inner(u.bind(x=xo, y=yo), e), sol)        # ∮ u·e ds — a mechanism's output
+
+        It integrates on **the quadrature the operator was assembled with**, so
+        ``fem.eval(a(u,u), sol) == sol @ fem.eval(a(u,phi), sol)`` exactly — the same rule on both sides,
+        rather than a difference nothing would report. Differentiable in the solution, in the runtime
+        parameters, and in the mesh coordinates (``∂/∂X`` flows through ``|det J|`` and the facet area
+        element), which is what a deformable-mesh design problem needs.
+
+        The region is read off the expression's coordinate Variables exactly as for a weak term, so a
+        boundary integrand is spelled by binding the field to that region's coordinates; a term naming two
+        regions is refused, because an integral has one measure. Narrower in scope than the weak path: the
+        whole volume and tagged boundary regions only, and steady native-Lagrange problems only. Where it
+        is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
+        partition of unity.
         """
         return self._eval_at(term, u, 0.0, args=args)
 
@@ -3452,6 +3481,19 @@ class FEM:
         """
         from .utils.solver.solver_helper import contains_node_type
 
+        terms = list(term) if isinstance(term, (list, tuple)) else [term]
+        bares = [getattr(t, "expr", t) for t in terms]
+        weak = [contains_node_type(b, TestFunction) for b in bares]
+        if any(weak) and not all(weak):
+            raise ValueError(
+                "fem.eval: every entry must be the same kind — either all WEAK TERMS (each carrying the "
+                "test function, assembling to one value per DOF) or all TEST-FREE integrands (each "
+                "integrating to a scalar). The two reduce differently, so a mixed list has no single "
+                "return shape."
+            )
+        if not any(weak):
+            return self._eval_functional(terms, bares, u, args)
+
         factory = getattr(self, "_term_residual_factory", None)
         if factory is None:
             raise NotImplementedError(
@@ -3459,18 +3501,12 @@ class FEM:
                 "the only route that publishes a free (pre-Dirichlet) residual. Not wired for: non-nodal "
                 "(Argyris/Morley/edge) elements, 1-D, and the VPINN path."
             )
-        terms = list(term) if isinstance(term, (list, tuple)) else [term]
-        bares: list = []
+        # `bares` is every entry; the weak path additionally splits it by measure, so the volume
+        # bucket needs its own name rather than shadowing it -- `_eval_functional` above is handed
+        # the full list.
+        vol_bares: list = []
         b_bares: dict = {}
-        for t in terms:
-            bare = getattr(t, "expr", t)
-            if not contains_node_type(bare, TestFunction):
-                raise ValueError(
-                    "fem.eval(term, u): every entry must be a WEAK TERM — it must contain the test "
-                    "function, so it assembles to one value per DOF. An expression without a test "
-                    "function is a field readout (a stress, an energy density) at quadrature points, "
-                    "which is a different operation and is not wired yet."
-                )
+        for t, bare in zip(terms, bares):
             support, region = _region_and_support(t, self.domain)
             # Surface terms are bucketed per region and handed to the factory's own `bterms` channel --
             # the same one the front-end fills at build time. This used to refuse outright, on the
@@ -3485,8 +3521,110 @@ class FEM:
                     "in the jno.fem([...]) term list (a Neumann/Robin flux, a slip condition), or read "
                     "the quantity as a volume term."
                 )
-            (bares.append(bare) if support == "volume" else b_bares.setdefault(region, []).append(bare))
-        return _as_flat(factory(bares, b_bares or None)(jnp.asarray(u).reshape(-1), t_eval, args))
+            (vol_bares.append(bare) if support == "volume" else b_bares.setdefault(region, []).append(bare))
+        return _as_flat(factory(vol_bares, b_bares or None)(jnp.asarray(u).reshape(-1), t_eval, args))
+
+    def _eval_functional(self, terms, bares, u, args):
+        """``∫ F dΩ`` / ``∮ F ds`` for the test-free entries of :meth:`eval` — see its docstring.
+
+        Each entry is routed to the volume or the boundary bucket by the same region classifier the weak
+        form uses, then integrated on the SAME quadrature the operator was assembled with. That is what
+        makes ``∫ σ(u):ε(u) dΩ`` equal ``u·fem.eval(a(u,φ), u)`` exactly, instead of to within a
+        quadrature error nothing would report."""
+        return jnp.asarray(self._functional_fn(terms, bares)(jnp.asarray(u).reshape(-1), 0.0, args)).reshape(())
+
+    def _integral_node(self, expr):
+        """``expr.integrate(fem)`` — the traced form of the scalar :meth:`eval` returns eagerly.
+
+        This is the objective/constraint entry point: the returned node is a scalar, so it drops straight
+        into ``jno.core([...])`` as a loss or inside ``jno.le(...)`` as a constraint, and it is
+        differentiable in the design parameters and the mesh coordinates through the solve it depends on.
+
+        Built as a plain ``FunctionCall`` over ``[solution, *runtime parameters]`` rather than as an
+        ``Integral`` node, and deliberately. An ``Integral`` whose target holds a trial symbol is marked
+        weak by its own constructor, and ``jno.core`` then hands anything so marked to the VPINN
+        assembler, which has no test function to work with here; the trial symbol also has no evaluator
+        handler of its own. Assembling through the FEM kernel instead keeps the expression where it
+        already means something, and the node's arguments state the real data dependencies -- which is
+        what makes the gradient right.
+        """
+        from .trace import FunctionCall
+        from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+        bare = getattr(expr, "expr", expr)
+        op = getattr(self, "operator", None)
+        declared = dict(getattr(op, "runtime_parameter_exprs", None) or {})
+
+        # A parameter the FORM never declared has no slot in the assembled kernel's per-cell pack, so it
+        # would read a placeholder rather than its value. Name it instead of integrating a silent zero.
+        used: dict = {}
+        _collect_runtime_parameter_exprs(bare, used)
+        undeclared = [n for n in used if n not in declared]
+        if undeclared:
+            raise ValueError(
+                f"expr.integrate(fem): the integrand uses parameter(s) {sorted(undeclared)} that the weak "
+                "form does not, so the assembler has no slot for them and they would not reach the "
+                "kernel. Use a parameter the form declares, or fold it in outside the integral."
+            )
+
+        fn = self._functional_fn([expr], [bare])  # host side: classify the measure, retag, build once
+        names = list(declared)
+        params = [declared[n] for n in names]
+        sol = self._functional_solution()
+
+        def _run(u, *vals):
+            return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
+
+        return FunctionCall(_run, [sol, *params], name="fem_integral")
+
+    def _functional_solution(self):
+        """The one solve every functional over this system shares.
+
+        Memoised on purpose: ``solve()`` builds a NEW node on each call and CSE keys unrecognised nodes by
+        identity, so an objective and three constraints written as four integrals would otherwise solve
+        the same system four times per step."""
+        sol = getattr(self, "_functional_sol", None)
+        if sol is None:
+            sol = self.solve()
+            self._functional_sol = sol
+        return sol
+
+    def _functional_fn(self, terms, bares):
+        """Classify each test-free entry onto its measure and return ``f(u_flat, t, args) -> ()``.
+
+        Split out of :meth:`_eval_functional` because it is the HOST-SIDE half — region classification and
+        the coordinate retag are done once, here, so the traced route (``expr.integrate(fem)``) can build
+        the callable at graph-construction time and call it per evaluation."""
+        factory = getattr(self, "_term_functional_factory", None)
+        if factory is None:
+            raise NotImplementedError(
+                "fem.eval: a test-free integrand is integrated only through the native Lagrange assembler "
+                "on a STEADY problem, which is the only route that publishes the functional. Not wired "
+                "for: transient, complex, 1-D, non-nodal (Argyris/Morley/edge) elements, and the VPINN "
+                "path. Assemble the equivalent weak term `F * phi` and sum it instead — a Lagrange basis "
+                "is a partition of unity, so that is the same integral."
+            )
+        vol, surf = [], {}
+        for t, bare in zip(terms, bares):
+            support, region = _region_and_support(t, self.domain, integrand=True)
+            if support == "volume":
+                if region != "volume":
+                    raise NotImplementedError(
+                        f"fem.eval: a functional restricted to the sub-region {region!r} is not wired yet "
+                        "— only the whole volume and tagged boundary regions are. Integrate over the "
+                        "whole domain against a region mask instead."
+                    )
+                _retag_coords_for_quadrature(t, "volume", region)
+                vol.append(bare)
+            elif support == "boundary":
+                _retag_coords_for_quadrature(t, "boundary", region)
+                surf.setdefault(region, []).append(bare)
+            else:
+                raise NotImplementedError(
+                    f"fem.eval: an integrand on support {support!r} is not an integral over the mesh; "
+                    "only the volume and tagged boundary regions are."
+                )
+        return factory(vol, surf or None)
 
     def region_dofs(self, region, *, field=0, component=None):
         """Global DOF indices of a tagged region — the companion to :meth:`eval`.
@@ -5820,6 +5958,7 @@ def _fem_impl(
         # Free (pre-Dirichlet) residual factory behind FEM.eval — same capture-now reason as above.
         fem_obj._term_residual_factory = getattr(domain, "_fem_native_term_residual", None)
         fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
+        fem_obj._term_functional_factory = getattr(domain, "_fem_native_term_functional", None)
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.

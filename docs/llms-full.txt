@@ -226,6 +226,8 @@ vol  = u.integrate()               # ∫_Ω u dV
 bnd  = u_b.integrate()             # ∮_∂Ω u ds
 heat = (u * v).integrate(ti)       # time-window integral (trapezoid)
 Ku   = (kernel(x, y) * u_of(y)).integrate(var=x)   # non-local / Fredholm — one value per point
+C    = inner(sig(u), eps(u)).integrate(fem)          # FEM functional ∫σ:ε dΩ at fem's solution — an objective node
+C0   = fem.eval(inner(sig(u), eps(u)), sol)          # the same integral, eager (test-free term -> scalar)
 
 xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
 flux = (u_b.x * nx + u_b.y * ny).integrate()       # ∮ ∂u/∂n ds — flux is written explicitly
