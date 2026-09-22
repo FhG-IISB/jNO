@@ -2298,12 +2298,12 @@ def _cavity(n, Re=100.0):
     xg, yg, _ = d.variable("gauge", split=True)
     terms.append(p(xg, yg) - 0.0)
     for r in ("left", "right", "bottom", "top"):
-        X, Y, _ = d.variable(r, split=True)
+        X, Y, _, nx, ny = d.variable(r, normals=True, split=True)
         ub, vb, pb = u.bind(x=X, y=Y), v.bind(x=X, y=Y), p.bind(x=X, y=Y)
-        mx = nu * (ub.xx + ub.yy) - (ub * ub.x + vb * ub.y)
+        mx = nu * (ub.xx + ub.yy) - (ub * ub.x + vb * ub.y)  # ν Δu − (u·∇)u, the wall momentum balance
         my = nu * (vb.xx + vb.yy) - (ub * vb.x + vb * vb.y)
-        dpdn = {"left": -mx, "right": mx, "bottom": -my, "top": my}[r]
-        terms += [u(X, Y) - (1.0 if r == "top" else 0.0), v(X, Y) - 0.0, pb.d(d.variable(r, normals=True)) - dpdn]
+        lid = 1.0 if r == "top" else 0.0
+        terms += [u(X, Y) - lid, v(X, Y) - 0.0, pb.d(d.variable(r, normals=True)) - (nx * mx + ny * my)]
     sol = np.asarray(jno.fdm(terms).solve())
     nx, ny = d.mesh_connectivity["grid"]["shape"]
     centre = sol[0].reshape(nx, ny)[nx // 2]  # u(0.5, y)
@@ -2341,3 +2341,34 @@ def test_unknown_region_tag_raises_and_a_point_region_pins_one_node():
     assert list(f._region_nodes("pin")) == [int(np.argmin(np.linalg.norm(_nodes(d) - [0.5, 0.5], axis=1)))]
     with pytest.raises(ValueError, match="no mesh nodes found"):
         _TraceFDM._region_nodes(f, "no-such-region")
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_normal_components_in_a_flux_value(structured):
+    """`nx, ny` from `d.variable(region, normals=True, split=True)` are the outward normal at the flux
+    nodes, so `ub.d(n) - (a nx + b ny)` is exactly ∂u/∂n for u = a x + b y. They were missing from the
+    evaluation context (KeyError)."""
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25 if structured else 0.15)
+    d = shape.structured().domain() if structured else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    x, y, _ = d.variable("interior", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    xl, yl, _ = d.variable("left", split=True)
+    terms = [-(ui.xx + ui.yy), u(xl, yl) - (2.0 * xl + 3.0 * yl)]
+    for r in ("right", "bottom", "top"):
+        xr, yr, _, nx, ny = d.variable(r, normals=True, split=True)
+        terms.append(u.bind(x=xr, y=yr).d(d.variable(r, normals=True)) - (2.0 * nx + 3.0 * ny))
+    sol = np.asarray(jno.fdm(terms).solve()).reshape(-1)
+    p = _nodes(d)
+    assert np.abs(sol - (2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < (1e-10 if structured else 1e-6)
+
+
+def test_a_flux_spelled_in_components_raises():
+    """`nx*ub.x + ny*ub.y - g` has no `.d(n)`: it read as a second PDE and was summed into the first."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)
+    u = d.unknown()
+    ui, ur = u.bind(x=x, y=y), u.bind(x=xr, y=yr)
+    with pytest.raises(ValueError, match="without a normal derivative"):
+        jno.fdm([-(ui.xx + ui.yy), nx * ur.x + ny * ur.y - 1.0])

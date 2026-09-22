@@ -642,6 +642,16 @@ def _is_normal_jacobian(node):
     )
 
 
+def _iter_variables(node):
+    """Every :class:`Variable` in the expression."""
+    from .trace import Variable
+
+    n = _unwrap(node)
+    if isinstance(n, Variable):
+        return [n]
+    return [v for c in _iter(n) for v in _iter_variables(c)]
+
+
 def _normal_jacobians(node):
     """Every normal-derivative node ``ub.d(n)`` in the expression."""
     n = _unwrap(node)
@@ -725,6 +735,21 @@ class _TraceFDM:
             elif _region_tag(c) == "initial" and _has_temporal(c):
                 self._vel_ic.append(c)
             elif any(_has_unknown_derivative(c, u) for u in self.unknowns):
+                tags = {
+                    v.tag
+                    for v in (getattr(c, "_coord_vars", None) or {}).values()
+                    if getattr(v, "axis", None) != "temporal"
+                }
+                boundary = set(getattr(self.domain, "_boundary_registry", {}) or {})
+                if tags and all(t in boundary or str(t).startswith("n_") for t in tags):
+                    # e.g. `nx*ub.x + ny*ub.y - g`: a flux spelled in components has no `.d(n)`, so it read as a
+                    # SECOND PDE and was summed into the first — silently wrong.
+                    raise ValueError(
+                        f"jno.fdm([...]): a condition on the boundary region(s) {sorted(tags)} differentiates the "
+                        "unknown without a normal derivative. Write the flux as `ub.d(n)` with "
+                        "`n = d.variable(region, normals=True)`; its value may use the components "
+                        "`nx, ny = d.variable(region, normals=True, split=True)[-2:]`."
+                    )
                 self._pde.append(c)
             elif _region_tag(c) == "initial":
                 self._ic.append(c)
@@ -1395,6 +1420,14 @@ class _TraceFDM:
             rows.append((jnp.asarray(secondary), jnp.asarray(main)))
         return rows
 
+    def _normal_field(self, region):
+        """``(N, dim)`` outward unit normals of ``region`` at its nodes (zero elsewhere): the values the
+        components ``nx, ny`` of ``d.variable(region, normals=True, split=True)`` take in a flux condition.
+        The same normals the flux rows use (:meth:`_node_normals`), so ``pb.d(n) - (nx*gx + ny*gy)`` is
+        exactly ``∇p·n = g·n``. They used to be missing from the evaluation context (a ``KeyError``)."""
+        idx, nrm = self._node_normals(region)
+        return jnp.zeros((self._N, self._pts.shape[1])).at[jnp.asarray(np.asarray(idx, dtype=int))].set(jnp.asarray(nrm))
+
     def _node_normals(self, region):
         """Unit outward normals for the flux nodes of ``region``, aligned to those nodes.
 
@@ -1496,6 +1529,10 @@ class _TraceFDM:
             if getattr(v, "axis", None) != "temporal" and not str(getattr(v, "tag", "")).startswith("n_")
         }
         context = self._eval_context(spatial_tags)
+        normal_tags = {  # `nx, ny` of `d.variable(region, normals=True, split=True)`, read as values
+            v.tag for v in _iter_variables(expr) if str(getattr(v, "tag", "")).startswith("n_")
+        }
+        context.update({tag: self._normal_field(tag[len("n_") :]) for tag in normal_tags})
         scope = self._params_scope(extra_params)
         N, unknowns = self._N, self.unknowns
 

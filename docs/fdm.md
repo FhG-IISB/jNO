@@ -632,8 +632,20 @@ Measured on `u_t = Δu − v`, `v_t = Δv + u` (exact `e^{−2π²t} S (cos t, s
 Δt ∝ h: 1.0e-2 / 2.5e-3 / 6.2e-4 structured, 1.7e-2 / 4.4e-3 / 1.1e-3 unstructured at h = 0.1 / 0.05 / 0.025.
 A flux condition on a coupled system belongs to the one field whose normal derivative it carries, and
 replaces that field's equation at the boundary nodes. Its value may read the other fields and their
-derivatives: `pb.d(n) - n·(ν Δu − u·∇u)` imposes a wall pressure from the momentum balance. A condition
-that differentiates two fields raises.
+derivatives. The normal's components `nx, ny` are available as values, so a wall pressure from the
+momentum balance, ∂p/∂n = n·(νΔ**u** − (**u**·∇)**u**), is one expression for every wall:
+
+```python
+xw, yw, _, nx, ny = d.variable(wall, normals=True, split=True)
+n = d.variable(wall, normals=True)
+mx, my = nu*Δ(uw) - (uw*uw.x + vw*uw.y), nu*Δ(vw) - (uw*vw.x + vw*vw.y)
+pw.d(n) - (nx*mx + ny*my)
+```
+
+`nx, ny` are the same per-node normals the flux row uses (exact on a box face). The flux itself must be
+written as `ub.d(n)`. Spelled in components, `nx*ub.x + ny*ub.y`, it raises: it has no normal
+derivative to be recognised by, and it used to be read as a second PDE. A condition that differentiates
+two fields raises too.
 
 Not supported on a coupled system, and each raises: `u.tt` (write it as a first-order system in
 `(u, v = u.t)`), and the time derivative of another field inside equation *k* (a non-diagonal mass).
