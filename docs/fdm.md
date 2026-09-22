@@ -306,8 +306,14 @@ jno.fdm([
     | `cotangent` | 8.2e-3 / 3.6e-3 / 2.2e-3 | **5.1e-3 / 2.3e-3 / 7.4e-4** |
 
     The bold column is what you get. Before this, `cotangent` was paired with the first-order column and
-    stalled. A structured grid is 6.9e-3 / 1.6e-3 / 4.1e-4; there a flux condition used to be dropped
-    altogether (∂u/∂n = 2 and ∂u/∂n = 5 gave identical answers). Naming a sub-scheme on the flux term,
+    stalled. A structured grid is 6.7e-3 / 1.7e-3 / 4.3e-4; there a flux condition used to be dropped
+    altogether (∂u/∂n = 2 and ∂u/∂n = 5 gave identical answers). A box face is axis-aligned, so on a grid
+    `∂u/∂n` is the three-point one-sided difference `(−3u₀ + 4u₁ − u₂)/2h`, not the quadratic fit. Both
+    are second order, but the fit's constant is large. Where the PDE fixes the mean of `u` only
+    through a small reaction term, a flux error ε shifts the whole solution by `∮ε`. On `−Δu + u = f` with
+    `∂u/∂n = 0` on all four sides, `u = cos πx cos πy + ½`, the fit gave 0.43 at h = 0.1 (the mean off by
+    0.31); the one-sided difference gives 2.4e-3 / 5.5e-4 / 2.4e-4 at h = 0.1 / 0.05 / 0.025, rate → 2
+    under further refinement (1.6, 1.8). On the single-edge problem above the two agree to within 7%. Naming a sub-scheme on the flux term,
     `ur.d(nr, scheme="finite_difference:lsq")`, overrides the choice.
 
 ### Periodic

@@ -315,7 +315,7 @@ def test_neumann_is_second_order(interior):
     solve at first order: 2.2e-3 at h = 0.025, rate 0.7. It now uses a quadratic least-squares fit over
     the node's two-ring: 2.3e-3 → 7.4e-4. The default `.d2` (a gradient of that same gradient) keeps it,
     because there it is the consistent closure: 7.5e-3 → 1.8e-3. The structured grid, which used to drop
-    the flux row altogether, gives 1.6e-3 → 4.1e-4."""
+    the flux row altogether, gives 1.7e-3 → 4.3e-4."""
     e = [_sin_neumann(h, interior) for h in (0.05, 0.025)]
     assert e[1] < 2e-3, f"error at h = 0.025: {e[1]:.2e}"
     assert e[0] / e[1] > 2.8, f"expected close to O(h²): {e}"
@@ -1755,7 +1755,7 @@ def _time_everywhere(kind, h):
 def test_time_dependent_flux_data_and_mass_coefficient(kind):
     """A datum written with t works wherever it appears: a Neumann value h(t), a Robin α(t), a mass
     (1 + t)·u_t. They were evaluated once at the start and held: 0.10, 0.12 and 5.8e-3 at T, against
-    8.8e-3, 6.6e-3 and 2.2e-3 now at h = 0.05 — and second order under refinement."""
+    1.5e-3, 1.2e-3 and 2.2e-3 now at h = 0.05 — and second order under refinement."""
     e = [_time_everywhere(kind, h) for h in (0.1, 0.05)]
     assert e[1] < 1e-2 and e[0] / e[1] > 3.0, e
 
@@ -2026,3 +2026,30 @@ def test_gradient_through_a_nonlinear_solve_with_any_linear_slot(linear):
     fd = (float(solve(0.5 + 1e-5)) - float(solve(0.5 - 1e-5))) / 2e-5
     got = float(jax.grad(lambda g: solve(g, linear=getattr(jno.solve, linear)()))(0.5))
     assert abs(got - fd) < 1e-8 * abs(fd), (got, fd)
+
+
+def test_all_neumann_structured_grid_keeps_the_mean():
+    """−Δu + u = f with ∂u/∂n = 0 on all four sides, u = cos πx cos πy + ½. The PDE fixes the mean of u only
+    through the reaction term, so a flux error ε shifts the whole solution by ∮ε. The quadratic boundary
+    fit left the mean 0.31 off (0.43 relative error at h = 0.1); a box face's ∂u/∂n is the three-point
+    one-sided difference, which gives 2.4e-3."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    errs = []
+    for h in (0.1, 0.05):
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+        x, y, _ = d.variable("interior", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        flux = []
+        for r in ("left", "right", "bottom", "top"):
+            xr, yr, _ = d.variable(r, split=True)
+            flux.append(u.bind(x=xr, y=yr).d(d.variable(r, normals=True)) - 0.0)
+        f = (2 * π**2 + 1) * jnn.cos(π * x) * jnn.cos(π * y) + 0.5
+        sol = np.asarray(jno.fdm([-(ui.xx + ui.yy) + ui - f, *flux]).solve()).reshape(-1)
+        p = _nodes(d)
+        exact = np.cos(π * p[:, 0]) * np.cos(π * p[:, 1]) + 0.5
+        assert abs(np.mean(sol - exact)) < 1e-3
+        errs.append(float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)))
+    assert errs[0] < 5e-3 and errs[0] / errs[1] > 3.5, errs
