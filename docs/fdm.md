@@ -317,17 +317,27 @@ boundaries wrap on a structured grid (see [Periodic](#periodic)). **Complex** fi
 by `jno.fdm` (see [Scope](#scope-and-limitations)); the grid operator itself preserves a complex field
 rather than silently dropping the imaginary part, matching the unstructured cotangent path.
 
-!!! note "Inner solver on a structured grid"
-    The strong-form `−ui.xx − ui.yy` with row-replaced Dirichlet gives a **nonsymmetric**
-    reduced operator, on which the default matrix-free BiCGStab can break down. A structured solve
-    therefore defaults its inner Krylov to **GMRES** (robust for nonsymmetric systems, still matrix-free
-    and differentiable via `custom_linear_solve`), **preconditioned by a geometric-multigrid V-cycle**
-    (`jno.precond.gmg()`) — O(N), grid-independent convergence (~0.1 residual reduction per cycle). All
-    automatic, with no change to how you write the problem; it falls back to plain GMRES when the grid is
-    too small to coarsen (an odd cell count on any axis — pick a size giving an even, ideally power-of-two,
-    cell count for the full multigrid speedup). `jno.precond.gmg()` is also a reusable slot for
-    `fem.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())` on a structured domain. Override the
-    inner solver with `.solve(nonlinear=…)` as usual.
+!!! note "Solvers on a structured grid"
+    A **linear** problem whose Dirichlet data covers the whole boundary is one Krylov solve, with no
+    Newton step. The Dirichlet rows are eliminated (`u = u_D + x`, `x` zero on the boundary ring), which
+    leaves the interior system the geometric-multigrid V-cycle (`jno.precond.gmg()`) preconditions, applied
+    matrix-free as the JVP of the residual. A random-probe test decides symmetry: a symmetric operator (a
+    diffusion, with a coefficient or a reaction term) gets **conjugate gradients**, anything else
+    **GMRES** that checks its residual every iteration. Measured on 3-D Poisson at 0.9M nodes (RTX 3070):
+    8 CG iterations, 212 MB peak and 0.05 s per solve, against 380 MB and 0.17 s for the Newton-GMRES path
+    it replaces; 4.2M nodes solve in 2-D or 3-D on an 8 GB card. Differentiable through
+    `custom_linear_solve`, and a solve that does not reach its tolerance raises.
+
+    Other problems -- nonlinear ones, a flux (Neumann/Robin) boundary, periodic axes -- keep the
+    matrix-free Newton with GMRES and the V-cycle. Explicit `linear=jno.solve.cg() / gmres() / bicgstab()`
+    with `precond=jno.precond.gmg()` (or no preconditioner) stays matrix-free on a structured linear
+    problem; other slots (`lu`, `amg`, `jacobi`, ...) assemble the operator. The multigrid needs a grid it
+    can coarsen: an even, ideally power-of-two, cell count per axis. A **coupled** system (several
+    unknowns, e.g. Navier–Stokes) is not multigrid-preconditioned yet, and its cost grows faster than
+    linearly with the grid; `linear=jno.solve.lu(backend="host")` makes its repeat solves much faster
+    (2.0 s against 46 s at 77k nodes, Kovasznay flow) after a slower first call. `jno.precond.gmg()` is
+    also a reusable slot for `fem.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())` on a
+    structured domain.
 
     Supported: **2-D axis-aligned rectangles** (`shape.rect`) and **3-D boxes** (`shape.box`). A
     composite/CSG shape or a spatially varying `size=` raises; composite / cut-cell geometry is planned.

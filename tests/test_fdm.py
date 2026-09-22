@@ -1369,10 +1369,12 @@ def test_compiled_residual_has_no_all_pairs_distance():
 
 
 def test_steady_solve_is_compiled_once_and_reused():
+    """A linear problem on a structured grid takes the one-Krylov-solve path; it compiles once."""
     d, _, prob = _structured_poisson(0.05)
     first = np.asarray(prob.solve())
+    fn = prob._grid_linear_cache["fn"]
     second = np.asarray(prob.solve())
-    assert len(prob._steady_cache) == 1
+    assert prob._grid_linear_cache["fn"] is fn
     np.testing.assert_array_equal(first, second)
     p = _nodes(d)
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
@@ -2612,3 +2614,142 @@ def test_a_data_field_as_a_pde_coefficient():
         jno.fdm([-(k * ui.x).d(x, scheme=jno.fd(average="arithmetic")) - (k * ui.y).y - f, u(xb, yb) - 0.0]).solve()
     ).reshape(-1)
     assert np.isfinite(data).all() and np.abs(data - formula).max() < 1e-10 and np.abs(data).max() > 1e-3
+
+
+# ---------------------------------------------------------------------------------------------------
+# a linear problem on a structured grid: one Krylov solve, no Newton
+# ---------------------------------------------------------------------------------------------------
+def _grid_problem(n, terms_of, dim=2):
+    d = (
+        (
+            jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1.0 / n)
+            if dim == 2
+            else jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=1.0 / n)
+        )
+        .structured()
+        .domain()
+    )
+    c = d.variable("interior", split=True)
+    cb = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(**dict(zip("xyz", c[:dim])))
+    return d, jno.fdm(terms_of(u, ui, c, cb))
+
+
+def test_a_linear_grid_problem_is_one_conjugate_gradient_solve():
+    """-Δu = f with u = 0: symmetric after the Dirichlet rows are eliminated, so conjugate gradients with the
+    multigrid V-cycle -- the same second-order answer the Newton path gave."""
+    import jno.jnp_ops as jnn
+
+    d, prob = _grid_problem(
+        32,
+        lambda u, ui, c, cb: [
+            -ui.d2(c[0]) - ui.d2(c[1]) - 2 * np.pi**2 * jnn.sin(np.pi * c[0]) * jnn.sin(np.pi * c[1]),
+            u(cb[0], cb[1]) - 0.0,
+        ],
+    )
+    sol = np.asarray(prob.solve()).reshape(-1)
+    assert prob._grid_linear_ok() and prob._grid_linear_symmetric_flag
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 1e-3
+
+
+def test_an_advection_diffusion_grid_problem_takes_gmres():
+    """-Δu + b·∇u = f is not symmetric: the probe sees it, and GMRES (checking every iteration) solves it.
+    Manufactured u = sin(πx) sin(πy) with b = (1, 2)."""
+    import jno.jnp_ops as jnn
+
+    def terms(u, ui, c, cb):
+        s, co = jnn.sin, jnn.cos
+        f = (
+            2 * np.pi**2 * s(np.pi * c[0]) * s(np.pi * c[1])
+            + np.pi * co(np.pi * c[0]) * s(np.pi * c[1])
+            + 2 * np.pi * s(np.pi * c[0]) * co(np.pi * c[1])
+        )
+        return [-ui.d2(c[0]) - ui.d2(c[1]) + 1.0 * ui.d(c[0]) + 2.0 * ui.d(c[1]) - f, u(cb[0], cb[1]) - 0.0]
+
+    d, prob = _grid_problem(32, terms)
+    sol = np.asarray(prob.solve()).reshape(-1)
+    assert prob._grid_linear_ok() and not prob._grid_linear_symmetric_flag
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 2e-3
+
+
+def test_the_grid_linear_path_is_differentiable_in_the_source():
+    """d/da of a misfit through -Δu = a·f on a structured grid: the adjoint through custom_linear_solve
+    against a central difference of the same solve."""
+    import jax
+
+    import jno.jnp_ops as jnn
+
+    obs = None
+
+    def loss(a):
+        _, prob = _grid_problem(
+            16,
+            lambda u, ui, c, cb: [
+                -ui.d2(c[0]) - ui.d2(c[1]) - a * 2 * np.pi**2 * jnn.sin(np.pi * c[0]) * jnn.sin(np.pi * c[1]),
+                u(cb[0], cb[1]) - 0.0,
+            ],
+        )
+        assert prob._grid_linear_ok()
+        sol = jnp.asarray(prob.solve()).reshape(-1)
+        return jnp.mean((sol - obs) ** 2)
+
+    d, prob0 = _grid_problem(16, lambda u, ui, c, cb: [-ui.d2(c[0]) - ui.d2(c[1]) - 1.0, u(cb[0], cb[1]) - 0.0])
+    p = _nodes(d)
+    obs = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+    g = float(jax.grad(loss)(1.5))
+    fd = (float(loss(1.5 + 1e-4)) - float(loss(1.5 - 1e-4))) / 2e-4
+    assert g == pytest.approx(fd, rel=1e-6)
+
+
+def test_a_grid_problem_with_a_flux_boundary_keeps_the_newton_path():
+    """Eliminating the Dirichlet rows leaves the V-cycle's interior only when the whole ring is Dirichlet."""
+    _, prob = _grid_problem(
+        16,
+        lambda u, ui, c, cb: [-ui.d2(c[0]) - ui.d2(c[1]) - 1.0, u(cb[0], cb[1]) - 0.0],
+    )
+    assert prob._grid_linear_ok()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1.0 / 16).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)
+    ur = u.bind(x=xr, y=yr)
+    terms = [-ui.d2(x) - ui.d2(y) - 1.0, u(xl, yl) - 0.0, ur.d(d.variable("right", normals=True)) - 0.0]
+    assert not jno.fdm(terms)._grid_linear_ok()
+
+
+def test_krylov_slots_on_a_grid_stay_matrix_free():
+    """linear=cg / gmres with precond=gmg on a structured linear problem runs on the JVP, not on an assembled
+    matrix (which cost 3x the memory and 25x the time at 1M nodes, measured) -- same answer as the default."""
+    import jno.jnp_ops as jnn
+
+    def terms(u, ui, c, cb):
+        return [
+            -ui.d2(c[0]) - ui.d2(c[1]) - 2 * np.pi**2 * jnn.sin(np.pi * c[0]) * jnn.sin(np.pi * c[1]),
+            u(cb[0], cb[1]) - 0.0,
+        ]
+
+    _, ref = _grid_problem(32, terms)
+    base = np.asarray(ref.solve()).reshape(-1)
+    for linear in (jno.solve.cg(tol=1e-10), jno.solve.gmres(tol=1e-10)):
+        _, prob = _grid_problem(32, terms)
+        sol = np.asarray(prob.solve(linear=linear, precond=jno.precond.gmg())).reshape(-1)
+        assert "_sparsity_cache" not in prob.__dict__, "the slot route assembled a matrix"
+        np.testing.assert_allclose(sol, base, atol=1e-8)
+
+
+def test_cg_on_a_nonsymmetric_grid_problem_raises():
+    import jno.jnp_ops as jnn
+
+    _, prob = _grid_problem(
+        16,
+        lambda u, ui, c, cb: [-ui.d2(c[0]) - ui.d2(c[1]) + 3.0 * ui.d(c[0]) - jnn.sin(np.pi * c[0]), u(cb[0], cb[1]) - 0.0],
+    )
+    with pytest.raises(ValueError, match="symmetric"):
+        prob.solve(linear=jno.solve.cg(), precond=jno.precond.gmg())

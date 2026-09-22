@@ -147,6 +147,40 @@ def _fd_newton_tolerances(residual_fn, u0, *, safety: float = 1000.0) -> dict:
     return {"atol": floor, "rtol": 1e-8}
 
 
+def _pcg(matvec, b, precond, tol, maxiter=1000):
+    """Preconditioned conjugate gradients (Hestenes & Stiefel, J. Res. Nat. Bur. Stand. 49 (1952) 409) to a
+    relative residual ``tol``; returns ``(x, ‖r‖)``. Four vectors of state."""
+    import jax
+
+    stop = tol * jnp.linalg.norm(b)
+    z = precond(b)
+    state = (jnp.zeros_like(b), b, z, z, b @ z, 0)
+
+    def cond(s):
+        return (jnp.linalg.norm(s[1]) > stop) & (s[5] < maxiter)
+
+    def body(s):
+        x, r, _, p, rz, k = s
+        Ap = matvec(p)
+        a = rz / (p @ Ap)
+        x, r = x + a * p, r - a * Ap
+        z = precond(r)
+        rz_new = r @ z
+        return x, r, z, z + (rz_new / rz) * p, rz_new, k + 1
+
+    x, r, *_ = jax.lax.while_loop(cond, body, state)
+    return x, jnp.linalg.norm(r)
+
+
+def _gmres_incremental(matvec, b, precond, tol, restart=30, maxiter=50):
+    """GMRES that checks its residual every iteration (JAX's ``incremental`` method) -- the ``batched``
+    method ``jno.solve.gmres`` uses finishes each 30-vector restart cycle whatever the convergence."""
+    from jax.scipy.sparse.linalg import gmres
+
+    x, _ = gmres(matvec, b, tol=tol, restart=restart, maxiter=maxiter, M=precond, solve_method="incremental")
+    return x, jnp.linalg.norm(b - matvec(x))
+
+
 def _structured_linear_solve(domain):
     """Inner linear solve for the matrix-free Newton–Krylov on a **structured grid**: GMRES rather than
     the driver's default BiCGStab. The reduced-Dirichlet 5-/7-point operator is nonsymmetric, and BiCGStab
@@ -2029,8 +2063,14 @@ class _TraceFDM:
             # BiCGStab on the assembled operator. Matrix-free and unpreconditioned, BiCGStab broke down on a
             # 3-D cotangent problem with a Neumann face (Newton residual 5e24) and GMRES stalled at 1.6e-2;
             # its flux rows (~1/h) and Laplacian rows (~1/h²) differ in scale, and Jacobi is what evens them.
-        if linear is not None or precond is not None:
+        if (linear is not None or precond is not None) and self._grid_slots_matrix_free(
+            nonlinear, linear, precond, extra_pins
+        ):
+            sol = self._grid_linear_steady(extra_params, linear=linear, precond=precond)
+        elif linear is not None or precond is not None:
             sol = self._slot_steady(nonlinear, linear, precond, x0, u0, extra_params, extra_pins)
+        elif nonlinear is None and extra_pins is None and self._grid_linear_ok():
+            sol = self._grid_linear_steady(extra_params)
         elif extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer):
             sol = self._compiled_steady(nonlinear, u0)
         else:
@@ -2233,6 +2273,173 @@ class _TraceFDM:
                 "from a better x0."
             )
         return sol
+
+    # ------------------------------------------------------------------------------------------------
+    # A linear problem on a structured grid: one Krylov solve on the interior, no Newton
+    # ------------------------------------------------------------------------------------------------
+    def _grid_linear_ok(self):
+        """Does the steady solve take the structured linear path? A single field on a non-periodic
+        structured grid the multigrid can coarsen, an affine residual, and Dirichlet data on the whole
+        boundary ring -- so the unknowns left after eliminating it are exactly the grid interior the
+        V-cycle preconditions. Decided once per problem."""
+        if getattr(self, "_grid_linear", None) is not None:
+            return self._grid_linear
+        ok = False
+        grid = self.domain.mesh_connectivity.get("grid") if self.domain.mesh_connectivity else None
+        if (
+            self._nf == 1
+            and not self._transient
+            and grid is not None
+            and not any(grid.get("periodic") or ())
+            and self._nodes_are_the_grid(grid)
+            and not self._flux_rows()
+            and not self._periodic_rows()
+        ):
+            from .utils.solver.geometric_mg import build_vcycle
+
+            _, n_levels = build_vcycle(grid["shape"], grid["spacing"])
+            if n_levels >= 2 and np.array_equal(self._dirichlet_nodes(), self._grid_ring(grid)):
+                import jax
+
+                with jax.ensure_compile_time_eval():
+                    probe = self._steady_residual({lid: n.model.module for lid, n in self._trainable_params().items()})
+                    ok = self._is_affine("steady", probe, self._Ntot)
+        self._grid_linear = ok
+        return ok
+
+    def _grid_slots_matrix_free(self, nonlinear, linear, precond, extra_pins):
+        """Explicit ``linear=`` / ``precond=`` slots on a structured linear problem stay matrix-free when
+        they can: a Krylov solver (cg, gmres, bicgstab) and the multigrid V-cycle or no preconditioner.
+        Anything else (a direct solve, AMG, ILU, Jacobi) needs the matrix and takes the assembled route."""
+        if nonlinear is not None or extra_pins is not None or not self._grid_linear_ok():
+            return False
+        krylov = linear is None or getattr(linear, "name", None) in ("cg", "gmres", "bicgstab")
+        return krylov and (precond is None or type(precond).__name__ == "_GMG")
+
+    def _dirichlet_nodes(self):
+        return np.unique(
+            np.concatenate([np.asarray(r[1], dtype=int) for r in self._dirichlet_rows()] or [np.zeros(0, int)])
+        )
+
+    def _grid_ring(self, grid):
+        """The nodes on the boundary ring of the structured grid, by lattice index."""
+        shape = np.asarray(grid["shape"], int)
+        k = np.rint(
+            (np.asarray(self._pts)[:, : len(shape)] - np.asarray(grid["origin"], float))
+            / np.asarray(grid["spacing"], float)
+        )
+        return np.nonzero(np.any((k == 0) | (k == shape - 1), axis=1))[0]
+
+    def _grid_linear_steady(self, extra_params=None, tol=1e-10, *, linear=None, precond=None):
+        """Solve ``R(u) = 0`` for an affine ``R`` on a structured grid as ONE linear solve.
+
+        The Dirichlet rows are eliminated -- ``u = u_D + x`` with ``x`` zero on the boundary ring -- which
+        leaves ``A x = -R(u_D)`` on the interior, applied matrix-free as the JVP of ``R``. ``A`` is
+        symmetric for a self-adjoint operator (a Laplacian, a diffusion with a coefficient, plus a
+        reaction); a two-vector probe decides, and a symmetric system gets preconditioned conjugate
+        gradients (Hestenes & Stiefel 1952) and any other one GMRES that stops at convergence, both
+        preconditioned by the geometric-multigrid V-cycle. The Newton-GMRES path this replaces linearised
+        the residual, ran a Newton step and a full 30-vector GMRES cycle per restart whatever the
+        convergence: measured at 0.9M nodes (3-D Poisson), 380 MB and 0.170 s against 143 MB and 0.024 s
+        with 8 CG iterations.
+
+        Differentiable: ``lax.custom_linear_solve`` gives the adjoint (a trainable parameter in the
+        coefficient, the source or the boundary data). The relative residual is checked on the concrete
+        result, and a solve that did not reach ``tol`` raises."""
+        import jax
+
+        from .utils.solver.geometric_mg import build_vcycle
+
+        grid = self.domain.mesh_connectivity["grid"]
+        if precond is not None:  # the user's V-cycle settings
+            vcycle, _ = build_vcycle(
+                grid["shape"],
+                grid["spacing"],
+                n_pre=precond.n_pre,
+                n_post=precond.n_post,
+                omega=precond.omega,
+                min_size=precond.min_size,
+            )
+        else:
+            vcycle, _ = build_vcycle(grid["shape"], grid["spacing"])
+        slots = linear is not None or precond is not None
+        # the tolerance the solve was asked for: the user's Krylov spec's, or this path's own
+        check_tol = ((linear.key[2][0] if linear is not None and linear.key else 1e-8) if slots else tol) or tol
+        N = self._N
+        eager = extra_params is None
+        cache = self.__dict__.setdefault("_grid_linear_cache", {})
+        key = (self._data_fingerprint(), id(linear), id(precond))
+        if eager and cache.get("key") == key:
+            fn = cache["fn"]
+        else:
+            residual = self._steady_residual(extra_params)
+            rows = self._dirichlet_rows(extra_params)
+            mask = np.ones(N)
+            mask[self._dirichlet_nodes()] = 0.0
+            mask = jnp.asarray(mask)
+            symmetric = self._grid_linear_symmetric(residual, mask)
+            if slots and getattr(linear, "name", None) == "cg" and not symmetric:
+                raise ValueError(
+                    "jno.fdm: linear=jno.solve.cg() needs a symmetric operator, and this one is not (after "
+                    "eliminating the Dirichlet rows, a random-probe test gives wᵀAv ≠ vᵀAw -- an advection "
+                    "term, or a one-sided boundary stencil). Use linear=jno.solve.gmres() or bicgstab()."
+                )
+
+            linear_spec = linear if linear is not None else _solve.gmres()
+
+            def fn(rows=rows):
+                uD = jnp.zeros(N)
+                for _, idx, vals in rows:
+                    uD = uD.at[idx].set(jnp.broadcast_to(jnp.asarray(vals), (idx.shape[0],)))
+                matvec = lambda v: jax.jvp(residual, (uD,), (v * mask,))[1] * mask  # noqa: E731
+                b = -residual(uD) * mask
+                M = lambda r: vcycle(r * mask) * mask  # noqa: E731
+                if slots:  # the user's Krylov spec (it carries its own custom_linear_solve and tolerance)
+                    from .utils.solver.solver_api import LinearOperator
+
+                    x = linear_spec(LinearOperator.from_matvec(matvec), b, M=M if precond is not None else None, x0=None)
+                    rn = jnp.linalg.norm(matvec(x) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
+                    return uD + x, rn
+                krylov = _pcg if symmetric else _gmres_incremental
+
+                def solve(mv, rhs):  # (x, relative residual the Krylov loop ended at) -- no extra matvec
+                    x, rn = krylov(mv, rhs, M, tol)
+                    return x, rn / jnp.maximum(jnp.linalg.norm(rhs), 1e-300)
+
+                # the V-cycle is symmetric, so the same preconditioned Krylov solve serves Aᵀ (the adjoint)
+                x, rel = jax.lax.custom_linear_solve(
+                    matvec, b, solve, transpose_solve=solve, symmetric=symmetric, has_aux=True
+                )
+                return uD + x, rel
+
+            if eager:
+                fn = jax.jit(fn)
+                cache.update(key=key, fn=fn)
+        u, rel = fn()
+        if not isinstance(rel, jax.core.Tracer) and not float(rel) <= 100 * check_tol:
+            raise RuntimeError(
+                f"jno.fdm: the structured linear solve stopped at relative residual {float(rel):.2e} against "
+                f"{check_tol:.0e} ({'conjugate gradients' if self._grid_linear_symmetric_flag else 'GMRES'} with "
+                "multigrid). The operator may be indefinite or badly scaled for this preconditioner; pick the "
+                "solver explicitly with linear=jno.solve.gmres() / jno.solve.lu() and precond=."
+            )
+        return u
+
+    def _grid_linear_symmetric(self, residual, mask):
+        """Is the eliminated operator symmetric? ``wᵀA v = vᵀA w`` for two random vectors: exact for a
+        symmetric linear operator, and violated with probability one otherwise. Decided once."""
+        if getattr(self, "_grid_linear_symmetric_flag", None) is None:
+            import jax
+
+            with jax.ensure_compile_time_eval():
+                rng = np.random.default_rng(7)
+                v, w = (jnp.asarray(rng.standard_normal(self._N)) * mask for _ in range(2))
+                z = jnp.zeros(self._N)
+                Av = jax.jvp(residual, (z,), (v,))[1] * mask
+                Aw = jax.jvp(residual, (z,), (w,))[1] * mask
+                a, b_ = float(w @ Av), float(v @ Aw)
+                self._grid_linear_symmetric_flag = abs(a - b_) <= 1e-10 * max(abs(a) + abs(b_), 1e-300)
+        return self._grid_linear_symmetric_flag
 
     def pinned_solver(self, node_ids, *, nonlinear=None):
         """A **reusable** ``f(values) -> field`` that solves the subdomain with ``node_ids`` pinned to
