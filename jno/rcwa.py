@@ -120,9 +120,11 @@ def detect_layers(E, z, tol=1e-3, slices=None, locate=None):
     slices:
         If given, staircase a continuously-varying ``eps`` into this many layers instead of raising.
     locate:
-        ``locate(k) -> z`` places the interface that lies between samples ``k - 1`` and ``k``. Without it
-        the interface is put halfway between them, so a thickness is only known to one sample spacing;
-        the front door passes a bisection on the analytic permittivity, which finds it exactly.
+        ``locate(z_lo, z_hi) -> z`` places the interface between two neighbouring layers, given heights
+        inside each (their middle samples). Without it the interface is put halfway between the last
+        sample of one layer and the first of the next, so a thickness is only known to one sample spacing.
+        The front door passes a bisection on the permittivity itself, which finds a sharp interface
+        exactly and a mesh field's interface where its interpolant crosses halfway between the layers.
 
     A layer's thickness is the distance between the interfaces that bound it -- not between its first
     and last samples, which is short by up to one spacing (a 0.2 slab sampled every 1/63 came out
@@ -158,8 +160,11 @@ def detect_layers(E, z, tol=1e-3, slices=None, locate=None):
 
     # interface heights: slab i spans [iface[i], iface[i + 1]]; the outer two are the cell's ends
     iface = [float(z[0])]
-    for a, _ in slabs[1:]:
-        iface.append(float(locate(a)) if locate is not None else 0.5 * float(z[a - 1] + z[a]))
+    for (a0, b0), (a, b) in zip(slabs[:-1], slabs[1:]):
+        if locate is not None:
+            iface.append(float(locate(float(z[(a0 + b0) // 2]), float(z[(a + b) // 2]))))
+        else:
+            iface.append(0.5 * float(z[a - 1] + z[a]))
     iface.append(float(z[-1]))
 
     layers, report, zmids, zspans = [], [], [], []
@@ -1360,9 +1365,9 @@ def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None, sub=
     return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
 
 
-def _interface_bisection(coeff_node, C, zs, grid, period, params, sub=1, iters=60):
-    """``locate(k)`` for :func:`detect_layers`: bisect the height of the interface between samples ``k-1``
-    and ``k`` on the analytic permittivity, to ``(zs[1]-zs[0]) / 2**iters`` -- machine precision.
+def _interface_bisection(coeff_node, grid, period, params, sub=1, iters=60):
+    """``locate(z_lo, z_hi)`` for :func:`detect_layers`: bisect the height of the interface between two
+    layers on the analytic permittivity, to ``(z_hi - z_lo) / 2**iters`` -- machine precision.
 
     Each probe samples the whole cell plane at one height and asks which of the two neighbouring slabs it
     matches, so a pattern that changes at the interface (a pillar ending) is located as exactly as a
@@ -1375,9 +1380,47 @@ def _interface_bisection(coeff_node, C, zs, grid, period, params, sub=1, iters=6
             vals = vals[..., 0, 0]
         return _pixel_average(vals.reshape(g, g), grid, sub)
 
-    def locate(k):
-        lo, hi = float(zs[k - 1]), float(zs[k])
-        below, above = C[k - 1], C[k]
+    def locate(lo, hi):
+        below, above = plane(lo), plane(hi)
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            p = plane(mid)
+            if np.max(np.abs(p - below)) <= np.max(np.abs(p - above)):
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    return locate
+
+
+def _interface_bisection_nodal(points, values, grid, period, sub=1, iters=40):
+    """``locate(z_lo, z_hi)`` for a MESH-FIELD permittivity: bisect on its piecewise-linear interpolant
+    (a Delaunay triangulation of the nodes, as the differentiable re-sampling uses), so the interface is
+    where the field crosses halfway between the two layers -- the geometry the mesh actually represents,
+    to within its own resolution. A slab that falls between mesh nodes cannot be located better than that."""
+    from scipy.spatial import Delaunay, cKDTree
+
+    tri, tree = Delaunay(points), cKDTree(points)
+    vals_n = np.asarray(values).reshape(-1)
+    g = grid * sub
+
+    def plane(z):
+        q = _cell_grid_at_z(period, g, z)
+        s = tri.find_simplex(q)
+        out = np.empty(len(q), vals_n.dtype)
+        inside = s >= 0
+        if inside.any():
+            T = tri.transform[s[inside]]
+            b3 = np.einsum("kij,kj->ki", T[:, :3, :], q[inside] - T[:, 3, :])
+            w = np.c_[b3, 1.0 - b3.sum(axis=1)]
+            out[inside] = np.sum(w * vals_n[tri.simplices[s[inside]]], axis=1)
+        if (~inside).any():
+            out[~inside] = vals_n[tree.query(q[~inside])[1]]
+        return _pixel_average(out.reshape(g, g), grid, sub)
+
+    def locate(lo, hi):
+        below, above = plane(lo), plane(hi)
         for _ in range(iters):
             mid = 0.5 * (lo + hi)
             p = plane(mid)
@@ -1920,19 +1963,18 @@ def rcwa(
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
             coeff_nodes = coeff_nodes.real.astype(complex)
         C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range, sub=sub)
-        locate = None  # a mesh field has no exact interface to find; detect_layers takes the midpoint
+        locate = None if slices is not None else _interface_bisection_nodal(pts, coeff_nodes, grid, period, sub)
+        if slices is None:
+            from jno.utils.logger import get_logger
+
+            get_logger().info(
+                "rcwa: the permittivity is a mesh field, so each layer interface is placed where its "
+                "interpolant crosses halfway between the layers -- as sharp as the mesh, no sharper."
+            )
     else:  # analytic permittivity -> sample the grid exactly
         C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams, sub=sub)
-        locate = None if slices is not None else _interface_bisection(coeff_node, C, zs, grid, period, cparams, sub)
+        locate = None if slices is not None else _interface_bisection(coeff_node, grid, period, cparams, sub)
     coeff_layers = detect_layers(C, zs, slices=slices, locate=locate)
-    if locate is None and slices is None and len(coeff_layers) > 2:
-        from jno.utils.logger import get_logger
-
-        dz = float(zs[1] - zs[0])
-        get_logger().info(
-            f"rcwa: the permittivity is a mesh field, so layer interfaces are placed to +-{dz / 2:.3g} "
-            f"(half the z-sampling); each thickness is uncertain by up to {dz:.3g}. Raise nz= to tighten it."
-        )
     zmids = list(detect_layers.last_zmid)  # representative z of each layer (both paths) -> re-sampling
     zspans = list(detect_layers.last_zspan)  # (z_lo, z_hi) per layer -> place an internal source in its layer
 

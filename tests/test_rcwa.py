@@ -647,5 +647,6 @@ def test_detect_layers_measures_between_interfaces():
     E = np.ones((11, 4, 4))
     E[4:7] = 5.0  # the slab occupies samples 4, 5, 6: its interfaces lie in (0.3, 0.4) and (0.6, 0.7)
     assert detect_layers(E, z)[1][0] == pytest.approx(0.3, abs=1e-12)
-    exact = {4: 0.312, 7: 0.648}
-    assert detect_layers(E, z, locate=lambda k: exact[k])[1][0] == pytest.approx(0.336, abs=1e-12)
+    # a locator gets heights inside the two neighbouring layers and returns the interface between them
+    exact = lambda lo, hi: 0.312 if hi < 0.6 else 0.648  # noqa: E731
+    assert detect_layers(E, z, locate=exact)[1][0] == pytest.approx(0.336, abs=1e-12)
