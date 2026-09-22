@@ -439,9 +439,14 @@ crux-driven inverse runs through the slots too.
     The default's inner Krylov is unpreconditioned, so its iteration count grows with Δt and with mesh
     refinement. AMG holds it at 6–8 per step. Every column gives the same answer to every printed digit.
 
-Scope: `gmg` preconditions one scalar field on a structured grid, so it refuses a coupled system and the
-`[u; v]` state of a `u.tt` problem; use `amg` there. That augmented system is not symmetric, so `cg` does
-not apply to it; use `gmres` or `bicgstab`.
+Scope: `gmg` preconditions one scalar field on a structured grid, so it refuses a coupled system; use
+`amg` there. A time step's matrix is `α(−Δ) + σI` (`I + θΔt(−Δ)` for a heat step, `(4/Δt²)I − Δ` for the
+Newmark wave step), and `gmg` reads `α` and `σ` from the operator and builds its V-cycle for exactly that.
+A cycle for `−Δ` alone had cost the 201² wave march 3.0 s at Δt = 1e-3 (1.0 s now). When the shift
+dominates (small Δt), `jacobi` is already nearly exact and is cheapest: 0.46 s on that march. `gmg` wins
+at large Δt, where diffusion dominates: 2.6 s against 11.8 s for `jacobi` on a 401² heat march at Δt = 0.1.
+For an operator of another form (a variable coefficient, advection), the cycle is built from its value at
+the centre node.
 
 ---
 

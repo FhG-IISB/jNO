@@ -24,7 +24,9 @@ per-field DOF blocks (``fem.blocks``); :func:`form` assembles auxiliary weak-for
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exported for user specs)
     PrecondApplier,
@@ -293,6 +295,7 @@ class _GMG(_Spec):
             )
         from .utils.solver.geometric_mg import build_vcycle
 
+        scale, shift = self._scale_and_shift(ctx.A, grid)
         vcycle, n_levels = build_vcycle(
             grid["shape"],
             grid["spacing"],
@@ -300,6 +303,8 @@ class _GMG(_Spec):
             n_post=self.n_post,
             omega=self.omega,
             min_size=self.min_size,
+            scale=scale,
+            shift=shift,
         )
         if n_levels < 2:
             raise ValueError(
@@ -307,6 +312,36 @@ class _GMG(_Spec):
                 "precondition. Use a finer grid, or jno.precond.jacobi() / amg()."
             )
         return PrecondApplier(vcycle)  # a V-cycle for -Δ is ~symmetric (SPD) → reuse M for the transpose
+
+    @staticmethod
+    def _scale_and_shift(A, grid):
+        """``(α, σ)`` with ``A ≈ α(−Δ) + σI`` in the interior, read from two matvecs at the centre node: the
+        response to a unit spike gives the neighbour weight ``−α/h²``, and the response to a constant field
+        (which ``−Δ`` annihilates) gives ``σ``.
+
+        A time step is this shape: ``I + θΔt(−Δ)`` for a heat step, ``(4/Δt²)I + (−Δ)`` for a Newmark
+        step. A V-cycle for ``−Δ`` alone preconditions those badly when Δt is small: measured on a
+        201² Newmark wave at Δt = 1e-3, cg + gmg took 3.0 s against 0.46 s for cg + jacobi. The V-cycle is
+        built for ``α(−Δ) + σI`` instead. An operator that is not of this form (a variable coefficient, an
+        advection term) is preconditioned for its value at the centre node, and a negative ``σ`` (Helmholtz)
+        or an operator that cannot be read (a traced one) keeps the plain ``−Δ`` V-cycle."""
+        shape, spacing = tuple(int(n) for n in grid["shape"]), grid["spacing"]
+        if A is None or getattr(A, "mv", None) is None or any(n < 5 for n in shape):
+            return 1.0, 0.0
+        n = int(np.prod(shape))
+        centre = int(np.ravel_multi_index(tuple(s // 2 for s in shape), shape))
+        stride = int(np.prod(shape[1:]))  # the neighbour along axis 0
+        spike = jnp.zeros(n).at[centre].set(1.0)
+        flat = jnp.ones(n)
+        try:
+            col, const = A.mv(spike), A.mv(flat)
+            alpha = -float(col[centre + stride]) * float(spacing[0]) ** 2
+            sigma = float(const[centre])
+        except (TypeError, jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError):
+            return 1.0, 0.0
+        if not (np.isfinite(alpha) and np.isfinite(sigma)) or alpha <= 0.0:
+            return 1.0, 0.0
+        return alpha, max(sigma, 0.0)
 
     def __repr__(self):
         return "jno.precond.gmg()"

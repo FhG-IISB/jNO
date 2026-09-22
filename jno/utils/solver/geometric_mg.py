@@ -115,12 +115,23 @@ def build_vcycle(shape, spacing, **kwargs):
         return _build_vcycle(shape, spacing, **kwargs)
 
 
-def _build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int = 5):
-    """Build a one-V-cycle applier ``M⁻¹: r_flat → e_flat`` for ``-Δ`` (homogeneous Dirichlet interior) on
-    the structured grid ``(shape, spacing)``. Returns ``(apply, n_levels)``; ``n_levels == 1`` means the
-    grid can't be coarsened (the caller should skip GMG). Damped-Jacobi smoothing (``omega`` defaults to
-    the model-problem optimum ``2d/(2d+1)``), full-weighting restriction ``½ᵈ Pᵀ``, rediscretised coarse
-    operators, dense solve at the coarsest level."""
+def _build_vcycle(
+    shape,
+    spacing,
+    *,
+    n_pre: int = 2,
+    n_post: int = 2,
+    omega: float | None = None,
+    min_size: int = 5,
+    scale: float = 1.0,
+    shift: float = 0.0,
+):
+    """Build a one-V-cycle applier ``M⁻¹: r_flat → e_flat`` for ``scale·(−Δ) + shift·I`` (homogeneous
+    Dirichlet interior) on the structured grid ``(shape, spacing)``. Returns ``(apply, n_levels)``;
+    ``n_levels == 1`` means the grid can't be coarsened (the caller should skip GMG). Damped-Jacobi
+    smoothing (``omega`` defaults to the model-problem optimum ``2d/(2d+1)``), full-weighting restriction
+    ``½ᵈ Pᵀ``, rediscretised coarse operators (the shift is the same on every level), dense solve at the
+    coarsest level. The shift is what a time step adds: ``I + θΔt(−Δ)`` is ``scale = θΔt, shift = 1``."""
     dim = len(shape)
     if omega is None:
         omega = 2.0 * dim / (2.0 * dim + 1.0)  # 2/3 (1-D), 4/5 (2-D), 6/7 (3-D)
@@ -129,7 +140,7 @@ def _build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: flo
     per = []  # per-level: (shape, spacing, interior, inv_diag, [P_axis], [R_axis])
     for lev, (sh, sp) in enumerate(levels):
         interior = _interior_mask(sh)
-        diag = 2.0 * sum(1.0 / (h * h) for h in sp)  # diag of -Δ
+        diag = scale * 2.0 * sum(1.0 / (h * h) for h in sp) + shift  # diag of scale·(−Δ) + shift
         Ps = Rs = None
         if lev + 1 < len(levels):
             csh = levels[lev + 1][0]
@@ -144,8 +155,11 @@ def _build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: flo
     int_flat = np.asarray(cint).reshape(-1) > 0.5
     int_idx = jnp.asarray(np.nonzero(int_flat)[0])
 
+    def _op(u, sp, interior):  # scale·(−Δ) + shift on the interior, zero on the boundary ring
+        return scale * _neg_laplacian(u, sp, interior) + shift * u * interior
+
     def _coarse_matvec(u_flat):
-        return _neg_laplacian(u_flat.reshape(csh), csp, cint).reshape(-1)
+        return _op(u_flat.reshape(csh), csp, cint).reshape(-1)
 
     A_coarse = jax.jacfwd(_coarse_matvec)(jnp.zeros(n_c))
     A_int = A_coarse[jnp.ix_(int_idx, int_idx)]
@@ -157,7 +171,7 @@ def _build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: flo
 
     def _smooth(u, r, sp, interior, inv_diag, n):
         for _ in range(n):
-            u = u + omega * inv_diag * (r - _neg_laplacian(u, sp, interior)) * interior
+            u = u + omega * inv_diag * (r - _op(u, sp, interior)) * interior
         return u
 
     # The transfers used to be dense 1-D matrices applied with `tensordot`: a (n_c × n_f) product along
@@ -180,7 +194,7 @@ def _build_vcycle(shape, spacing, *, n_pre: int = 2, n_post: int = 2, omega: flo
         if lev == len(levels) - 1:
             return _coarse_solve(r_grid)
         e = _smooth(jnp.zeros(sh), r_grid, sp, interior, inv_diag, n_pre)
-        resid = (r_grid - _neg_laplacian(e, sp, interior)) * interior
+        resid = (r_grid - _op(e, sp, interior)) * interior
         e = e + _prolong(_vcycle(_restrict(resid, Rs), lev + 1), Ps)
         e = _smooth(e, r_grid, sp, interior, inv_diag, n_post)
         return e * interior
