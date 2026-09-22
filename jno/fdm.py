@@ -1674,7 +1674,7 @@ class _TraceFDM:
             v0 = v0.at[jnp.asarray(idx)].set(vals)
         return v0
 
-    def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None):
+    def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
         machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
@@ -1692,7 +1692,13 @@ class _TraceFDM:
         ``time=`` selects the time scheme exactly as ``fem.solve(time=…)`` does — ``jno.solve.theta(θ)``
         (Crank–Nicolson at θ=0.5), ``jno.solve.adaptive(…)`` (step-doubling adaptive step size), or
         ``jno.solve.exponential(…)`` — defaulting to backward Euler. ``profile=True`` runs the (eager,
-        non-parametric) solve inside a JAX Perfetto trace and writes it to ``./jno_traces``."""
+        non-parametric) solve inside a JAX Perfetto trace and writes it to ``./jno_traces``.
+
+        ``save_ts=`` are the times a transient solve returns, exactly as ``fem.solve(save_ts=…)``: the march
+        keeps its own step ``Δt`` from ``domain.time`` and the trajectory is sampled at ``save_ts`` (linear
+        interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step."""
+        if save_ts is not None and not self._transient:
+            raise ValueError("jno.fdm([...]): save_ts= samples a transient march; this problem is steady.")
 
         def _run():
             trainable = self._trainable_params()
@@ -1700,8 +1706,10 @@ class _TraceFDM:
                 if x0 is not None:
                     raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
                 if trainable:
-                    return self._parametric_node(trainable, nonlinear=nonlinear, linear=linear, precond=precond, time=time)
-                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
+                    return self._parametric_node(
+                        trainable, nonlinear=nonlinear, linear=linear, precond=precond, time=time, save_ts=save_ts
+                    )
+                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts)
             if trainable:
                 return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
             return self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
@@ -1982,7 +1990,7 @@ class _TraceFDM:
         Schwarz driver builds once and reuses)."""
         return self.pinned_solver(node_ids, nonlinear=nonlinear)(values)
 
-    def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None):
+    def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None):
         """When the constraints carry a trainable ``jno.np.parameter`` (an inverse parameter), return the
         solve as a **trace node** instead of an array — exactly as ``fem.solve()`` does — so it composes
         into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with the parameter's
@@ -2013,7 +2021,7 @@ class _TraceFDM:
             # consults (the PDE, boundary and flux values, time coefficients, initial values).
             self._override = extra
             try:
-                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
+                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts)
             finally:
                 self._override = None
 
@@ -2176,8 +2184,14 @@ class _TraceFDM:
             return jnp.concatenate([ru, rv])
 
         v0 = jnp.where(algebraic, 0.0, self._initial_velocity())
-        if time is None and save_ts is None:
-            return self._newmark(spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, (t0, t1, dt), slots)
+        if time is None:
+            traj = self._newmark(spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, (t0, t1, dt), slots)
+            if save_ts is None:
+                return traj
+            from .utils.solver.backend_blocks import _resample_trajectory
+
+            grid_ts = jnp.linspace(float(t0), float(t1), traj.shape[0], dtype=traj.dtype)
+            return _resample_trajectory(traj, grid_ts, save_ts, traj.dtype)
         state0 = jnp.concatenate([self._initial_state(), v0])
         metadata = {"theta": 0.5, "second_order": True}
         return self._run_block(M, residual, state0, (t0, t1, dt), metadata, save_ts, time, slots)[:, :N]

@@ -398,6 +398,14 @@ traj = jno.fdm([...]).solve(time=jno.solve.theta(0.5))   # Crank–Nicolson (2nd
 traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # step-doubling adaptive step size
 ```
 
+`save_ts=` picks the times the march returns, as in `fem.solve(save_ts=…)`. The step Δt stays the one
+`domain.time` sets; the trajectory is sampled at those times, interpolating linearly between steps:
+
+```python
+ts = np.linspace(t0, t1, n_steps)
+traj = jno.fdm([...]).solve(save_ts=ts[::10])            # every 10th step
+```
+
 `jno.solve.theta(θ)` (θ = 1 backward Euler, 0.5 Crank–Nicolson, 0 forward Euler) and
 `jno.solve.adaptive(…)` compose onto the method-of-lines march. The Dirichlet and flux rows have zero
 mass, so they are constraints, and every θ imposes them at the new time. Forward Euler is explicit only in

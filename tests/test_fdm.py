@@ -2177,3 +2177,45 @@ def test_coupled_march_inverse_recovers_the_coupling():
     crux = jno.core([(problem(w).solve() - observed).mse])
     crux.solve(300)
     assert abs(float(np.asarray(crux.eval([w])).reshape(-1)[0]) - 6.0) < 1e-2
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_save_ts_samples_the_march(order):
+    """`save_ts=` as in fem.solve: the march keeps its own Δt, and the trajectory is sampled at the given
+    times. Every 5th step is exactly those rows of the full trajectory, for heat and for the Newmark wave;
+    a time between steps is the linear interpolation of its two neighbours."""
+    n = 41
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.2, n))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    lhs = ui.t.t if order == 2 else ui.t
+    problem = jno.fdm([lhs - ui.xx - ui.yy, u(xb, yb) - 0.0, u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)])
+    ts = np.linspace(0.0, 0.2, n)
+    full = np.asarray(problem.solve())
+    assert np.abs(np.asarray(problem.solve(save_ts=ts[::5])) - full[::5]).max() < 1e-12
+    mid = np.asarray(problem.solve(save_ts=[0.5 * (ts[3] + ts[4])]))[0]
+    assert np.abs(mid - 0.5 * (full[3] + full[4])).max() < 1e-12
+
+
+def test_save_ts_on_a_coupled_march_and_a_steady_refusal():
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    ic = jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)
+    terms = [ui.t - (ui.xx + ui.yy) + vi, vi.t - (vi.xx + vi.yy) - ui, u(xb, yb) - 0.0, v(xb, yb) - 0.0, u(xi, yi) - ic]
+    full = np.asarray(jno.fdm(terms).solve())
+    got = np.asarray(jno.fdm(terms).solve(save_ts=np.linspace(0.0, 0.1, 11)[::2]))
+    assert got.shape == (6, 2, full.shape[2]) and np.abs(got - full[::2]).max() < 1e-12
+    ds = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    xs, ys_, _ = ds.variable("interior", split=True)
+    xsb, ysb, _ = ds.variable("boundary", split=True)
+    w = ds.unknown()
+    wi = w.bind(x=xs, y=ys_)
+    with pytest.raises(ValueError, match="steady"):
+        jno.fdm([-(wi.xx + wi.yy) - 1.0, w(xsb, ysb) - 0.0]).solve(save_ts=[0.0])
