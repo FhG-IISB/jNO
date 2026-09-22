@@ -29,10 +29,9 @@ from __future__ import annotations
 import copy
 import gc
 import itertools
+import os
 from dataclasses import dataclass
 from typing import Any
-
-import os
 
 import numpy as np
 
@@ -890,8 +889,7 @@ def _cell_patch_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.nd
     return cand, mask
 
 
-def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts, dst_cells, dst_layout,
-                              dim, *, total_dst):
+def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts, dst_cells, dst_layout, dim, *, total_dst):
     """Conservative L2 projection of a P1 state from one mesh onto a DIFFERENT one: the Galerkin
     transfer ``M(dst) u_new = b``, ``b_i = int_{Omega_dst} u_old phi_i^dst``.
 
@@ -921,8 +919,7 @@ def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts
     # so on a destination cell it is not a polynomial and the load vector is the inexact part.
     a1, b1, w1 = 0.816847572980459, 0.091576213509771, 0.109951743655322
     a2, b2, w2 = 0.108103018168070, 0.445948490915965, 0.223381589678011
-    bary = _np.array([[a1, b1, b1], [b1, a1, b1], [b1, b1, a1],
-                      [a2, b2, b2], [b2, a2, b2], [b2, b2, a2]])
+    bary = _np.array([[a1, b1, b1], [b1, a1, b1], [b1, b1, a1], [a2, b2, b2], [b2, a2, b2], [b2, b2, a2]])
     wq = _np.array([w1, w1, w1, w2, w2, w2])
 
     P_s, C_s = _np.asarray(src_pts)[:, :dim], _np.asarray(src_cells)
@@ -930,10 +927,11 @@ def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts
     u_src = _np.asarray(src_state)
     nd = len(P_d)
 
-    V = P_d[C_d]                                            # (n_cell, 3, dim)
-    area = 0.5 * _np.abs((V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1])
-                         - (V[:, 2, 0] - V[:, 0, 0]) * (V[:, 1, 1] - V[:, 0, 1]))
-    qx = _np.einsum("qa,cad->qcd", bary, V)                 # (n_q, n_cell, dim) physical quad points
+    V = P_d[C_d]  # (n_cell, 3, dim)
+    area = 0.5 * _np.abs(
+        (V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1]) - (V[:, 2, 0] - V[:, 0, 0]) * (V[:, 1, 1] - V[:, 0, 1])
+    )
+    qx = _np.einsum("qa,cad->qcd", bary, V)  # (n_q, n_cell, dim) physical quad points
     loc = _locate_in_cells(P_s, C_s, qx.reshape(-1, dim), tol=1e-9, k=12)
     cell_idx, wts = _np.asarray(loc[0]), _np.asarray(loc[1])
 
@@ -941,15 +939,15 @@ def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts
     rows, cols, vals = [], [], []
     for i in range(3):
         for j in range(3):
-            rows.append(C_d[:, i]); cols.append(C_d[:, j])
+            rows.append(C_d[:, i])
+            cols.append(C_d[:, j])
             vals.append(_np.einsum("q,q,q->", wq, bary[:, i], bary[:, j]) * area)
-    M = coo_matrix((_np.concatenate(vals), (_np.concatenate(rows), _np.concatenate(cols))),
-                   shape=(nd, nd)).tocsr()
+    M = coo_matrix((_np.concatenate(vals), (_np.concatenate(rows), _np.concatenate(cols))), shape=(nd, nd)).tocsr()
 
     out = []
     offs, vecs = src_layout["offsets"], src_layout["vecs"]
     for f in range(len(vecs)):
-        blk = u_src[int(offs[f]): int(offs[f + 1])].reshape(-1, int(vecs[f]))
+        blk = u_src[int(offs[f]) : int(offs[f + 1])].reshape(-1, int(vecs[f]))
         comp = []
         for c in range(int(vecs[f])):
             src_nodal = blk[:, c]
@@ -3421,8 +3419,14 @@ def _ma_round_jitted(cells_np, n_verts: int, dim: int, n_relax: int, dt: float):
 
     # SHAPES only: geometry and connectivity both ride through as traced values, so neither the mesh
     # moving each round nor a reconnection changing the elements forces a recompile.
-    key = (int(n_verts), int(np.asarray(cells_np).shape[0]), int(np.asarray(cells_np).shape[1]),
-           int(dim), int(n_relax), float(dt))
+    key = (
+        int(n_verts),
+        int(np.asarray(cells_np).shape[0]),
+        int(np.asarray(cells_np).shape[1]),
+        int(dim),
+        int(n_relax),
+        float(dt),
+    )
     fn = _MA_JIT_CACHE.get(key)
     if fn is None:
 
@@ -5812,15 +5816,28 @@ def run_mesh_motion(
         if _p1_ok and dim == 2:
             state = jnp.asarray(
                 _l2_project_across_meshes(
-                    np.asarray(_opts), np.asarray(_ocells), np.asarray(_ostate), _olay,
-                    np.asarray(d.mesh.points), _new_cells_now, layout, dim,
+                    np.asarray(_opts),
+                    np.asarray(_ocells),
+                    np.asarray(_ostate),
+                    _olay,
+                    np.asarray(d.mesh.points),
+                    _new_cells_now,
+                    layout,
+                    dim,
                     total_dst=int(layout["offsets"][-1]),
                 )
             )
         else:
             _vals = _eval_fe_fields_at_points(
-                _opts, _ocells, jnp.asarray(_ostate), _olay["offsets"], _olay["orders"],
-                _olay["cells_f"], _olay["vecs"], layout["field_points"], dim=dim,
+                _opts,
+                _ocells,
+                jnp.asarray(_ostate),
+                _olay["offsets"],
+                _olay["orders"],
+                _olay["cells_f"],
+                _olay["vecs"],
+                layout["field_points"],
+                dim=dim,
             )
             state = jnp.concatenate([jnp.asarray(v).reshape(-1) for v in _vals])
 
@@ -6018,7 +6035,6 @@ def run_mesh_motion(
         named_np[sp["ids"]] = True
     named_j = jnp.asarray(named_np)
 
-    cells_j = jnp.asarray(shared_cells)
     # Only an INTERIOR cell whose quadrature leaves the old mesh is a fault: a cell touching the boundary
     # genuinely leaves it when that boundary moves outward, and the transfer clamps those to the nearest
     # simplex as the pointwise route did. Boundary-ness is connectivity, so it is hoisted.
@@ -6026,7 +6042,6 @@ def run_mesh_motion(
     _on_bnd = np.zeros(n_verts, dtype=bool)
     _on_bnd[np.unique(np.asarray(_bfac).reshape(-1))] = True
     interior_cell_j = jnp.asarray(~_on_bnd[shared_cells].any(axis=1))
-    sgn0 = jnp.sign(_signed_simplex_measures_jax(X0, cells_j, dim))  # orientation baseline is the START, not the seed mesh
     # ALE: a weak form that reads `coord.d(t)` states the transport relative to the moving mesh itself
     # (`u_t + (c - w).grad u`), so the nodal values RIDE with their vertices -- transferring them as well
     # would count the mesh advection twice. jno.fem rewrote those rates into this one vertex field; each
@@ -6231,9 +6246,7 @@ def run_mesh_motion(
                 # exceeds a wider threshold, so the free surface does not lose and regain wedges from one
                 # step to the next (measured: the perimeter swung +22 % and back -18 % without it).
                 _halpha = _resample_h(_budget[3], X_now, X_now)
-                new_pts, new_cells, new_bf = alpha_reconnect(
-                    X_now, _halpha, float(_cond.alpha), previous=shared_cells
-                )
+                new_pts, new_cells, new_bf = alpha_reconnect(X_now, _halpha, float(_cond.alpha), previous=shared_cells)
                 if np.asarray(_budget[3]).ndim and new_pts.shape[0] != X_now.shape[0]:
                     _budget = (_budget[0], _budget[1], _budget[2], _resample_h(_budget[3], X_now, new_pts))
                 _nodes_changed = new_pts.shape != X_now.shape or not np.array_equal(new_pts, X_now)
@@ -6371,9 +6384,7 @@ def run_mesh_motion(
                     _ma = _ma_round_jitted(shared_cells, n_verts, dim, _nrx, _mdt)
                     _T_ops = _t.perf_counter() - _T0
                     _T0 = _t.perf_counter()
-                    _disp = np.asarray(
-                        _ma(_mon, _sg, _meas, _wsum, jnp.asarray(_ops[3]), jnp.asarray(shared_cells))
-                    )
+                    _disp = np.asarray(_ma(_mon, _sg, _meas, _wsum, jnp.asarray(_ops[3]), jnp.asarray(shared_cells)))
                     _T_ma = _t.perf_counter() - _T0
                     _T0 = _t.perf_counter()
                     _disp = _constrain_boundary_slide(_disp, X_now, shared_cells, dim)
@@ -6389,7 +6400,9 @@ def run_mesh_motion(
                     # frames with nothing raised, temperatures still in a plausible band throughout.
                     _sgn_ref = np.asarray(carry[3]["sgn"]) if isinstance(carry[3], dict) else None
                     if _sgn_ref is not None and _sgn_ref.shape[0] == shared_cells.shape[0]:
-                        _sgn_new = np.sign(np.asarray(_signed_simplex_measures_jax(jnp.asarray(_Xr), jnp.asarray(shared_cells), dim)))
+                        _sgn_new = np.sign(
+                            np.asarray(_signed_simplex_measures_jax(jnp.asarray(_Xr), jnp.asarray(shared_cells), dim))
+                        )
                         if not np.array_equal(_sgn_new, _sgn_ref):
                             _n_inv = int((_sgn_new != _sgn_ref).sum())
                             if bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
@@ -6400,9 +6413,7 @@ def run_mesh_motion(
                                 )
                             _lg = getattr(getattr(fem, "domain", None), "log", None)
                             if _lg is not None:
-                                _lg.warning(
-                                    f"jno.solve.relocate: skipped one round -- it would invert {_n_inv} cell(s)."
-                                )
+                                _lg.warning(f"jno.solve.relocate: skipped one round -- it would invert {_n_inv} cell(s).")
                             history[-1]["relocate_skipped"] = True
                             history[-1]["relocate_would_invert"] = _n_inv
                             continue
@@ -6605,9 +6616,7 @@ def run_mesh_motion(
             return AdaptiveTrajectory(
                 np.concatenate([np.asarray(ts[: i + 1], dtype=float), np.asarray(rest.times[1:], dtype=float)]),
                 [state] + u_frames + list(rest.states[1:]),
-                [(X0, _cells_for(0))]
-                + [(x, _cells_for(k + 1)) for k, x in enumerate(X_frames)]
-                + list(rest.meshes[1:]),
+                [(X0, _cells_for(0))] + [(x, _cells_for(k + 1)) for k, x in enumerate(X_frames)] + list(rest.meshes[1:]),
                 layouts=[layout] * (i + 1) + list(rest.layouts[1:]),
             )
     _X_f = carry[1]

@@ -63,11 +63,11 @@ def _defect(P, C, u):
     a, b, c = P[C[:, 0]], P[C[:, 1]], P[C[:, 2]]
     A = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
     g = np.zeros(len(C))
-    for k, (i, j, l) in enumerate(C):
-        J = np.array([P[j] - P[i], P[l] - P[i]]).T
+    for k, (i, j, r) in enumerate(C):
+        J = np.array([P[j] - P[i], P[r] - P[i]]).T
         if abs(np.linalg.det(J)) < 1e-300:
             continue
-        g[k] = float(np.hypot(*np.linalg.solve(J.T, np.array([u[j] - u[i], u[l] - u[i]]))))
+        g[k] = float(np.hypot(*np.linalg.solve(J.T, np.array([u[j] - u[i], u[r] - u[i]]))))
     m = np.sqrt(1.0 + (g / max(g.max(), 1e-300) * 8.0) ** 2) * A
     return float(m.std() / m.mean())
 
@@ -168,6 +168,7 @@ def test_the_monge_ampere_operator_is_nonsingular_on_disconnected_bodies():
     This matters because a weld bridges two bodies: the mesh is disconnected until they merge.
     """
     import numpy as _np
+
     from jno.utils.solver.fem_adapt import _p1_operators
 
     def _disk(cx, r=1.0, n=12):

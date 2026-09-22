@@ -95,11 +95,7 @@ def _steady_pair(P, CA, CB):
         ndv = lambda f, i: nx * f.x[i] + ny * f.y[i]  # noqa: E731
         div_G = lambda f: f.x[0] + f.y[1] - (nx * ndv(f, 0) + ny * ndv(f, 1))  # noqa: E731
         conv = lambda i: ub[0] * ub.x[i] + ub[1] * ub.y[i]  # noqa: E731
-        mom = (
-            1.0 * (conv(0) * vv[0] + conv(1) * vv[1])
-            + 2.0 * 0.01 * ddot(D(ub), D(vv))
-            - pp * (vv.x[0] + vv.y[1])
-        )
+        mom = 1.0 * (conv(0) * vv[0] + conv(1) * vv[1]) + 2.0 * 0.01 * ddot(D(ub), D(vv)) - pp * (vv.x[0] + vv.y[1])
         return d, jno.fem([mom, -qq * (ub.x[0] + ub.y[1]), 10.0 * div_G(vs)])
 
     dA, femA = build(CA, True)

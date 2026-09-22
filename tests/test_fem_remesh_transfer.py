@@ -15,7 +15,6 @@ it worth having: ``int u`` is preserved.
 """
 
 import numpy as np
-import pytest
 from scipy.spatial import Delaunay
 
 from jno.utils.solver.fem_adapt import _eval_fe_fields_at_points, _l2_project_across_meshes
@@ -47,8 +46,7 @@ def _disk(n_ring, seed, n_bnd=64):
 def _integral(P, C, u):
     V = P[C]
     a = 0.5 * np.abs(
-        (V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1])
-        - (V[:, 2, 0] - V[:, 0, 0]) * (V[:, 1, 1] - V[:, 0, 1])
+        (V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1]) - (V[:, 2, 0] - V[:, 0, 0]) * (V[:, 1, 1] - V[:, 0, 1])
     )
     return float((u[C].mean(axis=1) * a).sum())
 
@@ -86,9 +84,7 @@ def test_the_conservative_transfer_beats_pointwise_interpolation():
 
     u_l2 = np.asarray(_l2_project_across_meshes(PA, CA, uA, lay, PB, CB, layB, 2, total_dst=len(PB)))
     u_pw = np.asarray(
-        _eval_fe_fields_at_points(
-            PA, CA, jnp.asarray(uA), lay["offsets"], lay["orders"], [CA], lay["vecs"], [PB], dim=2
-        )[0]
+        _eval_fe_fields_at_points(PA, CA, jnp.asarray(uA), lay["offsets"], lay["orders"], [CA], lay["vecs"], [PB], dim=2)[0]
     ).reshape(-1)
 
     e_l2 = abs(_integral(PB, CB, u_l2) - IA) / abs(IA)

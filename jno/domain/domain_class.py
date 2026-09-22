@@ -2018,7 +2018,7 @@ class domain(MeshIOMixin):
         num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
         return _vmapped(loc, num_args).astype(bool)
 
-    def dynamic_topology(self, enable: bool = True) -> "Domain":
+    def dynamic_topology(self, enable: bool = True) -> "domain":
         """Assemble against a **runtime** connectivity, so a reconnection that keeps every array shape
         hands over a new triangulation instead of rebuilding. Returns ``self``, so it chains::
 

@@ -60,12 +60,12 @@ def _alignment(tr, k=8):
     P, C = (np.asarray(x) for x in tr.meshes[-1])
     u = np.asarray(tr.states[-1])[: len(P)]
     ar, al = [], []
-    for i, j, l in C:
-        J = np.array([P[j] - P[i], P[l] - P[i]]).T
+    for i, j, m in C:
+        J = np.array([P[j] - P[i], P[m] - P[i]]).T
         if abs(np.linalg.det(J)) < 1e-30:
             continue
         U, sv, _ = np.linalg.svd(J)
-        g = np.linalg.solve(J.T, np.array([u[j] - u[i], u[l] - u[i]]))
+        g = np.linalg.solve(J.T, np.array([u[j] - u[i], u[m] - u[i]]))
         ng = float(np.linalg.norm(g))
         if ng < 1e-12:
             continue
