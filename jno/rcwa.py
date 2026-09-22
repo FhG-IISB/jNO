@@ -106,7 +106,7 @@ class RcwaError(ValueError):
 # =====================================================================================
 # Layer auto-detection: group z-invariant slabs of a sampled permittivity into RCWA layers.
 # =====================================================================================
-def detect_layers(E, z, tol=1e-3, slices=None):
+def detect_layers(E, z, tol=1e-3, slices=None, locate=None):
     """Group a z-sampled permittivity into RCWA layers.
 
     Parameters
@@ -119,6 +119,14 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         In-plane change below which two adjacent z-slices are the same material.
     slices:
         If given, staircase a continuously-varying ``eps`` into this many layers instead of raising.
+    locate:
+        ``locate(k) -> z`` places the interface that lies between samples ``k - 1`` and ``k``. Without it
+        the interface is put halfway between them, so a thickness is only known to one sample spacing;
+        the front door passes a bisection on the analytic permittivity, which finds it exactly.
+
+    A layer's thickness is the distance between the interfaces that bound it -- not between its first
+    and last samples, which is short by up to one spacing (a 0.2 slab sampled every 1/63 came out
+    11/63 = 0.175 thick, and its reflectance 0.34 against Airy's 0.62).
 
     Returns
     -------
@@ -148,6 +156,12 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         idx = np.linspace(0, Nz - 1, slices + 1).round().astype(int)
         slabs = [(idx[i], idx[i + 1]) for i in range(len(idx) - 1)]
 
+    # interface heights: slab i spans [iface[i], iface[i + 1]]; the outer two are the cell's ends
+    iface = [float(z[0])]
+    for a, _ in slabs[1:]:
+        iface.append(float(locate(a)) if locate is not None else 0.5 * float(z[a - 1] + z[a]))
+    iface.append(float(z[-1]))
+
     layers, report, zmids, zspans = [], [], [], []
     for i, (a, b) in enumerate(slabs):
         mid = (a + b) // 2
@@ -156,14 +170,14 @@ def detect_layers(E, z, tol=1e-3, slices=None):
             raise RcwaError(
                 f"slab z=[{z[a]:.3f},{z[min(b, Nz - 1)]:.3f}] is not z-invariant (var={var:.2g}); pass slices=."
             )
-        thick = np.inf if (i == 0 or i == len(slabs) - 1) else float(z[b - 1] - z[a])
+        thick = np.inf if (i == 0 or i == len(slabs) - 1) else iface[i + 1] - iface[i]
         eps_xy = E[mid]
         kind = "uniform" if np.ptp(eps_xy) < tol else "patterned"
         layers.append((thick, eps_xy))
         zmids.append(float(z[mid]))
-        zspans.append((float(z[a]), float(z[min(b - 1, Nz - 1)])))  # (z_lo, z_hi) -> place an internal source
+        zspans.append((iface[i], iface[i + 1]))  # (z_lo, z_hi) -> place an internal source
         report.append(
-            f"  layer {i}: z=[{z[a]:.3f},{z[min(b - 1, Nz - 1)]:.3f}] {kind} eps~[{eps_xy.min():.2f},{eps_xy.max():.2f}]"
+            f"  layer {i}: z=[{iface[i]:.4f},{iface[i + 1]:.4f}] {kind} eps~[{eps_xy.min():.2f},{eps_xy.max():.2f}]"
         )
     detect_layers.last_report = "detected layers:\n" + "\n".join(report)
     detect_layers.last_zmid = zmids  # representative z of each layer -- lets a param sweep re-sample eps
@@ -1346,6 +1360,36 @@ def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None, sub=
     return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
 
 
+def _interface_bisection(coeff_node, C, zs, grid, period, params, sub=1, iters=60):
+    """``locate(k)`` for :func:`detect_layers`: bisect the height of the interface between samples ``k-1``
+    and ``k`` on the analytic permittivity, to ``(zs[1]-zs[0]) / 2**iters`` -- machine precision.
+
+    Each probe samples the whole cell plane at one height and asks which of the two neighbouring slabs it
+    matches, so a pattern that changes at the interface (a pillar ending) is located as exactly as a
+    uniform film. Exact interfaces matter: RCWA's answer is a Fabry-Perot sum over the layer thicknesses."""
+    g = grid * sub
+
+    def plane(z):
+        vals = np.asarray(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, z), params or {}))
+        if vals.ndim >= 3 and vals.shape[-2:] == (3, 3):
+            vals = vals[..., 0, 0]
+        return _pixel_average(vals.reshape(g, g), grid, sub)
+
+    def locate(k):
+        lo, hi = float(zs[k - 1]), float(zs[k])
+        below, above = C[k - 1], C[k]
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            p = plane(mid)
+            if np.max(np.abs(p - below)) <= np.max(np.abs(p - above)):
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    return locate
+
+
 def _coeff_is_tensor(coeff_node, period, z_range, params):
     """True if the permittivity coefficient is a 3×3 tensor (anisotropic ε̂) rather than a scalar — decided
     by evaluating it once at a representative cell point and checking the value shape."""
@@ -1876,9 +1920,19 @@ def rcwa(
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
             coeff_nodes = coeff_nodes.real.astype(complex)
         C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range, sub=sub)
+        locate = None  # a mesh field has no exact interface to find; detect_layers takes the midpoint
     else:  # analytic permittivity -> sample the grid exactly
         C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams, sub=sub)
-    coeff_layers = detect_layers(C, zs, slices=slices)
+        locate = None if slices is not None else _interface_bisection(coeff_node, C, zs, grid, period, cparams, sub)
+    coeff_layers = detect_layers(C, zs, slices=slices, locate=locate)
+    if locate is None and slices is None and len(coeff_layers) > 2:
+        from jno.utils.logger import get_logger
+
+        dz = float(zs[1] - zs[0])
+        get_logger().info(
+            f"rcwa: the permittivity is a mesh field, so layer interfaces are placed to +-{dz / 2:.3g} "
+            f"(half the z-sampling); each thickness is uncertain by up to {dz:.3g}. Raise nz= to tighten it."
+        )
     zmids = list(detect_layers.last_zmid)  # representative z of each layer (both paths) -> re-sampling
     zspans = list(detect_layers.last_zspan)  # (z_lo, z_hi) per layer -> place an internal source in its layer
 

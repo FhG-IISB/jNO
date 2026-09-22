@@ -295,6 +295,16 @@ sol = rc.solve()
 layers, with the two ambients marked semi-infinite. Continuous z-variation (an inclined or curved
 geometry) **raises** unless you opt in with `slices=N` to staircase it.
 
+A layer's thickness is the distance between the **interfaces** that bound it. For an analytic
+permittivity (a `jno.fn` of the coordinates) the front door finds each interface by bisecting between
+the two z-samples either side of it, so a thickness is exact to machine precision whatever `nz` is.
+RCWA's answer is a Fabry–Pérot sum over the layer thicknesses, so this matters: measuring between the
+first and last samples inside a layer, as earlier versions did, took a 0.2 slab sampled every 1/63 as
+0.175 thick, and its reflectance as 0.34 against Airy's 0.62. A permittivity given as a **mesh field**
+(a per-node design parameter) has no exact interface to find: each is placed halfway between its two
+samples, the build logs the resulting uncertainty (up to one z-spacing per thickness), and `nz=`
+tightens it.
+
 ## Never fails silently
 
 Every inference is validated and raises `RcwaError` (or `ImportError` for the missing backend) with a

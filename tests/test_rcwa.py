@@ -635,3 +635,17 @@ def test_parametric_solve_is_jit_differentiable():
     g_jit = np.asarray(jax.jit(jax.grad(T))(rv0))  # must not raise (the fix); must match
     assert np.all(np.isfinite(g_jit))
     np.testing.assert_allclose(g_jit, g, rtol=1e-6, atol=1e-8)
+
+
+def test_detect_layers_measures_between_interfaces():
+    """Without a locator an interface sits halfway between the samples either side of it, so the slab
+    below (samples 4..6 of a 0.1 grid) is 0.3 thick -- the old sample span said 0.2. A locator that
+    knows the true interfaces makes the thickness exact."""
+    from jno.rcwa import detect_layers
+
+    z = np.linspace(0.0, 1.0, 11)
+    E = np.ones((11, 4, 4))
+    E[4:7] = 5.0  # the slab occupies samples 4, 5, 6: its interfaces lie in (0.3, 0.4) and (0.6, 0.7)
+    assert detect_layers(E, z)[1][0] == pytest.approx(0.3, abs=1e-12)
+    exact = {4: 0.312, 7: 0.648}
+    assert detect_layers(E, z, locate=lambda k: exact[k])[1][0] == pytest.approx(0.336, abs=1e-12)
