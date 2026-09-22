@@ -260,7 +260,24 @@ def _linsolve(matvec, b, *, tol, maxit, gate_forward=True):
     solve = lambda mv, rhs: bicgstab(mv, rhs, tol=tol, maxit=maxit)
     who = "the newton_krylov inner BiCGStab"
     fwd = _gated(solve, who, "forward") if gate_forward else solve
-    return jax.lax.custom_linear_solve(matvec, b, fwd, transpose_solve=_gated(solve, who, "transpose"))
+    rescued = lambda mv, rhs: _with_gmres_rescue(mv, rhs, bicgstab(mv, rhs, tol=tol, maxit=maxit), tol=tol)
+    return jax.lax.custom_linear_solve(matvec, b, fwd, transpose_solve=_gated(rescued, who, "transpose"))
+
+
+def _with_gmres_rescue(mv, rhs, x, *, tol):
+    """``x`` if it solves ``mv(x) = rhs`` to ``tol`` (true residual), else a GMRES re-solve.
+
+    Only the TRANSPOSE (adjoint) solve takes this path. BiCGStab can break down on ``Aᵀ`` while converging on
+    ``A``: on an FDM time step, whose algebraic boundary rows make the operator non-symmetric, it returned a
+    NaN, and a crux inverse for a diffusivity died on it. GMRES has no breakdown division. The forward
+    solve keeps plain BiCGStab, so a march that is not being differentiated pays nothing."""
+    eps = float(jnp.finfo(rhs.dtype).eps)
+    rel = jnp.linalg.norm(mv(x) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
+    return jax.lax.cond(
+        rel < max(10.0 * tol, 1e4 * eps),
+        lambda: x,
+        lambda: jax.scipy.sparse.linalg.gmres(mv, rhs, tol=tol, atol=0.0, restart=30)[0],
+    )
 
 
 def _step_and_tangent(linear_solve, who, *, tol, maxit):
