@@ -10,7 +10,7 @@ and everything else is evanescent. Sweeping the period Λ through λ therefore s
 orders on at Λ = λ -- the **Rayleigh anomaly** (Rayleigh, *Proc. R. Soc. A* 79, 399, 1907). Below
 it the structure is *sub-wavelength*: only m=0 survives, all the transmitted light goes straight
 ahead, and the slab acts as a homogeneous effective medium -- the regime metasurfaces work in.
-Above it the same slab is a **beam splitter**.
+Above it the same slab sends what it transmits into the ±1 orders.
 
 The whole problem is the scalar-Helmholtz term list you would hand ``jno.fem``:
 
@@ -21,8 +21,11 @@ The whole problem is the scalar-Helmholtz term list you would hand ``jno.fem``:
     u(front) − u(back) = 0        Floquet periodicity in y
 
 ``jno.rcwa`` infers the period from the Floquet ties, the ambients from the two z-normal radiation
-faces, the layer stack and ε from the volume coefficient, and the wavelength from ε in the vacuum
-superstrate -- so only ``orders`` (the Fourier truncation) is genuinely ours to choose. Because ε
+faces, the layer stack and ε from the volume coefficient, the wavelength from ε in the vacuum
+superstrate, and the polarization from the equation itself: for a grating whose ridges run along y the
+scalar equation is exactly Maxwell's for E_y, so it is solved TE -- the same equation ``jno.fem`` solves.
+Only the truncation is genuinely ours to choose: ``orders`` Fourier terms and a ``grid`` for sampling ε,
+which converge the reflectance here to about 2e-3 of an exact-coefficient reference (0.8441 at Λ = 1.5). Because ε
 is an analytic ``jno.fn``, it is sampled directly on the RCWA grid, so the tetrahedral mesh only
 has to carry the tags and can stay coarse. The modal method itself is Moharam & Gaylord,
 *J. Opt. Soc. Am.* 71, 811 (1981).
@@ -30,7 +33,7 @@ has to carry the tags and can stay coarse. The modal method itself is Moharam & 
 What is verified (no analytic field solution needed -- these are exact statements):
   1. energy conservation, R + T = 1, on a lossless structure;
   2. the grating-equation cutoff -- orders outside |m·λ/Λ| ≤ 1 carry exactly zero power;
-  3. mirror symmetry -- T(+1) = T(−1) for a symmetric grating at normal incidence (to ~2e-8: the
+  3. mirror symmetry -- T(+1) = T(−1) for a symmetric grating at normal incidence (to ~1e-10: the
      ±1 pair is degenerate here, and the modal eigensolve splits it at a floor that more Fourier
      orders do not lower -- unlike the energy balance, which holds to machine precision);
   4. completeness -- the propagating order efficiencies sum to the total transmission.
@@ -54,10 +57,10 @@ Z0, Z1 = 0.4, 0.6  # slab occupies z ∈ (0.4, 0.6); vacuum ambients above and b
 PY = 0.3  # y-period, deliberately sub-wavelength -> a 1-D grating
 DUTY = 0.5  # ridge fills the left half of each cell
 K0 = 2 * jnp.pi / WL
-ORDERS = 40
+ORDERS, GRID = 160, 256
 
 
-def grating(period, orders=ORDERS):
+def grating(period, orders=ORDERS, grid=GRID):
     """Solve one binary grating and return its order-resolved efficiencies."""
     d = jno.shape.box(0, 0, 0, period, PY, 1.0, size=0.25).domain()  # coarse: ε is analytic
     e = 1e-6
@@ -91,6 +94,7 @@ def grating(period, orders=ORDERS):
             uf - ubk,  # Floquet, y
         ],
         orders=orders,
+        grid=grid,
     ).solve()
 
     real = lambda a: float(jnp.real(jnp.asarray(a)))  # noqa: E731
@@ -125,8 +129,8 @@ for P, r in res.items():
         if m not in prop:
             assert o[m] < 1e-9, f"order {m} is evanescent at Λ={P} but carries {o[m]:.2e}"
     # The ±1 pair is degenerate at normal incidence, so the modal eigensolve splits it at its own
-    # floor: measured |T(+1) − T(−1)| ≈ 2e-8, and it does NOT shrink with `orders` (2.09e-8 at 40,
-    # 1.93e-8 at 80) — it is not Fourier truncation. Energy conservation, by contrast, holds to 1e-15.
+    # floor: measured |T(+1) − T(−1)| ≈ 7e-11, and it does NOT shrink with `orders` (7.5e-11 at 160,
+    # 6.9e-11 at 320) — it is not Fourier truncation. Energy conservation, by contrast, holds to 1e-15.
     assert abs(o[+1] - o[-1]) < 1e-6, f"symmetric grating at normal incidence: T(+1) must equal T(-1) (Λ={P})"
     assert abs(sum(o[m] for m in prop) - r["T"]) < 1e-6, f"propagating orders must sum to T (Λ={P})"
 

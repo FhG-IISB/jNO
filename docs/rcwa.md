@@ -38,6 +38,7 @@ What is inferred from the problem, and from where:
 | **permittivity** | the `K0²·ε` coefficient recovered from the scalar Helmholtz volume term, sampled along z, then grouped by [`detect_layers`](#layer-detection) |
 | **wavelength / `k0`** | the coefficient's value in the vacuum superstrate (`k0 = √coeff`); pass `wavelength=` to override |
 | **incident wave** (lit face + angle `k_in`) | the assembled forcing `b` — a constant-phase source ⇒ normal incidence |
+| **incident polarization** | a vector list's incident field `E_inc`; for a scalar list, the polarization the scalar equation describes — see [Polarization](#polarization) |
 | **tensor permittivity `ε̂`** | an `inner(ε̂ @ u, v)` mass term (a 3×3 `MatrixView`) — birefringence, polarization conversion |
 | **in-plane PML** | a complex coordinate stretch `S = 1 + iσ/k` in the stiffness coefficients — see below |
 | **internal source** | a `- f·v` / `- inner(J, v)` volume forcing — a dipole / Gaussian emitter — see below |
@@ -52,6 +53,29 @@ where no ambient is vacuum.
 Because RCWA solves the *infinitely periodic* problem, a finite aperture with plain absorbing side
 walls and **no ties** is **rejected** rather than silently periodicised. To model an *isolated*
 scatterer, keep the ties and add an in-plane PML frame (below) — the standard periodic-supercell trick.
+
+## Polarization
+
+RCWA solves Maxwell's equations, so every solve has an incident polarization. `jno.rcwa` takes it from
+the problem, logs it, and keeps it on `rc.spec.polarization` (a transverse Jones vector `(p_x, p_y)`) with
+the reason on `rc.spec.polarization_from`:
+
+- A **vector** (curl-curl) list states it: the transverse part of its incident field `E_inc`.
+- A **scalar** Helmholtz list is solved in the polarization for which Maxwell reduces *exactly* to the
+  written equation `Δu + k0²ε u = 0`: the field along an in-plane axis every layer is invariant along,
+  when the incidence has no component along it — TE, E parallel to the lines of a 1-D grating (either
+  orientation), and s-polarized light on a uniform stack at any azimuth. `jno.rcwa` and `jno.fem` then
+  answer the same equation. For a lamellar grating (period 0.6λ, ε = 11, fill 0.5, 0.05λ thick) this is
+  a reflectance of 0.617 — the TE value of an independent RCWA — where the x-polarized solve used for
+  every list before gave the TM value, 0.107.
+- A stack **patterned along both axes** (pillars, holes), an anisotropic or PML stack, or a 1-D grating
+  lit off its invariant axis (conical mount) reduces to the scalar equation for no polarization. It is
+  solved x-polarized and the log says so; choose with `polarization=` or write the vector list.
+
+`polarization=` overrides the inference: `"x"`, `"y"`, or any Jones vector — `(1, 1j)` is circular light,
+which a 1-D grating in the classical mount reflects at the mean of its TE and TM reflectances.
+`sol.jones()` gives the full 2×2 response regardless. The scalar aerial and bulk images use the field
+component along the incident polarization.
 
 ## In-plane PML — an isolated scatterer from a periodic supercell
 
@@ -181,7 +205,8 @@ mask solve:
 loss = lambda: ((jno.rcwa(mask(rho)).solve().aerial(NA=0.33, source=src) - target) ** 2).mean()
 ```
 
-By default the image is **scalar** (uses `E_x`) — correct at low NA. Pass `polarization=` to switch on the
+By default the image is **scalar** (the field component along the incident polarization — `E_x` for an
+x-polarized solve) — correct at low NA. Pass `polarization=` to switch on the
 **vector high-NA** model, which rotates each order's transverse `(E_x, E_y)` to the 3-D wafer field through
 the Richards-Wolf/Flagello vector pupil (with the aplanatic `1/√(cosθ)` apodization), so the TM component
 loses contrast at large ray angles — the defining high-NA effect:
@@ -261,7 +286,7 @@ vol = sol.expose(NA=0.33, source=0.5).bulk(jno.litho.Film(n_resist=1.7 + 0.02j, 
 
 `jno.litho.Film` carries the resist stack (`n_resist`, `thickness`, `n_substrate`, `n_top`, `nz`). At `z = 0`
 with no substrate reflection `bulk` equals the aerial image; a reflective substrate produces a vertical
-standing wave of period `λ/(2·n_resist)`. `bulk` is scalar (`E_x`) with a single-substrate-reflection model
+standing wave of period `λ/(2·n_resist)`. `bulk` is scalar (the co-polarized field) with a single-substrate-reflection model
 (full multilayer Airy and a vector bulk image are future work).
 
 **3-D PEB.** Pass a `Film` to `CAResist` and it switches from the 2-D aerial-driven bake to a full **3-D
@@ -315,6 +340,9 @@ concrete fix:
 | `fmmax` not installed | `ImportError` pointing at the `[rcwa]` extra |
 | no Floquet ties (finite aperture) | raises — author periodic side walls |
 | periodicity in only one of x / y | raises — add the missing tie |
+| a scalar list on a stack patterned along both axes | logged — solved x-polarized; choose with `polarization=` |
+| a vector incident field with no transverse part | raises — it carries no power into the stack |
+| a layer interface from a mesh-field permittivity | logged — located on the field's interpolant, as sharp as the mesh |
 | no z-normal ambient faces found | raises — tag the top/bottom faces |
 | `eps` varies continuously in z | raises unless `slices=N` |
 | no source / forcing in the problem | raises — nothing to illuminate with |
