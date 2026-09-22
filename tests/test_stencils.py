@@ -122,8 +122,8 @@ def test_refusals():
     xb, yb, _ = d.variable("boundary", split=True)
     u = d.unknown()
     ui = u.bind(x=x, y=y)
-    with pytest.raises(NotImplementedError, match="structured grid"):
-        jno.fdm([ui.d2(x, scheme=jno.fd(order=4)) + ui.yy, u(xb, yb) - 0.0]).solve()
+    with pytest.raises(NotImplementedError, match="structured grid"):  # offsets exist only on a grid
+        jno.fdm([ui.d2(x, scheme=jno.fd(points=(-1, 0, 1))) + ui.yy, u(xb, yb) - 0.0]).solve()
 
 
 # The conservative form of (κ·u.x).x. Chaining two central differences reads every second node — a
@@ -274,3 +274,87 @@ def test_upwind_refuses_a_mesh_and_other_stencil_options():
     ui = u.bind(x=x, y=y)
     with pytest.raises(NotImplementedError, match="structured grid"):
         jno.fdm([ui.d(x, scheme=jno.fd(upwind=1.0)) - ui.xx - ui.yy, u(xb, yb) - 0.0]).solve()
+
+
+# Unstructured meshes: jno.fd(order=k) / jno.fd(fit=p, rings=r) read the derivatives off a local polynomial
+# least-squares fit (a generalised finite difference), per node over the fewest rings that determine it.
+
+
+def test_mesh_fit_is_exact_on_polynomials():
+    from shapely.geometry import box
+
+    from jno.stencils import mesh_fit_derivative
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    P = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    cells = np.asarray(d.mesh_connectivity["triangles"])
+    X, Y = P[:, 0], P[:, 1]
+    f = jnp.asarray(X**3 + 2 * X * Y**2 - Y**3 + X)
+    spec = jno.fd(fit=3)
+    gx = mesh_fit_derivative(f, jnp.asarray(P), cells, spec, (0,))
+    lap = mesh_fit_derivative(f, jnp.asarray(P), cells, spec, (0, 0)) + mesh_fit_derivative(
+        f, jnp.asarray(P), cells, spec, (1, 1)
+    )
+    np.testing.assert_allclose(gx, 3 * X**2 + 2 * Y**2 + 1, atol=1e-11)
+    np.testing.assert_allclose(lap, 10 * X - 6 * Y, atol=1e-10)
+    d3 = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain()  # tetrahedra
+    P3 = np.asarray(d3.mesh_connectivity["points"])[:, :3]
+    T = np.asarray(d3.mesh_connectivity["tetrahedra"])
+    f3 = jnp.asarray(P3[:, 0] ** 2 * P3[:, 1] + P3[:, 2] ** 2)
+    np.testing.assert_allclose(mesh_fit_derivative(f3, jnp.asarray(P3), T, spec, (0,)), 2 * P3[:, 0] * P3[:, 1], atol=1e-11)
+    np.testing.assert_allclose(mesh_fit_derivative(f3, jnp.asarray(P3), T, spec, (2, 2)), 2.0, atol=1e-10)
+
+
+def _mesh_poisson(h, scheme):
+    from shapely.geometry import box
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, scheme=scheme)
+    f = -2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    sol = np.asarray(jno.fdm([ui.xx + ui.yy - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    P = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    return float(np.abs(sol - np.sin(np.pi * P[:, 0]) * np.sin(np.pi * P[:, 1])).max())
+
+
+def test_fourth_order_on_an_unstructured_mesh():
+    """Measured: order=4 → 2.3e-3, 1.5e-4, 9.6e-6 at h = 0.1 / 0.05 / 0.025 (rate 4.0); the default cotangent
+    Laplacian → 1.2e-2, 3.1e-3, 7.8e-4."""
+    e = [_mesh_poisson(h, jno.fd(order=4)) for h in (0.1, 0.05)]
+    assert e[1] < 3e-4 and np.log2(e[0] / e[1]) > 3.5, e
+
+
+def test_order_4_on_a_network_field_over_a_mesh():
+    """The PINN route on an unstructured mesh: 1.4e-4, 1.4e-5, 1.2e-6 against the network's exact derivative."""
+    import foundax
+    from shapely.geometry import box
+
+    net = jno.nn.wrap(foundax.mlp(2, output_dim=1, hidden_dims=16, num_layers=2, key=jax.random.PRNGKey(0)))
+    errs = []
+    for h in (0.1, 0.05):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+        x, y, _ = d.variable("interior", split=True)
+        u = net(x, y)
+        crux = jno.core([(u - 0.0).mse])
+        ad, fd4 = (np.asarray(v).reshape(-1) for v in crux.eval([u.d(x), u.d(x, scheme=jno.fd(order=4))]))
+        errs.append(np.abs(fd4 - ad).max() / np.abs(ad).max())
+    assert errs[1] < 5e-5 and np.log2(errs[0] / errs[1]) > 3.0, errs
+
+
+def test_mesh_fit_refusals():
+    from shapely.geometry import box
+
+    from jno.stencils import mesh_fit_derivative
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    P = jnp.asarray(np.asarray(d.mesh_connectivity["points"])[:, :2])
+    cells = np.asarray(d.mesh_connectivity["triangles"])
+    u = jnp.zeros(P.shape[0])
+    with pytest.raises(ValueError, match="neighbours"):  # one ring cannot determine a degree-5 fit
+        mesh_fit_derivative(u, P, cells, jno.fd(fit=5, rings=1), (0,))
+    with pytest.raises(ValueError, match="degree at least"):
+        mesh_fit_derivative(u, P, cells, jno.fd(fit=1), (0, 0))
+    with pytest.raises(ValueError, match="fit="):
+        jno.fd(fit=2, points=(-1, 0, 1))

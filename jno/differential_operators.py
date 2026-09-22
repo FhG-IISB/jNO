@@ -61,14 +61,19 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def _require_grid(method, grid) -> None:
-    """``jno.fd(...)`` stencils are defined on structured grids for now; refuse them on a mesh."""
-    if grid is None and _is_stencil(method):
-        raise NotImplementedError(
-            f"scheme={str(method)!r}: jno.fd(order=/points=/weights=/boundary=) stencils need a structured grid "
-            "(jno.shape.rect(...).structured()). On an unstructured mesh use the default, or "
-            "'finite_difference:lsq' / ':cotangent'."
-        )
+def _mesh_route(method, grid):
+    """For a ``jno.fd(...)`` spec on an unstructured mesh: ``"fit"`` (a polynomial least-squares fit),
+    ``"default"`` (grid-only options such as ``average=`` only: the kernel's default stencil), or raise for
+    options that exist only on a grid. ``None`` on a structured grid or for a scheme string."""
+    if grid is not None or not _is_stencil(method):
+        return None
+    return method.mesh_route()
+
+
+def _mesh_fit(u, points, cells, spec, axes):
+    from .stencils import mesh_fit_derivative
+
+    return mesh_fit_derivative(u, points, cells, spec, axes)
 
 
 def _is_stencil(method) -> bool:
@@ -307,7 +312,11 @@ class DifferentialOperators:
         Returns:
             ``∂u/∂x_dim`` at each point, shape ``(N,)``.
         """
-        _require_grid(method, grid)
+        route = _mesh_route(method, grid)
+        if route == "fit":  # `jno.fd(order=/fit=)` on a mesh: a local polynomial least-squares fit
+            return _mesh_fit(u_values, points, triangles, method, (dim,))
+        if route == "default":
+            method = "area_weighted"
         if grid is not None:
             # Promote against the mesh-coordinate dtype — exactly what the triangle path gets by
             # multiplying the field against the float64 point coords: a float32 field lifts to float64
@@ -464,7 +473,11 @@ class DifferentialOperators:
         Returns:
             Laplacian, shape ``(N,)``.
         """
-        _require_grid(method, grid)
+        route = _mesh_route(method, grid)
+        if route == "fit":
+            return sum(_mesh_fit(u_values, points, triangles, method, (d, d)) for d in dims)
+        if route == "default":
+            method = "gradient_of_gradient"
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
             per = grid.get("periodic") or (False,) * len(grid["shape"])
@@ -605,7 +618,12 @@ class DifferentialOperators:
         N = points.shape[0]
         n_vars = int(jnp.sqrt(len(var_dims)))
 
-        _require_grid(method, grid)
+        if _mesh_route(method, grid) == "fit":
+            n_v = int(round(len(var_dims) ** 0.5))
+            out = jnp.zeros((points.shape[0], n_v, n_v))
+            for i, vi_dim, j, vj_dim in var_dims:
+                out = out.at[:, i, j].set(_mesh_fit(u_values, points, triangles, method, (vi_dim, vj_dim)))
+            return out
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
             sp = grid["spacing"]
@@ -692,7 +710,11 @@ class DifferentialOperators:
             ``∂u/∂x_dim`` at each point, shape ``(N,)``. When ``grid`` is a structured-grid descriptor
             the reshaped central difference is used (see the 2-D gradient); ``tetrahedra`` is ignored.
         """
-        _require_grid(method, grid)
+        route = _mesh_route(method, grid)
+        if route == "fit":
+            return _mesh_fit(u_values, points, tetrahedra, method, (dim,))
+        if route == "default":
+            method = "area_weighted"
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             _per = grid.get("periodic") or (False,) * len(grid["shape"])
@@ -961,7 +983,11 @@ class DifferentialOperators:
         Returns:
             Laplacian, shape ``(N,)``.
         """
-        _require_grid(method, grid)
+        route = _mesh_route(method, grid)
+        if route == "fit":
+            return sum(_mesh_fit(u_values, points, tetrahedra, method, (d, d)) for d in dims)
+        if route == "default":
+            method = "gradient_of_gradient"
         if grid is not None:  # structured-grid 7-point stencil (Σ_d central 2nd difference), assembly-free
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             per = grid.get("periodic") or (False,) * len(grid["shape"])
@@ -1009,7 +1035,12 @@ class DifferentialOperators:
         N = points.shape[0]
         n_vars = int(jnp.sqrt(len(var_dims)))
 
-        _require_grid(method, grid)
+        if _mesh_route(method, grid) == "fit":
+            n_v = int(round(len(var_dims) ** 0.5))
+            out = jnp.zeros((points.shape[0], n_v, n_v))
+            for i, vi_dim, j, vj_dim in var_dims:
+                out = out.at[:, i, j].set(_mesh_fit(u_values, points, tetrahedra, method, (vi_dim, vj_dim)))
+            return out
         if grid is not None:  # structured grid: only the requested second-derivative components (see 2-D)
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             sp = grid["spacing"]

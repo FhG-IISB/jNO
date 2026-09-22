@@ -1111,7 +1111,7 @@ class _TraceFDM:
         v = jnp.asarray(np.random.default_rng(0).standard_normal(n), dtype=jnp.asarray(u).dtype)
         ref = jax.jvp(fun, (jnp.asarray(u),), (v,))[1]
         scale = float(jnp.linalg.norm(ref)) or 1.0
-        for radius in (1, 2, 3):
+        for radius in (1, 2, 3, 4, 5, 6):  # a jno.fd(order=/fit=) mesh fit can read several rings
             pattern = _stencil_pattern(cells, self._N, radius, n_fields=n_fields, extra_pairs=extra)
             color, n_colors = _color_columns(pattern)
             A = _assemble_sparse(fun, u, pattern, color, n_colors)
