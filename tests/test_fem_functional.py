@@ -46,7 +46,7 @@ def _x64():
 def _poisson(size=0.25, w=2.0, h=1.0):
     """A solved Poisson problem on ``[0,w]x[0,h]``, plus the pieces a functional is written from."""
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, w, h, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, w, h, size=size).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > w - 1e-9) | (y < 1e-9) | (y > h - 1e-9))
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
     X = [co[0], co[1]]
@@ -112,7 +112,7 @@ def _elastic(size=0.5, w=6.0, h=3.0):
     are demonstrably the same expression, not two hand-typed ones that might differ."""
     inner, sym, tr = jno.np.inner, jno.np.symgrad, jno.np.trace
     ddot = lambda a, b: inner(a, b, n_contract=2)  # noqa: E731
-    d = jno.Shape.rect(0.0, 0.0, w, h, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, w, h, size=size).domain()
     d.tag("root", lambda x, y: x < 1e-9)
     xi, yi, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("root", split=True)
@@ -193,7 +193,7 @@ def test_the_functional_is_differentiable_in_the_design():
 def test_a_boundary_functional_measures_the_region_it_lives_on():
     """∫ 1 ds over the tagged right edge of a 2x1 rectangle is that edge's length."""
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 2 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     d.tag("east", lambda x, y: x > 2 - 1e-9)
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
@@ -209,7 +209,7 @@ def test_a_boundary_functional_measures_the_region_it_lives_on():
 def test_a_boundary_flux_functional_matches_the_divergence_theorem():
     """∮ F·n ds = ∫ div F dΩ. With F = (x, y), div F = 2, so the closed boundary integral is 2|Ω|."""
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 2 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     co = d.variable("interior", split=True)
     cw = d.variable("walls", normals=True, split=True)
@@ -229,7 +229,7 @@ def test_the_functional_is_differentiable_in_the_mesh_coordinates():
     """The property a deformable-mesh design problem needs: ∂/∂X must flow through |det J|.
     Oracle is a central finite difference on the same functional."""
     grad, inner = jno.np.grad, jno.np.inner
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 2 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
     xm, ym, _ = d.variable("mv", where=lambda x, y: (x > 1e-9) & (x < 2 - 1e-9) & (y > 1e-9) & (y < 1 - 1e-9), split=True)
     xm.trainable(name="mesh_x"), ym.trainable(name="mesh_y")
@@ -291,7 +291,7 @@ def _design(size=0.4, w=6.0, h=3.0, volfrac=0.4):
     # volume constraint to bind and a non-uniform topology to emerge.
     emin, penal, nu, e0, tol, span = 1e-4, 3.0, 0.3, 1.0, 1e-6 * w, 1.0
     lam, mu = e0 * nu / (1 - nu**2), e0 / (2 * (1 + nu))
-    d = jno.Shape.rect(0.0, 0.0, w, h, size=size).domain()
+    d = jno.shape.rect(0.0, 0.0, w, h, size=size).domain()
     xi, yi, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)
     xt, yt, _ = d.variable("tip", where=lambda x, y: (x > w - tol) & (y < span + tol), split=True)
@@ -375,7 +375,7 @@ def test_an_integrand_using_a_parameter_the_form_never_declared_is_refused():
 
 def test_the_collocation_integral_is_untouched():
     """``.integrate()`` with no FEM is the Deep-Ritz/collocation route and must not have moved."""
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).domain()
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).domain()
     xi, yi, _ = d.variable("interior", split=True)
     assert abs(float(np.asarray((0.0 * xi + 1.0).integrate().eval(d)).reshape(-1)[0]) - 2.0) < 1e-12
     assert abs(float(np.asarray((xi * yi).integrate(quadrature="gauss").eval(d)).reshape(-1)[0]) - 1.0) < 1e-10
