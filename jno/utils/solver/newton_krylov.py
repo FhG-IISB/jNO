@@ -215,15 +215,33 @@ def bicgstab(matvec, b, *, tol=1e-10, maxit=2000):
         x, r, rhat, rho, alpha, omega, v, p, k = s
         rho_new = rhat @ r
         beta = (rho_new / (rho + _EPS)) * (alpha / (omega + _EPS))
-        p = r + beta * (p - omega * v)
-        v = matvec(p)
-        alpha = rho_new / (rhat @ v + _EPS)
-        sv = r - alpha * v
+        p1 = r + beta * (p - omega * v)
+        v1 = matvec(p1)
+        alpha1 = rho_new / (rhat @ v1 + _EPS)
+        sv = r - alpha1 * v1
         t = matvec(sv)
-        omega = (t @ sv) / (t @ t + _EPS)
-        x = x + alpha * p + omega * sv
-        r = sv - omega * t
-        return x, r, rhat, rho_new, alpha, omega, v, p, k + 1
+        omega1 = (t @ sv) / (t @ t + _EPS)
+        x1 = x + alpha1 * p1 + omega1 * sv
+        r1 = sv - omega1 * t
+        # Breakdown: r̂·v = 0 (or ρ = 0) makes alpha overflow, and the iterate went NaN. Measured on a
+        # 401² heat step at Δt = 0.1: r̂·v hit exactly 0 at iteration 1722 with the residual stalled just
+        # above its target, alpha = 2e275, then NaN. The standard remedy is a restart with a fresh shadow
+        # residual r̂ = r (x and r kept); a half-step that already converged (s = 0) is taken as is.
+        half = jnp.linalg.norm(sv) <= tol * bnorm
+        x1, r1 = jnp.where(half, x + alpha1 * p1, x1), jnp.where(half, sv, r1)
+        ok = jnp.isfinite(jnp.linalg.norm(x1)) & jnp.isfinite(jnp.linalg.norm(r1)) & (rho_new != 0)
+        keep = lambda new, old: jnp.where(ok, new, old)  # noqa: E731
+        return (
+            keep(x1, x),
+            keep(r1, r),
+            keep(rhat, r),
+            keep(rho_new, one),
+            keep(alpha1, one),
+            keep(omega1, one),
+            keep(v1, z),
+            keep(p1, z),
+            k + 1,
+        )
 
     z = jnp.zeros_like(b)
     one = jnp.array(1.0, b.dtype)

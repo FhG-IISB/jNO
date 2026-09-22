@@ -79,3 +79,31 @@ def test_nonlinear_default_solves_without_optimistix(monkeypatch):
     res = float(jnp.linalg.norm(jnp.asarray(res_fn(u))))
     assert np.all(np.isfinite(np.asarray(u)))
     assert res < 1e-6, f"nonlinear residual not converged: {res:.1e}"
+
+
+def test_bicgstab_breakdown_restarts_instead_of_returning_nan():
+    """r̂·(A p) = 0 with a nonzero residual made alpha overflow and the iterate NaN. A skew block gives
+    r̂·A r̂ = 0 at the very first step; the solver must come back finite (the Newton driver's own
+    convergence check is what judges it)."""
+    from jno.utils.solver.newton_krylov import bicgstab
+
+    A = jnp.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    x = bicgstab(lambda v: A @ v, jnp.array([1.0, 0.0, 0.0]), tol=1e-10, maxit=50)
+    assert bool(jnp.isfinite(x).all())
+
+
+@pytest.mark.slow
+def test_default_fdm_march_survives_a_bicgstab_breakdown():
+    """The measured case: a 401² heat march at Δt = 0.1 with the default matrix-free Newton. Its inner
+    BiCGStab hit r̂·v = 0 at iteration 1722 of step 7 and the march aborted with a NaN residual."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.0025).structured(), time=(0.0, 5.0, 51))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ic = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+    traj = np.asarray(jno.fdm([ui.t - ui.xx - ui.yy, u(xb, yb) - 0.0, u(xi, yi) - ic]).solve())
+    assert np.isfinite(traj).all()
