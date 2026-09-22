@@ -191,8 +191,9 @@ The `fem` is named because it is the one thing the expression cannot supply: a t
 its basis (`order`, `space`, `_domain`), but not the solution values, the assembly quadrature, or
 which system to differentiate through. `quadrature=` does not apply here — a FEM functional inherits
 the rule its operator was assembled with, which is what makes `∫ σ(u):ε(u) dΩ` equal `uᵀKu` exactly.
-Every functional over one `fem` shares a single solve. See `fem.eval` in [fem.md](fem.md) for the
-eager form and the scope limits.
+Every functional over one `fem` shares a single solve. See
+[`fem.eval` on a test-free expression](fem/boundary-conditions.md#integrating-a-quantity-femeval-on-a-test-free-expression)
+for the eager form and the scope limits.
 
 ### Reductions, math & comparisons
 

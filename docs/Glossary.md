@@ -119,6 +119,10 @@ function, optimiser state, and training history. The variable name
   `min_consecutive >= 2` (or `None`) in `core.solve()`.
 - `expr.integrate(x)` (with a spatial Variable) — vectorised integral
   for Fredholm-type kernels.
+- `expr.integrate(fem)` (with a `jno.fem` object) — the **FEM functional**
+  `∫ F(u) dΩ` at that form's solution, on its assembly quadrature. It is a
+  trace node, so an objective (compliance, a volume fraction) can be
+  optimised through `jno.core`. `fem.eval(F, u)` is the eager form.
 
 ### `min_consecutive`
 
