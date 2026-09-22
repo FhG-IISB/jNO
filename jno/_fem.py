@@ -2580,6 +2580,9 @@ class FEM:
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
+        if self._mode in ("transient", "complex_transient") and isinstance(getattr(self._op, "metadata", None), dict):
+            # the linear march reads its device placement from the block (see `_sharded_transient`)
+            self._op.metadata["shard"] = shard
         if contact is None and not getattr(self, "_in_contact_loop", False):
             # ... and NOT when the contact driver is re-entering this method for one of its own rounds:
             # it dispatches with `contact=None` by design, so an unguarded check would refuse the very

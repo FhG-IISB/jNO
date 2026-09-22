@@ -138,8 +138,12 @@ exchange, no ghost DOFs, no DOF renumbering. Every Krylov step is either a matve
 `all-reduce` inside) or a vector operation on replicated data (identical on every device, no
 communication).
 
-**What shards:** the default steady-linear solve, and the slot-composed solve
-(`linear=` any Krylov solver, with `precond=None` or `jno.precond.jacobi()`).
+**What shards:** the default steady-linear solve, the slot-composed solve (`linear=` any Krylov
+solver, with `precond=None` or `jno.precond.jacobi()`), and a **linear transient march** on assembled
+operators with the default step solve: `M` and `A` are partitioned on their nonzero axis and passed into
+the compiled `lax.scan` as arguments, the state stays replicated, and every step's Krylov solve is
+unchanged. Verified on simulated devices: each device holds exactly `nnz/n` of each operator, the
+compiled march emits `all-reduce` and no `all-gather`, and the trajectory matches one device to 1e-13.
 
 **Parametric / differentiate-through solves shard too, but only on an explicit `shard=`:**
 
@@ -176,7 +180,7 @@ placement leaves traced operators alone; an explicit `shard=` is a request you c
 | `precond=chebyshev()` / `form()` | not wired yet, and **not** a hard limit — Chebyshev is matvec-only by construction (spectral bounds by power iteration), so it composes with the sharded matvec directly; `form`'s auxiliary operator is just another assembled BCOO |
 | other `precond=` | the applier closes over the assembled operator, so a full copy would be replicated anyway. Jacobi is the exception: it needs only the diagonal, computed from the *sharded* triplets |
 | parametric / differentiate-through solves | **opt-in only** — needs an explicit `shard=`, see below |
-| transient | not wired yet. A sharding constraint inside the `lax.scan` body already produces the right collectives with the operator still closed over; threading it in as a jit argument additionally makes the per-device footprint provable (measured: exactly `nnz/N` per device) |
+| transient, NONLINEAR (a Newton step per time step), parametric (`mass_fn`/`operator_fn`), with solver slots, or evaluated inside a trace | not wired yet; the linear, non-parametric march shards (above) |
 
 No speedup figure is quoted here because none has been measured — the development machine has one
 GPU. What *is* verified, on simulated devices, is correctness, the even split, that XLA emits
