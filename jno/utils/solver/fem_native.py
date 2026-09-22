@@ -1133,9 +1133,13 @@ def assemble_fem_native(
     # several `_fem.py` entry points (single-field, multifield steady, multifield transient), and threading
     # a keyword through all of them buys nothing over one attribute the driver already owns.
     dynamic_topology = bool(dynamic_topology or getattr(domain, "_fem_want_dynamic_topology", False))
-    if dynamic_topology and _nonaffine and getattr(domain, "_fem_auto_dynamic_topology", False):
-        # Inferred from a geometry term, not asked for. This mesh cannot take the runtime-connectivity
-        # path, so fall back to the baked one rather than raising at a caller who never requested it.
+    _auto_dyn = getattr(domain, "_fem_auto_dynamic_topology", False)
+    if dynamic_topology and _auto_dyn and (_nonaffine or any(int(f["order"]) != 1 for f in fields)):
+        # Inferred from a geometry term, not asked for. This form cannot take the runtime-connectivity
+        # path -- a curved mesh, or a higher-order field whose edge nodes a reconnection would re-decide
+        # -- so fall back to the baked one rather than raising at a caller who never requested it. The
+        # higher-order case was missing: every P2/P3 moving-mesh march raised "P1 fields only" once the
+        # inference became the default (test_fem_geometry_terms, 6 failures).
         dynamic_topology = False
     if dynamic_topology and _nonaffine:
         raise NotImplementedError(
@@ -2008,6 +2012,11 @@ def assemble_fem_native(
         loc_seg.append(loc_seg[-1] + n_local_f[i] * vecs[i])
     cell_all_dofs = jnp.concatenate(cdofs, axis=1) if len(cdofs) > 1 else cdofs[0]  # (n_cell, n_local_all)
 
+    if dynamic_topology and _auto_dyn and (_gap_tables or _surf_region_faces):
+        # Same downgrade, decided here because contact gaps and surface readouts are only known now --
+        # and it must precede the bundle published below, or a stale one would outlive the decision.
+        dynamic_topology = False
+
     def _apply_topology(args):
         """``(cells, cells_f, cdofs, cell_all_dofs, parent, lface)`` for this evaluation.
 
@@ -2714,8 +2723,21 @@ def assemble_fem_native(
         return Jc, jnp.linalg.inv(Jc), None  # xq is formed by the caller from its own facet points
 
     def _surf_elem_res(
-        fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None, gaps=None, test_vals=None,
-        cells=None, cells_f=None, parent=None, lface=None,
+        fi,
+        local_all,
+        bcoeff,
+        btfi,
+        region,
+        t=0.0,
+        args=None,
+        pts=None,
+        normals=None,
+        gaps=None,
+        test_vals=None,
+        cells=None,
+        cells_f=None,
+        parent=None,
+        lface=None,
     ):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
         cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``. ``pts`` / ``normals``
@@ -3049,8 +3071,20 @@ def assemble_fem_native(
                 for bcoeff, btfi in btyped:
                     contribs = _elem_map(
                         lambda fi, la, gp, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
-                            fi, la, _e, _t, _r, t, args, pts_dyn, _nrm_for(_r), gp,
-                            cells=cl_d, cells_f=clf_d, parent=par_d, lface=lf_d,
+                            fi,
+                            la,
+                            _e,
+                            _t,
+                            _r,
+                            t,
+                            args,
+                            pts_dyn,
+                            _nrm_for(_r),
+                            gp,
+                            cells=cl_d,
+                            cells_f=clf_d,
+                            parent=par_d,
+                            lface=lf_d,
                         ),
                         (fids, lv, gslice),
                         _cell_chunk(int(fids.shape[0]), cd_d[btfi].shape[1], cad_d.shape[1]),
@@ -3412,8 +3446,20 @@ def assemble_fem_native(
                         # exactly as `jax.linearize` of the residual would.
                         return jax.jacfwd(
                             lambda v: _surf_elem_res(
-                                fi, v, _e, _t, _r, t, args, _p, _n, gp,
-                                cells=cl_d, cells_f=clf_d, parent=par_d, lface=lf_d,
+                                fi,
+                                v,
+                                _e,
+                                _t,
+                                _r,
+                                t,
+                                args,
+                                _p,
+                                _n,
+                                gp,
+                                cells=cl_d,
+                                cells_f=clf_d,
+                                parent=par_d,
+                                lface=lf_d,
                             )
                         )(la)
 
@@ -3431,9 +3477,7 @@ def assemble_fem_native(
                         )
                     _emit(
                         Kef.reshape(-1),
-                        lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cd_d[_t][_p][:, :, None], _K.shape).reshape(
-                            -1
-                        ),
+                        lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cd_d[_t][_p][:, :, None], _K.shape).reshape(-1),
                         lambda _K=Kef, _f=fcols: jnp.broadcast_to(_f[:, None, :], _K.shape).reshape(-1),
                     )
 

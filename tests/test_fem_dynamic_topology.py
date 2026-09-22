@@ -132,9 +132,7 @@ def _coalescence(nsteps):
 def _run(nsteps):
     fem = _coalescence(nsteps)
     with _CompileCounter() as cc:
-        traj = fem.solve(
-            nonlinear=jno.solve.newton(direct=True), adapt=jno.solve.remesh(alpha=1.2, every=1)
-        )
+        traj = fem.solve(nonlinear=jno.solve.newton(direct=True), adapt=jno.solve.remesh(alpha=1.2, every=1))
     flips = sum(1 for h in (getattr(fem, "adapt_history", []) or []) if h.get("remeshed"))
     return cc.n, flips, traj
 
@@ -196,3 +194,32 @@ def test_a_geometry_term_infers_dynamic_topology():
     assert not _mk(geometry=False), "a static mesh must be left alone -- nothing can change its cells"
     assert not _mk(geometry=True, explicit=False), "an explicit opt-out must beat the inference"
     assert _mk(geometry=True, explicit=True)
+
+
+def test_an_inferred_request_backs_off_for_a_higher_order_field_an_explicit_one_refuses():
+    """Runtime connectivity is P1-only: a P2 field has nodes on EDGES, which a reconnection re-decides.
+
+    Inferring it from every geometry term made each P2/P3 moving-mesh march raise "P1 fields only" --
+    six failures in test_fem_geometry_terms -- at callers who never asked for it. An inferred request now
+    falls back to the baked connectivity, like a curved mesh already did; an explicit one still refuses
+    by name, because that caller asked for something this form cannot have.
+    """
+    import pytest
+
+    import jno
+
+    def _mk(explicit=None):
+        d = jno.shape.disk(0.0, 0.0, 0.5, size=0.25).domain(time=(0.0, 0.1, 3))
+        if explicit is not None:
+            d.dynamic_topology(explicit)
+        u, v = d.fem_symbols(order=2)
+        xi, yi, ti = d.variable("interior", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        jno.fem([ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y), u(ci[0], ci[1]) - 1.0, xi.d(ti) - 0.0])
+        return d
+
+    d = _mk()
+    assert getattr(d, "_fem_native_topology_bundle", "unset") is None, "an inferred request must fall back"
+    with pytest.raises(NotImplementedError, match="P1 fields only"):
+        _mk(explicit=True)
