@@ -103,7 +103,7 @@ _FACET_CACHE_MAX = 8
 
 
 def pack_face_keys(canonical: np.ndarray):
-    """One ``int64`` per already-sorted face row, or ``None`` if the id range would overflow it.
+    """One ``int64`` per already-sorted face row (``None`` only past 2³¹ nodes).
 
     ``np.unique(..., axis=0)`` sorts a VOID VIEW of the rows, and its argsort is the single most
     expensive thing anyone does with a face table here: 2.32 s (a quarter of a 424k-tet domain
@@ -119,10 +119,16 @@ def pack_face_keys(canonical: np.ndarray):
     if canonical.size == 0:
         return np.zeros(len(canonical), dtype=np.int64)
     n_pts = int(canonical.max()) + 1
-    if n_pts ** canonical.shape[1] >= 2**62:
-        return None  # caller falls back to the row-wise unique
+    if n_pts >= 2**31:
+        return None  # a single column no longer leaves room to pack; the row-wise unique handles it
     keys = np.zeros(len(canonical), dtype=np.int64)
     for j in range(canonical.shape[1]):
+        if (int(keys.max()) + 1) * n_pts >= 2**62:
+            # Replace the partial key by its DENSE RANK before packing on: ranks keep the order, so the
+            # final key is still exactly lexicographic, and they stay below the row count. Without this
+            # a 4.2M-node tetrahedral grid overflowed n³ and fell back to the row-wise unique -- a void
+            # argsort that took 111 s of a 152 s domain build (measured, 160³).
+            keys = np.unique(keys, return_inverse=True)[1].reshape(-1).astype(np.int64)
         keys = keys * n_pts + canonical[:, j]
     return keys
 
