@@ -159,34 +159,35 @@ control is how a load-application bug or a plain refinement effect gets reported
 
 ![Top: the optimised physical density on the deformed mesh, a cantilever truss with thick well-defined members. Middle: the optimised mesh with interior nodes coloured by how far they moved, showing movement concentrated along the structural members. Bottom left: bar chart of compliance on its own mesh, the value expected on a clean mesh after correcting for discretisation, and the value actually measured. Bottom right: histogram of element densities, strongly bimodal at 0 and 1.](/jNO/assets/topology_optimisation_cantilever.png)
 
-4,226 elements, 4,408 dofs, 400 iterations, ~150 s on CPU:
+4,226 elements, 4,408 dofs, 400 iterations, ~3 min on CPU:
 
 | quantity | value |
 |---|---|
-| compliance, own deformed mesh | $78.64$ |
-| compliance, clean mesh (16,824 elements) | $87.36$ &nbsp; (raw gap $+11.1\%$) |
+| compliance, own deformed mesh | $78.41$ |
+| compliance, clean mesh (16,828 elements) | $82.43$ &nbsp; (raw gap $+5.1\%$) |
 | control, uniform density, no distortion | $661.28 \to 666.87$ &nbsp; ($+0.8\%$ discretisation) |
-| over-report attributable to the moved nodes | $+10.2\%$ &nbsp; (**but see below**) |
-| perimeter $P$ | $530.7$ against target $P^\*=650$ |
-| volume fraction / $M_{nd}$ / inverted elements | $0.3999$ / $0.071$ / $0$ |
+| over-report attributable to the moved nodes | $+4.2\%$ &nbsp; (**but see below**) |
+| perimeter $P$ | $445.9$ against target $P^\*=650$ |
+| volume fraction / $M_{nd}$ / inverted elements | $0.4000$ / $0.062$ / $0$ |
 
 ### Which of these numbers are reproducible
 
-Not all of them, and the difference matters more than any single value. Three runs of this script —
-one before the objective was rewritten as an integral, and two after, differing only in the Python
-and JAX build they ran on:
+Not all of them, and the difference matters more than any single value. Four runs of this script —
+one before the objective was rewritten as an integral, two after, differing only in the Python
+and JAX build they ran on, and run D on a later jNO (parameters float64 since #123), which is the one
+in the table and the figure above:
 
-| | run A | run B | run C |
-|---|---|---|---|
-| compliance | $78.45$ | $78.33$ | $78.64$ |
-| volume fraction | $0.400$ | $0.3998$ | $0.3999$ |
-| $M_{nd}$ | $0.075$ | $0.066$ | $0.071$ |
-| perimeter $P$ | $587.2$ | $504.1$ | $530.7$ |
-| over-report | $+13.6\%$ | $+5.4\%$ | $+10.2\%$ |
+| | run A | run B | run C | run D |
+|---|---|---|---|---|
+| compliance | $78.45$ | $78.33$ | $78.64$ | $78.41$ |
+| volume fraction | $0.400$ | $0.3998$ | $0.3999$ | $0.4000$ |
+| $M_{nd}$ | $0.075$ | $0.066$ | $0.071$ | $0.062$ |
+| perimeter $P$ | $587.2$ | $504.1$ | $530.7$ | $445.9$ |
+| over-report | $+13.6\%$ | $+5.4\%$ | $+10.2\%$ | $+4.2\%$ |
 
 **Compliance and volume fraction are stable** to a fraction of a percent — they are what the problem
-actually pins down. **The perimeter and the reanalysis gap are not**: they span $504$–$587$ and
-$+5.4$–$+13.6\%$. Runs B and C are the *same source code*, so this is not the rewrite; it is the
+actually pins down. **The perimeter and the reanalysis gap are not**: they span $446$–$587$ and
+$+4.2$–$+13.6\%$. Runs B and C are the *same source code*, so this is not the rewrite; it is the
 problem. It is non-convex, and MMA's asymptote update is *history-dependent with a branch in it* — a
 variable that just reversed direction has its asymptotes pulled in, one moving steadily has them
 pushed out — so a change in the last bit of a floating-point operation flips that test for some
@@ -196,7 +197,7 @@ variable, and the trajectories separate from there into different local optima.
 configuration: `penal` stays at $3.0$ and the continuation fires **zero** times in 400 iterations —
 see the note below.)
 
-The practical consequence: quote the over-report as "order $+10\%$" and not to three figures, and
+The practical consequence: quote the over-report as a range, "$+4$ to $+14\%$", and not to three figures, and
 treat a single run's perimeter as one sample rather than a measurement. ($C = f\cdot u$ and
 $C = \int \sigma(u){:}\varepsilon(u)\,d\Omega$ agree in value and in gradient analytically — both
 reduce to $-u^{\mathsf T}(\partial K/\partial\rho)u$ — so the rewrite changes the arithmetic path,
@@ -205,9 +206,9 @@ not the objective.)
 Perimeter control earns its place, though not in every column. Running the same script with
 `PSTAR = 0.0` gives $P=849.2$, $C=80.23$, $M_{nd}=0.127$ and an over-report of $+21.6\%$ (measured on
 the previous spelling of the objective and not re-run since). Against the spread above, the
-**binariness** separates cleanly — $M_{nd}$ $0.127$ uncontrolled against $0.066$–$0.075$ controlled —
+**binariness** separates cleanly — $M_{nd}$ $0.127$ uncontrolled against $0.062$–$0.075$ controlled —
 and the perimeter obviously does. The **over-report comparison does not**: $+21.6\%$ against a
-controlled range of $+5.4$–$+13.6\%$ is a difference of the same size as the run-to-run scatter, so
+controlled range of $+4.2$–$+13.6\%$ is a difference of the same size as the run-to-run scatter, so
 one uncontrolled run is not enough to claim it. What survives is the binariness, and the mechanism
 behind it: a design held to a length scale has fewer fine features to farm discretisation error with.
 
