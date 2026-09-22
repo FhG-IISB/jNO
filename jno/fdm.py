@@ -595,7 +595,7 @@ def _set_temporal(node, val, val_tt=0.0):
     ``F = m·u.tt + c·u.t + R_spatial`` affine in the time derivatives, the **spatial** residual
     ``R_spatial = F(0, 0)`` and the coefficients ``c = F(u.t=1) − F(0, 0)`` and ``m = F(u.tt=1) − F(0, 0)``
     — so a general ``c(x)·u.t`` term (variable material, e.g. ``ρcₚ(x)·u.t``) is handled without parsing
-    its structure, exactly as ``_set_normal`` handles a flux. (``u.tt`` used to be replaced by ``val`` as
+    its structure. (``u.tt`` used to be replaced by ``val`` as
     if it were ``u.t``, which silently solved a wave equation as a heat equation.)"""
     from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, TemporalDerivative
 
@@ -642,6 +642,43 @@ def _is_normal_jacobian(node):
     )
 
 
+def _spatial_tags(c):
+    """The spatial coordinate tags a constraint is bound to."""
+    return {v.tag for v in (getattr(c, "_coord_vars", None) or {}).values() if getattr(v, "axis", None) != "temporal"}
+
+
+def _context_leaf(tag, component, domain):
+    """A :class:`Variable` reading column ``component`` of the per-node array ``context[tag]`` — how a
+    rewritten boundary condition reads a value the solver supplies (a boundary gradient, a normal)."""
+    from .trace import Variable
+
+    leaf = Variable.__new__(Variable)
+    leaf.tag, leaf.dim, leaf.axis, leaf.fem_meta, leaf.size, leaf._domain = (
+        tag,
+        [component, component + 1],
+        "spatial",
+        None,
+        1,
+        domain,
+    )
+    return leaf
+
+
+def _map_children(node, fn):
+    """``node`` with ``fn`` applied to its children (the node types a strong-form condition is made of)."""
+    from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Placeholder
+
+    if isinstance(node, BinaryOp):
+        return BinaryOp(node.op, fn(node.left), fn(node.right))
+    if isinstance(node, FunctionCall):
+        return node.copy_with_args([fn(a) if isinstance(a, Placeholder) else a for a in node.args])
+    if isinstance(node, Hessian):
+        return Hessian(fn(node.target), node.variables, node.scheme, node.trace)
+    if isinstance(node, Jacobian):
+        return Jacobian(fn(node.target), node.variables, node.scheme)
+    return node
+
+
 def _iter_variables(node):
     """Every :class:`Variable` in the expression."""
     from .trace import Variable
@@ -660,39 +697,18 @@ def _normal_jacobians(node):
     return [j for c in _iter(n) for j in _normal_jacobians(c)]
 
 
-def _set_normal(node, val):
-    """Replace the normal-derivative node ``ui.d(n, ...)`` with the constant ``val``, leaving the rest of
-    the constraint intact. Evaluating the result at ``val = 0`` and ``val = 1`` recovers, for a condition
-    ``F(∂u/∂n) = a·∂u/∂n + b`` affine in the flux, the intercept ``b = F(0)`` and slope ``a = F(1) - F(0)``
-    — so **any** flux BC (Neumann ``∂u/∂n - h``, Robin ``∂u/∂n + α(u - u∞)``, a coordinate-coefficient
-    ``κ(x)·∂u/∂n``, either sign) is handled by ``a·(∇u·n) + b`` without parsing its structure."""
-    from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder
-
-    if _is_normal_jacobian(node):
-        return Literal(float(val))
-    if isinstance(node, BinaryOp):
-        return BinaryOp(node.op, _set_normal(node.left, val), _set_normal(node.right, val))
-    if isinstance(node, FunctionCall):
-        return node.copy_with_args([_set_normal(a, val) if isinstance(a, Placeholder) else a for a in node.args])
-    if isinstance(node, Jacobian):
-        return Jacobian(_set_normal(node.target, val), node.variables, node.scheme)
-    if isinstance(node, Hessian):
-        return Hessian(_set_normal(node.target, val), node.variables, node.scheme, node.trace)
-    return node
-
-
 class _TraceFDM:
     """Finite-difference system authored as a fem-style constraint list with ``u = domain.unknown()``:
     ``jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()``. Constraints are classified by the
     region their coordinate variables carry — the ``interior`` → the strong-form PDE residual, a
     boundary tag → a Dirichlet condition ``u(region) - g``, the ``initial`` region → the initial
-    condition ``u(initial) - u0`` (exactly as in :func:`jno.fem`), and a **flux condition** carrying a
-    normal derivative ``ur.d(n)`` (``n = domain.variable(region, normals=True)``, the field bound to the
-    edge's tags ``ur = u.bind(x=xr, y=yr)``) → a boundary row at that edge's nodes. Any condition
-    **affine in** ``∂u/∂n`` is handled — Neumann ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a
-    coordinate coefficient ``κ(x)·ur.d(n)`` — by writing the row as ``a·(∇u·n) + b`` with the two-probe
-    coefficients ``a = F(1) - F(0)``, ``b = F(0)`` (:meth:`_flux_value_fn`); no structural parsing, so
-    the whole edge equation is written with that edge's boundary tags. (Flux BCs are authored differently
+    condition ``u(initial) - u0`` (exactly as in :func:`jno.fem`), and a boundary condition that
+    **differentiates** the unknown (the field bound to the edge's tags ``ur = u.bind(x=xr, y=yr)``) → a
+    boundary row at that edge's nodes, evaluated as written with boundary-accurate first derivatives
+    (:meth:`_flux_row_fn`). Neumann ``ur.d(n) - h`` (``n = domain.variable(region, normals=True)``, or
+    ``ur.d((nx, ny))``, or ``nx*ur.x + ny*ur.y``), Robin ``ur.d(n) + α(u - u∞)``, ``(κ*ur).d(n)``, an
+    oblique or tangential derivative, a nonlinear flux — the whole edge equation is written with that
+    edge's boundary tags. (Flux BCs are authored differently
     from :func:`jno.fem`, where a Neumann is a *natural* weak term ``h·v`` — the strong form has no test
     function, so the flux is imposed directly.) A problem is **transient** iff it carries an initial
     condition; ``t_span`` and the step
@@ -730,26 +746,11 @@ class _TraceFDM:
                         f"(left/right, bottom/top, or front/back); got {tie}."
                     )
                 self._periodic_axes.append(ax)
-            elif _normal_jacobian(c) is not None:
-                self._neumann.append(c)
+            elif _normal_jacobian(c) is not None or self._is_boundary_derivative_condition(c):
+                self._neumann.append(c)  # a boundary row: Neumann, Robin, oblique, nonlinear flux, …
             elif _region_tag(c) == "initial" and _has_temporal(c):
                 self._vel_ic.append(c)
             elif any(_has_unknown_derivative(c, u) for u in self.unknowns):
-                tags = {
-                    v.tag
-                    for v in (getattr(c, "_coord_vars", None) or {}).values()
-                    if getattr(v, "axis", None) != "temporal"
-                }
-                boundary = set(getattr(self.domain, "_boundary_registry", {}) or {})
-                if tags and all(t in boundary or str(t).startswith("n_") for t in tags):
-                    # e.g. `nx*ub.x + ny*ub.y - g`: a flux spelled in components has no `.d(n)`, so it read as a
-                    # SECOND PDE and was summed into the first — silently wrong.
-                    raise ValueError(
-                        f"jno.fdm([...]): a condition on the boundary region(s) {sorted(tags)} differentiates the "
-                        "unknown without a normal derivative. Write the flux as `ub.d(n)` with "
-                        "`n = d.variable(region, normals=True)`; its value may use the components "
-                        "`nx, ny = d.variable(region, normals=True, split=True)[-2:]`."
-                    )
                 self._pde.append(c)
             elif _region_tag(c) == "initial":
                 self._ic.append(c)
@@ -1512,103 +1513,165 @@ class _TraceFDM:
         n, idx = MeshUtils._compute_normals_from_boundary_faces(pts, rfaces, apex_points=pts[rapex])
         return np.asarray(idx, dtype=int), jnp.asarray(n)
 
-    def _flux_value_fn(self, constraint, val, extra_params=None):
-        """Evaluate the flux constraint over ALL nodes with the normal derivative ``∂u/∂n`` pinned to the
-        constant ``val`` (:func:`_set_normal`) — everything else (the field value ``u``, ``α``, ``u∞``,
-        coordinate coefficients) evaluates normally against the nodal DOFs. Two such evaluations
-        (``val = 0`` and ``val = 1``) give the affine decomposition of the boundary condition in the flux.
-        ``extra_params`` injects trainable-parameter values, as in :meth:`_pde_residual_fn`."""
+    def _is_boundary_derivative_condition(self, c):
+        """A condition whose coordinates all live on boundary regions and which differentiates an unknown:
+        a boundary row (``nx*ub.x + ny*ub.y - g``, ``ub.d((nx, ny)) - g``, a tangential ``ub.x - g``). It
+        used to be read as a second PDE and summed into the first."""
+        tags = _spatial_tags(c)
+        boundary = set(getattr(self.domain, "_boundary_registry", {}) or {})
+        return (
+            bool(tags)
+            and all(t in boundary or str(t).startswith("n_") for t in tags)
+            and any(_has_unknown_derivative(c, u) for u in self.unknowns)
+        )
+
+    def _flux_region(self, c):
+        """The one boundary region a boundary row lives on (its coordinate tag, or its normal's)."""
+        normals = {str(v.tag)[len("n_") :] for v in _iter_variables(c) if str(getattr(v, "tag", "")).startswith("n_")}
+        boundary = set(getattr(self.domain, "_boundary_registry", {}) or {}) - {"boundary"}
+        tags = normals or {t for t in _spatial_tags(c) if t in boundary}  # interior coords in a value are fine
+        if len(tags) != 1:
+            raise ValueError(
+                f"jno.fdm([...]): a boundary condition must live on one boundary region; this one uses {sorted(tags)}. "
+                "Bind its fields and normal to the same region (`ub = u.bind(x=xr, y=yr)`, "
+                "`d.variable('right', normals=True)`)."
+            )
+        return next(iter(tags))
+
+    def _flux_owner(self, c, idx):
+        """Which field's equation the boundary row replaces at the region's nodes: of the fields the condition
+        differentiates, the one not already fixed there by a Dirichlet condition. A cavity wall carries
+        ``u = 0``, ``v = 0`` and ``∂p/∂n = n·(νΔu − u·∇u)``, which differentiates all three, and is p's row."""
+        fields = [k for k, w in enumerate(self.unknowns) if _has_unknown_derivative(c, w)]
+        pinned = self._dirichlet_mask()
+        free = [k for k in fields if not pinned[k * self._N + np.asarray(idx, dtype=int)].all()]
+        normal = {k for j in _normal_jacobians(c) for k, w in enumerate(self.unknowns) if _contains_unknown(j.target, w)}
+        if len(free) == 1:
+            return free[0]
+        if len(normal) == 1 and (not free or next(iter(normal)) in free):
+            return next(iter(normal))  # the field whose ∂/∂n it imposes (a Dirichlet on the same nodes wins)
+        if len(fields) == 1:
+            return fields[0]
+        raise ValueError(
+            "jno.fdm([...]): cannot tell which field this boundary condition is for: it differentiates unknowns "
+            f"{fields}, and {free if free else 'none'} of them are free on its region. A boundary row replaces one "
+            "field's equation there; give the others Dirichlet conditions on that region, or impose this "
+            "condition through its normal derivative `ub.d(n)`."
+        )
+
+    def _flux_row_fn(self, skeleton, extra_params=None):
+        """``(dofs, t) ↦ residual`` of a boundary condition at every node, from its eagerly built
+        :meth:`_flux_skeleton`; ``extra_params`` injects trainable-parameter values."""
         import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
 
-        expr = _set_normal(_unwrap(constraint), val)
-        spatial_tags = {  # every spatial term collocates at the mesh nodes; the normal tag is gone now
-            v.tag
-            for v in (getattr(constraint, "_coord_vars", None) or {}).values()
-            if getattr(v, "axis", None) != "temporal" and not str(getattr(v, "tag", "")).startswith("n_")
-        }
-        context = self._eval_context(spatial_tags)
-        normal_tags = {  # `nx, ny` of `d.variable(region, normals=True, split=True)`, read as values
-            v.tag for v in _iter_variables(expr) if str(getattr(v, "tag", "")).startswith("n_")
-        }
-        context.update({tag: self._normal_field(tag[len("n_") :]) for tag in normal_tags})
+        expr, context, jacs, grads, idx = skeleton
         scope = self._params_scope(extra_params)
-        N, unknowns = self._N, self.unknowns
+        N, dim, unknowns, jidx = self._N, int(self._pts.shape[1]), self.unknowns, jnp.asarray(idx)
 
-        def value_fn(dofs, t=None):
-            """``dofs``: the whole DOF vector (every field of a coupled system, so a flux value may read
-            another field, as ``∂p/∂n = ν Δu·n`` does). ``t``: the time a flux value ``h(x, t)`` or ``α(t)`` is
-            evaluated at (``None``: the start)."""
+        def row(dofs, t=None):
             dofs = jnp.asarray(dofs)
             fields = {
                 w.layer_id: eqx.tree_at(lambda m: m.value, w.module, dofs[k * N : (k + 1) * N].astype(w.module.value.dtype))
                 for k, w in enumerate(unknowns)
             }
             ev = TraceEvaluator(params={**scope, **fields})
-            ctx = context if t is None else {**context, "__time__": jnp.full((self._N, 1), t)}
+            ctx = dict(context) if t is None else {**context, "__time__": jnp.full((N, 1), t)}
+            for i, (j, g) in enumerate(zip(jacs, grads)):
+                target = jnp.broadcast_to(
+                    jnp.asarray(ev.evaluate(j.target, context=ctx, var_bindings={})).reshape(-1), (N,)
+                )
+                ctx[f"fdm_bgrad_{i}"] = jnp.zeros((N, dim), target.dtype).at[jidx].set(g(target))
             out = jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1)
-            return jnp.broadcast_to(out, (self._N,)) if out.shape[0] == 1 else out  # a constant `-h` → per-node
+            return jnp.broadcast_to(out, (N,)) if out.shape[0] == 1 else out
 
-        return value_fn
+        return row
+
+    def _flux_skeleton(self, c, idx):
+        """The structural part of the boundary row for ``c``, built once, eagerly: the rewritten condition,
+        its evaluation context (with the region's normals) and a boundary gradient per derivative node.
+        :meth:`_flux_row_fn` binds the parameters and returns ``(dofs, t) ↦ residual`` at every node.
+
+        The condition is evaluated **as written**. Every first derivative in it of an expression of the
+        unknowns — ``ub.x``, ``ub.d(n)``, ``ub.d((nx, ny))``, ``(κ*ub).x`` — is replaced by the
+        boundary-accurate gradient of that expression at the region's nodes (:meth:`_flux_gradient_fn`: the
+        one-sided difference on a grid, the quadratic fit on a mesh), and a normal derivative by that
+        gradient dotted with the region's normals. So any condition works, affine in ∂u/∂n or not —
+        Neumann, Robin, oblique, a nonlinear flux; Newton solves the rows. Second derivatives (``Δu`` in a
+        wall pressure) keep the grid stencil. ``extra_params`` injects trainable-parameter values."""
+        from .trace import Jacobian, TemporalDerivative
+
+        region = self._flux_region(c)
+        dim = int(self._pts.shape[1])
+        jacs = []
+
+        def is_normal(var):
+            return str(getattr(var, "tag", "")).startswith("n_")
+
+        def spatial_jacobian(n):
+            if not isinstance(n, Jacobian) or isinstance(n, TemporalDerivative) or len(n.variables) != 1:
+                return False
+            var = n.variables[0]
+            if not (is_normal(var) or getattr(var, "axis", "spatial") == "spatial"):
+                return False
+            return any(_contains_unknown(n.target, w) for w in self.unknowns)
+
+        def rewrite(n):
+            n = _unwrap(n)
+            if spatial_jacobian(n):
+                i = len(jacs)
+                jacs.append(n)
+                comp = lambda a: _context_leaf(f"fdm_bgrad_{i}", a, self.domain)  # noqa: E731
+                var = n.variables[0]
+                if is_normal(var):  # ∂/∂n = ∇·n with the region's normals
+                    out = comp(0) * _context_leaf(var.tag, 0, self.domain)
+                    for a in range(1, dim):
+                        out = out + comp(a) * _context_leaf(var.tag, a, self.domain)
+                    return out
+                return comp(int(var.dim[0]))
+            return _map_children(n, rewrite)
+
+        expr = rewrite(_unwrap(c))
+        spatial_tags = _spatial_tags(c) - {t for t in _spatial_tags(c) if str(t).startswith("n_")}
+        context = self._eval_context(spatial_tags)
+        context.update({f"n_{region}": self._normal_field(region)})
+        context.update({v.tag: self._normal_field(str(v.tag)[len("n_") :]) for v in _iter_variables(expr) if is_normal(v)})
+        grads = [self._jacobian_gradient_fn(j, idx) for j in jacs]
+        return expr, context, jacs, grads, np.asarray(idx, dtype=int)
+
+    def _jacobian_gradient_fn(self, jac, idx):
+        """The boundary gradient for one derivative node, honouring its FD sub-scheme."""
+        scheme = getattr(jac, "scheme", None) or "finite_difference"
+        if "finite_difference" not in str(scheme):
+            scheme = "finite_difference"  # `.d(v)` defaults to AD on a view; on nodal DOFs it is the FD stencil
+        _, grad_method, _ = _D.parse_fd_scheme(scheme)
+        return self._flux_gradient_fn(np.asarray(idx, dtype=int), scheme, grad_method)
 
     def _flux_rows(self, extra_params=None):
-        """Rows for **any** flux boundary condition affine in ``∂u/∂n`` — Neumann ``ui.d(n) - h``, Robin
-        ``ui.d(n) + α(u - u∞)``, a coordinate-coefficient ``κ(x)·ui.d(n)``, either sign. Writes the whole
-        edge equation with that edge's boundary tags (``xr, yr, nr = domain.variable(region, ...)``). Per
-        row: node indices, unit normals, the FD stencil, and the two-probe value functions ``F(0)`` and
-        ``F(1)`` (see :meth:`_flux_value_fn`) — the residual is ``(F(1) - F(0))·(∇u·n) + F(0)``. A
-        condition that is **not** affine in ``∂u/∂n`` (a third probe ``F(2)`` disagrees) raises.
-
-        ``extra_params`` (a trainable α, say) only enters the value functions; the structure comes from
-        :meth:`_flux_structure`, built once on concrete values. Building it inside a crux trace used to fail:
-        the host-side mesh work saw traced arrays, and the affine check called ``bool`` on a tracer."""
-        rows = []
-        for c, idx, nrm, grad_fn, k in self._flux_structure():
-            v0, v1 = self._flux_value_fn(c, 0.0, extra_params), self._flux_value_fn(c, 1.0, extra_params)
-            rows.append((k * self._N + idx, idx, nrm, grad_fn, v0, v1))  # rows of field k's block
-        return rows
+        """``[(rows, nodes, row_fn)]`` for every boundary condition that differentiates an unknown: the
+        global rows it replaces (its field's block at the region's nodes), the nodes, and
+        :meth:`_flux_row_fn`. ``extra_params`` (a trainable α, say) enters the row functions; the structure
+        comes from :meth:`_flux_structure`, built once on concrete values."""
+        return [
+            (k * self._N + idx, idx, self._flux_row_fn(skeleton, extra_params))
+            for _c, idx, k, skeleton in self._flux_structure()
+        ]
 
     def _flux_structure(self):
-        """``[(constraint, node_indices, normals, gradient_fn)]`` for the flux conditions, and the check
-        that each is affine in ``∂u/∂n`` — structural, so computed once, eagerly, with any trainable
-        parameters at their current values (it is the same structure at every value)."""
+        """``[(constraint, node_indices, field, skeleton)]`` for the boundary rows — structural, computed
+        once on concrete values (the normals and stencils are host-side mesh work, which a crux-traced
+        inverse solve cannot redo)."""
         if getattr(self, "_flux_struct", None) is not None:
             return self._flux_struct
         import jax
 
-        concrete = {lid: n.model.module for lid, n in self._trainable_params().items()}
         out = []
         with jax.ensure_compile_time_eval():
-            probe = jnp.zeros(self._Ntot)
             for c in self._neumann:
-                jac = _normal_jacobian(c)
-                owners = {
-                    k for j in _normal_jacobians(c) for k, w in enumerate(self.unknowns) if _contains_unknown(j.target, w)
-                }
-                if len(owners) != 1:
-                    raise ValueError(
-                        "jno.fdm([...]): a flux condition must carry the normal derivative `ub.d(n)` of exactly one "
-                        f"unknown; this one differentiates unknowns {sorted(owners)}. Its row replaces that unknown's "
-                        "equation at the boundary nodes, so there has to be one unknown it belongs to."
-                    )
-                (k,) = owners
-                nvar = next(v for v in jac.variables if str(getattr(v, "tag", "")).startswith("n_"))
-                region = nvar.tag[len("n_") :]  # `n_right` → `right`
-                idx, nrm = self._node_normals(region)
-                scheme = getattr(jac, "scheme", None) or "finite_difference"
-                _, grad_method, _ = _D.parse_fd_scheme(scheme)
-                f0, f1, f2 = (self._flux_value_fn(c, val, concrete)(probe) for val in (0.0, 1.0, 2.0))
-                if not bool(jnp.allclose(f2 - f0, 2.0 * (f1 - f0), atol=1e-6)):
-                    raise ValueError(
-                        "jno.fdm([...]): a flux boundary condition must be affine in the normal derivative "
-                        "∂u/∂n — e.g. Neumann `ui.d(n) - h` or Robin `ui.d(n) + α*(u - u∞)`. A condition "
-                        "nonlinear in ∂u/∂n is not supported."
-                    )
+                idx, _ = self._node_normals(self._flux_region(c))
                 idx = np.asarray(idx, dtype=int)
-                grad_k = self._flux_gradient_fn(idx, scheme, grad_method)
-                sl = slice(k * self._N, (k + 1) * self._N)
-                out.append((c, idx, jnp.asarray(nrm), (lambda u, g=grad_k, sl=sl: g(u[sl])), k))
+                out.append((c, idx, self._flux_owner(c, idx), self._flux_skeleton(c, idx)))
         self._flux_struct = out
         return out
 
@@ -1658,15 +1721,12 @@ class _TraceFDM:
 
     @staticmethod
     def _apply_flux_rows(u, r, flux_rows, t=None):
-        """Replace the flux nodes' rows of ``r`` by their conditions ``a·(∇u·n) + b``, SUMMING where several
-        flux regions share a node (a corner), so every condition is imposed there rather than the last one."""
+        """Replace the boundary rows of ``r`` by their conditions, SUMMING where several conditions of one
+        field share a node (a corner), so every condition is imposed there rather than the last one."""
         acc = jnp.zeros_like(r)
         hit = jnp.zeros(r.shape[0], dtype=bool)
-        for rows, idx, nrm, grad_fn, v0, v1 in flux_rows:  # `rows`: the owning field's block, `idx`: nodes
-            flux = jnp.sum(grad_fn(u) * nrm, axis=1)  # ∇u·n at the region's nodes, differentiable
-            b = v0(u, t)
-            a = v1(u, t) - b
-            acc = acc.at[rows].add(a[idx] * flux + b[idx])
+        for rows, idx, row_fn in flux_rows:  # `rows`: the owning field's block, `idx`: the region's nodes
+            acc = acc.at[rows].add(row_fn(u, t)[idx])
             hit = hit.at[rows].set(True)
         return jnp.where(hit, acc, r)
 

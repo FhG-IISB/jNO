@@ -380,18 +380,23 @@ def test_mixed_dirichlet_neumann_robin():
     assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-3
 
 
-def test_flux_rejects_nonaffine():
-    """A flux BC nonlinear in ∂u/∂n (here `(∂u/∂n)² − 1`) raises rather than silently returning a secant."""
+def test_nonlinear_flux_condition():
+    """A flux condition need not be affine in ∂u/∂n: the boundary row is evaluated as written and Newton
+    solves it. ∂u/∂n + (∂u/∂n)³ = g + g³ (slope 1 + 3s² > 0) with u = 2x + 3y is recovered to rounding.
+    It used to raise ("must be affine in the normal derivative")."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
     x, y, _ = d.variable("interior", split=True)
-    xl, yl, _ = d.variable("left", split=True)
-    xr, yr, _ = d.variable("right", split=True)
-    nr = d.variable("right", normals=True)
     u = d.unknown()
     ui = u.bind(x=x, y=y)
-    ur = u.bind(x=xr, y=yr)
-    with pytest.raises(ValueError, match="affine"):
-        jno.fdm([-ui.d2(x) - ui.d2(y), u(xl, yl) - 0.0, ur.d(nr) * ur.d(nr) - 1.0]).solve()
+    xl, yl, _ = d.variable("left", split=True)
+    terms = [-ui.d2(x) - ui.d2(y), u(xl, yl) - (2.0 * xl + 3.0 * yl)]
+    for r in ("right", "bottom", "top"):
+        xr, yr, _, nx, ny = d.variable(r, normals=True, split=True)
+        s, g = u.bind(x=xr, y=yr).d(d.variable(r, normals=True)), 2.0 * nx + 3.0 * ny
+        terms.append(s + s**3 - (g + g**3))
+    sol = np.asarray(jno.fdm(terms).solve()).reshape(-1)
+    p = _nodes(d)
+    assert np.abs(sol - (2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < 1e-10
 
 
 @pytest.mark.slow
@@ -501,12 +506,14 @@ def test_coupled_guards():
         jno.fdm([uit.t.t - (uit.d2(xt) + uit.d2(yt)) + vit, vit.t - uit, ut(xit, yit) - 0.0, vt(xit, yit) - 0.0])
     xr, yr, _ = d.variable("right", split=True)
     nr = d.variable("right", normals=True)
-    with pytest.raises(ValueError, match="exactly one"):  # a flux condition differentiating two fields
+    xl, yl, _ = d.variable("left", split=True)
+    with pytest.raises(ValueError, match="cannot tell which field"):  # two free fields: whose row is it?
         jno.fdm(
             [
                 -ui.d2(x) - ui.d2(y) + vi,
                 -vi.d2(x) - vi.d2(y) + ui,
-                u(xb, yb) - 0.0,
+                u(xl, yl) - 0.0,
+                v(xl, yl) - 0.0,
                 u.bind(x=xr, y=yr).d(nr) + v.bind(x=xr, y=yr).d(nr) - 1.0,
             ]
         ).solve()
@@ -2363,12 +2370,40 @@ def test_normal_components_in_a_flux_value(structured):
     assert np.abs(sol - (2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < (1e-10 if structured else 1e-6)
 
 
-def test_a_flux_spelled_in_components_raises():
-    """`nx*ub.x + ny*ub.y - g` has no `.d(n)`: it read as a second PDE and was summed into the first."""
-    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+@pytest.mark.parametrize("spelling", ["d(n)", "d((nx, ny))", "components", "oblique"])
+@pytest.mark.parametrize("structured", [True, False])
+def test_every_spelling_of_a_flux_condition(spelling, structured):
+    """∂u/∂n written three ways — `ub.d(n)`, `ub.d((nx, ny))`, `nx*ub.x + ny*ub.y` — and an oblique
+    condition mixing ∂u/∂x in, all recover u = 2x + 3y. The component spelling used to be read as a second
+    PDE and summed into the first."""
+    d = (
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+        if structured
+        else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    )
     x, y, _ = d.variable("interior", split=True)
-    xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)
     u = d.unknown()
-    ui, ur = u.bind(x=x, y=y), u.bind(x=xr, y=yr)
-    with pytest.raises(ValueError, match="without a normal derivative"):
-        jno.fdm([-(ui.xx + ui.yy), nx * ur.x + ny * ur.y - 1.0])
+    ui = u.bind(x=x, y=y)
+    xl, yl, _ = d.variable("left", split=True)
+    terms = [-(ui.xx + ui.yy), u(xl, yl) - (2.0 * xl + 3.0 * yl)]
+    for r in ("right", "bottom", "top"):
+        xr, yr, _, nx, ny = d.variable(r, normals=True, split=True)
+        n, ub, g = d.variable(r, normals=True), u.bind(x=xr, y=yr), 2.0 * nx + 3.0 * ny
+        terms.append(
+            {
+                "d(n)": ub.d(n) - g,
+                "d((nx, ny))": ub.d((nx, ny)) - g,
+                "components": nx * ub.x + ny * ub.y - g,
+                "oblique": (ub.x - 2.0) + 0.5 * (ub.d(n) - g),
+            }[spelling]
+        )
+    sol = np.asarray(jno.fdm(terms).solve()).reshape(-1)
+    p = _nodes(d)
+    assert np.abs(sol - (2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < (1e-10 if structured else 1e-6)
+
+
+def test_a_direction_needs_one_component_per_coordinate():
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)
+    with pytest.raises(ValueError, match="one component"):
+        d.unknown().bind(x=xr, y=yr).d((nx,))

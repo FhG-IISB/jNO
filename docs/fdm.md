@@ -266,10 +266,24 @@ ur.d(nr) - h                                       # Neumann:  ∂u/∂n = h
 ur.d(nr) + alpha * (ur - u_inf)                    # Robin:    ∂u/∂n + α(u - u∞) = 0
 ```
 
-`jno.fdm` handles **any condition affine in `∂u/∂n`** — Neumann, Robin, a coordinate-coefficient
-`κ(x)·ur.d(n)`, either sign — by reading the coefficient of `∂u/∂n` directly (it evaluates the term
-with the normal derivative pinned to `0` and to `1`, giving the row `a·(∇u·n) + b`). There are no
-special BC objects, and **any mix** of Dirichlet, Neumann, and Robin on different edges composes:
+A boundary condition that differentiates the unknown is evaluated **as written**. Every first derivative
+in it is taken with the boundary-accurate gradient at the edge's nodes. That is the one-sided difference
+on a grid and the quadratic fit on a mesh (see the note below). The normal derivative can be spelled any
+way the math is:
+
+```python
+xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)   # normal components as values
+ur.d(nr) - h                           # ∂u/∂n = h
+ur.d((nx, ny)) - h                     # the same: a derivative along the direction (nx, ny)
+nx*ur.x + ny*ur.y - h                  # the same, in components
+(kappa*ur).d(nr) - q                   # a coefficient inside the derivative
+ur.d(nr) + ur.d(nr)**3 - g             # nonlinear in the flux: Newton solves the row
+ur.x - g                               # a tangential or oblique derivative
+```
+
+`.d((cx, cy))` is the derivative along any direction, `Σ cᵢ ∂/∂xᵢ` over the bound coordinates, and it
+works on every view, in `jno.fem` and PINN terms too. There are no special BC objects, and **any mix** of
+Dirichlet, Neumann and Robin on different edges composes:
 
 ```python
 jno.fdm([
@@ -285,13 +299,13 @@ jno.fdm([
     In `jno.fem` a Neumann condition is a *natural* weak term `h·v` carrying the test function. The
     strong form has no test function, so the flux is imposed **directly** on the boundary node's
     equation. In **2-D** the normal is computed from the mesh boundary segments (exact on axis-aligned
-    edges), and a **corner** node shared by two flux edges has no single outward normal, so it falls
-    back to the interior PDE residual — give such a corner an explicit Dirichlet value if it needs
-    anchoring. In **3-D** the normal comes from the region's boundary **faces**, each oriented outward
+    edges). A **corner** node shared by two flux edges carries both conditions, summed, each with its
+    own edge's normal. In **3-D** the normal comes from the region's boundary **faces**, each oriented outward
     exactly via its owning tetrahedron's apex (a flat face gives an exact axis normal), so face-edge
     nodes keep their flux row; where a flux face meets a Dirichlet face, the Dirichlet value wins (its
-    row is applied last). A condition that is *not* affine in `∂u/∂n` raises rather than returning a
-    wrong answer.
+    row is applied last). A nonlinear condition is fine when it is well posed: the Newton tangent of
+    `(∂u/∂n)³ − g³` is zero at a zero initial guess, and that solve fails loudly. Give `x0=`, or write a
+    condition whose slope in ∂u/∂n does not vanish.
 
 !!! measured "The flux closure follows the interior stencil — both stay second order"
     The gradient used for `∂u/∂n` must match the stencil the PDE uses, and `jno.fdm` picks it for you.
@@ -595,8 +609,8 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
 **Supported:** scalar fields — or a **coupled system** of several `domain.unknown()` fields (Dirichlet
 conditions, one PDE equation per unknown, steady or first order in time; `.solve()` returns `(nf, N)`, a
 march `(n_steps, nf, N)`) — on a **2-D triangular or 3-D
-tetrahedral** mesh; any mix of Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in
-`∂u/∂n`) boundary conditions, in 2-D and 3-D, **steady or transient** (a transient flux node is an
+tetrahedral** mesh; any mix of Dirichlet and derivative boundary conditions (Neumann, Robin, oblique,
+nonlinear), in 2-D and 3-D, **steady or transient** (a transient flux node is an
 algebraic zero-mass-row constraint); transient problems by the method of lines, first order (a `u.t` term with a unit or a general `c(x)·u.t` mass
 coefficient, `M = diag(c)`) or second order ([`u.tt`](#second-order-in-time-utt), with optional damping and
 initial velocity), with a selectable [time scheme](#time-schemes); linear and nonlinear
@@ -642,10 +656,10 @@ mx, my = nu*Δ(uw) - (uw*uw.x + vw*uw.y), nu*Δ(vw) - (uw*vw.x + vw*vw.y)
 pw.d(n) - (nx*mx + ny*my)
 ```
 
-`nx, ny` are the same per-node normals the flux row uses (exact on a box face). The flux itself must be
-written as `ub.d(n)`. Spelled in components, `nx*ub.x + ny*ub.y`, it raises: it has no normal
-derivative to be recognised by, and it used to be read as a second PDE. A condition that differentiates
-two fields raises too.
+`nx, ny` are the same per-node normals the flux row uses (exact on a box face). The row replaces the
+equation of the one field the condition differentiates that is not already fixed on that edge by a
+Dirichlet condition. Here u and v have no-slip values, so it is p's. If that cannot be decided (two free
+fields), it raises.
 
 Not supported on a coupled system, and each raises: `u.tt` (write it as a first-order system in
 `(u, v = u.t)`), and the time derivative of another field inside equation *k* (a non-diagonal mass).

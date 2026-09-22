@@ -116,6 +116,26 @@ def _is_periodic_tie_combination(expr_a, expr_b) -> bool:
     return _has_unknown(expr_a) and _has_unknown(expr_b)
 
 
+def _directional(view, components, scheme):
+    """``Σ c_i ∂view/∂x_i`` over the spatial coordinates bound to ``view`` (in axis order)."""
+    cv = getattr(view, "_coord_vars", None) or {}
+    coords = sorted(
+        (var for var in cv.values() if getattr(var, "axis", "spatial") != "temporal"),
+        key=lambda var: int(getattr(var, "dim", [0])[0]),
+    )
+    if len(components) != len(coords):
+        raise ValueError(
+            f".d(({', '.join('c' + str(i) for i in range(len(components)))})): a direction needs one component "
+            f"per bound spatial coordinate, and this view has {len(coords)} ({[str(v) for v in coords]}). Bind "
+            "the coordinates first, `u.bind(x=xr, y=yr)`, and pass one component each: `ub.d((nx, ny))`."
+        )
+    out = None
+    for c, var in zip(components, coords):
+        term = c * view.d(var, scheme=scheme)
+        out = term if out is None else out + term
+    return out
+
+
 def _tag_of_coord_vars(cv) -> Optional[str]:
     """The single region tag shared by a bound view's coordinate Variables, or ``None``."""
     tags = {getattr(v, "tag", None) for v in (cv or {}).values()}
@@ -325,7 +345,13 @@ class ScalarView(_DelegatesToPlaceholder):
 
             n = domain.variable("interface_A_B", normals=True)
             kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+
+        ``v`` may also be a **vector of components** ``(c_x, c_y[, c_z])``: the directional derivative
+        ``Σ c_i ∂self/∂x_i`` along the coordinates bound with ``.bind(x=.., y=..)``. With the components
+        of a normal, ``ub.d((nx, ny))`` is ``∂u/∂n``; any other direction works the same way.
         """
+        if isinstance(v, (tuple, list)):
+            return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def d2(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
@@ -563,7 +589,10 @@ class VectorView(_DelegatesToPlaceholder):
         return self._rewrap(self._expr.stop_gradient)
 
     def d(self, v, scheme: str = "automatic_differentiation") -> "VectorView":
-        """Component-wise ``∂self/∂v`` — same view type."""
+        """Component-wise ``∂self/∂v`` — same view type. A vector ``v = (c_x, c_y[, c_z])`` gives the
+        component-wise directional derivative ``Σ c_i ∂self/∂x_i``, as for a scalar view."""
+        if isinstance(v, (tuple, list)):
+            return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def d2(self, v, scheme: str = "automatic_differentiation") -> "VectorView":
@@ -812,6 +841,8 @@ class ComplexView(_DelegatesToPlaceholder):
 
     def d(self, v, scheme: str = "automatic_differentiation") -> "ComplexView":
         """Component-wise ``∂self/∂v`` — same view type."""
+        if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
+            return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def d2(self, v, scheme: str = "automatic_differentiation") -> "ComplexView":
@@ -985,6 +1016,8 @@ class ComplexVectorView(_DelegatesToPlaceholder):
         return self._rewrap(self._expr.integrate(**kwargs))
 
     def d(self, v, scheme: str = "automatic_differentiation") -> "ComplexVectorView":
+        if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
+            return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def partials(self, **named_vars):
@@ -1159,6 +1192,8 @@ class ComplexPair:
     partials = bind
 
     def d(self, v, **kw) -> "ComplexPair":
+        if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
+            return _directional(self, v, kw.get("scheme", "automatic_differentiation"))
         return self._map(lambda p: p.d(v, **kw))
 
     def dot(self, other) -> "ComplexPair":
@@ -1270,6 +1305,8 @@ class MatrixView(_DelegatesToPlaceholder):
 
     def d(self, v, scheme: str = "automatic_differentiation") -> "MatrixView":
         """Element-wise ``∂self/∂v`` — same view type."""
+        if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
+            return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def d2(self, v, scheme: str = "automatic_differentiation") -> "MatrixView":
@@ -1582,6 +1619,8 @@ class VoigtView(_DelegatesToPlaceholder):
 
     def d(self, v, scheme: str = "automatic_differentiation") -> "VoigtView":
         """Component-wise ``∂self/∂v`` — same view type."""
+        if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
+            return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def d2(self, v, scheme: str = "automatic_differentiation") -> "VoigtView":
@@ -2017,6 +2056,8 @@ class FieldViewWithPartials(ScalarView):
 
     def d(self, v, scheme: str | None = None) -> "ScalarView":
         """``∂self/∂v`` — finite differences by default for a nodal field (pass ``scheme=`` to override)."""
+        if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
+            return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=scheme or self._default_deriv_scheme()))
 
     def d2(self, v, scheme: str | None = None) -> "ScalarView":
