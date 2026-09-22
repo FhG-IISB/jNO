@@ -195,3 +195,56 @@ def test_gmg_follows_the_time_step_shift(alpha, sigma):
     e = jnp.asarray(np.random.default_rng(0).standard_normal(n)) * interior.reshape(-1)
     after = e - M(A_mv(e))
     assert float(jnp.linalg.norm(after) / jnp.linalg.norm(e)) < 0.3
+
+
+def test_a_coarsening_that_stops_early_keeps_the_multigrid_factor():
+    """150 cells a side halve once (75 is odd), leaving a 76² coarsest level of 5,476 unknowns -- above
+    the dense cap, so Chebyshev iteration solves it. The V-cycle must still reduce the residual like
+    multigrid, reach the discretisation error, and stay SYMMETRIC: CG needs a fixed linear preconditioner,
+    which a fixed Chebyshev polynomial is and an inner Krylov solve would not be. (This grid used to
+    re-factorise a dense 5,476² coarse matrix on every V-cycle; at 1000² cells the matrix alone was 2 GB.)"""
+    from jno.utils.solver.geometric_mg import DENSE_COARSE_MAX
+
+    grid, A_mv, b, exact, int_flat = _poisson(1.0 / 150)
+    assert tuple(grid["shape"]) == (151, 151)
+    apply, nlev = build_vcycle(grid["shape"], grid["spacing"])
+    assert nlev == 2 and 74 * 74 > DENSE_COARSE_MAX
+    fac, u, _ = _iterate_vcycle(A_mv, b, apply)
+    assert fac < 0.2
+    assert float(np.linalg.norm(np.asarray(u) - exact) / np.linalg.norm(exact)) < 1e-4
+    rng = np.random.default_rng(0)
+    a, c = (jnp.asarray(rng.standard_normal(b.shape[0]) * int_flat) for _ in range(2))
+    ma_c, a_mc = float(jnp.dot(apply(a), c)), float(jnp.dot(a, apply(c)))
+    assert abs(ma_c - a_mc) < 1e-10 * abs(ma_c)
+
+
+def test_a_small_coarse_level_is_factorised_once(monkeypatch):
+    """128 cells coarsen to 5×5: a dense coarse solve, factorised at build and only back-substituted after."""
+    import jax.scipy.linalg as jsl
+
+    calls, real = [], jsl.cho_factor
+    monkeypatch.setattr(jsl, "cho_factor", lambda *a, **k: calls.append(1) or real(*a, **k))
+    grid, A_mv, b, exact, _ = _poisson(1.0 / 128)
+    apply, nlev = build_vcycle(grid["shape"], grid["spacing"])
+    for _ in range(3):
+        apply(b)
+    assert len(calls) == 1
+    fac, u, _ = _iterate_vcycle(A_mv, b, apply)
+    assert fac < 0.2
+
+
+def test_the_chebyshev_interval_is_the_exact_spectrum():
+    """The coarse Chebyshev iteration is only as good as its interval: check it against a dense eigensolve."""
+    from jno.utils.solver.geometric_mg import _laplacian_bounds
+
+    shape, spacing, scale, shift = (7, 9), (0.2, 0.13), 0.3, 1.5
+    interior = _interior_mask(shape)
+    idx = np.nonzero(np.asarray(interior).reshape(-1) > 0.5)[0]
+
+    def op(v):
+        u = jnp.zeros(int(np.prod(shape))).at[idx].set(v).reshape(shape)
+        return (scale * _neg_laplacian(u, spacing, interior) + shift * u * interior).reshape(-1)[idx]
+
+    ev = np.linalg.eigvalsh(np.asarray(jax.jacfwd(op)(jnp.zeros(idx.size))))
+    lo, hi = _laplacian_bounds(shape, spacing, scale, shift)
+    assert lo == pytest.approx(ev[0], rel=1e-12) and hi == pytest.approx(ev[-1], rel=1e-12)

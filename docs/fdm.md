@@ -332,7 +332,12 @@ rather than silently dropping the imaginary part, matching the unstructured cota
     matrix-free Newton with GMRES and the V-cycle. Explicit `linear=jno.solve.cg() / gmres() / bicgstab()`
     with `precond=jno.precond.gmg()` (or no preconditioner) stays matrix-free on a structured linear
     problem; other slots (`lu`, `amg`, `jacobi`, ...) assemble the operator. The multigrid needs a grid it
-    can coarsen: an even, ideally power-of-two, cell count per axis. A **coupled** system (several
+    can coarsen: it halves every axis while each has an even cell count, so a count of the form m·2ᵏ with
+    small m coarsens furthest (1024 cells to a 5×5 coarsest grid, 1000 cells only to 126×126). A coarsest
+    level of at most 1024 unknowns is factorised once; a larger one is solved by Chebyshev iteration on its
+    exact spectrum, which is logged with the step count. Either way the cost stays linear: 2-D Poisson on
+    an RTX 3070 solves in 0.044 s at 1024² cells and 0.041 s at 1000², and 16.8M nodes (4096²) fit in
+    3.9 GB. A **coupled** system (several
     unknowns, e.g. Navier–Stokes) is not multigrid-preconditioned yet, and its cost grows faster than
     linearly with the grid; `linear=jno.solve.lu(backend="host")` makes its repeat solves much faster
     (2.0 s against 46 s at 77k nodes, Kovasznay flow) after a slower first call. `jno.precond.gmg()` is

@@ -2295,9 +2295,9 @@ class _TraceFDM:
             and not self._flux_rows()
             and not self._periodic_rows()
         ):
-            from .utils.solver.geometric_mg import build_vcycle
+            from .utils.solver.geometric_mg import _hierarchy
 
-            _, n_levels = build_vcycle(grid["shape"], grid["spacing"])
+            n_levels = len(_hierarchy(grid["shape"], grid["spacing"], 5))  # the count only; nothing built
             if n_levels >= 2 and np.array_equal(self._dirichlet_nodes(), self._grid_ring(grid)):
                 import jax
 
@@ -2351,17 +2351,6 @@ class _TraceFDM:
         from .utils.solver.geometric_mg import build_vcycle
 
         grid = self.domain.mesh_connectivity["grid"]
-        if precond is not None:  # the user's V-cycle settings
-            vcycle, _ = build_vcycle(
-                grid["shape"],
-                grid["spacing"],
-                n_pre=precond.n_pre,
-                n_post=precond.n_post,
-                omega=precond.omega,
-                min_size=precond.min_size,
-            )
-        else:
-            vcycle, _ = build_vcycle(grid["shape"], grid["spacing"])
         slots = linear is not None or precond is not None
         # the tolerance the solve was asked for: the user's Krylov spec's, or this path's own
         check_tol = ((linear.key[2][0] if linear is not None and linear.key else 1e-8) if slots else tol) or tol
@@ -2372,6 +2361,18 @@ class _TraceFDM:
         if eager and cache.get("key") == key:
             fn = cache["fn"]
         else:
+            # built on a cache MISS only: a repeat solve reuses the compiled solve, V-cycle included
+            if precond is not None:  # the user's V-cycle settings
+                vcycle, _ = build_vcycle(
+                    grid["shape"],
+                    grid["spacing"],
+                    n_pre=precond.n_pre,
+                    n_post=precond.n_post,
+                    omega=precond.omega,
+                    min_size=precond.min_size,
+                )
+            else:
+                vcycle, _ = build_vcycle(grid["shape"], grid["spacing"])
             residual = self._steady_residual(extra_params)
             rows = self._dirichlet_rows(extra_params)
             mask = np.ones(N)
