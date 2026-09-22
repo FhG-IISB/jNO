@@ -329,6 +329,13 @@ def _fd_laplacian(mesh, scheme, dims):
     return _k
 
 
+def _stencil_or_none(scheme):
+    """A ``jno.fd(...)`` spec passes through to the grid kernels; a plain scheme string does not."""
+    from .stencils import FDStencil
+
+    return scheme if isinstance(scheme, FDStencil) else None
+
+
 def _fd_hessian(mesh, scheme, var_dims):
     mc = mesh.domain.mesh_connectivity
     cells = {1: "lines", 2: "triangles", 3: "tetrahedra"}[mesh.dim]
@@ -341,7 +348,7 @@ def _fd_hessian(mesh, scheme, var_dims):
     def _k(u_1d):
         if mesh.dim == 1:
             return fn(u_1d, mesh.points, mc[cells])
-        return fn(u_1d, mesh.points, mc[cells], var_dims, grid=mc.get("grid"))
+        return fn(u_1d, mesh.points, mc[cells], var_dims, grid=mc.get("grid"), method=_stencil_or_none(scheme))
 
     return _k
 
@@ -368,6 +375,27 @@ def _spectral_hessian(mesh, scheme, var_dims):
         return jnp.stack(comps, axis=-1).reshape(-1, n, n)
 
     return _k
+
+
+def _reads_stored_values(expr) -> bool:
+    """Does ``expr`` read stored values (any ``jno.np.parameter`` array, a nodal field, a frozen field)
+    rather than being a function of the coordinates (a formula, a network)? Stored values exist only at
+    the nodes, so they cannot be evaluated at a half-point."""
+    from .trace import FrozenField
+    from .utils.solver.solver_helper import iter_children
+
+    seen, stack = set(), [expr]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        n = getattr(n, "_expr", n)  # a view
+        model = getattr(n, "model", None)
+        if isinstance(n, FrozenField) or getattr(model, "_is_parameter", False) or getattr(model, "_fem_field", None):
+            return True
+        stack.extend(iter_children(n) or ())
+    return False
 
 
 #: ``image_shape`` marker for a per-node vector field ``(N, c)`` (see ``_mesh_field_values``).
@@ -762,6 +790,127 @@ class TraceEvaluator:
             # flattened to one (c·N,) array, and the stencil then failed to reshape it onto the grid.
             return mesh, u_full, _NODAL_VECTOR, int(u_full.shape[1])
         return mesh, (u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()), None, 1
+
+    def _upwind_derivative(self, u_flat, axis, scheme, tag, ctx, mesh):
+        """``∂u/∂x_axis`` with the upwind-biased stencil of ``jno.fd(upwind=b, order=k)``: per node, the
+        stencil that reads the side the wind comes from (the sign of ``b`` there). ``b`` is evaluated at the
+        nodes in this same evaluation, so a wind that is the unknown itself is the current iterate."""
+        from .stencils import FDStencil
+        from .trace import Placeholder
+
+        grid = mesh.domain.mesh_connectivity.get("grid")
+        if grid is None:
+            raise NotImplementedError(
+                f"scheme={str(scheme)!r}: jno.fd(upwind=...) needs a structured grid "
+                "(jno.shape.rect(...).structured()). On an unstructured mesh, write first-order upwinding as the "
+                "math: b*u.x - abs(b)*h/2*u.xx with h = domain.cell_size."
+            )
+        shape = tuple(int(n) for n in grid["shape"])
+        per = (grid.get("periodic") or (False,) * len(shape))[axis]
+        h = float(grid["spacing"][axis])
+        pos, neg = scheme.upwind_offsets()
+        b_order = scheme.boundary if scheme.boundary is not None else (scheme.order or 1)
+        s_pos, s_neg = FDStencil(points=pos, boundary=b_order), FDStencil(points=neg, boundary=b_order)
+        wind = scheme.upwind
+        if isinstance(wind, Placeholder) or hasattr(wind, "_expr"):
+            w = jnp.asarray(self._target_on_mesh(getattr(wind, "_expr", wind), tag, mesh.points, ctx))
+            w = w.reshape(mesh.n, -1)
+            w = w[:, axis] if w.shape[1] > 1 else w[:, 0]
+        else:
+            w = jnp.full((mesh.n,), float(wind))
+        cols = u_flat if u_flat.ndim == 2 else u_flat[:, None]
+        out = []
+        for c in range(cols.shape[1]):
+            U = cols[:, c].reshape(shape)
+            d_pos = DifferentialOperators._grid_stencil_diff(U, h, axis, 1, s_pos, per).reshape(-1)
+            d_neg = DifferentialOperators._grid_stencil_diff(U, h, axis, 1, s_neg, per).reshape(-1)
+            out.append(jnp.where(w >= 0, d_pos, d_neg))
+        return out[0] if u_flat.ndim == 1 else jnp.stack(out, axis=1)
+
+    def _compact_flux(self, target, var, tag, ctx, scheme, mesh):
+        """The conservative form of ``∂/∂x (κ · ∂u/∂x)`` on a structured grid, or ``None`` if ``target`` is
+        not ``κ · ∂u/∂x`` (along the same axis) of a scalar field.
+
+        Returns a function that takes the generic result (a first difference of the node values of
+        ``κ u_x``) and replaces its interior nodes by the compact flux difference
+
+            [κ_{i+½}(u_{i+1} − uᵢ) − κ_{i−½}(uᵢ − u_{i−1})] / h².
+
+        Chaining two central differences reads every second node: a 2h-wide stencil that decouples odd and
+        even nodes. Measured on layered electrostatics (ε = 1 | 10), it was first order, 0.14 off at
+        h = 0.1, with only the even nodes wrong. ``κ`` at the half-points is set by ``jno.fd(average=...)``:
+        - ``"exact"`` (the default when κ reads no stored field): κ evaluated at x ± h/2;
+        - ``"arithmetic"`` (the default otherwise), or ``"harmonic"``: a mean of the two node values.
+        The end nodes keep the generic value; a boundary row normally replaces them."""
+        from .stencils import FDStencil
+        from .trace import BinaryOp, Jacobian
+        from .trace.views import _unwrap
+
+        grid = mesh.domain.mesh_connectivity.get("grid")
+        axis = int(var.dim[0])
+        if grid is None or any((grid.get("periodic") or (False,) * 3)[: len(grid["shape"])]):
+            return None
+
+        def along_axis(n):
+            n = _unwrap(n)
+            return (
+                isinstance(n, Jacobian)
+                and len(n.variables) == 1
+                and int(n.variables[0].dim[0]) == axis
+                and getattr(n.variables[0], "tag", None) == tag
+                and scheme_family(str(n.scheme)) == "finite_difference"
+            )
+
+        t = _unwrap(target)
+        coef, inner = None, None
+        if along_axis(t):
+            inner = t
+        elif isinstance(t, BinaryOp) and t.op == "*":
+            for a, b in ((t.left, t.right), (t.right, t.left)):
+                if along_axis(b) and not along_axis(a):
+                    coef, inner = a, _unwrap(b)
+                    break
+        if inner is None:
+            return None
+        average = getattr(scheme, "average", None) if isinstance(scheme, FDStencil) else None
+        field_coef = coef is not None and _reads_stored_values(coef)
+        if average == "exact" and field_coef:
+            raise ValueError(
+                "jno.fd(average='exact') evaluates the coefficient at the half-points between nodes, and this "
+                "coefficient reads a stored field, which has no value there. Use average='arithmetic' or "
+                "'harmonic'."
+            )
+        shape, h = tuple(int(n) for n in grid["shape"]), float(grid["spacing"][axis])
+        mesh_points = mesh.points
+        u = jnp.asarray(self._target_on_mesh(inner.target, tag, mesh_points, ctx))
+        if u.size != mesh.n:  # a vector field: leave it to the generic path
+            return None
+        U = jnp.moveaxis(u.reshape(shape), axis, 0)
+        n = U.shape[0]
+        if n < 3:
+            return None
+
+        def on_mesh(expr, points):
+            v = jnp.asarray(self._target_on_mesh(expr, tag, points, ctx)).reshape(-1)
+            return jnp.moveaxis(jnp.broadcast_to(v, (mesh.n,)).reshape(shape), axis, 0)
+
+        if coef is None:
+            k_half = 1.0
+        elif (average or ("arithmetic" if field_coef else "exact")) == "exact":
+            shift = jnp.zeros_like(mesh_points).at[:, axis].set(0.5 * h)
+            k_half = on_mesh(coef, mesh_points + shift)[:-1]  # κ(x_i + h/2), i = 0 … n−2
+        else:
+            k = on_mesh(coef, mesh_points)
+            k_half = 0.5 * (k[1:] + k[:-1]) if average in (None, "arithmetic") else 2.0 * k[1:] * k[:-1] / (k[1:] + k[:-1])
+        flux = k_half * (U[1:] - U[:-1]) / h
+        interior = (flux[1:] - flux[:-1]) / h  # nodes 1 … n−2
+
+        def replace(generic):
+            G = jnp.moveaxis(jnp.asarray(generic).reshape(shape), axis, 0)
+            G = G.at[1:-1].set(interior.astype(G.dtype))
+            return jnp.moveaxis(G, 0, axis).reshape(-1)
+
+        return replace
 
     def _finish_mesh_jacobian(self, comps, image_shape, n_vars, mesh_points, points):
         """Shape a mesh-field gradient back to the caller's convention. A per-node vector field gives
@@ -1831,6 +1980,9 @@ class TraceEvaluator:
             # channel, put the shape back. Only the per-channel kernel differs, so that is the only
             # thing a new family supplies -- see `_MESH_FIELD_FAMILIES`.
             mesh, u_flat, image_shape, n_channels = self._mesh_field_values(target, tag, bound_var, ctx, family)
+            if getattr(scheme, "upwind", None) is not None:  # `jno.fd(upwind=b, order=k)`
+                comps = [self._upwind_derivative(u_flat, vi_dim, scheme, tag, ctx, mesh) for _i, vi_dim in var_dims]
+                return self._finish_mesh_jacobian(comps, image_shape, n_vars, mesh.points, points)
             kernel = _MESH_FIELD_FAMILIES[family].gradient(mesh, scheme)
             comps = [
                 jax.vmap(lambda u_c, _a=vi_dim: kernel(u_c, _a))(u_flat.T).T
@@ -1838,6 +1990,10 @@ class TraceEvaluator:
                 else kernel(u_flat, vi_dim)
                 for _i, vi_dim in var_dims
             ]
+            if family == "finite_difference" and n_vars == 1 and image_shape is None:
+                compact = self._compact_flux(target, variables[0], tag, ctx, scheme, mesh)
+                if compact is not None:
+                    comps = [compact(comps[0])]
             return self._finish_mesh_jacobian(comps, image_shape, n_vars, mesh.points, points)
         elif family == "automatic_differentiation":
             evaluator_self = self

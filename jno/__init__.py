@@ -21,6 +21,7 @@ from .info import info
 from .integration_operators import IntegrationOperators
 from .noise import noise
 from .rcwa import Rcwa, RcwaError, rcwa
+from .stencils import fd
 from .trace import (
     Assembly,
     Constraint,
@@ -154,6 +155,7 @@ __all__ = [
     "do",
     "fem",
     "fdm",
+    "fd",
     "rcwa",
     "Rcwa",
     "RcwaError",

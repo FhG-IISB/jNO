@@ -86,18 +86,34 @@ views therefore default to **finite differences**:
 ### Variable coefficients — `(κ * ui.x).x`
 
 The partials `ui.x`, `ui.y`, `ui.z` of the bound field compose, so a divergence-form operator
-−∇·(κ∇u) is written exactly as on paper. κ can depend on the coordinates or on `u` itself:
+−∇·(κ∇u) is written exactly as on paper. κ can be a formula in the coordinates, a field known at the nodes
+(a `jno.np.parameter` holding data), or depend on `u` itself:
 
 ```python
-κ = 1.0 + x                      # or 1.0 + ui for a nonlinear diffusivity
+κ = 1.0 + x                      # or 1.0 + ui for a nonlinear diffusivity, or a data field
 jno.fdm([-(κ * ui.x).x - (κ * ui.y).y - f, u(xb, yb) - 0.0]).solve()
 ```
 
 !!! measured "Manufactured u = sin(πx)sin(πy), unstructured mesh, h = 0.1 → 0.05 → 0.025"
     κ = 1 + x: 4.9e-2 → 1.2e-2 → 3.1e-3. κ = 1 + u: 5.1e-2 → 1.2e-2 → 3.0e-3. Both second order.
 
-Use `.x`, not `.d(x)`, on an expression like `κ * ui.x`: `.d(x)` asks for an autodiff derivative, which a
-nodal field cannot provide, so it raises.
+On a **structured grid**, `(κ * ui.x).x` is the conservative, compact flux difference
+
+    [κ_{i+½}(u_{i+1} − u_i) − κ_{i−½}(u_i − u_{i−1})] / h²
+
+with κ evaluated at the half-points between nodes. Chaining two central differences instead reads every
+second node, a 2h-wide stencil that decouples odd and even nodes. On a layered dielectric (ε = 1 | 10,
+`benchmarks/fdm/electrostatics.py`) that was first order, 0.14 off at h = 0.1, with only the even nodes
+wrong. The compact form is exact there. How κ is taken between nodes is `jno.fd(average=...)`:
+
+| `average=` | κ at the half-point | when |
+|---|---|---|
+| `"exact"` | κ evaluated at x ± h/2 | the default when κ is a formula or a network |
+| `"arithmetic"` | ½(κ_i + κ_{i+1}) | the default when κ reads stored values (a data field, `u`) |
+| `"harmonic"` | 2κ_iκ_{i+1}/(κ_i + κ_{i+1}) | layered media known only at the nodes |
+
+`average="exact"` on a coefficient known only at the nodes raises. All three are second order on a
+smooth κ = 1 + x² (7.5e-3, 1.9e-3, 4.7e-4 at h = 0.1 / 0.05 / 0.025).
 
 ### Convection — upwinding is a formula
 
@@ -114,6 +130,28 @@ jno.fdm([-ε*Δu + b*ui.x - jnn.abs(b)*h/2*ui.xx - f, u(xb, yb) - 0.0]).solve()
     ε = 1e-2 (Péclet 2.5): central peaks at 1.38; upwind peaks at 0.87 and equals the hand-assembled
     upwind system to 1e-8. ε = 1e-3: central 2.36, upwind 0.93. Upwinding is first order and smears
     boundary layers; where Péclet < 1 the central form is more accurate.
+
+On a structured grid, `jno.fd(upwind=b, order=k)` gives upwinding of any order on the derivative it is
+passed to. Per node, it reads the side the wind comes from: offsets (−1, 0) for k = 1, (−2, −1, 0) for
+k = 2, (−2, −1, 0, 1) for k = 3, mirrored where b < 0. The wind `b` is an expression (a number, a formula, a
+field), and it may be the unknown itself:
+
+```python
+b*ui.d(x, scheme=jno.fd(upwind=b, order=2)) - ε*(ui.xx + ui.yy)       # 2nd-order upwind convection
+ui*ui.d(x, scheme=jno.fd(upwind=ui, order=2)) - ν*(ui.xx + ui.yy)     # Burgers: the wind is u
+```
+
+!!! measured "−0.01u″ + u′ = 0, max error at h = 0.05 / 0.0125 / 0.003125 (cell Péclet 5 at the coarsest)"
+    | stencil | max error | range at h = 0.05 |
+    |---|---|---|
+    | central | 4.4e-1 / 5.6e-2 / 3.0e-3 | [−0.43, 1] |
+    | `upwind, order=1` | 1.6e-1 / 1.6e-1 / 5.1e-2 | [0, 1] |
+    | `upwind, order=2` | 1.2e-1 / 9.3e-2 / 1.2e-2 | [0, 1] |
+    | `upwind, order=3` | 1.3e-1 / 8.1e-3 / 2.1e-3 | [−0.13, 1] |
+
+    Third-order upwind-biased stencils are accurate but not monotone. On a smooth field the derivative is
+    of order k for k = 1, 2, 3. For steady Burgers with ν = 0.02, where the wind changes sign at the layer,
+    the matrix-free and the assembled-tangent Newton agree.
 
 In `jno.fdm`, `cell_size` at a node is the mean of `(d!·|K|)^(1/d)` over its cells: exactly the grid
 spacing on a structured grid in 2-D and 3-D. This differs from `jno.fem`, where it is `|K|^(1/d)`, which is
@@ -161,6 +199,41 @@ for locality. The scheme stays on the operator it describes — `ui.d2(x, scheme
 terms in the same residual can use different stencils. (`cotangent` is the accurate default in 2-D
 **and** 3-D — the cotangent-weight operator on triangles, and its exact analogue the P1 finite-element
 Laplace–Beltrami operator on tetrahedra; see [3-D tetrahedral meshes](#3-d-tetrahedral-meshes).)
+
+### Any stencil — `jno.fd(...)`
+
+On a structured grid, `jno.fd(...)` describes a stencil by its mathematics, and is accepted wherever
+`scheme=` is. It can go on one operator, or once on the binding, so that every `.x`, `.xx` and `.xy` of that
+binding uses it:
+
+```python
+u = U.bind(x=x, y=y, scheme=jno.fd(order=4))      # every derivative of u: 4th-order central
+-(u.xx + u.yy) - f                                 # a 4th-order Poisson operator, written as before
+
+u.d(x, scheme=jno.fd(points=(0, 1, 2)))            # any offsets: a one-sided 2nd-order first derivative
+u.d(x, scheme=jno.fd(weights={-1: -0.5, 1: 0.5}))  # explicit weights, first derivatives
+jno.fd(order=4, boundary=2)                        # the order of the one-sided stencil at the edges
+jno.fd(upwind=b, order=2)                          # upwinding (see Convection, above)
+jno.fd(average="harmonic")                         # the coefficient between nodes in (κ·u.x).x
+```
+
+The weights are exact on polynomials of the highest degree the points allow (B. Fornberg, *Math.
+Comp.* 51 (1988) 699). Where the interior stencil does not fit near an edge, a one-sided stencil with as
+many points is used, of order `boundary` (default: the interior order). A periodic axis wraps instead.
+Mixed derivatives (`.xy`) apply the first-derivative stencil along each axis.
+
+Measured:
+- **Poisson**, `u = sin πx sin πy`, max error at h = 0.1 / 0.05 / 0.025:
+  - default: 8.3e-3 / 2.1e-3 / 5.1e-4;
+  - `order=4`: 5.7e-5 / 6.3e-6 / 4.2e-7 (rate 3.9);
+  - `order=6`: 5.5e-6 / 3.6e-8 / 4.4e-10.
+- **A network evaluated on the grid** (a PINN loss on a field): `u.d(x, scheme=jno.fd(order=4))` converges
+  to the network's exact derivative at rate 4.1. The same stencil works on any field, not only on a
+  `jno.fdm` unknown.
+
+A contradictory spec raises: `order=` together with `points=`, an odd order, or weights that do not sum
+to zero. So does `jno.fd(...)` on an unstructured mesh, until the mesh form exists; use the built-in
+strings there.
 
 ## Structured grid (fast stencils)
 
