@@ -1881,3 +1881,64 @@ def test_transient_inverse_recovers_the_parameter(kind):
     crux = jno.core([(problem(s).solve(**slots) - observed).mse])
     crux.solve(300)
     assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - true) < 1e-3
+
+
+# θ-steps on the DAE: the Dirichlet and flux rows carry zero mass, so they are constraints, not ODEs.
+# Forward Euler used to evaluate them only at the OLD state (a singular step: NaN at step 38 once the
+# decaying field reached ~1e-8), and Crank-Nicolson averaged them (a boundary started off its value
+# flipped sign every step and never decayed). They are now imposed at the new time.
+
+
+def _heat_mode(k, n, *, ic_one=False, T=0.02, h=0.1):
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured(), time=(0.0, T, n))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ic = 1.0 + 0.0 * xi if ic_one else jno.np.sin(k * np.pi * xi) * jno.np.sin(k * np.pi * yi)
+    return d, jno.fdm([ui.t - ui.xx - ui.yy, u(xb, yb) - 0.0, u(xi, yi) - ic])
+
+
+@pytest.mark.parametrize("k, slots", [(1, {}), (9, {}), (1, {"linear": "gmres"}), (1, {"linear": "lu"})])
+def test_forward_euler_matches_the_discrete_decay(k, slots):
+    """θ = 0 on a grid mode of the 5-point Laplacian decays by exactly (1 − Δt·λ_h) per step. The k = 9
+    mode (Δt·λ_h = 0.39, stable) is the one that used to abort with a NaN."""
+    n, T, h = 201, 0.02, 0.1
+    d, problem = _heat_mode(k, n, T=T, h=h)
+    slots = {name: getattr(jno.solve, solver)() for name, solver in slots.items()}
+    traj = np.asarray(problem.solve(time=jno.solve.theta(0.0), **slots)).reshape(n, -1)
+    p = _nodes(d)
+    mode = np.sin(k * np.pi * p[:, 0]) * np.sin(k * np.pi * p[:, 1])
+    factor = (1.0 - T / (n - 1) * 8.0 / h**2 * np.sin(k * np.pi * h / 2) ** 2) ** np.arange(n)
+    for i in (10, 50, n - 1):
+        assert np.abs(traj[i] - factor[i] * mode).max() < 1e-8 * abs(factor[i]), (i, factor[i])
+
+
+@pytest.mark.parametrize("theta", [0.0, 0.5])
+def test_theta_step_imposes_the_boundary_at_the_new_time(theta):
+    """An initial state that violates the Dirichlet value (u0 = 1, g = 0) is pulled onto it by the first
+    step, as backward Euler does. Crank–Nicolson held the boundary at |u| = 1 for the whole march."""
+    d, problem = _heat_mode(0, 11, ic_one=True, T=1e-4)
+    traj = np.asarray(problem.solve(time=jno.solve.theta(theta))).reshape(11, -1)
+    p = _nodes(d)
+    on_boundary = (np.minimum(p[:, 0], 1.0 - p[:, 0]) < 1e-9) | (np.minimum(p[:, 1], 1.0 - p[:, 1]) < 1e-9)
+    assert np.abs(traj[1:, on_boundary]).max() < 1e-12
+
+
+def test_nonlinear_crank_nicolson_assembled_tangent():
+    """With a solver slot a nonlinear march uses the assembled step tangent M/Δt + θ·J. It dropped the θ,
+    so Crank–Nicolson's Newton converged on a wrong tangent: 3.3e-11 off the matrix-free march, now 4e-17."""
+
+    def solve(**slots):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.2, 21))
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y, t=t)
+        ic = 3.0 * jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)
+        terms = [ui.t - ui.xx - ui.yy + 30.0 * ui**3, u(xb, yb) - 0.0, u(xi, yi) - ic]
+        return np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5), **slots))[-1]
+
+    assert np.abs(solve(linear=jno.solve.lu()) - solve()).max() < 1e-13

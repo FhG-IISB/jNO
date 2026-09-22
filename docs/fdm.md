@@ -393,7 +393,10 @@ traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # step-doubling adaptiv
 ```
 
 `jno.solve.theta(θ)` (θ = 1 backward Euler, 0.5 Crank–Nicolson, 0 forward Euler) and
-`jno.solve.adaptive(…)` compose onto the method-of-lines march. The **exponential** integrator is *not*
+`jno.solve.adaptive(…)` compose onto the method-of-lines march. The Dirichlet and flux rows have zero
+mass, so they are constraints, and every θ imposes them at the new time. Forward Euler is explicit only in
+the interior: it is stable for `Δt·λ_max ≤ 2`, i.e. `Δt ≤ h²/4` for the 2-D five-point Laplacian (the
+largest eigenvalue is `8/h²`). The **exponential** integrator is *not*
 available for `jno.fdm`, and it raises. It forms `exp(−Δt M⁻¹A)`, and a strong-form march is a DAE: the
 Dirichlet and flux rows are algebraic constraints with zero mass. Measured with an assembled operator, it
 ran but came back 4.8e-3 off a converged reference, where Crank–Nicolson at the same step was 2.0e-5.

@@ -1294,7 +1294,13 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
     def _build(key):
-        op = LinearOperator(_add_step_operator(block.M, block.A, key))
+        A, scale = block.A, key
+        if key == 0.0:  # forward Euler: the constraint (zero-mass) rows are still imposed at t+dt, with dt·A
+            from .backend_blocks import _algebraic_rows, _row_scaled
+
+            alg = _algebraic_rows(block.M, block.M.shape[0], block.M.dtype)
+            A, scale = _row_scaled(A, alg.astype(block.M.dtype)), float(block.dt)
+        op = LinearOperator(_add_step_operator(block.M, A, scale))
         _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
 
     if _constant_operator:

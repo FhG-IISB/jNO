@@ -1067,8 +1067,13 @@ The same flag exists on `jno.core(...).solve(profile=True)` (see
 `bdf2` exists because `theta` cannot be second order *and* L-stable at once. Crank–Nicolson's
 amplification factor tends to `-1` for a stiff mode, so the mode does not decay — it alternates in
 sign. Measured on a heat problem whose initial condition is incompatible with its boundary (8 steps,
-`T = 0.5`, so the exact field is long dead): Crank–Nicolson reaches `min u = -1.00`, the *undecayed*
-initial amplitude with the sign flipped; BDF2 reaches `-0.023`. On a Navier–Stokes saddle system,
+`T = 0.5`, so the exact field is long dead): Crank–Nicolson reaches `min u = -0.70` and still carries
+0.33 at the end; BDF2 reaches `-0.023`.
+
+Rows with no time derivative (Dirichlet rows, a pressure, an FDM flux row) are constraints, and every
+θ-scheme imposes them at the **new** time, as backward Euler does. The θ-average would make Crank–Nicolson
+satisfy them only on average over the step (a boundary started off its value would flip sign every step
+and never settle), and would leave forward Euler with a singular step. On a Navier–Stokes saddle system,
 where the pressure has no time derivative at all, that ringing is exactly what you do not want.
 
 The first BDF2 step is plain backward Euler — a multistep method has no second level to start from.

@@ -29,6 +29,47 @@ def _verdict(G, u_prev, wn, report):
     )
 
 
+def _algebraic_rows(M, n, dtype):
+    """``True`` on the rows of the mass ``M`` that are entirely zero: equations with no time derivative
+    (a Dirichlet row, an FDM flux row, a pressure row), i.e. the algebraic part of the DAE."""
+    import jax.numpy as jnp
+
+    if hasattr(M, "todense"):  # BCOO: duplicates are summed, so a row is zero iff its |data| sums to zero
+        mass = jnp.zeros((n,), dtype).at[M.indices[:, 0]].add(jnp.abs(M.data).astype(dtype))
+    else:
+        mass = jnp.sum(jnp.abs(jnp.asarray(M, dtype)), axis=1)
+    return mass == 0
+
+
+def _row_scaled(A, w):
+    """``diag(w) · A`` for a BCOO or dense ``A``."""
+    import jax.numpy as jnp
+
+    if hasattr(A, "todense"):
+        import jax.experimental.sparse as jsp
+
+        return jsp.BCOO((A.data * w[A.indices[:, 0]], A.indices), shape=A.shape)
+    return w[:, None] * jnp.asarray(A)
+
+
+def _theta_row_weights(M, theta, n, dtype):
+    """Per-row θ of a θ-step on the DAE ``M u̇ + R(u) = 0``, or ``None`` when θ = 1 (nothing to change).
+
+    A zero-mass row is a constraint ``R_i(u) = 0``, not an ODE. The θ-average turns it into
+    ``θ R_i(u⁺) + (1−θ) R_i(u) = 0``: at θ = 0 the row does not involve ``u⁺`` at all (a singular step,
+    measured as a NaN once the leftover boundary residual fell below the tolerance), and at θ = ½ it
+    only holds on average, so an initial state that violates it flips sign every step and never decays
+    (measured: a Dirichlet boundary started at 1 stays at |u| = 1 under Crank–Nicolson, in FEM and FDM).
+    Those rows are imposed at the new time instead (weight 1), which is the θ-method applied to the
+    ODE on the constraint manifold (Hairer & Wanner, *Solving ODEs II*, §VI.1, the state-space form);
+    it keeps the method's order on the differential rows."""
+    if theta >= 1.0:
+        return None
+    import jax.numpy as jnp
+
+    return jnp.where(_algebraic_rows(M, n, dtype), jnp.asarray(1.0, dtype), jnp.asarray(theta, dtype))
+
+
 @dataclass
 class SemidiscreteTimeBlock:
     """
@@ -345,10 +386,13 @@ class SemidiscreteTimeBlock:
                 return _verdict(G, u, newton_krylov(G, u), report)
 
             M_t = _operand(self.mass(t_next, args))
-            r_now = (1.0 - thn) * jnp.asarray(self.residual(u, t, args), dtype).reshape(-1) if thn < 1.0 else None
+            # θ per row: the zero-mass (constraint) rows are imposed at t+dt; see `_theta_row_weights`.
+            w = _theta_row_weights(M_t, thn, u.size, dtype)
+            r_now = (1.0 - w) * jnp.asarray(self.residual(u, t, args), dtype).reshape(-1) if w is not None else None
 
             def G(wn):
-                g = (M_t @ (wn - u)) / dt + thn * jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
+                r_next = jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
+                g = (M_t @ (wn - u)) / dt + (r_next if w is None else w * r_next)
                 return g if r_now is None else g + r_now
 
             if nonlinear_solve is not None:
@@ -361,8 +405,9 @@ class SemidiscreteTimeBlock:
                 if getattr(nonlinear_solve, "wants_jacobian", False) and self.jacobian is not None:
                     from .solver_api import _add_step_operator
 
-                    def jac_step(wn):
-                        return _add_step_operator(self.jacobian(wn, t_next, args), M_t, 1.0 / dt)
+                    def jac_step(wn):  # ∂G/∂wn = M/dt + diag(w)·J_R; it used to drop the θ, a wrong tangent for θ < 1
+                        J = self.jacobian(wn, t_next, args)
+                        return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt)
 
                     return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
                 return _verdict(G, u, nonlinear_solve(G, u), report)
@@ -384,16 +429,29 @@ class SemidiscreteTimeBlock:
             return jnp.asarray(self.forcing_vector_fn(tt, args), dtype).reshape(-1)
 
         # (M + theta dt A) u_next = (M - (1-theta) dt A) u + dt c + dt(theta f_next + (1-theta) f_now)
-        f_avg = th * _forcing(t_next) + (1.0 - th) * _forcing(t)
+        f_next = _forcing(t_next)
+        f_avg = th * f_next + (1.0 - th) * _forcing(t)
         rhs = M @ u - (1.0 - th) * dt * (A @ u) + dt * c + dt * f_avg
         step_op = lambda wn: M @ wn + th * dt * (A @ wn)  # noqa: E731  the theta-method step operator
+        a_scale = th * dt  # the coefficient of A in the step operator, per row where it differs
+        w = _theta_row_weights(M, th, n, dtype)
+        if w is not None:
+            # Zero-mass (constraint) rows are imposed at t+dt: ``A_i u⁺ = c_i + f_i(t+dt)``, see
+            # `_theta_row_weights`. Scaled by θ·dt for θ > 0 so the step operator stays M + θ·dt·A (the
+            # matrix a composed solver pre-builds); at θ = 0 that row of M + 0·A is empty, so it takes dt.
+            kappa = th if th > 0.0 else 1.0
+            alg = w == 1.0  # θ < 1 here, so weight 1 marks exactly the constraint rows
+            rhs = jnp.where(alg, kappa * dt * (c + f_next), rhs)
+            if th == 0.0:
+                step_op = lambda wn: M @ wn + dt * (w * (A @ wn))  # noqa: E731
+                a_scale = dt * w
         if linear_solve is not None:
             # slot-composed per-step solve; the exact step diagonal keeps jacobi-type specs exact
             # ``scale`` is the coefficient of A in the step operator (M + scale*A). A scheme may take a
             # step that is not the block's own theta*dt -- BDF2 uses 2dt/3, and an adaptive march
             # re-sizes dt every step -- and the composed solver needs it to build the RIGHT operator
             # rather than the block's default one.
-            _diag = lambda: matrix_diagonal(M) + th * dt * matrix_diagonal(A)  # noqa: E731
+            _diag = lambda: matrix_diagonal(M) + a_scale * matrix_diagonal(A)  # noqa: E731
             # `scale` is OPT-IN. The documented contract for a caller-supplied `linear_solve` is
             # `(matvec, rhs, x0, diag_fn)`; only jNO's own composed step solver advertises that it can
             # also take the step scale, so only it is handed one.
@@ -401,7 +459,7 @@ class SemidiscreteTimeBlock:
                 return linear_solve(step_op, rhs, u, _diag, scale=th * dt)
             return linear_solve(step_op, rhs, u, _diag)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
-        d = matrix_diagonal(M) + th * dt * matrix_diagonal(A)
+        d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
         inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
         # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
         # the default and is right for the symmetric real blocks; the complex real-equivalent block
