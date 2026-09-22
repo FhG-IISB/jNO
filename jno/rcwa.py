@@ -693,12 +693,11 @@ class Rcwa:
         self._ex = fm.generate_expansion(self._lv, approximate_num_terms=orders)
         self._nt = self._ex.num_terms
 
-    def _eigensolve_stack(self, layers_spec, wl, kin):
-        """Eigensolve every layer (isotropic / anisotropic-ε / general ε&μ, by tuple length) and return the
-        ``LayerSolveResult`` list plus the thickness list. Shared by the plane-wave and internal-source paths."""
-        fm, lv, ex = self.fm, self._lv, self._ex
+    def _prepare_stack(self, layers_spec, kin):
+        """Each layer's permittivity as the eigensolve takes it, and the thickness list. EAGER on purpose:
+        collapsing a uniform layer reads its values, which a trace cannot do -- so this runs before the
+        compiled solve (:meth:`_solve_core`) and hands it the result as arguments."""
         kin = jnp.asarray(kin)
-        wl = jnp.asarray(wl).astype(kin.dtype)  # wl at the incidence real precision
         cdt = jnp.result_type(kin.dtype, jnp.complex64)  # one complex dtype for the eigensolve (robust to a
 
         def _grid(g):  # float32 design parameter, e.g. when trained through jno.core, vs float64 wavevectors)
@@ -732,42 +731,63 @@ class Rcwa:
             vals = [_uniform_value(g) for g in gs]
             if any(v is None for v in vals):
                 return gs
-            return [jnp.full((1, 1), v) for v in vals]
+            return [jnp.full((1, 1), v, dtype=cdt) for v in vals]
+
+        def prepare(e):
+            if isinstance(e, tuple) and len(e) in (5, 10):
+                return tuple(_collapse([_grid(c) for c in e]))
+            return _collapse([_grid(e)])[0]
+
+        grids = [prepare(e) for _, e in layers_spec]
+        thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
+        return grids, thick
+
+    def _eigensolve_grids(self, grids, wl, kin):
+        """Eigensolve every prepared layer (isotropic / anisotropic-ε / general ε&μ, by tuple length).
+        Pure in its arguments, so it compiles (:meth:`_solve_core`)."""
+        fm, lv, ex = self.fm, self._lv, self._ex
+        kin = jnp.asarray(kin)
+        wl = jnp.asarray(wl).astype(kin.dtype)  # wl at the incidence real precision
 
         def solve_layer(e):
             # general anisotropic layer: e = (ε_xx..ε_zz, μ_xx..μ_zz) -> ε AND μ tensors. Used for a uniaxial
             # PML (an in-plane coordinate stretch is a diagonal ε̂ and μ̂), and for magnetic / magneto-optic media.
             if isinstance(e, tuple) and len(e) == 10:
-                exx, exy, eyx, eyy, ezz, uxx, uxy, uyx, uyy, uzz = _collapse([_grid(c) for c in e])
-                return fm.eigensolve_general_anisotropic_media(
-                    jnp.asarray(wl),
-                    kin,
-                    lv,
-                    exx,
-                    exy,
-                    eyx,
-                    eyy,
-                    ezz,
-                    uxx,
-                    uxy,
-                    uyx,
-                    uyy,
-                    uzz,
-                    ex,
-                    formulation=self.formulation,
-                )
+                return fm.eigensolve_general_anisotropic_media(wl, kin, lv, *e, ex, formulation=self.formulation)
             # anisotropic layer: e = (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) grids -> fmmax's anisotropic eigensolve
             if isinstance(e, tuple) and len(e) == 5:
-                exx, exy, eyx, eyy, ezz = _collapse([_grid(c) for c in e])
-                return fm.eigensolve_anisotropic_media(
-                    jnp.asarray(wl), kin, lv, exx, exy, eyx, eyy, ezz, ex, formulation=self.formulation
-                )
-            (eps_g,) = _collapse([_grid(e)])
-            return fm.eigensolve_isotropic_media(jnp.asarray(wl), kin, lv, eps_g, ex, formulation=self.formulation)
+                return fm.eigensolve_anisotropic_media(wl, kin, lv, *e, ex, formulation=self.formulation)
+            return fm.eigensolve_isotropic_media(wl, kin, lv, e, ex, formulation=self.formulation)
 
-        layers = [solve_layer(e) for _, e in layers_spec]
-        thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
-        return layers, thick
+        return [solve_layer(e) for e in grids]
+
+    def _eigensolve_stack(self, layers_spec, wl, kin):
+        """Eigensolve every layer and return the ``LayerSolveResult`` list plus the thickness list. Used by
+        the internal-source path; the plane-wave path compiles the same steps (:meth:`_solve_core`)."""
+        grids, thick = self._prepare_stack(layers_spec, kin)
+        return self._eigensolve_grids(grids, wl, kin), thick
+
+    def _solve_core(self, grids, thick, wl, kin, pol):
+        """Eigensolves, S-matrix, incident amplitude and incident flux -- the numerical core of a plane-wave
+        solve, COMPILED once per stack structure.
+
+        Run eagerly, fmmax dispatches each primitive on its own: measured ~1,340 dispatches per solve of a
+        25-order crossed grating, a 0.7 s floor on the GPU that no truncation got below, while the dense
+        eigendecomposition it wraps takes milliseconds there. fmmax registers every type it returns as a
+        pytree for exactly this. Structural decisions that read VALUES (collapsing a uniform layer, the
+        guards) stay outside, eager."""
+        fn = self.__dict__.get("_core_jit")
+        if fn is None:
+
+            def core(grids, thick, wl, kin, pol):
+                layers = self._eigensolve_grids(grids, wl, kin)
+                s = self.fm.stack_s_matrix(layers, thick)
+                fwd = _incident(self.fm, self._ex, layers[0], self._nt, pol)
+                flux = self.fm.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0]
+                return layers, s, fwd, jnp.sum(jnp.real(flux))
+
+            fn = self._core_jit = jax.jit(core)
+        return fn(grids, thick, jnp.asarray(wl), jnp.asarray(kin), tuple(jnp.asarray(p) for p in pol))
 
     def solve(self, inc=None, wavelength=None, k_in=None, layers=None, source=None, polarization=None):
         """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
@@ -791,10 +811,6 @@ class Rcwa:
         nt = self._nt  # precomputed eagerly in __init__ (jit-safe)
         if source is not None:
             return self._solve_source(source, layers_spec, wl, kin)
-        with _annot("rcwa:eigensolve"):
-            layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
-        with _annot("rcwa:s_matrix"):
-            s = fm.stack_s_matrix(layers, thick)
         # Incidence: the 0th diffraction order (at k_in) -- a plane wave of the requested polarization whose
         # REAL-SPACE field is uniform. `argmax(eigenmode flux)` is wrong here: the (0,0) order does NOT carry
         # the max eigenmode flux (the oblique first-ring orders can tie higher), so argmax would excite an
@@ -802,8 +818,9 @@ class Rcwa:
         # direction-sensitive. `amplitudes_for_fields` divides out the Bloch phase, so a uniform field
         # decomposes to the forward 0th-order amplitude at k_in (jax-native, so the solve still traces).
         pol = self.polarization if polarization is None else _as_jones(polarization)
-        fwd = _incident(fm, self._ex, layers[0], nt, pol)
-        Pin = jnp.sum(jnp.real(fm.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0]))
+        grids, thick = self._prepare_stack(layers_spec, kin)
+        with _annot("rcwa:eigensolve+s_matrix"):
+            layers, s, fwd, Pin = self._solve_core(grids, thick, wl, kin, pol)
         if _concrete(Pin) and float(Pin) <= 0:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
         sol = _Sol(fm, s, layers, self._ex, nt, Pin, wl, thick=thick, period=self.period, pol=pol)

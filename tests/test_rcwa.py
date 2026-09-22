@@ -278,6 +278,38 @@ def test_uniform_grid_layers_take_the_analytic_eigensolve():
 
 
 @needs_fmmax
+def test_a_repeat_solve_runs_the_compiled_core():
+    """The eigensolves and S-matrix compile once per stack STRUCTURE. A repeat solve -- at a new wavelength,
+    or with a new design of the same shape -- runs that program instead of dispatching fmmax op by op
+    (measured ~1,340 dispatches a solve, a 0.7 s floor on the GPU at any truncation), and answers exactly
+    as a fresh engine does."""
+    import jax.numpy as jnp
+
+    from jno.rcwa import Rcwa
+
+    P, ng = 0.6, 24
+    xs = (np.arange(ng) + 0.5) / ng * P
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    disk = (((X - P / 2) ** 2 + (Y - P / 2) ** 2) < 0.18**2) * 1.0
+    args = dict(period=(P, P), orders=20, assume_periodic=True)
+    stack = lambda e: [(INF, 1.0), (0.35, 1.0 + e * disk), (INF, 1.0)]  # noqa: E731
+
+    rc = Rcwa(stack(10.0), wavelength=WL, **args)
+    rc.solve()
+    T1, n1 = _count_patterned_eigensolves(lambda: float(rc.solve(wavelength=1.1 * WL).efficiency("T")))
+    T2, n2 = _count_patterned_eigensolves(lambda: float(rc.solve(layers=stack(6.0)).efficiency("T")))
+    assert n1 == 0 and n2 == 0, "a repeat solve of the same structure re-traced the eigensolve"
+    fresh1 = float(Rcwa(stack(10.0), wavelength=1.1 * WL, **args).solve().efficiency("T"))
+    fresh2 = float(Rcwa(stack(6.0), wavelength=WL, **args).solve().efficiency("T"))
+    assert T1 == pytest.approx(fresh1, rel=1e-12) and T2 == pytest.approx(fresh2, rel=1e-12)
+    # a traced design (differentiating the solve) still runs through the same core
+    import jax
+
+    g = jax.grad(lambda e: rc.solve(layers=[(INF, 1.0), (0.35, 1.0 + e * jnp.asarray(disk)), (INF, 1.0)]).efficiency("T"))
+    assert np.isfinite(float(g(10.0)))
+
+
+@needs_fmmax
 def test_uniform_layer_as_grid_matches_scalar_and_analytic_slab():
     """Collapsing a constant grid is exact: same answer as the scalar form, and as the TMM slab."""
     from jno.rcwa import Rcwa
