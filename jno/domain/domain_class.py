@@ -3083,7 +3083,15 @@ class domain(MeshIOMixin):
             self._build_simplex_pools()
 
         if mesh is not None and self.compute_mesh_connectivity:
-            self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(mesh, self.dimension, boundary_indices)
+            # A structured grid repeats one voxel's cells everywhere (2 triangles per square, 6 Kuhn
+            # tetrahedra per cube, 1 quad/hex), so its quality line needs only the first block.
+            congruent = None
+            if getattr(self, "_structured_grid", None) is not None:
+                kinds = {c.type for c in mesh.cells}
+                congruent = 6 if "tetra" in kinds else 2 if "triangle" in kinds and self.dimension == 2 else 1
+            self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(
+                mesh, self.dimension, boundary_indices, congruent_cells=congruent
+            )
             self.log.info(msg)
 
     def _reset_custom_tag_state(self) -> None:
