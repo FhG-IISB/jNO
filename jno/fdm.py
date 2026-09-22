@@ -909,12 +909,44 @@ class _TraceFDM:
             exprs = [_fuse_fd_laplacian(e, int(self.domain.dimension)) for e in exprs]
         return exprs
 
+    def _referenced_models(self):
+        """``{layer_id: module}`` of every model the constraints read, other than the unknowns: a known
+        nodal field (a ``jno.np.parameter`` carrying data, no optimizer), a network. A data field used as a
+        PDE coefficient used to fail with "No model for Model N": only trainable parameters were in the
+        evaluation scope, and data fields only worked inside boundary values."""
+        cached = self.__dict__.get("_models_cache")
+        if cached is not None:
+            return dict(cached)
+        from .trace import ModelCall
+
+        found, seen, stack = {}, set(), [_unwrap(c) for c in self._constraints]
+        while stack:
+            n = stack.pop()
+            if id(n) in seen:
+                continue
+            seen.add(id(n))
+            if isinstance(n, ModelCall) and all(n.model is not u for u in self.unknowns):
+                module = getattr(n.model, "module", None)
+                value = getattr(module, "value", None)
+                if value is not None and np.ndim(value) == 1 and np.shape(value)[0] == self._N:
+                    # one value per node: a per-node scalar field, shaped (N, 1) like every other one in the
+                    # strong form. As (N,) it broadcast against an (N, 1) derivative to (N, N).
+                    import equinox as eqx
+
+                    module = eqx.tree_at(lambda m: m.value, module, jnp.reshape(value, (self._N, 1)))
+                if module is not None:
+                    found[n.model.layer_id] = module
+            stack.extend(_unwrap(c) for c in _iter(n))
+        self._models_cache = found
+        return dict(found)
+
     def _params_scope(self, extra_params=None):
         """The module every trainable parameter resolves to in an evaluation: its current value, then the
         values a traced solve injects (:attr:`_override`, set while a crux-driven march is traced), then
         ``extra_params``. Every evaluator this solver builds reads it, so a parameter works wherever it is
         written — in the PDE, a boundary value, a flux condition, a time coefficient, an initial value."""
-        scope = {lid: n.model.module for lid, n in self._trainable_params().items()}
+        scope = self._referenced_models()  # data fields and networks, at their current values
+        scope.update({lid: n.model.module for lid, n in self._trainable_params().items()})
         scope.update(getattr(self, "_override", None) or {})
         scope.update(extra_params or {})
         return scope
@@ -1021,10 +1053,7 @@ class _TraceFDM:
             k = self._field_index(c)
             for b in self._blocks_of(k):
                 mask[b * self._N + nodes] = True
-            inner = _unwrap(c)
-            g_node = 0.0
-            if getattr(inner, "op", None) == "-":
-                g_node = inner.right if any(_contains_unknown(inner.left, u) for u in self.unknowns) else inner.left
+            g_node = self._value_side(c)
             if self._is_nodal_data(g_node):
                 g = self._eval_g(g_node, nodes)  # a known nodal field: gathered at the region's nodes
             else:
@@ -1383,12 +1412,7 @@ class _TraceFDM:
     def _condition_value(self, constraint, idx):
         """Value ``g`` of an affine condition ``u(region) - g`` (Dirichlet or IC), evaluated at the
         region's nodes ``idx`` — reused for both boundary conditions and the initial state."""
-        inner = _unwrap(constraint)
-        g_node = 0.0
-        if getattr(inner, "op", None) == "-":  # u(region) - g  →  g is the side without any unknown
-            left_has_u = any(_contains_unknown(inner.left, u) for u in self.unknowns)
-            g_node = inner.right if left_has_u else inner.left
-        return self._eval_g(g_node, idx)
+        return self._eval_g(self._value_side(constraint), idx)
 
     def _field_index(self, constraint):
         """Which unknown's DOF block a value-only constraint (Dirichlet) pins — 0 for a single field."""
@@ -1426,11 +1450,30 @@ class _TraceFDM:
         )
 
     def _value_side(self, constraint):
-        """``g`` of a condition ``u(region) - g``: the side without the unknown."""
+        """``g`` of a value condition, so that it reads ``u = g``: ``u(region) - g`` and ``g - u(region)`` give
+        ``g``; ``u(region) + v`` and ``v + u(region)`` give ``−v``; a bare ``u(region)`` gives 0.
+
+        Anything else raises. Only the ``-`` form used to be read: ``u(xr, yr) + 1.0`` was imposed as u = 0,
+        silently, and a steady Burgers solve with u = −1 on its right wall converged to u = 0 there."""
+        from .trace import BinaryOp, Literal, ModelCall
+
         inner = _unwrap(constraint)
-        if getattr(inner, "op", None) != "-":
+
+        def bare(n):
+            n = _unwrap(n)
+            return isinstance(n, ModelCall) and any(n.model is w for w in self.unknowns)
+
+        if bare(inner):
             return 0.0
-        return inner.right if any(_contains_unknown(inner.left, u) for u in self.unknowns) else inner.left
+        if isinstance(inner, BinaryOp) and inner.op in ("-", "+"):
+            if bare(inner.left) and not any(_contains_unknown(inner.right, w) for w in self.unknowns):
+                return inner.right if inner.op == "-" else BinaryOp("*", Literal(-1.0), inner.right)
+            if bare(inner.right) and not any(_contains_unknown(inner.left, w) for w in self.unknowns):
+                return inner.left if inner.op == "-" else BinaryOp("*", Literal(-1.0), inner.left)
+        raise ValueError(
+            f"jno.fdm([...]): a value condition must read `u(region) - g` (or `u(region) + v`, `g - u(region)`); "
+            f"got {constraint!r}. Divide out any factor on the unknown: `2*u(xb, yb) - 2*g` is `u(xb, yb) - g`."
+        )
 
     @staticmethod
     def _uses_params(node, params):

@@ -2573,3 +2573,42 @@ def test_point_region_on_a_long_time_dependent_domain():
     xp, yp, _ = d.variable("pin", split=True)
     f = jno.fdm([ui.t - (ui.xx + ui.yy), u(xp, yp) - 0.0, u(xi, yi) - 1.0])
     assert list(f._region_nodes("pin")) == [int(np.argmin(np.linalg.norm(_nodes(d) - [0.5, 0.5], axis=1)))]
+
+
+@pytest.mark.parametrize("spelling", ["u - g", "g - u", "u + v"])
+def test_value_conditions_in_every_natural_form(spelling):
+    """`u(xb, yb) + 1.0` used to be imposed as u = 0: only the `-` form was read, anything else silently
+    gave g = 0. Each natural form now reads u = g; a factor on the unknown raises."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    bc = {"u - g": u(xb, yb) - (-1.0), "g - u": -1.0 - u(xb, yb), "u + v": u(xb, yb) + 1.0}[spelling]
+    sol = np.asarray(jno.fdm([ui.xx + ui.yy, bc]).solve()).reshape(-1)
+    assert np.abs(sol + 1.0).max() < 1e-10  # harmonic with u = −1 on the boundary: u ≡ −1
+    with pytest.raises(ValueError, match="Divide out"):
+        jno.fdm([ui.xx + ui.yy, 2.0 * u(xb, yb) - 2.0]).solve()
+
+
+def test_a_data_field_as_a_pde_coefficient():
+    """A known nodal field (a `jno.np.parameter` holding data, no optimizer) inside the PDE failed with
+    "No model for Model N": only trainable parameters were in the evaluation scope. −∇·(κ∇u) = f with
+    κ = 1 + x² given as nodal data reproduces the formula-κ solve."""
+    import equinox as eqx
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    P = _nodes(d)
+    K = jno.np.parameter((len(P),), name="kappa")
+    K.model.module = eqx.tree_at(lambda m: m.value, K.model.module, jnp.asarray(1 + P[:, 0] ** 2))
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 1.0 + 0.0 * x
+    data = np.asarray(jno.fdm([-(K * ui.x).x - (K * ui.y).y - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    k = 1 + x**2
+    formula = np.asarray(
+        jno.fdm([-(k * ui.x).d(x, scheme=jno.fd(average="arithmetic")) - (k * ui.y).y - f, u(xb, yb) - 0.0]).solve()
+    ).reshape(-1)
+    assert np.isfinite(data).all() and np.abs(data - formula).max() < 1e-10 and np.abs(data).max() > 1e-3
