@@ -81,8 +81,8 @@ k.bayesian(
 )
 
 # Physics residual through the frozen surrogate: -λ u'' + k u - f = 0.
-uf = u_net(x) * x * (1 - x)
-residual = (-LAMBDA * uf.dd(x) + k * uf - f_known) / SIGMA_PHYS
+uf = (u_net(x) * x * (1 - x)).scalar.bind(x=x)
+residual = (-LAMBDA * uf.xx + k * uf - f_known) / SIGMA_PHYS
 crux_inv = jno.core([residual.mse])
 crux_inv.solve(900)
 

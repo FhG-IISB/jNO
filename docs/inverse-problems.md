@@ -213,9 +213,9 @@ u_net = jno.nn(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_laye
 u_net.optimizer(optax.adam(1e-3))
 
 k = jno.fn.exp(k_raw(x))        # always > 0 by construction
-u = u_net(x) * x * (1 - x)      # hard zero Dirichlet BCs
+u = (u_net(x) * x * (1 - x)).scalar.bind(x=x)   # hard zero Dirichlet BCs
 
-pde  = k * u.dd(x) - f_pde
+pde  = k * u.xx - f_pde
 data = u - u_obs
 # Regularize the NETWORK CALL, not the transformed field: `.regularize` lives on the network call
 # or the parameter, and `jno.fn.exp(...)` has no `.regularize`. Smoothness of log-k is smoothness

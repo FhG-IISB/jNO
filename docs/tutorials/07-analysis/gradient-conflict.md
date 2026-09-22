@@ -65,8 +65,8 @@ u_net = jno.nn(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
 ).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
-u    = u_net(x) * x * (1 - x)        # hard BC: u(0) = u(1) = 0
-u_xx = u.d2(x)
+u    = (u_net(x) * x * (1 - x)).scalar.bind(x=x)   # hard BC: u(0) = u(1) = 0
+u_xx = u.xx
 pde  = -u_xx - jno.np.sin(π * x)
 ```
 
@@ -181,8 +181,8 @@ ax, ay, _ = adom.variable("interior", split=True)
 ax = ax.unit("m").scale(Lx)          # characteristic length along x
 ay = ay.unit("m").scale(Ly)          # 20× shorter characteristic length along y
 au = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(1)))(ax, ay)
-au = au.unit("K").scale(U)           # the field carries a temperature scale U
-aniso = au.d2(ax) + au.d2(ay)        # anisotropic Laplacian — two terms in ONE residual
+au = au.unit("K").scale(U).scalar.bind(x=ax, y=ay)   # the field carries a temperature scale U
+aniso = au.xx + au.yy                # anisotropic Laplacian — two terms in ONE residual
 ```
 
 **Phase A — audit and report.** `jno.units.check` confirms both terms share a unit ($\text{K}\cdot\text{m}^{-2}$); `jno.units.nondimensionalize` gives each term's dimensionless magnitude $\pi_i = S_i / S_\text{ref}$:

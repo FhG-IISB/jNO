@@ -132,7 +132,7 @@ not a blanket upgrade — a residual usually has different boundary behaviour al
 On `−∇²u = 5π² sin(2πx) sin(πy)`, periodic in `x` and Dirichlet in `y`:
 
 ```python
-res = -ui.d2(x, scheme="spectral") - ui.d2(y) - f     # exact basis in x, stencil in y
+res = -ui.d2(x, scheme="spectral") - ui.yy - f        # exact basis in x, stencil in y
 ```
 
 | | rel-L2 |
@@ -241,8 +241,8 @@ rewrites it to a well-scaled `O(1)` form.
 
 ```python
 x = x.unit("m").scale(L)          # dimension + characteristic length
-u = net(x, t).unit("K").scale(U)  # dimension + characteristic magnitude of the field
-res = u.d(t) - alpha * u.d2(x)
+u = net(x, t).unit("K").scale(U).scalar.bind(x=x, t=t)  # dimension + characteristic magnitude of the field
+res = u.t - alpha * u.xx
 
 jno.units.check(res)                       # audit dimensional consistency (.warnings is empty if OK)
 jno.units.infer(res)                       # the inferred Unit of an expression

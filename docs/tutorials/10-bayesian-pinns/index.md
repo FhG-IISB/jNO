@@ -81,8 +81,8 @@ k.bayesian(blackjax.nuts, step_size=1e-2, warmup=150, keep=300,
            num_chains=4,        # 4 chains ⇒ a meaningful R-hat
            init_jitter=0.5)     # over-disperse the starts so R-hat stays conservative
 
-uf = u_net(x) * x * (1 - x)
-residual = (-LAMBDA * uf.dd(x) + k * uf - f_known) / 0.05   # −λu″ + k u − f = 0
+uf = (u_net(x) * x * (1 - x)).scalar.bind(x=x)
+residual = (-LAMBDA * uf.xx + k * uf - f_known) / 0.05   # −λu″ + k u − f = 0
 jno.core([residual.mse]).solve(450)
 
 # ── read the chain ──────────────────────────────────────────────────────────
