@@ -2278,3 +2278,66 @@ def test_navier_stokes_kovasznay(pressure):
     (u0, p0), (u1, p1) = _kovasznay(0.1, pressure), _kovasznay(0.05, pressure)
     assert u1 < 3e-3 and u0 / u1 > 3.4, (u0, u1)
     assert p1 < 3e-2 and p0 / p1 > 2.3, (p0, p1)
+
+
+def _cavity(n, Re=100.0):
+    """Lid-driven cavity: u = (1, 0) on the lid, no slip elsewhere, ∂p/∂n from the momentum balance on
+    every wall. The pressure is then defined up to a constant, and `domain.point_region` fixes it at one
+    interior node — that row replaces the continuity equation there, which is the dependent one."""
+    nu = 1.0 / Re
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1.0 / n).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    u, v, p = d.unknown(), d.unknown(), d.unknown()
+    ui, vi, pi = u.bind(x=x, y=y), v.bind(x=x, y=y), p.bind(x=x, y=y)
+    terms = [
+        ui * ui.x + vi * ui.y + pi.x - nu * (ui.xx + ui.yy),
+        ui * vi.x + vi * vi.y + pi.y - nu * (vi.xx + vi.yy),
+        ui.x + vi.y - 0.05 * d.cell_size**2 * (pi.xx + pi.yy),
+    ]
+    d.point_region("gauge", (0.5, 0.5))
+    xg, yg, _ = d.variable("gauge", split=True)
+    terms.append(p(xg, yg) - 0.0)
+    for r in ("left", "right", "bottom", "top"):
+        X, Y, _ = d.variable(r, split=True)
+        ub, vb, pb = u.bind(x=X, y=Y), v.bind(x=X, y=Y), p.bind(x=X, y=Y)
+        mx = nu * (ub.xx + ub.yy) - (ub * ub.x + vb * ub.y)
+        my = nu * (vb.xx + vb.yy) - (ub * vb.x + vb * vb.y)
+        dpdn = {"left": -mx, "right": mx, "bottom": -my, "top": my}[r]
+        terms += [u(X, Y) - (1.0 if r == "top" else 0.0), v(X, Y) - 0.0, pb.d(d.variable(r, normals=True)) - dpdn]
+    sol = np.asarray(jno.fdm(terms).solve())
+    nx, ny = d.mesh_connectivity["grid"]["shape"]
+    centre = sol[0].reshape(nx, ny)[nx // 2]  # u(0.5, y)
+    # Ghia, Ghia & Shin, J. Comput. Phys. 48 (1982), Table I, Re = 100
+    gy = np.array([0.0547, 0.1719, 0.2813, 0.4531, 0.5, 0.6172, 0.7344, 0.8516, 0.9531, 0.9766])
+    gu = np.array([-0.03717, -0.10150, -0.15662, -0.21090, -0.20581, -0.13641, 0.00332, 0.23151, 0.68717, 0.84123])
+    return float(np.abs(np.interp(gy, np.linspace(0.0, 1.0, ny), centre) - gu).max()), sol
+
+
+def test_navier_stokes_lid_driven_cavity():
+    """Re = 100 on 33²: within 0.02 of Ghia et al. (0.0019 on 65², the slow test)."""
+    err, sol = _cavity(32)
+    assert err < 0.02 and np.isfinite(sol).all(), err
+
+
+@pytest.mark.slow
+def test_navier_stokes_lid_driven_cavity_fine():
+    err, _ = _cavity(64)
+    assert err < 3e-3, err
+
+
+def test_unknown_region_tag_raises_and_a_point_region_pins_one_node():
+    """An unrecognised region tag used to resolve to the WHOLE boundary, so a `point_region` pin fixed
+    every wall node (the cavity came out 0.016 off Ghia instead of 0.0019)."""
+    from jno.fdm import _TraceFDM
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    d.point_region("pin", (0.5, 0.5))
+    xp, yp, _ = d.variable("pin", split=True)
+    f = jno.fdm([-(ui.xx + ui.yy) - 1.0, u(xb, yb) - 0.0, u(xp, yp) - 0.0])
+    assert list(f._region_nodes("pin")) == [int(np.argmin(np.linalg.norm(_nodes(d) - [0.5, 0.5], axis=1)))]
+    with pytest.raises(ValueError, match="no mesh nodes found"):
+        _TraceFDM._region_nodes(f, "no-such-region")

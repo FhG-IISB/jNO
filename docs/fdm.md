@@ -667,7 +667,22 @@ Two things decide whether the pressure is right. Both were measured against exac
 Where the boundary pressure is not known, impose it from the momentum balance, as a flux condition on p:
 `pb.d(n) - n·(νΔu − u·∇u)`. With p given on one edge and that condition on the other three, Kovasznay
 converges the same way. Where every wall has that condition, p is defined only up to a constant. Fix it at
-one interior node with `domain.point_region` (below).
+one interior node:
+
+```python
+d.point_region("gauge", (0.5, 0.5))            # the mesh node nearest (0.5, 0.5)
+xg, yg, _ = d.variable("gauge", split=True)
+terms.append(p(xg, yg) - 0.0)                   # replaces continuity there, the one dependent equation
+```
+
+A boundary node would not do: the pressure's flux rows are independent of each other, and pinning one of
+them leaves the system singular. Measured on the lid-driven cavity at Re = 100 (no slip, lid u = 1, wall
+pressure from the momentum balance, default solver), `u(0.5, y)` against Ghia, Ghia & Shin (1982,
+Table I): max deviation 0.014 on 33² and 0.0019 on 65² (7 s). From a zero initial guess, Newton at
+higher Re diverges and raises. Continuing in Re with `x0=` from the previous solution
+(`nonlinear=jno.solve.newton(line_search=True)`) reached Re = 300 on 65² and failed at 350, where the cell
+Reynolds number Re·h is 5.5. That is past the classical limit of 2 for central differencing of
+convection, where the discrete steady solution can stop existing. Higher Re is not verified here.
 `jno.fdm` problem can also be **one subdomain of a larger solve** — coupled to a FEM or PINN region by
 overlapping Schwarz or Dirichlet–Neumann, and differentiable through the converged fixed point. See
 [Domain decomposition](domain-decomposition.md).

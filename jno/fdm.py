@@ -827,7 +827,25 @@ class _TraceFDM:
         ptags = getattr(self.domain, "_polygon_tags", {})  # a geometric sub-region (domain.region(...))
         if tag in ptags and ptags[tag][0] == "interior":
             return _mesh_nodes_in(np.asarray(self._pts), ptags[tag][1])
-        return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
+        if tag == "boundary" or tag is None:
+            return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
+        pool = getattr(self.domain, "_mesh_pool", {}).get(tag)
+        if pool is not None:  # a region sampled at mesh nodes (`domain.point_region(name, xy)`, …)
+            pts = np.asarray(pool).reshape(-1, np.asarray(pool).shape[-1])[:, : self._pts.shape[1]]
+            mesh = np.asarray(self._pts)
+            dist = ((pts[:, None, :] - mesh[None, :, :]) ** 2).sum(-1) if len(pts) < 64 else None
+            if dist is not None:
+                nodes = np.unique(dist.argmin(axis=1))
+                if np.allclose(dist.min(axis=1), 0.0, atol=1e-18):
+                    return nodes.astype(int)
+        # An unknown tag used to fall through to the WHOLE boundary: `p(xg, yg) - 0` on a
+        # `domain.point_region` pinned p on every wall node, and a lid-driven cavity came out 0.016 off
+        # Ghia et al. instead of 0.0019 — plausible, and wrong. Refused instead.
+        raise ValueError(
+            f"jno.fdm([...]): no mesh nodes found for region {tag!r}. Use a boundary tag of the domain, "
+            "'boundary', 'interior', a `domain.region(name, shape)` sub-region, or a "
+            "`domain.point_region(name, xy)` node."
+        )
 
     def _pde_exprs(self):
         """The PDE residual expressions as solved, one per field: summed for a single field, and with the
