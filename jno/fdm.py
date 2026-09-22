@@ -642,6 +642,14 @@ def _is_normal_jacobian(node):
     )
 
 
+def _normal_jacobians(node):
+    """Every normal-derivative node ``ub.d(n)`` in the expression."""
+    n = _unwrap(node)
+    if _is_normal_jacobian(n):
+        return [n]
+    return [j for c in _iter(n) for j in _normal_jacobians(c)]
+
+
 def _set_normal(node, val):
     """Replace the normal-derivative node ``ui.d(n, ...)`` with the constant ``val``, leaving the rest of
     the constraint intact. Evaluating the result at ``val = 0`` and ``val = 1`` recovers, for a condition
@@ -764,11 +772,6 @@ class _TraceFDM:
                     f"jno.fdm([...]): a coupled system needs exactly one PDE equation per unknown — got "
                     f"{self._nf} unknowns but {len(self._pde)} PDE equation(s). Author one equation per "
                     "field, in the order the unknowns are declared (equation k drives unknown k)."
-                )
-            if self._neumann:
-                raise NotImplementedError(
-                    "jno.fdm([...]): flux (Neumann/Robin) conditions on a coupled (multi-field) system are not "
-                    "supported yet — a coupled system takes Dirichlet conditions only."
                 )
             if self._transient and self._time_order == 2:
                 raise NotImplementedError(
@@ -1475,13 +1478,19 @@ class _TraceFDM:
             if getattr(v, "axis", None) != "temporal" and not str(getattr(v, "tag", "")).startswith("n_")
         }
         context = self._eval_context(spatial_tags)
-        lid, base = self.unknown.layer_id, self.unknown.module
         scope = self._params_scope(extra_params)
+        N, unknowns = self._N, self.unknowns
 
         def value_fn(dofs, t=None):
-            """``t``: the time a flux value ``h(x, t)`` or ``α(t)`` is evaluated at (``None``: the start)."""
-            mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
-            ev = TraceEvaluator(params={**scope, lid: mod})
+            """``dofs``: the whole DOF vector (every field of a coupled system, so a flux value may read
+            another field, as ``∂p/∂n = ν Δu·n`` does). ``t``: the time a flux value ``h(x, t)`` or ``α(t)`` is
+            evaluated at (``None``: the start)."""
+            dofs = jnp.asarray(dofs)
+            fields = {
+                w.layer_id: eqx.tree_at(lambda m: m.value, w.module, dofs[k * N : (k + 1) * N].astype(w.module.value.dtype))
+                for k, w in enumerate(unknowns)
+            }
+            ev = TraceEvaluator(params={**scope, **fields})
             ctx = context if t is None else {**context, "__time__": jnp.full((self._N, 1), t)}
             out = jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1)
             return jnp.broadcast_to(out, (self._N,)) if out.shape[0] == 1 else out  # a constant `-h` → per-node
@@ -1500,9 +1509,9 @@ class _TraceFDM:
         :meth:`_flux_structure`, built once on concrete values. Building it inside a crux trace used to fail:
         the host-side mesh work saw traced arrays, and the affine check called ``bool`` on a tracer."""
         rows = []
-        for c, idx, nrm, grad_fn in self._flux_structure():
+        for c, idx, nrm, grad_fn, k in self._flux_structure():
             v0, v1 = self._flux_value_fn(c, 0.0, extra_params), self._flux_value_fn(c, 1.0, extra_params)
-            rows.append((idx, nrm, grad_fn, v0, v1))
+            rows.append((k * self._N + idx, idx, nrm, grad_fn, v0, v1))  # rows of field k's block
         return rows
 
     def _flux_structure(self):
@@ -1516,9 +1525,19 @@ class _TraceFDM:
         concrete = {lid: n.model.module for lid, n in self._trainable_params().items()}
         out = []
         with jax.ensure_compile_time_eval():
-            probe = jnp.zeros(self._N)
+            probe = jnp.zeros(self._Ntot)
             for c in self._neumann:
                 jac = _normal_jacobian(c)
+                owners = {
+                    k for j in _normal_jacobians(c) for k, w in enumerate(self.unknowns) if _contains_unknown(j.target, w)
+                }
+                if len(owners) != 1:
+                    raise ValueError(
+                        "jno.fdm([...]): a flux condition must carry the normal derivative `ub.d(n)` of exactly one "
+                        f"unknown; this one differentiates unknowns {sorted(owners)}. Its row replaces that unknown's "
+                        "equation at the boundary nodes, so there has to be one unknown it belongs to."
+                    )
+                (k,) = owners
                 nvar = next(v for v in jac.variables if str(getattr(v, "tag", "")).startswith("n_"))
                 region = nvar.tag[len("n_") :]  # `n_right` → `right`
                 idx, nrm = self._node_normals(region)
@@ -1532,7 +1551,9 @@ class _TraceFDM:
                         "nonlinear in ∂u/∂n is not supported."
                     )
                 idx = np.asarray(idx, dtype=int)
-                out.append((c, idx, jnp.asarray(nrm), self._flux_gradient_fn(idx, scheme, grad_method)))
+                grad_k = self._flux_gradient_fn(idx, scheme, grad_method)
+                sl = slice(k * self._N, (k + 1) * self._N)
+                out.append((c, idx, jnp.asarray(nrm), (lambda u, g=grad_k, sl=sl: g(u[sl])), k))
         self._flux_struct = out
         return out
 
@@ -1586,12 +1607,12 @@ class _TraceFDM:
         flux regions share a node (a corner), so every condition is imposed there rather than the last one."""
         acc = jnp.zeros_like(r)
         hit = jnp.zeros(r.shape[0], dtype=bool)
-        for idx, nrm, grad_fn, v0, v1 in flux_rows:
+        for rows, idx, nrm, grad_fn, v0, v1 in flux_rows:  # `rows`: the owning field's block, `idx`: nodes
             flux = jnp.sum(grad_fn(u) * nrm, axis=1)  # ∇u·n at the region's nodes, differentiable
             b = v0(u, t)
             a = v1(u, t) - b
-            acc = acc.at[idx].add(a[idx] * flux + b[idx])
-            hit = hit.at[idx].set(True)
+            acc = acc.at[rows].add(a[idx] * flux + b[idx])
+            hit = hit.at[rows].set(True)
         return jnp.where(hit, acc, r)
 
     def _flux_gradient_fn(self, idx, scheme, grad_method):
@@ -1867,10 +1888,10 @@ class _TraceFDM:
         """The steady residual with every boundary row folded in, as a function of the DOF vector."""
         import jax
 
-        N, single = self._N, self._nf == 1
+        N = self._N
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows(extra_params)
-        flux_rows = self._flux_rows(extra_params) if single else []  # flux is single-field (guarded at build)
+        flux_rows = self._flux_rows(extra_params)
         periodic_rows = self._periodic_rows()  # (secondary, main) face DOF pairs per periodic axis
 
         def residual_with_bc(u):

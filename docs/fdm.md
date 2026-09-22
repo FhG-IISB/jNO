@@ -630,9 +630,44 @@ traj = jno.fdm([
 
 Measured on `u_t = Δu − v`, `v_t = Δv + u` (exact `e^{−2π²t} S (cos t, sin t)`), Crank–Nicolson with
 Δt ∝ h: 1.0e-2 / 2.5e-3 / 6.2e-4 structured, 1.7e-2 / 4.4e-3 / 1.1e-3 unstructured at h = 0.1 / 0.05 / 0.025.
-Not supported on a coupled system, and each raises: flux conditions, `u.tt` (write it as a first-order
-system in `(u, v = u.t)`), and the time derivative of another field inside equation *k* (a non-diagonal
-mass). A
+A flux condition on a coupled system belongs to the one field whose normal derivative it carries, and
+replaces that field's equation at the boundary nodes. Its value may read the other fields and their
+derivatives: `pb.d(n) - n·(ν Δu − u·∇u)` imposes a wall pressure from the momentum balance. A condition
+that differentiates two fields raises.
+
+Not supported on a coupled system, and each raises: `u.tt` (write it as a first-order system in
+`(u, v = u.t)`), and the time derivative of another field inside equation *k* (a non-diagonal mass).
+
+#### Incompressible Navier–Stokes
+
+Velocity and pressure are three coupled fields, and the equations are written as they are:
+
+```python
+h = d.cell_size
+jno.fdm([
+    ui.t + ui*ui.x + vi*ui.y + pi.x - nu*(ui.xx + ui.yy),
+    vi.t + ui*vi.x + vi*vi.y + pi.y - nu*(vi.xx + vi.yy),
+    ui.x + vi.y - 0.05*h**2*(pi.xx + pi.yy),        # continuity, pressure-stabilised
+    u(xb, yb) - U, v(xb, yb) - V, p(xb, yb) - P, u(xi, yi) - U0, v(xi, yi) - V0,
+]).solve(time=jno.solve.bdf2())
+```
+
+Two things decide whether the pressure is right. Both were measured against exact solutions.
+
+- **The `− 0.05·h²·Δp` term.** On one collocated grid, central differences split the pressure into four
+  decoupled sub-lattices (a checkerboard). The velocity still converges, but the pressure does not.
+  On Kovasznay flow (Re = 40) the pressure error stalls at 1e-1. The O(h²) pressure Laplacian
+  (pressure stabilisation, Brezzi & Pitkäranta 1984) couples the sub-lattices and vanishes as h → 0:
+  the pressure then converges (3.4e-2 / 1.0e-2 / 3.6e-3 at h = 0.1 / 0.05 / 0.025), and the velocity is
+  unchanged (second order).
+- **The time scheme.** The pressure has no time derivative, so it is an algebraic field. Crank–Nicolson
+  leaves its value at each step oscillating: on the Taylor–Green vortex it does not converge (0.11 / 0.18 /
+  0.21). Use `jno.solve.bdf2()` (5.7e-2 / 1.5e-2 / 4.0e-3, velocity second order) or backward Euler.
+
+Where the boundary pressure is not known, impose it from the momentum balance, as a flux condition on p:
+`pb.d(n) - n·(νΔu − u·∇u)`. With p given on one edge and that condition on the other three, Kovasznay
+converges the same way. Where every wall has that condition, p is defined only up to a constant. Fix it at
+one interior node with `domain.point_region` (below).
 `jno.fdm` problem can also be **one subdomain of a larger solve** — coupled to a FEM or PINN region by
 overlapping Schwarz or Dirichlet–Neumann, and differentiable through the converged fixed point. See
 [Domain decomposition](domain-decomposition.md).
@@ -645,8 +680,7 @@ A periodic tie `u(left) - u(right)` (opposite faces) wraps that axis on a
 
 **Planned:** periodic on unstructured meshes and periodic geometric multigrid (a periodic structured solve
 is currently un-preconditioned, so it is slow on fine grids); composite / cut-cell structured geometry
-(axis-aligned rectangles and boxes are supported, above); 1-D meshes; flux BCs on coupled multi-field
-systems. Authoring a `jno.shape` sub-region
+(axis-aligned rectangles and boxes are supported, above); 1-D meshes. Authoring a `jno.shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive

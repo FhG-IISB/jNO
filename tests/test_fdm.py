@@ -476,7 +476,7 @@ def test_coupled_two_field():
 
 
 def test_coupled_guards():
-    """A coupled system needs one PDE equation per unknown, takes Dirichlet conditions only, and marches
+    """A coupled system needs one PDE equation per unknown, a flux condition belongs to one unknown, and it marches
     first order in time with equation k carrying only its own unknown's `u.t`."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
     x, y, _ = d.variable("interior", split=True)
@@ -500,15 +500,16 @@ def test_coupled_guards():
     with pytest.raises(NotImplementedError, match="first order in time"):  # coupled u.tt
         jno.fdm([uit.t.t - (uit.d2(xt) + uit.d2(yt)) + vit, vit.t - uit, ut(xit, yit) - 0.0, vt(xit, yit) - 0.0])
     xr, yr, _ = d.variable("right", split=True)
-    with pytest.raises(NotImplementedError, match="flux"):  # a flux condition on a coupled system
+    nr = d.variable("right", normals=True)
+    with pytest.raises(ValueError, match="exactly one"):  # a flux condition differentiating two fields
         jno.fdm(
             [
                 -ui.d2(x) - ui.d2(y) + vi,
                 -vi.d2(x) - vi.d2(y) + ui,
                 u(xb, yb) - 0.0,
-                u.bind(x=xr, y=yr).d(d.variable("right", normals=True)) - 1.0,
+                u.bind(x=xr, y=yr).d(nr) + v.bind(x=xr, y=yr).d(nr) - 1.0,
             ]
-        )
+        ).solve()
 
 
 @pytest.mark.slow
@@ -2221,3 +2222,59 @@ def test_save_ts_on_a_coupled_march_and_a_steady_refusal():
     wi = w.bind(x=xs, y=ys_)
     with pytest.raises(ValueError, match="steady"):
         jno.fdm([-(wi.xx + wi.yy) - 1.0, w(xsb, ysb) - 0.0]).solve(save_ts=[0.0])
+
+
+# Incompressible Navier–Stokes in primitive variables. On one collocated grid, central differences leave
+# the pressure in four decoupled sub-lattices; the continuity equation is written with an O(h²) pressure
+# Laplacian (pressure stabilisation, Brezzi & Pitkäranta 1984) — ∇·u − ε h² Δp — which vanishes as h → 0.
+# Measured on Kovasznay flow: without it the pressure stalls at 1e-1; with ε = 0.05 it converges.
+
+
+def _kovasznay(h, pressure):
+    """Kovasznay flow, Re = 40 (Kovasznay 1948), on [-0.5, 1] × [-0.5, 1.5]. ``pressure``: the pressure
+    boundary condition — ``"dirichlet"`` everywhere, or ``"wall"``: p on the left edge and the momentum
+    balance ∂p/∂n = n·(νΔu − u·∇u) on the other three (a flux condition reading the velocity)."""
+    import jno.jnp_ops as jnn
+
+    Re, π = 40.0, np.pi
+    nu, lam = 1.0 / Re, Re / 2 - np.sqrt(Re**2 / 4 + 4 * π**2)
+    U = lambda x, y, m: 1 - m.exp(lam * x) * m.cos(2 * π * y)  # noqa: E731
+    V = lambda x, y, m: lam / (2 * π) * m.exp(lam * x) * m.sin(2 * π * y)  # noqa: E731
+    P = lambda x, y, m: 0.5 * (1 - m.exp(2 * lam * x))  # noqa: E731
+    d = jno.shape.rect(-0.5, -0.5, 1.0, 1.5, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v, p = d.unknown(), d.unknown(), d.unknown()
+    ui, vi, pi = u.bind(x=x, y=y), v.bind(x=x, y=y), p.bind(x=x, y=y)
+    terms = [
+        ui * ui.x + vi * ui.y + pi.x - nu * (ui.xx + ui.yy),
+        ui * vi.x + vi * vi.y + pi.y - nu * (vi.xx + vi.yy),
+        ui.x + vi.y - 0.05 * d.cell_size**2 * (pi.xx + pi.yy),
+        u(xb, yb) - U(xb, yb, jnn),
+        v(xb, yb) - V(xb, yb, jnn),
+    ]
+    if pressure == "dirichlet":
+        terms.append(p(xb, yb) - P(xb, yb, jnn))
+    else:
+        xl, yl, _ = d.variable("left", split=True)
+        terms.append(p(xl, yl) - P(xl, yl, jnn))
+        for r in ("right", "bottom", "top"):
+            X, Y, _ = d.variable(r, split=True)
+            ub, vb, pb = u.bind(x=X, y=Y), v.bind(x=X, y=Y), p.bind(x=X, y=Y)
+            mx = nu * (ub.xx + ub.yy) - (ub * ub.x + vb * ub.y)
+            my = nu * (vb.xx + vb.yy) - (ub * vb.x + vb * vb.y)
+            terms.append(pb.d(d.variable(r, normals=True)) - {"right": mx, "bottom": -my, "top": my}[r])
+    sol = np.asarray(jno.fdm(terms).solve())
+    pts = _nodes(d)
+    exact_u, exact_p = U(pts[:, 0], pts[:, 1], np), P(pts[:, 0], pts[:, 1], np)
+    rel = lambda a, b: float(np.linalg.norm(a - b) / np.linalg.norm(b))  # noqa: E731
+    return rel(sol[0], exact_u), rel(sol[2], exact_p)
+
+
+@pytest.mark.parametrize("pressure", ["dirichlet", "wall"])
+def test_navier_stokes_kovasznay(pressure):
+    """Velocity second order, pressure converging, with either pressure boundary condition. The wall
+    condition is a flux condition on a coupled system whose value reads another field's derivatives."""
+    (u0, p0), (u1, p1) = _kovasznay(0.1, pressure), _kovasznay(0.05, pressure)
+    assert u1 < 3e-3 and u0 / u1 > 3.4, (u0, u1)
+    assert p1 < 3e-2 and p0 / p1 > 2.3, (p0, p1)
