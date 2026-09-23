@@ -587,10 +587,23 @@ Scope: `gmg` needs the system to be fields on a structured grid (a coupled syste
 carries every field pair — but an operator that is not a whole number of fields on the grid raises); use
 `amg` there. A time step's matrix is the step operator itself (`M + θΔt·A`), and `gmg` reads *its* stencil,
 so the shift a small Δt adds is simply part of what the V-cycle is built for — as is a variable
-coefficient, a reaction or an advection term. When the shift dominates (small Δt) the step operator is
-nearly diagonal and `jacobi` is already nearly exact and cheapest: 0.46 s on a 201² Newmark wave march at
-Δt = 1e-3. `gmg` wins at large Δt, where diffusion dominates: 2.6 s against 11.8 s for `jacobi` on a 401²
-heat march at Δt = 0.1.
+coefficient, a reaction or an advection term.
+
+!!! measured "A march on a structured grid: leave the slots unset"
+    50 heat steps on an RTX 3070, repeat solve, same answer to every printed digit:
+
+    | nodes | Δt | default (matrix-free) | `gmres` + `jacobi` | `gmres` + `gmg` |
+    |---|---|---|---|---|
+    | 66k | 1e-2 | **0.64 s** | 1.00 s | 6.8 s |
+    | 263k | 1e-2 | **1.6 s** | 5.3 s | 16 s |
+
+    The step operator is the mass plus `θΔt` times the spatial operator, so at a usable Δt it is strongly
+    diagonally dominant and the default's unpreconditioned Krylov solve takes a handful of iterations on the
+    **stencil**, while a slot assembles the operator (a BCOO matvec is ~10× the stencil's cost) and a V-cycle
+    adds its own work per iteration. Preconditioning the default march's per-step Newton with a V-cycle was
+    tried and is worse: nesting it inside the Newton inside the scan cost a large compile and 7 GB. Reach for
+    a slot when the per-step solve is genuinely hard — a strongly varying coefficient, or a Δt so large that
+    diffusion dominates the step.
 
 ---
 

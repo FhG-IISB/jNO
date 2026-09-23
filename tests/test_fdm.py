@@ -2949,22 +2949,35 @@ def test_the_grid_linear_path_is_differentiable_in_the_source():
     assert g == pytest.approx(fd, rel=1e-6)
 
 
-def test_a_grid_problem_with_a_flux_boundary_keeps_the_newton_path():
-    """Eliminating the Dirichlet rows leaves the V-cycle's interior only when the whole ring is Dirichlet."""
-    _, prob = _grid_problem(
-        16,
-        lambda u, ui, c, cb: [-ui.d2(c[0]) - ui.d2(c[1]) - 1.0, u(cb[0], cb[1]) - 0.0],
-    )
-    assert prob._grid_linear_ok()
+def test_a_grid_problem_with_a_flux_boundary_takes_the_linear_path():
+    """A flux boundary and partial Dirichlet data used to force the Newton path, because the V-cycle was
+    built for -Δ with a Dirichlet ring. It is built from the operator now, so those rows are just rows: the
+    problem is one linear solve. Oracle: u = -x²/2 + x solves -u'' = 1 with u(0) = 0 and u'(1) = 0, exactly
+    on this grid, and the Newton path gives the same field."""
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1.0 / 16).structured().domain()
+    p = _nodes(d)
     x, y, _ = d.variable("interior", split=True)
     u = d.unknown()
     ui = u.bind(x=x, y=y)
     xl, yl, _ = d.variable("left", split=True)
-    xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)
-    ur = u.bind(x=xr, y=yr)
-    terms = [-ui.d2(x) - ui.d2(y) - 1.0, u(xl, yl) - 0.0, ur.d(d.variable("right", normals=True)) - 0.0]
-    assert not jno.fdm(terms)._grid_linear_ok()
+    xr, yr, _ = d.variable("right", split=True)
+    (xb, yb, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("bottom", "top"))
+    nr, nb, nt = (d.variable(r, normals=True) for r in ("right", "bottom", "top"))
+    ur, ub, ut = u.bind(x=xr, y=yr), u.bind(x=xb, y=yb), u.bind(x=xt, y=yt)
+    terms = [
+        -ui.xx - ui.yy - 1.0,
+        u(xl, yl) - 0.0,
+        ur.d(nr) - 0.0,
+        ub.d(nb) - 0.0,
+        ut.d(nt) - 0.0,
+    ]
+    prob = jno.fdm(terms)
+    assert prob._grid_linear_ok()
+    sol = np.asarray(prob.solve()).reshape(-1)
+    exact = -(p[:, 0] ** 2) / 2 + p[:, 0]
+    assert np.abs(sol - exact).max() < 1e-9
+    newton = np.asarray(jno.fdm(terms).solve(nonlinear=jno.solve.newton())).reshape(-1)
+    np.testing.assert_allclose(sol, newton, atol=1e-8)
 
 
 def test_krylov_slots_on_a_grid_stay_matrix_free():

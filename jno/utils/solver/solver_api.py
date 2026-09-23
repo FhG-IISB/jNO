@@ -422,6 +422,10 @@ class LinearSolver:
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
         self.direct = direct  # a direct solver ignores x0 and takes no preconditioner
         self.key = None if key is None else (type(self), name, key)
+        # The relative tolerance this spec asks for, readable without unpacking `key` (the Krylov builders
+        # put it first). A caller that runs its own loop -- jno.fdm's structured paths -- needs to know what
+        # the user asked for rather than assume a default.
+        self.tolerance = key[0] if isinstance(key, tuple) and key and isinstance(key[0], float) else None
 
     def __call__(self, A, b, *, M=None, x0=None):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)

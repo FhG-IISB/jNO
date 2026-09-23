@@ -234,13 +234,20 @@ def _structured_linear_solve(domain, periodic=False, vcycle=None):
     (an unstructured mesh, or no representative tangent) this is plain GMRES."""
     from .utils.solver.solver_api import LinearOperator
 
-    gmres = _solve.gmres()
     # Unstructured: GMRES too. The strong-form operator is not symmetric, and the driver's BiCGStab broke
     # down on it: a linear 3-D cotangent problem with one Neumann face diverged to a Newton residual of
     # 5e24, where a direct solve gives 2.4e-3.
     if vcycle is None:
+        gmres = _solve.gmres()
         return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
-    return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs, M=vcycle)
+    # Preconditioned, the iteration count is small, and `jno.solve.gmres` (JAX's batched method) would
+    # finish a whole 30-vector cycle whatever the convergence -- 30 V-cycles where 3 suffice. Measured on a
+    # 50-step heat march at 263k nodes: 34 s against 1.7 s for the incremental method, same answer.
+    # A Newton step does not need its linear system solved exactly -- only far enough that the outer
+    # iteration keeps converging (an inexact Newton method; Dembo, Eisenstat & Steihaug, SIAM J. Numer.
+    # Anal. 19 (1982) 400) -- and the V-cycle's preconditioned residual falls fast, so the budget is two
+    # restart cycles rather than the 50 a standalone solve may take.
+    return lambda mv, rhs: _gmres_incremental(mv, rhs, vcycle, _solve.gmres().tolerance, maxiter=2)[0]
 
 
 def _integrate_transient(block, ts, time, linear_solve=None, nonlinear_solve=None):
@@ -2579,7 +2586,7 @@ class _TraceFDM:
         grid = self.domain.mesh_connectivity["grid"]
         slots = linear is not None or precond is not None
         # the tolerance the solve was asked for: the user's Krylov spec's, or this path's own
-        check_tol = ((linear.key[2][0] if linear is not None and linear.key else 1e-8) if slots else tol) or tol
+        check_tol = ((getattr(linear, "tolerance", None) if linear is not None else 1e-8) if slots else tol) or tol
         N = self._N
         eager = extra_params is None
         cache = self.__dict__.setdefault("_grid_linear_cache", {})
@@ -2790,6 +2797,8 @@ class _TraceFDM:
         ``c = −R(0)``), so every step is one preconditioned linear solve and an AMG or LU setup is built
         once before the march; a nonlinear ``R`` keeps the Newton step, with the assembled tangent
         available to a direct solver. A ``nonlinear=`` slot configures the per-step Newton."""
+        import jax
+
         from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
         from .utils.solver.solver_api import compose_transient_step_solvers
 
@@ -2802,8 +2811,6 @@ class _TraceFDM:
         n = int(state0.size)
         self._check_precond_shape(precond, n)
         if linear is not None or precond is not None:
-            import jax
-
             zeros = jnp.zeros(n)
             with jax.ensure_compile_time_eval():  # structure is decided on concrete values
                 # the march's residual and mass are not jitted, so they read a probe's parameter values at
@@ -2846,6 +2853,12 @@ class _TraceFDM:
                     with jax.ensure_compile_time_eval():
                         linear = self._newton_linear(linear, "march", lambda: frozen, state0)
         else:
+            # The per-step solve stays the driver's matrix-free Newton-Krylov. A V-cycle on the step operator
+            # was tried and is slower here: the step operator is the mass plus θΔt times the spatial one, so
+            # at a usable Δt it is strongly diagonally dominant and an unpreconditioned Krylov solve already
+            # takes a handful of iterations, while nesting a V-cycle inside the Newton inside the scan costs
+            # a large compile and 7 GB. Measured, 50 heat steps: 0.55 s at 66k nodes and 1.6 s at 263k
+            # (Δt = 1e-2), against 6.8 s and 16 s for the assembled `precond=gmg()` slot.
             block = SemidiscreteTimeBlock(mass=lambda t, args: mass_of(t), residual=residual, **common)
         from .utils.solver.timeschemes import _ExponentialScheme
 
