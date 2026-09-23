@@ -2511,8 +2511,7 @@ class _TraceFDM:
         at = jnp.zeros(self._Ntot) if isinstance(at, jax.core.Tracer) else jnp.asarray(at)
         with jax.ensure_compile_time_eval():
             mask_host = np.ones(self._Ntot)
-            for b, idx, _vals in self._dirichlet_rows():
-                mask_host[b * self._N + np.asarray(idx, dtype=int)] = 0.0
+            mask_host[self._dirichlet_dofs()] = 0.0
             mask = jnp.asarray(mask_host)
         matvec = lambda v: jax.jvp(residual, (at,), (v * mask,))[1] * mask  # noqa: E731
         vcycle = self._lattice_vcycle(matvec, self._Ntot)
@@ -2778,6 +2777,23 @@ class _TraceFDM:
             self._dirichlet_node_cache = cached
         return cached
 
+    def _dirichlet_dofs(self):
+        """Host-side **blocked** DOF indices of the Dirichlet rows (``block·N + node``), found once.
+
+        :meth:`_dirichlet_nodes` gives the node indices, which is enough for a single field; a vector or
+        coupled system needs to know which block each row set belongs to. Cached and computed inside
+        ``ensure_compile_time_eval`` for the same reason: inside a crux trace the row indices are tracers,
+        and numpy cannot take one."""
+        cached = self.__dict__.get("_dirichlet_dof_cache")
+        if cached is None:
+            import jax
+
+            with jax.ensure_compile_time_eval():
+                parts = [b * self._N + np.asarray(idx, dtype=int) for b, idx, _v in self._dirichlet_rows()]
+            cached = np.unique(np.concatenate(parts)) if parts else np.zeros(0, int)
+            self._dirichlet_dof_cache = cached
+        return cached
+
     def _grid_ring(self, grid):
         """The nodes on the boundary ring of the structured grid, by lattice index."""
         shape = np.asarray(grid["shape"], int)
@@ -2820,8 +2836,7 @@ class _TraceFDM:
             residual = self._steady_residual(extra_params)
             rows = self._dirichlet_rows(extra_params)
             mask_host = np.ones(N)
-            for b_, idx_, _v in self._dirichlet_rows():  # one row set per DOF block, at its own offset
-                mask_host[b_ * self._N + np.asarray(idx_, dtype=int)] = 0.0
+            mask_host[self._dirichlet_dofs()] = 0.0  # one row set per DOF block, at its own offset
             mask = jnp.asarray(mask_host)
             # The V-cycle reads the eliminated operator itself, at the parameters' current values (a traced
             # parameter would otherwise put the whole probe inside every solve); it preconditions, so its
@@ -2857,7 +2872,8 @@ class _TraceFDM:
             def fn(rows=rows):
                 uD = jnp.zeros(N)
                 for b_, idx, vals in rows:
-                    where = jnp.asarray(b_ * self._N + np.asarray(idx, dtype=int))
+                    # jnp arithmetic, not numpy: under a crux trace these indices are tracers
+                    where = b_ * self._N + jnp.asarray(idx)
                     uD = uD.at[where].set(jnp.broadcast_to(jnp.asarray(vals), (where.shape[0],)))
                 matvec = lambda v: jax.jvp(residual, (uD,), (v * mask,))[1] * mask  # noqa: E731
                 b = -residual(uD) * mask
@@ -2871,6 +2887,12 @@ class _TraceFDM:
                     return uD + x, rn
                 # the spec whose tolerance, restart and iteration cap this loop runs to -- one source for
                 # the numbers, even where the iteration itself is run here rather than through the spec
+                # CG wherever the operator is symmetric, INCLUDING where it is indefinite. Routing a
+                # symmetric indefinite operator to MINRES is the textbook rule and was tried: measured on
+                # `-Δu - 50u` (two negative eigenvalues on a 33² grid), CG with the V-cycle reaches the
+                # 1e-12 tolerance while MINRES stalls at 1e-5 and the gate refuses it -- MINRES needs an
+                # SPD preconditioner, and a V-cycle built on an indefinite operator is not one (measured:
+                # rᵀMr = -1.1), so it would have to run bare. Where CG does break down the gate says so.
                 krylov, krylov_spec = (
                     (_pcg, _solve.cg(tol=tol)) if symmetric else (_gmres_incremental, _solve.gmres(tol=tol))
                 )
@@ -2894,7 +2916,8 @@ class _TraceFDM:
                 f"jno.fdm: the structured linear solve stopped at relative residual {float(rel):.2e} against "
                 f"{check_tol:.0e} ({'conjugate gradients' if self._grid_linear_symmetric_flag else 'GMRES'} with "
                 "multigrid). The operator may be indefinite or badly scaled for this preconditioner; pick the "
-                "solver explicitly with linear=jno.solve.gmres() / jno.solve.lu() and precond=."
+                "solver explicitly -- linear=jno.solve.minres() for a symmetric indefinite operator (a saddle "
+                "point, a shifted Helmholtz), or jno.solve.gmres() / jno.solve.lu() -- and precond=."
             )
         return u
 

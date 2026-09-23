@@ -2828,6 +2828,31 @@ def test_a_vector_wave_marches_every_component():
     assert errs[1] < 2e-3, errs
 
 
+def test_an_indefinite_helmholtz_solves_on_the_structured_path():
+    """`-Δu - k²u = f` with k² past the first eigenvalue of -Δ (2π² ≈ 19.7) is symmetric INDEFINITE, the
+    case the textbook rule sends to MINRES. Measured, CG with the operator V-cycle reaches the structured
+    path's 1e-12 tolerance here while MINRES stalls at 1e-5 (it needs an SPD preconditioner, and a V-cycle
+    built on an indefinite operator is not one), so CG keeps it and the gate raises if it ever breaks down.
+
+    Oracle: u = sin πx sin πy, for which -Δu - k²u = (2π² - k²)u exactly."""
+    import jno.jnp_ops as jnn
+
+    errs = []
+    for n in (16, 32):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured())
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        p = _nodes(d)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        k2 = 50.0
+        f = (2 * np.pi**2 - k2) * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = np.asarray(jno.fdm([-(ui.xx + ui.yy) - k2 * ui - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+        errs.append(np.abs(sol - np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])).max())
+    assert errs[1] < errs[0] / 3, errs  # second order in h, so the solve really converged
+    assert errs[1] < 1e-3, errs
+
+
 def test_an_algebraic_equation_needs_no_derivative():
     """A coupled system may close with an ALGEBRAIC equation -- a constitutive law, carrying no derivative
     at all. `v - u**2` used to be classified as a value pin (only a derivative-bearing constraint counted as
