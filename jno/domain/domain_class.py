@@ -835,9 +835,10 @@ class domain(MeshIOMixin):
         # boundary) and by tag() to build the sampling pool.
         self._tag_predicates: Dict[str, Any] = {}
         # Precomputed simplex pools (segments / triangles + optional normals)
-        # for in-JIT collocation sampling — populated by ``_build_simplex_pools``
-        # after each ``_apply_mesh``.
-        self._simplex_pools: Dict[str, SimplexPool] = {}
+        # for in-JIT collocation sampling — built by ``_build_simplex_pools`` on FIRST ACCESS to
+        # ``_simplex_pools``, not at mesh-apply time (see the property below).
+        self._simplex_pool_store: Dict[str, SimplexPool] = {}
+        self._simplex_pools_built = True  # nothing to build until a mesh is applied
         # self._boundary_predicates: Dict[str, Callable] = {}
 
         # Neural operator storage
@@ -3080,7 +3081,10 @@ class domain(MeshIOMixin):
                 self.log.info(f"Derived mesh regions {_added} (not defined by the file)")
             self.mesh = mesh
             boundary_indices = self._extract_points_from_mesh(mesh)
-            self._build_simplex_pools()
+            # Deferred: the pools are a precompute for in-JIT collocation sampling, and building them
+            # was 0.45 s of a 4.1 s build at 4.2M nodes (measured) for a dict no caller reads yet.
+            # `_simplex_pools` builds them on first access, so the capability costs nothing until used.
+            self._simplex_pools_built = False
 
         if mesh is not None and self.compute_mesh_connectivity:
             # A structured grid repeats one voxel's cells everywhere (2 triangles per square, 6 Kuhn
@@ -3190,6 +3194,23 @@ class domain(MeshIOMixin):
                 return np.asarray(facets)
         return None
 
+    @property
+    def _simplex_pools(self) -> Dict[str, SimplexPool]:
+        """The tags' collocation-sampling pools, built on first read.
+
+        Building them walks every tag's facets, which cost 0.45 s of a 4.1 s domain build at 4.2M nodes
+        (measured) -- paid by every build, while the dict is consulted only by a caller that samples a
+        tag. Reading it here gives the same pools, at the moment they are wanted."""
+        if not self._simplex_pools_built:
+            self._simplex_pools_built = True
+            self._build_simplex_pools()
+        return self._simplex_pool_store
+
+    @_simplex_pools.setter
+    def _simplex_pools(self, value: Dict[str, SimplexPool]) -> None:
+        self._simplex_pool_store = value
+        self._simplex_pools_built = True
+
     def _build_simplex_pools(self) -> None:
         """Populate ``self._simplex_pools`` from ``_tag_edges`` / ``_tag_triangles``.
 
@@ -3231,7 +3252,7 @@ class domain(MeshIOMixin):
         for tag, tri_indices in self._tag_triangles.items():
             tri_coords = points_d[tri_indices]
             if tri_coords.ndim == 3 and tri_coords.shape[1] == 3 and tri_coords.shape[2] == 2:
-                self._simplex_pools[tag] = SimplexPool.from_triangles(tri_coords)
+                self._simplex_pool_store[tag] = SimplexPool.from_triangles(tri_coords)
                 triangle_tags_this_build.add(tag)
 
         # 1-D interior + 2-D boundary tags (segment pool, with normals on dim=2).
@@ -3255,7 +3276,7 @@ class domain(MeshIOMixin):
                 cand[flip] *= -1.0
                 normals = cand.astype(np.float32)
 
-            self._simplex_pools[tag] = SimplexPool.from_segments(seg_coords, normals=normals)
+            self._simplex_pool_store[tag] = SimplexPool.from_segments(seg_coords, normals=normals)
 
     @staticmethod
     def _cells_of(block_data, indices, offset):
@@ -3411,8 +3432,18 @@ class domain(MeshIOMixin):
                 tag_edges = np.concatenate(tag_edge_blocks, axis=0) if tag_edge_blocks else np.zeros((0, 2), int)
                 tag_tris = np.concatenate(tag_tri_blocks, axis=0) if tag_tri_blocks else np.zeros((0, 3), int)
                 tag_quads = np.concatenate(tag_quad_blocks, axis=0) if tag_quad_blocks else np.zeros((0, 4), int)
-                # np.unique both de-duplicates and sorts, which is what `sorted(set(...))` did
-                tag_points = np.unique(np.concatenate(tag_point_blocks)) if tag_point_blocks else np.zeros(0, int)
+                # De-duplicated and sorted, which is what `sorted(set(...))` did -- but by marking a
+                # boolean over the node ids rather than by `np.unique`, which sorts. The ids are bounded
+                # by the node count, so a scatter plus `flatnonzero` is linear where a sort is N log N,
+                # and the interior tag holds EVERY cell: 25M ids at 4.2M nodes in 2-D, where the sort was
+                # the single largest line of the build (measured: 1.0 s of 5.9 s).
+                if tag_point_blocks:
+                    seen = np.zeros(len(points), dtype=bool)
+                    for _blk in tag_point_blocks:
+                        seen[_blk] = True
+                    tag_points = np.flatnonzero(seen)
+                else:
+                    tag_points = np.zeros(0, int)
 
                 if len(tag_quads):
                     self._tag_quads[name] = np.asarray(tag_quads, dtype=int)

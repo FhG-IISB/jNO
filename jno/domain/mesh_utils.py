@@ -353,8 +353,12 @@ class MeshUtils:
             mesh_connectivity.defer("p1_area", lambda: _p1_geometry("p1_area"))
             mesh_connectivity.defer("p1_grad_phi", lambda: _p1_geometry("p1_grad_phi"))
 
-        mesh_connectivity["nodal_ds"] = MeshUtils.compute_nodal_ds(mesh_connectivity)
-        mesh_connectivity["nodal_volumes"] = MeshUtils.compute_nodal_volumes(mesh_connectivity)
+        # Deferred: a quadrature weight per node, which only an integral reads. Measured on a 2-D
+        # structured build at 4.2M nodes, computing the volumes eagerly was 2.1 s of a 6.3 s build --
+        # a finite-difference solve, which collocates at the nodes and has no quadrature at all,
+        # never asks for them. `IntegrationOperators.nodal_volumes` reads the key when it wants it.
+        mesh_connectivity.defer("nodal_ds", lambda mc=mesh_connectivity: MeshUtils.compute_nodal_ds(mc))
+        mesh_connectivity.defer("nodal_volumes", lambda mc=mesh_connectivity: MeshUtils.compute_nodal_volumes(mc))
         mesh_connectivity["boundary_indices"] = boundary_indices
 
         bp = points[boundary_indices]
