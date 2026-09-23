@@ -538,7 +538,11 @@ class DifferentialOperators:
 
         cross = (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
         two_area = jnp.abs(cross)
-        safe_2A = jnp.where(two_area > 1e-12, two_area, 1.0)
+        # Degenerate (zero-area) triangles carry no weight. "Zero" is relative to the triangle's own size and
+        # the dtype's precision, not an absolute 1e-12, which a mesh in micrometres (areas ~1e-12) crossed.
+        size2 = jnp.sum((p1 - p0) ** 2, axis=1) + jnp.sum((p2 - p0) ** 2, axis=1)
+        live = two_area > 64 * jnp.finfo(two_area.dtype).eps * size2
+        safe_2A = jnp.where(live, two_area, 1.0)
 
         # Cotangents via dot / (2*area)
         e01x = p1[:, 0] - p0[:, 0]
@@ -559,10 +563,11 @@ class DifferentialOperators:
         e21y = p1[:, 1] - p2[:, 1]
         cot2 = (e20x * e21x + e20y * e21y) / safe_2A  # angle at vertex 2
 
-        # Clamp to avoid issues with flat / obtuse triangles
-        cot0 = jnp.clip(cot0, -10.0, 10.0)
-        cot1 = jnp.clip(cot1, -10.0, 10.0)
-        cot2 = jnp.clip(cot2, -10.0, 10.0)
+        # The exact P1 cotangent weights, for any non-degenerate triangle. They used to be clipped to ±10 (an
+        # angle under 5.7° or over 174.3°), which silently replaced the operator by another one on such a
+        # triangle. No jNO-generated mesh reached the clip (max |cot| 1.25 on box, disk, L-shape and structured
+        # meshes); only imported sliver meshes did, and there the P1 operator is still the consistent one.
+        cot0, cot1, cot2 = (jnp.where(live, c, 0.0) for c in (cot0, cot1, cot2))
 
         # Accumulate: edge (i,j) opposite k → weight cot2, etc.
         lap = (
@@ -586,8 +591,8 @@ class DifferentialOperators:
         # with A_i = (1/3) * Σ area.  Equivalently: normalise by (2/3)*Σ area.
         area_sum = jnp.zeros(N).at[i_idx].add(two_area / 2.0).at[j_idx].add(two_area / 2.0).at[k_idx].add(two_area / 2.0)
         A_i = area_sum * 2.0 / 3.0
-        safe_A = jnp.where(A_i > 1e-12, A_i, 1.0)
-        return jnp.where(A_i > 1e-12, lap / safe_A, 0.0)
+        safe_A = jnp.where(A_i > 0, A_i, 1.0)  # a node in no (live) triangle has no row
+        return jnp.where(A_i > 0, lap / safe_A, 0.0)
 
     @staticmethod
     def compute_fd_hessian_2d_simple(
@@ -938,7 +943,10 @@ class DifferentialOperators:
         # Jacobian with columns e1, e2, e3 = p1-p0, p2-p0, p3-p0
         jac = jnp.stack([pts[i1] - p0, pts[i2] - p0, pts[i3] - p0], axis=2)  # (M, 3, 3)
         det = jnp.linalg.det(jac)
-        good = jnp.abs(det) > 1e-14  # guard sliver / degenerate tets against a singular inverse
+        # guard degenerate tets against a singular inverse -- relative to the tet's own size and the dtype, not
+        # an absolute 1e-14 (a millimetre-scale mesh has volumes ~1e-9 and a micrometre one ~1e-18)
+        edge3 = jnp.sum(jac**2, axis=(1, 2)) ** 1.5
+        good = jnp.abs(det) > 64 * jnp.finfo(det.dtype).eps * edge3
         vol = jnp.where(good, jnp.abs(det) / 6.0, 0.0)
         jinv = jnp.linalg.inv(jnp.where(good[:, None, None], jac, jnp.eye(3, dtype=jac.dtype)))
         g1, g2, g3 = jinv[:, 0, :], jinv[:, 1, :], jinv[:, 2, :]  # ∇λ_1, ∇λ_2, ∇λ_3 (rows of J⁻¹)
@@ -958,8 +966,8 @@ class DifferentialOperators:
         )
         quarter = vol / 4.0
         mass = jnp.zeros(n).at[i0].add(quarter).at[i1].add(quarter).at[i2].add(quarter).at[i3].add(quarter)
-        safe_mass = jnp.where(mass > 1e-14, mass, 1.0)
-        return jnp.where(mass > 1e-14, -ku / safe_mass, 0.0)
+        safe_mass = jnp.where(mass > 0, mass, 1.0)  # a node in no (live) tet has no row
+        return jnp.where(mass > 0, -ku / safe_mass, 0.0)
 
     @staticmethod
     def compute_fd_laplacian_3d_simple(

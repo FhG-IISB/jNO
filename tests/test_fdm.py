@@ -2746,6 +2746,28 @@ def test_equal_solver_specs_share_the_compiled_solve():
     assert prob._grid_linear_cache["fn"] is not fn
 
 
+@pytest.mark.parametrize("dim", [2, 3])
+def test_the_cotangent_laplacian_does_not_depend_on_the_mesh_units(dim):
+    """Degenerate elements were detected with an ABSOLUTE threshold (2·area < 1e-12, |det| < 1e-14), so on a
+    mesh in micrometres every element counted as degenerate and the Laplacian was identically zero. The test is
+    now relative to each element's own size. Oracle: Δ(|x|²) = 2·dim at interior nodes, at any scale."""
+    from jno.differential_operators import DifferentialOperators as D
+
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1) if dim == 2 else jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25)
+    d = shape.structured().domain()
+    mc = d.mesh_connectivity
+    pts = np.asarray(mc["points"])[:, :dim]
+    interior = np.all((pts > 1e-9) & (pts < 1 - 1e-9), axis=1)
+    for scale in (1.0, 1e-6):
+        p = jnp.asarray(pts * scale)
+        u = jnp.sum(p**2, axis=1)
+        if dim == 2:
+            lap = D.compute_fd_laplacian_2d_simple(u, p, mc["triangles"], dims=(0, 1), method="cotangent")
+        else:
+            lap = D.compute_fd_laplacian_3d_simple(u, p, mc["tetrahedra"], dims=(0, 1, 2), method="cotangent")
+        np.testing.assert_allclose(np.asarray(lap)[interior], 2.0 * dim, rtol=1e-6)
+
+
 def test_a_rank_two_unknown_raises_up_front():
     """A matrix unknown (value_shape=(2, 2)) failed deep inside the kernels with a reshape or broadcasting
     error. It now raises when the problem is built, naming the vector-unknown workaround."""
