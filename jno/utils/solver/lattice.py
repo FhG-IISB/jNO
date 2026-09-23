@@ -170,9 +170,9 @@ def probe(matvec, shape, nf=1, *, window=None, hint=None, periodic=(), dtype=Non
 
     With ``window=None`` the candidates of :data:`WINDOWS` are tried in order and the first whose
     reconstruction reproduces ``matvec`` on a random vector (to ``√ε`` relative) is returned; passing a
-    window skips the search. ``hint`` is tried first and the search follows if it does not verify -- a
-    caller that knows its stencils (``jno.fdm`` reads them off the ``jno.fd`` specs in its terms) saves the
-    candidates it would otherwise walk, and a wide one (a sixth-order closure spans +-7) is found at all.
+    window skips the search. ``hint`` joins the candidates, in width order like the rest -- a caller that
+    knows its stencils (``jno.fdm`` reads them off the ``jno.fd`` specs in its terms) makes a window wider
+    than any in :data:`WINDOWS` reachable at all, which is what a sixth-order closure (+-7) needs.
     ``verify=False`` skips the check when the window is given.
 
     Cost: ``prod(window width)·nf`` matvecs per candidate, plus one for the check. A periodic axis needs
@@ -188,7 +188,15 @@ def probe(matvec, shape, nf=1, *, window=None, hint=None, periodic=(), dtype=Non
     ref = matvec(v) if verify else None
 
     per_full = tuple(periodic) + (False,) * (dim - len(periodic))
-    candidates = (window,) if window is not None else (((hint,) if hint is not None else ()) + WINDOWS)
+    # Smallest first, hint included: a candidate costs one probe pass of `width**dim` matvecs, so trying
+    # a wide one first is expensive exactly where it is unnecessary. The hint's job is to EXTEND the list
+    # past what `WINDOWS` reaches (a sixth-order closure spans ±7), not to jump the queue -- tried first,
+    # a plain second-order operator whose specs report a ±3 reach probed 49 colours a level where 9 do.
+    candidates = (
+        (window,)
+        if window is not None
+        else tuple(sorted({*WINDOWS, *((hint,) if hint is not None else ())}, key=lambda w: w[1] - w[0]))
+    )
     for cand in candidates:
         S = _probe_window(matvec, shape, nf, cand, per_full, dtype)
         if not verify:
@@ -225,10 +233,11 @@ def probe_reduced(matvec, shape, nf=1, *, window, periodic=(), dtype=None):
     dim = len(shape)
     dtype = jnp.result_type(float) if dtype is None else dtype
     per_full = tuple(periodic) + (False,) * (dim - len(periodic))
+    n_off = len(offsets(*window, dim))
     centre = offsets(*window, dim).index((0,) * dim)
     init = (
         jnp.zeros((nf,) + shape, dtype),
-        jnp.zeros(len(offsets(*window, dim)), dtype),
+        jnp.zeros(n_off, dtype),
         jnp.zeros((nf, nf) + shape, dtype),
     )
 
@@ -236,9 +245,16 @@ def probe_reduced(matvec, shape, nf=1, *, window, periodic=(), dtype=None):
         d, strength, block = carry
         contrib = jnp.abs(out) * live
         at_centre = (w == centre) * live
+        # One masked reduction per window offset, rather than `strength.at[w].add(...)`. The scatter
+        # sends every node to one of `n_off` bins -- a million threads contending for nine addresses --
+        # and measured at 1M nodes in 2-D it made this probe 7.2 s of RUN time (not compile) for nine
+        # colours, against milliseconds for the matvec it calls. `n_off` is small and static, so a
+        # reduction per offset does more arithmetic and no atomics at all.
+        per_node = contrib.sum(axis=0)
+        offset_sums = jnp.stack([jnp.sum(jnp.where(w == k, per_node, 0.0)) for k in range(n_off)])
         return (
             d + contrib,
-            strength.at[w.reshape(-1)].add(contrib.sum(axis=0).reshape(-1)),
+            strength + offset_sums,
             block.at[:, g].add(out * at_centre),  # the node's own nf x nf block
         )
 
