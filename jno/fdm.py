@@ -975,32 +975,39 @@ class _TraceFDM:
         """``{layer_id: module}`` of every model the constraints read, other than the unknowns: a known
         nodal field (a ``jno.np.parameter`` carrying data, no optimizer), a network. A data field used as a
         PDE coefficient used to fail with "No model for Model N": only trainable parameters were in the
-        evaluation scope, and data fields only worked inside boundary values."""
-        cached = self.__dict__.get("_models_cache")
-        if cached is not None:
-            return dict(cached)
-        from .trace import ModelCall
+        evaluation scope, and data fields only worked inside boundary values.
 
-        found, seen, stack = {}, set(), [_unwrap(c) for c in self._constraints]
-        while stack:
-            n = stack.pop()
-            if id(n) in seen:
-                continue
-            seen.add(id(n))
-            if isinstance(n, ModelCall) and all(n.model is not u for u in self.unknowns):
-                module = getattr(n.model, "module", None)
-                value = getattr(module, "value", None)
-                if value is not None and np.ndim(value) == 1 and np.shape(value)[0] == self._N:
-                    # one value per node: a per-node scalar field, shaped (N, 1) like every other one in the
-                    # strong form. As (N,) it broadcast against an (N, 1) derivative to (N, N).
-                    import equinox as eqx
+        The walk over the constraints is cached; the modules are read LIVE at every call. Caching the modules
+        themselves kept a data field's old value after the documented eager swap
+        ``K.model.module = eqx.tree_at(...)``: the repeat solve returned the old field's answer (measured:
+        κ 1 → 2 left max u at 0.0734 instead of 0.0367), although the data fingerprint had changed."""
+        models = self.__dict__.get("_models_cache")
+        if models is None:
+            from .trace import ModelCall
 
-                    module = eqx.tree_at(lambda m: m.value, module, jnp.reshape(value, (self._N, 1)))
-                if module is not None:
-                    found[n.model.layer_id] = module
-            stack.extend(_unwrap(c) for c in _iter(n))
-        self._models_cache = found
-        return dict(found)
+            models, seen, stack = {}, set(), [_unwrap(c) for c in self._constraints]
+            while stack:
+                n = stack.pop()
+                if id(n) in seen:
+                    continue
+                seen.add(id(n))
+                if isinstance(n, ModelCall) and all(n.model is not u for u in self.unknowns):
+                    models[n.model.layer_id] = n.model
+                stack.extend(_unwrap(c) for c in _iter(n))
+            self._models_cache = models
+        found = {}
+        for lid, model in models.items():
+            module = getattr(model, "module", None)
+            value = getattr(module, "value", None)
+            if value is not None and np.ndim(value) == 1 and np.shape(value)[0] == self._N:
+                # one value per node: a per-node scalar field, shaped (N, 1) like every other one in the
+                # strong form. As (N,) it broadcast against an (N, 1) derivative to (N, N).
+                import equinox as eqx
+
+                module = eqx.tree_at(lambda m: m.value, module, jnp.reshape(value, (self._N, 1)))
+            if module is not None:
+                found[lid] = module
+        return found
 
     def _params_scope(self, extra_params=None):
         """The module every trainable parameter resolves to in an evaluation: its current value, then the

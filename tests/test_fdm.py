@@ -2644,6 +2644,28 @@ def test_a_data_field_as_a_pde_coefficient():
     assert np.isfinite(data).all() and np.abs(data - formula).max() < 1e-10 and np.abs(data).max() > 1e-3
 
 
+def test_a_repeat_solve_reads_a_swapped_data_field():
+    """The documented eager swap ``K.model.module = eqx.tree_at(...)`` of a data field must reach the next
+    solve. The problem cached the modules it first read, so after κ went 1 → 2 the repeat solve returned the
+    κ = 1 answer (max u 0.0734 instead of 0.0367), with no error. Oracle: −∇·(κ∇u) = 1 with constant κ scales
+    as 1/κ."""
+    import equinox as eqx
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    n = len(_nodes(d))
+    K = jno.np.parameter((n,), name="kappa")
+    K.model.module = eqx.tree_at(lambda m: m.value, K.model.module, jnp.ones(n))
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-(K * ui.x).x - (K * ui.y).y - 1.0, u(xb, yb) - 0.0])
+    one = np.asarray(prob.solve()).reshape(-1)
+    K.model.module = eqx.tree_at(lambda m: m.value, K.model.module, jnp.full((n,), 2.0))
+    two = np.asarray(prob.solve()).reshape(-1)
+    np.testing.assert_allclose(two, one / 2, rtol=1e-8, atol=1e-12)
+
+
 # ---------------------------------------------------------------------------------------------------
 # a linear problem on a structured grid: one Krylov solve, no Newton
 # ---------------------------------------------------------------------------------------------------
