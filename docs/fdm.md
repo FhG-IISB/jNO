@@ -791,6 +791,11 @@ components with `jnn.stack`.
 **Not supported, and it raises:** complex values (a complex source, coefficient or boundary value; a real
 solve would keep only the real part).
 
+An equation need not carry a derivative. A **constitutive law** — `vi - ui**2`, a closure, a state read
+off another field — is an equation like any other, and is recognised as one by sitting on the same region
+as the differential equations (a value condition is written on a boundary edge or a sub-region). It
+constrains no time derivative, so in a march its row is algebraic.
+
 Author a coupled system as one PDE equation per unknown, in declaration order (equation *k* drives
 unknown *k*), plus each field's BCs:
 

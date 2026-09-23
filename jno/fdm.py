@@ -868,16 +868,17 @@ class _TraceFDM:
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
         self._pde, self._dirichlet, self._neumann, self._ic, self._vel_ic = [], [], [], [], []
         self._periodic_axes = []  # grid axes tied by a `u(A) - u(B)` periodic constraint (structured only)
+        # Classify by structure (not by which region tag), so a value-only pin works on ANY region —
+        # a boundary edge OR a geometric sub-region (`domain.region(name, geom)`, used by coupled /
+        # domain-decomposition solves to pin a subdomain's complement to a neighbour's field):
+        #   * a periodic tie `u(A) - u(B)` (opposite faces)  → wrap the grid axis (check first);
+        #   * a normal derivative `ui.d(n, ...)`           → a Neumann/Robin flux row;
+        #   * `u.t` on the `initial` region                → the initial velocity (u_tt problems);
+        #   * a derivative of the unknown (Laplacian, u.t) → the PDE residual;
+        #   * the `initial` region, value-only            → the initial condition;
+        #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
+        kinds = []
         for c in constraints:
-            # Classify by structure (not by which region tag), so a value-only pin works on ANY region —
-            # a boundary edge OR a geometric sub-region (`domain.region(name, geom)`, used by coupled /
-            # domain-decomposition solves to pin a subdomain's complement to a neighbour's field):
-            #   * a periodic tie `u(A) - u(B)` (opposite faces)  → wrap the grid axis (check first);
-            #   * a normal derivative `ui.d(n, ...)`           → a Neumann/Robin flux row;
-            #   * `u.t` on the `initial` region                → the initial velocity (u_tt problems);
-            #   * a derivative of the unknown (Laplacian, u.t) → the PDE residual;
-            #   * the `initial` region, value-only            → the initial condition;
-            #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
             tie = getattr(c, "_periodic_tie", None)
             if tie is not None:
                 ax = _periodic_axis(*(np.asarray(self._pts)[self._region_nodes(t)] for t in tie))
@@ -887,16 +888,40 @@ class _TraceFDM:
                         f"(left/right, bottom/top, or front/back); got {tie}."
                     )
                 self._periodic_axes.append(ax)
+                kinds.append(None)
             elif _normal_jacobian(c) is not None or self._is_boundary_derivative_condition(c):
-                self._neumann.append(c)  # a boundary row: Neumann, Robin, oblique, nonlinear flux, …
+                kinds.append("neumann")  # a boundary row: Neumann, Robin, oblique, nonlinear flux, …
             elif _region_tag(c) == "initial" and _has_temporal(c):
-                self._vel_ic.append(c)
+                kinds.append("vel_ic")
             elif any(_has_unknown_derivative(c, u) for u in self.unknowns):
-                self._pde.append(c)
+                kinds.append("pde")
             elif _region_tag(c) == "initial":
-                self._ic.append(c)
+                kinds.append("ic")
             else:
-                self._dirichlet.append(c)
+                kinds.append("dirichlet")
+        # An ALGEBRAIC equation carries no derivative at all -- a constitutive law `v - u**2`, an
+        # incompressibility-like closure, a fibre reading a state. Structure alone cannot tell it from a
+        # value pin, since both are value-only; the REGION can. A pin is written on a boundary edge or a
+        # sub-region, an equation on the same region as the differential equations it sits beside, so a
+        # value-only constraint on a PDE region is one more equation (with a zero mass row: it constrains
+        # no time derivative). Without this it fell through to `_dirichlet`, and a coupled system whose
+        # second equation happened to be algebraic was rejected for having too few equations.
+        #
+        # The tags are compared, not hashed: a constraint spanning several regions carries a set of them.
+        pde_regions = [_region_tag(c) for c, k in zip(constraints, kinds) if k == "pde"]
+        kinds = [
+            "pde" if k == "dirichlet" and any(_region_tag(c) == t for t in pde_regions) else k
+            for c, k in zip(constraints, kinds)
+        ]
+        for c, k in zip(constraints, kinds):
+            if k is not None:
+                {
+                    "pde": self._pde,
+                    "neumann": self._neumann,
+                    "vel_ic": self._vel_ic,
+                    "ic": self._ic,
+                    "dirichlet": self._dirichlet,
+                }[k].append(c)
         if not self._pde:
             raise ValueError("jno.fdm([...]): no PDE residual found (a term with a derivative of the unknown).")
         self._transient = bool(self._ic)

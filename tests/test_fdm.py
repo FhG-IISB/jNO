@@ -2828,6 +2828,31 @@ def test_a_vector_wave_marches_every_component():
     assert errs[1] < 2e-3, errs
 
 
+def test_an_algebraic_equation_needs_no_derivative():
+    """A coupled system may close with an ALGEBRAIC equation -- a constitutive law, carrying no derivative
+    at all. `v - u**2` used to be classified as a value pin (only a derivative-bearing constraint counted as
+    an equation), and the system was then rejected for having "1 PDE equation" for two unknowns. A
+    value-only constraint on the same region as the differential equations is one more equation.
+
+    Oracle: -Δu = 2π² sin πx sin πy with u = 0 on the boundary gives u = sin πx sin πy, so v = u²."""
+    import jno.jnp_ops as jnn
+
+    errs = []
+    for n in (10, 20):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured())
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        p = _nodes(d)
+        u, v = d.unknown(), d.unknown()
+        ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+        f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = np.asarray(jno.fdm([-(ui.xx + ui.yy) - f, vi - ui**2, u(xb, yb) - 0.0, v(xb, yb) - 0.0]).solve())
+        exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+        errs.append((np.abs(sol[0] - exact).max(), np.abs(sol[1] - exact**2).max()))
+    assert errs[1][0] < errs[0][0] / 3 and errs[1][1] < errs[0][1] / 3, errs  # second order in h
+    assert errs[1][0] < 3e-3 and errs[1][1] < 5e-3, errs
+
+
 def test_a_coupled_system_is_preconditioned_by_the_operator_v_cycle():
     """A coupled system gets the operator-dependent V-cycle: the Newton and structured-linear paths used to
     gate it on a single field, although the smoother has inverted each node's whole block since the
