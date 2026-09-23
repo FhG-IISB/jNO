@@ -199,26 +199,21 @@ def test_a_global_operator_has_no_stencil_and_raises():
         probe(dense, shape)
 
 
-def test_a_periodic_axis_wraps_and_an_incompatible_one_raises():
-    """With a periodic axis the window wraps; a period that does not divide the axis would fold two
-    coefficients of a row into one colour, so it raises."""
-    shape, h = (9, 7), 0.125
-    base = _laplacian_matvec(shape, h)
+def test_a_periodic_axis_wraps_whatever_its_length():
+    """With a periodic axis the window wraps. Where the window's width does not divide the axis -- 8 nodes
+    with a three-wide stencil -- plain ``i mod 3`` colouring would give a row two neighbours of one colour
+    across the seam and fold two coefficients into one, so the nodes at the seam get colours of their own."""
+    for n0 in (9, 8):  # 9 divides by 3, 8 does not
+        shape, h = (n0, 7), 0.125
+        base = _laplacian_matvec(shape, h)
 
-    def wrapped(v):  # -Δ with the first axis periodic: add the wrap couplings
-        u = v.reshape((1,) + shape)
-        out = base(v).reshape((1,) + shape)
-        edge = jnp.zeros_like(u).at[:, 0].set(-u[:, -1] / h**2).at[:, -1].set(-u[:, 0] / h**2)
-        return (out + edge).reshape(-1)
+        def wrapped(v, shape=shape, h=h, base=base):  # -Δ with the first axis periodic: add the wrap couplings
+            u = v.reshape((1,) + shape)
+            out = base(v).reshape((1,) + shape)
+            edge = jnp.zeros_like(u).at[:, 0].set(-u[:, -1] / h**2).at[:, -1].set(-u[:, 0] / h**2)
+            return (out + edge).reshape(-1)
 
-    window, S = probe(wrapped, shape, periodic=(True, False), window=(-1, 1))
-    v = jnp.asarray(np.random.default_rng(11).standard_normal(int(np.prod(shape))))
-    got = apply_stencil(S, window, v.reshape(1, *shape), periodic=(True, False)).reshape(-1)
-    np.testing.assert_allclose(np.asarray(got), np.asarray(wrapped(v)), rtol=1e-10, atol=1e-10)
-
-    def wrapped8(v):  # the same operator on 8 nodes, where a width-3 window does not divide the axis
-        u = v.reshape((1, 8, 7))
-        return (u * 0.0).reshape(-1)
-
-    with pytest.raises(ValueError, match="multiple of the stencil window"):
-        probe(wrapped8, (8, 7), periodic=(True, False), window=(-1, 1))
+        window, S = probe(wrapped, shape, periodic=(True, False), window=(-1, 1))
+        v = jnp.asarray(np.random.default_rng(11).standard_normal(int(np.prod(shape))))
+        got = apply_stencil(S, window, v.reshape(1, *shape), periodic=(True, False)).reshape(-1)
+        np.testing.assert_allclose(np.asarray(got), np.asarray(wrapped(v)), rtol=1e-10, atol=1e-10)

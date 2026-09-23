@@ -1,0 +1,306 @@
+"""Operator-dependent multigrid on a structured grid, built from the operator itself.
+
+The V-cycle in :mod:`geometric_mg` preconditions one operator: the constant-coefficient ``-Δ``. It is
+built from the grid alone, so a variable coefficient, a reaction term, an advection term, an anisotropy,
+a flux row or a second field all get a preconditioner for a *different* problem than the one being
+solved. This module builds the hierarchy from the operator's own coefficients instead:
+
+1. read the fine operator's per-node stencil (:mod:`lattice`);
+2. coarsen the axes that the operator actually couples strongly, by a factor of two;
+3. form the coarse operator **variationally**, ``A_c = Pᵀ A P`` (Galerkin), by probing ``Pᵀ ∘ A ∘ P`` on
+   the coarse lattice -- so the coarse levels inherit whatever the fine operator is, including its
+   boundary rows;
+4. smooth with ℓ¹-Jacobi, whose weights are read off the same stencil;
+5. factorise the coarsest level once.
+
+This is black-box multigrid (J. E. Dendy, *J. Comput. Phys.* 48 (1982) 366) with a probed operator in
+place of an assembled one. The Galerkin coarse operator is the variational one (Trottenberg, Oosterlee &
+Schüller, *Multigrid*, 2001, §2.3), which keeps the V-cycle symmetric when ``A`` is symmetric, so CG
+stays valid. ℓ¹-Jacobi (Baker, Falgout, Kolev & Yang, *SIAM J. Sci. Comput.* 33 (2011) 2864) has no
+damping parameter to choose and never diverges on a symmetric positive-definite operator.
+
+Nothing here knows which PDE produced the operator: a row with no coefficients at all (a Dirichlet
+degree of freedom the caller has eliminated) is passed through, and the number of levels follows the grid.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from .lattice import apply_stencil, offsets, probe, probe_reduced
+
+#: Strength below which an axis is left uncoarsened (semi-coarsening): an axis whose couplings are weaker
+#: than this fraction of the strongest axis' does not carry the error a coarse grid must represent. The
+#: classical strong-connection threshold of Ruge & Stüben (*Multigrid Methods*, SIAM 1987, §4.2).
+STRENGTH = 0.25
+#: The coarsest level is factorised densely, and its factor is baked into the compiled V-cycle, so it is
+#: kept small: 1024 unknowns is an 8 MB factor in float64. Coarsening stops there, or when no axis is long
+#: enough to halve (every axis merges its odd cell, so a hierarchy reaches a handful of nodes per axis).
+DENSE_MAX = 1024
+
+
+def _axis_nodes(n: int):
+    """The fine indices of the coarse nodes on an axis of ``n`` nodes.
+
+    Every other node, with the last cell **merged** into its neighbour when the cell count is odd: 8 nodes
+    (7 cells) give coarse nodes 0, 2, 4, 7, so the last coarse cell spans three fine cells rather than
+    leaving a one-cell cell that would survive every level while its neighbours doubled.
+    """
+    cells = n - 1
+    if cells <= 1:
+        return np.arange(n)
+    idx = list(range(0, n, 2))
+    if cells % 2:  # odd cell count: merge the last (one-cell) coarse cell into its neighbour
+        idx = idx[:-1]
+        if idx[-1] != n - 1:
+            idx.append(n - 1)
+    elif idx[-1] != n - 1:
+        idx.append(n - 1)
+    return np.asarray(idx, dtype=int)
+
+
+def _axis_transfer(n: int):
+    """``(coarse_fine_index, gather, weight)`` for linear interpolation along one axis.
+
+    ``gather`` and ``weight`` are ``(n, 2)``: fine node ``i`` is ``Σ_k weight[i, k] · x_c[gather[i, k]]``,
+    exact on linear functions for any (also non-uniform) coarse spacing.
+    """
+    coarse = _axis_nodes(n)
+    gather = np.zeros((n, 2), dtype=int)
+    weight = np.zeros((n, 2))
+    right = np.searchsorted(coarse, np.arange(n), side="left")
+    for i in range(n):
+        j = int(right[i])
+        if j < len(coarse) and coarse[j] == i:  # a coarse node: injected
+            gather[i] = (j, j)
+            weight[i] = (1.0, 0.0)
+            continue
+        a, b = j - 1, min(j, len(coarse) - 1)
+        span = coarse[b] - coarse[a]
+        gather[i] = (a, b)
+        weight[i] = ((coarse[b] - i) / span, (i - coarse[a]) / span)
+    return coarse, jnp.asarray(gather), jnp.asarray(weight)
+
+
+def _prolong(x, transfers, axes):
+    """Interpolate ``x`` (``(nf, *coarse_shape)``) onto the fine grid, one axis at a time."""
+    out = x
+    for axis, (_, gather, weight) in zip(axes, transfers):
+        ax = axis + 1
+        g = jnp.take(out, gather[:, 0], axis=ax) * jnp.expand_dims(
+            weight[:, 0], tuple(range(ax)) + tuple(range(ax + 1, out.ndim))
+        )
+        h = jnp.take(out, gather[:, 1], axis=ax) * jnp.expand_dims(
+            weight[:, 1], tuple(range(ax)) + tuple(range(ax + 1, out.ndim))
+        )
+        out = g + h
+    return out
+
+
+def _restrict(y, transfers, axes):
+    """``Pᵀ y``: the transpose of :func:`_prolong`, one axis at a time (a weighted scatter-add)."""
+    out = y
+    for axis, (coarse, gather, weight) in zip(axes, transfers):
+        ax = axis + 1
+        n_c = len(coarse)
+        acc = jnp.zeros(out.shape[:ax] + (n_c,) + out.shape[ax + 1 :], out.dtype)
+        for k in range(2):
+            w = jnp.expand_dims(weight[:, k], tuple(range(ax)) + tuple(range(ax + 1, out.ndim)))
+            acc = _scatter_add_axis(acc, gather[:, k], out * w, ax)
+        out = acc
+    return out
+
+
+def _scatter_add_axis(acc, index, src, axis):
+    """``acc[..., index[i], ...] += src[..., i, ...]`` along ``axis``."""
+    moved_src = jnp.moveaxis(src, axis, 0)
+    moved_acc = jnp.moveaxis(acc, axis, 0)
+    moved_acc = moved_acc.at[index].add(moved_src)
+    return jnp.moveaxis(moved_acc, 0, axis)
+
+
+def _strong_axes(strength, window, shape, dim):
+    """The axes an operator couples strongly enough to coarsen: those whose pure-axis coupling is at least
+    :data:`STRENGTH` of the strongest axis'. An axis of fewer than 4 nodes is never coarsened.
+
+    ``strength`` is one number per window offset (:func:`lattice.probe_reduced`). Coarsening only the strong
+    axes is semi-coarsening: on a 100:1 anisotropy the weak axis carries no error a coarse grid could
+    represent, and coarsening it anyway is what makes a V-cycle diverge there.
+    """
+    offs = offsets(*window, dim)
+    per_axis = np.zeros(dim)
+    st = np.asarray(strength)
+    for w, o in enumerate(offs):
+        nz = [a for a, oa in enumerate(o) if oa != 0]
+        if len(nz) == 1:
+            per_axis[nz[0]] += float(st[w])
+    top = per_axis.max() if per_axis.size else 0.0
+    if top <= 0:
+        return tuple(a for a in range(dim) if shape[a] >= 4)
+    return tuple(a for a in range(dim) if shape[a] >= 4 and per_axis[a] >= STRENGTH * top)
+
+
+def _strength_of(S, window, dim):
+    """:func:`_strong_axes`'s input, from a stored stencil."""
+    return jnp.abs(S).sum(axis=(0, 1)).reshape(-1, len(offsets(*window, dim))).mean(axis=0)
+
+
+def _l1_weights(S):
+    """ℓ¹-Jacobi weights ``d_i = Σ_j |a_ij|`` per row, from a stored stencil. A row with no coefficients at
+    all (a degree of freedom the caller eliminated) gets 0, which the smoother reads as "leave it alone"."""
+    return jnp.abs(S).sum(axis=(1, -1))  # over the input fields and the offsets -> (nf, *shape)
+
+
+def _dense_from_stencil(S, window, shape, nf, periodic):
+    """The coarsest level as a dense matrix, read straight off its stencil (one entry per node and offset)
+    rather than by differencing it ``n`` times. The indices are host-side; the values may be traced."""
+    dim = len(shape)
+    n = int(np.prod(shape))
+    idx = np.arange(n).reshape(shape)
+    A = jnp.zeros((nf * n, nf * n), S.dtype)
+    for w, o in enumerate(offsets(*window, dim)):
+        src, live = idx, np.ones(shape, bool)
+        for a, oa in enumerate(o):
+            if oa == 0:
+                continue
+            src = np.roll(src, -oa, axis=a)
+            if not (a < len(periodic) and periodic[a]):  # what wrapped is not a coupling
+                keep = np.ones(shape[a], bool)
+                keep[slice(shape[a] - oa, None) if oa > 0 else slice(0, -oa)] = False
+                live &= keep.reshape((1,) * a + (-1,) + (1,) * (dim - a - 1))
+        rows, cols, mask = idx.reshape(-1), src.reshape(-1), jnp.asarray(live.reshape(-1), S.dtype)
+        for f in range(nf):
+            for g in range(nf):
+                A = A.at[f * n + rows, g * n + cols].add(S[f, g, ..., w].reshape(-1) * mask)
+    return A
+
+
+def _periodic_reduction(matvec, shape, nf, periodic):
+    """Work on the **unique** nodes of a periodic axis.
+
+    A periodic ``jno.fdm`` grid carries the duplicate node ``x = L ≡ x = 0``, tied by a row ``u[L] − u[0]``
+    that couples two nodes a whole axis apart: no finite-difference window holds it, so the operator has no
+    stencil to read. Injecting ``u[L] = u[0]`` satisfies that row identically and leaves the interior rows,
+    which already wrap, so the reduced operator on the unique nodes is the one to coarsen.
+
+    Returns ``(reduced_matvec, reduced_shape, inject, extract)``.
+    """
+    keep = tuple(n - 1 if p else n for n, p in zip(shape, periodic))
+
+    def inject(xu):  # (nf, *keep) -> (nf, *shape), the duplicate node equal to the first
+        x = xu
+        for a, p in enumerate(periodic):
+            if p:
+                x = jnp.concatenate([x, jnp.take(x, jnp.asarray([0]), axis=a + 1)], axis=a + 1)
+        return x
+
+    def extract(y):  # (nf, *shape) -> (nf, *keep)
+        return y[(slice(None),) + tuple(slice(0, k) for k in keep)]
+
+    def reduced(v):
+        x = inject(jnp.asarray(v).reshape((nf,) + keep))
+        return extract(jnp.asarray(matvec(x.reshape(-1))).reshape((nf,) + shape)).reshape(-1)
+
+    return reduced, keep, inject, extract
+
+
+def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, window=None):
+    """An operator-dependent V-cycle ``M⁻¹: r -> e`` for ``matvec`` on the lattice ``shape``.
+
+    Returns ``(apply, n_levels)``. ``apply`` takes and returns the flat blocked vector ``matvec`` uses
+    (``nf`` blocks of ``prod(shape)``, C order within a block). Setup costs one stencil probe per level.
+
+    The **fine** level keeps ``matvec`` itself and stores only its ℓ¹ weights, one number per unknown: its
+    full stencil would be ``nf²·W`` numbers per node, 1.2 GB for a 2-D five-point operator at 16.8M nodes.
+    Coarse levels, each at least four times smaller, store theirs.
+    """
+    full_shape = tuple(int(s) for s in shape)
+    dim = len(full_shape)
+    dtype = jnp.result_type(float) if dtype is None else dtype
+    per = tuple(periodic) + (False,) * (dim - len(periodic))
+    full_matvec = matvec
+    if any(per):  # coarsen the unique nodes; the duplicate node's tie row has no stencil
+        matvec, shape, inject, extract = _periodic_reduction(matvec, full_shape, nf, per)
+    else:
+        shape, inject, extract = full_shape, (lambda x: x), (lambda y: y)
+    if window is None:  # find the window once, on the fine operator, then reduce rather than store it
+        window, _ = probe(matvec, shape, nf, periodic=per, dtype=dtype, seed=1)
+    d0, strength0 = probe_reduced(matvec, shape, nf, window=window, periodic=per, dtype=dtype)
+
+    levels = [
+        {
+            "shape": shape,
+            "apply": lambda x: matvec(x.reshape(-1)).reshape((nf,) + shape),
+            "d": d0,
+            "strength": strength0,
+            "window": window,
+            "periodic": per,
+        }
+    ]
+    while True:
+        top = levels[-1]
+        sh = top["shape"]
+        axes = _strong_axes(top["strength"], top["window"], sh, dim)
+        if not axes or nf * int(np.prod(sh)) <= DENSE_MAX:
+            break
+        transfers = [_axis_transfer(sh[a]) for a in axes]
+        coarse_shape = tuple(len(transfers[axes.index(a)][0]) if a in axes else sh[a] for a in range(dim))
+        top["axes"], top["transfers"] = axes, transfers
+        fine_apply, fine_per = top["apply"], top["periodic"]
+
+        def coarse_matvec(v, fine_apply=fine_apply, transfers=transfers, axes=axes, coarse_shape=coarse_shape):
+            x = _prolong(v.reshape((nf,) + coarse_shape), transfers, axes)
+            return _restrict(fine_apply(x), transfers, axes).reshape(-1)
+
+        cper = tuple(p and a in axes or p for a, p in enumerate(fine_per))  # periodicity survives coarsening
+        cwin, cS = probe(coarse_matvec, coarse_shape, nf, periodic=cper, dtype=dtype)
+        levels.append(
+            {
+                "shape": coarse_shape,
+                "apply": (lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper)),
+                "d": _l1_weights(cS),
+                "strength": _strength_of(cS, cwin, dim),
+                "window": cwin,
+                "periodic": cper,
+                "S": cS,
+            }
+        )
+        if coarse_shape == sh:
+            break
+
+    # the coarsest level, factorised once: a row the caller eliminated (a Dirichlet degree of freedom)
+    # carries nothing, so it gets an identity row and the V-cycle leaves it where it was
+    last = levels[-1]
+    n_c = nf * int(np.prod(last["shape"]))
+    if "S" in last:
+        dense = _dense_from_stencil(last["S"], last["window"], last["shape"], nf, last["periodic"])
+    else:  # a grid too small to coarsen at all: difference the operator itself
+        dense = jax.jacfwd(lambda v: matvec(v))(jnp.zeros(n_c, dtype))
+    live = jnp.abs(dense).sum(axis=1) > 0
+    lu = jax.scipy.linalg.lu_factor(jnp.where(live[:, None] & live[None, :], dense, jnp.eye(n_c, dtype=dtype)))
+
+    def smooth(lev, x, r):
+        d = levels[lev]["d"]
+        inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
+        return x + inv * (r - levels[lev]["apply"](x))
+
+    def vcycle(lev, r):
+        if lev == len(levels) - 1:
+            return jax.scipy.linalg.lu_solve(lu, r.reshape(-1)).reshape((nf,) + levels[lev]["shape"])
+        x = jnp.zeros_like(r)
+        for _ in range(n_pre):
+            x = smooth(lev, x, r)
+        axes, transfers = levels[lev]["axes"], levels[lev]["transfers"]
+        resid = r - levels[lev]["apply"](x)
+        x = x + _prolong(vcycle(lev + 1, _restrict(resid, transfers, axes)), transfers, axes)
+        for _ in range(n_post):
+            x = smooth(lev, x, r)
+        return x
+
+    def apply(r_flat):
+        r = extract(jnp.asarray(r_flat).reshape((nf,) + full_shape))
+        return inject(vcycle(0, r)).reshape(-1)
+
+    return jax.jit(apply), len(levels)

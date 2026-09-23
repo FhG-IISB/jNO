@@ -75,16 +75,66 @@ def apply_stencil(S: jnp.ndarray, window, x: jnp.ndarray, periodic=()) -> jnp.nd
     return y
 
 
-def _colour_masks(shape, period, dtype):
-    """One ``(*shape,)`` indicator per colour: 1 at the nodes whose lattice index is ``≡ c (mod period)``."""
-    grids = np.indices(shape)
-    masks = []
-    for c in itertools.product(*(range(p) for p in period)):
-        m = np.ones(shape, dtype=bool)
-        for axis, ca in enumerate(c):
-            m &= grids[axis] % period[axis] == ca
-        masks.append(jnp.asarray(m, dtype))
-    return masks
+def _axis_colours(n: int, lo: int, hi: int, periodic: bool):
+    """A colouring of one axis in which the ``hi − lo + 1`` nodes of any row's window all differ.
+
+    ``i mod P`` does that for an open axis, and for a periodic one whose length is a multiple of the width.
+    Where it is not -- 32 unique nodes with a three-wide stencil -- the last ``n mod P`` nodes would see two
+    window neighbours of the same colour across the seam, so they get colours of their own.
+
+    Returns ``(colour_of_node, n_colours, offset_of[colour, node])``; the offset table holds the one window
+    offset a node reads for a colour, or ``NONE`` where that colour touches none of its window.
+    """
+    period = hi - lo + 1
+    colour = np.arange(n) % period
+    n_colours = period
+    tail = n % period if periodic else 0
+    if tail:
+        colour[n - tail :] = period + np.arange(tail)
+        n_colours = period + tail
+    off = np.full((n_colours, n), _NONE, dtype=int)
+    for o in range(lo, hi + 1):
+        j = np.arange(n) + o
+        inside = (j >= 0) & (j < n) if not periodic else np.ones(n, bool)
+        j = j % n if periodic else np.clip(j, 0, n - 1)
+        rows = np.nonzero(inside)[0]
+        if np.any(off[colour[j[rows]], rows] != _NONE):
+            raise ValueError(
+                f"jno lattice probe: the colouring of an axis of {n} nodes with window [{lo}, {hi}] is not "
+                "proper -- two of a row's neighbours share a colour. Pass an explicit window."
+            )
+        off[colour[j[rows]], rows] = o
+    return colour, n_colours, off
+
+
+#: Marks "this colour touches none of the node's window" in an offset table.
+_NONE = -10_000
+
+
+def _colour_pass(matvec, shape, nf, window, periodic, dtype):
+    """One matvec per colour and seed field.
+
+    Yields ``(f_seed, out, w, live)``: the seeded field, the operator's output ``(nf, *shape)``, the window
+    offset each node reads for this colour (as a flat index into :func:`offsets`), and where that offset
+    exists at all. Every consumer -- the full stencil, and the reductions a multigrid level needs -- is a
+    different accumulation over this one pass.
+    """
+    lo, hi = window
+    period = hi - lo + 1
+    axes = [_axis_colours(n, lo, hi, a < len(periodic) and periodic[a]) for a, n in enumerate(shape)]
+    idx = np.indices(shape)
+    for g in range(nf):
+        for c in itertools.product(*(range(a[1]) for a in axes)):
+            seed = np.ones(shape, bool)
+            w = np.zeros(shape, dtype=int)
+            live = np.ones(shape, bool)
+            for a, (colour, _, off) in enumerate(axes):
+                seed &= colour[idx[a]] == c[a]
+                oa = off[c[a]][idx[a]]
+                live &= oa != _NONE
+                w = w * period + np.where(oa == _NONE, 0, oa - lo)
+            out = matvec(jnp.zeros((nf,) + shape, dtype).at[g].set(jnp.asarray(seed, dtype)).reshape(-1))
+            yield g, jnp.asarray(out).reshape((nf,) + shape), jnp.asarray(w), jnp.asarray(live, dtype)
 
 
 def probe(matvec, shape, nf=1, *, window=None, periodic=(), dtype=None, verify=True, seed=0):
@@ -110,21 +160,12 @@ def probe(matvec, shape, nf=1, *, window=None, periodic=(), dtype=None, verify=T
     v = jnp.asarray(rng.standard_normal(nf * n), dtype=dtype)
     ref = matvec(v) if verify else None
 
+    per_full = tuple(periodic) + (False,) * (dim - len(periodic))
     for cand in WINDOWS if window is None else (window,):
-        lo, hi = cand
-        period = tuple(hi - lo + 1 for _ in range(dim))
-        for axis, p in enumerate(period):
-            if axis < len(periodic) and periodic[axis] and shape[axis] % p:
-                raise ValueError(
-                    f"jno lattice probe: periodic axis {axis} has {shape[axis]} nodes, which is not a multiple "
-                    f"of the stencil window's width {p}, so one colour would carry two of a row's coefficients. "
-                    "Use a grid whose periodic axes are a multiple of the width, or pass an explicit window."
-                )
-        masks = _colour_masks(shape, period, dtype)
-        S = _probe_window(matvec, shape, nf, lo, hi, masks, dtype)
+        S = _probe_window(matvec, shape, nf, cand, per_full, dtype)
         if not verify:
             return cand, S
-        got = apply_stencil(S, cand, v.reshape(nf, *shape), periodic).reshape(-1)
+        got = apply_stencil(S, cand, v.reshape(nf, *shape), per_full).reshape(-1)
         scale = float(jnp.linalg.norm(ref)) or 1.0
         if float(jnp.linalg.norm(got - ref)) <= float(np.sqrt(np.finfo(dtype).eps)) * scale:
             return cand, S
@@ -140,25 +181,36 @@ def probe(matvec, shape, nf=1, *, window=None, periodic=(), dtype=None, verify=T
     )
 
 
-def _probe_window(matvec, shape, nf, lo, hi, masks, dtype):
-    """One pass of colours: ``S[f, g, i, w]`` from ``matvec`` applied to each colour of each field.
+def probe_reduced(matvec, shape, nf=1, *, window, periodic=(), dtype=None):
+    """The two reductions of the stencil a multigrid level needs, **without storing it**:
 
-    For colour ``c`` the seed is 1 exactly at the nodes ``≡ c (mod period)``, so row ``i``'s output is the
-    coefficient of the single window offset ``o ≡ c − i (mod period)``. That offset's index in the window is
-    the same for every field pair, so one scatter per output field places the whole colour's result.
+    * ``d[f, i] = Σ_g Σ_o |a_{fg}(i, o)|`` -- the ℓ¹ row weight of every row;
+    * ``strength[w] = mean_i Σ_{f,g} |a_{fg}(i, o_w)|`` -- how strongly the operator couples along each
+      offset of the window.
+
+    The full stencil of a fine level is ``nf²·W`` numbers per node (1.2 GB for a 2-D five-point operator at
+    16.8M nodes); these two are ``nf`` per node and ``W`` in total. Same colours, same cost as :func:`probe`.
     """
+    shape = tuple(int(s) for s in shape)
     dim = len(shape)
-    offs = offsets(lo, hi, dim)
-    period = hi - lo + 1
-    idx = tuple(jnp.asarray(a) for a in np.indices(shape))  # lattice index per node, per axis
-    blocks = [[jnp.zeros(shape + (len(offs),), dtype) for _ in range(nf)] for _ in range(nf)]
-    for g in range(nf):  # the field the seed vector carries
-        for c, mask in enumerate(masks):
-            colour = np.unravel_index(c, (period,) * dim)
-            out = matvec(jnp.zeros((nf,) + shape, dtype).at[g].set(mask).reshape(-1)).reshape((nf,) + shape)
-            w = jnp.zeros(shape, dtype=int)  # this colour's offset index, per node
-            for a in range(dim):
-                w = w * period + (colour[a] - idx[a] - lo) % period
-            for f in range(nf):
-                blocks[f][g] = blocks[f][g].at[idx + (w,)].set(out[f])
+    dtype = jnp.result_type(float) if dtype is None else dtype
+    per_full = tuple(periodic) + (False,) * (dim - len(periodic))
+    d = jnp.zeros((nf,) + shape, dtype)
+    strength = jnp.zeros(len(offsets(*window, dim)), dtype)
+    for _g, out, w, live in _colour_pass(matvec, shape, nf, window, per_full, dtype):
+        contrib = jnp.abs(out) * live
+        d = d + contrib
+        strength = strength.at[w.reshape(-1)].add(contrib.sum(axis=0).reshape(-1))
+    return d, strength / float(np.prod(shape))
+
+
+def _probe_window(matvec, shape, nf, window, periodic, dtype):
+    """``S[f, g, i, w]``: every coefficient of every row, from one colour pass (:func:`_colour_pass`)."""
+    dim = len(shape)
+    n_off = len(offsets(*window, dim))
+    idx = tuple(jnp.asarray(a) for a in np.indices(shape))
+    blocks = [[jnp.zeros(shape + (n_off,), dtype) for _ in range(nf)] for _ in range(nf)]
+    for g, out, w, live in _colour_pass(matvec, shape, nf, window, periodic, dtype):
+        for f in range(nf):
+            blocks[f][g] = blocks[f][g].at[idx + (w,)].add(out[f] * live)
     return jnp.stack([jnp.stack(row) for row in blocks])
