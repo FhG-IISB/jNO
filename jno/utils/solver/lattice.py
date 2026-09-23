@@ -137,19 +137,21 @@ def _accumulate_colours(matvec, shape, nf, window, periodic, dtype, init, update
     for g in range(nf):  # the seeded field is static: nf is small, and it keeps the scatter's index static
 
         def body(c, carry, g=g):
-            seed = jnp.ones(shape, dtype)
-            w = jnp.zeros(shape, dtype=int)
-            live = jnp.ones(shape, dtype)
+            # int32 / bool intermediates: one index and one flag per node, on a grid that can hold
+            # millions of them (int64 and float masks cost 8 bytes a node each)
+            seed = jnp.ones(shape, bool)
+            w = jnp.zeros(shape, dtype=jnp.int32)
+            live = jnp.ones(shape, bool)
             for a in range(dim):
                 stride = int(np.prod(counts[a + 1 :]))
                 ca = (c // stride) % counts[a]
-                seed = seed * (colours[a][idx[a]] == ca).astype(dtype)
+                seed = seed & (colours[a][idx[a]] == ca)
                 oa = tables[a][ca][idx[a]]
-                live = live * (oa != _NONE).astype(dtype)
-                w = w * period + jnp.where(oa == _NONE, 0, oa - lo)
-            x = jnp.zeros((nf,) + shape, dtype).at[g].set(seed)
+                live = live & (oa != _NONE)
+                w = w * period + jnp.where(oa == _NONE, 0, oa - lo).astype(jnp.int32)
+            x = jnp.zeros((nf,) + shape, dtype).at[g].set(seed.astype(dtype))
             out = jnp.asarray(matvec(x.reshape(-1))).reshape((nf,) + shape)
-            return update(carry, g, out, w, live)
+            return update(carry, g, out, w, live.astype(dtype))
 
         carry = jax.jit(lambda carry, body=body: jax.lax.fori_loop(0, n_col, body, carry))(carry)
     return carry
