@@ -339,11 +339,17 @@ part). Write the real and imaginary parts as two real unknowns.
     | built from the grid (before) | 0.17 | 8.3 | 925 | 92 | 22 | 1.07 |
     | built from the operator | 0.30 | 0.69 | 0.31 | 0.13 | 0.27 | 0.57 |
 
-    Everything above 1 diverges. A **coupled** system (several unknowns, e.g. Navier–Stokes) is
-    preconditioned too — the stencil carries every field pair — though its cost is still governed by how
-    well a point smoother handles the coupling; `linear=jno.solve.lu(backend="host")` makes repeat solves of
-    a saddle-point system much faster (2.0 s against 46 s at 77k nodes, Kovasznay flow) after a slower first
-    call.
+    Everything above 1 diverges. A **nonlinear** problem gets the same V-cycle inside its Newton step, built
+    on the tangent with the Dirichlet rows eliminated. Measured on Bratu (repeat solve): 0.037 s at 16k
+    nodes, 0.047 s at 66k, 0.092 s at 263k and 0.25 s at 1.05M — against 0.85 s, 6.6 s and 97 s without it,
+    a cost that grew faster than the grid.
+
+    A **coupled** system is preconditioned too (the stencil carries every field pair, and the smoother
+    inverts each node's block). Kovasznay flow at 77k dofs went from 25 s to 6.0 s, second order in the
+    velocity. Its cost still grows faster than linearly (32 s at 198k dofs): the velocity–pressure coupling
+    of a saddle-point system sits *between* nodes, where a point-block smoother cannot reach it, and a patch
+    smoother or a block/Schur preconditioner is the next step. `linear=jno.solve.lu(backend="host")` remains
+    the fastest route for repeat solves of a small saddle-point system.
 
     Any grid size coarsens: an odd cell count merges into its neighbour, so 1000 cells a side coarsen as far
     as 1024 do. Only the axes the operator couples strongly are halved (semi-coarsening), and coarsening
