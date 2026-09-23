@@ -2695,6 +2695,24 @@ def test_complex_data_on_a_real_unknown_raises(where):
         jno.fdm(terms).solve()
 
 
+def test_equal_solver_specs_share_the_compiled_solve():
+    """The solve caches were keyed on ``id(spec)``, so every fresh ``jno.solve.gmres()`` (equal to the last one)
+    recompiled. They key on the spec now: equal keyed specs share the compiled solve, a different one does not."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-ui.xx - ui.yy - 1.0, u(xb, yb) - 0.0])
+    a = np.asarray(prob.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg()))
+    fn = prob._grid_linear_cache["fn"]
+    b = np.asarray(prob.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg()))
+    assert prob._grid_linear_cache["fn"] is fn
+    np.testing.assert_array_equal(a, b)
+    prob.solve(linear=jno.solve.gmres(tol=1e-10), precond=jno.precond.gmg())
+    assert prob._grid_linear_cache["fn"] is not fn
+
+
 def test_a_rank_two_unknown_raises_up_front():
     """A matrix unknown (value_shape=(2, 2)) failed deep inside the kernels with a reshape or broadcasting
     error. It now raises when the problem is built, naming the vector-unknown workaround."""

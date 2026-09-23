@@ -2278,8 +2278,10 @@ class _TraceFDM:
                 )
             eager = extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer)
             cache = self.__dict__.setdefault("_assembled_cache", {})
-            key = (id(linear), id(precond), self._data_fingerprint())
-            if eager and key in cache and cache[key][0] is linear and cache[key][1] is precond:
+            # Keyed on the specs themselves: equal keyed specs (two `jno.solve.gmres()` calls) share an entry,
+            # a keyless one matches only itself, and the key keeps it alive. `id()` missed equal specs.
+            key = (linear, precond, self._data_fingerprint())
+            if eager and key in cache:
                 A, rhs = cache[key][2], cache[key][3]  # a repeat solve: the operator is a constant of the problem
             else:
                 A, lift_rhs = self._dirichlet_lift("steady", self._sparse_operator("steady", residual, zeros))
@@ -2415,9 +2417,9 @@ class _TraceFDM:
         from .utils.solver.solver_api import record_nonlinear_verdict
 
         cache = self.__dict__.setdefault("_steady_cache", {})
-        key = (id(nonlinear), self._data_fingerprint())
+        key = (nonlinear, self._data_fingerprint())  # a nonlinear spec compares by identity; the key keeps it alive
         entry = cache.get(key)
-        if entry is None or entry[0] is not nonlinear:
+        if entry is None:
             residual = self._steady_residual()
             driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual, u0))
             linear = _structured_linear_solve(self.domain, bool(self._periodic_axes)) if self._nf == 1 else None
@@ -2518,7 +2520,7 @@ class _TraceFDM:
         N = self._N
         eager = extra_params is None
         cache = self.__dict__.setdefault("_grid_linear_cache", {})
-        key = (self._data_fingerprint(), id(linear), id(precond))
+        key = (self._data_fingerprint(), linear, precond)  # the specs themselves: equal keyed specs share a compile
         if eager and cache.get("key") == key:
             fn = cache["fn"]
         else:

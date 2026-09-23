@@ -284,6 +284,9 @@ class _GMG(_Spec):
 
     def __init__(self, n_pre, n_post, omega, min_size):
         self.n_pre, self.n_post, self.omega, self.min_size = n_pre, n_post, omega, min_size
+        # value identity, so two equal `gmg()` specs share a cached solve (not `traceable`, so this does not put
+        # it on the compiled slot path; see `_compilable`)
+        self.key = ("gmg", n_pre, n_post, omega, min_size)
 
     def materialize(self, ctx: PrecondContext):
         grid = ctx.grid
