@@ -3211,6 +3211,32 @@ class domain(MeshIOMixin):
         self._simplex_pool_store = value
         self._simplex_pools_built = True
 
+    def _lattice_boundary_nodes(self, points):
+        """Which nodes lie on the boundary, in closed form, or ``None`` when this domain is not a full
+        lattice.
+
+        A full tensor grid fills its bounding box, so a node is on the boundary exactly when one of its
+        coordinates is that axis' first or last -- the coordinates come from a ``linspace``, so the
+        comparison is exact. The guard is ``prod(shape) == n_points``: a lattice MASKED to some other
+        shape has boundary nodes strictly inside the bounding box, and a predicate that missed them would
+        drop real boundary faces rather than merely fail to prune.
+
+        It only ever prunes (:func:`jno.utils.solver.fem_facets._boundary_faces` counts what survives),
+        so the faces, their order and their normals are exactly what the unpruned count gives.
+        """
+        grid = getattr(self, "_structured_grid", None)
+        if not grid:
+            return None
+        shape = tuple(int(s) for s in grid.get("shape", ()) or ())
+        dim = int(self.dimension)
+        if len(shape) != dim or int(np.prod(shape)) != len(points):
+            return None
+        on = np.zeros(len(points), dtype=bool)
+        for axis in range(dim):
+            col = np.asarray(points)[:, axis]
+            on |= (col == col.min()) | (col == col.max())
+        return on
+
     def _build_simplex_pools(self) -> None:
         """Populate ``self._simplex_pools`` from ``_tag_edges`` / ``_tag_triangles``.
 
@@ -3305,7 +3331,9 @@ class domain(MeshIOMixin):
         self._boundary_regions = {}
 
         if self.dimension > 1:
-            boundary_normals, boundary_indices = self.get_boundary_normals(mesh)
+            boundary_normals, boundary_indices = self.get_boundary_normals(
+                mesh, boundary_nodes=self._lattice_boundary_nodes(points)
+            )
             boundary_normals = boundary_normals[:, : self.dimension]
         else:
             left_boundary = np.where(points[:, 0] == np.min(points[:, 0]))[0]
