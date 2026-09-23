@@ -173,18 +173,21 @@ def test_the_probe_handles_a_coupled_system_and_three_dimensions():
     np.testing.assert_allclose(np.asarray(got3), np.asarray(mv3(v3)), rtol=1e-10, atol=1e-10)
 
 
-def test_the_probe_costs_one_matvec_per_colour():
-    """The whole operator for 9 matvecs (a compact 2-D stencil) plus one for the check."""
+def test_the_colours_run_inside_one_compiled_program():
+    """The whole colour pass is one ``fori_loop``, so the operator is TRACED once (plus once for the check)
+    however many colours there are. Dispatching a program per colour per level cost 12 s of multigrid setup
+    at 1M nodes against 0.3 s of arithmetic."""
     shape = (7, 7)
-    calls = []
+    traces = []
     base = _laplacian_matvec(shape, 0.25)
 
     def counted(v):
-        calls.append(1)
+        traces.append(1)
         return base(v)
 
-    probe(counted, shape)
-    assert len(calls) == 9 + 1
+    window, S = probe(counted, shape)
+    assert window == (-1, 1)
+    assert len(traces) == 2  # one fold over the 9 colours, one verification matvec
 
 
 def test_a_global_operator_has_no_stencil_and_raises():

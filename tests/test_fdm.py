@@ -1550,11 +1550,37 @@ def test_wave_slots_on_the_newmark_step():
         assert _max_rel(make().solve(**kw), ref) < 1e-7, kw
 
 
-def test_gmg_refuses_the_augmented_wave_state():
-    """An explicit time scheme keeps the augmented [u; v] march, which gmg cannot precondition."""
-    make = _slot_problem("structured", time=(0.0, 0.1, 21), order=2)
-    with pytest.raises(ValueError, match="single scalar field"):
-        make().solve(linear=jno.solve.gmres(), precond=jno.precond.gmg(), time=jno.solve.theta(0.5))
+def test_gmg_preconditions_a_coupled_system():
+    """The V-cycle is built from the operator's own stencil, which carries every field pair, so a coupled
+    system is preconditioned like a scalar one -- it used to raise ("a single scalar field"). Oracle: the
+    default solve, and a direct one."""
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 32).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    terms = [
+        -ui.xx - ui.yy + 2.0 * vi - f,
+        -vi.xx - vi.yy - 0.5 * ui - f,
+        u(xb, yb) - 0.0,
+        v(xb, yb) - 0.0,
+    ]
+    base = np.asarray(jno.fdm(terms).solve())
+    got = np.asarray(jno.fdm(terms).solve(linear=jno.solve.gmres(), precond=jno.precond.gmg()))
+    direct = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    np.testing.assert_allclose(got, base, atol=1e-9)
+    np.testing.assert_allclose(got, direct, atol=1e-9)
+
+
+def test_gmg_refuses_a_system_that_is_not_a_lattice_operator():
+    """It still needs the system to BE fields on the grid: a size that is not a whole number of them raises."""
+    make = _slot_problem("structured")
+    prob = make()
+    with pytest.raises(ValueError, match="whole number of them"):
+        prob._check_precond_shape(jno.precond.gmg(), prob._N + 1)
 
 
 @pytest.mark.parametrize("case", ["steady", "heat", "wave"])

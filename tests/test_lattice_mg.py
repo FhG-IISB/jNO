@@ -49,12 +49,12 @@ def _eliminated(prob):
 
 
 def _expected_levels(shape, periodic=()):
-    """Every axis halves (merging an odd cell) until none can, whatever the grid's arithmetic: 101 nodes a
-    side coarsen 101 -> 51 -> 26 -> 13 -> 7 -> 4 -> 2, not 101 -> 51 -> stop. A periodic axis drops its
-    duplicate node first. (An isotropic operator coarsens every axis at every level, so this counts levels.)"""
+    """Every axis halves (merging an odd cell) until the level is small enough to factorise, whatever the
+    grid's arithmetic: 101 nodes a side coarsen 101 -> 51 -> 26, not 101 -> 51 -> stop. A periodic axis drops
+    its duplicate node first. (An isotropic operator coarsens every axis at every level.)"""
     shape = [n - 1 if a < len(periodic) and periodic[a] else n for a, n in enumerate(shape)]
     levels = 1
-    while True:
+    while int(np.prod(shape)) > lattice_mg.DENSE_MAX:
         nxt = [
             len(lattice_mg._axis_nodes(n))
             if n >= lattice_mg.MIN_NODES
@@ -63,8 +63,9 @@ def _expected_levels(shape, periodic=()):
             for a, n in enumerate(shape)
         ]
         if nxt == shape:
-            return levels
+            break
         shape, levels = nxt, levels + 1
+    return levels
 
 
 def _rho(mv, b, M, cycles=10):
@@ -93,15 +94,15 @@ def test_the_convergence_factor_does_not_grow_with_the_grid(kind):
     100:1 anisotropy, a strong reaction and an advection term, none of which the grid-only V-cycle
     preconditions (measured there: ρ 8.3, 925, 92, 22, 1.07 -- all divergent)."""
     rhos = []
-    for n in (32, 64):
+    for n in (64, 128):  # both build a hierarchy: a 33² grid is below the dense coarsest level (one level)
         d, prob = _problem(n, kind)
         shape = tuple(d.mesh_connectivity["grid"]["shape"])
         mv, b, mask = _eliminated(prob)
         vcycle, levels = lattice_mg.build(mv, shape)
         if kind == "anisotropic":  # semi-coarsening: only the strong axis halves first, so it takes more levels
             assert levels >= _expected_levels(shape)
-        elif kind == "advection":  # stops where the coarse operator's smoother would amplify (cell Péclet > 2)
-            assert levels < _expected_levels(shape)
+        elif kind == "advection":  # stops at or before the geometric bound: a coarse level whose smoother
+            assert levels <= _expected_levels(shape)  # would amplify (cell Péclet > 2) is not built
         else:
             assert levels == _expected_levels(shape)
         rho, _ = _rho(mv, b, lambda r: vcycle(r * mask) * mask)

@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .lattice import apply_stencil, offsets, probe, probe_reduced
+from .lattice import apply_stencil, offsets, probe, probe_reduced, shift
 
 #: Strength below which an axis is left uncoarsened (semi-coarsening): an axis whose couplings are weaker
 #: than this fraction of the strongest axis' does not carry the error a coarse grid must represent. The
@@ -37,9 +37,15 @@ from .lattice import apply_stencil, offsets, probe, probe_reduced
 STRENGTH = 0.25
 #: An axis of fewer than this many nodes cannot be halved (two cells at least).
 MIN_NODES = 4
-#: Largest coarsest level that is factorised densely. This is a MEMORY statement, not a guess about the
-#: problem: the factor is baked into the compiled V-cycle, and 2048 unknowns is 32 MB in float64. A coarsest
-#: level above it is smoothed instead of solved, which weakens the preconditioner and changes no answer.
+#: Where the hierarchy ends: a level of at most this many unknowns is factorised densely instead of being
+#: coarsened further. Two costs meet here, and neither is a guess about the problem:
+#:
+#: * memory -- the factor is baked into the compiled V-cycle, and 2048 unknowns is 32 MB in float64;
+#: * setup -- every level costs a compilation (measured: 0.65 s each on an RTX 3070, whatever its size),
+#:   while a dense solve of 2048 unknowns costs one factorisation and a back-substitution per cycle.
+#:
+#: A level ABOVE it that cannot be coarsened (a convection stall) is smoothed instead of solved, which
+#: weakens the preconditioner and changes no answer.
 DENSE_MAX = 2048
 
 
@@ -162,6 +168,26 @@ def _strength_of(S, window, dim):
     return jnp.abs(S).sum(axis=(0, 1)).reshape(-1, len(offsets(*window, dim))).mean(axis=0)
 
 
+def _symmetric_stencil(S, window, dim):
+    """Is the stencil symmetric, ``a_{fg}(i, o) == a_{gf}(i + o, −o)``? Then the operator is, and ℓ¹-Jacobi
+    cannot amplify on it (Baker et al. 2011), so the power iteration below is not needed."""
+    offs = offsets(*window, dim)
+    tol = float(np.sqrt(np.finfo(np.asarray(S).dtype).eps))
+    scale = float(jnp.max(jnp.abs(S))) or 1.0
+    for w, o in enumerate(offs):
+        back = offs.index(tuple(-oa for oa in o)) if all(window[0] <= -oa <= window[1] for oa in o) else None
+        if back is None:
+            if float(jnp.max(jnp.abs(S[..., w]))) > tol * scale:
+                return False
+            continue
+        for f in range(S.shape[0]):
+            for g in range(S.shape[1]):
+                shifted = shift(S[g, f, ..., back][None], o)[0]  # a_{gf}(i + o, −o)
+                if float(jnp.max(jnp.abs(S[f, g, ..., w] - shifted))) > tol * scale:
+                    return False
+    return True
+
+
 def _smoother_amplifies(apply_fn, d, shape, nf, iters=20, seed=0):
     """Does ℓ¹-Jacobi **grow** the error on this level: is ``ρ(I − D⁻¹A) > 1``?
 
@@ -281,6 +307,8 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
     while True:
         top = levels[-1]
         sh = top["shape"]
+        if nf * int(np.prod(sh)) <= DENSE_MAX:
+            break  # small enough to factorise: cheaper than another level's setup
         axes = _strong_axes(top["strength"], top["window"], sh, dim, top["periodic"])
         if not axes:  # no axis can be halved: this is the coarsest level
             break
@@ -289,6 +317,7 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
         top["axes"], top["transfers"] = axes, transfers
         fine_apply, fine_per = top["apply"], top["periodic"]
 
+        @jax.jit  # one compiled program per level: the probe applies it once per colour
         def coarse_matvec(v, fine_apply=fine_apply, transfers=transfers, axes=axes, coarse_shape=coarse_shape):
             x = _prolong(v.reshape((nf,) + coarse_shape), transfers, axes)
             return _restrict(fine_apply(x), transfers, axes).reshape(-1)
@@ -296,7 +325,7 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
         cper = tuple(p and a in axes or p for a, p in enumerate(fine_per))  # periodicity survives coarsening
         cwin, cS = probe(coarse_matvec, coarse_shape, nf, periodic=cper, dtype=dtype)
         cd = _l1_weights(cS)
-        amplifies = _smoother_amplifies(
+        amplifies = not _symmetric_stencil(cS, cwin, dim) and _smoother_amplifies(
             lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper), cd, coarse_shape, nf
         )
         if amplifies and nf * int(np.prod(sh)) <= DENSE_MAX:
@@ -304,7 +333,7 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
         levels.append(
             {
                 "shape": coarse_shape,
-                "apply": (lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper)),
+                "apply": jax.jit(lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper)),
                 "d": cd,
                 "strength": _strength_of(cS, cwin, dim),
                 "window": cwin,
@@ -339,34 +368,48 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
         live = jnp.abs(dense).sum(axis=1) > 0
         lu = jax.scipy.linalg.lu_factor(jnp.where(live[:, None] & live[None, :], dense, jnp.eye(n_c, dtype=dtype)))
 
-    def smooth(lev, x, r):
-        d = levels[lev]["d"]
-        inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
-        return x + inv * (r - levels[lev]["apply"](x))
+    # The per-level stencils and weights are handed to the compiled V-cycle as ARGUMENTS, not closed over:
+    # a closed-over array becomes a constant inside the executable, and at 4.2M nodes loading that executable
+    # ran the card out of memory ("Failed to load in-memory CUBIN").
+    weights = tuple(lev["d"] for lev in levels)
+    stencils = tuple(lev.get("S") for lev in levels[1:])
 
-    def coarsest(r):
-        if lu is not None:
-            return jax.scipy.linalg.lu_solve(lu, r.reshape(-1)).reshape((nf,) + levels[-1]["shape"])
+    def smooth(lev, x, r, state):
+        d = state[0][lev]
+        inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
+        return x + inv * (r - level_apply(lev, x, state))
+
+    def level_apply(lev, x, state):
+        if lev == 0:
+            return jnp.asarray(matvec(x.reshape(-1))).reshape((nf,) + levels[0]["shape"])
+        S = state[1][lev - 1]
+        return apply_stencil(S, levels[lev]["window"], x, levels[lev]["periodic"])
+
+    def coarsest(r, state):
+        if state[2] is not None:
+            return jax.scipy.linalg.lu_solve(state[2], r.reshape(-1)).reshape((nf,) + levels[-1]["shape"])
         x = jnp.zeros_like(r)  # too large to factorise: smooth it instead (linear, so the V-cycle stays linear)
         for _ in range(n_pre + n_post):
-            x = smooth(len(levels) - 1, x, r)
+            x = smooth(len(levels) - 1, x, r, state)
         return x
 
-    def vcycle(lev, r):
+    def vcycle(lev, r, state):
         if lev == len(levels) - 1:
-            return coarsest(r)
+            return coarsest(r, state)
         x = jnp.zeros_like(r)
         for _ in range(n_pre):
-            x = smooth(lev, x, r)
+            x = smooth(lev, x, r, state)
         axes, transfers = levels[lev]["axes"], levels[lev]["transfers"]
-        resid = r - levels[lev]["apply"](x)
-        x = x + _prolong(vcycle(lev + 1, _restrict(resid, transfers, axes)), transfers, axes)
+        resid = r - level_apply(lev, x, state)
+        x = x + _prolong(vcycle(lev + 1, _restrict(resid, transfers, axes), state), transfers, axes)
         for _ in range(n_post):
-            x = smooth(lev, x, r)
+            x = smooth(lev, x, r, state)
         return x
 
-    def apply(r_flat):
+    @jax.jit
+    def _apply(r_flat, state):
         r = extract(jnp.asarray(r_flat).reshape((nf,) + full_shape))
-        return inject(vcycle(0, r)).reshape(-1)
+        return inject(vcycle(0, r, state)).reshape(-1)
 
-    return jax.jit(apply), len(levels)
+    state = (weights, stencils, lu)
+    return (lambda r_flat: _apply(r_flat, state)), len(levels)

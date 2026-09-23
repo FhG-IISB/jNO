@@ -318,31 +318,43 @@ by `jno.fdm`: a complex source, coefficient or boundary value raises (a real sol
 part). Write the real and imaginary parts as two real unknowns.
 
 !!! note "Solvers on a structured grid"
-    A **linear** problem whose Dirichlet data covers the whole boundary is one Krylov solve, with no
-    Newton step. The Dirichlet rows are eliminated (`u = u_D + x`, `x` zero on the boundary ring), which
-    leaves the interior system the geometric-multigrid V-cycle (`jno.precond.gmg()`) preconditions, applied
-    matrix-free as the JVP of the residual. A random-probe test decides symmetry: a symmetric operator (a
-    diffusion, with a coefficient or a reaction term) gets **conjugate gradients**, anything else
-    **GMRES** that checks its residual every iteration. Measured on 3-D Poisson at 0.9M nodes (RTX 3070):
-    8 CG iterations, 212 MB peak and 0.05 s per solve, against 380 MB and 0.17 s for the Newton-GMRES path
-    it replaces; 4.2M nodes solve in 2-D or 3-D on an 8 GB card. Differentiable through
-    `custom_linear_solve`, and a solve that does not reach its tolerance raises.
+    A **linear** problem on a lattice is one Krylov solve, with no Newton step. The Dirichlet rows are
+    eliminated (`u = u_D + x`, `x` zero where the data is given), and the rest is applied matrix-free as the
+    JVP of the residual. A random-probe test decides symmetry: a symmetric operator (a diffusion, with a
+    coefficient or a reaction term) gets **conjugate gradients**, anything else **GMRES**, restarted until
+    the *true* residual meets the tolerance. Measured on 3-D Poisson at 0.9M nodes (RTX 3070): 8 CG
+    iterations, 212 MB peak and 0.05 s per solve, against 380 MB and 0.17 s for the Newton-GMRES path it
+    replaces. Differentiable through `custom_linear_solve`, and a solve that does not reach its tolerance
+    raises. Flux (Neumann/Robin) boundaries, partial Dirichlet data and periodic axes take this path too;
+    nonlinear problems keep the matrix-free Newton, with the same V-cycle inside it.
 
-    Other problems -- nonlinear ones, a flux (Neumann/Robin) boundary, periodic axes -- keep the
-    matrix-free Newton with GMRES and the V-cycle. Explicit `linear=jno.solve.cg() / gmres() / bicgstab()`
-    with `precond=jno.precond.gmg()` (or no preconditioner) stays matrix-free on a structured linear
-    problem; other slots (`lu`, `amg`, `jacobi`, ...) assemble the operator. The multigrid needs a grid it
-    can coarsen: it halves every axis while each has an even cell count, so a count of the form m·2ᵏ with
-    small m coarsens furthest (1024 cells to a 5×5 coarsest grid, 1000 cells only to 126×126). A coarsest
-    level of at most 1024 unknowns is factorised once; a larger one is solved by Chebyshev iteration on its
-    exact spectrum, which is logged with the step count. Either way the cost stays linear: 2-D Poisson on
-    an RTX 3070 solves in 0.044 s at 1024² cells and 0.041 s at 1000², and 16.8M nodes (4096²) fit in
-    3.9 GB. A **coupled** system (several
-    unknowns, e.g. Navier–Stokes) is not multigrid-preconditioned yet, and its cost grows faster than
-    linearly with the grid; `linear=jno.solve.lu(backend="host")` makes its repeat solves much faster
-    (2.0 s against 46 s at 77k nodes, Kovasznay flow) after a slower first call. `jno.precond.gmg()` is
-    also a reusable slot for `fem.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())` on a
-    structured domain.
+    **The V-cycle is built from the operator being solved** (`jno.precond.gmg()`), not from the grid: its
+    per-node stencil is read by colouring (9 matvecs for a 2-D five-point operator), the coarse operators
+    are the variational `Pᵀ A P` probed on each coarse lattice, and the smoother is ℓ¹-Jacobi with the rows'
+    own weights. Measured as a standalone iteration on a 65² grid (residual factor per cycle, lower is
+    better):
+
+    | operator | Poisson | κ(x) smooth | κ jump 10³ | 100:1 anisotropy | strong reaction | advection |
+    |---|---|---|---|---|---|---|
+    | built from the grid (before) | 0.17 | 8.3 | 925 | 92 | 22 | 1.07 |
+    | built from the operator | 0.30 | 0.69 | 0.31 | 0.13 | 0.27 | 0.57 |
+
+    Everything above 1 diverges. A **coupled** system (several unknowns, e.g. Navier–Stokes) is
+    preconditioned too — the stencil carries every field pair — though its cost is still governed by how
+    well a point smoother handles the coupling; `linear=jno.solve.lu(backend="host")` makes repeat solves of
+    a saddle-point system much faster (2.0 s against 46 s at 77k nodes, Kovasznay flow) after a slower first
+    call.
+
+    Any grid size coarsens: an odd cell count merges into its neighbour, so 1000 cells a side coarsen as far
+    as 1024 do. Only the axes the operator couples strongly are halved (semi-coarsening), and coarsening
+    stops where the next level's own smoother would amplify — which is what a convection term does once
+    coarsening pushes its cell Péclet number past 2. The coarsest level is factorised once while it is at
+    most 2048 unknowns (a 32 MB factor in float64), and smoothed instead when it is larger, which is logged.
+
+    Explicit `linear=jno.solve.cg() / gmres() / bicgstab()` with `precond=jno.precond.gmg()` (or no
+    preconditioner) stays matrix-free; other slots (`lu`, `amg`, `jacobi`, …) assemble the operator.
+    `jno.precond.gmg()` is also a slot for `fem.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())`
+    on a structured domain.
 
     Supported: **2-D axis-aligned rectangles** (`shape.rect`) and **3-D boxes** (`shape.box`). A
     composite/CSG shape or a spatially varying `size=` raises; composite / cut-cell geometry is planned.
@@ -571,14 +583,14 @@ crux-driven inverse runs through the slots too.
     The default's inner Krylov is unpreconditioned, so its iteration count grows with Δt and with mesh
     refinement. AMG holds it at 6–8 per step. Every column gives the same answer to every printed digit.
 
-Scope: `gmg` preconditions one scalar field on a structured grid, so it refuses a coupled system; use
-`amg` there. A time step's matrix is `α(−Δ) + σI` (`I + θΔt(−Δ)` for a heat step, `(4/Δt²)I − Δ` for the
-Newmark wave step), and `gmg` reads `α` and `σ` from the operator and builds its V-cycle for exactly that.
-A cycle for `−Δ` alone had cost the 201² wave march 3.0 s at Δt = 1e-3 (1.0 s now). When the shift
-dominates (small Δt), `jacobi` is already nearly exact and is cheapest: 0.46 s on that march. `gmg` wins
-at large Δt, where diffusion dominates: 2.6 s against 11.8 s for `jacobi` on a 401² heat march at Δt = 0.1.
-For an operator of another form (a variable coefficient, advection), the cycle is built from its value at
-the centre node.
+Scope: `gmg` needs the system to be fields on a structured grid (a coupled system is fine — the stencil
+carries every field pair — but an operator that is not a whole number of fields on the grid raises); use
+`amg` there. A time step's matrix is the step operator itself (`M + θΔt·A`), and `gmg` reads *its* stencil,
+so the shift a small Δt adds is simply part of what the V-cycle is built for — as is a variable
+coefficient, a reaction or an advection term. When the shift dominates (small Δt) the step operator is
+nearly diagonal and `jacobi` is already nearly exact and cheapest: 0.46 s on a 201² Newmark wave march at
+Δt = 1e-3. `gmg` wins at large Δt, where diffusion dominates: 2.6 s against 11.8 s for `jacobi` on a 401²
+heat march at Δt = 0.1.
 
 ---
 

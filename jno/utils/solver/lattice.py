@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import itertools
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -111,30 +112,47 @@ def _axis_colours(n: int, lo: int, hi: int, periodic: bool):
 _NONE = -10_000
 
 
-def _colour_pass(matvec, shape, nf, window, periodic, dtype):
-    """One matvec per colour and seed field.
+def _accumulate_colours(matvec, shape, nf, window, periodic, dtype, init, update):
+    """Fold ``update`` over every colour of every seed field, inside ONE compiled loop per seed field.
 
-    Yields ``(f_seed, out, w, live)``: the seeded field, the operator's output ``(nf, *shape)``, the window
-    offset each node reads for this colour (as a flat index into :func:`offsets`), and where that offset
-    exists at all. Every consumer -- the full stencil, and the reductions a multigrid level needs -- is a
-    different accumulation over this one pass.
+    ``update(carry, g, out, w, live) -> carry`` sees the operator's output for that colour, the window
+    offset each node reads (a flat index into :func:`offsets`), and where that offset exists. Every consumer
+    -- the full stencil, and the reductions a multigrid level needs -- is a different fold over this.
+
+    The colours run inside ``lax.fori_loop`` rather than as a Python loop: a hierarchy probes a dozen levels,
+    and dispatching (and compiling) a program per colour per level cost 12 s of setup at 1M nodes against
+    0.3 s of arithmetic.
     """
     lo, hi = window
+    dim = len(shape)
     period = hi - lo + 1
     axes = [_axis_colours(n, lo, hi, a < len(periodic) and periodic[a]) for a, n in enumerate(shape)]
-    idx = np.indices(shape)
-    for g in range(nf):
-        for c in itertools.product(*(range(a[1]) for a in axes)):
-            seed = np.ones(shape, bool)
-            w = np.zeros(shape, dtype=int)
-            live = np.ones(shape, bool)
-            for a, (colour, _, off) in enumerate(axes):
-                seed &= colour[idx[a]] == c[a]
-                oa = off[c[a]][idx[a]]
-                live &= oa != _NONE
-                w = w * period + np.where(oa == _NONE, 0, oa - lo)
-            out = matvec(jnp.zeros((nf,) + shape, dtype).at[g].set(jnp.asarray(seed, dtype)).reshape(-1))
-            yield g, jnp.asarray(out).reshape((nf,) + shape), jnp.asarray(w), jnp.asarray(live, dtype)
+    counts = [int(k) for _, k, _ in axes]
+    colours = [jnp.asarray(c) for c, _, _ in axes]
+    tables = [jnp.asarray(o) for _, _, o in axes]
+    idx = [jnp.asarray(a) for a in np.indices(shape)]
+    n_col = int(np.prod(counts))
+
+    carry = init
+    for g in range(nf):  # the seeded field is static: nf is small, and it keeps the scatter's index static
+
+        def body(c, carry, g=g):
+            seed = jnp.ones(shape, dtype)
+            w = jnp.zeros(shape, dtype=int)
+            live = jnp.ones(shape, dtype)
+            for a in range(dim):
+                stride = int(np.prod(counts[a + 1 :]))
+                ca = (c // stride) % counts[a]
+                seed = seed * (colours[a][idx[a]] == ca).astype(dtype)
+                oa = tables[a][ca][idx[a]]
+                live = live * (oa != _NONE).astype(dtype)
+                w = w * period + jnp.where(oa == _NONE, 0, oa - lo)
+            x = jnp.zeros((nf,) + shape, dtype).at[g].set(seed)
+            out = jnp.asarray(matvec(x.reshape(-1))).reshape((nf,) + shape)
+            return update(carry, g, out, w, live)
+
+        carry = jax.jit(lambda carry, body=body: jax.lax.fori_loop(0, n_col, body, carry))(carry)
+    return carry
 
 
 def probe(matvec, shape, nf=1, *, window=None, periodic=(), dtype=None, verify=True, seed=0):
@@ -195,22 +213,27 @@ def probe_reduced(matvec, shape, nf=1, *, window, periodic=(), dtype=None):
     dim = len(shape)
     dtype = jnp.result_type(float) if dtype is None else dtype
     per_full = tuple(periodic) + (False,) * (dim - len(periodic))
-    d = jnp.zeros((nf,) + shape, dtype)
-    strength = jnp.zeros(len(offsets(*window, dim)), dtype)
-    for _g, out, w, live in _colour_pass(matvec, shape, nf, window, per_full, dtype):
+    init = (jnp.zeros((nf,) + shape, dtype), jnp.zeros(len(offsets(*window, dim)), dtype))
+
+    def update(carry, _g, out, w, live):
+        d, strength = carry
         contrib = jnp.abs(out) * live
-        d = d + contrib
-        strength = strength.at[w.reshape(-1)].add(contrib.sum(axis=0).reshape(-1))
+        return d + contrib, strength.at[w.reshape(-1)].add(contrib.sum(axis=0).reshape(-1))
+
+    d, strength = _accumulate_colours(matvec, shape, nf, window, per_full, dtype, init, update)
     return d, strength / float(np.prod(shape))
 
 
 def _probe_window(matvec, shape, nf, window, periodic, dtype):
-    """``S[f, g, i, w]``: every coefficient of every row, from one colour pass (:func:`_colour_pass`)."""
+    """``S[f, g, i, w]``: every coefficient of every row, folded over the colours."""
     dim = len(shape)
     n_off = len(offsets(*window, dim))
     idx = tuple(jnp.asarray(a) for a in np.indices(shape))
-    blocks = [[jnp.zeros(shape + (n_off,), dtype) for _ in range(nf)] for _ in range(nf)]
-    for g, out, w, live in _colour_pass(matvec, shape, nf, window, periodic, dtype):
+    init = jnp.zeros((nf, nf) + shape + (n_off,), dtype)
+
+    def update(S, g, out, w, live):
         for f in range(nf):
-            blocks[f][g] = blocks[f][g].at[idx + (w,)].add(out[f] * live)
-    return jnp.stack([jnp.stack(row) for row in blocks])
+            S = S.at[(f, g) + idx + (w,)].add(out[f] * live)
+        return S
+
+    return _accumulate_colours(matvec, shape, nf, window, periodic, dtype, init, update)

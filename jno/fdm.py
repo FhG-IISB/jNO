@@ -2274,7 +2274,7 @@ class _TraceFDM:
         with jax.ensure_compile_time_eval():
             at = jnp.zeros(self._Ntot) if isinstance(at, jax.core.Tracer) else jnp.asarray(at)
             vcycle, _levels = build(
-                lambda v: jax.jvp(residual, (at,), (v,))[1],
+                jax.jit(lambda v: jax.jvp(residual, (at,), (v,))[1]),  # jitted: one program per probe colour
                 tuple(grid["shape"]),
                 nf=self._nf,
                 periodic=(self._grid or {}).get("periodic", ()),
@@ -2371,18 +2371,19 @@ class _TraceFDM:
         )
 
     def _check_precond_shape(self, precond, n):
-        """``gmg`` is a V-cycle on ONE scalar grid field. A coupled system or the augmented ``[u; v]`` state
-        of a ``u.tt`` problem is several fields long, and the V-cycle would reshape it onto the grid."""
+        """``gmg`` reads the operator's stencil on the grid, so the system must BE a lattice operator: a whole
+        number of fields on this grid. A coupled system and the augmented ``[u; v]`` state of a ``u.tt``
+        problem both are (the V-cycle probes every field pair); a system of some other size is not."""
         if precond is None:
             return
         from .precond import _GMG
         from .utils.solver.solver_api import _specs_in
 
-        if n != self._N and any(isinstance(s, _GMG) for s in _specs_in(precond)):
+        if n % self._N and any(isinstance(s, _GMG) for s in _specs_in(precond)):
             raise ValueError(
-                f"jno.precond.gmg() preconditions a single scalar field on the grid ({self._N} nodes), but "
-                f"this system has {n} unknowns (a coupled system, or the [u; v] state of a u.tt problem). "
-                "Use jno.precond.amg(), which works on any assembled operator."
+                f"jno.precond.gmg() preconditions fields on the grid ({self._N} nodes each), and this system "
+                f"has {n} unknowns, which is not a whole number of them. Use jno.precond.amg(), which works on "
+                "any assembled operator."
             )
 
     def _steady_residual(self, extra_params=None, extra_pins=None):
@@ -2492,31 +2493,23 @@ class _TraceFDM:
     # A linear problem on a structured grid: one Krylov solve on the interior, no Newton
     # ------------------------------------------------------------------------------------------------
     def _grid_linear_ok(self):
-        """Does the steady solve take the structured linear path? A single field on a non-periodic
-        structured grid the multigrid can coarsen, an affine residual, and Dirichlet data on the whole
-        boundary ring -- so the unknowns left after eliminating it are exactly the grid interior the
-        V-cycle preconditions. Decided once per problem."""
+        """Does the steady solve take the structured linear path? One scalar field on a lattice, with an
+        affine residual: then ``R(u) = 0`` is one preconditioned Krylov solve rather than a Newton step
+        around it.
+
+        It used to need Dirichlet data on the whole boundary ring, no flux row and no periodic tie, because
+        the V-cycle it preconditioned with was built for ``-Δ`` with a Dirichlet ring. The V-cycle is built
+        from this operator now (:meth:`_grid_vcycle`), so those rows are just rows. Decided once per problem.
+        """
         if getattr(self, "_grid_linear", None) is not None:
             return self._grid_linear
         ok = False
         grid = self.domain.mesh_connectivity.get("grid") if self.domain.mesh_connectivity else None
-        if (
-            self._nf == 1
-            and not self._transient
-            and grid is not None
-            and not self._periodic_axes
-            and self._nodes_are_the_grid(grid)
-            and not self._flux_rows()
-            and not self._periodic_rows()
-        ):
-            from .utils.solver.geometric_mg import _hierarchy
+        if self._nf == 1 and not self._transient and grid is not None and self._nodes_are_the_grid(grid):
+            import jax
 
-            n_levels = len(_hierarchy(grid["shape"], grid["spacing"], 5))  # the count only; nothing built
-            if n_levels >= 2 and np.array_equal(self._dirichlet_nodes(), self._grid_ring(grid)):
-                import jax
-
-                with jax.ensure_compile_time_eval():
-                    ok = self._is_affine("steady", lambda: self._steady_residual(self._current_params()), self._Ntot)
+            with jax.ensure_compile_time_eval():
+                ok = self._is_affine("steady", lambda: self._steady_residual(self._current_params()), self._Ntot)
         self._grid_linear = ok
         return ok
 
@@ -2543,7 +2536,7 @@ class _TraceFDM:
         )
         return np.nonzero(np.any((k == 0) | (k == shape - 1), axis=1))[0]
 
-    def _grid_linear_steady(self, extra_params=None, tol=1e-10, *, linear=None, precond=None):
+    def _grid_linear_steady(self, extra_params=None, tol=1e-12, *, linear=None, precond=None):
         """Solve ``R(u) = 0`` for an affine ``R`` on a structured grid as ONE linear solve.
 
         The Dirichlet rows are eliminated -- ``u = u_D + x`` with ``x`` zero on the boundary ring -- which
@@ -2588,8 +2581,11 @@ class _TraceFDM:
             with jax.ensure_compile_time_eval():
                 probe_residual = self._steady_residual(self._current_params())
                 zeros = jnp.zeros(self._Ntot)
+                # jitted: the probe applies it once per colour per level, and an un-jitted jvp of a jitted
+                # residual re-traces and re-compiles on every one of them (12 s of setup at 1M nodes)
+                probe_mv = jax.jit(lambda v: jax.jvp(probe_residual, (zeros,), (v * mask,))[1] * mask)
                 vcycle, _levels = build_vcycle(
-                    lambda v: jax.jvp(probe_residual, (zeros,), (v * mask,))[1] * mask,
+                    probe_mv,
                     tuple(grid["shape"]),
                     nf=self._nf,
                     periodic=(self._grid or {}).get("periodic", ()),
