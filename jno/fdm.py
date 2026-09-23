@@ -810,14 +810,6 @@ class _TraceFDM:
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])  # nodes per field
         # A vector unknown (`domain.unknown(value_shape=(2,))`) is one DOF block per component, so the DOF
         # vector is [u_0 components…, u_1 components…] in declaration order; `_nf` counts BLOCKS.
-        for w in self.unknowns:
-            if np.ndim(w.module.value) > 2:
-                shape = tuple(np.shape(w.module.value)[1:])
-                raise NotImplementedError(
-                    f"jno.fdm([...]): an unknown with value_shape={shape} (rank {len(shape)}) is not supported yet: "
-                    "the finite-difference kernels take one channel axis. Use a vector unknown, "
-                    f"domain.unknown(value_shape=({int(np.prod(shape))},)), and index its components."
-                )
         self._ncomp = [int(np.prod(np.shape(w.module.value)[1:], dtype=int)) for w in self.unknowns]
         self._block0 = [int(b) for b in np.cumsum([0] + self._ncomp)[:-1]]
         self._nf = int(sum(self._ncomp))

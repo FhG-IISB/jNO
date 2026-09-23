@@ -2794,16 +2794,72 @@ def test_the_cotangent_laplacian_does_not_depend_on_the_mesh_units(dim):
         np.testing.assert_allclose(np.asarray(lap)[interior], 2.0 * dim, rtol=1e-6)
 
 
-def test_a_rank_two_unknown_raises_up_front():
-    """A matrix unknown (value_shape=(2, 2)) failed deep inside the kernels with a reshape or broadcasting
-    error. It now raises when the problem is built, naming the vector-unknown workaround."""
-    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 8).structured().domain()
+@pytest.mark.parametrize("structured", [True, False])
+def test_a_matrix_unknown_equals_the_same_components_as_scalars(structured):
+    """`domain.unknown(value_shape=(2, 2))` -- a tensor field, e.g. a stress or a conformation tensor -- is
+    four scalars that travel together: coupled through their equation, differentiated component-wise. It used
+    to fail inside the kernels with a reshape or broadcasting error, because they take one channel axis.
+    Oracle: the same system written as four scalar unknowns."""
+    import jno.jnp_ops as jnn
+
+    d = (
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+        if structured
+        else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12)
+    )
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    rhs = [(k + 1.0) * f for k in range(4)]  # one source per component
+
     T = d.unknown(value_shape=(2, 2))
     Ti = T.bind(x=x, y=y)
-    with pytest.raises(NotImplementedError, match=r"value_shape=\(4,\)"):
-        jno.fdm([-Ti.xx - Ti.yy - 1.0, T(xb, yb) - 0.0])
+    zero = 0.0 * xb
+    F = jnn.stack([jnn.stack([rhs[0], rhs[1]], axis=-1), jnn.stack([rhs[2], rhs[3]], axis=-1)], axis=-2)
+    Z = jnn.stack([jnn.stack([zero, zero], axis=-1), jnn.stack([zero, zero], axis=-1)], axis=-2)
+    tensor = np.asarray(jno.fdm([-Ti.xx - Ti.yy - F, T(xb, yb) - Z]).solve())
+
+    scalars = []
+    for k in range(4):
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        scalars.append(np.asarray(jno.fdm([-ui.xx - ui.yy - rhs[k], u(xb, yb) - 0.0]).solve()).reshape(-1))
+    assert tensor.shape == (4, len(scalars[0]))
+    for k in range(4):
+        np.testing.assert_allclose(tensor[k], scalars[k], atol=1e-8 * max(np.abs(scalars[k]).max(), 1e-30))
+
+
+def test_a_matrix_unknown_couples_its_components_through_a_tensor_product():
+    """A tensor equation may mix the components: `-ΔT + T·C = F`. Oracle: T = sin(πx) sin(πy)·M solves it
+    exactly for F = 2π² S·M + S·(M·C), so the discrete answer is that field to second order."""
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 24).structured().domain()
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    M = np.array([[1.0, 2.0], [3.0, 4.0]])
+    C = np.array([[0.0, 1.0], [1.0, 0.0]])  # swaps the columns: (0,0) couples to (0,1), (1,0) to (1,1)
+    S = jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    one = 0.0 * x + 1.0
+
+    def const(A):  # a constant 2x2 matrix as a per-node field
+        return jnn.stack([jnn.stack([A[i, j] * one for j in range(2)], axis=-1) for i in range(2)], axis=-2)
+
+    def scaled(A):  # A[i, j] * S as a per-node field (a scalar point quantity is (N, 1) and does not
+        return jnn.stack(  # broadcast against an (N, 2, 2) field, so the components are built one by one)
+            [jnn.stack([A[i, j] * S for j in range(2)], axis=-1) for i in range(2)], axis=-2
+        )
+
+    T = d.unknown(value_shape=(2, 2))
+    Ti = T.bind(x=x, y=y)
+    src = scaled(2 * np.pi**2 * M) + scaled(M @ C)
+    zero = 0.0 * xb
+    Z = jnn.stack([jnn.stack([zero, zero], axis=-1), jnn.stack([zero, zero], axis=-1)], axis=-2)
+    sol = np.asarray(jno.fdm([-Ti.xx - Ti.yy + Ti @ const(C) - src, T(xb, yb) - Z]).solve())
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    for k, (i, j) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+        assert np.abs(sol[k] - M[i, j] * exact).max() < 8e-3 * M[i, j], (k, np.abs(sol[k] - M[i, j] * exact).max())
 
 
 def test_a_repeat_solve_reads_a_swapped_data_field():

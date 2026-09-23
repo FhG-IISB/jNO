@@ -758,9 +758,15 @@ coefficient, `M = diag(c)`) or second order ([`u.tt`](#second-order-in-time-utt)
 initial velocity), with a selectable [time scheme](#time-schemes); linear and nonlinear
 residuals; differentiable inverse problems.
 
-**Not supported yet, and each raises when the problem is built or solved:** complex values (a complex source,
-coefficient or boundary value; a real solve would keep only the real part), and an unknown whose `value_shape`
-has rank 2 or more (use `value_shape=(4,)` for a 2×2 field and index its components).
+An unknown may carry a **tensor** value shape, `domain.unknown(value_shape=(2, 2))` — a stress or a
+conformation tensor. Its components are differentiated component-wise and may be coupled through a tensor
+expression (`Ti @ C`), and the solve returns them as rows in C order, exactly as four scalar unknowns would
+(verified to round-off). Two limits: a component is not addressable as `Ti[i, j]`, and a scalar point
+quantity does not broadcast against a tensor field (`S * T` with `S` of shape `(N, 1)`), so build the
+components with `jnn.stack`.
+
+**Not supported, and it raises:** complex values (a complex source, coefficient or boundary value; a real
+solve would keep only the real part).
 
 Author a coupled system as one PDE equation per unknown, in declaration order (equation *k* drives
 unknown *k*), plus each field's BCs:

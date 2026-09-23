@@ -431,6 +431,14 @@ def _reads_stored_values(expr) -> bool:
 #: ``image_shape`` marker for a per-node vector field ``(N, c)`` (see ``_mesh_field_values``).
 _NODAL_VECTOR = object()
 
+
+class _NodalShape(tuple):
+    """Marks a nodal field whose value shape has rank >= 2 (``domain.unknown(value_shape=(2, 2))``), and
+    carries that shape. The kernels take one channel axis, so such a field is flattened to ``(N, prod)`` on
+    the way in and restored on the way out -- a 2x2 field differentiates like four scalars that travel
+    together, which is what its equation and its boundary values are written against."""
+
+
 #: Families that differentiate stored values on the mesh. A new one is an entry here plus its
 #: kernels; neither `_eval_jacobian` nor `_eval_hessian` changes. (Automatic differentiation is
 #: deliberately absent -- it differentiates a FUNCTION per point and never touches the mesh.)
@@ -819,6 +827,12 @@ class TraceEvaluator:
             # A per-node VECTOR field (`domain.unknown(value_shape=(2,))`): one channel per component. It was
             # flattened to one (c·N,) array, and the stencil then failed to reshape it onto the grid.
             return mesh, u_full, _NODAL_VECTOR, int(u_full.shape[1])
+        if u_full.ndim > 2 and u_full.shape[0] == mesh.n:
+            # A per-node field of rank >= 2 (`value_shape=(2, 2)`): flatten its value axes into channels and
+            # remember the shape. Without this it fell through to `.ravel()` and became one (4N,) channel,
+            # which reshaped onto the grid wrongly on a lattice and gathered the wrong values on a mesh.
+            trailing = tuple(int(k) for k in u_full.shape[1:])
+            return mesh, u_full.reshape(mesh.n, -1), _NodalShape(trailing), int(np.prod(trailing))
         return mesh, (u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()), None, 1
 
     def _upwind_derivative(self, u_flat, axis, scheme, tag, ctx, mesh):
@@ -945,8 +959,10 @@ class TraceEvaluator:
     def _finish_mesh_jacobian(self, comps, image_shape, n_vars, mesh_points, points):
         """Shape a mesh-field gradient back to the caller's convention. A per-node vector field gives
         ``(N, c)`` for one variable and ``(N, c, n_vars)`` for several."""
-        if image_shape is _NODAL_VECTOR:
+        if image_shape is _NODAL_VECTOR or isinstance(image_shape, _NodalShape):
             out = comps[0] if n_vars == 1 else jnp.stack(comps, axis=-1)
+            if isinstance(image_shape, _NodalShape):  # channels back to the field's own value shape
+                out = out.reshape((out.shape[0],) + tuple(image_shape) + out.shape[2:])
             return self._map_mesh_to_sampled(mesh_points, points, out)
         if image_shape is not None:
             if n_vars == 1:
@@ -2131,7 +2147,9 @@ class TraceEvaluator:
             if compute_trace:
                 lap = backend.laplacian(mesh, scheme, dims)
                 lap_full = jax.vmap(lap)(u_flat.T).T if multi else lap(u_flat)
-                if image_shape is _NODAL_VECTOR:  # (N, c): the component-wise Laplacian
+                if image_shape is _NODAL_VECTOR or isinstance(image_shape, _NodalShape):  # component-wise
+                    if isinstance(image_shape, _NodalShape):
+                        lap_full = lap_full.reshape((lap_full.shape[0],) + tuple(image_shape))
                     return self._map_mesh_to_sampled(mesh.points, points, lap_full) if points is not None else lap_full
                 if image_shape is not None:
                     return lap_full.reshape(image_shape)
@@ -2142,7 +2160,9 @@ class TraceEvaluator:
 
             hess = backend.hessian(mesh, scheme, var_dims)
             hess_full = jnp.moveaxis(jax.vmap(hess)(u_flat.T), 0, 1) if multi else hess(u_flat)
-            if image_shape is _NODAL_VECTOR:  # (N, c, n, n)
+            if image_shape is _NODAL_VECTOR or isinstance(image_shape, _NodalShape):  # (N, c, n, n)
+                if isinstance(image_shape, _NodalShape):
+                    hess_full = hess_full.reshape((hess_full.shape[0],) + tuple(image_shape) + hess_full.shape[2:])
                 return self._map_mesh_to_sampled(mesh.points, points, hess_full)
             if image_shape is not None:
                 if n_channels > 1:
