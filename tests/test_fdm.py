@@ -1995,11 +1995,6 @@ def test_nonlinear_crank_nicolson_assembled_tangent():
     assert np.abs(solve(linear=jno.solve.lu()) - solve()).max() < 1e-13
 
 
-# cg / minres on a Newton path: the assembled tangent keeps the Dirichlet identity rows, whose columns the
-# interior rows still reference, so it is not symmetric and CG returned NaN. The Newton path now solves
-# through the same Dirichlet elimination the linear path uses, exactly, for J and for Jᵀ (the adjoint).
-
-
 def test_dirichlet_elimination_is_exact_for_the_tangent_and_its_transpose():
     import jax.experimental.sparse as jsp
 
@@ -2708,6 +2703,37 @@ def test_an_advection_diffusion_grid_problem_takes_gmres():
     p = _nodes(d)
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
     assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 2e-3
+
+
+def test_structure_is_decided_for_every_value_of_a_trainable_parameter():
+    """Whether the residual is affine (one linear solve) or needs Newton used to be decided once, at the trainable
+    parameters' current values. With k starting at 0, ``-Δu + k·u³ = f`` looked affine, and a solve at k = 1
+    returned the LINEAR solution (max error 5.0, true residual 1e4) with no error: in an inverse, k's gradient
+    would have been zero. Oracle: the same problem written with a literal k = 1."""
+    import equinox as eqx
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 200.0 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    ref = np.asarray(jno.fdm([-ui.xx - ui.yy + 1.0 * ui**3 - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    k = jno.np.parameter((1,), name="k")
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(0.0))
+    k.optimizer(optax.adam(1e-2))
+    prob = jno.fdm([-ui.xx - ui.yy + k * ui**3 - f, u(xb, yb) - 0.0])
+    prob.solve()  # the deferred node: structure is decided here, with k = 0
+    lid, call = next(iter(prob._trainable_params().items()))
+    at_one = eqx.tree_at(lambda m: m.value, call.model.module, jnp.asarray([1.0]))
+    sol = np.asarray(prob._steady_solve(extra_params={lid: at_one})).reshape(-1)
+    assert not prob._grid_linear
+    np.testing.assert_allclose(sol, ref, atol=1e-8 * np.abs(ref).max())
 
 
 def test_the_grid_linear_path_is_differentiable_in_the_source():

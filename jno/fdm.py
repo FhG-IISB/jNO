@@ -62,6 +62,8 @@ automatic, no authoring change. Composite/CSG and cut-cell geometry are planned.
 
 from __future__ import annotations
 
+import contextlib
+
 import jax.numpy as jnp
 import numpy as np
 
@@ -71,6 +73,14 @@ from .differential_operators import DifferentialOperators as _D
 from .trace_evaluator import fd_grid
 
 __all__ = ["fdm", "laplacian", "gradient"]
+
+
+def _rtol(dtype=None) -> float:
+    """The relative tolerance to which two floating-point results that should be equal are compared (an
+    affine probe, a symmetry probe, a node on a lattice): ``√ε`` of ``dtype`` (the default float if ``None``),
+    1.5e-8 in float64 and 3.5e-4 in float32. It replaces fixed 1e-10 / 1e-9 / 1e-6 thresholds, which were
+    below float32's resolution (every float32 operator probed "nonlinear" and "non-symmetric")."""
+    return float(np.sqrt(np.finfo(jnp.result_type(float) if dtype is None else dtype).eps))
 
 
 def _fd_operator_noise(residual_fn, u0) -> float:
@@ -541,8 +551,9 @@ def _periodic_axis(points_a, points_b):
     if pa.size == 0 or pb.size == 0:
         return None
     ax_a, ax_b = int(np.argmin(np.ptp(pa, axis=0))), int(np.argmin(np.ptp(pb, axis=0)))
-    flat = np.ptp(pa[:, ax_a]) < 1e-9 and np.ptp(pb[:, ax_b]) < 1e-9
-    if not flat or ax_a != ax_b or abs(pa[0, ax_a] - pb[0, ax_b]) < 1e-9:
+    tol = _rtol(pa.dtype) * max(float(np.ptp(np.concatenate([pa, pb]), axis=0).max()), np.finfo(float).tiny)
+    flat = np.ptp(pa[:, ax_a]) <= tol and np.ptp(pb[:, ax_b]) <= tol  # relative to the faces' extent
+    if not flat or ax_a != ax_b or abs(pa[0, ax_a] - pb[0, ax_b]) <= tol:
         return None
     return ax_a
 
@@ -609,7 +620,9 @@ def _mesh_nodes_in(pts, geom):
     else:
         import shapely
 
-        mask = np.asarray(shapely.contains_xy(geom.buffer(1e-9), p[:, 0], p[:, 1]))
+        # a boundary node counts as inside: buffer by a tolerance relative to the region's size, not 1e-9
+        minx, miny, maxx, maxy = geom.bounds
+        mask = np.asarray(shapely.contains_xy(geom.buffer(_rtol() * max(maxx - minx, maxy - miny)), p[:, 0], p[:, 1]))
     return np.nonzero(mask)[0].astype(int)
 
 
@@ -927,7 +940,8 @@ class _TraceFDM:
             # A time-dependent domain stores the pool once per time step, (n_time, n, D): the same points.
             pts = np.unique(np.asarray(pool).reshape(-1, np.asarray(pool).shape[-1])[:, :dim], axis=0)
             dist, nodes = cKDTree(np.asarray(self._pts)).query(pts)
-            if len(pts) and np.allclose(dist, 0.0, atol=1e-9):
+            extent = float(np.ptp(np.asarray(self._pts), axis=0).max())
+            if len(pts) and np.all(dist <= _rtol() * extent):  # relative to the domain's size, not 1e-9
                 return np.unique(nodes).astype(int)
         # An unknown tag used to fall through to the WHOLE boundary: `p(xg, yg) - 0` on a
         # `domain.point_region` pinned p on every wall node, and a lid-driven cavity came out 0.016 off
@@ -999,6 +1013,50 @@ class _TraceFDM:
         scope.update(extra_params or {})
         return scope
 
+    def _current_params(self):
+        """``{layer_id: module}`` of every trainable parameter at its current value."""
+        return {lid: n.model.module for lid, n in self._trainable_params().items()}
+
+    def _live_params(self):
+        """Parameter values an evaluator applies when it is CALLED, over the ones it was built with: the
+        probe values of :meth:`_perturbed_params` while a structural decision is made, else none."""
+        return getattr(self, "_perturbation", None) or {}
+
+    @contextlib.contextmanager
+    def _perturbed_params(self):
+        """While active, every trainable parameter reads a probe value ``(1 + a)·p + b`` near its current
+        value ``p`` (``a, b`` drawn from [0.1, 0.2], fixed seed): a generic point that keeps the sign of a
+        nonzero value, so a probe does not wander into a regime (a negative diffusivity) the problem never
+        visits, while a zero moves off zero."""
+        import equinox as eqx
+
+        rng = np.random.default_rng(11)
+        probe = {}
+        for lid, m in self._current_params().items():
+            p = np.asarray(m.value)
+            a, b = rng.uniform(0.1, 0.2, p.shape), rng.uniform(0.1, 0.2, p.shape)
+            probe[lid] = eqx.tree_at(lambda mm: mm.value, m, jnp.asarray((1.0 + a) * p + b, dtype=m.value.dtype))
+        saved = getattr(self, "_perturbation", None)
+        self._perturbation = probe
+        try:
+            yield
+        finally:
+            self._perturbation = saved
+
+    def _for_every_parameter(self, decide):
+        """``[decide(False)]``, plus ``decide(True)`` under :meth:`_perturbed_params` when the problem has
+        trainable parameters. A structural decision (is the residual affine in u? its operator symmetric?
+        constant in time?) must hold for every value a parameter takes in an inverse, not only the one it
+        starts at. Measured: with k starting at 0, ``-Δu + k·u³ = f`` looked affine, and the solve returned
+        the LINEAR solution at k = 1 (max error 5.0, true residual 1e4), with no error. ``decide(perturbed)``
+        must build what it evaluates when ``perturbed`` is set, if that is jitted (a jitted function keeps
+        its first trace); an un-jitted evaluator reads the probe values at call time."""
+        out = [decide(False)]
+        if self._trainable_params():
+            with self._perturbed_params():
+                out.append(decide(True))
+        return out
+
     def _pde_residual_fn(self, *, spatial=False, extra_params=None):
         """Differentiable residual over the nodal DOF vector, collocated at the mesh nodes. With
         ``spatial=True`` the ``u.t`` terms are dropped (:func:`_zero_temporal`) to give the
@@ -1020,7 +1078,7 @@ class _TraceFDM:
             """``t``: the time a source ``f(x, t)`` is evaluated at (the march passes each step's own
             time); ``None`` keeps the start time."""
             dofs = jnp.asarray(dofs)
-            ev = TraceEvaluator(params={**scope, **self._inject(dofs)})
+            ev = TraceEvaluator(params={**scope, **self._live_params(), **self._inject(dofs)})
             ctx = context if t is None else {**context, "__time__": jnp.full((N, 1), t, dtype=dofs.dtype)}
             with self._fd_scope():
                 blocks = [
@@ -1148,7 +1206,7 @@ class _TraceFDM:
             return False
         pts = np.asarray(self._pts)[:, : len(shape)]
         k = (pts - np.asarray(grid["origin"], float)) / np.asarray(grid["spacing"], float)
-        return bool(np.max(np.abs(k - np.round(k))) < 1e-6)
+        return bool(np.max(np.abs(k - np.round(k))) <= _rtol(pts.dtype) * max(shape))  # in lattice units
 
     def _uses_cell_size(self):
         """Does any constraint read ``domain.cell_size``?"""
@@ -1168,13 +1226,15 @@ class _TraceFDM:
         count = jnp.zeros(self._N).at[cells.reshape(-1)].add(1.0)
         return total / jnp.maximum(count, 1.0)
 
-    def _sparsity(self, key, fun, u):
+    def _sparsity(self, key, fun, u, make=None):
         """``(pattern, colour, n_colours)`` for assembling ``fun``'s Jacobian, found once per problem.
 
         The stencil width depends on the operators (one ring for ``cotangent`` and the structured grid,
         two for a gradient of a gradient or the quadratic flux fit), so candidate patterns of growing
         radius are tried and each is **verified**: the assembled matrix must reproduce the matrix-free
-        JVP on a random vector to 1e-10. Raises if none does, rather than solving with a wrong matrix."""
+        JVP on a random vector to 1e-10, for any value of the parameters (a coefficient that starts at 0 can
+        switch a wider stencil on; ``make()`` rebuilds ``fun`` when it is jitted, see
+        :meth:`_for_every_parameter`). Raises if none does, rather than solving with a wrong matrix."""
         cache = self.__dict__.setdefault("_sparsity_cache", {})
         if key in cache:
             return cache[key]
@@ -1185,13 +1245,19 @@ class _TraceFDM:
         n = int(np.asarray(u).size)
         n_fields = n // self._N
         v = jnp.asarray(np.random.default_rng(0).standard_normal(n), dtype=jnp.asarray(u).dtype)
-        ref = jax.jvp(fun, (jnp.asarray(u),), (v,))[1]
-        scale = float(jnp.linalg.norm(ref)) or 1.0
+
+        def reproduces(f, pattern, color, n_colors):
+            ref = jax.jvp(f, (jnp.asarray(u),), (v,))[1]
+            A = _assemble_sparse(f, u, pattern, color, n_colors)
+            return float(jnp.linalg.norm(A @ v - ref)) <= _rtol(ref.dtype) * (float(jnp.linalg.norm(ref)) or 1.0)
+
         for radius in (1, 2, 3, 4, 5, 6):  # a jno.fd(order=/fit=) mesh fit can read several rings
             pattern = _stencil_pattern(cells, self._N, radius, n_fields=n_fields, extra_pairs=extra)
             color, n_colors = _color_columns(pattern)
-            A = _assemble_sparse(fun, u, pattern, color, n_colors)
-            if float(jnp.linalg.norm(A @ v - ref)) <= 1e-10 * scale:
+            ok = self._for_every_parameter(
+                lambda probe: reproduces((make() if make is not None and probe else fun), pattern, color, n_colors)
+            )
+            if all(ok):
                 cache[key] = (pattern, color, n_colors)
                 return cache[key]
         raise ValueError(
@@ -1290,16 +1356,19 @@ class _TraceFDM:
         key = None if linear.key is None else ("dirichlet-eliminated", linear.key)
         return LinearSolver(fn, name=linear.name, traits=linear.traits, key=key)
 
-    def _newton_linear(self, linear, key, residual, at):
+    def _newton_linear(self, linear, key, make, at):
         """The ``linear=`` slot for a Newton on an assembled tangent: ``cg`` / ``minres`` go through the
-        Dirichlet elimination, after the eliminated tangent at ``at`` passes the symmetry guard."""
+        Dirichlet elimination, after the eliminated tangent at ``at`` of the residual ``make()`` builds passes
+        the symmetry guard."""
         if getattr(linear, "name", "") not in ("cg", "minres"):
             return linear
         import jax
 
+        mask = self._dirichlet_mask()
         with jax.ensure_compile_time_eval():
-            A_s, _ = self._eliminate(self._sparse_operator(key, residual, at), self._dirichlet_mask())
-            self._require_symmetric(linear, A_s, key=key + "-newton")
+            self._require_symmetric(
+                linear, lambda: self._eliminate(self._sparse_operator(key, make(), at), mask)[0], key=key + "-newton"
+            )
         return self._eliminating(linear)
 
     def _dirichlet_mask(self):
@@ -1319,42 +1388,56 @@ class _TraceFDM:
         w = jnp.asarray(rng.standard_normal(K.shape[0]))
         return float(w @ (K @ v)), float(v @ (K @ w))
 
-    def _is_symmetric(self, K, key=None):
+    def _is_symmetric(self, make_K, key=None):
+        """Is the assembled operator ``make_K()`` symmetric, for any value of the parameters
+        (:meth:`_for_every_parameter`)? Cached per ``key``."""
         cache = self.__dict__.setdefault("_symmetric_cache", {})
         if key is not None and key in cache:
             return cache[key]
-        a, b = self._symmetry_probe(K)
-        out = abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1e-300)
+
+        def symmetric(_):
+            a, b = self._symmetry_probe(make_K())
+            return abs(a - b) <= _rtol() * max(abs(a), abs(b), np.finfo(float).tiny)
+
+        out = all(self._for_every_parameter(symmetric))
         if key is not None:
             cache[key] = out
         return out
 
-    def _require_symmetric(self, linear, K, key=None):
+    def _require_symmetric(self, linear, make_K, key=None):
         """``cg`` and ``minres`` assume a symmetric operator; on a non-symmetric one they return a wrong answer
         that can still pass the residual gate. FDM operators are symmetric on a structured grid (after the
-        Dirichlet lift) but not on an unstructured mesh, whose cotangent rows are divided by nodal areas."""
+        Dirichlet lift) but not on an unstructured mesh, whose cotangent rows are divided by nodal areas.
+        ``make_K()`` assembles the operator; it must be symmetric for every value of the parameters."""
         name = getattr(linear, "name", "")
-        if name not in ("cg", "minres") or self._is_symmetric(K, key):
+        if name not in ("cg", "minres") or self._is_symmetric(make_K, key):
             return
-        a, b = self._symmetry_probe(K)
+        a, b = self._symmetry_probe(make_K())
         raise ValueError(
             f"jno.solve.{name} needs a symmetric operator, and this strong-form operator is not "
             f"(wᵀKv = {a:.6e} vs vᵀKw = {b:.6e}). Unstructured FDM stencils are divided by nodal areas, "
             "and flux rows are one-sided. Use jno.solve.gmres() or jno.solve.bicgstab()."
         )
 
-    def _mass_varies_in_time(self, mass_of, t0, t1):
-        """Does the ``u.t`` coefficient change in time? Cached like the other structural decisions."""
+    def _mass_varies_in_time(self, make, t0, t1):
+        """Does the ``u.t`` coefficient (``make()`` builds ``mass_of(t)``) change in time, for any value of the
+        parameters (:meth:`_for_every_parameter`)? Cached like the other structural decisions."""
         cache = self.__dict__.setdefault("_varies_cache", {})
         if "mass" not in cache:
-            cache["mass"] = not bool(jnp.allclose(mass_of(t0).data, mass_of(t1).data))
+
+            def varies(_):
+                mass_of = make()
+                return not bool(jnp.allclose(mass_of(t0).data, mass_of(t1).data))
+
+            cache["mass"] = any(self._for_every_parameter(varies))
         return cache["mass"]
 
-    def _operator_varies_in_time(self, residual, n, t0, t1, key="march"):
-        """Cached per ``key``: decided on concrete values (a warm-up solve) and reused inside a traced one."""
+    def _operator_varies_in_time(self, make, n, t0, t1, key="march"):
+        """Cached per ``key``: decided on concrete values (a warm-up solve), for any value of the parameters,
+        and reused inside a traced solve. ``make()`` builds ``residual(y, t, args)``."""
         cache = self.__dict__.setdefault("_varies_cache", {})
         if key not in cache:
-            cache[key] = self._operator_varies_now(residual, n, t0, t1)
+            cache[key] = any(self._for_every_parameter(lambda _: self._operator_varies_now(make(), n, t0, t1)))
         return cache[key]
 
     @staticmethod
@@ -1367,21 +1450,26 @@ class _TraceFDM:
         z = jnp.zeros(n)
         a = jax.jvp(lambda y: residual(y, t0, {}), (z,), (v,))[1]
         b = jax.jvp(lambda y: residual(y, t1, {}), (z,), (v,))[1]
-        return bool(jnp.linalg.norm(a - b) > 1e-10 * (float(jnp.linalg.norm(a)) or 1.0))
+        return bool(jnp.linalg.norm(a - b) > _rtol(a.dtype) * (float(jnp.linalg.norm(a)) or 1.0))
 
-    def _is_affine(self, key, fun, n):
-        """Is ``fun`` affine in the DOF vector? Its JVP must be the same at two different states.
-        Decided once per problem, eagerly, with the parameters at their current values."""
+    def _is_affine(self, key, make, n):
+        """Is the function ``make()`` builds affine in the DOF vector? Its JVP must be the same at two
+        different states. Decided once per problem, eagerly, for the parameters' current values and a probe
+        value (:meth:`_for_every_parameter`)."""
         cache = self.__dict__.setdefault("_affine_cache", {})
         if key not in cache:
             import jax
 
-            rng = np.random.default_rng(1)
-            v = jnp.asarray(rng.standard_normal(n))
-            w = jnp.asarray(rng.standard_normal(n))
-            j0 = jax.jvp(fun, (jnp.zeros(n),), (v,))[1]
-            j1 = jax.jvp(fun, (w,), (v,))[1]
-            cache[key] = bool(jnp.linalg.norm(j1 - j0) <= 1e-10 * (float(jnp.linalg.norm(j0)) or 1.0))
+            def affine(_):
+                fun = make()
+                rng = np.random.default_rng(1)
+                v = jnp.asarray(rng.standard_normal(n))
+                w = jnp.asarray(rng.standard_normal(n))
+                j0 = jax.jvp(fun, (jnp.zeros(n),), (v,))[1]
+                j1 = jax.jvp(fun, (w,), (v,))[1]
+                return bool(jnp.linalg.norm(j1 - j0) <= _rtol(j0.dtype) * (float(jnp.linalg.norm(j0)) or 1.0))
+
+            cache[key] = all(self._for_every_parameter(affine))
         return cache[key]
 
     def _mass_coefficient(self):
@@ -1398,6 +1486,14 @@ class _TraceFDM:
         if len(coefs) == 1:
             return coefs[0]
         return lambda t=None: jnp.concatenate([c(t) for c in coefs])
+
+    @staticmethod
+    def _same(a, b):
+        """Are two evaluations of the same quantity equal to floating-point accuracy (:func:`_rtol`), relative
+        to their magnitude?"""
+        a, b = jnp.asarray(a), jnp.asarray(b)
+        scale = max(float(jnp.max(jnp.abs(a))), float(jnp.max(jnp.abs(b))), np.finfo(float).tiny)
+        return bool(jnp.max(jnp.abs(a - b)) <= _rtol(a.dtype) * scale)
 
     def _time_coefficient(self, t_val, tt_val, what, example, k=0):
         """Per-node coefficient of the time derivative selected by the probe ``(u.t, u.tt) = (t_val,
@@ -1423,7 +1519,7 @@ class _TraceFDM:
                     )
                     for w in self.unknowns
                 }
-                ev = TraceEvaluator(params={**scope, **states})
+                ev = TraceEvaluator(params={**scope, **self._live_params(), **states})
                 with self._fd_scope():
                     return jnp.asarray(ev.evaluate(_set_temporal(expr, tv, ttv), context=ctx, var_bindings={}))
 
@@ -1434,7 +1530,7 @@ class _TraceFDM:
             return self._as_blocks(diff, ncomp)
 
         checked = self.__dict__.setdefault("_coefficient_checked", set())  # decided once, on concrete values
-        if (t_val, tt_val, k) not in checked and not bool(jnp.allclose(probe(0.0), probe(1.0), atol=1e-6, rtol=1e-6)):
+        if (t_val, tt_val, k) not in checked and not self._same(probe(0.0), probe(1.0)):
             raise ValueError(
                 f"jno.fdm([...]): the {what} depends on u (a {example}) — only a coefficient of the "
                 "coordinates and time is supported."
@@ -1585,6 +1681,7 @@ class _TraceFDM:
 
         walk(g_node)
         params.update(extra_params or {})
+        params.update(self._live_params())
         with self._fd_scope():
             out = jnp.asarray(TraceEvaluator(params=params).evaluate(_unwrap(g_node), context=ctx, var_bindings={}))
         return jnp.broadcast_to(out.reshape(-1), (len(idx),)) if out.size == 1 else out.reshape(-1)
@@ -1759,7 +1856,7 @@ class _TraceFDM:
                 return _row(dofs, t)
 
         def _row(dofs, t=None):
-            ev = TraceEvaluator(params={**scope, **self._inject(jnp.asarray(dofs))})
+            ev = TraceEvaluator(params={**scope, **self._live_params(), **self._inject(jnp.asarray(dofs))})
             ctx = dict(context) if t is None else {**context, "__time__": jnp.full((N, 1), t)}
             for i, (j, g) in enumerate(zip(jacs, grads)):
                 target = jnp.asarray(ev.evaluate(j.target, context=ctx, var_bindings={}))
@@ -2113,8 +2210,7 @@ class _TraceFDM:
         import jax
 
         with jax.ensure_compile_time_eval():
-            probe = self._steady_residual({lid: n.model.module for lid, n in self._trainable_params().items()})
-            return self._is_affine("steady", probe, self._Ntot)
+            return self._is_affine("steady", lambda: self._steady_residual(self._current_params()), self._Ntot)
 
     def _slot_steady(self, nonlinear, linear, precond, x0, u0, extra_params, extra_pins):
         """The steady solve through ``fem.solve``'s ``linear=`` / ``precond=`` slots, on the assembled
@@ -2129,10 +2225,11 @@ class _TraceFDM:
         zeros = jnp.zeros(self._Ntot)
         # Structure (linearity, sparsity) is decided on a CONCRETE residual: the trainable parameters at
         # their current values, so this works when the solve itself runs inside a crux trace.
+        make_probe = lambda: self._steady_residual(self._current_params())  # noqa: E731  (jitted: rebuilt per probe)
         with jax.ensure_compile_time_eval():
-            probe = self._steady_residual({lid: n.model.module for lid, n in self._trainable_params().items()})
-            linear_problem = self._is_affine("steady", probe, self._Ntot)
-            self._sparsity("steady", probe, jnp.zeros(self._Ntot))  # the pattern search needs values
+            probe = make_probe()
+            linear_problem = self._is_affine("steady", make_probe, self._Ntot)
+            self._sparsity("steady", probe, jnp.zeros(self._Ntot), make=make_probe)  # the pattern search needs values
         if linear_problem:
             if nonlinear is not None:
                 raise ValueError(
@@ -2142,7 +2239,7 @@ class _TraceFDM:
             with jax.ensure_compile_time_eval():
                 self._require_symmetric(
                     linear,
-                    self._dirichlet_lift("steady", self._sparse_operator("steady", probe, jnp.zeros(self._Ntot)))[0],
+                    lambda: self._dirichlet_lift("steady", self._sparse_operator("steady", make_probe(), zeros))[0],
                     key="steady",
                 )
             eager = extra_params is None and extra_pins is None and not isinstance(u0, jax.core.Tracer)
@@ -2163,7 +2260,7 @@ class _TraceFDM:
             # matrix-free JVP has no diagonal or matrix to give them).
             nonlinear = _solve.newton(direct=True)
         precond = self._frozen_precond(precond, lambda: tangent(u0 if not isinstance(u0, jax.core.Tracer) else zeros))
-        linear = self._newton_linear(linear, "steady", probe, u0 if not isinstance(u0, jax.core.Tracer) else zeros)
+        linear = self._newton_linear(linear, "steady", make_probe, u0 if not isinstance(u0, jax.core.Tracer) else zeros)
         driver = compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self)
         return driver(residual, u0, jacobian=tangent)
 
@@ -2327,8 +2424,7 @@ class _TraceFDM:
                 import jax
 
                 with jax.ensure_compile_time_eval():
-                    probe = self._steady_residual({lid: n.model.module for lid, n in self._trainable_params().items()})
-                    ok = self._is_affine("steady", probe, self._Ntot)
+                    ok = self._is_affine("steady", lambda: self._steady_residual(self._current_params()), self._Ntot)
         self._grid_linear = ok
         return ok
 
@@ -2403,7 +2499,7 @@ class _TraceFDM:
             mask = np.ones(N)
             mask[self._dirichlet_nodes()] = 0.0
             mask = jnp.asarray(mask)
-            symmetric = self._grid_linear_symmetric(residual, mask)
+            symmetric = self._grid_linear_symmetric(lambda: self._steady_residual(self._current_params()), mask)
             if slots and getattr(linear, "name", None) == "cg" and not symmetric:
                 raise ValueError(
                     "jno.fdm: linear=jno.solve.cg() needs a symmetric operator, and this one is not (after "
@@ -2451,20 +2547,25 @@ class _TraceFDM:
             )
         return u
 
-    def _grid_linear_symmetric(self, residual, mask):
-        """Is the eliminated operator symmetric? ``wᵀA v = vᵀA w`` for two random vectors: exact for a
-        symmetric linear operator, and violated with probability one otherwise. Decided once."""
+    def _grid_linear_symmetric(self, make, mask):
+        """Is the eliminated operator of the residual ``make()`` builds symmetric? ``wᵀA v = vᵀA w`` for two
+        random vectors: exact for a symmetric linear operator, and violated with probability one otherwise.
+        Decided once, for any value of the parameters (:meth:`_for_every_parameter`)."""
         if getattr(self, "_grid_linear_symmetric_flag", None) is None:
             import jax
 
-            with jax.ensure_compile_time_eval():
+            def symmetric(_):
+                residual = make()
                 rng = np.random.default_rng(7)
                 v, w = (jnp.asarray(rng.standard_normal(self._N)) * mask for _ in range(2))
                 z = jnp.zeros(self._N)
                 Av = jax.jvp(residual, (z,), (v,))[1] * mask
                 Aw = jax.jvp(residual, (z,), (w,))[1] * mask
                 a, b_ = float(w @ Av), float(v @ Aw)
-                self._grid_linear_symmetric_flag = abs(a - b_) <= 1e-10 * max(abs(a) + abs(b_), 1e-300)
+                return abs(a - b_) <= _rtol() * max(abs(a) + abs(b_), np.finfo(float).tiny)
+
+            with jax.ensure_compile_time_eval():
+                self._grid_linear_symmetric_flag = all(self._for_every_parameter(symmetric))
         return self._grid_linear_symmetric_flag
 
     def pinned_solver(self, node_ids, *, nonlinear=None):
@@ -2611,11 +2712,13 @@ class _TraceFDM:
 
             zeros = jnp.zeros(n)
             with jax.ensure_compile_time_eval():  # structure is decided on concrete values
+                # the march's residual and mass are not jitted, so they read a probe's parameter values at
+                # call time (`_live_params`) and need no rebuilding
                 self._sparsity("march", frozen, jnp.zeros(n))
                 linear_problem = (
-                    self._is_affine("march", frozen, n)
-                    and not self._operator_varies_in_time(residual, n, float(t0), float(t1), key="march")
-                    and not self._mass_varies_in_time(mass_of, float(t0), float(t1))
+                    self._is_affine("march", lambda: frozen, n)
+                    and not self._operator_varies_in_time(lambda: residual, n, float(t0), float(t1), key="march")
+                    and not self._mass_varies_in_time(lambda: mass_of, float(t0), float(t1))
                 )
             if linear_problem:
                 # Time-dependent DATA (a source f(x, t), a boundary value g(x, t)) rides the block's forcing
@@ -2623,7 +2726,11 @@ class _TraceFDM:
                 # −R(0, t0) as a constant bias silently held the data at the start time.
                 A, lift_rhs = self._dirichlet_lift("march", self._sparse_operator("march", frozen, zeros))
                 if self._time_order == 1:  # the lift knows the fields' Dirichlet rows, not the [u; v] layout
-                    self._require_symmetric(linear, A, key="march")
+                    self._require_symmetric(
+                        linear,
+                        lambda: self._dirichlet_lift("march", self._sparse_operator("march", frozen, zeros))[0],
+                        key="march",
+                    )
                     forcing = lambda t, args: lift_rhs(-residual(jnp.zeros(n), t, args))  # noqa: E731
                 else:
                     A = self._sparse_operator("march", frozen, zeros)
@@ -2643,7 +2750,7 @@ class _TraceFDM:
                 nonlinear = nonlinear or _solve.newton(direct=True)
                 if self._time_order == 1:
                     with jax.ensure_compile_time_eval():
-                        linear = self._newton_linear(linear, "march", frozen, state0)
+                        linear = self._newton_linear(linear, "march", lambda: frozen, state0)
         else:
             block = SemidiscreteTimeBlock(mass=lambda t, args: mass_of(t), residual=residual, **common)
         from .utils.solver.timeschemes import _ExponentialScheme
@@ -2755,9 +2862,9 @@ class _TraceFDM:
         with jax.ensure_compile_time_eval():
             linear_problem = (
                 nonlinear is None
-                and self._is_affine("newmark", probe, self._N)
+                and self._is_affine("newmark", lambda: probe, self._N)
                 and not self._operator_varies_in_time(
-                    lambda w, t, args: step_residual(w, u0, v0, r0, t), self._N, t0 + dt, t1, key="newmark"
+                    lambda: lambda w, t, args: step_residual(w, u0, v0, r0, t), self._N, t0 + dt, t1, key="newmark"
                 )
             )
         if linear_problem:
@@ -2817,8 +2924,9 @@ class _TraceFDM:
         with jax.ensure_compile_time_eval():
             self._sparsity("newmark", probe, u0)
             K, lift_rhs = self._dirichlet_lift("newmark", self._sparse_operator("newmark", probe, u0))
-            self._require_symmetric(linear, K, key="newmark")
-            symmetric = self._is_symmetric(K, key="newmark")
+            make_K = lambda: self._dirichlet_lift("newmark", self._sparse_operator("newmark", probe, u0))[0]  # noqa: E731
+            self._require_symmetric(linear, make_K, key="newmark")
+            symmetric = self._is_symmetric(make_K, key="newmark")
             coo = self._sparsity_cache["newmark"][0].tocoo()
             on_diag = np.nonzero(coo.row == coo.col)[0]
             diag = jnp.zeros(K.shape[0]).at[jnp.asarray(coo.row[on_diag])].add(K.data[jnp.asarray(on_diag)])
