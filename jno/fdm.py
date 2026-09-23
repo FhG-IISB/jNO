@@ -2259,27 +2259,34 @@ class _TraceFDM:
             )
         return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
 
-    def _grid_vcycle(self, residual, at):
-        """The operator-dependent V-cycle (:func:`jno.utils.solver.lattice_mg.build`) for this problem's
-        tangent at ``at``, or ``None`` off a lattice. Built once on concrete values and frozen for the Newton
-        loop that uses it: the tangent drifts as Newton proceeds, and the hierarchy built here does not follow
-        it, which changes how fast the inner solve converges, never what it converges to."""
+    def _lattice_vcycle(self, matvec, n):
+        """The operator-dependent V-cycle (:func:`jno.utils.solver.lattice_mg.build`) for the ``n``-unknown
+        lattice operator ``matvec``, or ``None`` when this problem is not on a lattice (or the system is not
+        a whole number of fields on it). Built on concrete values."""
         import jax
 
         from .utils.solver.lattice_mg import build
 
         grid = self.domain.mesh_connectivity.get("grid") if self.domain.mesh_connectivity else None
-        if grid is None or not self._nodes_are_the_grid(grid):
+        if grid is None or not self._nodes_are_the_grid(grid) or n % self._N:
             return None
         with jax.ensure_compile_time_eval():
-            at = jnp.zeros(self._Ntot) if isinstance(at, jax.core.Tracer) else jnp.asarray(at)
             vcycle, _levels = build(
-                jax.jit(lambda v: jax.jvp(residual, (at,), (v,))[1]),  # jitted: one program per probe colour
+                jax.jit(matvec),  # jitted: the probe applies it once per colour per level
                 tuple(grid["shape"]),
-                nf=self._nf,
+                nf=n // self._N,
                 periodic=(self._grid or {}).get("periodic", ()),
             )
         return vcycle
+
+    def _grid_vcycle(self, residual, at):
+        """The V-cycle for this problem's tangent at ``at``. Built once and frozen for the Newton loop that
+        uses it: the tangent drifts as Newton proceeds, and the hierarchy built here does not follow it,
+        which changes how fast the inner solve converges, never what it converges to."""
+        import jax
+
+        at = jnp.zeros(self._Ntot) if isinstance(at, jax.core.Tracer) else jnp.asarray(at)
+        return self._lattice_vcycle(lambda v: jax.jvp(residual, (at,), (v,))[1], self._Ntot)
 
     def _default_is_assembled(self):
         """Does the default steady solve go through the assembled operator? For a linear, single-field
@@ -2523,9 +2530,21 @@ class _TraceFDM:
         return krylov and (precond is None or type(precond).__name__ == "_GMG")
 
     def _dirichlet_nodes(self):
-        return np.unique(
-            np.concatenate([np.asarray(r[1], dtype=int) for r in self._dirichlet_rows()] or [np.zeros(0, int)])
-        )
+        """Host-side node indices of the Dirichlet rows, found once.
+
+        They are structural -- which nodes a region holds -- but computing them means array operations, and
+        inside a trace (a crux-driven inverse) every array operation becomes traced, so a recomputation there
+        would hand a tracer to numpy."""
+        cached = self.__dict__.get("_dirichlet_node_cache")
+        if cached is None:
+            import jax
+
+            with jax.ensure_compile_time_eval():
+                cached = np.unique(
+                    np.concatenate([np.asarray(r[1], dtype=int) for r in self._dirichlet_rows()] or [np.zeros(0, int)])
+                )
+            self._dirichlet_node_cache = cached
+        return cached
 
     def _grid_ring(self, grid):
         """The nodes on the boundary ring of the structured grid, by lattice index."""
@@ -2571,19 +2590,22 @@ class _TraceFDM:
             # built on a cache MISS only: a repeat solve reuses the compiled solve, V-cycle included
             residual = self._steady_residual(extra_params)
             rows = self._dirichlet_rows(extra_params)
-            mask = np.ones(N)
-            mask[self._dirichlet_nodes()] = 0.0
-            mask = jnp.asarray(mask)
+            mask_host = np.ones(N)
+            mask_host[self._dirichlet_nodes()] = 0.0
+            mask = jnp.asarray(mask_host)
             # The V-cycle reads the eliminated operator itself, at the parameters' current values (a traced
             # parameter would otherwise put the whole probe inside every solve); it preconditions, so its
             # being one step behind the parameter changes nothing about the answer.
             sweeps = {"n_pre": precond.n_pre, "n_post": precond.n_post} if precond is not None else {}
             with jax.ensure_compile_time_eval():
+                # every input the probe closes over is built HERE: inside a crux trace even
+                # `jnp.asarray(numpy_array)` is a tracer, and one traced input makes the whole probe traced
                 probe_residual = self._steady_residual(self._current_params())
                 zeros = jnp.zeros(self._Ntot)
+                probe_mask = jnp.asarray(mask_host)
                 # jitted: the probe applies it once per colour per level, and an un-jitted jvp of a jitted
                 # residual re-traces and re-compiles on every one of them (12 s of setup at 1M nodes)
-                probe_mv = jax.jit(lambda v: jax.jvp(probe_residual, (zeros,), (v * mask,))[1] * mask)
+                probe_mv = jax.jit(lambda v: jax.jvp(probe_residual, (zeros,), (v * probe_mask,))[1] * probe_mask)
                 vcycle, _levels = build_vcycle(
                     probe_mv,
                     tuple(grid["shape"]),
@@ -2591,7 +2613,7 @@ class _TraceFDM:
                     periodic=(self._grid or {}).get("periodic", ()),
                     **sweeps,
                 )
-            symmetric = self._grid_linear_symmetric(lambda: self._steady_residual(self._current_params()), mask)
+                symmetric = self._grid_linear_symmetric(lambda: self._steady_residual(self._current_params()), probe_mask)
             if slots and getattr(linear, "name", None) == "cg" and not symmetric:
                 raise ValueError(
                     "jno.fdm: linear=jno.solve.cg() needs a symmetric operator, and this one is not (after "
