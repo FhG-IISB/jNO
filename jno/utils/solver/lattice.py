@@ -206,7 +206,9 @@ def probe_reduced(matvec, shape, nf=1, *, window, periodic=(), dtype=None):
 
     * ``d[f, i] = Σ_g Σ_o |a_{fg}(i, o)|`` -- the ℓ¹ row weight of every row;
     * ``strength[w] = mean_i Σ_{f,g} |a_{fg}(i, o_w)|`` -- how strongly the operator couples along each
-      offset of the window.
+      offset of the window;
+    * ``block[f, g, i] = a_{fg}(i, 0)`` -- the node's own coupling between fields, which a point-BLOCK
+      smoother inverts.
 
     The full stencil of a fine level is ``nf²·W`` numbers per node (1.2 GB for a 2-D five-point operator at
     16.8M nodes); these two are ``nf`` per node and ``W`` in total. Same colours, same cost as :func:`probe`.
@@ -215,15 +217,25 @@ def probe_reduced(matvec, shape, nf=1, *, window, periodic=(), dtype=None):
     dim = len(shape)
     dtype = jnp.result_type(float) if dtype is None else dtype
     per_full = tuple(periodic) + (False,) * (dim - len(periodic))
-    init = (jnp.zeros((nf,) + shape, dtype), jnp.zeros(len(offsets(*window, dim)), dtype))
+    centre = offsets(*window, dim).index((0,) * dim)
+    init = (
+        jnp.zeros((nf,) + shape, dtype),
+        jnp.zeros(len(offsets(*window, dim)), dtype),
+        jnp.zeros((nf, nf) + shape, dtype),
+    )
 
-    def update(carry, _g, out, w, live):
-        d, strength = carry
+    def update(carry, g, out, w, live):
+        d, strength, block = carry
         contrib = jnp.abs(out) * live
-        return d + contrib, strength.at[w.reshape(-1)].add(contrib.sum(axis=0).reshape(-1))
+        at_centre = (w == centre) * live
+        return (
+            d + contrib,
+            strength.at[w.reshape(-1)].add(contrib.sum(axis=0).reshape(-1)),
+            block.at[:, g].add(out * at_centre),  # the node's own nf x nf block
+        )
 
-    d, strength = _accumulate_colours(matvec, shape, nf, window, per_full, dtype, init, update)
-    return d, strength / float(np.prod(shape))
+    d, strength, block = _accumulate_colours(matvec, shape, nf, window, per_full, dtype, init, update)
+    return d, strength / float(np.prod(shape)), block
 
 
 def _probe_window(matvec, shape, nf, window, periodic, dtype):

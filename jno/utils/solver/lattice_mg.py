@@ -188,7 +188,7 @@ def _symmetric_stencil(S, window, dim):
     return True
 
 
-def _smoother_amplifies(apply_fn, d, shape, nf, iters=20, seed=0):
+def _smoother_amplifies(apply_fn, inv, shape, nf, iters=20, seed=0):
     """Does ℓ¹-Jacobi **grow** the error on this level: is ``ρ(I − D⁻¹A) > 1``?
 
     A coarse grid is only worth building while its own smoother still damps. Coarsening doubles ``h``, and
@@ -202,12 +202,12 @@ def _smoother_amplifies(apply_fn, d, shape, nf, iters=20, seed=0):
     stencil pattern: a *geometric* artefact can break diagonal dominance while leaving a perfectly good
     smoother (the merged odd cell of a 26-node axis is 12% short of dominant, and smooths at ρ = 0.94).
     """
-    inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
     v = jnp.asarray(np.random.default_rng(seed).standard_normal((nf,) + shape))
     v = v / jnp.linalg.norm(v)
     rho = 0.0
     for _ in range(iters):
-        w = v - inv * apply_fn(v)
+        av = apply_fn(v)
+        w = v - (inv * av if nf == 1 else jnp.einsum("...fg,g...->f...", inv, av))
         rho = jnp.linalg.norm(w)
         v = w / jnp.maximum(rho, jnp.finfo(v.dtype).tiny)
     return float(rho) > 1.0
@@ -217,6 +217,31 @@ def _l1_weights(S):
     """ℓ¹-Jacobi weights ``d_i = Σ_j |a_ij|`` per row, from a stored stencil. A row with no coefficients at
     all (a degree of freedom the caller eliminated) gets 0, which the smoother reads as "leave it alone"."""
     return jnp.abs(S).sum(axis=(1, -1))  # over the input fields and the offsets -> (nf, *shape)
+
+
+def _centre_block(S, window, dim):
+    """The node's own ``nf x nf`` coupling ``a_{fg}(i, 0)``, which the point-block smoother inverts."""
+    return S[..., offsets(*window, dim).index((0,) * dim)]
+
+
+def _smoother_inverse(d, block):
+    """``D⁻¹`` of the point-block ℓ¹ smoother, per node: the node's own block, with the rest of each row's
+    ℓ¹ weight added to its diagonal.
+
+    For one field this is ℓ¹-Jacobi exactly. For several it inverts the coupling a point smoother would
+    otherwise ignore -- two fields that exchange strongly at the same node (a reaction) are a ``2x2`` solve,
+    not two independent scalings. Rows that carry nothing keep an identity row, so the smoother leaves them.
+    """
+    nf = d.shape[0]
+    if nf == 1:
+        inv = jnp.where(d[0] > 0, 1.0 / jnp.where(d[0] > 0, d[0], 1.0), 0.0)
+        return inv[None]
+    off = d - jnp.abs(block).sum(axis=1)  # each row's weight outside its own node
+    D = jnp.moveaxis(block, (0, 1), (-2, -1))  # (*shape, nf, nf)
+    D = D + jnp.moveaxis(off, 0, -1)[..., None] * jnp.eye(nf, dtype=d.dtype)
+    live = jnp.moveaxis(d, 0, -1).sum(axis=-1) > 0
+    D = jnp.where(live[..., None, None], D, jnp.eye(nf, dtype=d.dtype))
+    return jnp.where(live[..., None, None], jnp.linalg.inv(D), 0.0)
 
 
 def _dense_from_stencil(S, window, shape, nf, periodic):
@@ -292,13 +317,14 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
         shape, inject, extract = full_shape, (lambda x: x), (lambda y: y)
     if window is None:  # find the window once, on the fine operator, then reduce rather than store it
         window, _ = probe(matvec, shape, nf, periodic=per, dtype=dtype, seed=1)
-    d0, strength0 = probe_reduced(matvec, shape, nf, window=window, periodic=per, dtype=dtype)
+    d0, strength0, block0 = probe_reduced(matvec, shape, nf, window=window, periodic=per, dtype=dtype)
 
     levels = [
         {
             "shape": shape,
             "apply": lambda x: matvec(x.reshape(-1)).reshape((nf,) + shape),
             "d": d0,
+            "block": block0,
             "strength": strength0,
             "window": window,
             "periodic": per,
@@ -324,9 +350,12 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
 
         cper = tuple(p and a in axes or p for a, p in enumerate(fine_per))  # periodicity survives coarsening
         cwin, cS = probe(coarse_matvec, coarse_shape, nf, periodic=cper, dtype=dtype)
-        cd = _l1_weights(cS)
+        cd, cblock = _l1_weights(cS), _centre_block(cS, cwin, dim)
         amplifies = not _symmetric_stencil(cS, cwin, dim) and _smoother_amplifies(
-            lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper), cd, coarse_shape, nf
+            lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper),
+            _smoother_inverse(cd, cblock),
+            coarse_shape,
+            nf,
         )
         if amplifies and nf * int(np.prod(sh)) <= DENSE_MAX:
             break  # no smoother works on that level, and this one is small enough to solve exactly
@@ -335,6 +364,7 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
                 "shape": coarse_shape,
                 "apply": jax.jit(lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper)),
                 "d": cd,
+                "block": cblock,
                 "strength": _strength_of(cS, cwin, dim),
                 "window": cwin,
                 "periodic": cper,
@@ -371,13 +401,17 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
     # The per-level stencils and weights are handed to the compiled V-cycle as ARGUMENTS, not closed over:
     # a closed-over array becomes a constant inside the executable, and at 4.2M nodes loading that executable
     # ran the card out of memory ("Failed to load in-memory CUBIN").
-    weights = tuple(lev["d"] for lev in levels)
+    weights = tuple(_smoother_inverse(lev["d"], lev["block"]) for lev in levels)
     stencils = tuple(lev.get("S") for lev in levels[1:])
 
     def smooth(lev, x, r, state):
-        d = state[0][lev]
-        inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
-        return x + inv * (r - level_apply(lev, x, state))
+        inv = state[0][lev]
+        res = r - level_apply(lev, x, state)
+        if nf == 1:
+            return x + inv * res
+        # (*shape, nf, nf) @ (*shape, nf) -> one small solve per node
+        applied = jnp.einsum("...fg,g...->f...", inv, res)
+        return x + applied
 
     def level_apply(lev, x, state):
         if lev == 0:

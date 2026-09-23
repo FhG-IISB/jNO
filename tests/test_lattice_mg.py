@@ -125,6 +125,48 @@ def test_a_round_grid_size_coarsens_all_the_way():
         assert rho < 0.6, (n, rho)
 
 
+def test_a_strongly_coupled_system_is_smoothed_by_its_node_blocks():
+    """Two fields exchanging at the node (a fast reaction) are one 2x2 block per node, which the smoother
+    inverts. Scaling each row on its own instead -- what a point smoother does -- stops working once the
+    exchange outgrows the diffusion: measured factors 0.97 (row) against 0.06 (block) at c = 20000 on a 48²
+    grid, where 4/h² is 9216, and the row smoother diverges outright (2.55) at c = 100000."""
+    from jno.utils.solver import lattice_mg as L
+
+    def rowwise(d, block):  # scale each row on its own, ignoring the node's own coupling
+        inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
+        nf = d.shape[0]
+        return inv[None] if nf == 1 else jnp.moveaxis(inv, 0, -1)[..., None] * jnp.eye(nf, dtype=d.dtype)
+
+    c = 20000.0
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 48).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    f = 1.0 + 0.0 * x
+    prob = jno.fdm([-ui.xx - ui.yy + c * vi - f, -vi.xx - vi.yy - c * ui - f, u(xb, yb) - 0.0, v(xb, yb) - 0.0])
+    res = prob._steady_residual()
+    mask = np.ones(prob._Ntot)
+    for b_, idx, _vals in prob._dirichlet_rows():
+        mask[b_ * prob._N + np.asarray(idx)] = 0.0
+    mask = jnp.asarray(mask)
+    z = jnp.zeros(prob._Ntot)
+    mv = jax.jit(lambda w: jax.jvp(res, (z,), (w * mask,))[1] * mask)
+    rhs = -res(z) * mask
+    shape = tuple(d.mesh_connectivity["grid"]["shape"])
+    factors = {}
+    original = L._smoother_inverse
+    try:
+        for kind, inverse in (("block", original), ("row", rowwise)):
+            L._smoother_inverse = inverse
+            vcycle, _ = L.build(mv, shape, nf=2)
+            factors[kind], _ = _rho(mv, rhs, lambda r: vcycle(r * mask) * mask, cycles=8)
+    finally:
+        L._smoother_inverse = original
+    assert factors["block"] < 0.3, factors
+    assert factors["block"] < 0.5 * factors["row"], factors
+
+
 def test_the_v_cycle_is_symmetric_when_the_operator_is():
     """A Galerkin coarse operator with Pᵀ restriction and matching pre/post smoothing is symmetric, which is
     what makes it a valid preconditioner for conjugate gradients."""
