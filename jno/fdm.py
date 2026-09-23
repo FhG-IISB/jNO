@@ -1892,7 +1892,7 @@ class _TraceFDM:
             "condition through its normal derivative `ub.d(n)`."
         )
 
-    def _flux_row_fn(self, skeleton, extra_params=None):
+    def _flux_row_fn(self, skeleton, extra_params=None, ncomp=1):
         """``(dofs, t) ↦ residual`` of a boundary condition at every node, from its eagerly built
         :meth:`_flux_skeleton`; ``extra_params`` injects trainable-parameter values."""
 
@@ -1919,9 +1919,10 @@ class _TraceFDM:
                 G = jnp.stack([g(target[:, k]) for k in range(target.shape[1])], axis=1)  # (len(idx), c, dim)
                 for a in range(dim):
                     ctx[f"fdm_bgrad_{i}_{a}"] = jnp.zeros((N, target.shape[1]), target.dtype).at[jidx].set(G[:, :, a])
-            out = self._require_real(
-                jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1), "a flux condition"
-            )
+            out = self._require_real(jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})), "a flux condition")
+            if ncomp > 1:  # a vector condition (a traction) carries one row per component
+                return jnp.broadcast_to(out.reshape(-1, ncomp), (N, ncomp))
+            out = out.reshape(-1)
             return jnp.broadcast_to(out, (N,)) if out.shape[0] == 1 else out
 
         return row
@@ -1989,11 +1990,15 @@ class _TraceFDM:
 
     def _flux_rows(self, extra_params=None):
         """``[(rows, nodes, row_fn)]`` for every boundary condition that differentiates an unknown: the
-        global rows it replaces (its field's block at the region's nodes), the nodes, and
+        global rows it replaces -- one set per component of its field, ``(ncomp, n_nodes)`` -- the nodes, and
         :meth:`_flux_row_fn`. ``extra_params`` (a trainable α, say) enters the row functions; the structure
         comes from :meth:`_flux_structure`, built once on concrete values."""
         return [
-            (self._block0[k] * self._N + idx, idx, self._flux_row_fn(skeleton, extra_params))
+            (
+                np.stack([(b * self._N + idx) for b in self._blocks_of(k)]),  # (ncomp, n_nodes)
+                idx,
+                self._flux_row_fn(skeleton, extra_params, self._ncomp[k]),
+            )
             for _c, idx, k, skeleton in self._flux_structure()
         ]
 
@@ -2011,12 +2016,6 @@ class _TraceFDM:
                 idx, _ = self._node_normals(self._flux_region(c))
                 idx = np.asarray(idx, dtype=int)
                 owner = self._flux_owner(c, idx)
-                if self._ncomp[owner] != 1:
-                    raise NotImplementedError(
-                        "jno.fdm([...]): a derivative boundary condition on a vector unknown (a traction on U, "
-                        "say) is not supported yet. Give the vector field Dirichlet values, or write it as "
-                        "scalar unknowns."
-                    )
                 out.append((c, idx, owner, self._flux_skeleton(c, idx)))
         self._flux_struct = out
         return out
@@ -2071,9 +2070,11 @@ class _TraceFDM:
         field share a node (a corner), so every condition is imposed there rather than the last one."""
         acc = jnp.zeros_like(r)
         hit = jnp.zeros(r.shape[0], dtype=bool)
-        for rows, idx, row_fn in flux_rows:  # `rows`: the owning field's block, `idx`: the region's nodes
-            acc = acc.at[rows].add(row_fn(u, t)[idx])
-            hit = hit.at[rows].set(True)
+        for rows, idx, row_fn in flux_rows:  # `rows`: (ncomp, n_nodes) of the owning field's blocks
+            out = row_fn(u, t)  # (N,) for a scalar condition, (N, ncomp) for a vector one (a traction)
+            for j, rows_j in enumerate(rows):
+                acc = acc.at[rows_j].add(out[idx] if out.ndim == 1 else out[idx, j])
+                hit = hit.at[rows_j].set(True)
         return jnp.where(hit, acc, r)
 
     def _flux_gradient_fn(self, idx, scheme, grad_method):
@@ -2767,7 +2768,7 @@ class _TraceFDM:
         bmask_np, _ = self._dirichlet_values_at(float(t0))
         algebraic = bmask_np.copy()  # Dirichlet + flux nodes are algebraic (zero mass row)
         for row in flux_rows:
-            algebraic[np.asarray(row[0])] = True
+            algebraic[np.asarray(row[0]).reshape(-1)] = True  # every component's rows
         bmask, algebraic = jnp.asarray(bmask_np), jnp.asarray(algebraic)
 
         spatial_res = self._pde_residual_fn(spatial=True)

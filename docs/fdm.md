@@ -838,9 +838,10 @@ traj = jno.fdm([
 compact stencil. A vector unknown is one DOF block per component, so a solve returns the components as
 rows, in declaration order. It is the same discretisation as writing `u`, `v` and `p` as three scalar
 unknowns: on Kovasznay flow the two agree to 8e-15. A vector equation must drive a vector unknown with the
-same number of components, and a mismatch raises. Derivative boundary conditions on a vector unknown (a
-traction) are not supported yet and raise. Give the velocity Dirichlet values, and put flux conditions on
-the pressure.
+same number of components, and a mismatch raises. A **derivative** boundary condition on a vector unknown
+— a traction, `ur.d(n) - t` with `t` a vector — replaces one row per component; measured second order
+against a manufactured solution. For the cavity, give the velocity Dirichlet values and put the flux
+condition on the pressure.
 
 The vector-calculus operators are shorthand for the same terms, giving identical values:
 `u.grad() @ u` is `(u·∇)u`, `pi.grad()` is `∇p`, `u.laplacian()` is `u.xx + u.yy` and `u.div()` is

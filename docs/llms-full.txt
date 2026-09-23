@@ -599,8 +599,8 @@ jno.fdm([
 ```
 
 With pressure flux conditions on every wall, fix p at one interior node:
-`d.point_region("gauge", (0.5, 0.5))`, then `p(xg, yg) - 0.0`. Derivative BCs on a vector unknown
-(traction) raise; put flux conditions on the scalar fields.
+`d.point_region("gauge", (0.5, 0.5))`, then `p(xg, yg) - 0.0`. A derivative BC on a vector unknown (a
+traction, `ur.d(n) - t`) replaces one row per component.
 
 **Transient and coupled.** A `ui.t` term plus `domain(time=(t0, t1, n))` marches (backward Euler by
 default; `jno.solve.theta`, `bdf2`). Several unknowns in one list are a coupled system; `u.tt` is

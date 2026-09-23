@@ -2794,6 +2794,42 @@ def test_the_cotangent_laplacian_does_not_depend_on_the_mesh_units(dim):
         np.testing.assert_allclose(np.asarray(lap)[interior], 2.0 * dim, rtol=1e-6)
 
 
+def test_a_derivative_condition_on_a_vector_unknown():
+    """A traction -- a derivative boundary condition on a vector field -- used to raise ("not supported yet.
+    Give the vector field Dirichlet values"). It replaces one row per component now. Oracle: the manufactured
+    solution u = (sin πx sin πy, xy) of -Δu = f, prescribed on the right wall by its normal derivative;
+    second order in the first component, exact in the second (a bilinear field)."""
+    import jno.jnp_ops as jnn
+
+    errs = []
+    for n in (16, 32):
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured().domain()
+        p = _nodes(d)
+        x, y, _ = d.variable("interior", split=True)
+        (xl, yl, _), (xb, yb, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("left", "bottom", "top"))
+        xr, yr, _ = d.variable("right", split=True)
+        nr = d.variable("right", normals=True)
+        U = d.unknown(value_shape=(2,))
+        u, ur = U.vector.bind(x=x, y=y), U.vector.bind(x=xr, y=yr)
+        f = jnn.stack([2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y), 0.0 * x], axis=-1)
+        g = lambda X, Y: jnn.stack([jnn.sin(np.pi * X) * jnn.sin(np.pi * Y), X * Y], axis=-1)  # noqa: E731
+        sol = np.asarray(
+            jno.fdm(
+                [
+                    -u.xx - u.yy - f,
+                    U(xl, yl) - g(xl, yl),
+                    U(xb, yb) - g(xb, yb),
+                    U(xt, yt) - g(xt, yt),
+                    ur.d(nr) - jnn.stack([np.pi * jnn.cos(np.pi * xr) * jnn.sin(np.pi * yr), yr], axis=-1),
+                ]
+            ).solve()
+        )
+        exact0 = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+        errs.append(np.abs(sol[0] - exact0).max())
+        assert np.abs(sol[1] - p[:, 0] * p[:, 1]).max() < 1e-8  # bilinear: exact on this stencil
+    assert errs[0] / errs[1] > 3.5, errs  # second order
+
+
 @pytest.mark.parametrize("structured", [True, False])
 def test_a_matrix_unknown_equals_the_same_components_as_scalars(structured):
     """`domain.unknown(value_shape=(2, 2))` -- a tensor field, e.g. a stress or a conformation tensor -- is
