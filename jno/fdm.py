@@ -1537,8 +1537,10 @@ class _TraceFDM:
         """Are two evaluations of the same quantity equal to floating-point accuracy (:func:`_rtol`), relative
         to their magnitude?"""
         a, b = jnp.asarray(a), jnp.asarray(b)
-        scale = max(float(jnp.max(jnp.abs(a))), float(jnp.max(jnp.abs(b))), np.finfo(float).tiny)
-        return bool(jnp.max(jnp.abs(a - b)) <= _rtol(a.dtype) * scale)
+        # Compared inside JAX: the values can be tracers (a coefficient differentiated by jax.grad), whose
+        # comparison resolves but whose magnitude does not (`float()` of a tracer raises).
+        scale = jnp.maximum(jnp.maximum(jnp.max(jnp.abs(a)), jnp.max(jnp.abs(b))), jnp.finfo(a.dtype).tiny)
+        return bool(jnp.all(jnp.abs(a - b) <= _rtol(a.dtype) * scale))
 
     def _time_coefficient(self, t_val, tt_val, what, example, k=0):
         """Per-node coefficient of the time derivative selected by the probe ``(u.t, u.tt) = (t_val,
