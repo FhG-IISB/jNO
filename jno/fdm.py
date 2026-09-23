@@ -243,11 +243,11 @@ def _structured_linear_solve(domain, periodic=False, vcycle=None):
     # Preconditioned, the iteration count is small, and `jno.solve.gmres` (JAX's batched method) would
     # finish a whole 30-vector cycle whatever the convergence -- 30 V-cycles where 3 suffice. Measured on a
     # 50-step heat march at 263k nodes: 34 s against 1.7 s for the incremental method, same answer.
-    # A Newton step does not need its linear system solved exactly -- only far enough that the outer
-    # iteration keeps converging (an inexact Newton method; Dembo, Eisenstat & Steihaug, SIAM J. Numer.
-    # Anal. 19 (1982) 400) -- and the V-cycle's preconditioned residual falls fast, so the budget is two
-    # restart cycles rather than the 50 a standalone solve may take.
-    return lambda mv, rhs: _gmres_incremental(mv, rhs, vcycle, _solve.gmres().tolerance, maxiter=2)[0]
+    # Stops when the TRUE residual meets the tolerance, however many cycles that takes. A fixed budget was
+    # tried instead (two restart cycles, on the inexact-Newton argument that a step needs only enough
+    # progress to keep the outer iteration converging): at 66k nodes it left the step so far from solved
+    # that Newton diverged on Bratu, residual 6.2e2 against a 5e-6 tolerance.
+    return lambda mv, rhs: _gmres_incremental(mv, rhs, vcycle, _solve.gmres().tolerance)[0]
 
 
 def _integrate_transient(block, ts, time, linear_solve=None, nonlinear_solve=None):
@@ -2289,11 +2289,24 @@ class _TraceFDM:
     def _grid_vcycle(self, residual, at):
         """The V-cycle for this problem's tangent at ``at``. Built once and frozen for the Newton loop that
         uses it: the tangent drifts as Newton proceeds, and the hierarchy built here does not follow it,
-        which changes how fast the inner solve converges, never what it converges to."""
+        which changes how fast the inner solve converges, never what it converges to.
+
+        Built on the tangent with its **Dirichlet rows and columns eliminated**, as the linear path solves it,
+        and applied as identity there. A Dirichlet row of a Newton tangent is a unit row, scale 1, next to
+        interior rows of scale 1/h²; a smoother reads those as one operator and the V-cycle then amplifies
+        (measured: a standalone factor of 107 on the unmasked tangent, 0.28 on the eliminated one)."""
         import jax
 
         at = jnp.zeros(self._Ntot) if isinstance(at, jax.core.Tracer) else jnp.asarray(at)
-        return self._lattice_vcycle(lambda v: jax.jvp(residual, (at,), (v,))[1], self._Ntot)
+        with jax.ensure_compile_time_eval():
+            mask_host = np.ones(self._Ntot)
+            for b, idx, _vals in self._dirichlet_rows():
+                mask_host[b * self._N + np.asarray(idx, dtype=int)] = 0.0
+            mask = jnp.asarray(mask_host)
+        vcycle = self._lattice_vcycle(lambda v: jax.jvp(residual, (at,), (v * mask,))[1] * mask, self._Ntot)
+        if vcycle is None:
+            return None
+        return lambda r: jnp.where(mask > 0, vcycle(r * mask), r)
 
     def _default_is_assembled(self):
         """Does the default steady solve go through the assembled operator? For a linear, single-field
