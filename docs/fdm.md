@@ -642,6 +642,12 @@ columns moved to the right-hand side) and GMRES otherwise. The Krylov iterations
 matrix-free. An explicit `time=` scheme marches the augmented `[u; v]` state instead: backward Euler
 visibly damps the wave, and BDF2 refuses. `.solve()` returns the `u` trajectory.
 
+A **vector unknown** (`d.unknown(value_shape=(2,))`, written `u.tt - u.xx - u.yy` on the vector view) and a
+**coupled system** of several unknowns are both second-order too; the march returns `(n_steps, nf, N)`.
+They take the augmented `[u; v]` path whatever `time=` says, because the Newmark step operator comes out
+rank-deficient for a system (measured: rank 152 of 162 on a two-component wave, so CG returns NaN). The
+answer is the same; the cost is twice the unknowns per step.
+
 !!! measured "Gaussian pulse in a closed box, 300 steps to t = 1.5, RTX 3070, float64"
     | nodes | augmented `[u; v]`, `gmres` | Newmark default |
     |---|---|---|
@@ -749,8 +755,8 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
 ## Scope and limitations
 
 **Supported:** scalar fields — or a **coupled system** of several `domain.unknown()` fields (Dirichlet
-conditions, one PDE equation per unknown, steady or first order in time; `.solve()` returns `(nf, N)`, a
-march `(n_steps, nf, N)`) — on a **2-D triangular or 3-D
+conditions, one PDE equation per unknown, steady or transient to first or second order in time;
+`.solve()` returns `(nf, N)`, a march `(n_steps, nf, N)`) — on a **2-D triangular or 3-D
 tetrahedral** mesh; any mix of Dirichlet and derivative boundary conditions (Neumann, Robin, oblique,
 nonlinear), in 2-D and 3-D, **steady or transient** (a transient flux node is an
 algebraic zero-mass-row constraint); transient problems by the method of lines, first order (a `u.t` term with a unit or a general `c(x)·u.t` mass
@@ -813,8 +819,8 @@ equation of the one field the condition differentiates that is not already fixed
 Dirichlet condition. Here u and v have no-slip values, so it is p's. If that cannot be decided (two free
 fields), it raises.
 
-Not supported on a coupled system, and each raises: `u.tt` (write it as a first-order system in
-`(u, v = u.t)`), and the time derivative of another field inside equation *k* (a non-diagonal mass).
+Not supported on a coupled system, and it raises: the time derivative of another field inside equation *k*
+(a non-diagonal mass). `u.tt` is supported — see [second order in time](#second-order-in-time-utt).
 
 #### Incompressible Navier–Stokes
 

@@ -889,11 +889,6 @@ class _TraceFDM:
                     f"{len(self.unknowns)} unknowns but {len(self._pde)} PDE equation(s). Author one equation per "
                     "field, in the order the unknowns are declared (equation k drives unknown k)."
                 )
-            if self._transient and self._time_order == 2:
-                raise NotImplementedError(
-                    "jno.fdm([...]): a coupled system is marched to first order in time only (`u.t`); a coupled "
-                    "`u.tt` system is not supported. Write it as a first-order system in (u, v = u.t)."
-                )
             for k, (eq, own) in enumerate(zip(self._pde, self.unknowns)):
                 other = [j for j, w in enumerate(self.unknowns) if w is not own and _has_temporal_of(eq, w)]
                 if other:
@@ -1514,10 +1509,12 @@ class _TraceFDM:
         node values of ``ρcₚ(x)``. ``c`` must be constant in ``u`` (a nonlinear mass ``c(u)·u.t`` raises).
         A coupled system stacks one block per field: equation k's coefficient of ``u_k.t`` (zero for an
         equation without a time derivative, whose field is then algebraic)."""
-        coefs = [
-            self._time_coefficient(1.0, 0.0, "`u.t` mass coefficient", "nonlinear mass `c(u)·u.t`", k=k)
-            for k in range(len(self._pde_exprs()))  # one per equation; a vector one spans its components
-        ]
+        return self._time_coefficients(1.0, 0.0, "`u.t` mass coefficient", "nonlinear mass `c(u)·u.t`")
+
+    def _time_coefficients(self, t_val, tt_val, what, example):
+        """:meth:`_time_coefficient` over every equation, concatenated into the blocked DOF layout: equation
+        k's coefficient of its own field's time derivative (a vector equation spans its components)."""
+        coefs = [self._time_coefficient(t_val, tt_val, what, example, k=k) for k in range(len(self._pde_exprs()))]
         if len(coefs) == 1:
             return coefs[0]
         return lambda t=None: jnp.concatenate([c(t) for c in coefs])
@@ -2144,18 +2141,20 @@ class _TraceFDM:
         return u0
 
     def _initial_velocity(self):
-        """Initial velocity ``v0`` (shape ``(N,)``) from the ``ui0.t - v0`` condition(s) on the ``initial``
-        region, as :func:`jno.fem` reads it for ``u_tt``; zero when none is given."""
-        v0 = jnp.zeros(self._N)
+        """Initial velocity ``v0`` over the blocked DOF vector, from the ``ui0.t - v0`` condition(s) on the
+        ``initial`` region, as :func:`jno.fem` reads it for ``u_tt``; zero when none is given."""
+        v0 = jnp.zeros(self._Ntot)
         for c in self._vel_ic:
-            idx = self._region_nodes(_region_tag(c))
+            idx = np.asarray(self._region_nodes(_region_tag(c)), dtype=int)
             inner = _unwrap(c)
             if getattr(inner, "op", None) != "-":
                 raise ValueError(f"jno.fdm([...]): write an initial velocity as `ui0.t - v0`; got {c!r}.")
             g_node = inner.right if _has_temporal(inner.left) else inner.left  # v0 is the side without u.t
             scope = self._params_scope()
             vals = self._eval_value(g_node, idx, scope) if self._uses_params(g_node, scope) else self._eval_g(g_node, idx)
-            v0 = v0.at[jnp.asarray(idx)].set(vals)
+            k = self._field_index(c)
+            for b, vb in zip(self._blocks_of(k), self._split_components(k, vals, len(idx))):
+                v0 = v0.at[jnp.asarray(b * self._N + idx)].set(vb)
         return v0
 
     def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None):
@@ -2814,7 +2813,9 @@ class _TraceFDM:
 
         slots = dict(nonlinear=nonlinear, linear=linear, precond=precond)
         if self._time_order == 2:
-            return self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots)
+            traj = self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots)
+            # (steps, field, node) for a vector or coupled field, as the first-order march returns
+            return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)
 
         c_of = self._mass_coefficient()  # u.t coefficient c(x, t): 1 for a plain u.t, ρcₚ(x) for ρcₚ(x)·u.t
         n = self._Ntot  # a coupled system marches the blocked vector [u_0; …; u_{nf-1}]
@@ -2934,9 +2935,9 @@ class _TraceFDM:
         ``u`` trajectory ``(n_save, N)``."""
         import jax.experimental.sparse as jsparse
 
-        N = self._N
-        m_nodes = self._time_coefficient(0.0, 1.0, "`u.tt` inertia coefficient", "nonlinear inertia `m(u)·u.tt`")
-        c_nodes = self._time_coefficient(1.0, 0.0, "`u.t` damping coefficient", "nonlinear damping `c(u)·u.t`")
+        N = self._Ntot  # the blocked vector: a vector or coupled field marches every component
+        m_nodes = self._time_coefficients(0.0, 1.0, "`u.tt` inertia coefficient", "nonlinear inertia `m(u)·u.tt`")
+        c_nodes = self._time_coefficients(1.0, 0.0, "`u.t` damping coefficient", "nonlinear damping `c(u)·u.t`")
         diag = jnp.stack([jnp.arange(2 * N), jnp.arange(2 * N)], axis=1)
 
         def M(t=None):
@@ -2950,7 +2951,12 @@ class _TraceFDM:
             return jnp.concatenate([ru, rv])
 
         v0 = jnp.where(algebraic, 0.0, self._initial_velocity())
-        if time is None:
+        # The Newmark shortcut eliminates v and solves for the new displacement alone. For ONE field that is
+        # half the unknowns and a well-conditioned step operator; for a vector or coupled field its step
+        # operator comes out rank-deficient (measured: rank 152 of 162 on a two-component wave) and CG
+        # returns NaN, so such a system marches the augmented [u; v] block instead -- the same answer, twice
+        # the unknowns per step. Making Newmark work for systems is open.
+        if time is None and self._nf == 1:
             traj = self._newmark(spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, (t0, t1, dt), slots)
             if save_ts is None:
                 return traj
@@ -3005,14 +3011,14 @@ class _TraceFDM:
             return row_scale * boundary_rows(w, g, t_next)
 
         nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
-        self._check_precond_shape(precond, self._N)
+        self._check_precond_shape(precond, self._Ntot)
         probe = lambda w: step_residual(w, u0, v0, r0, t0 + dt)  # noqa: E731
         with jax.ensure_compile_time_eval():
             linear_problem = (
                 nonlinear is None
-                and self._is_affine("newmark", lambda: probe, self._N)
+                and self._is_affine("newmark", lambda: probe, self._Ntot)
                 and not self._operator_varies_in_time(
-                    lambda: lambda w, t, args: step_residual(w, u0, v0, r0, t), self._N, t0 + dt, t1, key="newmark"
+                    lambda: lambda w, t, args: step_residual(w, u0, v0, r0, t), self._Ntot, t0 + dt, t1, key="newmark"
                 )
             )
         if linear_problem:

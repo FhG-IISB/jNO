@@ -481,8 +481,9 @@ def test_coupled_two_field():
 
 
 def test_coupled_guards():
-    """A coupled system needs one PDE equation per unknown, a flux condition belongs to one unknown, and it marches
-    first order in time with equation k carrying only its own unknown's `u.t`."""
+    """A coupled system needs one PDE equation per unknown, a flux condition belongs to one unknown, and
+    equation k carries only its own unknown's `u.t` (a non-diagonal mass raises). Second order in time is
+    supported -- see `test_a_coupled_second_order_system_marches`."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -502,8 +503,6 @@ def test_coupled_guards():
     vit = vt.bind(x=xt, y=yt, t=tt)
     with pytest.raises(NotImplementedError, match="time derivative of unknown 1"):  # off-diagonal mass
         jno.fdm([vit.t - (uit.d2(xt) + uit.d2(yt)), uit.t - (vit.d2(xt) + vit.d2(yt)), ut(xit, yit) - 0.0])
-    with pytest.raises(NotImplementedError, match="first order in time"):  # coupled u.tt
-        jno.fdm([uit.t.t - (uit.d2(xt) + uit.d2(yt)) + vit, vit.t - uit, ut(xit, yit) - 0.0, vt(xit, yit) - 0.0])
     xr, yr, _ = d.variable("right", split=True)
     nr = d.variable("right", normals=True)
     xl, yl, _ = d.variable("left", split=True)
@@ -2792,6 +2791,74 @@ def test_the_cotangent_laplacian_does_not_depend_on_the_mesh_units(dim):
         else:
             lap = D.compute_fd_laplacian_3d_simple(u, p, mc["tetrahedra"], dims=(0, 1, 2), method="cotangent")
         np.testing.assert_allclose(np.asarray(lap)[interior], 2.0 * dim, rtol=1e-6)
+
+
+def test_a_vector_wave_marches_every_component():
+    """`u.tt` on a vector unknown: a standing wave U = (S, 2S)·cos(√2 π t) with S = sin πx sin πy. A coupled
+    or vector second-order system used to raise ("marched to first order in time only"), and `.tt` on a
+    vector view raised about automatic differentiation over finite-difference partials."""
+    import jno.jnp_ops as jnn
+
+    T, errs = 0.25, []
+    for n in (16, 24):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured(), time=(0.0, T, 81))
+        p = _nodes(d)
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        U = d.unknown(value_shape=(2,))
+        u = U.vector.bind(x=x, y=y, t=t)
+        S0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+        zero = 0.0 * xb
+        traj = np.asarray(
+            jno.fdm(
+                [
+                    u.tt - u.xx - u.yy,
+                    U(xb, yb) - jnn.stack([zero, zero], axis=-1),
+                    U(xi, yi) - jnn.stack([S0, 2 * S0], axis=-1),
+                ]
+            ).solve()
+        )
+        assert traj.shape[1:] == (2, len(p))  # (steps, field, node)
+        S = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.cos(np.sqrt(2) * np.pi * T)
+        errs.append(max(np.abs(traj[-1][0] - S).max(), np.abs(traj[-1][1] - 2 * S).max() / 2))
+    assert errs[1] < errs[0], errs  # converging under refinement
+    assert errs[1] < 2e-3, errs
+
+
+def test_a_coupled_second_order_system_marches():
+    """`u.tt` on a system of separate unknowns, which used to raise ("marched to first order in time only").
+    Oracle: two membranes coupled by their difference, `ui.tt - Δu + (u - w)`, started equal -- the coupling
+    term is identically zero along the solution, so each is the standing wave `sin πx sin πy cos(√2 π t)`."""
+    import jno.jnp_ops as jnn
+
+    T, errs = 0.25, []
+    for n in (16, 24):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured(), time=(0.0, T, 81))
+        p = _nodes(d)
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        u, w = d.unknown(), d.unknown()
+        ui, wi = u.bind(x=x, y=y, t=t), w.bind(x=x, y=y, t=t)
+        S0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+        traj = np.asarray(
+            jno.fdm(
+                [
+                    ui.tt - (ui.xx + ui.yy) + (ui - wi),
+                    wi.tt - (wi.xx + wi.yy) + (wi - ui),
+                    u(xb, yb) - 0.0,
+                    w(xb, yb) - 0.0,
+                    u(xi, yi) - S0,
+                    w(xi, yi) - S0,
+                ]
+            ).solve()
+        )
+        assert traj.shape[1:] == (2, len(p))  # (steps, field, node)
+        S = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.cos(np.sqrt(2) * np.pi * T)
+        errs.append(max(np.abs(traj[-1][0] - S).max(), np.abs(traj[-1][1] - S).max()))
+    assert errs[1] < errs[0], errs  # converging under refinement
+    assert errs[1] < 2e-3, errs
 
 
 def test_a_derivative_condition_on_a_vector_unknown():

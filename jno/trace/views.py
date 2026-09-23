@@ -603,6 +603,26 @@ class VectorView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return VectorView(new_expr)
 
+    @property
+    def tt(self) -> "VectorView":
+        """The second time derivative, component by component -- the chained ``TemporalDerivative`` the
+        scalar view builds for ``ui.tt``, so a vector wave reads ``u.tt - u.xx - u.yy``.
+
+        Without it, ``.tt`` fell through to the placeholder's generic attribute handling, which asked for an
+        automatic-differentiation derivative of an expression built from finite-difference partials -- a
+        thing the guard refuses, with a message about `u.x.d(x)` that named nothing the caller wrote.
+        """
+        from . import TemporalDerivative
+
+        cv = object.__getattribute__(self, "_coord_vars") or {}
+        temporal = [v for v in cv.values() if getattr(v, "axis", None) == "temporal"]
+        if not temporal:
+            raise ValueError(
+                "jno: `.tt` needs a time coordinate in the binding -- `U.vector.bind(x=x, y=y, t=t)`. This "
+                "view is bound to spatial coordinates only."
+            )
+        return VectorView(TemporalDerivative(TemporalDerivative(self._expr, temporal[0]), temporal[0]))
+
     def _frozen_domain_tag(self):
         """The mesh domain + spatial region tag from this view's ``.bind(...)`` coords, so a frozen field
         can map its nodal values onto the region (shared by :meth:`freeze` / :meth:`freeze_path`)."""
