@@ -1,7 +1,6 @@
 """Operator-dependent multigrid on a structured grid, built from the operator itself.
 
-The V-cycle in :mod:`geometric_mg` preconditions one operator: the constant-coefficient ``-Δ``. It is
-built from the grid alone, so a variable coefficient, a reaction term, an advection term, an anisotropy,
+A V-cycle built from the grid alone preconditions one operator: the constant-coefficient ``-Δ``. So a variable coefficient, a reaction term, an advection term, an anisotropy,
 a flux row or a second field all get a preconditioner for a *different* problem than the one being
 solved. This module builds the hierarchy from the operator's own coefficients instead:
 

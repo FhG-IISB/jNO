@@ -2,7 +2,7 @@
 
 The oracle is the V-cycle's own convergence factor ρ, measured as a standalone iteration
 ``x <- x + M(b - Ax)``: multigrid's defining property is that ρ does not grow as the grid is refined. The
-V-cycle built from the grid alone (`geometric_mg`) is the comparison — it preconditions ``-Δ`` whatever
+V-cycle built from the grid alone (what this replaced) is the comparison — it preconditions ``-Δ`` whatever
 the operator is, and diverges as an iteration on every case here except Poisson.
 """
 
@@ -123,6 +123,62 @@ def test_a_round_grid_size_coarsens_all_the_way():
         assert levels == _expected_levels(shape), (n, levels)
         rho, _ = _rho(mv, b, lambda r: vcycle(r * mask) * mask)
         assert rho < 0.6, (n, rho)
+
+
+def _poisson_operator(h=0.05):
+    """(grid descriptor, matvec, rhs, exact) for -Δu = 2π² sin(πx) sin(πy) with u = 0 on the ring."""
+    n = int(round(1.0 / h)) + 1
+    shape, xs = (n, n), np.linspace(0.0, 1.0, n)
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    interior = np.zeros(shape, bool)
+    interior[1:-1, 1:-1] = True
+    exact = (np.sin(np.pi * X) * np.sin(np.pi * Y) * interior).reshape(-1)
+    rhs = (2 * np.pi**2 * np.sin(np.pi * X) * np.sin(np.pi * Y) * interior).reshape(-1)
+    mask = jnp.asarray(interior.reshape(-1).astype(float))
+
+    def mv(v):
+        u = (jnp.asarray(v) * mask).reshape(shape)
+        lap = jnp.zeros(shape)
+        core = (slice(1, -1), slice(1, -1))
+        acc = 4.0 * u[core] - u[2:, 1:-1] - u[:-2, 1:-1] - u[1:-1, 2:] - u[1:-1, :-2]
+        return (lap.at[core].set(acc / h**2).reshape(-1)) * mask
+
+    return {"shape": shape, "spacing": (h, h), "origin": (0.0, 0.0)}, mv, jnp.asarray(rhs) * mask, exact
+
+
+def test_a_gmg_preconditioned_solve_is_differentiable():
+    """A gmg-preconditioned GMRES solve is reverse-mode differentiable in the right-hand side's scale."""
+    from jno.utils.solver.solver_api import LinearOperator, PrecondContext
+
+    grid, mv, b, exact = _poisson_operator()
+    op = LinearOperator.from_matvec(mv, shape=(b.shape[0], b.shape[0]))
+    obs = jnp.asarray(exact)
+
+    def loss(scale):
+        applier = jno.precond.gmg().materialize(PrecondContext(op, grid=grid))
+        sol = jno.solve.gmres(maxiter=50)(op, scale * b, M=applier)
+        return jnp.mean((sol - obs) ** 2)
+
+    g = float(jax.grad(loss)(1.3))
+    assert np.isfinite(g) and g > 0.0  # scale 1.3 (above the true 1.0) → the loss increases
+
+
+def test_gmg_needs_a_grid_and_a_matvec():
+    """Off a structured grid there is no lattice to read a stencil from, and it says so."""
+    from jno.utils.solver.solver_api import LinearOperator, PrecondContext
+
+    op = LinearOperator.from_matvec(lambda v: v, shape=(9, 9))
+    with pytest.raises(ValueError, match="structured grid"):
+        jno.precond.gmg().materialize(PrecondContext(op))
+
+
+def test_gmg_rejects_settings_that_no_longer_apply():
+    """omega and min_size belonged to the damped-Jacobi, coarsen-to-a-size V-cycle. They raise rather than
+    being silently ignored."""
+    with pytest.raises(ValueError, match="no damping parameter"):
+        jno.precond.gmg(omega=0.8)
+    with pytest.raises(ValueError, match="no damping parameter"):
+        jno.precond.gmg(min_size=5)
 
 
 def test_a_strongly_coupled_system_is_smoothed_by_its_node_blocks():
