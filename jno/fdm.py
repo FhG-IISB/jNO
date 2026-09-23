@@ -184,13 +184,40 @@ def _pcg(matvec, b, precond, tol, maxiter=1000):
     return x, jnp.linalg.norm(r)
 
 
-def _gmres_incremental(matvec, b, precond, tol, restart=30, maxiter=50):
+def _gmres_incremental(matvec, b, precond, tol, restart=30, maxiter=50, cycles=8):
     """GMRES that checks its residual every iteration (JAX's ``incremental`` method) -- the ``batched``
-    method ``jno.solve.gmres`` uses finishes each 30-vector restart cycle whatever the convergence."""
+    method ``jno.solve.gmres`` uses finishes each 30-vector restart cycle whatever the convergence -- and
+    whose tolerance is measured on the TRUE residual.
+
+    JAX's ``gmres`` applies ``M`` on the LEFT, so it stops on ``‖M(b − Ax)‖``. Where ``M`` is not spectrally
+    equivalent to the operator -- a ``jno.fd(order=4)`` stencil preconditioned by the second-order V-cycle --
+    the two differ: measured 1e-10 preconditioned against 2.7e-8 true, which the caller's own gate then
+    refused (`test_higher_order_poisson`). The outer loop restarts from the iterate and re-forms ``b − Ax``,
+    so the tolerance means the same thing whatever ``M`` does; it costs one matvec per cycle. It stops at the
+    tolerance, when a cycle no longer halves the residual (``M`` cannot do better), or after ``cycles``.
+    Right-preconditioned FGMRES (:func:`jno.utils.solver.krylov.fgmres`) would measure the true residual
+    directly, but keeps a second ``(restart, n)`` basis -- 4 GB more at 16.8M nodes."""
+    import jax
     from jax.scipy.sparse.linalg import gmres
 
-    x, _ = gmres(matvec, b, tol=tol, restart=restart, maxiter=maxiter, M=precond, solve_method="incremental")
-    return x, jnp.linalg.norm(b - matvec(x))
+    nb = jnp.maximum(jnp.linalg.norm(b), jnp.finfo(b.dtype).tiny)
+
+    def cond(s):
+        _, rn, prev, k = s
+        return (rn > tol * nb) & (rn <= 0.5 * prev) & (k < cycles)
+
+    def body(s):
+        x, rn, _, k = s
+        dx, _ = gmres(
+            matvec, b - matvec(x), tol=tol, restart=restart, maxiter=maxiter, M=precond, solve_method="incremental"
+        )
+        x = x + dx
+        return x, jnp.linalg.norm(b - matvec(x)), rn, k + 1
+
+    zero = jnp.zeros_like(b)
+    state = (zero, nb * jnp.ones((), b.dtype), jnp.array(jnp.inf, b.dtype), jnp.array(0))
+    x, rn, *_ = jax.lax.while_loop(cond, body, state)
+    return x, rn
 
 
 def _structured_linear_solve(domain, periodic=False):
@@ -203,8 +230,8 @@ def _structured_linear_solve(domain, periodic=False):
     The GMRES is **preconditioned by a geometric-multigrid V-cycle** (:func:`build_vcycle`) built from the
     grid — O(N), grid-independent convergence (~0.1 residual reduction per cycle) on Poisson-type
     operators — falling back to plain GMRES when the grid is too small to coarsen (a single level). The
-    V-cycle is a fixed linear operator, so standard GMRES (not FGMRES) suffices. Returns ``None`` for an
-    unstructured mesh, so the driver keeps its (BiCGStab) default there."""
+    V-cycle is a fixed linear operator, so standard GMRES (not FGMRES) suffices. On an unstructured mesh it is
+    plain GMRES (no multigrid)."""
     if getattr(domain, "mesh_connectivity", None) is None or domain.mesh_connectivity.get("grid") is None:
         # Unstructured: GMRES too. The strong-form operator is not symmetric, and the driver's BiCGStab broke
         # down on it: a linear 3-D cotangent problem with one Neumann face diverged to a Newton residual of
@@ -1280,7 +1307,7 @@ class _TraceFDM:
                 return cache[key]
         raise ValueError(
             "jno.fdm: could not assemble this strong-form operator as a sparse matrix (no stencil radius up "
-            "to 3 reproduces its matrix-free action), so the linear=/precond= slots that need a matrix "
+            "to 6 reproduces its matrix-free action), so the linear=/precond= slots that need a matrix "
             "cannot be used. Leave linear=/precond= unset to keep the matrix-free default."
         )
 
