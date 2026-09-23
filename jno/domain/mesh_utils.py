@@ -362,8 +362,11 @@ class MeshUtils:
         mesh_connectivity["boundary_indices"] = boundary_indices
 
         bp = points[boundary_indices]
-        all_indices = np.arange(len(points))
-        non_boundary_indices = np.setdiff1d(all_indices, boundary_indices)
+        # The complement of a bounded index set: mark and read off, which is linear, rather than
+        # `np.setdiff1d`, which sorts both sides. Same array -- sorted and unique either way.
+        _interior = np.ones(len(points), dtype=bool)
+        _interior[np.asarray(boundary_indices, dtype=int)] = False
+        non_boundary_indices = np.flatnonzero(_interior)
         _bp = points[non_boundary_indices]
 
         mesh_connectivity["boundary_points"] = bp

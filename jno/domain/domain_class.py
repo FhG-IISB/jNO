@@ -3491,7 +3491,12 @@ class domain(MeshIOMixin):
                         # interior free. Append rather than merge, so the ordered loop stays a prefix
                         # for the consumers that rely on it. Empty for a straight mesh, where the chain
                         # already covers every node, so this path is unchanged there.
-                        _extra = np.setdiff1d(tag_points, np.asarray(indices_list, dtype=int))
+                        # marked over the node ids rather than `np.setdiff1d`, which sorts both sides;
+                        # `tag_points` is already sorted and unique, so the result is identical
+                        _seen = np.zeros(len(points), dtype=bool)
+                        _seen[np.asarray(tag_points, dtype=int)] = True
+                        _seen[np.asarray(indices_list, dtype=int)] = False
+                        _extra = np.flatnonzero(_seen)
                         if _extra.size:
                             indices_list = np.concatenate([np.asarray(indices_list, dtype=int), _extra])
                     else:
