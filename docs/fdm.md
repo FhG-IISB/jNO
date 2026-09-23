@@ -314,8 +314,8 @@ differentiable — no authoring change from the unstructured case. **Transient**
 `.structured()` together with `time=(t0, t1, n)` and a `ui.t` term marches by method of lines as usual
 (its backward-Euler operator is diagonally dominant, so it stays on the default inner solve). **Periodic**
 boundaries wrap on a structured grid (see [Periodic](#periodic)). **Complex** fields are *not* supported
-by `jno.fdm` (see [Scope](#scope-and-limitations)); the grid operator itself preserves a complex field
-rather than silently dropping the imaginary part, matching the unstructured cotangent path.
+by `jno.fdm`: a complex source, coefficient or boundary value raises (a real solve would keep only the real
+part). Write the real and imaginary parts as two real unknowns.
 
 !!! note "Solvers on a structured grid"
     A **linear** problem whose Dirichlet data covers the whole boundary is one Krylov solve, with no
@@ -726,6 +726,10 @@ algebraic zero-mass-row constraint); transient problems by the method of lines, 
 coefficient, `M = diag(c)`) or second order ([`u.tt`](#second-order-in-time-utt), with optional damping and
 initial velocity), with a selectable [time scheme](#time-schemes); linear and nonlinear
 residuals; differentiable inverse problems.
+
+**Not supported yet, and each raises when the problem is built or solved:** complex values (a complex source,
+coefficient or boundary value; a real solve would keep only the real part), and an unknown whose `value_shape`
+has rank 2 or more (use `value_shape=(4,)` for a 2×2 field and index its components).
 
 Author a coupled system as one PDE equation per unknown, in declaration order (equation *k* drives
 unknown *k*), plus each field's BCs:

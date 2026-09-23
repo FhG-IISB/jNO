@@ -17,9 +17,10 @@ u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([
 initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
 inferred from ``domain.time``.
 
-Scope: scalar fields — or a **coupled system** of several ``domain.unknown()`` fields (steady + Dirichlet;
-one PDE equation per unknown, equation *k* driving unknown *k*, ``.solve()`` returning ``(nf, N)``) — on a
-**2-D triangular or 3-D tetrahedral mesh**. The interior operators
+Scope: scalar fields, vector fields (``domain.unknown(value_shape=(c,))``), or a **coupled system** of several
+``domain.unknown()`` fields (one PDE equation per unknown, equation *k* driving unknown *k*, steady or first order
+in time, Dirichlet and flux conditions; ``.solve()`` returning ``(nf, N)``) — on a **2-D triangular or 3-D
+tetrahedral mesh** or a structured grid. Real fields only: a complex value raises. The interior operators
 (``jno.fdm.laplacian`` / ``jno.fdm.gradient``, and the constraint-list ``u.d2(x)+u.d2(y)+u.d2(z)``
 authoring) dispatch on ``domain.dimension``; the default ``cotangent`` Laplacian is the cotangent-weight
 operator in 2-D and its exact analogue, the **P1 tetrahedral finite-element** Laplace-Beltrami operator,
@@ -784,6 +785,14 @@ class _TraceFDM:
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])  # nodes per field
         # A vector unknown (`domain.unknown(value_shape=(2,))`) is one DOF block per component, so the DOF
         # vector is [u_0 components…, u_1 components…] in declaration order; `_nf` counts BLOCKS.
+        for w in self.unknowns:
+            if np.ndim(w.module.value) > 2:
+                shape = tuple(np.shape(w.module.value)[1:])
+                raise NotImplementedError(
+                    f"jno.fdm([...]): an unknown with value_shape={shape} (rank {len(shape)}) is not supported yet: "
+                    "the finite-difference kernels take one channel axis. Use a vector unknown, "
+                    f"domain.unknown(value_shape=({int(np.prod(shape))},)), and index its components."
+                )
         self._ncomp = [int(np.prod(np.shape(w.module.value)[1:], dtype=int)) for w in self.unknowns]
         self._block0 = [int(b) for b in np.cumsum([0] + self._ncomp)[:-1]]
         self._nf = int(sum(self._ncomp))
@@ -1094,7 +1103,8 @@ class _TraceFDM:
                     )
                     for k, e in enumerate(exprs)
                 ]
-            return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
+            out = blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
+            return self._require_real(out, "the PDE residual (a complex coefficient or source)")
 
         return residual_fn
 
@@ -1104,6 +1114,7 @@ class _TraceFDM:
         import equinox as eqx
 
         out, N = {}, self._N
+        self._require_real(dofs, "the state (an initial guess x0?)")
         for w, b0, c in zip(self.unknowns, self._block0, self._ncomp):
             sl = dofs[b0 * N : (b0 + c) * N]
             value = sl if c == 1 and np.ndim(w.module.value) == 1 else sl.reshape(c, N).T.reshape(w.module.value.shape)
@@ -1574,6 +1585,17 @@ class _TraceFDM:
             walk(c)
         return found
 
+    def _require_real(self, value, what):
+        """``value``, unless it is complex while every unknown is real: a real solve would keep only its real
+        part (JAX casts complex to real with a warning), which is a wrong answer, not a supported one."""
+        if jnp.iscomplexobj(value) and not any(jnp.iscomplexobj(w.module.value) for w in self.unknowns):
+            raise NotImplementedError(
+                f"jno.fdm: {what} is complex, but the unknown is real, and a real solve would keep only the real "
+                "part. jno.fdm has no complex fields yet: write the real and imaginary parts as two real unknowns "
+                "(a coupled system)."
+            )
+        return value
+
     def _eval_g(self, g_node, idx):
         """Value ``g`` at the nodes ``idx`` — a constant, a coordinate expression, or a **known nodal
         field** (a ``jno.np.parameter`` / ``domain.unknown()`` carrying data, e.g. a neighbour's current
@@ -1586,8 +1608,10 @@ class _TraceFDM:
             return jnp.full((idx.shape[0],), float(g_node))
         inner = _unwrap(g_node)
         if isinstance(inner, ModelCall) and getattr(inner.model, "_is_parameter", False):
-            return jnp.asarray(inner.model.module.value).reshape(-1)[jnp.asarray(idx)]  # nodal data → gather
-        return jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+            out = jnp.asarray(inner.model.module.value).reshape(-1)[jnp.asarray(idx)]  # nodal data → gather
+        else:
+            out = jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+        return self._require_real(out, "a condition's value")
 
     def _condition_value(self, constraint, idx):
         """Value ``g`` of an affine condition ``u(region) - g`` (Dirichlet or IC), evaluated at the
@@ -1691,6 +1715,7 @@ class _TraceFDM:
         params.update(self._live_params())
         with self._fd_scope():
             out = jnp.asarray(TraceEvaluator(params=params).evaluate(_unwrap(g_node), context=ctx, var_bindings={}))
+        self._require_real(out, "a condition's value")
         return jnp.broadcast_to(out.reshape(-1), (len(idx),)) if out.size == 1 else out.reshape(-1)
 
     def _periodic_rows(self):
@@ -1875,7 +1900,9 @@ class _TraceFDM:
                 G = jnp.stack([g(target[:, k]) for k in range(target.shape[1])], axis=1)  # (len(idx), c, dim)
                 for a in range(dim):
                     ctx[f"fdm_bgrad_{i}_{a}"] = jnp.zeros((N, target.shape[1]), target.dtype).at[jidx].set(G[:, :, a])
-            out = jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1)
+            out = self._require_real(
+                jnp.asarray(ev.evaluate(expr, context=ctx, var_bindings={})).reshape(-1), "a flux condition"
+            )
             return jnp.broadcast_to(out, (N,)) if out.shape[0] == 1 else out
 
         return row

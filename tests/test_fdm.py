@@ -2674,6 +2674,39 @@ def test_a_data_field_as_a_pde_coefficient():
     assert np.isfinite(data).all() and np.abs(data - formula).max() < 1e-10 and np.abs(data).max() > 1e-3
 
 
+@pytest.mark.parametrize("where", ["source", "dirichlet", "coefficient"])
+def test_complex_data_on_a_real_unknown_raises(where):
+    """jno.fdm has no complex fields. Complex Dirichlet data used to be solved with its imaginary part
+    dropped (a real answer, a warning at most), and a complex source or coefficient failed inside JAX with a
+    tangent-dtype error that named neither. Each now raises and says what to do."""
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 8).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    terms = {
+        "source": [-ui.xx - ui.yy - (1.0 + 1j) * jnn.sin(x), u(xb, yb) - 0.0],
+        "dirichlet": [-ui.xx - ui.yy - 1.0, u(xb, yb) - (1j + 0.0 * xb)],
+        "coefficient": [-(1.0 + 0.5j) * (ui.xx + ui.yy) - 1.0, u(xb, yb) - 0.0],
+    }[where]
+    with pytest.raises(NotImplementedError, match="complex, but the unknown is real"):
+        jno.fdm(terms).solve()
+
+
+def test_a_rank_two_unknown_raises_up_front():
+    """A matrix unknown (value_shape=(2, 2)) failed deep inside the kernels with a reshape or broadcasting
+    error. It now raises when the problem is built, naming the vector-unknown workaround."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 8).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    T = d.unknown(value_shape=(2, 2))
+    Ti = T.bind(x=x, y=y)
+    with pytest.raises(NotImplementedError, match=r"value_shape=\(4,\)"):
+        jno.fdm([-Ti.xx - Ti.yy - 1.0, T(xb, yb) - 0.0])
+
+
 def test_a_repeat_solve_reads_a_swapped_data_field():
     """The documented eager swap ``K.model.module = eqx.tree_at(...)`` of a data field must reach the next
     solve. The problem cached the modules it first read, so after κ went 1 → 2 the repeat solve returned the
