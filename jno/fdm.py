@@ -220,36 +220,27 @@ def _gmres_incremental(matvec, b, precond, tol, restart=30, maxiter=50, cycles=8
     return x, rn
 
 
-def _structured_linear_solve(domain, periodic=False):
+def _structured_linear_solve(domain, periodic=False, vcycle=None):
     """Inner linear solve for the matrix-free Newton–Krylov on a **structured grid**: GMRES rather than
     the driver's default BiCGStab. The reduced-Dirichlet 5-/7-point operator is nonsymmetric, and BiCGStab
     can break down on it (a strong-form ``u.d2(x)+u.d2(y)`` returns NaN), whereas GMRES is robust for
     nonsymmetric systems while staying matrix-free and differentiable (the driver firewalls it in
     ``custom_linear_solve``, so the reverse pass runs GMRES on ``Aᵀ``).
 
-    The GMRES is **preconditioned by a geometric-multigrid V-cycle** (:func:`build_vcycle`) built from the
-    grid — O(N), grid-independent convergence (~0.1 residual reduction per cycle) on Poisson-type
-    operators — falling back to plain GMRES when the grid is too small to coarsen (a single level). The
-    V-cycle is a fixed linear operator, so standard GMRES (not FGMRES) suffices. On an unstructured mesh it is
-    plain GMRES (no multigrid)."""
-    if getattr(domain, "mesh_connectivity", None) is None or domain.mesh_connectivity.get("grid") is None:
-        # Unstructured: GMRES too. The strong-form operator is not symmetric, and the driver's BiCGStab broke
-        # down on it: a linear 3-D cotangent problem with one Neumann face diverged to a Newton residual of
-        # 5e24, where a direct solve gives 2.4e-3.
-        gmres = _solve.gmres()
-        from .utils.solver.solver_api import LinearOperator
-
-        return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
-    from .utils.solver.geometric_mg import build_vcycle
+    The GMRES is preconditioned by the **operator-dependent V-cycle**
+    (:func:`jno.utils.solver.lattice_mg.build`), built from ``vcycle_of`` -- a representative tangent, taken
+    at the initial guess and frozen for the whole Newton loop, the same trade the march makes. A
+    preconditioner changes how fast the Krylov solve converges, never what it converges to. Without one
+    (an unstructured mesh, or no representative tangent) this is plain GMRES."""
     from .utils.solver.solver_api import LinearOperator
 
-    grid = domain.mesh_connectivity["grid"]
     gmres = _solve.gmres()
-    if periodic:  # the GMG V-cycle assumes Dirichlet boundaries; skip it (plain GMRES)
+    # Unstructured: GMRES too. The strong-form operator is not symmetric, and the driver's BiCGStab broke
+    # down on it: a linear 3-D cotangent problem with one Neumann face diverged to a Newton residual of
+    # 5e24, where a direct solve gives 2.4e-3.
+    if vcycle is None:
         return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
-    vcycle, n_levels = build_vcycle(grid["shape"], grid["spacing"])
-    precond = vcycle if n_levels >= 2 else None  # skip GMG when the grid can't be coarsened
-    return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs, M=precond)
+    return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs, M=vcycle)
 
 
 def _integrate_transient(block, ts, time, linear_solve=None, nonlinear_solve=None):
@@ -2260,9 +2251,35 @@ class _TraceFDM:
             sol = driver(
                 residual_with_bc,
                 u0,
-                linear_solve=_structured_linear_solve(self.domain, bool(self._periodic_axes)) if single else None,
+                linear_solve=_structured_linear_solve(
+                    self.domain, bool(self._periodic_axes), self._grid_vcycle(residual_with_bc, u0)
+                )
+                if single
+                else None,
             )
         return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
+
+    def _grid_vcycle(self, residual, at):
+        """The operator-dependent V-cycle (:func:`jno.utils.solver.lattice_mg.build`) for this problem's
+        tangent at ``at``, or ``None`` off a lattice. Built once on concrete values and frozen for the Newton
+        loop that uses it: the tangent drifts as Newton proceeds, and the hierarchy built here does not follow
+        it, which changes how fast the inner solve converges, never what it converges to."""
+        import jax
+
+        from .utils.solver.lattice_mg import build
+
+        grid = self.domain.mesh_connectivity.get("grid") if self.domain.mesh_connectivity else None
+        if grid is None or not self._nodes_are_the_grid(grid):
+            return None
+        with jax.ensure_compile_time_eval():
+            at = jnp.zeros(self._Ntot) if isinstance(at, jax.core.Tracer) else jnp.asarray(at)
+            vcycle, _levels = build(
+                lambda v: jax.jvp(residual, (at,), (v,))[1],
+                tuple(grid["shape"]),
+                nf=self._nf,
+                periodic=(self._grid or {}).get("periodic", ()),
+            )
+        return vcycle
 
     def _default_is_assembled(self):
         """Does the default steady solve go through the assembled operator? For a linear, single-field
@@ -2451,7 +2468,11 @@ class _TraceFDM:
         if entry is None:
             residual = self._steady_residual()
             driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual, u0))
-            linear = _structured_linear_solve(self.domain, bool(self._periodic_axes)) if self._nf == 1 else None
+            linear = (
+                _structured_linear_solve(self.domain, bool(self._periodic_axes), self._grid_vcycle(residual, u0))
+                if self._nf == 1
+                else None
+            )
             fn = jax.jit(lambda u_init: driver(residual, u_init, linear_solve=linear))
             entry = cache[key] = (nonlinear, driver, residual, fn)
         _, driver, residual, fn = entry
@@ -2530,7 +2551,8 @@ class _TraceFDM:
         symmetric for a self-adjoint operator (a Laplacian, a diffusion with a coefficient, plus a
         reaction); a two-vector probe decides, and a symmetric system gets preconditioned conjugate
         gradients (Hestenes & Stiefel 1952) and any other one GMRES that stops at convergence, both
-        preconditioned by the geometric-multigrid V-cycle. The Newton-GMRES path this replaces linearised
+        preconditioned by the V-cycle built from **this** operator's stencil
+        (:func:`jno.utils.solver.lattice_mg.build`). The Newton-GMRES path this replaces linearised
         the residual, ran a Newton step and a full 30-vector GMRES cycle per restart whatever the
         convergence: measured at 0.9M nodes (3-D Poisson), 380 MB and 0.170 s against 143 MB and 0.024 s
         with 8 CG iterations.
@@ -2540,7 +2562,7 @@ class _TraceFDM:
         result, and a solve that did not reach ``tol`` raises."""
         import jax
 
-        from .utils.solver.geometric_mg import build_vcycle
+        from .utils.solver.lattice_mg import build as build_vcycle
 
         grid = self.domain.mesh_connectivity["grid"]
         slots = linear is not None or precond is not None
@@ -2554,22 +2576,25 @@ class _TraceFDM:
             fn = cache["fn"]
         else:
             # built on a cache MISS only: a repeat solve reuses the compiled solve, V-cycle included
-            if precond is not None:  # the user's V-cycle settings
-                vcycle, _ = build_vcycle(
-                    grid["shape"],
-                    grid["spacing"],
-                    n_pre=precond.n_pre,
-                    n_post=precond.n_post,
-                    omega=precond.omega,
-                    min_size=precond.min_size,
-                )
-            else:
-                vcycle, _ = build_vcycle(grid["shape"], grid["spacing"])
             residual = self._steady_residual(extra_params)
             rows = self._dirichlet_rows(extra_params)
             mask = np.ones(N)
             mask[self._dirichlet_nodes()] = 0.0
             mask = jnp.asarray(mask)
+            # The V-cycle reads the eliminated operator itself, at the parameters' current values (a traced
+            # parameter would otherwise put the whole probe inside every solve); it preconditions, so its
+            # being one step behind the parameter changes nothing about the answer.
+            sweeps = {"n_pre": precond.n_pre, "n_post": precond.n_post} if precond is not None else {}
+            with jax.ensure_compile_time_eval():
+                probe_residual = self._steady_residual(self._current_params())
+                zeros = jnp.zeros(self._Ntot)
+                vcycle, _levels = build_vcycle(
+                    lambda v: jax.jvp(probe_residual, (zeros,), (v * mask,))[1] * mask,
+                    tuple(grid["shape"]),
+                    nf=self._nf,
+                    periodic=(self._grid or {}).get("periodic", ()),
+                    **sweeps,
+                )
             symmetric = self._grid_linear_symmetric(lambda: self._steady_residual(self._current_params()), mask)
             if slots and getattr(linear, "name", None) == "cg" and not symmetric:
                 raise ValueError(

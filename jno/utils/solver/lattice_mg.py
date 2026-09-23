@@ -35,10 +35,12 @@ from .lattice import apply_stencil, offsets, probe, probe_reduced
 #: than this fraction of the strongest axis' does not carry the error a coarse grid must represent. The
 #: classical strong-connection threshold of Ruge & Stüben (*Multigrid Methods*, SIAM 1987, §4.2).
 STRENGTH = 0.25
-#: The coarsest level is factorised densely, and its factor is baked into the compiled V-cycle, so it is
-#: kept small: 1024 unknowns is an 8 MB factor in float64. Coarsening stops there, or when no axis is long
-#: enough to halve (every axis merges its odd cell, so a hierarchy reaches a handful of nodes per axis).
-DENSE_MAX = 1024
+#: An axis of fewer than this many nodes cannot be halved (two cells at least).
+MIN_NODES = 4
+#: Largest coarsest level that is factorised densely. This is a MEMORY statement, not a guess about the
+#: problem: the factor is baked into the compiled V-cycle, and 2048 unknowns is 32 MB in float64. A coarsest
+#: level above it is smoothed instead of solved, which weakens the preconditioner and changes no answer.
+DENSE_MAX = 2048
 
 
 def _axis_nodes(n: int):
@@ -121,13 +123,17 @@ def _scatter_add_axis(acc, index, src, axis):
     return jnp.moveaxis(moved_acc, 0, axis)
 
 
-def _strong_axes(strength, window, shape, dim):
+def _strong_axes(strength, window, shape, dim, periodic=()):
     """The axes an operator couples strongly enough to coarsen: those whose pure-axis coupling is at least
     :data:`STRENGTH` of the strongest axis'. An axis of fewer than 4 nodes is never coarsened.
 
     ``strength`` is one number per window offset (:func:`lattice.probe_reduced`). Coarsening only the strong
     axes is semi-coarsening: on a 100:1 anisotropy the weak axis carries no error a coarse grid could
     represent, and coarsening it anyway is what makes a V-cycle diverge there.
+
+    When no strong axis can be halved any more, the weak ones are coarsened instead, so the hierarchy always
+    runs down to a few dozen unknowns: without that, a strongly anisotropic operator would stop at a level as
+    long as its weak axis, and the "coarsest" solve would be the size of the problem.
     """
     offs = offsets(*window, dim)
     per_axis = np.zeros(dim)
@@ -136,15 +142,49 @@ def _strong_axes(strength, window, shape, dim):
         nz = [a for a, oa in enumerate(o) if oa != 0]
         if len(nz) == 1:
             per_axis[nz[0]] += float(st[w])
+    width = window[1] - window[0] + 1
+    # A periodic axis must keep at least the stencil's width, or a row's window wraps onto itself and the
+    # operator has no stencil left to read.
+    halvable = tuple(
+        a
+        for a in range(dim)
+        if shape[a] >= MIN_NODES and (not (a < len(periodic) and periodic[a]) or len(_axis_nodes(shape[a])) >= width)
+    )
     top = per_axis.max() if per_axis.size else 0.0
     if top <= 0:
-        return tuple(a for a in range(dim) if shape[a] >= 4)
-    return tuple(a for a in range(dim) if shape[a] >= 4 and per_axis[a] >= STRENGTH * top)
+        return halvable
+    strong = tuple(a for a in halvable if per_axis[a] >= STRENGTH * top)
+    return strong or halvable
 
 
 def _strength_of(S, window, dim):
     """:func:`_strong_axes`'s input, from a stored stencil."""
     return jnp.abs(S).sum(axis=(0, 1)).reshape(-1, len(offsets(*window, dim))).mean(axis=0)
+
+
+def _smoother_amplifies(apply_fn, d, shape, nf, iters=20, seed=0):
+    """Does ℓ¹-Jacobi **grow** the error on this level: is ``ρ(I − D⁻¹A) > 1``?
+
+    A coarse grid is only worth building while its own smoother still damps. Coarsening doubles ``h``, and
+    for a convection term that doubles the cell Péclet number ``|b|h/ε``: past the classical limit of 2 the
+    central-difference operator loses its M-matrix structure (Patankar, *Numerical Heat Transfer and Fluid
+    Flow*, 1980, §5.2) and a point smoother amplifies instead of damping. Measured on an advection problem,
+    ρ goes 0.997, 0.972, **1.060**, 1.117 down the levels, and a V-cycle that uses those levels diverges
+    (factor 1.97); stopping where ρ first exceeds 1 and solving that level exactly is what works.
+
+    This is measured, by power iteration on the smoother's own iteration matrix, rather than inferred from a
+    stencil pattern: a *geometric* artefact can break diagonal dominance while leaving a perfectly good
+    smoother (the merged odd cell of a 26-node axis is 12% short of dominant, and smooths at ρ = 0.94).
+    """
+    inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
+    v = jnp.asarray(np.random.default_rng(seed).standard_normal((nf,) + shape))
+    v = v / jnp.linalg.norm(v)
+    rho = 0.0
+    for _ in range(iters):
+        w = v - inv * apply_fn(v)
+        rho = jnp.linalg.norm(w)
+        v = w / jnp.maximum(rho, jnp.finfo(v.dtype).tiny)
+    return float(rho) > 1.0
 
 
 def _l1_weights(S):
@@ -214,13 +254,12 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
 
     The **fine** level keeps ``matvec`` itself and stores only its ℓ¹ weights, one number per unknown: its
     full stencil would be ``nf²·W`` numbers per node, 1.2 GB for a 2-D five-point operator at 16.8M nodes.
-    Coarse levels, each at least four times smaller, store theirs.
+    Coarse levels, each at least twice smaller, store theirs.
     """
     full_shape = tuple(int(s) for s in shape)
     dim = len(full_shape)
     dtype = jnp.result_type(float) if dtype is None else dtype
     per = tuple(periodic) + (False,) * (dim - len(periodic))
-    full_matvec = matvec
     if any(per):  # coarsen the unique nodes; the duplicate node's tie row has no stencil
         matvec, shape, inject, extract = _periodic_reduction(matvec, full_shape, nf, per)
     else:
@@ -242,8 +281,8 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
     while True:
         top = levels[-1]
         sh = top["shape"]
-        axes = _strong_axes(top["strength"], top["window"], sh, dim)
-        if not axes or nf * int(np.prod(sh)) <= DENSE_MAX:
+        axes = _strong_axes(top["strength"], top["window"], sh, dim, top["periodic"])
+        if not axes:  # no axis can be halved: this is the coarsest level
             break
         transfers = [_axis_transfer(sh[a]) for a in axes]
         coarse_shape = tuple(len(transfers[axes.index(a)][0]) if a in axes else sh[a] for a in range(dim))
@@ -256,11 +295,17 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
 
         cper = tuple(p and a in axes or p for a, p in enumerate(fine_per))  # periodicity survives coarsening
         cwin, cS = probe(coarse_matvec, coarse_shape, nf, periodic=cper, dtype=dtype)
+        cd = _l1_weights(cS)
+        amplifies = _smoother_amplifies(
+            lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper), cd, coarse_shape, nf
+        )
+        if amplifies and nf * int(np.prod(sh)) <= DENSE_MAX:
+            break  # no smoother works on that level, and this one is small enough to solve exactly
         levels.append(
             {
                 "shape": coarse_shape,
                 "apply": (lambda x, cS=cS, cwin=cwin, cper=cper: apply_stencil(cS, cwin, x, cper)),
-                "d": _l1_weights(cS),
+                "d": cd,
                 "strength": _strength_of(cS, cwin, dim),
                 "window": cwin,
                 "periodic": cper,
@@ -270,25 +315,46 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
         if coarse_shape == sh:
             break
 
-    # the coarsest level, factorised once: a row the caller eliminated (a Dirichlet degree of freedom)
-    # carries nothing, so it gets an identity row and the V-cycle leaves it where it was
+    # The coarsest level, factorised once. Coarsening runs until no axis can be halved, so this is a few
+    # dozen unknowns however large the fine grid is -- there is no size threshold anywhere. A row the caller
+    # eliminated (a Dirichlet degree of freedom) carries nothing, so it gets an identity row and the V-cycle
+    # leaves it where it was.
     last = levels[-1]
     n_c = nf * int(np.prod(last["shape"]))
-    if "S" in last:
-        dense = _dense_from_stencil(last["S"], last["window"], last["shape"], nf, last["periodic"])
-    else:  # a grid too small to coarsen at all: difference the operator itself
-        dense = jax.jacfwd(lambda v: matvec(v))(jnp.zeros(n_c, dtype))
-    live = jnp.abs(dense).sum(axis=1) > 0
-    lu = jax.scipy.linalg.lu_factor(jnp.where(live[:, None] & live[None, :], dense, jnp.eye(n_c, dtype=dtype)))
+    if n_c > DENSE_MAX:
+        from ..logger import get_logger
+
+        get_logger().info(
+            f"multigrid: the coarsest level has {n_c} unknowns, above the {DENSE_MAX} this factorises densely "
+            f"({8 * DENSE_MAX**2 / 1e6:.0f} MB), so it is smoothed instead of solved. Coarsening stopped there "
+            "because halving further would leave an operator a point smoother cannot smooth (a cell Péclet "
+            "number above 2, or an indefinite operator)."
+        )
+    lu = None
+    if n_c <= DENSE_MAX:
+        if "S" in last:
+            dense = _dense_from_stencil(last["S"], last["window"], last["shape"], nf, last["periodic"])
+        else:  # a grid too small to coarsen at all: difference the operator itself
+            dense = jax.jacfwd(lambda v: matvec(v))(jnp.zeros(n_c, dtype))
+        live = jnp.abs(dense).sum(axis=1) > 0
+        lu = jax.scipy.linalg.lu_factor(jnp.where(live[:, None] & live[None, :], dense, jnp.eye(n_c, dtype=dtype)))
 
     def smooth(lev, x, r):
         d = levels[lev]["d"]
         inv = jnp.where(d > 0, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
         return x + inv * (r - levels[lev]["apply"](x))
 
+    def coarsest(r):
+        if lu is not None:
+            return jax.scipy.linalg.lu_solve(lu, r.reshape(-1)).reshape((nf,) + levels[-1]["shape"])
+        x = jnp.zeros_like(r)  # too large to factorise: smooth it instead (linear, so the V-cycle stays linear)
+        for _ in range(n_pre + n_post):
+            x = smooth(len(levels) - 1, x, r)
+        return x
+
     def vcycle(lev, r):
         if lev == len(levels) - 1:
-            return jax.scipy.linalg.lu_solve(lu, r.reshape(-1)).reshape((nf,) + levels[lev]["shape"])
+            return coarsest(r)
         x = jnp.zeros_like(r)
         for _ in range(n_pre):
             x = smooth(lev, x, r)

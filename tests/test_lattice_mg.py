@@ -49,26 +49,42 @@ def _eliminated(prob):
 
 
 def _expected_levels(shape, periodic=()):
-    """Every strongly coupled axis halves (merging an odd cell) until the level fits the dense coarsest
-    solve -- whatever the grid's arithmetic. 101 nodes a side coarsen 101 -> 51 -> 26, not 101 -> 51 -> stop.
-    A periodic axis drops its duplicate node first."""
+    """Every axis halves (merging an odd cell) until none can, whatever the grid's arithmetic: 101 nodes a
+    side coarsen 101 -> 51 -> 26 -> 13 -> 7 -> 4 -> 2, not 101 -> 51 -> stop. A periodic axis drops its
+    duplicate node first. (An isotropic operator coarsens every axis at every level, so this counts levels.)"""
     shape = [n - 1 if a < len(periodic) and periodic[a] else n for a, n in enumerate(shape)]
     levels = 1
-    while int(np.prod(shape)) > lattice_mg.DENSE_MAX and all(n >= 4 for n in shape):
-        shape = [len(lattice_mg._axis_nodes(n)) for n in shape]
-        levels += 1
-    return levels
+    while True:
+        nxt = [
+            len(lattice_mg._axis_nodes(n))
+            if n >= lattice_mg.MIN_NODES
+            and (not (a < len(periodic) and periodic[a]) or len(lattice_mg._axis_nodes(n)) >= 3)
+            else n
+            for a, n in enumerate(shape)
+        ]
+        if nxt == shape:
+            return levels
+        shape, levels = nxt, levels + 1
 
 
 def _rho(mv, b, M, cycles=10):
-    """The convergence factor of ``x <- x + M(b - Ax)``, and the total reduction."""
+    """The convergence factor of ``x <- x + M(b - Ax)``, and the total reduction.
+
+    Only the cycles above the round-off floor count: a V-cycle that solves exactly (a one-level hierarchy
+    is a direct solve) reaches 1e-13 and then stays there, and ratios of floor values are meaningless.
+    """
     x = jnp.zeros_like(b)
     norms = []
     for _ in range(cycles):
         r = b - mv(x)
         norms.append(float(jnp.linalg.norm(r)))
         x = x + M(r)
-    return (norms[-1] / norms[-4]) ** (1 / 3), norms[-1] / norms[0]
+    floor = 1e-12 * norms[0]
+    live = [n for n in norms if n > floor]
+    if len(live) < 3:
+        return 0.0, norms[-1] / norms[0]  # converged to round-off
+    tail = live[-min(4, len(live)) :]
+    return (tail[-1] / tail[0]) ** (1 / (len(tail) - 1)), norms[-1] / norms[0]
 
 
 @pytest.mark.parametrize("kind", ["poisson", "kappa_smooth", "kappa_jump", "anisotropic", "reaction", "advection"])
@@ -82,8 +98,12 @@ def test_the_convergence_factor_does_not_grow_with_the_grid(kind):
         shape = tuple(d.mesh_connectivity["grid"]["shape"])
         mv, b, mask = _eliminated(prob)
         vcycle, levels = lattice_mg.build(mv, shape)
-        # an anisotropic operator semi-coarsens (only the strong axis halves), so it takes more levels
-        assert levels >= _expected_levels(shape) if kind == "anisotropic" else levels == _expected_levels(shape)
+        if kind == "anisotropic":  # semi-coarsening: only the strong axis halves first, so it takes more levels
+            assert levels >= _expected_levels(shape)
+        elif kind == "advection":  # stops where the coarse operator's smoother would amplify (cell Péclet > 2)
+            assert levels < _expected_levels(shape)
+        else:
+            assert levels == _expected_levels(shape)
         rho, _ = _rho(mv, b, lambda r: vcycle(r * mask) * mask)
         rhos.append(rho)
     assert max(rhos) < 0.85, rhos
