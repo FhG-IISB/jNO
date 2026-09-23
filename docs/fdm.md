@@ -289,6 +289,18 @@ answer* as the unstructured `cotangent` operator, only cheaper.
     table to map mesh nodes onto themselves. That made the structured path *slower* (7.9 s / 5.0 s at 17k),
     and both paths ran out of memory at 66k.
 
+!!! measured "Building the domain, structured lattice, host (2026-09-23)"
+    | nodes | 2-D | | nodes | 3-D |
+    |---|---|---|---|---|
+    | 263k | 0.10 s | | 275k | 0.32 s |
+    | 1.05M | 0.36 s | | 1.03M | 1.12 s |
+    | 4.20M | 1.42 s | | 2.15M | 2.35 s |
+
+    Generating the cells is a small part of this (0.18 s at 4.2M); the rest is the derived topology every
+    domain carries. Quantities only some callers read — the nodal quadrature weights, the collocation
+    sampling pools — are computed on first access rather than at build, and a lattice's boundary is found
+    from its grid indices instead of by counting every cell face. These were 6.35 s and 9.51 s before.
+
 !!! measured "Parallelism: XLA does it, and the stencil runs at memory bandwidth"
     You write no parallel code. XLA spreads the fused stencil over the CPU cores and compiles it to one
     GPU kernel. i5-13600K (20 threads) and RTX 3070, float64:
