@@ -2266,11 +2266,7 @@ class _TraceFDM:
             sol = driver(
                 residual_with_bc,
                 u0,
-                linear_solve=_structured_linear_solve(
-                    self.domain, bool(self._periodic_axes), self._grid_vcycle(residual_with_bc, u0)
-                )
-                if single
-                else None,
+                linear_solve=self._structured_inner(residual_with_bc, u0),
             )
         return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
 
@@ -2337,6 +2333,58 @@ class _TraceFDM:
                 return None
         return vcycle
 
+    def _accept_vcycle(self, apply, matvec, n):
+        """``apply`` if one cycle of it shrinks the error on ``matvec``, else ``None``, having said so.
+
+        Whether a V-cycle preconditions is a property of the **operator**, not of the grid: a point (or
+        point-block) smoother needs each node's own block to dominate its row, and a saddle point -- the
+        incompressibility row of Navier-Stokes has a zero pressure block, its velocity coupling living in
+        *neighbouring* nodes -- has no such block by construction. Measuring says so for any operator,
+        where a list of PDE names would not.
+
+        Measured on the applier as the solve will call it, not on the bare cycle: the two differ where
+        Dirichlet rows are eliminated. There ``matvec`` is zero in both the row and the column, while the
+        bare cycle's prolongation still writes to those nodes -- an error component the operator can never
+        remove, so the power iteration finds an eigenvalue of exactly 1 whatever the cycle does on the rows
+        that are actually solved (measured: ρ = 1.0 on a coupled reaction-diffusion system whose cycle in
+        fact corrects to within 10%)."""
+        from .utils.solver.lattice_mg import contraction
+
+        if apply is None:
+            return None
+        rho = contraction(apply, matvec, n)
+        # `not (rho < 1)` rather than `rho >= 1`, because the two differ on NaN and NaN is the answer that
+        # matters: a cycle whose smoother has a singular point block returns NaN rather than a large
+        # number, and `NaN >= 1` is False -- it would have been accepted. Measured on the lid-driven
+        # cavity, whose zero pressure block does exactly that.
+        if not (rho < 1.0):
+            from .utils.logger import get_logger
+
+            get_logger().info(
+                f"jno.fdm: the operator-dependent V-cycle does not contract on this operator (measured "
+                f"factor {rho:.3g}), so the solve runs without it. A saddle-point system "
+                "(velocity-pressure) has no diagonally dominant point block; pass linear=/precond= to "
+                "choose another."
+            )
+            return None
+        return apply
+
+    def _structured_inner(self, residual, at):
+        """The inner linear solve for this problem's matrix-free Newton, or ``None`` to leave the driver its
+        own default.
+
+        One field gets GMRES either way: the reduced strong-form operator is nonsymmetric and the driver's
+        BiCGStab breaks down on it (a linear 3-D cotangent problem with one Neumann face diverged to a
+        Newton residual of 5e24 where a direct solve gives 2.4e-3). A **system** gets it only when the
+        V-cycle earns its place, because without one there is nothing to gain and something to lose: a
+        saddle-point tangent is what declines the V-cycle, and unpreconditioned GMRES on one is slower than
+        the BiCGStab the driver would have used.
+        """
+        vcycle = self._grid_vcycle(residual, at)
+        if vcycle is None and self._nf > 1:
+            return None
+        return _structured_linear_solve(self.domain, bool(self._periodic_axes), vcycle)
+
     def _grid_vcycle(self, residual, at):
         """The V-cycle for this problem's tangent at ``at``. Built once and frozen for the Newton loop that
         uses it: the tangent drifts as Newton proceeds, and the hierarchy built here does not follow it,
@@ -2354,10 +2402,12 @@ class _TraceFDM:
             for b, idx, _vals in self._dirichlet_rows():
                 mask_host[b * self._N + np.asarray(idx, dtype=int)] = 0.0
             mask = jnp.asarray(mask_host)
-        vcycle = self._lattice_vcycle(lambda v: jax.jvp(residual, (at,), (v * mask,))[1] * mask, self._Ntot)
+        matvec = lambda v: jax.jvp(residual, (at,), (v * mask,))[1] * mask  # noqa: E731
+        vcycle = self._lattice_vcycle(matvec, self._Ntot)
         if vcycle is None:
             return None
-        return lambda r: jnp.where(mask > 0, vcycle(r * mask), r)
+        with jax.ensure_compile_time_eval():
+            return self._accept_vcycle(lambda r: jnp.where(mask > 0, vcycle(r * mask), r), matvec, self._Ntot)
 
     def _default_is_assembled(self):
         """Does the default steady solve go through the assembled operator? For a linear, single-field
@@ -2547,11 +2597,7 @@ class _TraceFDM:
         if entry is None:
             residual = self._steady_residual()
             driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual, u0))
-            linear = (
-                _structured_linear_solve(self.domain, bool(self._periodic_axes), self._grid_vcycle(residual, u0))
-                if self._nf == 1
-                else None
-            )
+            linear = self._structured_inner(residual, u0)
             fn = jax.jit(lambda u_init: driver(residual, u_init, linear_solve=linear))
             entry = cache[key] = (nonlinear, driver, residual, fn)
         _, driver, residual, fn = entry
@@ -2571,19 +2617,22 @@ class _TraceFDM:
     # A linear problem on a structured grid: one Krylov solve on the interior, no Newton
     # ------------------------------------------------------------------------------------------------
     def _grid_linear_ok(self):
-        """Does the steady solve take the structured linear path? One scalar field on a lattice, with an
-        affine residual: then ``R(u) = 0`` is one preconditioned Krylov solve rather than a Newton step
-        around it.
+        """Does the steady solve take the structured linear path? Fields on a lattice with an affine
+        residual: then ``R(u) = 0`` is one preconditioned Krylov solve rather than a Newton step around it.
 
         It used to need Dirichlet data on the whole boundary ring, no flux row and no periodic tie, because
         the V-cycle it preconditioned with was built for ``-Δ`` with a Dirichlet ring. The V-cycle is built
-        from this operator now (:meth:`_grid_vcycle`), so those rows are just rows. Decided once per problem.
+        from this operator now (:meth:`_grid_vcycle`), so those rows are just rows. It also needed a single
+        field, because the smoother inverted a scalar diagonal; it inverts each node's whole block now, so a
+        vector unknown or a coupled system takes this path as well -- and where the block smoother does not
+        work (a saddle point) the measured admission test declines the V-cycle and the same solve runs
+        unpreconditioned. Decided once per problem.
         """
         if getattr(self, "_grid_linear", None) is not None:
             return self._grid_linear
         ok = False
         grid = self.domain.mesh_connectivity.get("grid") if self.domain.mesh_connectivity else None
-        if self._nf == 1 and not self._transient and grid is not None and self._nodes_are_the_grid(grid):
+        if not self._transient and grid is not None and self._nodes_are_the_grid(grid):
             import jax
 
             with jax.ensure_compile_time_eval():
@@ -2648,7 +2697,7 @@ class _TraceFDM:
         slots = linear is not None or precond is not None
         # the tolerance the solve was asked for: the user's Krylov spec's, or this path's own
         check_tol = ((getattr(linear, "tolerance", None) if linear is not None else 1e-8) if slots else tol) or tol
-        N = self._N
+        N = self._Ntot  # the blocked DOF vector: a vector unknown or a coupled system solves every block
         eager = extra_params is None
         cache = self.__dict__.setdefault("_grid_linear_cache", {})
         key = (self._data_fingerprint(), linear, precond)  # the specs themselves: equal keyed specs share a compile
@@ -2659,7 +2708,8 @@ class _TraceFDM:
             residual = self._steady_residual(extra_params)
             rows = self._dirichlet_rows(extra_params)
             mask_host = np.ones(N)
-            mask_host[self._dirichlet_nodes()] = 0.0
+            for b_, idx_, _v in self._dirichlet_rows():  # one row set per DOF block, at its own offset
+                mask_host[b_ * self._N + np.asarray(idx_, dtype=int)] = 0.0
             mask = jnp.asarray(mask_host)
             # The V-cycle reads the eliminated operator itself, at the parameters' current values (a traced
             # parameter would otherwise put the whole probe inside every solve); it preconditions, so its
@@ -2675,6 +2725,13 @@ class _TraceFDM:
                 # residual re-traces and re-compiles on every one of them (12 s of setup at 1M nodes)
                 probe_mv = jax.jit(lambda v: jax.jvp(probe_residual, (zeros,), (v * probe_mask,))[1] * probe_mask)
                 vcycle = self._lattice_vcycle(probe_mv, self._Ntot, **sweeps)
+                # The admission test governs the AUTOMATIC choice only. `precond=jno.precond.gmg()` is a
+                # request, and a request is honoured or refused, never quietly replaced by something else.
+                if vcycle is not None and precond is None:  # measured as the solve applies it
+                    applied = self._accept_vcycle(
+                        lambda r, vc=vcycle: vc(r * probe_mask) * probe_mask, probe_mv, self._Ntot
+                    )
+                    vcycle = None if applied is None else vcycle
                 symmetric = self._grid_linear_symmetric(lambda: self._steady_residual(self._current_params()), probe_mask)
             if slots and getattr(linear, "name", None) == "cg" and not symmetric:
                 raise ValueError(
@@ -2687,8 +2744,9 @@ class _TraceFDM:
 
             def fn(rows=rows):
                 uD = jnp.zeros(N)
-                for _, idx, vals in rows:
-                    uD = uD.at[idx].set(jnp.broadcast_to(jnp.asarray(vals), (idx.shape[0],)))
+                for b_, idx, vals in rows:
+                    where = jnp.asarray(b_ * self._N + np.asarray(idx, dtype=int))
+                    uD = uD.at[where].set(jnp.broadcast_to(jnp.asarray(vals), (where.shape[0],)))
                 matvec = lambda v: jax.jvp(residual, (uD,), (v * mask,))[1] * mask  # noqa: E731
                 b = -residual(uD) * mask
                 # no V-cycle (an operator with no bounded stencil, e.g. a spectral axis): solve unpreconditioned
@@ -2738,8 +2796,8 @@ class _TraceFDM:
             def symmetric(_):
                 residual = make()
                 rng = np.random.default_rng(7)
-                v, w = (jnp.asarray(rng.standard_normal(self._N)) * mask for _ in range(2))
-                z = jnp.zeros(self._N)
+                v, w = (jnp.asarray(rng.standard_normal(self._Ntot)) * mask for _ in range(2))
+                z = jnp.zeros(self._Ntot)
                 Av = jax.jvp(residual, (z,), (v,))[1] * mask
                 Aw = jax.jvp(residual, (z,), (w,))[1] * mask
                 a, b_ = float(w @ Av), float(v @ Aw)

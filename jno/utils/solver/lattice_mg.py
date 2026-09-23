@@ -212,6 +212,38 @@ def _smoother_amplifies(apply_fn, inv, shape, nf, iters=20, seed=0):
     return float(rho) > 1.0
 
 
+def contraction(apply, matvec, n, *, dtype=None, iters=10, seed=0):
+    """The measured error contraction of one cycle of ``apply`` as a preconditioner for ``matvec``:
+    ``ρ(I − M·A)``, by power iteration from a random start on ``n`` unknowns.
+
+    Below 1 the cycle converges on its own and preconditions; at or above 1 it amplifies, and a Krylov
+    method preconditioned by it can stall or return NaN. Whether that happens is a property of the
+    **operator**, not of the grid: a point (or point-block) smoother needs each node's own block to
+    dominate its row, and a saddle point -- the incompressibility row of Navier-Stokes has a zero pressure
+    block, its coupling to the velocity living in *neighbouring* nodes -- has no such block by construction.
+    Rather than name the operators that fail, a caller measures this and declines the cycle when it grows
+    the error, which is the same rule :func:`_smoother_amplifies` applies one level down.
+
+    The power iteration starts at ``A·random`` rather than at ``random``: an eliminated row (a Dirichlet
+    degree of freedom the caller has masked out of both ``A`` and ``M``) is zero in both, so an error
+    component there is never touched and a random start measures ``ρ = 1`` on any operator, however well
+    the cycle works on the rows that are actually solved. Starting in the range of ``A`` confines the
+    iteration to the subspace the Krylov error lives in.
+
+    Cost: ``iters + 1`` cycles and ``iters + 1`` matvecs, once, at setup.
+    """
+    v = jnp.asarray(np.random.default_rng(seed).standard_normal(n), dtype=dtype)
+    av = matvec(v)
+    v = av if float(jnp.linalg.norm(av)) > 0 else v  # concrete: the caller measures on a built cycle
+    v = v / jnp.linalg.norm(v)
+    rho = 0.0
+    for _ in range(iters):
+        w = v - apply(matvec(v))
+        rho = jnp.linalg.norm(w)
+        v = w / jnp.maximum(rho, jnp.finfo(v.dtype).tiny)
+    return float(rho)
+
+
 def _l1_weights(S):
     """ℓ¹-Jacobi weights ``d_i = Σ_j |a_ij|`` per row, from a stored stencil. A row with no coefficients at
     all (a degree of freedom the caller eliminated) gets 0, which the smoother reads as "leave it alone"."""

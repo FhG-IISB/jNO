@@ -2826,6 +2826,52 @@ def test_a_vector_wave_marches_every_component():
     assert errs[1] < 2e-3, errs
 
 
+def test_a_coupled_system_is_preconditioned_by_the_operator_v_cycle():
+    """A coupled system gets the operator-dependent V-cycle: the Newton and structured-linear paths used to
+    gate it on a single field, although the smoother has inverted each node's whole block since the
+    point-block commit. Unpreconditioned, this two-field system takes 55 s at 32x32 and does not converge at
+    all at 64x64; the oracle here is the manufactured solution plus the V-cycle's measured contraction."""
+    import jax
+    import jax.numpy as jnp
+
+    import jno.jnp_ops as jnn
+    from jno.utils.solver.lattice_mg import contraction
+
+    n = 24
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    U = lambda a, b: jnn.sin(np.pi * a) * jnn.sin(np.pi * b)  # noqa: E731
+    V = lambda a, b: a * (1 - a) * b * (1 - b)  # noqa: E731
+    f1 = 2 * np.pi**2 * U(x, y) + U(x, y) - V(x, y)
+    f2 = 2 * (x * (1 - x) + y * (1 - y)) + 2 * V(x, y) - U(x, y)
+    s = jno.fdm(
+        [
+            -(ui.xx + ui.yy) + ui - vi - f1,
+            -(vi.xx + vi.yy) + 2 * vi - ui - f2,
+            u(xb, yb) - U(xb, yb),
+            v(xb, yb) - V(xb, yb),
+        ]
+    )
+    sol = np.asarray(s.solve())
+    np.testing.assert_allclose(sol[0], np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]), atol=2e-3)
+    np.testing.assert_allclose(sol[1], p[:, 0] * (1 - p[:, 0]) * p[:, 1] * (1 - p[:, 1]), atol=2e-3)
+
+    # the V-cycle this path builds really contracts on the two-field operator
+    residual = s._steady_residual()
+    mask = np.ones(s._Ntot)
+    for b, idx, _vals in s._dirichlet_rows():
+        mask[b * s._N + np.asarray(idx, dtype=int)] = 0.0
+    mask = jnp.asarray(mask)
+    matvec = lambda w: jax.jvp(residual, (jnp.zeros(s._Ntot),), (w * mask,))[1] * mask  # noqa: E731
+    apply = s._grid_vcycle(residual, jnp.zeros(s._Ntot))
+    assert apply is not None, "a coupled lattice operator must get a V-cycle"
+    assert contraction(apply, matvec, s._Ntot) < 0.5
+
+
 def test_a_coupled_second_order_system_marches():
     """`u.tt` on a system of separate unknowns, which used to raise ("marched to first order in time only").
     Oracle: two membranes coupled by their difference, `ui.tt - Δu + (u - w)`, started equal -- the coupling

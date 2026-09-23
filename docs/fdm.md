@@ -344,12 +344,28 @@ part). Write the real and imaginary parts as two real unknowns.
     nodes, 0.047 s at 66k, 0.092 s at 263k and 0.25 s at 1.05M — against 0.85 s, 6.6 s and 97 s without it,
     a cost that grew faster than the grid.
 
-    A **coupled** system is preconditioned too (the stencil carries every field pair, and the smoother
-    inverts each node's block). Kovasznay flow at 77k dofs went from 25 s to 6.0 s, second order in the
-    velocity. Its cost still grows faster than linearly (32 s at 198k dofs): the velocity–pressure coupling
-    of a saddle-point system sits *between* nodes, where a point-block smoother cannot reach it, and a patch
-    smoother or a block/Schur preconditioner is the next step. `linear=jno.solve.lu(backend="host")` remains
-    the fastest route for repeat solves of a small saddle-point system.
+    A **coupled or vector** system is preconditioned on the same path, with no slot to set: the stencil
+    carries every field pair, and the smoother inverts each node's whole block. Measured on a two-field
+    reaction–diffusion system (repeat solve, RTX 3070), against the unpreconditioned solve it replaces:
+
+    | grid | 32² | 64² | 128² |
+    |---|---|---|---|
+    | unpreconditioned (before) | 54.7 s | did not converge | did not converge |
+    | now | 0.004 s | 0.005 s | 0.006 s |
+
+    Same answer where both finish, second order in *h* (7.7e-4, 1.9e-4, 4.8e-5). "Did not converge" is the
+    loud kind: GMRES stopped at a relative residual of 1.2e-4 against its own gate and raised.
+
+    Whether a V-cycle is used at all is **measured**, not assumed: a power iteration on `I − M·A` runs once
+    at setup, and a cycle that would grow the error is declined, logged, and the solve runs without it.
+    That governs the automatic choice only — an explicit `precond=jno.precond.gmg()` is a request, and is
+    used as asked. That
+    is what a **saddle point** does — the incompressibility row of Navier–Stokes has a zero pressure block,
+    its velocity coupling living in *neighbouring* nodes, so no point-block smoother reaches it. Kovasznay
+    flow at 77k dofs went from 25 s to 6.0 s with `precond=jno.precond.gmg()`, second order in the velocity,
+    but the cost still grows faster than linearly (32 s at 198k dofs); a patch (Vanka) smoother or a
+    block/Schur preconditioner is the next step, and `linear=jno.solve.lu(backend="host")` remains the
+    fastest route for repeat solves of a small saddle-point system.
 
     Any grid size coarsens: an odd cell count merges into its neighbour, so 1000 cells a side coarsen as far
     as 1024 do. Only the axes the operator couples strongly are halved (semi-coarsening), and coarsening
@@ -473,9 +489,10 @@ jno.fdm([
 This is **structured-only**: the tie wraps that grid axis so the `jnp.roll` stencil gives the true
 periodic 5-/7-point Laplacian (a strong-form stencil must *wrap* — a mere boundary tie on an unstructured
 mesh would keep a one-sided edge and solve the wrong problem, so it raises). The redundant `x=L ≡ x=0`
-face is pinned to its main by the tie. Note: a periodic structured solve is currently un-preconditioned
-(the geometric-multigrid V-cycle assumes Dirichlet boundaries), so it is slow on fine grids — periodic GMG
-is a planned extension.
+face is pinned to its main by the tie. A periodic solve is preconditioned like any other: the tie rows are
+eliminated and the V-cycle is built on the reduced operator, with the seam's wrap in its stencil. A
+periodic axis keeps at least the stencil's width on every level, so it stops coarsening earlier than a
+Dirichlet one.
 
 ---
 
