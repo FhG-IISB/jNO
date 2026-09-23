@@ -2315,6 +2315,12 @@ class _TraceFDM:
         import jax
 
         N = self._N
+        if extra_pins is not None and self._nf != 1:
+            raise NotImplementedError(
+                f"jno.fdm: interface pins (a domain-decomposition subdomain) index the nodes of ONE field, and this "
+                f"system has {self._nf} DOF blocks (a coupled system or a vector unknown). Only field 0 would be pinned. "
+                "Couple a single scalar field per subdomain."
+            )
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows(extra_params)
         flux_rows = self._flux_rows(extra_params)
@@ -2330,7 +2336,7 @@ class _TraceFDM:
                 r = r.at[secondary].set(u[secondary] - u[main])
             if extra_pins is not None:  # interface pin (a coupled subdomain's complement) — before the
                 pidx, pvals = extra_pins  # authored Dirichlet, so the physical outer BC still wins on ∂Ω
-                r = r.at[pidx].set(u[pidx] - pvals)
+                r = r.at[pidx].set(u[pidx] - pvals)  # node indices: the single field's block (checked above)
             for k, idx, gvals in rows:  # Dirichlet: pin field k's DOF block at its region nodes
                 base = k * N
                 r = r.at[base + idx].set(u[base + idx] - gvals)
@@ -2577,32 +2583,12 @@ class _TraceFDM:
 
     def pinned_solver(self, node_ids, *, nonlinear=None):
         """A **reusable** ``f(values) -> field`` that solves the subdomain with ``node_ids`` pinned to
-        ``values`` (the interface Dirichlet data from a neighbour) on top of the authored BCs. Built
-        ONCE and JIT-compiled, so the Newton solve compiles a single time and is reused across Schwarz
-        iterations — a fresh per-call closure would recompile every step and exhaust device memory."""
-        import jax
-
-        residual_fn = self._pde_residual_fn()
-        rows = self._dirichlet_rows()
-        flux_rows = self._flux_rows()
-        pin_idx = jnp.asarray(node_ids)
-        driver = nonlinear or _solve.newton()
-
-        @jax.jit
-        def solve(values):
-            pv = jnp.asarray(values)
-
-            def residual_with_bc(u):
-                r = residual_fn(u)
-                r = self._apply_flux_rows(u, r, flux_rows) if flux_rows else r
-                r = r.at[pin_idx].set(u[pin_idx] - pv)  # interface pin — before the authored Dirichlet
-                for _k, idx, gvals in rows:  # single-field (domain-decomposition) path ⇒ block 0
-                    r = r.at[idx].set(u[idx] - gvals)
-                return r
-
-            return driver(residual_with_bc, jnp.zeros(self._N))
-
-        return solve
+        ``values`` (the interface Dirichlet data from a neighbour) on top of the authored conditions. It is
+        the step the Schwarz driver (:mod:`jno.dd`) takes, :meth:`_steady_solve` with ``extra_pins``, so every
+        flux row, periodic tie, trainable parameter and cached compilation of the plain solve applies, from one
+        code path rather than a second hand-written Newton."""
+        pin = jnp.asarray(np.asarray(node_ids, dtype=int))
+        return lambda values: self._steady_solve(nonlinear=nonlinear, extra_pins=(pin, jnp.asarray(values)))
 
     def solve_pinned(self, node_ids, values, *, nonlinear=None):
         """One-shot: solve with ``node_ids`` pinned to ``values`` (see :meth:`pinned_solver`, which the

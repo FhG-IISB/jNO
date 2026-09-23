@@ -659,6 +659,36 @@ def test_a_periodic_problem_does_not_leak_into_the_next_one():
     assert dirichlet_error() == pytest.approx(before, rel=1e-9)
 
 
+def test_a_pinned_solve_is_the_plain_solve_with_interface_pins():
+    """``pinned_solver`` (the domain-decomposition step) is the plain solve plus pins: pinning a line of
+    interior nodes to the unpinned discrete solution reproduces that solution, on a periodic grid. Pins on a
+    coupled system raise: they index one field's nodes, and only field 0 used to be pinned, silently."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).structured())
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 5 * np.pi**2 * jnn.cos(2 * np.pi * x) * jnn.sin(np.pi * y)  # u = cos(2πx) sin(πy): nonzero at the seam
+    prob = jno.fdm([-ui.xx - ui.yy - f, u(xl, yl) - u(xr, yr), u(xb, yb) - 0.0, u(xt, yt) - 0.0])
+    plain = np.asarray(prob.solve()).reshape(-1)
+    line = np.nonzero(np.isclose(p[:, 1], p[np.argmin(np.abs(p[:, 1] - 0.5)), 1]) & (p[:, 0] > 0) & (p[:, 0] < 1))[0]
+    pinned = np.asarray(prob.pinned_solver(line)(plain[line])).reshape(-1)
+    np.testing.assert_allclose(pinned, plain, atol=1e-7 * np.abs(plain).max())
+
+    w, z = d.unknown(), d.unknown()
+    wi, zi = w.bind(x=x, y=y), z.bind(x=x, y=y)
+    xa, ya, _ = d.variable("boundary", split=True)
+    coupled = jno.fdm([-wi.xx - wi.yy + zi - f, -zi.xx - zi.yy - f, w(xa, ya) - 0.0, z(xa, ya) - 0.0])
+    with pytest.raises(NotImplementedError, match="ONE field"):
+        coupled.pinned_solver(line)(np.zeros(line.size))
+
+
 def test_periodic_requires_structured():
     """A periodic tie on an unstructured mesh raises — the FD stencil must wrap the grid, which only a
     structured grid can do."""
