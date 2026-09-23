@@ -608,16 +608,22 @@ supported for a single field (write a coupled system as first order in `(u, v = 
 
 **Structured grids.** `structured=True` on an axis-aligned `shape.rect`/`shape.box` builds a
 uniform grid and switches the interior operators to direct 5-point (2-D) / 7-point (3-D) stencils
-by array reshaping. Same answer as the unstructured cotangent operator, cheaper. The inner Krylov
-defaults to **GMRES + geometric-multigrid V-cycle** because row-replaced Dirichlet makes the
-reduced operator nonsymmetric. Pick a size giving an **even** (ideally power-of-two) cell count per
-axis or multigrid falls back to plain GMRES. A periodic tie `u(left) - u(right)` wraps that axis on a
-structured grid (un-preconditioned). Complex fields are **not** supported in `jno.fdm`.
+by array reshaping. Same answer as the unstructured cotangent operator, cheaper. A **linear** problem is
+one Krylov solve (CG where the eliminated operator probes symmetric, else GMRES); a nonlinear one is
+Newton with the same preconditioner inside. Both use a **V-cycle built from the operator itself**
+(`jno.precond.gmg()`): its per-node stencil is read by colouring, the coarse operators are the variational
+`Pᵀ A P`, and the smoother inverts each node's field block. So a variable coefficient, a jump, an
+anisotropy, a reaction, an advection term, a flux boundary, a periodic axis and a coupled system are all
+preconditioned — a V-cycle built from the grid alone diverges on every one of them. Any cell count
+coarsens (an odd one merges into its neighbour). Complex fields are **not** supported in `jno.fdm`: a
+complex source, coefficient or boundary value raises. An unknown with `value_shape` of rank ≥ 2 raises.
 
-**Weak spots.** The default nonlinear solver (matrix-free, unpreconditioned) struggles on coupled
-saddle-point systems: pass `linear=jno.solve.lu()` for small problems, march to a steady state instead of
-a steady solve from zero, and continue in Re with `x0=`. Central convection needs cell Reynolds < 2; use
-`jno.fd(upwind=u, order=k)` beyond.
+**Weak spots.** A saddle-point system (Navier–Stokes) is preconditioned but still grows faster than
+linearly: the velocity–pressure coupling sits between nodes, where a point-block smoother cannot reach it.
+Pass `linear=jno.solve.lu()` for small problems, march to a steady state instead of solving from zero, and
+continue in Re with `x0=`. Central convection needs cell Reynolds < 2; use `jno.fd(upwind=u, order=k)`
+beyond. The transient march's per-step solve is matrix-free and unpreconditioned, which measures fastest
+on a lattice — reach for `linear=`/`precond=` only when a step is genuinely hard.
 
 ---
 
