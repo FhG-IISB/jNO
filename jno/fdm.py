@@ -159,11 +159,19 @@ def _fd_newton_tolerances(residual_fn, u0, *, safety: float = 1000.0) -> dict:
     return {"atol": floor, "rtol": 1e-8}
 
 
-def _pcg(matvec, b, precond, tol, maxiter=1000):
-    """Preconditioned conjugate gradients (Hestenes & Stiefel, J. Res. Nat. Bur. Stand. 49 (1952) 409) to a
-    relative residual ``tol``; returns ``(x, ‖r‖)``. Four vectors of state."""
+def _pcg(matvec, b, precond, spec):
+    """Preconditioned conjugate gradients (Hestenes & Stiefel, J. Res. Nat. Bur. Stand. 49 (1952) 409) to
+    the relative residual ``spec`` asks for; returns ``(x, ‖r‖)``. Four vectors of state.
+
+    ``spec`` is the ``jno.solve.cg()`` spec, the one place the tolerance and the iteration cap are written:
+    this loop is CG on the same system, run here rather than through the spec only because it needs the
+    caller's V-cycle and the true residual back."""
     import jax
 
+    tol = spec.tolerance
+    # `maxiter=None` means "no cap" to the spec; CG's own bound is the dimension (it terminates in `n`
+    # steps in exact arithmetic), so that is the honest cap rather than a round number.
+    maxiter = spec.settings.get("maxiter") or b.shape[0]
     stop = tol * jnp.linalg.norm(b)
     z = precond(b)
     state = (jnp.zeros_like(b), b, z, z, b @ z, 0)
@@ -184,7 +192,7 @@ def _pcg(matvec, b, precond, tol, maxiter=1000):
     return x, jnp.linalg.norm(r)
 
 
-def _gmres_incremental(matvec, b, precond, tol, restart=30, maxiter=50, cycles=8):
+def _gmres_incremental(matvec, b, precond, spec):
     """GMRES that checks its residual every iteration (JAX's ``incremental`` method) -- the ``batched``
     method ``jno.solve.gmres`` uses finishes each 30-vector restart cycle whatever the convergence -- and
     whose tolerance is measured on the TRUE residual.
@@ -196,10 +204,18 @@ def _gmres_incremental(matvec, b, precond, tol, restart=30, maxiter=50, cycles=8
     so the tolerance means the same thing whatever ``M`` does; it costs one matvec per cycle. It stops at the
     tolerance, when a cycle no longer halves the residual (``M`` cannot do better), or after ``cycles``.
     Right-preconditioned FGMRES (:func:`jno.utils.solver.krylov.fgmres`) would measure the true residual
-    directly, but keeps a second ``(restart, n)`` basis -- 4 GB more at 16.8M nodes."""
+    directly, but keeps a second ``(restart, n)`` basis -- 4 GB more at 16.8M nodes.
+
+    ``spec`` is the ``jno.solve.gmres()`` spec: the tolerance, the restart length and the inner iteration
+    cap all come from it, so they are configured in one place. The number of OUTER cycles is not a knob --
+    each one must at least halve the residual to continue, so ``log2(1/tol)`` of them is every cycle the
+    stopping rule can use."""
     import jax
     from jax.scipy.sparse.linalg import gmres
 
+    tol, restart = spec.tolerance, spec.settings.get("restart", 30)
+    maxiter = spec.settings.get("maxiter") or 50  # `None` means "no cap" to JAX; this loop re-forms b - Ax
+    cycles = max(1, int(np.ceil(np.log2(1.0 / max(tol, np.finfo(float).tiny)))))
     nb = jnp.maximum(jnp.linalg.norm(b), jnp.finfo(b.dtype).tiny)
 
     def cond(s):
@@ -247,7 +263,7 @@ def _structured_linear_solve(domain, periodic=False, vcycle=None):
     # tried instead (two restart cycles, on the inexact-Newton argument that a step needs only enough
     # progress to keep the outer iteration converging): at 66k nodes it left the step so far from solved
     # that Newton diverged on Bratu, residual 6.2e2 against a 5e-6 tolerance.
-    return lambda mv, rhs: _gmres_incremental(mv, rhs, vcycle, _solve.gmres().tolerance)[0]
+    return lambda mv, rhs: _gmres_incremental(mv, rhs, vcycle, _solve.gmres())[0]
 
 
 def _integrate_transient(block, ts, time, linear_solve=None, nonlinear_solve=None):
@@ -2683,10 +2699,14 @@ class _TraceFDM:
                     x = linear_spec(LinearOperator.from_matvec(matvec), b, M=M if precond is not None else None, x0=None)
                     rn = jnp.linalg.norm(matvec(x) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
                     return uD + x, rn
-                krylov = _pcg if symmetric else _gmres_incremental
+                # the spec whose tolerance, restart and iteration cap this loop runs to -- one source for
+                # the numbers, even where the iteration itself is run here rather than through the spec
+                krylov, krylov_spec = (
+                    (_pcg, _solve.cg(tol=tol)) if symmetric else (_gmres_incremental, _solve.gmres(tol=tol))
+                )
 
                 def solve(mv, rhs):  # (x, relative residual the Krylov loop ended at) -- no extra matvec
-                    x, rn = krylov(mv, rhs, M, tol)
+                    x, rn = krylov(mv, rhs, M, krylov_spec)
                     return x, rn / jnp.maximum(jnp.linalg.norm(rhs), 1e-300)
 
                 # the V-cycle is symmetric, so the same preconditioned Krylov solve serves Aᵀ (the adjoint)

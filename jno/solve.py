@@ -257,7 +257,12 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
-    return LinearSolver(_fn, name=name, key=(tol, atol, maxiter, tuple(sorted(fixed.items()))))
+    return LinearSolver(
+        _fn,
+        name=name,
+        key=(tol, atol, maxiter, tuple(sorted(fixed.items()))),
+        settings=dict(tol=tol, atol=atol, maxiter=maxiter, **fixed),
+    )
 
 
 def cg(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = 20_000) -> LinearSolver:
@@ -344,7 +349,7 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
         raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
 
-    return LinearSolver(_fn, name="minres", key=(tol, maxiter))
+    return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
 
 
 def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
@@ -368,7 +373,7 @@ def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
         # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg")
 
-    return LinearSolver(_fn, name="cocg", key=(tol, maxiter))
+    return LinearSolver(_fn, name="cocg", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
 
 
 def chebyshev(

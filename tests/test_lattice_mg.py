@@ -245,7 +245,7 @@ def test_it_preconditions_the_solve_to_the_tolerance():
     shape = tuple(d.mesh_connectivity["grid"]["shape"])
     mv, b, mask = _eliminated(prob)
     vcycle, _ = lattice_mg.build(mv, shape)
-    x, rn = _gmres_incremental(mv, b, lambda r: vcycle(r * mask) * mask, 1e-12)
+    x, rn = _gmres_incremental(mv, b, lambda r: vcycle(r * mask) * mask, jno.solve.gmres(tol=1e-12))
     assert float(rn) / float(jnp.linalg.norm(b)) < 1e-11
     dense = jax.jacfwd(mv)(jnp.zeros(prob._N))
     live = np.abs(np.asarray(dense)).sum(axis=1) > 0

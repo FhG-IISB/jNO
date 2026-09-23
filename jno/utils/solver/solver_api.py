@@ -416,16 +416,31 @@ class LinearSolver:
     solver is slow until its key is written, never silently wrong.
     """
 
-    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: bool = False, key: Any = None):
+    def __init__(
+        self,
+        fn: Callable,
+        *,
+        name: str,
+        traits: Optional[dict] = None,
+        direct: bool = False,
+        key: Any = None,
+        settings: Optional[dict] = None,
+    ):
         self._fn = fn
         self.name = name
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
         self.direct = direct  # a direct solver ignores x0 and takes no preconditioner
         self.key = None if key is None else (type(self), name, key)
-        # The relative tolerance this spec asks for, readable without unpacking `key` (the Krylov builders
-        # put it first). A caller that runs its own loop -- jno.fdm's structured paths -- needs to know what
-        # the user asked for rather than assume a default.
-        self.tolerance = key[0] if isinstance(key, tuple) and key and isinstance(key[0], float) else None
+        # What this spec was configured with, by name: `tol`, `atol`, `maxiter`, and whatever else the
+        # method takes (GMRES's `restart`). A caller that runs its own loop rather than calling `fn` --
+        # jno.fdm's structured paths, which need the true residual and their own preconditioner -- reads
+        # the configuration here instead of unpacking `key` by position or assuming a default.
+        self.settings = dict(settings or {})
+        # The relative tolerance asked for. Falls back to `key`'s first float for a spec that declares no
+        # settings, which is what the older builders pass.
+        self.tolerance = self.settings.get("tol")
+        if self.tolerance is None and isinstance(key, tuple) and key and isinstance(key[0], float):
+            self.tolerance = key[0]
 
     def __call__(self, A, b, *, M=None, x0=None):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
