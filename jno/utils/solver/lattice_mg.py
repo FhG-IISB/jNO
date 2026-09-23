@@ -296,7 +296,7 @@ def _periodic_reduction(matvec, shape, nf, periodic):
     return reduced, keep, inject, extract
 
 
-def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, window=None):
+def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, window=None, hint=None):
     """An operator-dependent V-cycle ``M⁻¹: r -> e`` for ``matvec`` on the lattice ``shape``.
 
     Returns ``(apply, n_levels)``. ``apply`` takes and returns the flat blocked vector ``matvec`` uses
@@ -315,7 +315,7 @@ def build(matvec, shape, *, nf=1, periodic=(), dtype=None, n_pre=2, n_post=2, wi
     else:
         shape, inject, extract = full_shape, (lambda x: x), (lambda y: y)
     if window is None:  # find the window once, on the fine operator, then reduce rather than store it
-        window, _ = probe(matvec, shape, nf, periodic=per, dtype=dtype, seed=1)
+        window, _ = probe(matvec, shape, nf, hint=hint, periodic=per, dtype=dtype, seed=1)
     d0, strength0, block0 = probe_reduced(matvec, shape, nf, window=window, periodic=per, dtype=dtype)
 
     levels = [

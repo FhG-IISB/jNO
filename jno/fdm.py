@@ -2259,7 +2259,37 @@ class _TraceFDM:
             )
         return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
 
-    def _lattice_vcycle(self, matvec, n):
+    def _stencil_window(self):
+        """The offset range this problem's finite-difference schemes read, per axis, from the specs
+        themselves -- the window a stencil probe should try first.
+
+        A ``jno.fd(order=k)`` spec knows its own offsets, one-sided closures included: order 2 spans ±3 for a
+        second derivative, order 4 ±5, order 6 ±7. Searching for those blindly costs a probe pass per
+        candidate (a width-15 window is 225 colours in 2-D), and the search stops before it reaches them.
+        ``None`` when no spec says otherwise, which leaves the default candidates."""
+        from .stencils import FDStencil
+        from .trace import Hessian, Jacobian
+
+        reach = 0
+        stack, seen = [_unwrap(c) for c in self._constraints], set()
+        while stack:
+            node = _unwrap(stack.pop())
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.extend(_iter(node))
+            if isinstance(node, (Jacobian, Hessian)):
+                spec = getattr(node, "scheme", None)
+                if isinstance(spec, FDStencil):
+                    deriv = 2 if isinstance(node, Hessian) else 1
+                    try:
+                        per_node = spec.stencils(deriv, max(8, 2 * (spec.order or 2) + 3))
+                    except Exception:  # a spec this grid cannot answer for: leave it to the search
+                        continue
+                    reach = max(reach, max(max(abs(o) for o in offs) for offs, _w in per_node))
+        return (-reach, reach) if reach else None
+
+    def _lattice_vcycle(self, matvec, n, **sweeps):
         """The operator-dependent V-cycle (:func:`jno.utils.solver.lattice_mg.build`) for the ``n``-unknown
         lattice operator ``matvec``, or ``None`` when this problem is not on a lattice (or the system is not
         a whole number of fields on it). Built on concrete values."""
@@ -2271,12 +2301,25 @@ class _TraceFDM:
         if grid is None or not self._nodes_are_the_grid(grid) or n % self._N:
             return None
         with jax.ensure_compile_time_eval():
-            vcycle, _levels = build(
-                jax.jit(matvec),  # jitted: the probe applies it once per colour per level
-                tuple(grid["shape"]),
-                nf=n // self._N,
-                periodic=(self._grid or {}).get("periodic", ()),
-            )
+            try:
+                vcycle, _levels = build(
+                    jax.jit(matvec),  # jitted: the probe applies it once per colour per level
+                    tuple(grid["shape"]),
+                    nf=n // self._N,
+                    periodic=(self._grid or {}).get("periodic", ()),
+                    hint=self._stencil_window(),
+                    **sweeps,
+                )
+            except ValueError as exc:  # no bounded stencil to read (a spectral axis): solve without one
+                if "no window" not in str(exc):
+                    raise
+                from .utils.logger import get_logger
+
+                get_logger().info(
+                    f"jno.fdm: {exc} The solve runs without a multigrid preconditioner; pass "
+                    "linear=/precond= to choose another."
+                )
+                return None
         return vcycle
 
     def _grid_vcycle(self, residual, at):
@@ -2587,9 +2630,6 @@ class _TraceFDM:
         result, and a solve that did not reach ``tol`` raises."""
         import jax
 
-        from .utils.solver.lattice_mg import build as build_vcycle
-
-        grid = self.domain.mesh_connectivity["grid"]
         slots = linear is not None or precond is not None
         # the tolerance the solve was asked for: the user's Krylov spec's, or this path's own
         check_tol = ((getattr(linear, "tolerance", None) if linear is not None else 1e-8) if slots else tol) or tol
@@ -2619,13 +2659,7 @@ class _TraceFDM:
                 # jitted: the probe applies it once per colour per level, and an un-jitted jvp of a jitted
                 # residual re-traces and re-compiles on every one of them (12 s of setup at 1M nodes)
                 probe_mv = jax.jit(lambda v: jax.jvp(probe_residual, (zeros,), (v * probe_mask,))[1] * probe_mask)
-                vcycle, _levels = build_vcycle(
-                    probe_mv,
-                    tuple(grid["shape"]),
-                    nf=self._nf,
-                    periodic=(self._grid or {}).get("periodic", ()),
-                    **sweeps,
-                )
+                vcycle = self._lattice_vcycle(probe_mv, self._Ntot, **sweeps)
                 symmetric = self._grid_linear_symmetric(lambda: self._steady_residual(self._current_params()), probe_mask)
             if slots and getattr(linear, "name", None) == "cg" and not symmetric:
                 raise ValueError(
@@ -2642,7 +2676,8 @@ class _TraceFDM:
                     uD = uD.at[idx].set(jnp.broadcast_to(jnp.asarray(vals), (idx.shape[0],)))
                 matvec = lambda v: jax.jvp(residual, (uD,), (v * mask,))[1] * mask  # noqa: E731
                 b = -residual(uD) * mask
-                M = lambda r: vcycle(r * mask) * mask  # noqa: E731
+                # no V-cycle (an operator with no bounded stencil, e.g. a spectral axis): solve unpreconditioned
+                M = (lambda r: vcycle(r * mask) * mask) if vcycle is not None else (lambda r: r)  # noqa: E731
                 if slots:  # the user's Krylov spec (it carries its own custom_linear_solve and tolerance)
                     from .utils.solver.solver_api import LinearOperator
 

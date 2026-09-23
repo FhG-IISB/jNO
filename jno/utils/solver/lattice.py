@@ -35,6 +35,10 @@ import numpy as np
 
 #: Windows tried, in order of size: the compact stencil, then one-sided room for a boundary closure, then
 #: wider ones. A window ``(lo, hi)`` means offsets ``lo <= o <= hi`` on every axis.
+#:
+#: A one-sided closure reaches further than the interior stencil it matches -- ``jno.fd(order=k)`` reads
+#: ``k + 1`` nodes from the boundary inwards -- so the candidates are asymmetric: order 2 needs ``(-1, 2)``,
+#: order 4 ``(-2, 4)`` and order 6 ``(-3, 6)``.
 WINDOWS = ((-1, 1), (-1, 2), (-2, 2), (-2, 3), (-3, 3), (-3, 4), (-4, 4))
 
 
@@ -157,7 +161,7 @@ def _accumulate_colours(matvec, shape, nf, window, periodic, dtype, init, update
     return carry
 
 
-def probe(matvec, shape, nf=1, *, window=None, periodic=(), dtype=None, verify=True, seed=0):
+def probe(matvec, shape, nf=1, *, window=None, hint=None, periodic=(), dtype=None, verify=True, seed=0):
     """The per-node stencil of ``matvec`` on the lattice ``shape``.
 
     ``matvec`` takes and returns a flat vector of ``nf * prod(shape)`` entries, blocked by field and in C
@@ -166,7 +170,10 @@ def probe(matvec, shape, nf=1, *, window=None, periodic=(), dtype=None, verify=T
 
     With ``window=None`` the candidates of :data:`WINDOWS` are tried in order and the first whose
     reconstruction reproduces ``matvec`` on a random vector (to ``√ε`` relative) is returned; passing a
-    window skips the search. ``verify=False`` skips the check when the window is given.
+    window skips the search. ``hint`` is tried first and the search follows if it does not verify -- a
+    caller that knows its stencils (``jno.fdm`` reads them off the ``jno.fd`` specs in its terms) saves the
+    candidates it would otherwise walk, and a wide one (a sixth-order closure spans +-7) is found at all.
+    ``verify=False`` skips the check when the window is given.
 
     Cost: ``prod(window width)·nf`` matvecs per candidate, plus one for the check. A periodic axis needs
     its length to be a multiple of the window's width, so that a node's window holds one offset per colour;
@@ -181,7 +188,8 @@ def probe(matvec, shape, nf=1, *, window=None, periodic=(), dtype=None, verify=T
     ref = matvec(v) if verify else None
 
     per_full = tuple(periodic) + (False,) * (dim - len(periodic))
-    for cand in WINDOWS if window is None else (window,):
+    candidates = (window,) if window is not None else (((hint,) if hint is not None else ()) + WINDOWS)
+    for cand in candidates:
         S = _probe_window(matvec, shape, nf, cand, per_full, dtype)
         if not verify:
             return cand, S
