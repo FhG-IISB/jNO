@@ -159,6 +159,41 @@ def _fd_newton_tolerances(residual_fn, u0, *, safety: float = 1000.0) -> dict:
     return {"atol": floor, "rtol": 1e-8}
 
 
+#: Shared atoms of the affine split (:meth:`_TraceFDM._affine_in_unknown`), built once so that "is this the
+#: trivial coefficient" is an identity test rather than a numeric one: under a crux trace a ``Literal``'s
+#: value can be a tracer, and ``float()`` on one raises.
+_AFFINE_ATOMS: dict = {}
+
+
+def _affine_atom(which):
+    """``"one"`` -> ``Literal(1.0)``, ``"minus"`` -> ``Literal(-1.0)``, ``"minus_one"`` -> ``−1·one``."""
+    if which not in _AFFINE_ATOMS:
+        from .trace import BinaryOp, Literal
+
+        _AFFINE_ATOMS["one"] = _AFFINE_ATOMS.get("one") or Literal(1.0)
+        _AFFINE_ATOMS["minus"] = _AFFINE_ATOMS.get("minus") or Literal(-1.0)
+        _AFFINE_ATOMS["minus_one"] = _AFFINE_ATOMS.get("minus_one") or BinaryOp(
+            "*", _AFFINE_ATOMS["minus"], _AFFINE_ATOMS["one"]
+        )
+    return _AFFINE_ATOMS[which]
+
+
+def _negate(node):
+    """``−node``, cancelling a negation this module put there.
+
+    Without the cancellation, ``u(xb, yb) - g`` would come back as ``−1·(−1·g)`` rather than ``g`` itself,
+    and the checks that look at the value node -- is it a whole-mesh nodal data field, does it read a
+    trainable parameter -- would no longer recognise it. They match on the node, not on its value."""
+    from .trace import BinaryOp
+
+    n = _unwrap(node)
+    if isinstance(n, BinaryOp) and n.op == "*" and n.left is _affine_atom("minus"):
+        return n.right
+    if n is _affine_atom("one"):
+        return _affine_atom("minus_one")
+    return BinaryOp("*", _affine_atom("minus"), n)
+
+
 def _pcg(matvec, b, precond, spec):
     """Preconditioned conjugate gradients (Hestenes & Stiefel, J. Res. Nat. Bur. Stand. 49 (1952) 409) to
     the relative residual ``spec`` asks for; returns ``(x, ‖r‖)``. Four vectors of state.
@@ -1686,30 +1721,82 @@ class _TraceFDM:
         )
 
     def _value_side(self, constraint):
-        """``g`` of a value condition, so that it reads ``u = g``: ``u(region) - g`` and ``g - u(region)`` give
-        ``g``; ``u(region) + v`` and ``v + u(region)`` give ``−v``; a bare ``u(region)`` gives 0.
+        """``g`` of a value condition, so that it reads ``u = g``.
 
-        Anything else raises. Only the ``-`` form used to be read: ``u(xr, yr) + 1.0`` was imposed as u = 0,
-        silently, and a steady Burgers solve with u = −1 on its right wall converged to u = 0 there."""
-        from .trace import BinaryOp, Literal, ModelCall
+        A value condition is any expression **affine** in ``u(region)``: ``a·u + b`` with ``a`` and ``b``
+        free of the unknown. The condition ``a·u + b = 0`` is ``u = −b/a``, and that is what this returns,
+        as an expression, so a trainable parameter inside it is still traced.
+
+        Affinity is read structurally, by :meth:`_affine_in_unknown`, not matched against a list of shapes.
+        The shapes are what the caller happens to write and there is no end to them: ``u(xb, yb) - xb`` is
+        one, ``u(xb, yb) - xb - 0.0*yb`` another (which used to raise), ``2*u(xb, yb) - 2*g`` a third (which
+        used to raise, telling the caller to divide the 2 out by hand), ``g - u(region)`` a fourth. All four
+        are the same affine condition.
+
+        Only the ``-`` form used to be read at all: ``u(xr, yr) + 1.0`` was imposed as u = 0, silently, and a
+        steady Burgers solve with u = −1 on its right wall converged to u = 0 there."""
+        from .trace import BinaryOp
 
         inner = _unwrap(constraint)
-
-        def bare(n):
-            n = _unwrap(n)
-            return isinstance(n, ModelCall) and any(n.model is w for w in self.unknowns)
-
-        if bare(inner):
+        split = self._affine_in_unknown(inner)
+        if split is not None and split[0] is None:  # no unknown in it at all: not a value condition
+            split = None
+        if split is None:
+            raise ValueError(
+                f"jno.fdm([...]): a value condition must be AFFINE in the unknown -- `a·u(region) + b`, with "
+                f"a and b free of the unknown (`u(xb, yb) - g`, `g - u(xb, yb)`, `2*u(xb, yb) - 2*g`). Got "
+                f"{constraint!r}, where the unknown appears nonlinearly. Write the value it should take."
+            )
+        a, b = split
+        if b is None:  # a·u = 0
             return 0.0
-        if isinstance(inner, BinaryOp) and inner.op in ("-", "+"):
-            if bare(inner.left) and not any(_contains_unknown(inner.right, w) for w in self.unknowns):
-                return inner.right if inner.op == "-" else BinaryOp("*", Literal(-1.0), inner.right)
-            if bare(inner.right) and not any(_contains_unknown(inner.left, w) for w in self.unknowns):
-                return inner.left if inner.op == "-" else BinaryOp("*", Literal(-1.0), inner.left)
-        raise ValueError(
-            f"jno.fdm([...]): a value condition must read `u(region) - g` (or `u(region) + v`, `g - u(region)`); "
-            f"got {constraint!r}. Divide out any factor on the unknown: `2*u(xb, yb) - 2*g` is `u(xb, yb) - g`."
-        )
+        # The two trivial coefficients are recognised by identity and divided out symbolically, so the
+        # common spellings give back the caller's own `g` node -- see :func:`_negate`.
+        if a is _affine_atom("one"):
+            return _negate(b)
+        if a is _affine_atom("minus_one"):
+            return b
+        return BinaryOp("/", _negate(b), a)
+
+    def _affine_in_unknown(self, node):
+        """``(a, b)`` with ``node == a·u(region) + b``, or ``None`` when ``node`` is not affine in the
+        unknown (or does not contain it). ``b`` is ``None`` for a pure ``a·u``.
+
+        Both parts come back as trace expressions, so whatever they read -- a coordinate, nodal data, a
+        trainable parameter -- is evaluated the same way the rest of the condition is."""
+        from .trace import BinaryOp, ModelCall
+
+        node = _unwrap(node)
+        free = not any(_contains_unknown(node, w) for w in self.unknowns)
+        if free:
+            return (None, node)
+        if isinstance(node, ModelCall) and any(node.model is w for w in self.unknowns):
+            return (_affine_atom("one"), None)
+        if not isinstance(node, BinaryOp):
+            return None
+
+        def combine(x, y, minus):
+            """``x + y`` (or ``x − y``) of two ``(a, b)`` splits."""
+            neg = lambda n: None if n is None else (_negate(n) if minus else n)  # noqa: E731
+            add = lambda p, q: q if p is None else (p if q is None else BinaryOp("+", p, q))  # noqa: E731
+            return (add(x[0], neg(y[0])), add(x[1], neg(y[1])))
+
+        left, right = self._affine_in_unknown(node.left), self._affine_in_unknown(node.right)
+        if left is None or right is None:
+            return None
+        if node.op in ("+", "-"):
+            return combine(left, right, node.op == "-")
+        scale = lambda part, k: None if part is None else BinaryOp("*", part, k)  # noqa: E731
+        if node.op == "*":  # affine only when one side is free of the unknown
+            if left[0] is None:
+                return (scale(right[0], left[1]), scale(right[1], left[1]))
+            if right[0] is None:
+                return (scale(left[0], right[1]), scale(left[1], right[1]))
+            return None
+        if node.op == "/" and right[0] is None:  # dividing by something free of the unknown stays affine
+            div = lambda part: None if part is None else BinaryOp("/", part, right[1])  # noqa: E731
+            return (div(left[0]), div(left[1]))
+        return None
 
     @staticmethod
     def _uses_params(node, params):

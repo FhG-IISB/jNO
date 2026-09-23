@@ -2696,7 +2696,7 @@ def test_point_region_on_a_long_time_dependent_domain():
 @pytest.mark.parametrize("spelling", ["u - g", "g - u", "u + v"])
 def test_value_conditions_in_every_natural_form(spelling):
     """`u(xb, yb) + 1.0` used to be imposed as u = 0: only the `-` form was read, anything else silently
-    gave g = 0. Each natural form now reads u = g; a factor on the unknown raises."""
+    gave g = 0. Each natural form now reads u = g."""
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -2705,8 +2705,10 @@ def test_value_conditions_in_every_natural_form(spelling):
     bc = {"u - g": u(xb, yb) - (-1.0), "g - u": -1.0 - u(xb, yb), "u + v": u(xb, yb) + 1.0}[spelling]
     sol = np.asarray(jno.fdm([ui.xx + ui.yy, bc]).solve()).reshape(-1)
     assert np.abs(sol + 1.0).max() < 1e-10  # harmonic with u = −1 on the boundary: u ≡ −1
-    with pytest.raises(ValueError, match="Divide out"):
-        jno.fdm([ui.xx + ui.yy, 2.0 * u(xb, yb) - 2.0]).solve()
+    # a factor on the unknown is the same condition, and is read as one -- see
+    # test_every_affine_spelling_of_a_value_condition
+    scaled = np.asarray(jno.fdm([ui.xx + ui.yy, 2.0 * u(xb, yb) - 2.0 * (-1.0)]).solve()).reshape(-1)
+    assert np.abs(scaled + 1.0).max() < 1e-10
 
 
 def test_a_data_field_as_a_pde_coefficient():
@@ -2870,6 +2872,46 @@ def test_a_coupled_system_is_preconditioned_by_the_operator_v_cycle():
     apply = s._grid_vcycle(residual, jnp.zeros(s._Ntot))
     assert apply is not None, "a coupled lattice operator must get a V-cycle"
     assert contraction(apply, matvec, s._Ntot) < 0.5
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["u - g", "nested subtract", "scaled", "g - u", "divided", "plus form"],
+)
+def test_every_affine_spelling_of_a_value_condition(spelling):
+    """A value condition is any expression affine in the unknown. `u(xb, yb) - xb - 2*yb` (a nested
+    subtraction) and `2*u(xb, yb) - 2*g` (a scaled one) used to raise, the second telling the caller to
+    divide the factor out by hand. Oracle: the harmonic u = x + 2y, which the 5-point Laplacian represents
+    exactly, so every spelling of the same condition must return it."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    g = xb + 2 * yb
+    bc = {
+        "u - g": lambda: u(xb, yb) - g,
+        "nested subtract": lambda: u(xb, yb) - xb - 2 * yb,
+        "scaled": lambda: 2 * u(xb, yb) - 2 * g,
+        "g - u": lambda: g - u(xb, yb),
+        "divided": lambda: (u(xb, yb) - g) / 3.0,
+        "plus form": lambda: u(xb, yb) + (-xb - 2 * yb),
+    }[spelling]()
+    sol = np.asarray(jno.fdm([ui.xx + ui.yy, bc]).solve())
+    np.testing.assert_allclose(sol, p[:, 0] + 2 * p[:, 1], atol=1e-5)
+
+
+def test_a_value_condition_must_be_affine_in_the_unknown():
+    """A condition the unknown enters nonlinearly is not a value condition, and says so rather than
+    imposing some side of it."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    with pytest.raises(ValueError, match="must be AFFINE in the unknown"):
+        jno.fdm([ui.xx + ui.yy, u(xb, yb) ** 2 - 1.0]).solve()
 
 
 def test_a_coupled_second_order_system_marches():
