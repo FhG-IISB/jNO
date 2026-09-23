@@ -2025,6 +2025,39 @@ def test_nonlinear_crank_nicolson_assembled_tangent():
     assert np.abs(solve(linear=jno.solve.lu()) - solve()).max() < 1e-13
 
 
+def test_a_frozen_march_preconditioner_is_built_for_the_scheme(monkeypatch):
+    """A preconditioner that needs a matrix (gmg, amg) is set up once on the step tangent M + s·J. ``s`` came
+    from ``metadata["theta"]``, which an FDM block does not carry, so a Crank–Nicolson march was preconditioned
+    for backward Euler (s = Δt instead of Δt/2). It is read from the time scheme now. Speed only: the answer
+    never depended on it."""
+    from jno.utils.solver import solver_api
+
+    scales = []
+    real = solver_api._add_step_operator
+
+    def spy(M, A, scale):
+        scales.append(float(scale))
+        return real(M, A, scale)
+
+    monkeypatch.setattr(solver_api, "_add_step_operator", spy)
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured(), time=(0.0, 0.2, 21))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ic = jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)
+    terms = [ui.t - ui.xx - ui.yy + ui**3, u(xb, yb) - 0.0, u(xi, yi) - ic]
+    jno.fdm(terms).solve(time=jno.solve.theta(0.5), linear=jno.solve.gmres(), precond=jno.precond.gmg())
+    dt = 0.2 / 20
+    assert scales and scales[0] == pytest.approx(0.5 * dt)
+
+
+# cg / minres on a Newton path: the assembled tangent keeps the Dirichlet identity rows, whose columns the
+# interior rows still reference, so it is not symmetric and CG returned NaN. The Newton path now solves
+# through the same Dirichlet elimination the linear path uses, exactly, for J and for Jᵀ (the adjoint).
+
+
 def test_dirichlet_elimination_is_exact_for_the_tangent_and_its_transpose():
     import jax.experimental.sparse as jsp
 

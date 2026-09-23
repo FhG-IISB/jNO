@@ -1093,7 +1093,7 @@ class _FrozenMarchPrecond:
         return f"frozen-for-march({self._of!r})"
 
 
-def _freeze_precond_for_march(precond, fem, block, state=None):
+def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
     """Materialize a NON-traceable preconditioner once, from the step tangent at the initial state.
 
     ``spec.traceable`` is the library's own word for "can materialize inside a trace". ``jacobi`` reads
@@ -1107,9 +1107,11 @@ def _freeze_precond_for_march(precond, fem, block, state=None):
     Krylov solve converges, never what it converges to. It is also what the LINEAR transient path already
     does one branch below, where the step operator is formed once and materialized before the scan.
 
-    Built from ``M + theta*dt*J(u0, t0)``, which is ``dt`` times the true step tangent
-    ``M/dt + theta*J``. A uniform scaling of the operator leaves the Krylov iterates unchanged (it
-    rescales the preconditioned residual, not the subspace), so the extra factor costs nothing.
+    Built from ``M + scale*J(u0, t0)``, which is ``dt`` times the true step tangent ``M/dt + theta*J`` for
+    ``scale = theta*dt``. A uniform scaling of the operator leaves the Krylov iterates unchanged (it
+    rescales the preconditioned residual, not the subspace), so the extra factor costs nothing. ``scale``
+    comes from the time scheme (:meth:`step_scales`); without one, from ``metadata["theta"]`` (default 1).
+    A block whose metadata carried no theta used to be preconditioned for backward Euler under any scheme.
     """
     if precond is None:
         return None
@@ -1145,6 +1147,7 @@ def _freeze_precond_for_march(precond, fem, block, state=None):
     theta = float((block.metadata or {}).get("theta", 1.0))
     t0 = float((block.metadata or {}).get("t0", 0.0))
     dt = float(block.dt)
+    scale = theta * dt if scale is None else float(scale)
     J = block.jacobian(at, t0, None)
     if block.mass is None:
         # STATE-DEPENDENT mass (``c(u) u_t``, e.g. an enthalpy-porosity heat capacity): there is no mass
@@ -1158,14 +1161,14 @@ def _freeze_precond_for_march(precond, fem, block, state=None):
             _slice = _u0[_s0:_s1]
             _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
         J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
-        A_rep = _add_step_operator(J, J_mass, 1.0 / dt)
+        A_rep = _add_step_operator(J, J_mass, 1.0 / scale)  # ∝ J_mass + scale·J; scale = dt for backward Euler
         op = LinearOperator(A_rep)
         prepare_precond(precond, fem)
         applier = materialize_precond(precond, PrecondContext(op, fem))
         _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
         return _FrozenMarchPrecond(applier, precond)
     M = block.mass(t0, None)
-    A_rep = _add_step_operator(M, J, theta * dt)
+    A_rep = _add_step_operator(M, J, scale)
     op = LinearOperator(A_rep)
     prepare_precond(precond, fem)
     applier = materialize_precond(precond, PrecondContext(op, fem))
@@ -1264,7 +1267,10 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # inside the march's scan, so both the matrix-free JVP and the `direct=True` assembled tangent are
         # traced by the time it is asked for. Build it once, now, from the step tangent at the initial
         # state, and freeze it for the march.
-        precond = _freeze_precond_for_march(precond, fem, block, state)
+        # The step operator's coefficient on J, from the scheme: θ·Δt for a θ-scheme, and the 2Δt/3 of the
+        # BDF2 steps (the last of `step_scales`, which every step but the first uses).
+        scales = tuple(scheme.step_scales(block)) if scheme is not None and hasattr(scheme, "step_scales") else ()
+        precond = _freeze_precond_for_march(precond, fem, block, state, scale=scales[-1] if scales else None)
         return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
     if nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
