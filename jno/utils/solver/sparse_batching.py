@@ -7,13 +7,13 @@ per-sample gradients -- raises ``NotImplementedError: Batching rule for 'csr_mat
 The rules here fill that gap without replacing anything JAX already defines, and keep every batched
 product on cuSPARSE:
 
-* **one matrix, many vectors** -- one SpMV per vector below :data:`SPMM_MIN_BATCH` vectors, one SpMM
-  (``csr_matmat``) on the ``(n, B)`` block from there up. Measured on four real FEM operators
-  (142k-515k DOF, RTX 3070, float64): SpMM costs 4.3-6.2x a loop of SpMVs at 2 vectors, 1.0-1.5x at 8,
-  0.67-1.0x at 12 and 0.28-0.38x at 32 -- cuSPARSE's SpMM is slow for a handful of columns.
-* **batched solves** (``spsolve``): the B systems become block-diagonal systems of up to
-  :data:`SPSOLVE_BLOCK_NNZ` nonzeros each, one solve per block-diagonal system (see
-  :func:`_spsolve_batch`).
+* **one matrix, many vectors** -- either one SpMV per vector or one SpMM (``csr_matmat``) on the
+  ``(n, B)`` block, whichever is faster ON THIS DEVICE: the choice is measured the first time a batch
+  shape is traced (see :func:`_prefer_spmm`), never hard-coded. It matters: on one RTX 3070 SpMM cost
+  4-6x a loop of SpMVs at 2 vectors and 0.3x at 32, and the crossover moves with the GPU, the cuSPARSE
+  version and the dtype.
+* **batched solves** (``spsolve``): one solve per system under ``lax.map`` -- the memory of an unbatched
+  solve on any machine (see :func:`_spsolve_batch` for why not block-diagonal).
 * **batched matrices** (values, and optionally the pattern): the B matrices become ONE block-diagonal
   CSR -- column indices offset by ``b * ncols``, row pointers by ``b * nse`` -- applied in a single
   call. On a 303k-DOF operator with 16 value sets: 231 us per item (a single SpMV is 183 us), against
@@ -30,14 +30,9 @@ import jax.numpy as jnp
 from jax.experimental.sparse import csr as _csr
 from jax.interpreters import batching
 
-#: Below this many vectors a loop of cuSPARSE SpMVs beats one SpMM (see the module docstring).
-SPMM_MIN_BATCH = 12
+#: Per-device measured choices, keyed on (platform, device kind, shape, nnz, batch, dtype, transpose).
+_SPMM_DECISIONS: dict = {}
 
-#: Largest block-diagonal system (in stored nonzeros) handed to ONE ``spsolve``; bigger batches are split
-#: into chunks run by ``lax.map``. cuSolver's sparse QR allocates for its fill-in, not for ``nnz``:
-#: measured on an 8 GB card, a 3-D 20k-DOF Laplacian failed to allocate at 32 copies (4.3M nnz) and
-#: solved at 8 (1.07M), while a 2-D 20k-DOF operator solved at 32 copies (4.4M).
-SPSOLVE_BLOCK_NNZ = 1_000_000
 
 _UNBATCHED = None  # the batch dimension JAX passes for an operand that is not being vmapped
 
@@ -69,6 +64,68 @@ def _block_diagonal(data, indices, indptr, shape):
     return data.reshape(-1), big_indices, big_indptr, (B * nrows, B * ncols)
 
 
+def _prefer_spmm(shape, nse, batch, dtype, transpose) -> bool:
+    """One SpMM, or one SpMV per vector? MEASURED on the default device the first time this batch shape
+    is traced, then cached for the process -- the way XLA autotunes its GEMMs at compile time.
+
+    The real sparsity pattern is a tracer here, so both variants are timed on a banded CSR of the SAME
+    shape and nonzeros per row, generated on the device. If timing fails for any reason the loop is
+    chosen -- it is never slower than ``batch`` separate products -- and the failure is logged rather
+    than hidden.
+    """
+    import time
+
+    import jax
+
+    dev = jax.devices()[0]
+    key = (dev.platform, dev.device_kind, tuple(shape), int(nse), int(batch), jnp.dtype(dtype).name, bool(transpose))
+    if key in _SPMM_DECISIONS:
+        return _SPMM_DECISIONS[key]
+    try:
+        with jax.ensure_compile_time_eval():
+            # Same size as the real operator: a scaled-down stand-in moves the crossover (measured: a
+            # 5k-row stand-in picked SpMM from 4 vectors where the 300k-row operator needs 8-12). The
+            # pattern is a band generated ON the device -- sorted, in bounds, built in milliseconds.
+            nrows, ncols = shape
+            per_row = max(1, min(ncols, int(round(nse / max(nrows, 1)))))
+            r = jnp.arange(nrows, dtype=jnp.int32)[:, None]
+            start = (r.astype(jnp.int64) * (ncols - per_row) // max(nrows - 1, 1)).astype(jnp.int32)
+            idx = (start + jnp.arange(per_row, dtype=jnp.int32)[None, :]).reshape(-1)
+            ptr = jnp.arange(nrows + 1, dtype=jnp.int32) * per_row
+            data = jnp.ones(idx.size, dtype)
+            tshape = (nrows, ncols)
+            V = jnp.ones((nrows if transpose else ncols, batch), dtype)
+
+            spmm = jax.jit(lambda V: _csr._csr_matmat(data, idx, ptr, V, shape=tshape, transpose=transpose))
+            loop = jax.jit(
+                lambda V: jnp.stack(
+                    [_csr._csr_matvec(data, idx, ptr, V[:, b], shape=tshape, transpose=transpose) for b in range(batch)]
+                )
+            )
+
+            def best(f):
+                jax.block_until_ready(f(V))
+                ts = []
+                for _ in range(3):
+                    t0 = time.perf_counter()
+                    jax.block_until_ready(f(V))
+                    ts.append(time.perf_counter() - t0)
+                return min(ts)
+
+            choice = best(spmm) < best(loop)
+    except Exception as exc:  # noqa: BLE001 -- a failed measurement must not break the user's vmap
+        from ..logger import get_logger
+
+        get_logger().warning(
+            f"jno sparse vmap: could not time SpMM against an SpMV loop for a batch of {batch} on "
+            f"{dev.device_kind} ({type(exc).__name__}: {exc}); using the SpMV loop, which is never slower "
+            f"than {batch} separate products."
+        )
+        choice = False
+    _SPMM_DECISIONS[key] = choice
+    return choice
+
+
 def _matrix_unbatched(dims):
     return all(d is _UNBATCHED for d in dims[:3])
 
@@ -77,7 +134,7 @@ def _csr_matvec_batch(args, dims, *, shape, transpose):
     data, indices, indptr, v = args
     if _matrix_unbatched(dims):
         V = jnp.moveaxis(v, dims[3], 1)  # (n, B)
-        if V.shape[1] < SPMM_MIN_BATCH:
+        if not _prefer_spmm(shape, data.shape[0], V.shape[1], data.dtype, transpose):
             cols = [
                 _csr._csr_matvec(data, indices, indptr, V[:, b], shape=shape, transpose=transpose)
                 for b in range(V.shape[1])
@@ -106,37 +163,28 @@ def _csr_matmat_batch(args, dims, *, shape, transpose):
 
 
 def _spsolve_batch(args, dims, *, tol, reorder):
-    """B square systems -> block-diagonal systems, one ``spsolve`` each (cuSolver QR on GPU, SciPy on CPU).
+    """B square systems, one ``spsolve`` each under ``lax.map`` -- the memory of an unbatched solve.
 
-    Up to :data:`SPSOLVE_BLOCK_NNZ` stored nonzeros go into one block-diagonal system; a larger batch is
-    split into chunks of that size, run by ``lax.map`` (the last chunk padded with copies of a real
-    system, never zeros, so padding cannot make it singular). Measured against a ``lax.map`` of single
-    solves: 1.5-2.0x faster on 2-D operators, 1.07x on a 3-D one. A shared matrix with batched
-    right-hand sides is replicated: the direct solver takes one right-hand side, so each block is
-    factorised separately."""
+    Stacking them into ONE block-diagonal system was measured 1.07-2x faster where it fits, but whether
+    it fits is not knowable here: cuSolver's sparse QR allocates for its fill-in, which depends on the
+    sparsity pattern (a tracer at this point) and on how much device memory JAX leaves outside its own
+    pool, and JAX exposes neither. On one 8 GB card a 3-D 20k-DOF Laplacian ran out of memory at 32
+    stacked copies and a 2-D operator of the same size did not. A default sized to one machine is not a
+    default, so the batch is solved one system at a time. (The machine-independent way to get the
+    speed-up back is cuSolver's own batched QR, ``cusolverSpXcsrqrBufferInfoBatched``, which reports its
+    exact workspace -- not exposed by JAX.)"""
     import jax
     from jax.experimental.sparse import linalg as _splinalg
 
     size = _batch_size(args, dims)
-    data, indices, indptr, b = (_front(a, d, size) for a, d in zip(args, dims))
-    n, nse = b.shape[1], data.shape[1]
-    chunk = max(1, min(size, SPSOLVE_BLOCK_NNZ // max(nse, 1)))
+    shared = [d is _UNBATCHED for d in dims]
+    batched = tuple(_front(a, d, size) if not s_ else None for a, d, s_ in zip(args, dims, shared))
 
-    def solve_block(data, indices, indptr, b):
-        bd, bi, bp, _ = _block_diagonal(data, indices, indptr, (n, n))
-        return _splinalg.spsolve_p.bind(bd, bi, bp, b.reshape(-1), tol=tol, reorder=reorder).reshape(-1, n)
+    def one(xs):
+        vals = [a if s_ else x for a, x, s_ in zip(args, xs, shared)]
+        return _splinalg.spsolve_p.bind(*vals, tol=tol, reorder=reorder)
 
-    if chunk >= size:
-        return solve_block(data, indices, indptr, b), 0
-    n_chunks = -(-size // chunk)
-    pad = n_chunks * chunk - size
-    padded = [
-        jnp.concatenate([a, jnp.broadcast_to(a[:1], (pad,) + a.shape[1:])]) if pad else a
-        for a in (data, indices, indptr, b)
-    ]
-    chunks = [a.reshape((n_chunks, chunk) + a.shape[1:]) for a in padded]
-    out = jax.lax.map(lambda c: solve_block(*c), tuple(chunks))
-    return out.reshape(n_chunks * chunk, n)[:size], 0
+    return jax.lax.map(one, batched), 0
 
 
 def _rules():

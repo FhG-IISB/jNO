@@ -57,11 +57,13 @@ def _uses_cusparse(f, *args):
     return "cusparse" in jax.jit(f).lower(*args).compile().as_text()
 
 
-@pytest.mark.parametrize("B", [5, csr_batching.SPMM_MIN_BATCH + 3])  # SpMV-loop path and SpMM path
+@pytest.mark.parametrize("spmm", [False, True])  # both paths, whatever this machine's measurement picks
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.parametrize("axis", [0, 1])
-def test_vmap_over_the_vector(dtype, transpose, axis, B):
+def test_vmap_over_the_vector(dtype, transpose, axis, spmm, monkeypatch):
+    monkeypatch.setattr(csr_batching, "_prefer_spmm", lambda *a, **k: spmm)
+    B = 6
     S = _pattern()
     d, i, p = _parts(S, dtype)
     A = S.toarray().astype(dtype)
@@ -192,11 +194,8 @@ def _solve(d, i, p, b):
     return spsolve(d, i, p, b, tol=1e-12)
 
 
-@pytest.mark.parametrize("budget", [None, "tiny"])  # one block-diagonal system, and the chunked lax.map path
-def test_spsolve_vmap_over_rhs_values_and_both(budget, monkeypatch):
+def test_spsolve_vmap_over_rhs_values_and_both():
     S, d, i, p = _square()
-    if budget == "tiny":
-        monkeypatch.setattr(csr_batching, "SPSOLVE_BLOCK_NNZ", 2 * S.nnz)  # chunks of 2, a padded last chunk
     rng = np.random.default_rng(0)
     B = rng.standard_normal((5, S.shape[0]))
     D = (1 + 0.1 * rng.standard_normal((5, S.nnz))) * S.data
@@ -211,14 +210,13 @@ def test_spsolve_vmap_over_rhs_values_and_both(budget, monkeypatch):
         np.testing.assert_allclose(np.asarray(got_shared_b[k]), np.linalg.solve(Ak, B[0]), rtol=1e-10, atol=1e-12)
 
 
-def test_spsolve_jacfwd_jacrev_and_value_jacobian(monkeypatch):
+def test_spsolve_jacfwd_jacrev_and_value_jacobian():
     S, d, i, p = _square(n=40)
     b = jnp.asarray(np.random.default_rng(1).standard_normal(S.shape[0]))
     Ainv = np.linalg.inv(S.toarray())
     np.testing.assert_allclose(np.asarray(jax.jacfwd(lambda bb: _solve(d, i, p, bb))(b)), Ainv, rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(np.asarray(jax.jacrev(lambda bb: _solve(d, i, p, bb))(b)), Ainv, rtol=1e-9, atol=1e-12)
-    # w.r.t. the matrix values: nnz tangents -> chunked block-diagonal solves
-    monkeypatch.setattr(csr_batching, "SPSOLVE_BLOCK_NNZ", 7 * S.nnz)
+    # w.r.t. the matrix values: one tangent per nonzero -> nnz solves, one at a time
     J = jax.jacfwd(lambda dd: _solve(dd, i, p, b))(d)
     x = np.linalg.solve(S.toarray(), np.asarray(b))
     row = np.repeat(np.arange(S.shape[0]), np.diff(S.indptr))
@@ -247,3 +245,26 @@ def test_jacrev_through_jnos_sparse_lu_solve_matches_rowwise_jacobian():
     J_row = rowwise_jacobian(f, theta, range(7))
     np.testing.assert_allclose(np.asarray(J_rev), np.asarray(J_row), rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(np.asarray(jax.jacfwd(f)(theta)), np.asarray(J_row), rtol=1e-9, atol=1e-12)
+
+
+def test_spmm_choice_is_measured_per_device_and_cached():
+    csr_batching._SPMM_DECISIONS.clear()
+    first = csr_batching._prefer_spmm((500, 500), 3000, 16, np.float64, False)
+    assert isinstance(first, bool)
+    (key,) = csr_batching._SPMM_DECISIONS
+    dev = jax.devices()[0]
+    assert key[:2] == (dev.platform, dev.device_kind)  # keyed on the machine, not hard-coded
+    csr_batching._SPMM_DECISIONS[key] = not first  # a cached decision is reused, not re-measured
+    assert csr_batching._prefer_spmm((500, 500), 3000, 16, np.float64, False) is (not first)
+
+
+def test_a_failed_measurement_falls_back_to_the_spmv_loop_and_says_so(monkeypatch, capsys):
+    csr_batching._SPMM_DECISIONS.clear()
+
+    def broken(*a, **k):
+        raise RuntimeError("no SpMM here")
+
+    monkeypatch.setattr(csr_batching._csr, "_csr_matmat", broken)
+    assert csr_batching._prefer_spmm((300, 300), 1500, 20, np.float64, False) is False
+    assert "using the SpMV loop" in capsys.readouterr().out
+    csr_batching._SPMM_DECISIONS.clear()
