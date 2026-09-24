@@ -414,7 +414,7 @@ class SemidiscreteTimeBlock:
             return _verdict(G, u, newton_krylov(G, u), report)
 
         from .krylov import gmres as _scaled_gmres
-        from .linear import matrix_diagonal
+        from .linear import matrix_diagonal, sparse_matvec
 
         th = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
         # A parametric mass (``mass_fn``) is re-assembled from ``args`` each step (unknown-density inverse);
@@ -432,8 +432,11 @@ class SemidiscreteTimeBlock:
         # (M + theta dt A) u_next = (M - (1-theta) dt A) u + dt c + dt(theta f_next + (1-theta) f_now)
         f_next = _forcing(t_next)
         f_avg = th * f_next + (1.0 - th) * _forcing(t)
-        rhs = M @ u - (1.0 - th) * dt * (A @ u) + dt * c + dt * f_avg
-        step_op = lambda wn: M @ wn + th * dt * (A @ wn)  # noqa: E731  the theta-method step operator
+        # Index work split once per step, outside the Krylov loop that applies `step_op` (BCOO's own `@`
+        # redoes it on every call; see `sparse_matvec`).
+        mv_M, mv_A = sparse_matvec(M), sparse_matvec(A)
+        rhs = mv_M(u) - (1.0 - th) * dt * mv_A(u) + dt * c + dt * f_avg
+        step_op = lambda wn: mv_M(wn) + th * dt * mv_A(wn)  # noqa: E731  the theta-method step operator
         a_scale = th * dt  # the coefficient of A in the step operator, per row where it differs
         w = _theta_row_weights(M, th, n, dtype)
         if w is not None:
@@ -444,7 +447,7 @@ class SemidiscreteTimeBlock:
             alg = w == 1.0  # θ < 1 here, so weight 1 marks exactly the constraint rows
             rhs = jnp.where(alg, kappa * dt * (c + f_next), rhs)
             if th == 0.0:
-                step_op = lambda wn: M @ wn + dt * (w * (A @ wn))  # noqa: E731
+                step_op = lambda wn: mv_M(wn) + dt * (w * mv_A(wn))  # noqa: E731
                 a_scale = dt * w
         if linear_solve is not None:
             # slot-composed per-step solve; the exact step diagonal keeps jacobi-type specs exact

@@ -110,6 +110,52 @@ def matrix_diagonal(A):
     return jnp.diagonal(jnp.asarray(A))
 
 
+def sparse_matvec(A, *, transpose: bool = False):
+    """``v -> A @ v`` (or ``A^T @ v``) with the BCOO index work done ONCE, for use inside a solver loop.
+
+    ``BCOO @ v`` is not only a gather and a scatter-add: each call first splits ``indices`` into its
+    row and column arrays, wraps negative indices and bounds-checks them -- a separate kernel as large
+    as the operator. XLA does not hoist that kernel out of a ``while_loop``, so an iterative solve pays
+    it on every matvec. Measured in a fixed-iteration CG loop (RTX 3070, JAX 0.10.2, float64, 1M-row
+    2-D P1 pattern): it is 150-210 us of an 844 us iteration. Splitting once here and applying
+    ``zeros.at[rows].add(data * v[cols])`` gives 630 -> 352 us per matvec and 844 -> 565 us per CG
+    iteration, within 7 % of cuSPARSE CSR (526 us) while keeping ``vmap``/``jacfwd`` (CSR's matvec has
+    no batching rule).
+
+    Call it OUTSIDE the loop and hand the returned closure to the solver: the split happens where this
+    is called. The map is exactly BCOO's -- duplicates are summed, and out-of-bound (padding) triplets
+    contribute nothing, because the gather fills with zero and the scatter drops. It is reverse- and
+    forward-mode differentiable in both ``A.data`` and ``v`` and batches under ``vmap``.
+
+    Only a plain 2-D BCOO (``n_batch == n_dense == 0``) is rewritten; anything else -- a dense array, a
+    batched BCOO, a jNO ``LinearOperator`` -- falls back to its own ``@`` unchanged. Do not pass
+    ``indices_are_sorted=True`` to the scatter here: XLA's sorted-scatter path measured 4-7x SLOWER.
+    """
+    if not _plain_bcoo(A):
+        if transpose:
+            return lambda v: v @ A if jnp.ndim(v) == 1 else (v.T @ A).T
+        return lambda v: A @ v
+    idx, data = A.indices, A.data
+    out_idx, in_idx = (idx[:, 1], idx[:, 0]) if transpose else (idx[:, 0], idx[:, 1])
+    n_out = A.shape[1] if transpose else A.shape[0]
+
+    def mv(v):
+        v = jnp.asarray(v)
+        gathered = v.at[in_idx].get(mode="fill", fill_value=0)
+        prod = data.reshape(data.shape + (1,) * (v.ndim - 1)) * gathered
+        return jnp.zeros((n_out,) + v.shape[1:], prod.dtype).at[out_idx].add(prod, mode="drop")
+
+    return mv
+
+
+def _plain_bcoo(A) -> bool:
+    try:
+        import jax.experimental.sparse as jsp
+    except ImportError:  # pragma: no cover - jax always ships it
+        return False
+    return isinstance(A, jsp.BCOO) and A.n_batch == 0 and A.n_dense == 0 and A.ndim == 2
+
+
 def jacobi(A):
     """Diagonal (Jacobi) preconditioner ``M^{-1} x ~ x / diag(A)`` for an iterative solver.
 

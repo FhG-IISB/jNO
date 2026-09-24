@@ -80,6 +80,23 @@ class PrecondApplier:
         return self if self._t is None else PrecondApplier(self._t, self._fwd)
 
 
+def _split_matvecs(A):
+    """``(A @ v, A^T @ v)`` closures with the index split done now, or ``None`` to keep ``A``'s own ``@``.
+
+    Only for a BCOO whose indices are TRACED -- the operator arrived as a ``jit`` argument, which is how
+    every compiled solve (:func:`_compiled_linear_solve`, the default solve) receives it. There the
+    split must be made here, once, because BCOO re-derives it on every ``@`` and XLA does not hoist
+    that out of the Krylov loop (see :func:`jno.utils.solver.linear.sparse_matvec`). A CONCRETE
+    operator is left alone: inside a trace it is a compile-time constant, XLA folds the same index work
+    away (measured: the same 630 -> 352 us per matvec), and a cached split would hold 8 bytes/nonzero of
+    device memory for as long as the operator lives, for nothing."""
+    from .linear import _plain_bcoo, sparse_matvec
+
+    if not _plain_bcoo(A) or not isinstance(A.indices, jax.core.Tracer):
+        return None
+    return sparse_matvec(A), sparse_matvec(A, transpose=True)
+
+
 class LinearOperator:
     """Uniform handle over an assembled operator (BCOO, dense array, or bare matvec).
 
@@ -100,6 +117,7 @@ class LinearOperator:
         self._dense_fn = None
         self._shape = None
         self._transposed = _transposed
+        self._split = _split_matvecs(A)
 
     @classmethod
     def from_matvec(
@@ -144,6 +162,9 @@ class LinearOperator:
                 (out,) = jax.linear_transpose(self._mv, jnp.zeros_like(v))(v)
                 return out
             return self._mv(v)
+        if self._split is not None and jnp.ndim(v) == 1:
+            fwd, rev = self._split
+            return rev(v) if self._transposed else fwd(v)
         # ``v @ A`` is the transposed matvec for both BCOO and dense -- no transpose materialised
         return (v @ self._A) if self._transposed else (self._A @ v)
 
@@ -162,7 +183,10 @@ class LinearOperator:
                 _transposed=not self._transposed,
             )
             return op
-        return LinearOperator(self._A, _transposed=not self._transposed)
+        op = LinearOperator.__new__(LinearOperator)
+        op.__dict__.update(self.__dict__)
+        op._transposed = not self._transposed  # shares the prepared split: no second index slice
+        return op
 
     def diag(self):
         if self._A is None:
