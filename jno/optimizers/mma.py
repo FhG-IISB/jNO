@@ -313,11 +313,10 @@ class MMACallback(_Callback):
             residuals = compiled_fn(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
             return jnp.stack([jnp.mean(r) for r in residuals])
 
-        # `rowwise_jacobian`, NOT `jacrev`: `jacrev` vmaps its pullback across the output rows, and
-        # a differentiable FEM solve bottoms out in `spsolve`, which has no batching rule -- so the
-        # Jacobian of a constraint that depends on `fem.solve()` cannot be taken that way at all.
-        # Only the `jno.le` rows are asked for; the objective's gradient already arrives through
-        # `grads`.
+        # `rowwise_jacobian`, not `jacrev`: `jacrev` vmaps its pullback across the output rows, which
+        # through a `fem.solve()` batches the adjoint `spsolve`s into block-diagonal systems (one
+        # matrix copy per row, all held at once -- see `rowwise_jacobian`). Only the `jno.le` rows are
+        # asked for; the objective's gradient already arrives through `grads`.
         rows = list(self._ineq)
 
         def jac(trainable, context, rng):

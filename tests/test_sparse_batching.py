@@ -177,3 +177,73 @@ def test_block_diagonal_refuses_an_index_overflow_instead_of_wrapping():
     ptr = jnp.zeros((4, 4), jnp.int32)
     with pytest.raises(NotImplementedError, match="overflows int32"):
         csr_batching._block_diagonal(data, idx, ptr, (3, 2**30))
+
+
+# ---------------------------------------------------------------------------------------------- spsolve
+def _square(n=60, seed=0):
+    S = (sp.diags([-1.0, 4.2, -1.3], [-1, 0, 1], (n, n)) + 0.2 * sp.random(n, n, 0.03, random_state=seed)).tocsr()
+    S.sort_indices()
+    return S, jnp.asarray(S.data), jnp.asarray(S.indices.astype(np.int32)), jnp.asarray(S.indptr.astype(np.int32))
+
+
+def _solve(d, i, p, b):
+    from jax.experimental.sparse.linalg import spsolve
+
+    return spsolve(d, i, p, b, tol=1e-12)
+
+
+@pytest.mark.parametrize("budget", [None, "tiny"])  # one block-diagonal system, and the chunked lax.map path
+def test_spsolve_vmap_over_rhs_values_and_both(budget, monkeypatch):
+    S, d, i, p = _square()
+    if budget == "tiny":
+        monkeypatch.setattr(csr_batching, "SPSOLVE_BLOCK_NNZ", 2 * S.nnz)  # chunks of 2, a padded last chunk
+    rng = np.random.default_rng(0)
+    B = rng.standard_normal((5, S.shape[0]))
+    D = (1 + 0.1 * rng.standard_normal((5, S.nnz))) * S.data
+    A = S.toarray()
+    got = jax.vmap(lambda b: _solve(d, i, p, b))(jnp.asarray(B))
+    np.testing.assert_allclose(np.asarray(got), np.linalg.solve(A, B.T).T, rtol=1e-10, atol=1e-12)
+    got = jax.vmap(lambda dd, b: _solve(dd, i, p, b))(jnp.asarray(D), jnp.asarray(B))
+    got_shared_b = jax.vmap(lambda dd: _solve(dd, i, p, jnp.asarray(B[0])))(jnp.asarray(D))
+    for k in range(5):
+        Ak = sp.csr_matrix((D[k], S.indices, S.indptr), shape=S.shape).toarray()
+        np.testing.assert_allclose(np.asarray(got[k]), np.linalg.solve(Ak, B[k]), rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(got_shared_b[k]), np.linalg.solve(Ak, B[0]), rtol=1e-10, atol=1e-12)
+
+
+def test_spsolve_jacfwd_jacrev_and_value_jacobian(monkeypatch):
+    S, d, i, p = _square(n=40)
+    b = jnp.asarray(np.random.default_rng(1).standard_normal(S.shape[0]))
+    Ainv = np.linalg.inv(S.toarray())
+    np.testing.assert_allclose(np.asarray(jax.jacfwd(lambda bb: _solve(d, i, p, bb))(b)), Ainv, rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(jax.jacrev(lambda bb: _solve(d, i, p, bb))(b)), Ainv, rtol=1e-9, atol=1e-12)
+    # w.r.t. the matrix values: nnz tangents -> chunked block-diagonal solves
+    monkeypatch.setattr(csr_batching, "SPSOLVE_BLOCK_NNZ", 7 * S.nnz)
+    J = jax.jacfwd(lambda dd: _solve(dd, i, p, b))(d)
+    x = np.linalg.solve(S.toarray(), np.asarray(b))
+    row = np.repeat(np.arange(S.shape[0]), np.diff(S.indptr))
+    # d x / d a_k = -A^{-1} e_{row_k} x_{col_k}
+    ref = -Ainv[:, row] * x[S.indices][None, :]
+    np.testing.assert_allclose(np.asarray(J), ref, rtol=1e-8, atol=1e-11)
+
+
+def test_jacrev_through_jnos_sparse_lu_solve_matches_rowwise_jacobian():
+    """The path `jno.solve.lu()` takes. `jax.jacrev` used to raise here; it must now agree with jNO's own
+    vmap-free `rowwise_jacobian`."""
+    from jno.utils.ad_mode import rowwise_jacobian
+    from jno.utils.solver.linear import sparse_lu_solve
+
+    S, d, i, p = _square(n=50, seed=3)
+    coo = S.tocoo()
+    idx = jnp.asarray(np.stack([coo.row, coo.col], 1).astype(np.int32))
+    b = jnp.asarray(np.random.default_rng(2).standard_normal(S.shape[0]))
+
+    def f(theta):  # a parametric operator: values scaled by exp(theta), a load scaled by theta
+        A = js.BCOO((jnp.asarray(coo.data) * jnp.exp(theta[0]), idx), shape=S.shape)
+        return sparse_lu_solve(A, b * (1.0 + theta[1]))[:7]
+
+    theta = jnp.asarray([0.1, -0.2])
+    J_rev = jax.jacrev(f)(theta)
+    J_row = rowwise_jacobian(f, theta, range(7))
+    np.testing.assert_allclose(np.asarray(J_rev), np.asarray(J_row), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(jax.jacfwd(f)(theta)), np.asarray(J_row), rtol=1e-9, atol=1e-12)

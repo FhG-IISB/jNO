@@ -1454,16 +1454,16 @@ class TraceEvaluator:
         except NotImplementedError as exc:
             if "atching rule" not in str(exc):
                 raise
-            # Forward mode vmaps P tangents through the target, and a sparse solve has no
-            # batching rule for either `spsolve` or `csr_matvec`. Reverse mode would work but
-            # costs one pass per OUTPUT point, which for a per-point network Jacobian is the
-            # N-way blow-up jacfwd is chosen here to avoid — so refuse rather than silently
-            # trade a crash for an unusable runtime.
+            # Forward mode vmaps P tangents through the target. jNO registers batching rules for
+            # the sparse primitives JAX lacks them for (`csr_matvec`, `csr_matmat`, `spsolve`, see
+            # `jno.utils.solver.sparse_batching`), so this is some OTHER primitive without one.
+            # Reverse mode costs one pass per OUTPUT point -- the N-way blow-up jacfwd is chosen
+            # here to avoid -- so refuse rather than silently trade a crash for an unusable runtime.
             raise NotImplementedError(
-                f"NetworkGradient: the target has {N} output points and contains a sparse "
-                "solve, which has no batching rule — neither forward mode (used here) nor "
-                "jax.jacrev can vmap through it. Reduce the target to a scalar (e.g. "
-                "`expr.mean().grad(net)`), which takes a single reverse pass."
+                f"NetworkGradient: the target has {N} output points and contains an operation "
+                f"with no batching rule ({exc}), so forward mode (used here) cannot vmap through "
+                "it. Reduce the target to a scalar (e.g. `expr.mean().grad(net)`), which takes a "
+                "single reverse pass."
             ) from exc
 
         # Flatten all param leaves into a single (N, D, P) array, then squeeze D=1
