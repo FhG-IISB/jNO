@@ -355,3 +355,59 @@ def test_setup_sets_lu_stack_from_the_argument_and_from_toml(tmp_path, monkeypat
     monkeypatch.setattr(config, "get_config", lambda: {"jno": {"lu_stack": 5}})
     jno.setup(str(script))
     assert csr_batching._LU_STACK == 5
+
+
+# ------------------------------------------------------------- factor once: cuDSS and PARDISO as well
+def _backend(name):
+    from jno.utils.solver import linear
+
+    avail = {"cudss": linear._cudss_available, "pardiso": linear._pardiso_available}[name]
+    if not avail():
+        pytest.skip(f"{name} not installed (jno extra [{name}])")
+    return linear, {"cudss": linear.cudss_lu_solve, "pardiso": linear.pardiso_lu_solve}[name]
+
+
+@pytest.mark.parametrize("name", ["cudss", "pardiso"])
+def test_factor_once_backends_solve_a_vmapped_batch_in_one_call(name, monkeypatch):
+    linear, solve = _backend(name)
+    S, A = _bcoo_square()
+    host_fn = f"_{name}_host_solve"
+    calls = {"n": 0}
+    orig = getattr(linear, host_fn)
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(linear, host_fn, counting)
+    B = jnp.asarray(np.random.default_rng(3).standard_normal((6, S.shape[0])))
+    X = jax.vmap(lambda b: solve(A, b))(B)
+    np.testing.assert_allclose(np.asarray(X), np.linalg.solve(S.toarray(), np.asarray(B).T).T, rtol=1e-9, atol=1e-11)
+    assert calls["n"] == 1, "a vmapped batch against one matrix must reach the backend as ONE block solve"
+
+
+@pytest.mark.parametrize("name", ["cudss", "pardiso"])
+def test_factor_once_backends_jacobians_and_batched_values(name):
+    linear, solve = _backend(name)
+    S, A = _bcoo_square()
+    Ainv = np.linalg.inv(S.toarray())
+    b = jnp.asarray(np.random.default_rng(4).standard_normal(S.shape[0]))
+    np.testing.assert_allclose(np.asarray(jax.jacrev(lambda bb: solve(A, bb))(b)), Ainv, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(jax.jacfwd(lambda bb: solve(A, bb))(b)), Ainv, rtol=1e-8, atol=1e-10)
+    rng = np.random.default_rng(5)
+    D = jnp.asarray(1 + 0.1 * rng.standard_normal((3, S.nnz))) * A.data
+    Bs = jnp.asarray(rng.standard_normal((3, S.shape[0])))
+    X = jax.vmap(lambda d, bb: solve(js.BCOO((d, A.indices), shape=A.shape), bb))(D, Bs)
+    for k in range(3):
+        Ak = sp.coo_matrix((np.asarray(D[k]), (S.row, S.col)), shape=S.shape).toarray()
+        np.testing.assert_allclose(np.asarray(X[k]), np.linalg.solve(Ak, np.asarray(Bs[k])), rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.parametrize("name", ["cudss", "pardiso"])
+def test_a_vmapped_block_right_hand_side(name):
+    linear, solve = _backend(name)
+    S, A = _bcoo_square()
+    Bk = jnp.asarray(np.random.default_rng(6).standard_normal((4, S.shape[0], 3)))  # 4 blocks of 3 columns
+    X = jax.vmap(lambda blk: solve(A, blk))(Bk)
+    ref = np.stack([np.linalg.solve(S.toarray(), np.asarray(Bk[j])) for j in range(4)])
+    np.testing.assert_allclose(np.asarray(X), ref, rtol=1e-9, atol=1e-11)
