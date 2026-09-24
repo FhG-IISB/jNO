@@ -845,6 +845,7 @@ def _cached_march(block, config, march, *inputs):
         treedef,
         tuple((jnp.shape(x), jnp.result_type(x)) for x in leaves),
         _block_fingerprint(block),
+        _trace_time_settings(),
     )
     cache = block.__dict__.setdefault("_march_cache", collections.OrderedDict())
     hit = cache.get(sig)
@@ -865,6 +866,16 @@ def _cached_march(block, config, march, *inputs):
         cache.move_to_end(sig)
     consts, run, out_tree = hit
     return jax.tree_util.tree_unflatten(out_tree, run(consts, leaves))
+
+
+def _trace_time_settings():
+    """The ``jno.setup`` settings a march bakes in when it is TRACED: the sparse-operator storage
+    (``matvec_format``) and how many systems a vmapped device LU stacks (``lu_stack``). Their setters
+    clear JAX's caches, which does not reach this block-level cache -- so they are part of its key, or a
+    changed setting would silently keep the old one for any block that had already marched."""
+    from . import matvec_format, sparse_batching
+
+    return (matvec_format._FORMAT, sparse_batching._LU_STACK)
 
 
 def _block_fingerprint(block):

@@ -121,3 +121,21 @@ def test_traced_inputs_bypass_the_cache_and_still_differentiate():
     assert calls["n"] == 1 and len(block.__dict__["_march_cache"]) == 1
     np.testing.assert_allclose(np.asarray(a), np.asarray(march(s0, grid, {})), rtol=1e-12)
     np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-12)
+
+
+def test_a_changed_jno_setup_setting_is_not_served_from_a_stale_march_cache():
+    """`matvec_format` / `lu_stack` are baked into a march when it is traced; their setters clear JAX's
+    caches but not this block-level one, so they must be part of its key."""
+    from jno.utils.solver import matvec_format
+
+    fem = _heat(steps=4)
+    block = fem.operator
+    try:
+        matvec_format.set_matvec_format("coo")
+        a = np.asarray(fem.solve().fn())
+        matvec_format.set_matvec_format("csr")
+        b = np.asarray(fem.solve().fn())
+        assert len(block.__dict__["_march_cache"]) == 2  # re-traced for the new setting, not reused
+        np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12)
+    finally:
+        matvec_format.set_matvec_format("auto")
