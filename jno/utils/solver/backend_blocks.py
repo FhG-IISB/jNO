@@ -709,21 +709,24 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # step is a linear solve with its own guard and is not judged here.
     _judge = bool(block.is_nonlinear())
 
-    def step(w, t_next):
-        out = block.step(
-            w,
-            t_next - dt,
-            dt,
-            args=args,
-            theta=theta,
-            linear_solve=linear_solve,
-            nonlinear_solve=nonlinear_solve,
-            report=_judge,
-        )
-        if not _judge:
-            return out, out
-        wn, r_end, r_start = out
-        return wn, (wn, r_end, r_start)
+    def march(s0, grid_ts, args):
+        def step(w, t_next):
+            out = block.step(
+                w,
+                t_next - dt,
+                dt,
+                args=args,
+                theta=theta,
+                linear_solve=linear_solve,
+                nonlinear_solve=nonlinear_solve,
+                report=_judge,
+            )
+            if not _judge:
+                return out, out
+            wn, r_end, r_start = out
+            return wn, (wn, r_end, r_start)
+
+        return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
 
     # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
     # residuals (the rhs, the θ-combination, the Krylov solve's saved primals — measured ~32 vectors
@@ -735,7 +738,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # this library targets (an un-checkpointed 6000-step × 18k-DOF case failed to allocate 5.72 GiB
     # on an 8 GB card — see the sampling note below). A pure forward solve pays nothing — checkpoint
     # is the identity outside differentiation.
-    _, ys = jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])
+    ys = _cached_march(block, (linear_solve, nonlinear_solve, theta, dt), march, s0, grid_ts, args)
     if _judge:
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -753,6 +756,81 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+
+_MARCH_CACHE_SIZE = 4  # per block: the configurations re-evaluated in turn (e.g. two solver slots)
+
+
+def _cached_march(block, config, march, *inputs):
+    """Run ``march(*inputs)``, reusing its trace and compiled program across EAGER evaluations.
+
+    Called eagerly (``fem.solve().fn()``), ``jax.lax.scan`` traces its body into a fresh jaxpr on every
+    call, so JAX's dispatch cache never hits and each evaluation re-traces ``block.step``, re-lowers the
+    march and re-fetches the executable. Measured on a 19k-DOF, 19-step P1 heat march (RTX 3070): ~160 ms
+    tracing + ~120 ms lowering + ~60 ms cache fetch against ~115 ms of GPU work -- the same cost for a
+    brand-new node and for re-evaluating the same one.
+
+    Here the march is traced ONCE per (block, configuration, input shapes) with ``make_jaxpr`` and run
+    through a ``jax.jit`` of ``eval_jaxpr`` that takes the jaxpr's constants as ARGUMENTS. Jitting the
+    closure directly would bake the operators and mesh arrays into the executable as constants; as
+    arguments they stay the block's own device buffers.
+
+    Only the eager path is cached. Under an outer trace (``jno.core``, ``jax.grad``, ``vmap``) an input
+    is a tracer and the march runs inline exactly as before -- the enclosing ``jit`` owns caching there.
+    The cache lives on the block and is keyed on the identity of the block's public fields, so
+    reassigning any of them (jNO does, e.g. for contact and coupled residuals) re-traces rather than
+    reusing stale constants. At most ``_MARCH_CACHE_SIZE`` configurations are kept per block.
+    """
+    import collections
+
+    import jax
+    import jax.numpy as jnp
+
+    leaves, treedef = jax.tree_util.tree_flatten(inputs)
+    if any(isinstance(x, jax.core.Tracer) for x in leaves):
+        return march(*inputs)
+    sig = (
+        config,
+        treedef,
+        tuple((jnp.shape(x), jnp.result_type(x)) for x in leaves),
+        _block_fingerprint(block),
+    )
+    cache = block.__dict__.setdefault("_march_cache", collections.OrderedDict())
+    hit = cache.get(sig)
+    if hit is None:
+        closed, out_shape = jax.make_jaxpr(march, return_shape=True)(*inputs)
+        if any(isinstance(c, jax.core.Tracer) for c in closed.consts):  # the block itself holds tracers
+            return march(*inputs)
+        jaxpr = closed.jaxpr
+        hit = (
+            closed.consts,
+            jax.jit(lambda consts, flat: jax.core.eval_jaxpr(jaxpr, consts, *flat)),
+            jax.tree_util.tree_structure(out_shape),
+        )
+        cache[sig] = hit
+        while len(cache) > _MARCH_CACHE_SIZE:
+            cache.popitem(last=False)
+    else:
+        cache.move_to_end(sig)
+    consts, run, out_tree = hit
+    return jax.tree_util.tree_unflatten(out_tree, run(consts, leaves))
+
+
+def _block_fingerprint(block):
+    """Identity of every public field (dict fields one level deep). Private attributes are excluded:
+    the evaluation bookkeeping (``_n_evaluations``, ``_last_evaluation``) changes on every call."""
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(block)} if dataclasses.is_dataclass(block) else set()
+    out = []
+    for k, v in sorted(vars(block).items()):
+        if k.startswith("_") and k not in fields:
+            continue
+        if isinstance(v, dict):
+            out.append((k, tuple(sorted((str(kk), id(vv)) for kk, vv in v.items()))))
+        else:
+            out.append((k, id(v)))
+    return tuple(out)
 
 
 def _resample_trajectory(traj, grid_ts, save_ts, dtype):
