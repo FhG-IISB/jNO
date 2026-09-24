@@ -687,6 +687,9 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     import jax
     import jax.numpy as jnp
 
+    from .matvec_format import prime
+
+    prime(block.M, getattr(block, "A", None))  # CSR or COO, measured on the real (concrete) operators
     _s0f = getattr(block, "state0_fn", None)  # parametric initial state (net-valued IC): re-form from args
     s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
     dtype = s0.dtype

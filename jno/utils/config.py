@@ -332,6 +332,7 @@ def setup(
     hessian_type: str | None = None,
     compile_cache: bool | str | None = None,
     lu_stack: int | None = None,
+    matvec_format: str | None = None,
 ) -> str:
     """Initialise logging and return the run directory for *script_file*.
 
@@ -409,6 +410,15 @@ def setup(
 
             Batching against ONE matrix is better served by ``jno.solve.lu(backend="host")``, which
             factors once for the whole batch; cuSolver factors every system.
+        matvec_format: The storage jNO's iterative solvers apply a sparse operator with.
+
+            * ``None`` (default) — read ``[jno] matvec_format`` from the TOML config; ``"auto"`` if absent.
+            * ``"auto"`` — per operator, whichever of cuSPARSE CSR and split COO MEASURES faster on this
+              device (timed once, on the real operator where possible, logged, cached). Neither wins
+              everywhere: CSR was 1.45x faster on a 27-nonzeros-per-row stencil and 1.25x slower on a
+              small 3-D Laplacian on the same card.
+            * ``"csr"`` / ``"coo"`` — force one, e.g. for reproducible timings or to rule the choice out
+              while debugging. Both are exact, differentiable and vmappable.
 
     Returns:
         The path of the run directory (created if absent).
@@ -464,6 +474,11 @@ def setup(
     from .solver.sparse_batching import set_lu_stack
 
     set_lu_stack(int(get_config().get("jno", {}).get("lu_stack", 1)) if lu_stack is None else lu_stack)
+
+    # --- Sparse operator storage in iterative solves (explicit kwarg wins over TOML; default "auto") ---
+    from .solver.matvec_format import set_matvec_format
+
+    set_matvec_format(get_config().get("jno", {}).get("matvec_format", "auto") if matvec_format is None else matvec_format)
 
     # --- Optional Weights & Biases ---
     _init_wandb(wandb, stem, str(dire))

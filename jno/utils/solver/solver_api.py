@@ -946,6 +946,9 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
         """
         if isinstance(A, LinearOperator):
             return composed(A, b)
+        from .matvec_format import prime
+
+        prime(A)  # CSR or COO, measured on THIS operator before the compiled solve traces it
         op = LinearOperator(A)
         if devices and _shardable(op, linear, precond):
             return composed(A, b)

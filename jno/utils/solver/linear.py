@@ -113,6 +113,10 @@ def matrix_diagonal(A):
 def sparse_matvec(A, *, transpose: bool = False):
     """``v -> A @ v`` (or ``A^T @ v``) with the BCOO index work done ONCE, for use inside a solver loop.
 
+    The storage it applies is chosen per operator by :mod:`jno.utils.solver.matvec_format`: cuSPARSE
+    CSR or the split COO below, whichever MEASURES faster on this device for this operator (override:
+    ``jno.setup(matvec_format=...)``). The COO side:
+
     ``BCOO @ v`` is not only a gather and a scatter-add: each call first splits ``indices`` into its
     row and column arrays, wraps negative indices and bounds-checks them -- a separate kernel as large
     as the operator. XLA does not hoist that kernel out of a ``while_loop``, so an iterative solve pays
@@ -135,6 +139,15 @@ def sparse_matvec(A, *, transpose: bool = False):
         if transpose:
             return lambda v: v @ A if jnp.ndim(v) == 1 else (v.T @ A).T
         return lambda v: A @ v
+    from . import matvec_format
+
+    if matvec_format.choose(A) == "csr":
+        return matvec_format.csr_matvec(matvec_format.csr_parts(A), tuple(A.shape), transpose)
+    return _split_coo_matvec(A, transpose)
+
+
+def _split_coo_matvec(A, transpose: bool = False):
+    """The COO side of :func:`sparse_matvec`: row/column split once, gather + scatter-add per product."""
     idx, data = A.indices, A.data
     out_idx, in_idx = (idx[:, 1], idx[:, 0]) if transpose else (idx[:, 0], idx[:, 1])
     n_out = A.shape[1] if transpose else A.shape[0]

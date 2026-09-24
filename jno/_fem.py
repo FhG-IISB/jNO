@@ -184,6 +184,9 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
     # both convergence checks -- is one compiled program. Measured faster than the split shape it
     # replaces (1.90 ms against 2.73 ms at n=1441), because the eager check's own matvec and host
     # sync go away.
+    from .utils.solver import matvec_format
+
+    matvec_format.prime(A)  # CSR or COO, measured on THIS operator before it becomes a tracer
     return _firewalled_bicgstab(A, b, float(tol), int(maxiter))
 
 
@@ -209,7 +212,7 @@ def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
 
     who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
     AT = A.T
-    mv, mvT = sparse_matvec(A), sparse_matvec(AT)
+    mv, mvT = sparse_matvec(A), sparse_matvec(A, transpose=True)  # no re-conversion of A.T
     fwd = lambda _mv, rhs: residual_gate(mv, rhs, _bicgstab_jacobi(A, rhs, tol, maxiter), who, side="forward")
     rev = lambda _mv, rhs: residual_gate(mvT, rhs, _bicgstab_jacobi(AT, rhs, tol, maxiter), who, side="transpose")
     return jax.lax.custom_linear_solve(mv, b, fwd, transpose_solve=rev)
