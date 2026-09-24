@@ -203,9 +203,13 @@ class _BDF2Scheme(_TimeScheme):
         # its residual norms and they are judged below -- as in the theta march and the load path.
         _judge = bool(block.is_nonlinear())
 
+        from .backend_blocks import hoist_time_invariant
+
+        blk = hoist_time_invariant(block, args, float(grid_ts[0]))  # static loads/operators: once per march
+
         def _advance(u_prev, t_land, h):
             """One implicit step landing at ``t_land`` from ``u_prev`` over an effective step ``h``."""
-            return block.step(
+            return blk.step(
                 u_prev,
                 t_land - h,
                 h,

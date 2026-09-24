@@ -710,8 +710,10 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     _judge = bool(block.is_nonlinear())
 
     def march(s0, grid_ts, args):
+        blk = hoist_time_invariant(block, args, grid_ts[0])  # static loads/operators: once, not per step
+
         def step(w, t_next):
-            out = block.step(
+            out = blk.step(
                 w,
                 t_next - dt,
                 dt,
@@ -756,6 +758,55 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+
+_PER_STEP_CALLABLES = ("forcing_vector_fn", "operator_fn", "mass_fn", "mass")
+
+
+def hoist_time_invariant(block, args, t0):
+    """``block`` with every per-step ``f(t, args)`` that does not depend on ``t`` evaluated ONCE.
+
+    The step re-evaluates ``forcing_vector_fn``, ``operator_fn`` and ``mass_fn`` (linear route) or
+    ``mass`` (nonlinear route) at every step -- the forcing twice, at ``t`` and ``t + dt``. The assembled
+    forcing is ``-R(0, t)``: the WHOLE spatial residual re-assembled at zero state, element loop and
+    Jacobian inverses included, whether or not the problem has a source. Measured on a 69k-DOF P1 heat
+    march with no source: removing it took the march 511 -> 235 ms. In a parametric/inverse march
+    ``operator_fn(t, args)`` re-assembles the operator every step for the same reason.
+
+    Independence is decided EXACTLY, not guessed: each callable is traced at ``(t, args)`` and
+    dead-code-eliminated; ``t`` is independent only when no surviving equation reads it (assembly threads
+    ``t`` through the quadrature points even when no term uses it, so "t appears" would never hoist).
+    A hoisted value is computed from the march's own ``args``, so gradients with respect to them flow
+    through it unchanged. Anything that does depend on ``t`` (a time-dependent source or Dirichlet
+    value) -- or whose independence cannot be proven -- keeps its per-step evaluation.
+
+    Call it inside the march, before the time loop. Returns ``block`` itself when nothing hoists.
+    """
+    import dataclasses
+
+    changes = {}
+    for name in _PER_STEP_CALLABLES:
+        fn = getattr(block, name, None)
+        if not callable(fn) or not _independent_of_t(fn, t0, args):
+            continue
+        value = fn(t0, args)
+        changes[name] = lambda t, a=None, _v=value: _v
+    if not changes or not dataclasses.is_dataclass(block):
+        return block
+    return dataclasses.replace(block, **changes)
+
+
+def _independent_of_t(fn, t0, args) -> bool:
+    import jax
+
+    try:
+        closed = jax.make_jaxpr(lambda t: fn(t, args))(t0)
+        from jax._src.interpreters import partial_eval as pe
+
+        _, used = pe.dce_jaxpr(closed.jaxpr, [True] * len(closed.jaxpr.outvars))
+        return not used[0]
+    except Exception:  # noqa: BLE001 -- cannot prove independence: keep the per-step evaluation
+        return False
 
 
 _MARCH_CACHE_SIZE = 4  # per block: the configurations re-evaluated in turn (e.g. two solver slots)
