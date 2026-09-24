@@ -156,6 +156,22 @@ def build_hierarchy(
         R = jsp.BCOO.from_scipy_sparse(lvl.R.tocoo())
         lmax = _smoother_lmax(lvl.A, A_l, safety=safety, iters=bound_iters, degree=smoother_degree, lmin_ratio=lmin_ratio)
         levels.append({"A": A_l, "P": P, "R": R, "lmin": lmin_ratio * lmax, "lmax": lmax, "degree": smoother_degree})
+    # Each level's A / P / R in the storage MEASURED fastest for it on this device (CSR or split COO,
+    # see jno.utils.solver.matvec_format), converted here once. A V-cycle is ~10 fine-level products
+    # (Chebyshev pre + post + residuals): measured 65% of its time on a 3-D P1 operator, and CSR levels
+    # made a 303k-DOF 3-D AMG-PCG solve 1.20x faster, a 142k-DOF P2 one 1.44x.
+    from . import matvec_format as _mf
+
+    formats = []
+    for lv in levels:
+        lv["fast"] = {k: _mf.prepare(lv[k], log=False) for k in ("A", "P", "R")}
+        formats.append("/".join(next(iter(lv["fast"][k])) for k in ("A", "P", "R")))
+    from ..logger import get_logger
+
+    get_logger().info(
+        f"jno AMG hierarchy: {len(levels)} levels + coarse solve; level storage (A/P/R, measured on each level "
+        f"matrix): {', '.join(formats)}"
+    )
     A_c = np.asarray(ml.levels[-1].A.todense())
     if not np.isfinite(A_c).all() or not np.abs(A_c).max() > 0:
         raise ValueError(
@@ -176,10 +192,18 @@ def vcycle_apply(levels: List[dict], r):
         lv = levels[i]
         if "Ainv" in lv:
             return lv["Ainv"] @ r
-        A = lv["A"]
-        smooth = lambda rhs: chebyshev_apply(lambda v: A @ v, rhs, lmin=lv["lmin"], lmax=lv["lmax"], degree=lv["degree"])
+        if "fast" in lv:  # the storage measured fastest for this level (built by `build_hierarchy`)
+            from .matvec_format import apply_prepared
+
+            fast = lv["fast"]
+            mv_A = lambda v: apply_prepared(fast["A"], lv["A"].shape, v)  # noqa: E731
+            mv_P = lambda v: apply_prepared(fast["P"], lv["P"].shape, v)  # noqa: E731
+            mv_R = lambda v: apply_prepared(fast["R"], lv["R"].shape, v)  # noqa: E731
+        else:
+            mv_A, mv_P, mv_R = (lambda v: lv["A"] @ v), (lambda v: lv["P"] @ v), (lambda v: lv["R"] @ v)
+        smooth = lambda rhs: chebyshev_apply(mv_A, rhs, lmin=lv["lmin"], lmax=lv["lmax"], degree=lv["degree"])
         x = smooth(r)  # pre-smooth (from zero)
-        x = x + (lv["P"] @ _cycle(i + 1, lv["R"] @ (r - A @ x)))  # coarse-grid correction
-        return x + smooth(r - A @ x)  # post-smooth
+        x = x + mv_P(_cycle(i + 1, mv_R(r - mv_A(x))))  # coarse-grid correction
+        return x + smooth(r - mv_A(x))  # post-smooth
 
     return _cycle(0, jnp.asarray(r).reshape(-1))

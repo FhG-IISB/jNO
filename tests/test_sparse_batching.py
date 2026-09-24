@@ -258,7 +258,13 @@ def test_spmm_choice_is_measured_per_device_and_cached():
     assert csr_batching._prefer_spmm((500, 500), 3000, 16, np.float64, False) is (not first)
 
 
-def test_a_failed_measurement_falls_back_to_the_spmv_loop_and_says_so(monkeypatch, capsys):
+def test_a_failed_measurement_falls_back_to_the_spmv_loop_and_says_so(monkeypatch):
+    from jno.utils import logger as _logger
+
+    got = []  # a spy, not stdout capture: `jno.setup` elsewhere re-binds the logger past pytest's capture
+    monkeypatch.setattr(
+        _logger, "get_logger", lambda *a, **k: type("Spy", (), {"warning": lambda self, m: got.append(m)})()
+    )
     csr_batching._SPMM_DECISIONS.clear()
 
     def broken(*a, **k):
@@ -266,7 +272,7 @@ def test_a_failed_measurement_falls_back_to_the_spmv_loop_and_says_so(monkeypatc
 
     monkeypatch.setattr(csr_batching._csr, "_csr_matmat", broken)
     assert csr_batching._prefer_spmm((300, 300), 1500, 20, np.float64, False) is False
-    assert "using the SpMV loop" in capsys.readouterr().out
+    assert any("using the SpMV loop" in m for m in got)
     csr_batching._SPMM_DECISIONS.clear()
 
 

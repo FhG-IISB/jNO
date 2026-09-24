@@ -30,6 +30,24 @@ def _x64_and_restore():
         jax.config.update("jax_enable_x64", prev)
 
 
+@pytest.fixture
+def logs(monkeypatch):
+    """Messages sent to jNO's logger. Patched rather than captured from stdout: `jno.setup` (another
+    test) re-binds the logger to a file logger whose console handler bypasses pytest's capture."""
+    from jno.utils import logger as _logger
+
+    got = []
+
+    class _Spy:
+        def info(self, m):
+            got.append(m)
+
+        warning = info
+
+    monkeypatch.setattr(_logger, "get_logger", lambda *a, **k: _Spy())
+    return got
+
+
 def _ops(n=60, seed=0):
     """The operator shapes jNO produces: compressed (sorted, unique), uncompressed (unsorted duplicates),
     and padded (out-of-bound triplets from sum_duplicates)."""
@@ -92,31 +110,28 @@ def test_both_formats_differentiate_and_vmap_like_bcoo(fmt):
     )
 
 
-def test_auto_measures_once_per_operator_key_on_the_real_operator_when_concrete(capsys):
+def test_auto_measures_once_per_operator_key_on_the_real_operator_when_concrete(logs):
     mf._DECISIONS.clear()
     _, ops = _ops(n=200)
     B = ops["compressed"]
-    capsys.readouterr()
     fmt = mf.choose(B)
     assert fmt in ("csr", "coo")
-    out = capsys.readouterr().out
-    assert "measured on the operator" in out and "->" in out
-    assert mf.choose(B) == fmt and "per product" not in capsys.readouterr().out  # cached: no second timing
+    assert len(logs) == 1 and "measured on the operator" in logs[0] and "->" in logs[0]
+    assert mf.choose(B) == fmt and len(logs) == 1  # cached: no second timing
     (key,) = mf._DECISIONS
     dev = jax.devices()[0]
     assert key[:2] == (dev.platform, dev.device_kind)
 
 
-def test_a_traced_operator_is_decided_on_a_banded_stand_in(capsys):
+def test_a_traced_operator_is_decided_on_a_banded_stand_in(logs):
     mf._DECISIONS.clear()
     _, ops = _ops(n=150, seed=3)
     B = ops["compressed"]
-    capsys.readouterr()
     jax.jit(lambda B, x: sparse_matvec(B)(x))(B, jnp.ones(B.shape[1]))
-    assert "banded stand-in" in capsys.readouterr().out
+    assert any("banded stand-in" in m for m in logs)
 
 
-def test_prime_decides_concrete_operators_and_ignores_the_rest(capsys):
+def test_prime_decides_concrete_operators_and_ignores_the_rest(logs):
     mf._DECISIONS.clear()
     _, ops = _ops(n=120, seed=4)
     mf.prime(ops["compressed"], None, jnp.eye(3))
@@ -165,15 +180,38 @@ def test_fem_solve_gives_the_same_answer_with_either_format():
         mf.set_matvec_format(fmt)
         fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(cb[0], cb[1]) - 0.0])
         sols[fmt] = np.asarray(jax.tree_util.tree_leaves(fem.solve())[0])
-    np.testing.assert_allclose(sols["csr"], sols["coo"], rtol=1e-8, atol=1e-12)
+    # two iterative solves converged to a 1e-8 relative residual: they agree to that order, not bitwise
+    np.testing.assert_allclose(sols["csr"], sols["coo"], rtol=1e-6, atol=1e-10)
     assert np.abs(sols["coo"]).max() > 1e-3
 
 
-def test_auto_measures_rectangular_operators_too(capsys):
+def test_auto_measures_rectangular_operators_too(logs):
     """AMG prolongation / restriction operators are rectangular; the timing must not assume square."""
     mf._DECISIONS.clear()
     P = jsp.BCOO.from_scipy_sparse(sp.random(300, 40, density=0.05, random_state=7, format="coo"))
-    capsys.readouterr()
     assert mf.choose(P) in ("csr", "coo") and mf.choose(P.T) in ("csr", "coo")
-    out = capsys.readouterr().out
-    assert "could not time" not in out and out.count("per product") == 2
+    assert not any("could not time" in m for m in logs) and sum("per product" in m for m in logs) == 2
+
+
+@pytest.mark.parametrize("fmt", ["coo", "csr"])
+def test_amg_levels_in_the_measured_storage_are_the_same_v_cycle(fmt):
+    """`build_hierarchy` stores each level's A/P/R in the chosen storage; the V-cycle must be the same
+    linear map as the plain-BCOO one, and the levels a pytree of arrays."""
+    from jno.utils.solver.amg import build_hierarchy, vcycle_apply
+
+    mf.set_matvec_format(fmt)
+    m = 30
+    T = sp.diags([-1.0, 2.0, -1.0], [-1, 0, 1], (m, m))
+    K = (sp.kron(T, sp.eye(m)) + sp.kron(sp.eye(m), T)).tocoo()  # 2-D Laplacian, 900 dofs
+    levels = build_hierarchy(jsp.BCOO.from_scipy_sparse(K), coarse_size=20)
+    assert all("fast" in lv and next(iter(lv["fast"]["A"])) == fmt for lv in levels if "A" in lv)
+    plain = [{k: v for k, v in lv.items() if k != "fast"} for lv in levels]
+    r = jnp.asarray(np.random.default_rng(8).standard_normal(K.shape[0]))
+    np.testing.assert_allclose(
+        np.asarray(jax.jit(lambda r: vcycle_apply(levels, r))(r)),
+        np.asarray(vcycle_apply(plain, r)),
+        rtol=1e-12,
+        atol=1e-13,
+    )
+    leaves = jax.tree_util.tree_leaves(levels)
+    assert all(hasattr(x, "shape") or isinstance(x, (int, float)) for x in leaves)

@@ -121,7 +121,7 @@ def _time_products(mv, v):
     return best / _PRODUCTS_PER_TIMING
 
 
-def choose(A) -> str:
+def choose(A, *, log: bool = True) -> str:
     """``"csr"`` or ``"coo"`` for the 2-D BCOO ``A`` -- the override, else the measured faster one."""
     if _FORMAT != "auto":
         return _FORMAT
@@ -139,12 +139,13 @@ def choose(A) -> str:
             t_coo = _time_products(_split_coo_matvec(B, False), v)
             t_csr = _time_products(csr_matvec(csr_parts(B), B.shape), v)
         fmt = "csr" if t_csr < t_coo else "coo"
-        get_logger().info(
-            f"jNO sparse operator {B.shape[0]:,}x{B.shape[1]:,} ({int(A.nse):,} nnz, {key[4]}) on {key[1]}: "
-            f"CSR {1e6 * t_csr:.1f} us vs COO {1e6 * t_coo:.1f} us per product "
-            f"({'measured on the operator' if real else 'measured on a banded stand-in of its size'}) -> "
-            f"{fmt.upper()}. Override with jno.setup(matvec_format=...)."
-        )
+        if log:
+            get_logger().info(
+                f"jNO sparse operator {B.shape[0]:,}x{B.shape[1]:,} ({int(A.nse):,} nnz, {key[4]}) on {key[1]}: "
+                f"CSR {1e6 * t_csr:.1f} us vs COO {1e6 * t_coo:.1f} us per product "
+                f"({'measured on the operator' if real else 'measured on a banded stand-in of its size'}) -> "
+                f"{fmt.upper()}. Override with jno.setup(matvec_format=...)."
+            )
     except Exception as exc:  # noqa: BLE001 -- a failed measurement must not break the solve
         fmt = "coo"
         get_logger().warning(
@@ -167,3 +168,26 @@ def prime(*operators) -> None:
     for A in operators:
         if _plain_bcoo(A) and _is_concrete(A):
             choose(A)
+
+
+def prepare(A, *, log: bool = True) -> dict:
+    """EAGER: the measured format for the concrete BCOO ``A`` and its arrays, as a pytree of arrays --
+    ``{"csr": (data, indices, indptr)}`` or ``{"coo": (data, rows, cols)}``.
+
+    For operators that are frozen once and applied many times from inside a trace (the AMG hierarchy):
+    the conversion happens here, once, instead of being staged into every compiled program."""
+    fmt = choose(A, log=log)
+    with jax.ensure_compile_time_eval():
+        if fmt == "csr":
+            return {"csr": csr_parts(A)}
+        return {"coo": (A.data, A.indices[:, 0], A.indices[:, 1])}
+
+
+def apply_prepared(prep: dict, shape, v):
+    """``A @ v`` from :func:`prepare`'s arrays (``shape`` is ``A``'s)."""
+    if "csr" in prep:
+        return csr_matvec(prep["csr"], tuple(shape))(v)
+    d, r, c = prep["coo"]
+    v = jnp.asarray(v)
+    prod = d.reshape(d.shape + (1,) * (v.ndim - 1)) * v.at[c].get(mode="fill", fill_value=0)
+    return jnp.zeros((shape[0],) + v.shape[1:], prod.dtype).at[r].add(prod, mode="drop")
