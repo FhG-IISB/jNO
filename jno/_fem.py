@@ -4691,6 +4691,37 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
     return out
 
 
+def _refuse_trainable_slip_vertices(domain: Any, slip_points: Any, regions: List[str]) -> None:
+    """Raise if a runtime (``.trainable()``) mesh coordinate lies on a slip region.
+
+    The slip elimination bakes each node's normal ``N_i = ∫ φ_i n ds`` into the prolongation ``P`` from the
+    BUILD-time points; nothing recomputes it when the coordinates arrive at solve time. Moving a vertex of
+    the slip surface changes those normals (facet areas and angles), so the solve would enforce the old
+    surface's ``n·u = 0`` on the new mesh -- a converged, plausible, wrong answer. Measured on a 3-D
+    rolling model whose side widened by 1 mm: 3e-4 relative, with the residual of the moved build
+    identical to a fresh build's to 3e-17 (only the constraint was stale). Trainable vertices OFF the
+    slip region are fine: a region's normals depend only on its own facets."""
+    tc = getattr(domain, "_trainable_coords", None) or []
+    if not tc:
+        return
+    pts = np.asarray(domain.mesh.points, dtype=float)
+    dim = int(np.asarray(slip_points).shape[1])
+    scale = max(float(np.ptp(pts[:, :dim])), 1e-300)
+    key = lambda a: {tuple(r) for r in np.round(np.asarray(a, dtype=float)[:, :dim] / scale, 10)}  # noqa: E731
+    on_slip = key(slip_points)
+    for entry in tc:
+        hit = key(pts[np.asarray(entry["ids"], dtype=int)]) & on_slip
+        if hit:
+            raise NotImplementedError(
+                f"jno.fem: {len(hit)} vertex/vertices of the slip region {'+'.join(regions)!r} carry a trainable "
+                f"(runtime) coordinate from `.trainable()` on region {entry.get('tag')!r} (axis {entry['axis']}). "
+                "The slip normals are computed once, from the build-time mesh, so moving those vertices at "
+                "solve time would impose the OLD surface's n·u = 0 on the new one -- silently wrong. Either "
+                "leave the slip surface's vertices out of the trainable region (a region whose normals do not "
+                "depend on the moved coordinates), or rebuild jno.fem on the moved mesh."
+            )
+
+
 def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells: Any, ele_order: int) -> dict:
     """Exact elimination of the slip conditions ``n·u = 0`` -> a prolongation in the periodic format.
 
@@ -4771,6 +4802,7 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
             for node, nrm in got.items():
                 merged.setdefault(int(node), []).append(np.asarray(nrm, dtype=float)[:vec_i])
         nodes = sorted(merged)
+        _refuse_trainable_slip_vertices(domain, np.asarray(pts_i)[nodes], by_field[i])
         node_dofs = np.asarray([[n * vec_i + c for c in range(vec_i)] for n in nodes], dtype=np.int64)
         coeff_blocks = [np.stack(merged[n], axis=0) for n in nodes]
         pro = build_slip_prolongation(n_i, node_dofs, coeff_blocks)
