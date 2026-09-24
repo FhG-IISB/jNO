@@ -167,3 +167,13 @@ def test_fem_solve_gives_the_same_answer_with_either_format():
         sols[fmt] = np.asarray(jax.tree_util.tree_leaves(fem.solve())[0])
     np.testing.assert_allclose(sols["csr"], sols["coo"], rtol=1e-8, atol=1e-12)
     assert np.abs(sols["coo"]).max() > 1e-3
+
+
+def test_auto_measures_rectangular_operators_too(capsys):
+    """AMG prolongation / restriction operators are rectangular; the timing must not assume square."""
+    mf._DECISIONS.clear()
+    P = jsp.BCOO.from_scipy_sparse(sp.random(300, 40, density=0.05, random_state=7, format="coo"))
+    capsys.readouterr()
+    assert mf.choose(P) in ("csr", "coo") and mf.choose(P.T) in ("csr", "coo")
+    out = capsys.readouterr().out
+    assert "could not time" not in out and out.count("per product") == 2

@@ -104,8 +104,12 @@ def _banded_standin(A):
 
 
 def _time_products(mv, v):
+    # The carry is the INPUT vector, made to depend on each product through a scalar: that works for a
+    # rectangular operator (an AMG prolongation/restriction -- feeding the output back only fits a square
+    # one) and still stops XLA from hoisting a loop-invariant product out of the loop. The extra
+    # reduction is the same for both formats.
     def body(_, x):
-        return mv(x) * jnp.asarray(0.1, x.dtype)
+        return x + jnp.asarray(1e-30, x.dtype) * jnp.sum(mv(x))
 
     f = jax.jit(lambda x: jax.lax.fori_loop(0, _PRODUCTS_PER_TIMING, body, x))
     jax.block_until_ready(f(v))
