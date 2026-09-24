@@ -1599,6 +1599,20 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
         x0 = jnp.asarray(x0).reshape(-1)
         if jnp.iscomplexobj(x0):  # complex seed enters the real-equivalent layout
             x0 = jnp.concatenate([jnp.real(x0), jnp.imag(x0)])
+        if periodic is not None and mode == "nonlinear":
+            # The march iterates in the REDUCED space; `x0` is a full state like every other `fem.solve`
+            # warm start (and like what this driver returns), so restrict it -- the same gather the plain
+            # reduced solve applies. It used to be taken as-is and failed inside the first residual with
+            # a bare shape mismatch.
+            from .fem_utils import restrict_state_periodic
+
+            n_full = int(op.size)
+            if x0.shape[0] != n_full:
+                raise ValueError(
+                    f"fem.solve(continuation=..., x0=...): x0 has {x0.shape[0]} entries, but this problem's "
+                    f"state has {n_full} (a full state, as fem.solve returns it)."
+                )
+            x0 = jnp.asarray(restrict_state_periodic(periodic, x0)).reshape(-1)
         prev = x0
 
     outs = []
