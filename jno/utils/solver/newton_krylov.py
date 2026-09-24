@@ -37,7 +37,7 @@ _EPS = 1e-300
 LAST_NEWTON_STATS: dict = {}
 
 
-def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None):
+def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, factorizations=None):
     """Raise (eagerly) if the Newton loop returned on its STEP CAP rather than on the tolerance.
 
     Both drivers below iterate a ``jax.lax.while_loop`` whose condition is
@@ -63,6 +63,8 @@ def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None):
         steps=None if steps is None or isinstance(steps, jax.core.Tracer) else int(steps),
         converged=bool(math.isfinite(rn) and rn <= bound),
     )
+    if factorizations is not None and not isinstance(factorizations, jax.core.Tracer):
+        LAST_NEWTON_STATS["factorizations"] = int(factorizations)
     if not math.isfinite(rn) or rn > bound:
         raise RuntimeError(
             f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
@@ -391,6 +393,7 @@ def newton_direct(
     ls_max=25,
     ls_c=1e-4,
     linear_solve=None,
+    reuse=False,
 ):
     """Root-find ``residual_fn(u) = 0`` with a **sparse-direct** Newton: each step solves against the
     ASSEMBLED Jacobian ``jacobian_fn(u)`` (a ``jax.experimental.sparse.BCOO``) instead of the
@@ -416,7 +419,34 @@ def newton_direct(
     solves ``Jᵀ`` directly too, not with a stalling Krylov). That transpose is the one requirement on a
     supplied ``linear_solve``: it is called on ``Jᵀ`` as well as ``J``. ``jacobian_fn(u)`` must return the
     assembled Jacobian of ``residual_fn`` at ``u``. ``damping`` / ``line_search`` as in
-    :func:`newton_krylov`."""
+    :func:`newton_krylov`.
+
+    ``reuse=True`` is **lagged-Jacobian Newton**: keep the last tangent and step against it again
+    until it stops paying, instead of assembling and factorizing a new one every step. The rule is
+    adaptive, with no knob -- after a step taken on a REUSED tangent, the contraction
+    ``theta = ||r_new|| / ||r_old||`` decides:
+
+        theta < 1/2        keep the tangent (it still contracts well)
+        1/2 <= theta < 1   accept the step, refresh the tangent for the next one
+        theta >= 1 or NaN  REJECT the step (the iterate does not move) and refresh
+
+    so a stale tangent can cost at most one wasted solve, never a divergence the fresh Newton would
+    not have made. A step on a FRESH tangent is always accepted, exactly as with ``reuse=False``, and
+    the next step tries reusing it. Chord/Shamanskii Newton with this kind of contraction test is
+    classical (Kelley, *Solving Nonlinear Equations with Newton's Method*, SIAM 2003, sections 1.5 and
+    2.4 on the chord and Shamanskii methods); the threshold 1/2 is the usual "the tangent is still
+    worth a linear-rate step" choice, not a tuned value.
+
+    The saving is a FACTORIZATION, and it is only real where the linear backend keeps one: the
+    ``lu(backend="cudss" | "pardiso")`` caches and ``lu(backend="host", reuse=True)`` all key the
+    numeric factorization on the matrix values, so handing them the same tangent again is a solve,
+    not a refactorization. ``backend="device"`` (JAX ``spsolve``) refactorizes on every call whatever
+    it is given; reuse then still skips the ASSEMBLY but not the factorization. The trade is honest:
+    more (cheap) steps for fewer (expensive) factorizations -- worth it where a factorization costs
+    many residual evaluations, i.e. a large 3-D saddle; on a small problem it can be slower. The
+    count is reported as ``fem.stats["nonlinear"]["factorizations"]``. Convergence and the gradient
+    are unaffected: the loop still stops on the true residual, and the implicit gradient uses a fresh
+    tangent at the root."""
     if linear_solve is None:
         from .linear import sparse_lu_solve
 
@@ -432,7 +462,7 @@ def newton_direct(
         r0n = jnp.linalg.norm(f0(x0))
 
         def cond(state):
-            _u, r, k = state
+            _u, r, k = state[:3]
             return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
 
         def body(state):
@@ -443,11 +473,37 @@ def newton_direct(
             u = u + alpha * delta
             return u, f0(u), k + 1
 
-        u, _r, k = jax.lax.while_loop(cond, body, (x0, f0(x0), 0))
-        return u, k
+        if not reuse:
+            u, _r, k = jax.lax.while_loop(cond, body, (x0, f0(x0), 0))
+            return u, k, k
 
-    root, _steps = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
-    _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_direct", steps=_steps)
+        def body_reuse(state):
+            # Lagged-Jacobian step: see the docstring for the rule. `J` is the tangent carried from
+            # the last refresh; `fresh` says whether it was assembled at THIS iterate.
+            u, r, k, J, fresh, nfact = state
+            rn = jnp.linalg.norm(r)
+            delta = linear_solve(J, -r)
+            alpha = _backtrack(u, delta, rn) if line_search else damping
+            u_try = u + alpha * delta
+            r_try = f0(u_try)
+            theta = jnp.linalg.norm(r_try) / rn
+            stale = jnp.logical_not(fresh)
+            # NaN-safe by construction: `not (theta < x)` is True for a NaN contraction.
+            reject = stale & jnp.logical_not(theta < 1.0)
+            refresh = stale & jnp.logical_not(theta < 0.5)
+            u_new = jnp.where(reject, u, u_try)
+            r_new = jnp.where(reject, r, r_try)
+            J_new = jax.lax.cond(refresh, lambda: jacobian_fn(u_new), lambda: J)
+            return u_new, r_new, k + 1, J_new, refresh, nfact + refresh.astype(jnp.int32)
+
+        state0 = (x0, f0(x0), 0, jacobian_fn(x0), jnp.asarray(True), jnp.asarray(1, jnp.int32))
+        u, _r, k, _J, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
+        return u, k, nfact
+
+    root, _steps, _nfact = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
+    _convergence_check(
+        f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_direct", steps=_steps, factorizations=_nfact
+    )
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
         J = jacobian_fn(root)

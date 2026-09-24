@@ -808,6 +808,22 @@ silently.
 > there changes the algorithm, not just the solver. And the direct Newton needs the assembler to
 > supply a tangent, so the matrix-free-only routes (a coupled-residual wrapper) fail loud either way.
 
+**Reusing the factorization — `newton(direct=True, reuse=True)`.** Lagged-Jacobian (chord / Shamanskii)
+Newton: keep stepping against the last factorized tangent while each step still halves the residual,
+refresh it when the contraction falls below that, and *reject* a stale step that does not reduce the
+residual at all (Kelley, *Solving Nonlinear Equations with Newton's Method*, SIAM 2003, §1.5, §2.4). It
+trades expensive factorizations for cheap extra steps, so it only pays where a factorization costs many
+residual evaluations, and only with a backend that keeps its factorization — `lu(backend="cudss")`,
+`"pardiso"` and `"host"` cache on the matrix values, so the same tangent again is a solve;
+`backend="device"` refactorizes anyway. `fem.stats["nonlinear"]["factorizations"]` reports the count on
+an eager solve.
+
+Measured, honestly mixed. A 2-D manufactured nonlinear Poisson: 5 → 2 factorizations, same root. A 3-D
+rigid-plastic rolling model (22k DOFs, cuDSS, RTX 3070): the continuation ladder dropped from 137 to 75
+factorizations, **but the run got slower** (134 s against 120 s) — there a factorization costs ~0.12 s
+while recompiling for each remeshed geometry costs ~6 s, so the linear solve was never the bottleneck.
+Measure where your time goes before reaching for it.
+
 ## Writing your own
 
 User extension is duck-typed — a linear solver is any `fn(A, b, *, M=None, x0=None) -> x` with `A` a

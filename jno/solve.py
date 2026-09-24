@@ -465,8 +465,15 @@ def amg(
 
 
 def _root_driver(
-    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False
+    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False, reuse=False
 ) -> NonlinearSolver:
+    if reuse and not direct:
+        raise ValueError(
+            f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED, factorized tangent between steps, and only "
+            f"the sparse-direct driver has one: pass direct=True as well. The matrix-free default never "
+            f"forms the tangent, so there is nothing to reuse."
+        )
+
     def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
         if direct:
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
@@ -496,6 +503,7 @@ def _root_driver(
                 # the composed ``linear=``/``precond=`` slots, over the ASSEMBLED tangent; None keeps
                 # the historic sparse-LU default
                 linear_solve=linear_solve,
+                reuse=reuse,
             )
         from .utils.solver.newton_krylov import newton_krylov
 
@@ -532,6 +540,7 @@ def newton(
     ls_max: int = 25,
     ls_c: float = 1e-4,
     direct: bool = False,
+    reuse: bool = False,
 ) -> NonlinearSolver:
     """Newton root-find, as a configurable slot. Two inner-solve modes:
 
@@ -546,7 +555,15 @@ def newton(
       problem (steady or the transient stepper); the ``linear=``/``precond=`` slots are then unused.
 
     ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
-    to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning."""
+    to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning.
+
+    ``reuse=True`` (with ``direct=True``) is **lagged-Jacobian Newton**: step against the last factorized
+    tangent until its contraction drops below 1/2, then refresh -- fewer factorizations for more,
+    cheaper steps. A step on a stale tangent that does not reduce the residual is rejected, so it
+    cannot diverge where the fresh Newton would not. Pays off with a backend that keeps its
+    factorization (``lu(backend="cudss" | "pardiso")``); ``backend="device"`` refactorizes anyway.
+    ``fem.stats["nonlinear"]["factorizations"]`` reports the count. See
+    :func:`jno.utils.solver.newton_krylov.newton_direct` for the rule and its source."""
     return _root_driver(
         "newton",
         damping=damping,
@@ -559,6 +576,7 @@ def newton(
         ls_max=ls_max,
         ls_c=ls_c,
         direct=direct,
+        reuse=reuse,
     )
 
 
