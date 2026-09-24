@@ -247,7 +247,7 @@ def build_plan(domain, pts_i, cells_i, order_i, regions, nodes, node_dofs, refer
         for key in ("piv", "free", "rows", "cols", "src"):
             gr[key] = np.asarray(gr[key], dtype=np.int64)
 
-    return {
+    plan = {
         "dim": dim,
         "order": int(order_i),
         "V0": V0,
@@ -260,9 +260,31 @@ def build_plan(domain, pts_i, cells_i, order_i, regions, nodes, node_dofs, refer
         "kept": kept,
         "shape": (int(n_i), int(n_red)),
     }
+    # STRUCTURAL zeros. An entry of P that is exactly zero at the build coordinates AND at random small
+    # perturbations of every trainable axis is identically zero under the allowed motion (e.g. the z-part of
+    # a normal on a surface y = f(x) when only z moves), so it is left out of the pattern. Keeping it costs
+    # more than an entry: when the tangent's own pattern is not concrete the sparse reduction expands every
+    # triplet over D^2 slot pairs (D = entries per row of P), and one extra entry per slip row quadrupled
+    # the reduced tangent a 3-D solve factorized (1.9M -> 7.6M stored, 5.5x the factorization time). Every
+    # eager solve re-checks the pruned entries at its own coordinates (`check_pruned`), so a motion that
+    # does make one nonzero raises instead of being dropped.
+    rng = np.random.default_rng(0)
+    scale = float(np.ptp(V0)) or 1.0
+    samples = [None]
+    for _ in range(2):
+        samples.append({nm: V0[ids, ax] + 1e-4 * scale * rng.standard_normal(ids.size) for ids, ax, nm in specs})
+    vals = [np.abs(_group_values(plan, a, np)) for a in samples]
+    plan["mask"] = np.flatnonzero(np.maximum.reduce(vals) > 0.0)
+    plan["pruned"] = np.setdiff1d(np.arange(vals[0].size), plan["mask"])
+    return plan
 
 
-def plan_P(plan, args=None, xp=jnp):
+def _group_values(plan, args, xp):
+    """All (pivot, free) entries of every slip node, concatenated over the groups, before pruning."""
+    return plan_P(plan, args, xp=xp, _raw=True)
+
+
+def plan_P(plan, args=None, xp=jnp, _raw=False):
     """The slip prolongation for the coordinates in ``args`` (build-time coordinates when absent)."""
     dim = plan["dim"]
     V = xp.asarray(plan["V0"])
@@ -303,6 +325,13 @@ def plan_P(plan, args=None, xp=jnp):
         cc = np.repeat(gr["cols"][:, None, :], m, axis=1)
         idx.append(np.stack([rr.reshape(-1), cc.reshape(-1)], axis=1))
         data.append((-R).reshape(-1))
+    if _raw:
+        return xp.concatenate(data[1:]) if len(data) > 1 else xp.zeros(0)
+    if "mask" in plan:  # keep the identity rows and only the structurally nonzero slip entries
+        gi = np.concatenate(idx[1:]) if len(idx) > 1 else np.zeros((0, 2), np.int64)
+        gd = xp.concatenate(data[1:]) if len(data) > 1 else xp.zeros(0)
+        idx = [idx[0], gi[plan["mask"]]]
+        data = [data[0], gd[plan["mask"]]]
     I = np.concatenate(idx).astype(np.int32)
     D = xp.concatenate(data)
     if xp is np:
@@ -380,6 +409,30 @@ def bind_periodic(periodic, args):
         out["P"] = P
         out["P_node"] = P
     return out
+
+
+def check_pruned(periodic, args) -> None:
+    """Raise if a pruned (structurally zero at build) entry of the slip P is nonzero at these coordinates.
+
+    Eager: call it where the solve's parameter values are concrete (the verdict after a solve)."""
+    if not is_runtime(periodic) or args is None:
+        return
+    plan = periodic["slip_runtime"]["plan"]
+    if not plan.get("pruned", np.zeros(0)).size:
+        return
+    concrete = {k: np.asarray(v) for k, v in args.items() if not isinstance(v, jax.core.Tracer)}
+    if len(concrete) != len(args):
+        return  # traced (grad/jit over the solve): nothing concrete to check here
+    raw = np.asarray(plan_P(plan, concrete, xp=jnp, _raw=True))
+    worst = float(np.max(np.abs(raw[plan["pruned"]])))
+    if worst > 1e-12:
+        raise NotImplementedError(
+            f"jno.fem: the runtime coordinates tilted the slip surface into a direction its build-time "
+            f"pattern left out (a pruned prolongation entry is {worst:.2e}, not 0): the slip condition was "
+            "NOT imposed exactly on this solve. The pattern keeps only entries that can move under the "
+            "trainable axes seen at build; free the axis that produces this motion before jno.fem(...), "
+            "or rebuild jno.fem on the moved mesh."
+        )
 
 
 def runtime_info(domain, pts_i, slip_points) -> bool:

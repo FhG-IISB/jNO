@@ -1626,6 +1626,10 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                     _r_end, _bound, _conv = record_nonlinear_verdict(
                         lambda uu: _residual_at(vals, uu), step, prev, nonlinear, _who
                     )
+                    if periodic is not None:
+                        from .slip_runtime import check_pruned
+
+                        check_pruned(periodic, vals)
                     # `None` means the rung was TRACED, so no verdict could be made -- that is not a stall.
                     _stalled = _conv is False
                     if periodic is None:

@@ -3049,6 +3049,10 @@ class FEM:
         from .utils.solver.slip_runtime import bind_periodic
 
         op, per, vals = self._op, self._periodic, kwargs["values"]
+        if per is not None:
+            from .utils.solver.slip_runtime import check_pruned
+
+            check_pruned(per, vals)  # eager: a pruned P entry must still be zero at these coordinates
         per = bind_periodic(per, vals) if per is not None else None
         u = jnp.asarray(out).reshape(-1)
         zero = jnp.zeros((int(op.size),), dtype=jnp.result_type(float))

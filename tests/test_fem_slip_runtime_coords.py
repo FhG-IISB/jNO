@@ -178,3 +178,34 @@ def test_the_solution_is_differentiable_in_the_slip_surface_position():
     g_ad = float(jax.grad(J)(t))
     g_fd = (float(J(t + h)) - float(J(t - h))) / (2 * h)
     assert abs(g_ad - g_fd) <= 1e-5 * max(abs(g_fd), 1e-12), (g_ad, g_fd)
+
+
+def test_structural_zeros_are_pruned_and_a_violated_pruning_raises():
+    """With only x trainable the flat top stays flat, so the x-coupling of its normal is identically zero
+    and is pruned from P. If a pruned entry is nonzero at a solve's coordinates (simulated here by marking
+    a live entry as pruned) the eager check must refuse the result rather than drop the coupling."""
+    d = jno.domain(_builder(0.0), compute_mesh_connectivity=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xp_ = xi.trainable()
+    ct = d.variable("top", normals=True, split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    grad, inner = jno.np.grad, jno.np.inner
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    k = 1.0 + 0.5 * (ui[0] * ui[0] + ui[1] * ui[1])
+    weak = k * inner(grad(u, [xi, yi]), grad(v, [xi, yi]), n_contract=2) - (1.0 * vi[0] + 0.5 * vi[1])
+    ut = u(ct[0], ct[1])
+    fem = jno.fem([weak, ct[-2] * ut[0] + ct[-1] * ut[1] - 0.0, u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0])
+    plan = fem._periodic["slip_runtime"]["plan"]
+    assert plan["mask"].size == 0 and plan["pruned"].size > 0  # every top coupling is structurally zero
+    ids = np.asarray(d._trainable_coords[0]["ids"])
+    xs = _lattice(0.0)[0][ids, 0] ** 1.2  # a nonuniform x-stretch: the top stays flat
+    fem.solve(**{_pname(xp_): xs}, **NL)  # fine: pruned entries are still zero
+
+    # now tilt: y is NOT trainable, so simulate a violated pruning by checking at coordinates the plan
+    # cannot represent -- move y through the plan's own spec list
+    plan["specs"].append((np.asarray(ids), 1, "__tilt__"))
+    from jno.utils.solver.slip_runtime import check_pruned
+
+    with pytest.raises(NotImplementedError, match="pruned"):
+        check_pruned(fem._periodic, {_pname(xp_): xs, "__tilt__": _lattice(TILT)[0][ids, 1]})

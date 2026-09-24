@@ -120,6 +120,14 @@ Xx = xi.trainable()                                # ONLY the x-positions of the
     at build. Before this, the build-time normals were used silently (3e-4 relative error on the rolling
     model) — the reason one build could not serve a sequence of remeshed geometries.
 
+    Entries of `P` that the allowed motion cannot make nonzero (the z-part of a normal on a surface
+    `y = f(x)` when only z is trainable) are left out of its pattern — detected at build by evaluating `P` at
+    random perturbations of the trainable axes, and re-checked after every eager solve, which raises if one
+    is nonzero after all. Keeping them quadrupled the reduced tangent on the rolling model (the sparse
+    reduction expands each triplet over the square of `P`'s entries per row) and made each factorization
+    5.5x slower; pruned, a moved-mesh solve costs what a fresh build's does (23.6 s vs 22.5 s for its
+    137-step continuation) and a re-solve after the mesh moves takes 1.1 s instead of a 7.6 s rebuild.
+
 **r-adaptivity in one call.** Tagging coordinates `.trainable()` and driving the relocation yourself is the
 low-level path; the packaged form reuses the **same `adapt=` slot** as h-refinement:
 
