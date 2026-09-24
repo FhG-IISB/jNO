@@ -1536,16 +1536,21 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
         else:
             from .fem_utils import prolong_periodic, reduce_vector_periodic, wrap_reduced_dirichlet
 
+            from .slip_runtime import bind_periodic
+
             def _residual_at(vals, ur):
                 # reduced system: solve on the constraint manifold, u = P u~. `Pᵀ` sums an eliminated
                 # DOF's equation into the rows it ties to, so a prescribed DOF that is a tie target
                 # loses the row holding its value -- re-imposed here, per load step, because the
-                # closure binds `vals` and the wrap has to happen inside it.
-                def _free(uu):
-                    full = op.residual(prolong_periodic(periodic, uu), vals)
-                    return reduce_vector_periodic(periodic, jnp.asarray(full).reshape(-1))
+                # closure binds `vals` and the wrap has to happen inside it. A slip surface on runtime
+                # coordinates gets the P of THIS rung's coordinates.
+                pb = bind_periodic(periodic, vals)
 
-                return wrap_reduced_dirichlet(periodic, _free)[0](ur)
+                def _free(uu):
+                    full = op.residual(prolong_periodic(pb, uu), vals)
+                    return reduce_vector_periodic(pb, jnp.asarray(full).reshape(-1))
+
+                return wrap_reduced_dirichlet(pb, _free)[0](ur)
 
         # A sparse-direct Newton (`newton(direct=True)`, or any direct `linear=` slot, which selects it)
         # flags `wants_jacobian` and factorizes the ASSEMBLED tangent. The march used to hand its driver a
@@ -1566,10 +1571,12 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 from .fem_utils import reduce_matrix_periodic, wrap_reduced_dirichlet
 
                 def _jac_at(vals, ur):
-                    def _free(uu):
-                        return reduce_matrix_periodic(periodic, op.jacobian(prolong_periodic(periodic, uu), vals))
+                    pb = bind_periodic(periodic, vals)
 
-                    return wrap_reduced_dirichlet(periodic, None, _free)[1](ur)
+                    def _free(uu):
+                        return reduce_matrix_periodic(pb, op.jacobian(prolong_periodic(pb, uu), vals))
+
+                    return wrap_reduced_dirichlet(pb, None, _free)[1](ur)
 
         if _jac_at is None:
             _step = jax.jit(lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev))
@@ -1624,7 +1631,7 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                     if periodic is None:
                         u = step
                     else:
-                        prev_red, u = step, prolong_periodic(periodic, step)
+                        prev_red, u = step, prolong_periodic(bind_periodic(periodic, vals), step)
                 else:
                     A, b = op.evaluate(vals)
                     b = jnp.asarray(b).reshape(-1)

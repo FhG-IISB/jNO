@@ -3919,6 +3919,10 @@ class FemResidualOperator:
         names = list(self.runtime_parameter_exprs)
         params = [self.runtime_parameter_exprs[n] for n in names]
 
+        # A solver that flags ``wants_args`` also receives the runtime parameter values: the reduced-space
+        # wrapper needs them when a slip surface moves with runtime coordinates (its P is rebuilt per solve).
+        _xa = (lambda a: {"args": a}) if getattr(solve_fn, "wants_args", False) else (lambda a: {})  # noqa: E731
+
         def _solve(*values):
             args = dict(zip(names, values))
             residual_fn = lambda u: self.residual(u, args)  # noqa: E731
@@ -3926,8 +3930,8 @@ class FemResidualOperator:
             # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
             # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
             if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args))
-            return solve_fn(residual_fn, u0)
+                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+            return solve_fn(residual_fn, u0, **_xa(args))
 
         if values is None:
             return FunctionCall(_solve, params, name="fem_solve")
@@ -3964,8 +3968,8 @@ class FemResidualOperator:
                 args = dict(zip(names, value_args))
                 rf = lambda u: self.residual(u, args)  # noqa: E731
                 if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args))
-                return solve_fn(rf, u0_arg)
+                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+                return solve_fn(rf, u0_arg, **_xa(args))
 
             fn = cache[key] = jax.jit(_run)
         return fn(u0_t, *vals_t)

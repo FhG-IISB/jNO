@@ -357,13 +357,14 @@ def _rect_slip_on_top():
     return d, [weak, ct[-2] * ut[0] + ct[-1] * ut[1] - 0.0, u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0]
 
 
-def test_a_trainable_coordinate_on_the_slip_surface_is_refused():
-    """The slip normals are built once from the build-time mesh; moving the slip surface's own vertices
-    at solve time would enforce the OLD surface's n·u = 0 -- a silent wrong answer. It must raise."""
+def test_a_trainable_coordinate_on_the_slip_surface_of_a_linear_problem_is_refused():
+    """Moving the slip surface at solve time needs its normals rebuilt per solve, which the steady
+    NONLINEAR path does (tests/test_fem_slip_runtime_coords.py). This problem is linear: it must raise
+    rather than enforce the build-time surface's n·u = 0 on the moved one."""
     d, terms = _rect_slip_on_top()
     xt, yt, _ = d.variable("top", split=True)
     yt.trainable()
-    with pytest.raises(NotImplementedError, match="slip region"):
+    with pytest.raises(NotImplementedError, match="NONLINEAR"):
         jno.fem(terms)
 
 

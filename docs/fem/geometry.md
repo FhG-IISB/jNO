@@ -109,6 +109,17 @@ Xx = xi.trainable()                                # ONLY the x-positions of the
     *relocation*, not remeshing (h-remeshing stays the non-differentiable outer AFEM loop); it is differentiable
     on valid meshes, with element inversion (tangling) the boundary of that regime.
 
+!!! note "Moving a slip surface (`n·u = 0`) with runtime coordinates"
+    The exact slip elimination carries `u = P ũ` with `P` built from the surface's per-node normals
+    `N_i = ∫ φ_i n ds`. When the slip surface's own vertices are trainable, those normals move, so `P` is
+    **rebuilt for each solve** from the coordinates it is given: same sparsity (the build-time pivots and
+    facets), new values, pure JAX, differentiable in the coordinates. Checked against a fresh build of the
+    moved mesh (1e-16 on a tilted 2-D surface, 2e-11 m/s on a 3-D rolling model) and against the flux
+    `Σ u_i·N_i` through the moved surface, which stays at round-off. Scope: the **steady nonlinear** solve
+    (`fem.solve(param=...)`, `continuation=`); a linear or transient form with a moving slip surface raises
+    at build. Before this, the build-time normals were used silently (3e-4 relative error on the rolling
+    model) — the reason one build could not serve a sequence of remeshed geometries.
+
 **r-adaptivity in one call.** Tagging coordinates `.trainable()` and driving the relocation yourself is the
 low-level path; the packaged form reuses the **same `adapt=` slot** as h-refinement:
 
