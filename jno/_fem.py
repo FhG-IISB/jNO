@@ -3044,9 +3044,8 @@ class FEM:
         full residual of a constrained problem keeps the constraint's reaction, which is physical and
         stays O(1) however well converged the solve is.
         """
-        from .utils.solver.solver_api import record_nonlinear_verdict
-
         from .utils.solver.slip_runtime import bind_periodic
+        from .utils.solver.solver_api import record_nonlinear_verdict
 
         op, per, vals = self._op, self._periodic, kwargs["values"]
         if per is not None:
@@ -4808,7 +4807,8 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
 
             P_ref = pro["P"]
             A_ref = _sp.coo_matrix(
-                (np.asarray(P_ref.data), (np.asarray(P_ref.indices)[:, 0], np.asarray(P_ref.indices)[:, 1])), shape=P_ref.shape
+                (np.asarray(P_ref.data), (np.asarray(P_ref.indices)[:, 0], np.asarray(P_ref.indices)[:, 1])),
+                shape=P_ref.shape,
             ).tocsr()
             A_new = _sp.coo_matrix((np.asarray(D_rt), (I_rt[:, 0], I_rt[:, 1])), shape=P_ref.shape).tocsr()
             if abs(A_ref - A_new).max() > 1e-10:

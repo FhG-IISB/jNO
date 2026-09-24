@@ -264,9 +264,7 @@ def test_a_full_state_warm_start_seeds_a_reduced_march():
     )
     nl = jno.solve.newton(direct=True, rtol=1e-12, atol=1e-12)
     first = np.asarray(fem.solve(continuation=jno.solve.continuation(visc=[0.0, 1.0]), nonlinear=nl)).reshape(-1)
-    again = np.asarray(
-        fem.solve(continuation=jno.solve.continuation(visc=[1.0]), nonlinear=nl, x0=first)
-    ).reshape(-1)
+    again = np.asarray(fem.solve(continuation=jno.solve.continuation(visc=[1.0]), nonlinear=nl, x0=first)).reshape(-1)
     assert np.linalg.norm(again - first) <= 1e-9 * np.linalg.norm(first)
     with pytest.raises(ValueError, match="full state"):
         fem.solve(continuation=jno.solve.continuation(visc=[1.0]), nonlinear=nl, x0=first[:-3])

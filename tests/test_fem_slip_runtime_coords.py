@@ -144,7 +144,7 @@ def test_a_linear_problem_with_a_moving_slip_surface_is_refused():
     ct = d.variable("top", normals=True, split=True)
     xb, yb, _ = d.variable("bottom", split=True)
     grad, inner = jno.np.grad, jno.np.inner
-    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    vi = v.bind(x=xi, y=yi)
     weak = inner(grad(u, [xi, yi]), grad(v, [xi, yi]), n_contract=2) - (1.0 * vi[0] + 0.5 * vi[1])
     ut = u(ct[0], ct[1])
     with pytest.raises(NotImplementedError, match="NONLINEAR"):

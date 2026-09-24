@@ -1535,7 +1535,6 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
 
         else:
             from .fem_utils import prolong_periodic, reduce_vector_periodic, wrap_reduced_dirichlet
-
             from .slip_runtime import bind_periodic
 
             def _residual_at(vals, ur):

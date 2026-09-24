@@ -320,7 +320,7 @@ def plan_P(plan, args=None, xp=jnp, _raw=False):
         Cp = xp.take_along_axis(C, xp.asarray(gr["piv"])[:, None, :], axis=2)  # (Ng, m, m)
         Cf = xp.take_along_axis(C, xp.asarray(gr["free"])[:, None, :], axis=2)  # (Ng, m, d-m)
         R = xp.linalg.solve(Cp, Cf)  # u_piv = -R u_free
-        Ng, nfree = Cf.shape[0], Cf.shape[2]
+        nfree = Cf.shape[2]
         rr = np.repeat(gr["rows"][:, :, None], nfree, axis=2)
         cc = np.repeat(gr["cols"][:, None, :], m, axis=1)
         idx.append(np.stack([rr.reshape(-1), cc.reshape(-1)], axis=1))
@@ -332,14 +332,14 @@ def plan_P(plan, args=None, xp=jnp, _raw=False):
         gd = xp.concatenate(data[1:]) if len(data) > 1 else xp.zeros(0)
         idx = [idx[0], gi[plan["mask"]]]
         data = [data[0], gd[plan["mask"]]]
-    I = np.concatenate(idx).astype(np.int32)
+    idx_all = np.concatenate(idx).astype(np.int32)
     D = xp.concatenate(data)
     if xp is np:
-        return I, D
+        return idx_all, D
     # The PATTERN must stay concrete under a trace: the sparse reductions read it host-side, and
     # `jnp.asarray(numpy)` inside jit is a tracer. Without this the reduction falls back to the DENSE product.
     with jax.ensure_compile_time_eval():
-        Ij = jnp.asarray(I)
+        Ij = jnp.asarray(idx_all)
     return jsparse.BCOO((D, Ij), shape=plan["shape"])
 
 

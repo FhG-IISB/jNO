@@ -115,9 +115,7 @@ def test_fem_reuse_matches_fresh_newton_and_the_exact_solution():
     lin = jno.solve.lu(backend="host")  # content-keyed factor cache: a reused tangent is a solve
     u_fresh = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-12, atol=1e-12), linear=lin))
     n_fresh = fem.stats["nonlinear"]["factorizations"]
-    u_lag = np.asarray(
-        fem.solve(nonlinear=jno.solve.newton(direct=True, reuse=True, rtol=1e-12, atol=1e-12), linear=lin)
-    )
+    u_lag = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, reuse=True, rtol=1e-12, atol=1e-12), linear=lin))
     n_lag = fem.stats["nonlinear"]["factorizations"]
     assert np.max(np.abs(u_lag - u_fresh)) < 1e-9  # same discrete root
     rel = np.linalg.norm(u_lag.ravel() - exact) / np.linalg.norm(exact)
