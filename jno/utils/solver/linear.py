@@ -864,9 +864,14 @@ def host_lu_solve(A, b, *, reuse: bool = True):
     which keys its cache on the sparsity and re-uses the plan across a Newton loop -- measured 64.7x
     per step against this function at n=64,000.
 
-    Limitations, all inherited from ``pure_callback``: no ``vmap`` batching rule, and the callback
-    is forward-only, so this cannot appear inside a transformation that needs to differentiate
-    *through* the callback itself (the ``custom_linear_solve`` firewall means it does not have to).
+    **Under ``vmap`` it factors once.** ``jax.jacrev`` / ``jax.jacfwd`` through this solve with respect
+    to the right-hand side, or any vmap over a batch of loads, reaches the host as ONE callback with the
+    whole block of right-hand sides, solved against a single factorization; batched matrix values are
+    factored one by one.
+
+    Limitation inherited from ``pure_callback``: the callback is forward-only, so this cannot appear
+    inside a transformation that needs to differentiate *through* the callback itself (the
+    ``custom_linear_solve`` firewall means it does not have to).
     """
     import jax
     import jax.experimental.sparse as jsp
@@ -923,13 +928,37 @@ def host_lu_solve(A, b, *, reuse: bool = True):
             _FACTOR_CACHE.move_to_end(key)
         return _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
 
+    def _batched_host_solve(data, indices, rhs, transpose):
+        """The callback under ``vmap`` (``vmap_method="expand_dims"``): every vmapped level adds a
+        leading axis, of size 1 on an operand that is not batched.
+
+        One matrix for the whole batch -- ``jax.jacrev`` / ``jax.jacfwd`` through a solve with respect
+        to its right-hand side, a batch of loads -- is FACTORED ONCE and the whole block of right-hand
+        sides solved against it in a single SuperLU call. Batched matrix values are factored one by
+        one (identical ones still hit :data:`_FACTOR_CACHE`)."""
+        import numpy as _np
+
+        data, indices, rhs = _np.asarray(data), _np.asarray(indices), _np.asarray(rhs)
+        batch = _np.broadcast_shapes(data.shape[:-1], indices.shape[:-2], rhs.shape[:-1])
+        if not batch:
+            return _host_solve(data, indices, rhs, transpose)
+        k = int(_np.prod(batch))
+        R = _np.broadcast_to(rhs, batch + (n,)).reshape(k, n)
+        if all(s == 1 for s in data.shape[:-1] + indices.shape[:-2]):
+            X = _host_solve(data.reshape(-1), indices.reshape(-1, 2), _np.ascontiguousarray(R.T), transpose)
+            return _np.ascontiguousarray(X.T).reshape(batch + (n,))
+        D = _np.broadcast_to(data, batch + data.shape[-1:]).reshape(k, -1)
+        Ix = _np.broadcast_to(indices, batch + indices.shape[-2:]).reshape(k, -1, 2)
+        return _np.stack([_host_solve(D[j], Ix[j], R[j], transpose) for j in range(k)]).reshape(batch + (n,))
+
     def _call(rhs, transpose):
         return jax.pure_callback(
-            lambda d, i, r: _host_solve(d, i, r, transpose),
+            lambda d, i, r: _batched_host_solve(d, i, r, transpose),
             jax.ShapeDtypeStruct((n,), rhs.dtype),
             A.data,
             A.indices,
             rhs,
+            vmap_method="expand_dims",
         )
 
     return jax.lax.custom_linear_solve(

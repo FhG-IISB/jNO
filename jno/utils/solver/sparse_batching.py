@@ -12,8 +12,9 @@ product on cuSPARSE:
   shape is traced (see :func:`_prefer_spmm`), never hard-coded. It matters: on one RTX 3070 SpMM cost
   4-6x a loop of SpMVs at 2 vectors and 0.3x at 32, and the crossover moves with the GPU, the cuSPARSE
   version and the dtype.
-* **batched solves** (``spsolve``): one solve per system under ``lax.map`` -- the memory of an unbatched
-  solve on any machine (see :func:`_spsolve_batch` for why not block-diagonal).
+* **batched solves** (``spsolve``): one system per ``lax.map`` step by default -- the memory of an unbatched
+  solve on any machine -- or ``jno.setup(lu_stack=k)`` systems per block-diagonal call (see
+  :func:`_spsolve_batch`).
 * **batched matrices** (values, and optionally the pattern): the B matrices become ONE block-diagonal
   CSR -- column indices offset by ``b * ncols``, row pointers by ``b * nse`` -- applied in a single
   call. On a 303k-DOF operator with 16 value sets: 231 us per item (a single SpMV is 183 us), against
@@ -162,29 +163,66 @@ def _csr_matmat_batch(args, dims, *, shape, transpose):
     return out.reshape(size, -1, X.shape[-1]), 0
 
 
-def _spsolve_batch(args, dims, *, tol, reorder):
-    """B square systems, one ``spsolve`` each under ``lax.map`` -- the memory of an unbatched solve.
+#: How many systems a vmapped ``spsolve`` (``jno.solve.lu()``, the default "device" backend) stacks into
+#: ONE block-diagonal cuSolver call. Set it with ``jno.setup(lu_stack=k)`` (or ``[jno] lu_stack`` in
+#: ``.jno.toml``); read when the vmap is traced.
+_LU_STACK = 1
 
-    Stacking them into ONE block-diagonal system was measured 1.07-2x faster where it fits, but whether
-    it fits is not knowable here: cuSolver's sparse QR allocates for its fill-in, which depends on the
-    sparsity pattern (a tracer at this point) and on how much device memory JAX leaves outside its own
-    pool, and JAX exposes neither. On one 8 GB card a 3-D 20k-DOF Laplacian ran out of memory at 32
-    stacked copies and a 2-D operator of the same size did not. A default sized to one machine is not a
-    default, so the batch is solved one system at a time. (The machine-independent way to get the
-    speed-up back is cuSolver's own batched QR, ``cusolverSpXcsrqrBufferInfoBatched``, which reports its
-    exact workspace -- not exposed by JAX.)"""
+
+def set_lu_stack(k: int) -> None:
+    """Set :data:`_LU_STACK` (``jno.setup(lu_stack=...)``). ``k`` must be a positive integer."""
+    global _LU_STACK
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ValueError(f"jno.setup(lu_stack={k!r}): expected a positive integer number of systems per call.")
+    if k != _LU_STACK:
+        import jax
+
+        _LU_STACK = k
+        # The value is read while a vmap is TRACED, and JAX caches batched programs (a jitted solve's
+        # batched jaxpr is reused across calls), so without this a change after the first vmapped
+        # solve would be silently ignored -- verified: 8 set after 1 in one process still stacked 1.
+        jax.clear_caches()
+
+
+def _spsolve_batch(args, dims, *, tol, reorder):
+    """B square systems through ``spsolve`` (cuSolver's sparse QR on GPU): ``lu_stack`` systems per call.
+
+    The default, ONE system per ``lax.map`` step, costs exactly the memory of an unbatched solve on any
+    machine. ``jno.setup(lu_stack=k)`` stacks ``k`` of them into one block-diagonal system instead --
+    measured 1.07-2x faster -- but cuSolver's QR allocates for its fill-in, which depends on the sparsity
+    pattern and on the device memory JAX leaves outside its pool, so how large ``k`` may be is the
+    user's to choose for their machine and problem: too large fails loudly with a cuSolver allocation
+    error, never with a wrong answer. (One 8 GB card ran a 3-D 20k-DOF Laplacian out of memory at 32
+    stacked copies and not a 2-D operator of the same size.)
+
+    cuSolver's QR takes one right-hand side, so even a SHARED matrix is factorised once per system here.
+    To factor once and solve the whole batch, use a factor-once backend: ``jno.solve.lu(backend="host")``
+    (see :func:`jno.utils.solver.linear.host_lu_solve`)."""
     import jax
     from jax.experimental.sparse import linalg as _splinalg
 
     size = _batch_size(args, dims)
-    shared = [d is _UNBATCHED for d in dims]
-    batched = tuple(_front(a, d, size) if not s_ else None for a, d, s_ in zip(args, dims, shared))
+    data, indices, indptr, b = (_front(a, d, size) for a, d in zip(args, dims))
+    n = b.shape[1]
+    chunk = max(1, min(size, _LU_STACK))
 
-    def one(xs):
-        vals = [a if s_ else x for a, x, s_ in zip(args, xs, shared)]
-        return _splinalg.spsolve_p.bind(*vals, tol=tol, reorder=reorder)
+    def solve_stack(data, indices, indptr, b):
+        if data.shape[0] == 1:
+            return _splinalg.spsolve_p.bind(data[0], indices[0], indptr[0], b[0], tol=tol, reorder=reorder)[None]
+        bd, bi, bp, _ = _block_diagonal(data, indices, indptr, (n, n))
+        return _splinalg.spsolve_p.bind(bd, bi, bp, b.reshape(-1), tol=tol, reorder=reorder).reshape(-1, n)
 
-    return jax.lax.map(one, batched), 0
+    if chunk >= size:
+        return solve_stack(data, indices, indptr, b), 0
+    n_chunks = -(-size // chunk)
+    pad = n_chunks * chunk - size  # padded with copies of a real system, never zeros (no singular pad)
+    parts = [
+        jnp.concatenate([a, jnp.broadcast_to(a[:1], (pad,) + a.shape[1:])]) if pad else a
+        for a in (data, indices, indptr, b)
+    ]
+    stacked = tuple(a.reshape((n_chunks, chunk) + a.shape[1:]) for a in parts)
+    out = jax.lax.map(lambda c: solve_stack(*c), stacked)
+    return out.reshape(n_chunks * chunk, n)[:size], 0
 
 
 def _rules():

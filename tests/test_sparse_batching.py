@@ -268,3 +268,90 @@ def test_a_failed_measurement_falls_back_to_the_spmv_loop_and_says_so(monkeypatc
     assert csr_batching._prefer_spmm((300, 300), 1500, 20, np.float64, False) is False
     assert "using the SpMV loop" in capsys.readouterr().out
     csr_batching._SPMM_DECISIONS.clear()
+
+
+# ---------------------------------------------------------------------------- factor once / lu_stack
+def _bcoo_square(n=80, seed=4):
+    S = (sp.diags([-1.0, 4.2, -1.3], [-1, 0, 1], (n, n)) + 0.2 * sp.random(n, n, 0.03, random_state=seed)).tocoo()
+    A = js.BCOO((jnp.asarray(S.data), jnp.asarray(np.stack([S.row, S.col], 1).astype(np.int32))), shape=S.shape)
+    return S, A
+
+
+def test_host_lu_factors_once_for_a_batch_against_one_matrix(monkeypatch):
+    import scipy.sparse.linalg as spla
+
+    from jno.utils.solver import linear
+
+    S, A = _bcoo_square()
+    calls = {"n": 0}
+    orig = spla.splu
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(spla, "splu", counting)
+    B = jnp.asarray(np.random.default_rng(0).standard_normal((7, S.shape[0])))
+    X = jax.vmap(lambda b: linear.host_lu_solve(A, b, reuse=False))(B)
+    np.testing.assert_allclose(np.asarray(X), np.linalg.solve(S.toarray(), np.asarray(B).T).T, rtol=1e-10, atol=1e-12)
+    assert calls["n"] == 1, "a batch against one matrix must factor once"
+    calls["n"] = 0
+    J = jax.jacrev(lambda b: linear.host_lu_solve(A, b, reuse=False))(B[0])
+    np.testing.assert_allclose(np.asarray(J), np.linalg.inv(S.toarray()), rtol=1e-9, atol=1e-12)
+    assert calls["n"] == 2  # the forward solve + ONE for all 80 adjoint rows
+
+
+def test_host_lu_batched_values_are_factored_each():
+    from jno.utils.solver import linear
+
+    S, A = _bcoo_square()
+    rng = np.random.default_rng(1)
+    D = jnp.asarray(1 + 0.1 * rng.standard_normal((3, S.nnz))) * A.data
+    B = jnp.asarray(rng.standard_normal((3, S.shape[0])))
+    X = jax.vmap(lambda d, b: linear.host_lu_solve(js.BCOO((d, A.indices), shape=A.shape), b, reuse=False))(D, B)
+    for k in range(3):
+        Ak = sp.coo_matrix((np.asarray(D[k]), (S.row, S.col)), shape=S.shape).toarray()
+        np.testing.assert_allclose(np.asarray(X[k]), np.linalg.solve(Ak, np.asarray(B[k])), rtol=1e-10, atol=1e-12)
+
+
+def _spsolve_sizes(f, *args):
+    import re
+
+    return [int(m) for m in re.findall(r"f64\[(\d+)\] = spsolve", str(jax.make_jaxpr(f)(*args)))]
+
+
+@pytest.fixture
+def _restore_lu_stack():
+    yield
+    csr_batching.set_lu_stack(1)
+
+
+def test_lu_stack_stacks_takes_effect_when_changed_and_pads_correctly(_restore_lu_stack):
+    S, d, i, p = _square(n=30)
+    B = jnp.asarray(np.random.default_rng(2).standard_normal((5, S.shape[0])))
+    f = jax.vmap(lambda b: _solve(d, i, p, b))
+    csr_batching.set_lu_stack(1)
+    assert _spsolve_sizes(f, B) == [30]  # one system per lax.map step
+    csr_batching.set_lu_stack(2)  # 5 systems -> chunks of 2, last one padded
+    assert _spsolve_sizes(f, B) == [60]
+    np.testing.assert_allclose(np.asarray(f(B)), np.linalg.solve(S.toarray(), np.asarray(B).T).T, rtol=1e-10, atol=1e-12)
+    csr_batching.set_lu_stack(8)  # >= batch: one call
+    assert _spsolve_sizes(f, B) == [150]
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, True, "4"])
+def test_lu_stack_rejects_non_positive_integers(bad):
+    with pytest.raises(ValueError, match="lu_stack"):
+        csr_batching.set_lu_stack(bad)
+
+
+def test_setup_sets_lu_stack_from_the_argument_and_from_toml(tmp_path, monkeypatch, _restore_lu_stack):
+    from jno.utils import config
+
+    script = tmp_path / "run.py"
+    script.write_text("")
+    jno.setup(str(script), lu_stack=3)
+    assert csr_batching._LU_STACK == 3
+    monkeypatch.setattr(config, "get_config", lambda: {"jno": {"lu_stack": 5}})
+    jno.setup(str(script))
+    assert csr_batching._LU_STACK == 5

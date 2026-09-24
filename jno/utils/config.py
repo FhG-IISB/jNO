@@ -331,6 +331,7 @@ def setup(
     diff_type: str | None = None,
     hessian_type: str | None = None,
     compile_cache: bool | str | None = None,
+    lu_stack: int | None = None,
 ) -> str:
     """Initialise logging and return the run directory for *script_file*.
 
@@ -396,6 +397,19 @@ def setup(
             first build 4.75 s -> 2.22 s, repeat build 2.48 s -> 1.51 s. Set it once per project with
             ``[jno] compile_cache = true`` in ``.jno.toml`` rather than editing each script.
 
+        lu_stack: How many systems a ``vmap``-ed ``jno.solve.lu()`` (the default ``"device"`` backend,
+            cuSolver's sparse QR) stacks into ONE block-diagonal call -- the batches behind
+            ``jax.jacrev`` / ``jax.jacfwd`` through a solve and any vmap over solves.
+
+            * ``None`` (default) — read ``[jno] lu_stack`` from the TOML config; ``1`` if absent.
+            * ``1`` — one system per call: exactly the memory of an unbatched solve, on any machine.
+            * ``k > 1`` — ``k`` systems per call: measured 1.07-2x faster, but cuSolver allocates for
+              the fill-in of all ``k``, which depends on your problem and your card, so the right ``k``
+              is yours to find. Too large fails with a cuSolver allocation error, never a wrong answer.
+
+            Batching against ONE matrix is better served by ``jno.solve.lu(backend="host")``, which
+            factors once for the whole batch; cuSolver factors every system.
+
     Returns:
         The path of the run directory (created if absent).
     """
@@ -445,6 +459,11 @@ def setup(
     elif cache_opt:
         cache_dir = enable_compile_cache(cache_opt if isinstance(cache_opt, str) else None)
         _logger_mod._default_logger.info(f"XLA compilation cache enabled at {cache_dir}")
+
+    # --- Batched device LU: systems per cuSolver call (explicit kwarg wins over TOML; default 1) ---
+    from .solver.sparse_batching import set_lu_stack
+
+    set_lu_stack(int(get_config().get("jno", {}).get("lu_stack", 1)) if lu_stack is None else lu_stack)
 
     # --- Optional Weights & Biases ---
     _init_wandb(wandb, stem, str(dire))

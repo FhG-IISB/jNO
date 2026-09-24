@@ -83,8 +83,16 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
     indefinite saddle-point systems where Jacobi-preconditioned Krylov stalls, reverse-mode
     differentiable in the matrix entries and the right-hand side. Direct: ignores ``x0`` and
-    rejects a preconditioner. ``jit`` yes; **no vmap batching rule upstream** (trait
-    ``vmap="no"``) -- use a Krylov solver inside vmapped/batched solves.
+    rejects a preconditioner. ``jit`` yes, and ``vmap`` -- so ``jax.jacrev`` / ``jax.jacfwd`` through
+    a solve -- works on every backend except cuDSS and PARDISO (not yet). How a batch is solved
+    depends on the backend:
+
+    * ``"host"`` **factors once** for a batch against one matrix and solves the whole block of
+      right-hand sides in one call -- the batch to pick for Jacobians and sensitivities. Measured
+      (RTX 3070 box, float64, factorising on every call): ``jacrev`` over 32 outputs of a 2-D
+      20k-DOF solve 108 ms against 58 ms for ONE solve, where ``"device"`` took 16.7 s.
+    * ``"device"`` (cuSolver's sparse QR) takes one right-hand side, so it factorises every system:
+      one per call by default, or ``jno.setup(lu_stack=k)`` stacked per call.
 
     Args:
         backend: WHERE the factorization happens. All three obey the same ``(A, b) -> x`` contract and
@@ -204,7 +212,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
     # on the host and cannot go back through JAX -- notably ARPACK's shift-invert OPinv in the
     # non-symmetric eigensolver. "device" has none: it IS a JAX primitive.
     traits = {
-        "vmap": "no",
+        "vmap": "no" if backend in ("cudss", "pardiso") else "yes",
         "multi_rhs": backend == "cudss",
         "host_kernel": None if backend == "device" else backend,
     }
