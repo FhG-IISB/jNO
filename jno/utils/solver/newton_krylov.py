@@ -117,17 +117,25 @@ def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, fac
 
 
 def compiled_with_verdicts(fn):
-    """``jax.jit(fn)`` for a solve that must keep the drivers' eager convergence check.
+    """A compiled, reusable ``fn`` for a solve that must keep the drivers' eager convergence check.
 
     Running a Newton driver eagerly re-stages its ``while_loop`` and ``custom_root`` on every call and
     evaluates every residual outside the loop op by op: measured on a 3-D P1 nonlinear Poisson problem
     (87k DOF, RTX 3070) that was 2.3 s per warm ``fem.solve()`` against ~0.3 s of GPU work. Compiled, the
     check would silently switch off, so the drivers' residual norms and step counts become extra outputs
-    of the compiled program and :func:`judge_verdicts` makes the same judgement on them. Returns a
-    function ``(*args) -> (fn(*args), verdicts)``.
+    of the compiled program and :func:`judge_verdicts` makes the same judgement on them.
+
+    Traced ONCE with ``make_jaxpr`` and run through a ``jax.jit`` of ``eval_jaxpr`` that takes the
+    jaxpr's constants (the mesh and operator arrays the residual closes over) as ARGUMENTS, the way
+    ``backend_blocks._cached_march`` does: a plain ``jax.jit`` would bake them into the executable as
+    constants -- a bigger program to compile and to cache, and a second copy of the mesh kept alive by
+    it. The constants move to the solving device once. Under an outer trace (an argument or a constant
+    is a tracer) it runs inline, uncached. Returns ``(*args) -> (fn(*args), verdicts)``.
     """
+    from .placement import to_solve_device
 
     static: list = []  # tolerances and driver names, fixed per trace; only the norms are traced outputs
+    state: dict = {}
 
     def _traced(*args):
         global _TRACED_VERDICTS
@@ -146,14 +154,28 @@ def compiled_with_verdicts(fn):
         finally:
             _TRACED_VERDICTS = prev
 
-    jitted = jax.jit(_traced)
-
-    def run(*args):
-        out, norms = jitted(*args)
+    def _label(out, norms):
         return out, [
             dict(m, rn=rn, r0=r0, steps=k if m["steps"] else None, factorizations=f if m["factorizations"] else None)
             for m, (rn, r0, k, f) in zip(static, norms)
         ]
+
+    def run(*args):
+        flat = jax.tree_util.tree_leaves(args)
+        if any(isinstance(x, jax.core.Tracer) for x in flat):
+            return _label(*_traced(*args))
+        if "prog" not in state:
+            closed, out_shape = jax.make_jaxpr(_traced, return_shape=True)(*args)
+            if any(isinstance(c, jax.core.Tracer) for c in closed.consts):  # closes over an outer trace
+                return _label(*_traced(*args))
+            jaxpr = closed.jaxpr
+            state.update(
+                consts=to_solve_device(list(closed.consts), numpy=True),
+                prog=jax.jit(lambda consts, flat: jax.core.eval_jaxpr(jaxpr, consts, *flat)),
+                out_tree=jax.tree_util.tree_structure(out_shape),
+            )
+        out = jax.tree_util.tree_unflatten(state["out_tree"], state["prog"](state["consts"], flat))
+        return _label(*out)
 
     return run
 
