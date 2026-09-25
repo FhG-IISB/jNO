@@ -255,7 +255,7 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
     # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
-        if name == "cg" and getattr(M, "low_precision", False):
+        if name == "cg" and (getattr(M, "low_precision", False) or getattr(M, "nonsymmetric", False)):
             # A float32 preconditioner is only approximately symmetric: standard CG's beta then loses
             # conjugacy and was measured stopping at a TRUE residual of 6e-6 against a requested 1e-8
             # (float32 FSAI, 3-D elasticity), silently. Flexible CG is robust to that at no extra products.

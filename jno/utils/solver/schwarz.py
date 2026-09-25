@@ -1,0 +1,202 @@
+"""Algebraic overlapping Schwarz preconditioners (one- and two-level) for any assembled sparse operator.
+
+Toselli & Widlund, *Domain Decomposition Methods*, Springer 2005 (Ch. 3: additive Schwarz; Sec. 3.8 the
+two-level method); Cai & Sarkis, SIAM J. Sci. Comput. 21(2), 1999 (restricted additive Schwarz, RAS);
+Nicolaides, SIAM J. Numer. Anal. 24(2), 1987 (the piecewise-constant coarse space).
+
+Built purely from the operator ``A`` -- no mesh, no physics -- so it serves FEM of any element, FDM, multi-field
+and the fused complex 2n block alike:
+
+* the unknowns are split into ``p`` parts by recursive bisection of ``A``'s graph (breadth-first level sets
+  from a pseudo-peripheral node: contiguous, balanced parts, no METIS);
+* each part grows by ``overlap`` layers of graph neighbours; its local problem is ``A`` restricted to that set
+  (Dirichlet on the grown boundary -- the algebraic Schwarz subproblem);
+* all local problems are PADDED to one size and solved together (``vmap``): the same layout later shards
+  across devices, one block of subdomains per device, which is what a compiled loop needs;
+* the coarse space (two-level) is Nicolaides': one constant per part, ``A_c = Z^T A Z``, a dense ``p x p``.
+
+Two phases, as for :mod:`fsai`: the symbolic one (partition, overlap, index tables) runs once on the host from a
+concrete operator; the numeric one (local matrices, their LU factors, the coarse matrix) is pure JAX from the
+operator's current values -- inside a compiled solve, a Newton loop or a time march.
+"""
+
+from __future__ import annotations
+
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+__all__ = ["SchwarzPattern", "schwarz_pattern", "schwarz_factor", "schwarz_apply"]
+
+
+class SchwarzPattern(NamedTuple):
+    """The symbolic phase (pattern only). ``idx``: each part's unknowns (padded with ``n``, out of range);
+    ``own``: which of them the part OWNS (the non-overlapping partition); ``lrow``/``lcol``/``lpos``: every
+    local-matrix entry as (row, col) in the part and its position in A's sorted unique entries (``nnz`` = a
+    zero slot, ``nnz + 1`` = a one slot for the padded diagonal)."""
+
+    n: int
+    p: int
+    m: int
+    nnz: int
+    checksum: tuple
+    idx: jnp.ndarray  # (p, m) int32
+    own: jnp.ndarray  # (p, m) bool
+    lrow: jnp.ndarray  # (p, L) int32
+    lcol: jnp.ndarray  # (p, L) int32
+    lpos: jnp.ndarray  # (p, L) int32
+    part: jnp.ndarray  # (n,) int32 owner of each unknown
+    crow: jnp.ndarray  # (nnz,) int32 coarse index part[r] * p + part[c] of each unique entry
+
+
+def _bisect(G, nodes, parts, out, first):
+    """Recursively split ``nodes`` into ``parts`` contiguous pieces (BFS level order from a pseudo-peripheral
+    node, cut at the proportional size) and write part ids from ``first`` into ``out``."""
+    from scipy.sparse.csgraph import breadth_first_order
+
+    if parts == 1 or nodes.size <= 1:
+        out[nodes] = first
+        return
+    from scipy.sparse.csgraph import connected_components
+
+    sub = G[nodes][:, nodes]
+    # Component by component, largest first, each in BFS level order from its own pseudo-peripheral node.
+    # An operator's graph is rarely connected: every eliminated Dirichlet row is an isolated node (400 of them
+    # on a 12k-unknown square). A single BFS that happened to start on one reached nothing, and the fallback
+    # ordered the rest by raw index -- a part came out in 568 disconnected pieces.
+    ncomp, label = connected_components(sub, directed=False)
+    sizes = np.bincount(label, minlength=ncomp)
+    order = []
+    for comp in np.argsort(-sizes, kind="stable"):
+        members = np.nonzero(label == comp)[0]
+        if members.size == 1:
+            order.append(members)
+            continue
+        start = members[0]
+        for _ in range(2):  # two sweeps: the farthest node from the farthest node is (nearly) peripheral
+            o = breadth_first_order(sub, start, directed=False, return_predecessors=False)
+            start = o[-1]
+        order.append(o)
+    order = np.concatenate(order)
+    left = parts // 2
+    cut = int(round(nodes.size * left / parts))
+    _bisect(G, nodes[order[:cut]], left, out, first)
+    _bisect(G, nodes[order[cut:]], parts - left, out, first + left)
+
+
+def schwarz_pattern(A, *, parts: int, overlap: int = 1) -> SchwarzPattern:
+    """Symbolic phase from a CONCRETE operator."""
+    import scipy.sparse as sp
+
+    from .amg import _to_scipy_csr
+    from .fsai import _checksum
+
+    if not jax.config.jax_enable_x64:
+        raise ValueError("jno.precond.schwarz() needs x64: its entry keys row*n + col overflow int32.")
+    S = _to_scipy_csr(A).astype(np.float64)
+    S.sum_duplicates()
+    n = S.shape[0]
+    if S.shape != (n, n):
+        raise ValueError(f"jno.precond.schwarz(): the operator must be square, got {S.shape}.")
+    parts = int(min(max(1, parts), n))
+    G = (abs(S) + abs(S).T).tocsr()
+    G.data[:] = 1.0
+    part = np.zeros(n, np.int64)
+    _bisect(G, np.arange(n), parts, part, 0)
+
+    member = sp.csr_matrix((np.ones(n), (np.arange(n), part)), shape=(n, parts))
+    for _ in range(int(overlap)):  # grow every part by one layer of graph neighbours
+        member = ((G @ member) + member).tocsr()
+        member.data[:] = 1.0
+    memberT = member.T.tocsr()
+    sets = [memberT.indices[memberT.indptr[i] : memberT.indptr[i + 1]] for i in range(parts)]
+    m = max(s.size for s in sets)
+
+    coo = S.tocoo()
+    keys = np.sort(np.asarray(coo.row, np.int64) * n + np.asarray(coo.col, np.int64))
+    idx = np.full((parts, m), n, np.int64)
+    own = np.zeros((parts, m), bool)
+    rows, cols, poss = [], [], []
+    for i, s in enumerate(sets):
+        s = np.sort(s)
+        idx[i, : s.size] = s
+        own[i, : s.size] = part[s] == i
+        sub = S[s][:, s].tocoo()
+        pos = np.searchsorted(keys, s[sub.row].astype(np.int64) * n + s[sub.col])
+        pad = np.arange(s.size, m)  # identity on the padded slots
+        rows.append(np.concatenate([sub.row, pad]))
+        cols.append(np.concatenate([sub.col, pad]))
+        poss.append(np.concatenate([pos, np.full(pad.size, keys.size + 1)]))
+    L = max(r.size for r in rows)
+
+    def stack(xs, fill):
+        return np.stack([np.concatenate([x, np.full(L - x.size, fill)]) for x in xs])
+
+    ku = keys // n, keys % n
+    return SchwarzPattern(
+        n,
+        parts,
+        m,
+        int(keys.size),
+        tuple(int(v) for v in _checksum(keys, np)),
+        jnp.asarray(idx, jnp.int32),
+        jnp.asarray(own),
+        jnp.asarray(stack(rows, 0), jnp.int32),
+        jnp.asarray(stack(cols, 0), jnp.int32),
+        jnp.asarray(stack(poss, keys.size), jnp.int32),  # padding entries read the zero slot
+        jnp.asarray(part, jnp.int32),
+        jnp.asarray(part[ku[0]] * parts + part[ku[1]], jnp.int32),
+    )
+
+
+def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool):
+    """Numeric phase (traceable): the inverse of every local matrix and, two-level, of the coarse matrix."""
+    from .fsai import FsaiPattern, _keys_and_values
+
+    _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
+    ext = jnp.concatenate([vals, jnp.zeros((1,), vals.dtype), jnp.ones((1,), vals.dtype)])
+    blk = jnp.zeros((pat.p, pat.m, pat.m), vals.dtype)
+    blk = jax.vmap(lambda b, r, c, q: b.at[r, c].add(ext[q]))(blk, pat.lrow, pat.lcol, pat.lpos)
+    # The local INVERSES, not LU factors: applying them is then one batched dense matrix-vector product, where
+    # batched triangular solves of small blocks are among the slowest kernels a GPU runs (measured ~1 ms per
+    # application for 256 blocks of 102). Same memory (m^2 per part); the blocks are small principal
+    # submatrices, as well conditioned as the operator allows.
+    local = jnp.linalg.inv(blk)
+    if not coarse:
+        return local, None
+    Ac = jax.ops.segment_sum(vals, pat.crow, num_segments=pat.p * pat.p).reshape(pat.p, pat.p)
+    return local, jnp.linalg.inv(Ac)  # applied twice per application: a gemv, not two triangular solves
+
+
+def schwarz_apply(pat: SchwarzPattern, factors, *, restricted: bool, mv=None):
+    """``v -> M^-1 v``: the local solves summed back (all overlap contributions for the symmetric additive
+    method, only the owned ones for RAS) plus, two-level, the coarse correction ``Z A_c^-1 Z^T v`` -- applied
+    MULTIPLICATIVELY after the coarse solve when ``mv`` (``v -> A v``) is given (the "balanced" hybrid, which
+    converges faster than the purely additive sum)."""
+    local, coarse = factors
+    n, p = pat.n, pat.p
+
+    def locals_(r):
+        rl = jnp.take(r, pat.idx, mode="fill", fill_value=0)  # (p, m); padded slots read 0
+        zl = jnp.einsum("pij,pj->pi", local, rl)
+        w = pat.own if restricted else jnp.ones_like(pat.own)
+        return jnp.zeros((n,), r.dtype).at[pat.idx.reshape(-1)].add((zl * w).reshape(-1), mode="drop")
+
+    if coarse is None:
+        return locals_
+
+    def coarse_(r):
+        rc = jax.ops.segment_sum(r, pat.part, num_segments=p)
+        return (coarse @ rc)[pat.part]
+
+    if mv is None:
+        return lambda r: coarse_(r) + locals_(r)
+
+    def hybrid(r):  # coarse first, then the local solves on the remaining residual (Toselli & Widlund 2.4)
+        z = coarse_(r)
+        z = z + locals_(r - mv(z))
+        return z + coarse_(r - mv(z)) if not restricted else z
+
+    return hybrid

@@ -66,7 +66,7 @@ class PrecondApplier:
     callable preconditioner (no ``.T``) still works: callers fall back to reusing ``M``.
     """
 
-    __slots__ = ("_fwd", "_t", "low_precision")
+    __slots__ = ("_fwd", "_t", "low_precision", "nonsymmetric")
 
     def __init__(self, fwd, t=None, *, low_precision=False):
         self._fwd = fwd
@@ -74,6 +74,8 @@ class PrecondApplier:
         # Applied in a lower precision than the solve (``float32=True`` on the spec): its rounding makes it
         # only APPROXIMATELY symmetric and linear, which `jno.solve.cg` answers with flexible CG.
         self.low_precision = low_precision
+        # A deliberately non-symmetric preconditioner (restricted Schwarz): `jno.solve.cg` needs flexible CG.
+        self.nonsymmetric = False
 
     def __call__(self, v):
         return self._fwd(v)

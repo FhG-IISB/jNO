@@ -55,6 +55,7 @@ __all__ = [
     "gmg",
     "nystrom",
     "fsai",
+    "schwarz",
 ]
 
 
@@ -2944,6 +2945,104 @@ def _representative_operator(fem):
             return None  # a parametric / transient signature this probe does not know; build on first use
         return J if hasattr(J, "todense") else None
     return None
+
+
+class _Schwarz(_Spec):
+    """Spec for the algebraic overlapping Schwarz preconditioner; see :func:`schwarz`."""
+
+    def __init__(self, parts, overlap, coarse, restricted):
+        self.parts, self.overlap, self.coarse, self.restricted = parts, overlap, coarse, restricted
+        self._pattern = None
+
+    @property
+    def traceable(self):
+        return self._pattern is not None
+
+    @property
+    def key(self):
+        return None if self._pattern is None else (type(self), id(self._pattern), self.coarse, self.restricted)
+
+    def build(self, A) -> "_Schwarz":
+        """Eager symbolic setup (partition, overlap, index tables) from a CONCRETE operator; any operator with
+        the same sparsity pattern reuses it."""
+        from .utils.solver.schwarz import schwarz_pattern
+        from .utils.solver.solver_api import LinearOperator
+
+        if isinstance(A, LinearOperator):
+            A = A.bcoo if A.bcoo is not None else A.dense()
+        n = int(A.shape[0])
+        parts = self.parts if self.parts is not None else max(1, -(-n // 256))
+        pat = schwarz_pattern(A, parts=parts, overlap=self.overlap)
+        need = pat.p * pat.m * pat.m * jnp.dtype(A.dtype).itemsize
+        dev = jax.devices()[0]
+        cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
+        if cap and need > 0.25 * cap:
+            raise ValueError(
+                f"jno.precond.schwarz(parts={pat.p}, overlap={self.overlap}): the local problems are solved "
+                f"exactly with dense LU, {pat.p} blocks of {pat.m}x{pat.m} = {need / 2**30:.1f} GiB -- over a "
+                f"quarter of this device's memory. Use more parts (smaller blocks), overlap=0/1, or float32=True."
+            )
+        self._pattern = pat
+        return self
+
+    def prepare(self, fem):
+        if self._pattern is None and fem is not None:
+            A = _representative_operator(fem)
+            if A is not None:
+                self.build(A)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.schwarz import schwarz_apply, schwarz_factor
+
+        A = ctx.A.bcoo
+        if A is None:
+            raise TypeError(
+                "jno.precond.schwarz() needs the ASSEMBLED operator (its graph and entries), but this solve only "
+                "has a matvec. Use an assembled path, or jno.precond.chebyshev() / nystrom()."
+            )
+        if self._pattern is None:
+            if isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+                raise TypeError(
+                    "jno.precond.schwarz(): the operator arrived traced and no partition was built yet. Build it "
+                    "eagerly: spec = jno.precond.schwarz(); spec.build(fem.A)."
+                )
+            self.build(A)
+        factors = schwarz_factor(self._pattern, A, coarse=self.coarse)
+        fwd = schwarz_apply(self._pattern, factors, restricted=self.restricted, mv=ctx.A.mv if self.coarse else None)
+        applier = PrecondApplier(fwd)
+        applier.nonsymmetric = self.restricted
+        return applier
+
+    def __repr__(self):
+        return (
+            f"jno.precond.schwarz(parts={self.parts}, overlap={self.overlap}, coarse={self.coarse}, "
+            f"restricted={self.restricted}, built={self._pattern is not None})"
+        )
+
+
+def schwarz(
+    *, parts: int | None = None, overlap: int = 1, coarse: bool = True, restricted: bool = False, float32: bool = False
+) -> _Schwarz:
+    """**Overlapping Schwarz** domain decomposition, algebraic: built from the assembled operator alone, so it
+    applies to any FEM/FDM system (Toselli & Widlund, *Domain Decomposition Methods*, 2005; restricted variant:
+    Cai & Sarkis, SIAM J. Sci. Comput. 21(2), 1999; coarse space: Nicolaides, SIAM J. Numer. Anal. 24(2), 1987).
+
+    The unknowns are split into ``parts`` pieces by recursive bisection of the operator's graph (default: one
+    part per ~256 unknowns), each grown by ``overlap`` layers of neighbours; every local problem is solved
+    exactly (batched dense LU). ``coarse=True`` adds the two-level coarse correction (one constant per part,
+    applied in the balanced hybrid form), which is what keeps the iteration count from growing with the number
+    of parts. ``restricted=True`` is RAS -- usually fewer iterations, but non-symmetric (use bicgstab/gmres;
+    ``cg`` switches to flexible CG); the default is the symmetric additive form, fit for ``cg``.
+
+    Works best for elliptic, positive-definite problems (diffusion, elasticity, implicit time steps); a
+    piecewise-constant coarse space does not capture elasticity's rigid-body modes, and indefinite problems
+    (Helmholtz, saddle points as a whole) are outside what Schwarz handles robustly.
+    """
+    if parts is not None and (isinstance(parts, bool) or not isinstance(parts, int) or parts < 1):
+        raise ValueError(f"jno.precond.schwarz(parts={parts!r}): must be a positive int or None.")
+    if isinstance(overlap, bool) or not isinstance(overlap, int) or overlap < 0:
+        raise ValueError(f"jno.precond.schwarz(overlap={overlap!r}): must be an int >= 0.")
+    return _precision(_Schwarz(parts, overlap, bool(coarse), bool(restricted)), float32)
 
 
 def fsai(*, power: int = 1, float32: bool = False) -> _FSAI:
