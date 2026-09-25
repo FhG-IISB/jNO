@@ -259,16 +259,19 @@ def test_direct_linear_slot_with_an_explicit_matrix_free_newton_is_refused():
     """An explicit matrix-free ``nonlinear=`` with a direct ``linear=`` is contradictory, and says so
     instead of failing six frames deep inside the Krylov loop."""
     with pytest.raises(ValueError, match="DIRECT solver and needs the assembled tangent"):
-        _nonlinear().solve(nonlinear=jno.solve.newton(), linear=jno.solve.lu())
+        _nonlinear().solve(nonlinear=jno.solve.newton(direct=False), linear=jno.solve.lu())
 
 
 def test_iterative_linear_slot_still_takes_the_matrix_free_path():
-    """Only a DIRECT linear slot changes the driver: an iterative one leaves the matrix-free Newton
-    (and its ``wants_jacobian`` flag) exactly as before."""
+    """Only a DIRECT linear slot changes the driver: an iterative one leaves an explicitly matrix-free
+    Newton (and its ``wants_jacobian`` flag) exactly as it was. The DEFAULT Newton takes the assembled
+    tangent whenever one is offered, so it wants it either way."""
     from jno.utils.solver.solver_api import compose_nonlinear_solve_fn
 
-    assert compose_nonlinear_solve_fn(None, jno.solve.bicgstab(), None, None).wants_jacobian is False
-    assert compose_nonlinear_solve_fn(None, None, None, None).wants_jacobian is False
+    free = jno.solve.newton(direct=False)
+    assert compose_nonlinear_solve_fn(free, jno.solve.bicgstab(), None, None).wants_jacobian is False
+    assert compose_nonlinear_solve_fn(free, None, None, None).wants_jacobian is False
+    assert compose_nonlinear_solve_fn(None, jno.solve.bicgstab(), None, None).wants_jacobian is True
     assert compose_nonlinear_solve_fn(None, jno.solve.lu(), None, None).wants_jacobian is True
     u = np.asarray(_nonlinear().solve(linear=jno.solve.bicgstab(tol=1e-12)))
     assert np.abs(u - np.asarray(_nonlinear().solve())).max() < 1e-7
@@ -348,11 +351,12 @@ def test_nonlinear_slot_on_linear_problem_raises():
 
 
 def test_jacobi_on_matrix_free_nonlinear_raises():
-    """precond= composes with the nonlinear path (materialized per linearization against the JVP
+    """(Explicitly matrix-free Newton; the default assembles the tangent and jacobi then composes.)
+    precond= composes with the nonlinear path (materialized per linearization against the JVP
     operator) — but jacobi needs the assembled diagonal, which a matvec-only operator lacks."""
     fem = _nonlinear()
     with pytest.raises(TypeError, match="matvec-only"):
-        fem.solve(nonlinear=jno.solve.newton(), precond=jno.precond.jacobi())
+        fem.solve(nonlinear=jno.solve.newton(direct=False), precond=jno.precond.jacobi())
 
 
 # NOTE: the former ``test_complex_transient_slots_raise`` is gone. A complex transient is now assembled

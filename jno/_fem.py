@@ -1273,12 +1273,16 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
         return f"{name} + {_nm(precond, 'jacobi')}"
 
     mode = fem_obj._mode
+    # The default Newton runs on the assembled tangent whenever the assembler provides one (newton_default).
+    _assembled = getattr(getattr(fem_obj, "_op", None), "jacobian", None) is not None
+    _newton = "newton (assembled tangent)" if _assembled else "newton-krylov (JFNK)"
     if mode == "transient":
         step = _nm(time, "theta(1) backward-Euler")
-        inner = _nm(nonlinear, "newton-krylov") if not fem_obj.is_linear else _lin()
+        inner = _nm(nonlinear, _newton) if not fem_obj.is_linear else _lin()
         return f"solve: transient · {step} · per step {inner}"
     if mode == "nonlinear":
-        return f"solve: nonlinear · {_nm(nonlinear, 'newton-krylov (JFNK)')} · inner {_lin()}"
+        default_inner = "bicgstab (assembled)" if _assembled and nonlinear is None else "bicgstab (matrix-free)"
+        return f"solve: nonlinear · {_nm(nonlinear, _newton)} · inner {_lin(default_inner)}"
     return f"solve: {mode} · {_lin()}"
 
 
@@ -3029,6 +3033,16 @@ class FEM:
             # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
             # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
             # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
+            if solve_fn is None or (getattr(solve_fn, "cache_key", None) is not None and precond is None):
+                # jNO's own solvers (the default, or one composed from the slots) have a value identity, so
+                # the solve is compiled once and reused: evaluated lazily, every call re-staged the Newton
+                # `while_loop` and `custom_root` and ran each residual op by op -- measured 2.3 s per warm
+                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%.
+                return self._op.solve(solve_fn, values={}, **kwargs)
+            # A user `solve_fn=` has no identity to cache on (a fresh lambda per call would recompile every
+            # time) and may do things that need concrete values, so it keeps running eagerly. So does a
+            # `precond=`: it can hold state built from concrete values (a hierarchy, a Picard-lagged form
+            # refreshed from the entry iterate) that a cached compiled solve would silently keep stale.
             return self._op.solve(solve_fn, **kwargs).fn()
         if self._mode == "transient" and self.is_complex and not self._op.runtime_parameter_exprs:
             # Non-parametric COMPLEX transient: return the concrete complex trajectory eagerly, exactly as

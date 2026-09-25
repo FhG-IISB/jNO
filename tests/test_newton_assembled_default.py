@@ -125,3 +125,31 @@ def test_a_nonlinear_transient_march_defaults_to_the_assembled_tangent():
     ref = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=False)).fn())
     assert np.abs(traj).max() > 1e-2
     np.testing.assert_allclose(traj, ref, rtol=1e-7, atol=1e-10)
+
+
+def test_the_plain_solve_is_compiled_once_and_reused(monkeypatch):
+    """A non-parametric nonlinear ``fem.solve()`` used to re-stage Newton on every call (eager)."""
+    fem = _nonlinear()
+    op = fem.operator
+    traces = {"n": 0}
+    orig = op.residual
+
+    def counting(*a, **k):
+        if isinstance(a[0], jax.core.Tracer):
+            traces["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(op, "residual", counting)
+    u1 = _leaf(fem.solve())
+    n_first = traces["n"]
+    u2 = _leaf(fem.solve())
+    assert n_first > 0 and traces["n"] == n_first, "the second solve re-traced the residual"
+    np.testing.assert_allclose(u1, u2, rtol=1e-12, atol=1e-15)  # GPU scatter-add order: last-bit only
+    assert fem.stats["nonlinear"]["converged"] and fem.stats["nonlinear"]["steps"] >= 2
+
+
+def test_the_compiled_solve_still_refuses_a_stalled_newton():
+    fem = _nonlinear()
+    with pytest.raises(RuntimeError, match="did not converge in max_steps=1"):
+        fem.solve(nonlinear=jno.solve.newton(max_steps=1))
+    assert fem.stats["nonlinear"]["converged"] is False and fem.stats["nonlinear"]["steps"] == 1

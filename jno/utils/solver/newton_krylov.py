@@ -39,6 +39,29 @@ _EPS = 1e-300
 LAST_NEWTON_STATS: dict = {}
 
 
+#: While a compiled solve is being traced by :func:`compiled_with_verdicts`, the drivers' convergence
+#: checks hand their (traced) residual norms here instead of silently skipping, so the verdict can be
+#: made on the compiled result. ``None`` everywhere else.
+_TRACED_VERDICTS: list | None = None
+
+
+def _judge(rn, bound, *, rtol, atol, max_steps, who, steps, factorizations=None):
+    """Record the outcome in :data:`LAST_NEWTON_STATS` and raise if the loop left on its step cap."""
+    LAST_NEWTON_STATS.clear()
+    LAST_NEWTON_STATS.update(
+        driver=who, residual=rn, bound=bound, steps=steps, converged=bool(math.isfinite(rn) and rn <= bound)
+    )
+    if factorizations is not None:
+        LAST_NEWTON_STATS["factorizations"] = int(factorizations)
+    if not math.isfinite(rn) or rn > bound:
+        raise RuntimeError(
+            f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
+            f"tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, rtol={rtol:g}). The last "
+            "iterate is NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
+            "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0."
+        )
+
+
 def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, factorizations=None):
     """Raise (eagerly) if the Newton loop returned on its STEP CAP rather than on the tolerance.
 
@@ -49,35 +72,105 @@ def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, fac
     already refuses to do that (``_fem._residual_check`` / ``solver_api._maybe_residual_check``); the
     nonlinear path had no equivalent, which is the gap this closes.
 
-    No-op under ``jit``/``vmap``/``grad``: the test needs a concrete residual, so it would both force a
+    Under ``jit``/``vmap``/``grad`` the test needs a concrete residual, so it would both force a
     device->host sync and fail to concretise. Same guard, and same trade, as the two linear checks --
-    under a transform the solver's own iteration cap is all there is.
+    under a transform the solver's own iteration cap is all there is. The exception is a solve compiled
+    by :func:`compiled_with_verdicts`: there the norms leave the compiled program as outputs and the
+    same judgement is made on them afterwards.
     """
     if any(isinstance(v, jax.core.Tracer) for v in (u, u0)):
+        # Only a check made directly in the compiled solve's own trace: one inside an inner trace (a driver
+        # called in a `scan` / `while_loop` body) holds tracers that cannot leave it, and keeps the old
+        # behaviour -- the iteration cap is all there is.
+        if _TRACED_VERDICTS is not None and getattr(u, "_trace", None) is _TRACED_VERDICTS[0]:
+            _TRACED_VERDICTS.append(
+                dict(
+                    rn=jnp.linalg.norm(f0(u)),
+                    r0=jnp.linalg.norm(f0(u0)),
+                    steps=None if steps is None else jnp.asarray(steps),
+                    factorizations=None if factorizations is None else jnp.asarray(factorizations),
+                    rtol=rtol,
+                    atol=atol,
+                    max_steps=max_steps,
+                    who=who,
+                )
+            )
         return u
     r, r0 = f0(u), f0(u0)
     if any(isinstance(v, jax.core.Tracer) for v in (r, r0)):  # a concrete root of a residual under `grad`
         return u
     rn = float(jnp.linalg.norm(r))
     bound = atol + rtol * float(jnp.linalg.norm(r0))
-    LAST_NEWTON_STATS.clear()
-    LAST_NEWTON_STATS.update(
-        driver=who,
-        residual=rn,
-        bound=bound,
+    _judge(
+        rn,
+        bound,
+        rtol=rtol,
+        atol=atol,
+        max_steps=max_steps,
+        who=who,
         steps=None if steps is None or isinstance(steps, jax.core.Tracer) else int(steps),
-        converged=bool(math.isfinite(rn) and rn <= bound),
+        factorizations=None
+        if factorizations is None or isinstance(factorizations, jax.core.Tracer)
+        else int(factorizations),
     )
-    if factorizations is not None and not isinstance(factorizations, jax.core.Tracer):
-        LAST_NEWTON_STATS["factorizations"] = int(factorizations)
-    if not math.isfinite(rn) or rn > bound:
-        raise RuntimeError(
-            f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
-            f"tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, rtol={rtol:g}). The last "
-            "iterate is NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
-            "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0."
-        )
     return u
+
+
+def compiled_with_verdicts(fn):
+    """``jax.jit(fn)`` for a solve that must keep the drivers' eager convergence check.
+
+    Running a Newton driver eagerly re-stages its ``while_loop`` and ``custom_root`` on every call and
+    evaluates every residual outside the loop op by op: measured on a 3-D P1 nonlinear Poisson problem
+    (87k DOF, RTX 3070) that was 2.3 s per warm ``fem.solve()`` against ~0.3 s of GPU work. Compiled, the
+    check would silently switch off, so the drivers' residual norms and step counts become extra outputs
+    of the compiled program and :func:`judge_verdicts` makes the same judgement on them. Returns a
+    function ``(*args) -> (fn(*args), verdicts)``.
+    """
+
+    static: list = []  # tolerances and driver names, fixed per trace; only the norms are traced outputs
+
+    def _traced(*args):
+        global _TRACED_VERDICTS
+        from jax._src import core as _core
+
+        # Slot 0 is the trace this solve is staged in; the verdicts follow it.
+        prev, _TRACED_VERDICTS = _TRACED_VERDICTS, [_core.trace_ctx.trace]
+        try:
+            out = fn(*args)
+            found = _TRACED_VERDICTS[1:]
+            static[:] = [{k: v[k] for k in ("rtol", "atol", "max_steps", "who")} for v in found]
+            for m, v in zip(static, found):
+                m["steps"] = v["steps"] is not None
+                m["factorizations"] = v.get("factorizations") is not None
+            return out, [(v["rn"], v["r0"], v["steps"], v.get("factorizations")) for v in found]
+        finally:
+            _TRACED_VERDICTS = prev
+
+    jitted = jax.jit(_traced)
+
+    def run(*args):
+        out, norms = jitted(*args)
+        return out, [
+            dict(m, rn=rn, r0=r0, steps=k if m["steps"] else None, factorizations=f if m["factorizations"] else None)
+            for m, (rn, r0, k, f) in zip(static, norms)
+        ]
+
+    return run
+
+
+def judge_verdicts(verdicts):
+    """Apply :func:`_convergence_check`'s judgement to the norms a compiled solve returned."""
+    for v in verdicts:
+        _judge(
+            float(v["rn"]),
+            v["atol"] + v["rtol"] * float(v["r0"]),
+            rtol=v["rtol"],
+            atol=v["atol"],
+            max_steps=v["max_steps"],
+            who=v["who"],
+            steps=None if v["steps"] is None else int(v["steps"]),
+            factorizations=None if v.get("factorizations") is None else int(v["factorizations"]),
+        )
 
 
 def _retreat(accept, *, hi, lo, max_halvings, dtype):
