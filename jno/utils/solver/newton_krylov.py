@@ -515,7 +515,8 @@ def newton_krylov(
         return _retreat(_armijo(f, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
     def solve(f, x0):
-        r0n = jnp.linalg.norm(f(x0))
+        r_start = f(x0)
+        r0n = jnp.linalg.norm(r_start)
 
         def cond(state):
             _, r, k = state
@@ -529,15 +530,21 @@ def newton_krylov(
             u = u + alpha * delta
             return u, f(u), k + 1
 
-        u, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
-        return u
+        u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+        # Diagnostics ride out of custom_root as AUX (never differentiated): the step count for
+        # `fem.stats`, and the two norms the convergence check would otherwise re-evaluate.
+        # The count as a FLOAT: custom_root's JVP gives integer aux an int zero tangent, not float0, and
+        # then rejects it ("Custom JVP rule must produce primal and tangent outputs ... expecting float0").
+        return u, (k.astype(r0n.dtype), jnp.linalg.norm(r), r0n)
 
     tangent_solve = lambda g, y: inner_tangent(g, y)
-    root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
+    root, (steps, rn, r0n) = jax.lax.custom_root(f0, u0, solve, tangent_solve, has_aux=True)
     # Checked OUTSIDE custom_root: everything inside `solve` is traced, so an in-loop guard could
     # never concretise. Here `root` is concrete whenever the caller was eager, which is exactly when
     # the check can do any good.
-    return _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_krylov")
+    return _convergence_check(
+        f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_krylov", steps=steps, norms=(rn, r0n)
+    )
 
 
 def assembled_krylov_solve(tol=1e-10, maxit=2000):
@@ -970,7 +977,8 @@ def staggered_newton(
         return damping * _bisect_slope(f, x, dx, atol=atol, rtol=ls_c, max_iters=ls_max, dtype=x.dtype)
 
     def solve(f, x0):
-        r0n = jnp.linalg.norm(f(x0))
+        r_start = f(x0)
+        r0n = jnp.linalg.norm(r_start)
 
         def cond(state):
             _u, r, k = state
@@ -981,8 +989,9 @@ def staggered_newton(
             u = _sweep(u)
             return u, f(u), k + 1
 
-        u, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
-        return u
+        u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+        # aux: sweeps (as a float -- see newton_krylov) + the norms the convergence check needs
+        return u, (k.astype(r0n.dtype), jnp.linalg.norm(r), r0n)
 
     if direct:
         # Same shape as `newton_direct`: run the sweep undifferentiated, then hang `custom_root` off the
@@ -990,7 +999,7 @@ def staggered_newton(
         # FULL assembled Jacobian. The alternating structure is absent from the derivative either way --
         # the implicit-function theorem does not care how the root was reached — but a direct tangent is
         # the consistent choice here: the caller picked a direct slot precisely because Krylov stalls.
-        root_val = solve(f0, u0)
+        root_val, (steps, rn, r0n) = solve(f0, u0)
 
         def _tangent(g, y):
             J = jacobian(root_val)
@@ -1001,5 +1010,7 @@ def staggered_newton(
         root = jax.lax.custom_root(f0, root_val, lambda _f, _x0: root_val, _tangent)
     else:
         tangent_solve = lambda g, y: inner_tangent(g, y)  # noqa: E731
-        root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
-    return _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_sweeps, who="staggered")
+        root, (steps, rn, r0n) = jax.lax.custom_root(f0, u0, solve, tangent_solve, has_aux=True)
+    return _convergence_check(
+        f0, u0, root, rtol=rtol, atol=atol, max_steps=max_sweeps, who="staggered", steps=steps, norms=(rn, r0n)
+    )

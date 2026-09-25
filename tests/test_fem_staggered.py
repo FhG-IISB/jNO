@@ -538,3 +538,10 @@ def test_there_is_exactly_one_armijo_implementation():
     assert src.count("1.0 - ls_c") == 1, "the Armijo predicate is written more than once — reuse `_armijo`"
     assert src.count("jax.lax.while_loop(cond, body") >= 1
     assert src.count("def _retreat(") == 1, "there must be exactly one retreat helper"
+
+
+def test_staggered_reports_its_sweep_count():
+    fem, a, b = _convex_pair()
+    fem.solve(nonlinear=jno.solve.staggered([a, b]))
+    st = fem.stats["nonlinear"]
+    assert st["converged"] and isinstance(st["steps"], int) and st["steps"] >= 2

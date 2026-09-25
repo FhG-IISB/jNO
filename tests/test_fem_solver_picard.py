@@ -188,3 +188,11 @@ def test_lag_freezes_gradients_but_not_values():
     ui = u.bind(x=xi, y=yi)
     lagged = jno.lag(1.0 + ui**2)
     assert hasattr(lagged, "_expr") or hasattr(lagged, "op_id")
+
+
+def test_picard_reports_its_step_count():
+    """The fixed-point drivers used to report steps=None; the count now rides out of custom_root as aux."""
+    fem = _nonlinear_diffusion(lagged=True)
+    fem.solve(nonlinear=jno.solve.picard())
+    st = fem.stats["nonlinear"]
+    assert st["converged"] and isinstance(st["steps"], int) and st["steps"] >= 2
