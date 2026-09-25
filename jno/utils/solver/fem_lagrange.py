@@ -352,6 +352,7 @@ def identity_pushforward(
     ref_grads: jnp.ndarray,
     J: jnp.ndarray,
     detJ: jnp.ndarray,
+    K: jnp.ndarray | None = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Isoparametric push-forward of scalar Lagrange basis data to a physical cell.
 
@@ -374,7 +375,8 @@ def identity_pushforward(
     phi       : ``(n_quad, n_dof)``  physical shape values (``= ref_values[..., 0]``).
     dphi_phys : ``(n_quad, n_dof, tdim)``  physical gradients ``∂φ/∂x``.
     """
-    K = small_inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
+    if K is None:  # a caller with a static mesh passes its cached J⁻¹ (see fem_native `_static_geometry`)
+        K = small_inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
     phi = ref_values[..., 0]  # (n_quad, n_dof)
     dphi_ref = ref_grads[..., 0, :]  # (n_quad, n_dof, tdim)
     # One inverse per quadrature point when the geometry is curved; one for the whole cell when affine.

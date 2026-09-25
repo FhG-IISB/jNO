@@ -1945,6 +1945,31 @@ def assemble_fem_native(
                 pts = pts.at[_ids, _axis].set(jnp.asarray(args[_name], dtype=pts.dtype).reshape(-1))
         return pts
 
+    _geo_cache: list = []
+    # Only where the residual and tangent are evaluated at EVERY step of a march (a `time=` or `tau=` grid):
+    # measured on a 46k-DOF nonlinear 3-D heat march, first march 5.14 -> 4.30 s and every later one
+    # 2.06 -> 1.75 s. A single steady solve gains 6% warm but compiles 0.6 s longer, so it is left alone.
+    _geo_cache_on = getattr(domain, "time", None) is not None
+
+    def _static_geometry():
+        """``(J⁻¹, det J)`` of every affine cell of the BAKED mesh, computed once and reused by every residual
+        and tangent evaluation of a march (``_geo_cache_on``). Recomputing the inverse per call was ~1 ms of a
+        5.8 ms residual on a 491k-cell 3-D P1 mesh. Costs ``(dim² + 1)`` numbers per cell (80 bytes in 3-D). Built under
+        ``ensure_compile_time_eval`` so the first request -- usually inside a trace -- computes it eagerly,
+        with exactly the arithmetic of the per-call path (the values are bitwise the same)."""
+        if not _geo_cache:
+
+            def build(P, C):
+                verts = P[C]  # (n_cell, dim+1, dim)
+                Jall = jnp.stack([verts[:, i + 1] - verts[:, 0] for i in range(dim)], axis=2)
+                return small_inv(Jall), small_det(Jall)
+
+            # ONE compiled program, run eagerly: op by op, each primitive compiled on its own and cost ~0.8 s
+            # of cold start on a 491k-cell mesh.
+            with jax.ensure_compile_time_eval():
+                _geo_cache.append(jax.jit(build)(pts_j, cells_j))
+        return _geo_cache[0]
+
     def _cell_fields(c, cell_sols, pts=pts_j, cells=None, cells_f=None):
         """Per-field ``(phi, dphi_phys, cell_sol)`` and shared ``(xq, meas)`` for cell c.
 
@@ -1958,6 +1983,7 @@ def assemble_fem_native(
         reconnecting march overrides them per-eval so an edge flip needs no new program."""
         cells = cells_j if cells is None else cells
         cells_f = cells_f_j if cells_f is None else cells_f
+        K_cell = None  # the cached J⁻¹ when the static-geometry path applies
         if _nonaffine:
             # x(ξ) = Σ_a x_a N_a(ξ) over the geometry nodes, so J_dn(ξ) = Σ_a x_a[d] ∂N_a/∂ξ_n is a
             # function of ξ. Everything downstream that was one number per cell -- detJ, the
@@ -1971,13 +1997,19 @@ def assemble_fem_native(
         else:
             verts = pts[cells[c]]  # (dim+1, dim)
             J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
-            detJ = small_det(J)
             xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
+            # The baked mesh (no trainable coordinates, no runtime connectivity -- both hand in OTHER arrays):
+            # its inverse and determinant are cached. Anything else recomputes them from these vertices.
+            if _geo_cache_on and pts is pts_j and cells is cells_j:
+                K_all, det_all = _static_geometry()
+                K_cell, detJ = K_all[c], det_all[c]
+            else:
+                detJ = small_det(J)
         meas = jnp.abs(detJ)  # scalar (affine) or (n_quad,) (curved)
 
         per = []
         for i in range(len(fields)):
-            phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ)
+            phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ, K_cell)
             if _cblk[i] > 1:
                 # Enrich in PHYSICAL coordinates -- h_i(ξ)(ξ - ξ_i) would be discontinuous across a
                 # shared face, because the two cells disagree about ξ. Tagged "Lagrange" below so
