@@ -410,6 +410,217 @@ class _SDIRKScheme(_TimeScheme):
         return f"jno.solve.sdirk(order={self.order})"
 
 
+def _rosenbrock_tableau(method):
+    """Standard-form Rosenbrock coefficients ``(a, g, b, order)`` (Hairer & Wanner II, Sec. IV.7, eq. (7.4)):
+    ``a`` strictly lower (stage points), ``g`` lower with the constant diagonal ``gamma`` (Jacobian couplings).
+
+    * ``ros34pw2`` -- Rang & Angermann, BIT Numer. Math. 45 (2005) 761-787: 4 stages, order 3, stiffly
+      accurate (``b`` is the last row of ``a + g``), L-stable, a W-method (an approximate Jacobian keeps the
+      order) and consistent for index-1 DAEs, i.e. algebraic (zero-mass) rows.
+    * ``ros2`` -- 2 stages, order 2, L-stable with ``gamma = 1 + 1/sqrt(2)`` (Verwer, Spee, Blom & Hundsdorfer,
+      SIAM J. Sci. Comput. 20(4), 1999): ``a21 = 1``, ``g21 = -2 gamma``, ``b = (1/2, 1/2)`` -- the standard-form
+      solution of the order conditions ``sum b = 1``, ``b2 (a21 + g21) = 1/2 - gamma``. Not stiffly accurate.
+    """
+    import numpy as np
+
+    if method == "ros34pw2":
+        g0 = 4.3586652150845900e-01
+        a = np.array(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [8.7173304301691801e-01, 0.0, 0.0, 0.0],
+                [8.4457060015369423e-01, -1.1299064236484185e-01, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ]
+        )
+        g = np.array(
+            [
+                [g0, 0.0, 0.0, 0.0],
+                [-8.7173304301691801e-01, g0, 0.0, 0.0],
+                [-9.0338057013044082e-01, 5.4180672388095326e-02, g0, 0.0],
+                [2.4212380706095346e-01, -1.2232505839045147e00, 5.4526025533510214e-01, g0],
+            ]
+        )
+        b = np.array([2.4212380706095346e-01, -1.2232505839045147e00, 1.5452602553351020e00, 4.3586652150845900e-01])
+        return a, g, b, 3
+    if method == "ros2":
+        gam = 1.0 + 1.0 / np.sqrt(2.0)
+        return np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([[gam, 0.0], [-2.0 * gam, gam]]), np.array([0.5, 0.5]), 2
+    raise ValueError(f"jno.solve.rosenbrock(method={method!r}): method must be 'ros34pw2' or 'ros2'.")
+
+
+class _RosenbrockScheme(_TimeScheme):
+    """Linearly implicit Rosenbrock(-W) time scheme; see :func:`jno.solve.rosenbrock`.
+
+    With ``R`` the block's residual (``M u' = -R(u, t)``) and ``J = dR/du`` at the step's start, every stage is
+    ONE linear solve with the same matrix ``W = M + gamma h J``:
+
+        ``W k_i = -h R(t_n + alpha_i h, u_n + sum_j a_ij k_j) - h J sum_{j<i} g_ij k_j - gamma_i h^2 R_t``,
+        ``u_{n+1} = u_n + sum_i b_i k_i``,
+
+    ``alpha_i = sum_j a_ij``, ``gamma_i = sum_{j<=i} g_ij`` -- no Newton loop at all.
+    """
+
+    needs_linear_step = True  # a nonlinear block still gets a LINEAR step solve (see compose_transient_step_solvers)
+
+    def __init__(self, method):
+        self.method = method
+        self.a, self.g, self.b, self.order = _rosenbrock_tableau(method)
+        self.gamma = float(self.g[0, 0])
+        self.alpha = self.a.sum(axis=1)
+        self.gsum = self.g.sum(axis=1)
+
+    @property
+    def step_order(self):
+        return self.order
+
+    def step_scales(self, block):
+        return (self.gamma * float(block.dt),)
+
+    def _refuse(self, block):
+        md = block.metadata or {}
+        if md.get("second_order"):
+            raise NotImplementedError(
+                f"{self!r}: a second-order-in-time (u_tt) block must NOT be damped, and this scheme is L-stable. "
+                "Use the block's own scheme, or jno.solve.theta(0.5)."
+            )
+        if getattr(block, "mass_residual", None) is not None:
+            raise NotImplementedError(
+                f"{self!r}: a state-dependent mass c(u) u_t needs the dM/du term a linearly implicit scheme does "
+                "not carry. Use jno.solve.sdirk() or bdf2(), which treat it by a Newton solve per stage."
+            )
+
+    def _pieces(self, blk, args):
+        """``(R(u, t), J(u, t) -> BCOO | None, M(t))`` for a linear or a nonlinear block."""
+        import jax.numpy as jnp
+
+        from .linear import sparse_matvec
+
+        if blk.is_nonlinear():
+            return (
+                lambda u, t: jnp.asarray(blk.residual(u, t, args)).reshape(-1),
+                (lambda u, t: blk.jacobian(u, t, args)) if blk.jacobian is not None else None,
+                lambda t: blk.mass(t, args),
+            )
+        def A_of(t):
+            return blk.operator_fn(t, args) if blk.operator_fn is not None else blk.A
+
+        def R(u, t):
+            r = sparse_matvec(A_of(t))(u) if hasattr(A_of(t), "todense") else jnp.asarray(A_of(t)) @ u
+            if blk.affine_bias is not None:
+                r = r - jnp.asarray(blk.affine_bias, u.dtype).reshape(-1)
+            if blk.forcing_vector_fn is not None:
+                r = r - jnp.asarray(blk.forcing_vector_fn(t, args), u.dtype).reshape(-1)
+            return r
+
+        return R, (lambda u, t: A_of(t)), (lambda t: blk.mass_fn(t, args) if blk.mass_fn is not None else blk.M)
+
+    def _one_step(self, blk, u, t, h, args, linear_solve):
+        import jax
+        import jax.numpy as jnp
+
+        from .backend_blocks import _default_step_solve
+        from .linear import matrix_diagonal, sparse_matvec
+        from .solver_api import _add_step_operator
+
+        R, jac, mass = self._pieces(blk, args)
+        M = mass(t)
+        J = jac(u, t) if jac is not None else None
+        mv_M = sparse_matvec(M) if hasattr(M, "todense") else (lambda v: jnp.asarray(M) @ v)
+        if J is not None and hasattr(J, "todense"):
+            mv_J = sparse_matvec(J)
+        elif J is not None:
+            mv_J = lambda v: jnp.asarray(J) @ v  # noqa: E731
+        else:  # matrix-free tangent: a JVP of the residual
+            mv_J = lambda v: jax.jvp(lambda w: R(w, t), (u,), (v,))[1]  # noqa: E731
+        s = h * self.gamma
+        W_mv = lambda v: mv_M(v) + s * mv_J(v)  # noqa: E731
+        diag = matrix_diagonal(M) + (s * matrix_diagonal(J) if J is not None else 0.0)
+        R_t = jax.jvp(lambda tt: R(u, tt), (t,), (jnp.ones_like(t),))[1]
+        W_op = None
+        if linear_solve is not None and getattr(linear_solve, "wants_operator", False) and hasattr(J, "todense"):
+            W_op = _add_step_operator(M, J, s) if hasattr(M, "todense") else None
+        krylov = (blk.metadata or {}).get("krylov")
+
+        def solve(rhs, x0):
+            if linear_solve is None:
+                return _default_step_solve(W_mv, rhs, x0, diag, krylov=krylov)
+            kw = {}
+            if getattr(linear_solve, "wants_scale", False):
+                kw["scale"] = s
+            if W_op is not None:
+                kw["operator"] = W_op
+            return linear_solve(W_mv, rhs, x0, lambda: diag, **kw)
+
+        ks = []
+        for i in range(self.a.shape[0]):
+            Y = u
+            coupled = jnp.zeros_like(u)
+            for j in range(i):
+                if self.a[i, j] != 0.0:
+                    Y = Y + float(self.a[i, j]) * ks[j]
+                if self.g[i, j] != 0.0:
+                    coupled = coupled + float(self.g[i, j]) * ks[j]
+            rhs = -h * R(Y, t + float(self.alpha[i]) * h) - float(self.gsum[i]) * h * h * R_t
+            if i:
+                rhs = rhs - h * mv_J(coupled)
+            ks.append(solve(rhs, ks[-1] if ks else jnp.zeros_like(u)))
+        out = u
+        for i, k in enumerate(ks):
+            out = out + float(self.b[i]) * k
+        return out
+
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        self._refuse(block)
+        return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve)
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        from .backend_blocks import _cached_march, _resample_trajectory, hoist_time_invariant
+        from .matvec_format import prime
+
+        self._refuse(block)
+        if nonlinear_solve is not None:
+            raise ValueError(f"{self!r} is linearly implicit: there is no Newton solve for nonlinear= to drive.")
+        prime(block.M, getattr(block, "A", None))
+        _s0f = getattr(block, "state0_fn", None)
+        s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
+        dtype = s0.dtype
+        dt = float(block.dt)
+        t0, t1 = float(block.t0), float(block.t1)
+        grid_ts = jnp.asarray(np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1), dtype)
+
+        def march(s0, grid_ts, args):
+            blk = hoist_time_invariant(block, args, grid_ts[0])
+            if block.is_nonlinear():
+                if block.mass is not None and blk.mass is block.mass:
+                    raise NotImplementedError(
+                        f"{self!r}: the mass matrix depends on time, which a linearly implicit scheme would need an "
+                        "M'(t) u term for. Use jno.solve.sdirk() or bdf2()."
+                    )
+            elif block.mass_fn is not None and blk.mass_fn is block.mass_fn:
+                raise NotImplementedError(
+                    f"{self!r}: the mass matrix depends on time (or on a parameter), which a linearly implicit "
+                    "scheme would need an M'(t) u term for. Use jno.solve.sdirk() or bdf2()."
+                )
+
+            def step(u, t_next):
+                un = self._one_step(blk, u, t_next - dt, dt, args, linear_solve)
+                return un, un
+
+            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+
+        ys = _cached_march(block, (linear_solve, repr(self), dt), march, s0, grid_ts, args)
+        traj = jnp.concatenate([s0[None, :], ys], axis=0)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+    def __repr__(self):
+        return f"jno.solve.rosenbrock(method={self.method!r})"
+
+
 class _AdaptiveScheme(_TimeScheme):
     """Step-size **policy** wrapping a base scheme — step-doubling (Richardson) error control on that
     scheme's implicit step, so it inherits the block's DAE handling and works for a linear or nonlinear

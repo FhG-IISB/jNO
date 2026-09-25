@@ -1325,6 +1325,7 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
       time-dependent ``operator_fn(t, args)`` falls back to per-step materialization against a
       matvec-only operator that still exposes the exact step diagonal (so ``jacobi`` works).
     """
+    linear_step = bool(getattr(scheme, "needs_linear_step", False))
     if block.is_nonlinear():
         # A preconditioner that must SEE a matrix cannot be materialized in here: the per-step solve runs
         # inside the march's scan, so both the matrix-free JVP and the `direct=True` assembled tangent are
@@ -1334,8 +1335,17 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # BDF2 steps (the last of `step_scales`, which every step but the first uses).
         scales = tuple(scheme.step_scales(block)) if scheme is not None and hasattr(scheme, "step_scales") else ()
         precond = _freeze_precond_for_march(precond, fem, block, state, scale=scales[-1] if scales else None)
-        return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
-    if nonlinear is not None:
+        if not linear_step:
+            return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
+        # A LINEARLY implicit scheme (Rosenbrock) solves linear systems with the stage matrix even on a
+        # nonlinear block: it takes the linear step solve composed below, not a Newton driver.
+        if nonlinear is not None:
+            raise ValueError(
+                f"fem.solve(time={scheme!r}): this scheme is linearly implicit -- one linear solve per stage, no "
+                "Newton -- so nonlinear= has nothing to drive. Drop nonlinear=, or use jno.solve.sdirk() / "
+                "bdf2() / theta() for a Newton-per-step scheme."
+            )
+    elif nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
 
     if linear is None and precond is None:
@@ -1404,10 +1414,17 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # prebuilt preconditioner is kept: for a nearby operator it changes only the convergence speed.
         return None, (_static.get(_default_scale) or (None, None))[1]
 
-    def step_solve(matvec, rhs, x0, diag_fn, scale=None):
+    def step_solve(matvec, rhs, x0, diag_fn, scale=None, operator=None):
         op, M = _static_for(scale)
         if op is None:
-            op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
+            # `operator`: the ASSEMBLED step matrix when the scheme has one (a Rosenbrock stage matrix built
+            # from an assembled tangent) -- a direct solver can factorise it and a matrix-reading
+            # preconditioner can see it; otherwise only the matvec is known.
+            op = (
+                LinearOperator(operator)
+                if operator is not None
+                else LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
+            )
             if M is None:
                 M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         if getattr(solver, "direct", False):
@@ -1428,6 +1445,7 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     # bring-your-own solver that implements exactly that signature (caught by the moving-mesh march,
     # whose `_step_solve` takes the four documented arguments and nothing else).
     step_solve.wants_scale = True
+    step_solve.wants_operator = True
     return step_solve, None
 
 

@@ -66,6 +66,7 @@ __all__ = [
     "lstsq",
     "bdf2",
     "sdirk",
+    "rosenbrock",
     "theta",
     "exponential",
     "adaptive",
@@ -1761,6 +1762,27 @@ def sdirk(order: int = 3):
     if isinstance(order, bool) or order not in (2, 3):
         raise ValueError(f"jno.solve.sdirk(order={order!r}): order must be 2 or 3.")
     return _SDIRKScheme(order)
+
+
+def rosenbrock(method: str = "ros34pw2"):
+    """**Rosenbrock** (linearly implicit Runge-Kutta) time scheme for ``fem.solve(time=...)``: no Newton loop --
+    each stage is ONE linear solve with the same matrix ``M + gamma*dt*J`` (``J`` the tangent at the step's
+    start), so a nonlinear problem costs a fixed number of linear solves per step.
+
+    * ``"ros34pw2"`` (default) -- Rang & Angermann, BIT Numer. Math. 45 (2005): 4 stages, order 3, stiffly
+      accurate and L-stable, a W-method (order kept with an approximate tangent) and consistent for index-1
+      DAEs, so Dirichlet and algebraic (zero-mass) rows are handled.
+    * ``"ros2"`` -- 2 stages, order 2, L-stable (Verwer et al., SIAM J. Sci. Comput. 20(4), 1999); not
+      stiffly accurate, so prefer ``ros34pw2`` with algebraic rows.
+
+    Composes with ``linear=`` / ``precond=`` (the stage matrix is what they see; on a linear block with a
+    constant operator it is built once) and with ``.adaptive(...)``. Refuses what a linearly implicit form
+    cannot carry: a time-dependent or parameter-dependent mass, a state-dependent mass ``c(u) u_t``, and a
+    second-order-in-time (``u_tt``) block -- use ``sdirk()`` / ``bdf2()`` for the first two.
+    """
+    from .utils.solver.timeschemes import _RosenbrockScheme
+
+    return _RosenbrockScheme(method)
 
 
 def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):
