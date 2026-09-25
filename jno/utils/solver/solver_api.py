@@ -83,6 +83,24 @@ class PrecondApplier:
         return self if self._t is None else PrecondApplier(self._t, self._fwd, low_precision=self.low_precision)
 
 
+def _concrete_matvecs(A):
+    """For a CONCRETE plain BCOO: ``(A @ v, A^T @ v)`` in the measured-fastest storage, built once, lazily --
+    or ``None`` (not a plain BCOO, or traced: :func:`_split_matvecs` handles that at construction).
+
+    BCOO's own ``@`` is a scatter-add re-deriving its indices on every product. Inside a jitted solve a
+    concrete operator is a constant, so the index work folds away, but the scatter stays -- where CSR is
+    measured faster, every product paid the difference: a float64 Chebyshev preconditioner (8 products per
+    application) on 3-D elasticity ran 1029 ms against 344 ms once its products went through
+    ``sparse_matvec``. Built under ``ensure_compile_time_eval`` so the conversion happens once, eagerly,
+    even when the first product is requested inside a trace; the operator keeps it for its lifetime."""
+    from .linear import _plain_bcoo, sparse_matvec
+
+    if not _plain_bcoo(A) or isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+        return None
+    with jax.ensure_compile_time_eval():
+        return sparse_matvec(A), sparse_matvec(A, transpose=True)
+
+
 def _split_matvecs(A):
     """``(A @ v, A^T @ v)`` closures with the index split done now, or ``None`` to keep ``A``'s own ``@``.
 
@@ -165,6 +183,8 @@ class LinearOperator:
                 (out,) = jax.linear_transpose(self._mv, jnp.zeros_like(v))(v)
                 return out
             return self._mv(v)
+        if self._split is None and jnp.ndim(v) == 1:
+            self._split = _concrete_matvecs(self._A)
         if self._split is not None and jnp.ndim(v) == 1:
             fwd, rev = self._split
             return rev(v) if self._transposed else fwd(v)
