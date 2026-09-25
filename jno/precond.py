@@ -1351,8 +1351,9 @@ class _LSC(_Spec):
         if B is None or Bt is None or F is None:
             raise NotImplementedError(
                 "jno.precond.lsc(): the system operator is matrix-free, so the divergence and momentum "
-                "blocks cannot be extracted. Use an assembled path -- a steady linear solve, or "
-                "jno.solve.newton(direct=True)."
+                "blocks cannot be extracted. Use an assembled path -- a steady linear solve, or Newton on "
+                "the assembled tangent (jno.solve.newton(), the default, or direct=True); not "
+                "newton(direct=False)."
             )
         self._B, self._Bt, self._F = B, Bt, F
         if self._p_apply is not None:
@@ -1511,8 +1512,9 @@ def lsc(*, inner=None, scaled: bool = True, velocity=None) -> _LSC:
     whole preconditioner a fixed linear operator). ``scaled=False`` drops the mass scaling (the
     original Elman 1999 commutator) — cheaper to set up, slower to converge.
 
-    Needs an **assembled** operator: a steady linear solve, or ``jno.solve.newton(direct=True)``. A
-    matrix-free path has no blocks to slice and is refused by name. The approximation is
+    Needs an **assembled** operator: a steady linear solve, or Newton on the assembled tangent
+    (``jno.solve.newton()``, the default, or ``direct=True``). A matrix-free path
+    (``newton(direct=False)``) has no blocks to slice and is refused by name. The approximation is
     non-symmetric once convection is on, so drive it with ``gmres``/``fgmres``, not ``cg``/``minres``.
 
     Reference: Elman, Howle, Shadid, Shuttleworth & Tuminaro, *J. Comput. Phys.* **227** (2008) 1790.

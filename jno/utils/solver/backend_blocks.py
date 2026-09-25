@@ -335,7 +335,7 @@ class SemidiscreteTimeBlock:
             return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
 
         if self.is_nonlinear():
-            from .newton_krylov import newton_krylov
+            from .newton_krylov import newton_default, newton_krylov
 
             # θ-method: M(y⁺−y)/dt + θ R(y⁺) + (1−θ) R(y) = 0. θ=1 (default) is backward Euler — the
             # existing first-order behaviour; a second-order (u_tt) block sets θ=½ (trapezoidal /
@@ -383,6 +383,16 @@ class SemidiscreteTimeBlock:
 
                         return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
                     return _verdict(G, u, nonlinear_solve(G, u), report)
+                # default Newton: on the assembled step tangent when both Jacobians exist
+                if self.jacobian is not None and self.mass_residual_jac is not None:
+                    from .solver_api import _add_step_operator
+
+                    def jac_default(wn):
+                        return _add_step_operator(
+                            self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
+                        )
+
+                    return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
                 return _verdict(G, u, newton_krylov(G, u), report)
 
             M_t = _operand(self.mass(t_next, args))
@@ -411,6 +421,14 @@ class SemidiscreteTimeBlock:
 
                     return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
                 return _verdict(G, u, nonlinear_solve(G, u), report)
+            # default Newton: on the assembled step tangent M/dt + J when the assembler provides J
+            if self.jacobian is not None:
+                from .solver_api import _add_step_operator
+
+                def jac_default(wn):
+                    return _add_step_operator(self.jacobian(wn, t_next, args), M_t, 1.0 / dt)
+
+                return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
             return _verdict(G, u, newton_krylov(G, u), report)
 
         from .krylov import gmres as _scaled_gmres

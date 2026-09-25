@@ -517,7 +517,7 @@ class NonlinearSolver:
     stepper), which threads it in via ``jacobian=``.
     """
 
-    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: bool = False):
+    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: Optional[bool] = False):
         self._fn = fn
         self.name = name
         self.direct = direct
@@ -1002,8 +1002,9 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     # ``LinearSolver.direct`` is exactly the "needs an assembled operator" flag: lu, dense, amg.
     needs_assembled = bool(getattr(linear, "direct", False))
     if nonlinear is None:
-        nonlinear = _solve_ns.newton(direct=needs_assembled)
-    elif needs_assembled and not bool(getattr(nonlinear, "direct", False)):
+        # the assembled tangent by default (direct=None); a direct linear slot pins the sparse-direct mode
+        nonlinear = _solve_ns.newton(direct=True if needs_assembled else None)
+    elif needs_assembled and getattr(nonlinear, "direct", False) is False:
         raise ValueError(
             f"fem.solve: linear={getattr(linear, 'name', linear)!r} is a DIRECT solver and needs the "
             f"assembled tangent, but nonlinear={getattr(nonlinear, 'name', nonlinear)!r} linearizes "
@@ -1056,7 +1057,8 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
 
     # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller
     # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
-    _composed.wants_jacobian = bool(getattr(nonlinear, "direct", False))
+    # ``direct=None`` (newton's default) assembles the tangent whenever one is offered, so it wants it too.
+    _composed.wants_jacobian = getattr(nonlinear, "direct", False) is not False
     # An over-relaxed driver steps past its sub-solve's answer and needs the box projector to stay
     # feasible; the `bounds` wrapper is the only thing that owns one.
     _composed.wants_project = bool(getattr(nonlinear, "wants_project", False))

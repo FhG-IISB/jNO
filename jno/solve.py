@@ -499,14 +499,33 @@ def amg(
 def _root_driver(
     name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False, reuse=False
 ) -> NonlinearSolver:
-    if reuse and not direct:
+    if reuse and direct is not True:
         raise ValueError(
             f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED, factorized tangent between steps, and only "
-            f"the sparse-direct driver has one: pass direct=True as well. The matrix-free default never "
-            f"forms the tangent, so there is nothing to reuse."
+            f"the sparse-direct driver has one: pass direct=True as well. The default iterative and the "
+            f"matrix-free modes never factorize the tangent, so there is nothing to reuse."
         )
-
+    # direct: True = assembled tangent + sparse LU; None = assembled tangent + iterative inner solve when the
+    # assembler provides one, matrix-free otherwise (newton's default); False = always matrix-free.
     def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
+        if direct is None and jacobian is not None:
+            # The default: Newton on the ASSEMBLED tangent, solved iteratively -- the composed
+            # ``linear=``/``precond=`` slots if given, else Jacobi-BiCGStab (see newton_default).
+            from .utils.solver.newton_krylov import assembled_krylov_solve, newton_direct
+
+            return newton_direct(
+                residual_fn,
+                jacobian,
+                u0,
+                rtol=rtol,
+                atol=atol,
+                max_steps=max_steps,
+                damping=damping,
+                line_search=line_search,
+                ls_max=ls_max,
+                ls_c=ls_c,
+                linear_solve=linear_solve if linear_solve is not None else assembled_krylov_solve(inner_tol, inner_maxit),
+            )
         if direct:
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
             # drag where the matrix-free Krylov inner solve stalls). Needs the assembler-provided Jacobian.
@@ -571,21 +590,28 @@ def newton(
     line_search: bool = False,
     ls_max: int = 25,
     ls_c: float = 1e-4,
-    direct: bool = False,
+    direct: bool | None = None,
     reuse: bool = False,
 ) -> NonlinearSolver:
-    """Newton root-find, as a configurable slot. Two inner-solve modes:
+    """Newton root-find, as a configurable slot. Three inner-solve modes:
 
-    * **default (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default BiCGStab, or the
-      ``linear=`` slot), implicit differentiation via ``lax.custom_root``. The historic behaviour.
+    * **default (``direct=None``) -- the ASSEMBLED tangent, solved iteratively.** Wherever the assembler
+      provides the tangent (native nonlinear FEM, the transient stepper), each step assembles ``J(u)`` and
+      solves it with the ``linear=``/``precond=`` slots -- by default Jacobi-BiCGStab -- so an inner
+      iteration is one SpMV instead of two Jacobian-vector products through the element loop, and a
+      preconditioner that needs an assembled matrix (``jacobi``, a built ``amg``) composes. Measured on a
+      3-D P1 ``-div((1+u^2) grad u)`` problem (RTX 3070): 2.3-3.4x faster than the matrix-free Newton at
+      10k-87k DOF, same root. A problem with no assembled tangent (a residual-only operator) falls back to
+      the matrix-free mode automatically.
+    * **``direct=False`` (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default BiCGStab,
+      or the ``linear=`` slot). No tangent is ever stored, so it is the choice when the assembled tangent
+      would not fit in memory. The previous default.
     * **``direct=True`` (sparse-direct)** -- factorize the ASSEMBLED tangent each step with a sparse LU
-      instead of an iterative inner solve. Robust on **indefinite / ill-conditioned** systems -- a
-      Taylor-Hood velocity/pressure saddle, a stiff Carman-Kozeny phase-change drag -- where the
-      matrix-free BiCGStab has no saddle-point preconditioner and stalls. Still differentiable (implicit
-      diff with a *direct*, transposable tangent solve at the root). Composes only where the assembler
-      provides the tangent: ``fem.solve(nonlinear=jno.solve.newton(direct=True))`` on a native nonlinear
-      problem (steady or the transient stepper); the ``linear=``/``precond=`` slots are then unused.
+      (or the ``linear=`` slot's direct solver). Robust on **indefinite / ill-conditioned** systems -- a
+      Taylor-Hood velocity/pressure saddle, a stiff Carman-Kozeny phase-change drag -- where an iterative
+      inner solve has no saddle-point preconditioner and stalls.
 
+    All three are differentiable (implicit differentiation via ``lax.custom_root``).
     ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
     to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning.
 

@@ -64,14 +64,15 @@ def _any_step_slot(x0, nonlinear, linear, precond, time) -> bool:
     return any(s is not None for s in (x0, nonlinear, linear, precond, time))
 
 
-def _default_newton(residual_fn, u0):
+def _default_newton(residual_fn, u0, *, jacobian=None):
     """The operator's own default nonlinear driver, called explicitly.
 
     ``FemResidualOperator.solve(None)`` picks this internally; the bound wrapper has to name it because
-    it always hands the operator a ``solve_fn``, so "no slot passed" can no longer mean "use the default"."""
-    from .utils.solver.newton_krylov import newton_krylov
+    it always hands the operator a ``solve_fn``, so "no slot passed" can no longer mean "use the default".
+    With the assembler's tangent it is the assembled-tangent Newton (see ``newton_default``)."""
+    from .utils.solver.newton_krylov import newton_default
 
-    return newton_krylov(residual_fn, u0)
+    return newton_default(residual_fn, u0, jacobian=jacobian)
 
 
 def _as_dense(x):
@@ -2975,10 +2976,10 @@ class FEM:
                         if jac is not None and getattr(user_fn, "wants_jacobian", False):
                             return user_fn(rf, y, jacobian=jac)
                         return user_fn(rf, y)
-                    # Matrix-free Newton-Krylov default (no optimistix); implicit-diff preserved.
-                    from .utils.solver.newton_krylov import newton_krylov
+                    # Default Newton: the assembled tangent when there is one, else matrix-free.
+                    from .utils.solver.newton_krylov import newton_default
 
-                    return newton_krylov(rf, y)
+                    return newton_default(rf, y, jacobian=jac)
 
                 red_jac = None
                 if jacobian is not None:
@@ -3896,7 +3897,8 @@ class FEM:
         def _bounded(residual_fn, u0, *, jacobian=None):
             root_fn, start = _prepare_residual(residual_fn, u0)
             if solve_fn is None:
-                return _default_newton(root_fn, start)
+                jac = _prepare_jacobian(residual_fn, jacobian, u0) if jacobian is not None else None
+                return _default_newton(root_fn, start, jacobian=jac)
             extra = {}
             if jacobian is not None and getattr(solve_fn, "wants_jacobian", False):
                 extra["jacobian"] = _prepare_jacobian(residual_fn, jacobian, u0)
@@ -3910,6 +3912,8 @@ class FEM:
         for _attr in ("tolerances", "wants_jacobian", "wants_project"):
             if getattr(solve_fn, _attr, None) is not None:
                 setattr(_bounded, _attr, getattr(solve_fn, _attr))
+        if solve_fn is None:
+            _bounded.wants_jacobian = True  # the default Newton runs on the assembled tangent when offered
         return _bounded
 
     def _resolve_bounds(self, u_warm):

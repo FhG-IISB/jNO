@@ -3905,12 +3905,14 @@ class FemResidualOperator:
 
         if solve_fn is None:
 
-            def solve_fn(residual_fn, y0):
-                # Default: matrix-free Jacobian-free Newton-Krylov (no optimistix dependency).
-                # Implicit-diff via custom_root, so the gradient still reaches the parameters.
-                from ..utils.solver.newton_krylov import newton_krylov
+            def solve_fn(residual_fn, y0, *, jacobian=None):
+                # Default: Newton on the ASSEMBLED tangent (this operator's ``jacobian``) when there is
+                # one, else matrix-free Newton-Krylov. Implicit-diff via custom_root either way.
+                from ..utils.solver.newton_krylov import newton_default
 
-                return newton_krylov(residual_fn, y0)
+                return newton_default(residual_fn, y0, jacobian=jacobian)
+
+            solve_fn.wants_jacobian = True
 
             # The default solver is one fixed function, so it gets one fixed identity -- built fresh
             # per call, it would otherwise defeat the compiled-solve cache below on every call.

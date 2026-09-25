@@ -97,9 +97,9 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             if jac is not None and getattr(solve_fn, "wants_jacobian", False):
                 return jnp.asarray(solve_fn(res, u_prev, jacobian=jac)).reshape(-1)
             return jnp.asarray(solve_fn(res, u_prev)).reshape(-1)
-        from .newton_krylov import newton_krylov
+        from .newton_krylov import newton_default
 
-        return newton_krylov(res, u_prev)
+        return newton_default(res, u_prev, jacobian=jac)
 
     def _root_of(res, u_prev):
         """``(root_fn, start)`` — the function ``_newton`` above actually drives to zero, and from where.
