@@ -181,3 +181,14 @@ def test_reverse_mode_through_a_checkpointed_march_of_assembled_newton_with_a_sl
 
     g = float(jax.grad(loss)(0.5, lambda J, b: jno_slot(J, b)))
     np.testing.assert_allclose(g, float(jax.grad(loss)(0.5, raw)), rtol=1e-7)
+
+
+@pytest.mark.parametrize("make", [jno.solve.newton, jno.solve.picard])
+def test_a_spec_argument_is_part_of_the_compiled_solve_identity(make):
+    """Two specs differing only in an argument printed alike, so they shared ONE compiled solve: the second
+    silently ran with the first one's settings. Here the second caps Newton at one step and must refuse."""
+    fem = _nonlinear()
+    fem.solve(nonlinear=make())
+    with pytest.raises(RuntimeError, match="did not converge in max_steps=1"):
+        fem.solve(nonlinear=make(max_steps=1))
+    assert repr(make(damping=0.7)) != repr(make())

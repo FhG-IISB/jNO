@@ -576,7 +576,11 @@ def _root_driver(
     # The tolerances travel WITH the spec, not just inside the closure: a driver run under `lax.scan`
     # (the load-path march) cannot raise on non-convergence from inside the trace, so the caller
     # re-checks outside it — and it must judge against the tolerance the user actually asked for.
-    return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol})
+    config = dict(
+        damping=damping, rtol=rtol, atol=atol, max_steps=max_steps, inner_tol=inner_tol, inner_maxit=inner_maxit,
+        line_search=line_search, ls_max=ls_max, ls_c=ls_c, direct=direct,
+    )  # fmt: skip
+    return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol}, config=config)
 
 
 def newton(
@@ -885,8 +889,22 @@ def staggered(
             ls_c=ls_c,
         )
 
+    def _label(f):  # a field's value identity for the repr; an unnamed one falls back to its repr (never equal)
+        if isinstance(f, (list, tuple)):
+            return tuple(_label(g) for g in f)
+        return getattr(f, "name", None) or repr(f)
+
+    config = dict(
+        fields=tuple(_label(f) for f in fields), rtol=rtol, atol=atol, max_sweeps=max_sweeps,
+        inner_steps=inner_steps, inner_tol=inner_tol, inner_maxit=inner_maxit, line_search=line_search,
+        damping=damping, ls_max=ls_max, ls_c=ls_c, direct=direct, over_relax=over_relax,
+    )  # fmt: skip
     spec = NonlinearSolver(
-        _fn, name="staggered", direct=direct, traits={"vmap": "native", "jit": True, "rtol": rtol, "atol": atol}
+        _fn,
+        name="staggered",
+        direct=direct,
+        traits={"vmap": "native", "jit": True, "rtol": rtol, "atol": atol},
+        config=config,
     )
     # Over-relaxation steps PAST the sub-solve's answer, so a box-constrained field needs the projector
     # the `bounds` wrapper owns; ask for it only when it is actually needed.

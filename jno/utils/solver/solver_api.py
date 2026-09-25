@@ -517,18 +517,30 @@ class NonlinearSolver:
     stepper), which threads it in via ``jacobian=``.
     """
 
-    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: Optional[bool] = False):
+    def __init__(
+        self,
+        fn: Callable,
+        *,
+        name: str,
+        traits: Optional[dict] = None,
+        direct: Optional[bool] = False,
+        config: Optional[dict] = None,
+    ):
         self._fn = fn
         self.name = name
         self.direct = direct
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
+        # Every constructor argument, for the repr -- which is the solver's VALUE identity: the compiled-solve
+        # caches key on it (`_composed.cache_key`), so two specs that differ in any argument must print
+        # differently or the second silently reuses the first's compiled solve.
+        self.config = dict(config or {})
 
     def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None, project=None):
         kw = {"project": project} if project is not None else {}
         return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian, **kw)
 
     def __repr__(self):
-        return f"jno.solve.{self.name}()"
+        return f"jno.solve.{self.name}({', '.join(f'{k}={v!r}' for k, v in self.config.items())})"
 
 
 class PrecondContext:
