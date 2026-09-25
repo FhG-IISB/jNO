@@ -641,6 +641,8 @@ def newton_direct(
 
         linear_solve = sparse_lu_solve
 
+    from .solver_api import gate_suspended
+
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
     u0 = jnp.asarray(u0).reshape(-1)
 
@@ -671,7 +673,12 @@ def newton_direct(
 
         def body(state):
             u, r, k = state
-            delta = linear_solve(J_fwd(u), -r)  # DIRECT solve of the assembled tangent
+            # The Newton STEP is not gated (see `_step_and_tangent`: the outer residual is the contract,
+            # judged by `_convergence_check`); only custom_root's tangent below is. Gating it here also put a
+            # host callback inside this while_loop, which JAX's rematerialisation cannot partially evaluate:
+            # reverse mode through a checkpointed time march died on an AssertionError in its loop rules.
+            with gate_suspended():
+                delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
             alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
             u = u + alpha * delta
             return u, f_fwd(u), k + 1

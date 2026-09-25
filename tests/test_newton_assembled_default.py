@@ -153,3 +153,31 @@ def test_the_compiled_solve_still_refuses_a_stalled_newton():
     with pytest.raises(RuntimeError, match="did not converge in max_steps=1"):
         fem.solve(nonlinear=jno.solve.newton(max_steps=1))
     assert fem.stats["nonlinear"]["converged"] is False and fem.stats["nonlinear"]["steps"] == 1
+
+
+@pytest.mark.parametrize("slot", ["gmres", "bicgstab"])
+def test_reverse_mode_through_a_checkpointed_march_of_assembled_newton_with_a_slot(slot):
+    """The Newton STEP solve used to be gated like the tangent; its host callback sat inside the Newton
+    while_loop, and JAX's rematerialisation of a checkpointed scan died on it under reverse mode
+    (``newton(direct=True)`` with any jno.solve slot; since the default became the assembled tangent,
+    plain ``newton()`` too). Oracle: the same march with a raw JAX GMRES."""
+    import jax.experimental.sparse as jsp
+
+    from jno.utils.solver.newton_krylov import newton_direct
+
+    n = 20
+    A = jsp.BCOO.fromdense(2 * jnp.eye(n) - jnp.eye(n, k=1) - jnp.eye(n, k=-1))
+    jno_slot = getattr(jno.solve, slot)(tol=1e-12)
+    raw = lambda J, b: jax.scipy.sparse.linalg.gmres(lambda v: J @ v, b, tol=1e-13)[0]  # noqa: E731
+
+    def loss(a, lin):
+        def step(u, _):
+            R = lambda w: A @ w + a * w**3 - (u + 1.0)  # noqa: E731
+            Jf = lambda w: A + jsp.BCOO.fromdense(jnp.diag(3 * a * w**2), nse=n)  # noqa: E731
+            return newton_direct(R, Jf, u, linear_solve=lin), None
+
+        u, _ = jax.lax.scan(jax.checkpoint(step), jnp.zeros(n), None, length=3)
+        return jnp.sum(u**2)
+
+    g = float(jax.grad(loss)(0.5, lambda J, b: jno_slot(J, b)))
+    np.testing.assert_allclose(g, float(jax.grad(loss)(0.5, raw)), rtol=1e-7)
