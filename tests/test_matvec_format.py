@@ -215,3 +215,17 @@ def test_amg_levels_in_the_measured_storage_are_the_same_v_cycle(fmt):
     )
     leaves = jax.tree_util.tree_leaves(levels)
     assert all(hasattr(x, "shape") or isinstance(x, (int, float)) for x in leaves)
+
+
+def test_operators_of_one_size_class_share_a_measurement():
+    """An adaptive loop builds a new operator per remesh; re-measuring each cost ~0.5 s. Close sizes share
+    the first one's decision, and a clearly different size is measured anew."""
+    mf._DECISIONS.clear()
+    a = jsp.BCOO.from_scipy_sparse(sp.diags([-1.0, 2.2, -1.0], [-1, 0, 1], (1000, 1000)).tocoo())
+    b = jsp.BCOO.from_scipy_sparse(sp.diags([-1.0, 2.2, -1.0], [-1, 0, 1], (1100, 1100)).tocoo())
+    c = jsp.BCOO.from_scipy_sparse(sp.diags([-1.0, 2.2, -1.0], [-1, 0, 1], (4000, 4000)).tocoo())
+    mf.choose(a, log=False)
+    mf.choose(b, log=False)
+    assert len(mf._DECISIONS) == 1
+    mf.choose(c, log=False)
+    assert len(mf._DECISIONS) == 2

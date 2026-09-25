@@ -10,7 +10,7 @@ device that runs it -- never a threshold tuned on one card:
 * the real operator is timed whenever it is concrete (the solver entry points see it before tracing),
 * an operator only ever seen traced is decided on a banded stand-in of the same shape and nonzeros per
   row, generated on the device,
-* the decision is cached per (platform, device kind, shape, nnz, dtype) and logged once.
+* the decision is cached per (platform, device kind, size class, dtype) (see `_key`) and logged once.
 
 ``jno.setup(matvec_format="csr" | "coo" | "auto")`` (or ``[jno] matvec_format``) overrides it.
 
@@ -28,7 +28,7 @@ import jax.numpy as jnp
 _FORMATS = ("auto", "csr", "coo")
 _FORMAT = "auto"
 
-#: measured decisions, keyed on (platform, device kind, shape, nnz, dtype)
+#: measured decisions, keyed on (platform, device kind, size class, dtype) -- see `_key`
 _DECISIONS: dict = {}
 
 _PRODUCTS_PER_TIMING = 20  # products per timed program: in-loop cost, dispatch amortised
@@ -47,8 +47,29 @@ def set_matvec_format(fmt: str) -> None:
 
 
 def _key(A):
+    """The decision's key: the device, and the operator's SIZE CLASS rather than its exact size.
+
+    Rows and columns to the nearest power of two, stored entries per row to the nearest half-octave. An
+    exact key re-measured every operator an adaptive loop produces -- each remesh has a new size -- and a
+    measurement is two compilations: measured ~0.5 s per new operator, which made a cold h-adaptive march
+    3.9 s slower (15.8 -> 19.8 s) and a cold steady h-adaptive solve 1.7 s slower (8.5 -> 10.2 s), for no
+    gain at those sizes. Operators within a factor ~1.4 of each other in size and density share one
+    measurement, taken on the first real operator of the class; where they straddle a crossover the two
+    formats cost about the same, so a shared decision gives little away.
+    """
+    import math
+
     dev = jax.devices()[0]
-    return (dev.platform, dev.device_kind, tuple(int(s) for s in A.shape), int(A.nse), jnp.dtype(A.dtype).name)
+    n, m = (int(s) for s in A.shape)
+    per_row = max(int(A.nse), 1) / max(n, 1)
+    return (
+        dev.platform,
+        dev.device_kind,
+        round(math.log2(max(n, 1))),
+        round(math.log2(max(m, 1))),
+        jnp.dtype(A.dtype).name,
+        round(2 * math.log2(per_row)),
+    )
 
 
 def _is_concrete(A) -> bool:
