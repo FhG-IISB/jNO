@@ -2862,6 +2862,11 @@ class FEM:
             # BCOO operator (never densifies -> memory O(nnz); GPU-safe; solves general systems). Pass
             # your own ``solve_fn=(A, b) -> u`` to use a dense / direct solver instead -- it receives
             # the densified (A, b). (The runtime-parametric case is a FemLinearSystem below.)
+            from .utils.solver.placement import to_solve_device
+
+            # Assembled on the host (`_host_assembly_scope`); moved to the solving device once, here,
+            # rather than copied there again by every solve.
+            self._op = to_solve_device(self._op)
             A, b = self._op
             b = jnp.asarray(b).reshape(-1)
             # A fused complex system solves as the real 2n block, so its periodic reduction is

@@ -872,14 +872,23 @@ def _cached_march(block, config, march, *inputs):
         if any(isinstance(c, jax.core.Tracer) for c in closed.consts):  # the block itself holds tracers
             return march(*inputs)
         jaxpr = closed.jaxpr
+        from .placement import to_solve_device
+
+        # The constants (operators, mesh arrays) move to the solving device ONCE, here, instead of being
+        # copied from the host on every run; configurations cached on the same block share the copies.
         hit = (
-            closed.consts,
+            to_solve_device(list(closed.consts), block.__dict__.setdefault("_device_consts", {}), numpy=True),
             jax.jit(lambda consts, flat: jax.core.eval_jaxpr(jaxpr, consts, *flat)),
             jax.tree_util.tree_structure(out_shape),
         )
         cache[sig] = hit
         while len(cache) > _MARCH_CACHE_SIZE:
             cache.popitem(last=False)
+            # ...and the device copies only the evicted configuration used go with it.
+            live = {id(c) for h in cache.values() for c in h[0]}
+            memo = block.__dict__["_device_consts"]
+            for k in [k for k, (_, moved) in memo.items() if id(moved) not in live]:
+                del memo[k]
     else:
         cache.move_to_end(sig)
     consts, run, out_tree = hit
