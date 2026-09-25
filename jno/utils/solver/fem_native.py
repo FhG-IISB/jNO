@@ -3256,7 +3256,7 @@ def assemble_fem_native(
             """
             return args.get("__gap_tables__") if isinstance(args, dict) else None
 
-        def _gap_static(region, face_ids, btfi, args=None):
+        def _gap_static_impl(region, face_ids, btfi, args=None):
             """Concrete index/weight geometry of a region's gap blocks, for the pairing in ``args`` —
             shared by the pattern hoist and the traced assembly so the two cannot drift. The three
             nonlocal blocks, flat index arrays in emission order:
@@ -3318,9 +3318,16 @@ def assemble_fem_native(
             _gap_static_cache[cache_key] = out
             return out
 
+        def _gap_static(region, face_ids, btfi, args=None):
+            # Built from the pairing's CONCRETE tables and cached across calls, so it must be concrete even when
+            # its first call is inside a trace (a compiled Newton solve assembles the tangent inside its loop):
+            # staged there, the cached arrays would be that trace's tracers and leak into the next one.
+            with jax.ensure_compile_time_eval():
+                return _gap_static_impl(region, face_ids, btfi, args)
+
         _pattern_cache: Dict[str, Any] = {"tag": object(), "val": None}
 
-        def _pattern(args=None):
+        def _pattern_impl(args=None):
             """``(idx_static, plan, blk_sizes)`` for the pairing in ``args``.
 
             The sparsity pattern is derived from the pairing's concrete node ids, so it moves when the
@@ -3422,6 +3429,12 @@ def assemble_fem_native(
             _host_idx = None
             _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
             return _pattern_cache["val"]
+
+        def _pattern(args=None):
+            # Cached across calls: concrete even when first built inside a trace (see `_gap_static`). Ops on a
+            # traced runtime-connectivity bundle are still staged -- and that case is never cached.
+            with jax.ensure_compile_time_eval():
+                return _pattern_impl(args)
 
         def _host_plan(cells_host):
             """``(uniq, inv, nse)`` for a NEW triangulation, compressed on the host.
