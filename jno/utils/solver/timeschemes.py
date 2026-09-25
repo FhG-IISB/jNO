@@ -203,53 +203,57 @@ class _BDF2Scheme(_TimeScheme):
         # its residual norms and they are judged below -- as in the theta march and the load path.
         _judge = bool(block.is_nonlinear())
 
-        from .backend_blocks import hoist_time_invariant
-
-        blk = hoist_time_invariant(block, args, float(grid_ts[0]))  # static loads/operators: once per march
-
-        def _advance(u_prev, t_land, h):
-            """One implicit step landing at ``t_land`` from ``u_prev`` over an effective step ``h``."""
-            return blk.step(
-                u_prev,
-                t_land - h,
-                h,
-                args=args,
-                theta=1.0,
-                linear_solve=linear_solve,
-                nonlinear_solve=nonlinear_solve,
-                report=_judge,
-            )
-
-        # Startup: plain backward Euler, OUTSIDE the scan. Being outside it, its iterate is CONCRETE,
-        # so the driver's own `_convergence_check` fires there in the ordinary eager path and this
-        # march needs no second check for it -- only the norms discarded. (Under an outer jit both
-        # self-disable together, which is the documented limit, not a hole this could plug.)
-        s1 = _advance(s0, float(grid_ts[1]), dt)
-        if _judge:
-            s1 = s1[0]
+        from .backend_blocks import _cached_march, hoist_time_invariant
 
         dt_eff = 2.0 * dt / 3.0
 
-        def step(carry, t_next):
-            u_n, u_nm1 = carry
-            u_star = (4.0 * u_n - u_nm1) / 3.0
-            out = _advance(u_star, t_next, dt_eff)
-            if not _judge:
-                return (out, u_n), out
-            wn, r_end, r_start = out
-            return (wn, u_n), (wn, r_end, r_start)
+        def march(s0, grid, args):
+            blk = hoist_time_invariant(block, args, grid[0])  # static loads/operators: once per march
 
-        # Checkpointed for the same reason the theta march is: reverse mode would otherwise keep every
-        # step's internal Krylov/Newton residuals.
-        _, ys = jax.lax.scan(jax.checkpoint(step), (s1, s0), grid_ts[2:])
+            def _advance(u_prev, t_land, h):
+                """One implicit step landing at ``t_land`` from ``u_prev`` over an effective step ``h``."""
+                return blk.step(
+                    u_prev,
+                    t_land - h,
+                    h,
+                    args=args,
+                    theta=1.0,
+                    linear_solve=linear_solve,
+                    nonlinear_solve=nonlinear_solve,
+                    report=_judge,
+                )
+
+            # Startup: plain backward Euler, then the BDF2 steps. Its norms are judged with the others.
+            s1 = _advance(s0, grid[1], dt)
+
+            def step(carry, t_next):
+                u_n, u_nm1 = carry
+                u_star = (4.0 * u_n - u_nm1) / 3.0
+                out = _advance(u_star, t_next, dt_eff)
+                if not _judge:
+                    return (out, u_n), out
+                wn, r_end, r_start = out
+                return (wn, u_n), (wn, r_end, r_start)
+
+            # Checkpointed for the same reason the theta march is: reverse mode would otherwise keep every
+            # step's internal Krylov/Newton residuals.
+            first = s1[0] if _judge else s1
+            _, ys = jax.lax.scan(jax.checkpoint(step), (first, s0), grid[2:])
+            return s1, ys
+
+        # Traced ONCE per block and configuration (see `_cached_march`): an eager BDF2 march used to re-trace
+        # its scan on every call -- measured ~0.3 s per warm call of a 12k-DOF heat march.
+        s1, ys = _cached_march(
+            block, (linear_solve, nonlinear_solve, "bdf2", dt), march, s0, jnp.asarray(grid_ts, dtype), args
+        )
         if _judge:
-            ys, _r_end, _r_start = ys
+            (s1, r1_end, r1_start), (ys, _r_end, _r_start) = s1, ys
             _check_march_converged(
-                _r_end,
-                _r_start,
-                grid_ts[2:],
+                jnp.concatenate([jnp.reshape(r1_end, (1,)), _r_end]),
+                jnp.concatenate([jnp.reshape(r1_start, (1,)), _r_start]),
+                grid_ts[1:],
                 nonlinear_solve,
-                states=ys,
+                states=jnp.concatenate([s1[None, :], ys], axis=0),
                 what="transient march (BDF2)",
                 coord="t",
                 advice=_TRANSIENT_ADVICE,

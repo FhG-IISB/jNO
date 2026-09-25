@@ -874,7 +874,7 @@ def _cached_march(block, config, march, *inputs):
     if any(isinstance(x, jax.core.Tracer) for x in leaves):
         return march(*inputs)
     sig = (
-        config,
+        _value_identity(config),
         treedef,
         tuple((jnp.shape(x), jnp.result_type(x)) for x in leaves),
         _block_fingerprint(block),
@@ -908,6 +908,23 @@ def _cached_march(block, config, march, *inputs):
         cache.move_to_end(sig)
     consts, run, out_tree = hit
     return jax.tree_util.tree_unflatten(out_tree, run(consts, leaves))
+
+
+def _value_identity(config):
+    """``config`` with each composed solver replaced by its VALUE identity (``cache_key``) where it has one.
+
+    ``fem.solve`` composes fresh per-step solvers on every call, so keying the march cache on the objects
+    themselves missed every time: a warm nonlinear march with ``time=`` (or any solver slot) re-traced and
+    re-compiled on every call -- measured ~1.1 s per call on a 3k-DOF 2-D problem whose march takes 30 ms.
+    The value identity describes the solver completely (the compiled-solve caches already key on it).
+    """
+    if not isinstance(config, tuple):
+        return config
+    out = []
+    for c in config:
+        k = getattr(c, "cache_key", None)
+        out.append(("cache_key", k) if k is not None else c)
+    return tuple(out)
 
 
 def _trace_time_settings():

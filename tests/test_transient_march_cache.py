@@ -139,3 +139,47 @@ def test_a_changed_jno_setup_setting_is_not_served_from_a_stale_march_cache():
         np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12)
     finally:
         matvec_format.set_matvec_format("auto")
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(time="sdirk"),
+        dict(time="bdf2"),
+        dict(time="rosenbrock"),
+        dict(nonlinear="newton"),
+    ],
+)
+def test_a_march_with_time_or_solver_slots_is_traced_once(kw):
+    """fem.solve composes fresh per-step solvers on every call; the march cache keyed on those objects missed
+    every time, re-tracing a warm nonlinear march on every call (~1.1 s where the march takes 30 ms)."""
+    import jax as _jax
+
+    import jno as _jno
+
+    d = _jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain(time=(0.0, 0.1, 6))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    cb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    fem = _jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y + ui**3 * vi, u(cb[0], cb[1]) - 0.0, u(ci[0], ci[1]) - 1.0])
+    blk = fem.operator
+    count, orig = [0], blk.residual
+
+    def counted(w, *a, **k):
+        if isinstance(w, _jax.core.Tracer):
+            count[0] += 1
+        return orig(w, *a, **k)
+
+    object.__setattr__(blk, "residual", counted)
+    specs = {
+        "time": {"sdirk": _jno.solve.sdirk, "bdf2": _jno.solve.bdf2, "rosenbrock": _jno.solve.rosenbrock},
+        "nonlinear": {"newton": _jno.solve.newton},
+    }
+    make = lambda: {k: specs[k][v]() for k, v in kw.items()}  # noqa: E731  fresh spec objects every call
+    first = np.asarray(fem.solve(**make()).fn())
+    traced = count[0]
+    again = np.asarray(fem.solve(**make()).fn())
+    assert traced > 0 and count[0] == traced, "the warm march was traced again"
+    np.testing.assert_allclose(again, first, rtol=1e-12, atol=1e-14)
