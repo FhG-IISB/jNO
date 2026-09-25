@@ -255,14 +255,22 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
     # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
-        from .utils.solver.krylov import gmres as _scaled_gmres
+        if name == "cg" and getattr(M, "low_precision", False):
+            # A float32 preconditioner is only approximately symmetric: standard CG's beta then loses
+            # conjugacy and was measured stopping at a TRUE residual of 6e-6 against a requested 1e-8
+            # (float32 FSAI, 3-D elasticity), silently. Flexible CG is robust to that at no extra products.
+            from .utils.solver.krylov import flexible_cg
 
-        method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
+            raw = lambda mv, rhs, M, x0: flexible_cg(mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000)  # noqa: E731
+        else:
+            from .utils.solver.krylov import gmres as _scaled_gmres
 
-        def raw(mv, rhs, M, x0):
-            if name == "gmres" and M is not None:
-                M = _unit_scaled(M, rhs)
-            return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+            method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
+
+            def raw(mv, rhs, M, x0):
+                if name == "gmres" and M is not None:
+                    M = _unit_scaled(M, rhs)
+                return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 

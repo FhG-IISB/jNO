@@ -264,6 +264,44 @@ def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
 # ---------------------------------------------------------------------------
 
 
+def flexible_cg(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, maxiter=2000):
+    """**Flexible** preconditioned CG: the Polak-Ribiere ``beta = z_new^T (r_new - r_old) / (z_old^T r_old)``.
+
+    Y. Notay, *Flexible conjugate gradients*, SIAM J. Sci. Comput. 22(4), 2000, 1444-1460. Standard PCG's
+    ``beta = z_new^T r_new / z_old^T r_old`` relies on ``M`` being exactly symmetric and fixed; with a
+    preconditioner that is only approximately so -- applied in float32 inside a float64 solve, an inner
+    iteration, a V-cycle with a tolerance -- conjugacy is lost and the solve can stall or stop short of the
+    requested accuracy. The flexible ``beta`` is the same for an exact ``M`` and robust for an inexact one,
+    for one extra vector difference per iteration. Returns ``x``.
+    """
+    M = M or _ident
+    b = jnp.asarray(b)
+    x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
+    tiny = _tiny_of(b.dtype)
+    tol_abs = jnp.maximum(_effective_tol(tol, b.dtype) * jnp.linalg.norm(b), atol)
+    r0 = b - matvec(x0)
+    z0 = M(r0)
+    state0 = (x0, r0, z0, z0, r0 @ z0, jnp.asarray(0), jnp.asarray(False))
+
+    def cond(st):
+        r, itn, broke = st[1], st[5], st[6]
+        return (jnp.linalg.norm(r) > tol_abs) & (itn < maxiter) & jnp.logical_not(broke)
+
+    def body(st):
+        x, r, z, p, rz, itn, broke = st
+        q = matvec(p)
+        pq = p @ q
+        bad = (pq <= tiny) | (jnp.abs(rz) <= tiny)
+        alpha = jnp.where(bad, 0.0, rz / jnp.where(bad, 1.0, pq))
+        x = x + alpha * p
+        r_new = r - alpha * q
+        z_new = M(r_new)
+        beta = jnp.where(bad, 0.0, (z_new @ (r_new - r)) / jnp.where(bad, 1.0, rz))
+        return (x, r_new, z_new, z_new + beta * p, r_new @ z_new, itn + 1, broke | bad)
+
+    return jax.lax.while_loop(cond, body, state0)[0]
+
+
 def cocg(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
     """COCG — **complex-symmetric** systems, ``A = A^T`` (NOT ``A = A^H``).
 
@@ -532,6 +570,10 @@ def chebyshev_apply(matvec, v, *, lmin, lmax, degree, M=None):
     """Fixed-``degree`` Chebyshev polynomial application ``p(A) v ≈ A^{-1} v`` (no convergence
     test — a *linear* operator in ``v``, usable as a preconditioner for CG/MINRES/FGMRES)."""
     M = M or _ident
+    # The recurrence runs in v's precision: spectrum bounds measured in another one (a float64 estimate for
+    # a float32 preconditioner) would otherwise promote the iterate and change the loop carry's dtype.
+    rdt = jnp.zeros((), jnp.asarray(v).dtype).real.dtype
+    lmin, lmax = jnp.asarray(lmin, rdt), jnp.asarray(lmax, rdt)
     theta = 0.5 * (lmax + lmin)
     delta = 0.5 * (lmax - lmin)
     sigma1 = theta / delta

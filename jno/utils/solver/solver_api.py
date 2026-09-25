@@ -66,18 +66,21 @@ class PrecondApplier:
     callable preconditioner (no ``.T``) still works: callers fall back to reusing ``M``.
     """
 
-    __slots__ = ("_fwd", "_t")
+    __slots__ = ("_fwd", "_t", "low_precision")
 
-    def __init__(self, fwd, t=None):
+    def __init__(self, fwd, t=None, *, low_precision=False):
         self._fwd = fwd
         self._t = t
+        # Applied in a lower precision than the solve (``float32=True`` on the spec): its rounding makes it
+        # only APPROXIMATELY symmetric and linear, which `jno.solve.cg` answers with flexible CG.
+        self.low_precision = low_precision
 
     def __call__(self, v):
         return self._fwd(v)
 
     @property
     def T(self) -> "PrecondApplier":
-        return self if self._t is None else PrecondApplier(self._t, self._fwd)
+        return self if self._t is None else PrecondApplier(self._t, self._fwd, low_precision=self.low_precision)
 
 
 def _split_matvecs(A):
@@ -207,6 +210,48 @@ class LinearOperator:
     @property
     def bcoo(self):
         return self._A if hasattr(self._A, "todense") else None
+
+    def astype(self, dtype) -> "LinearOperator":
+        """This operator with its STORED values in ``dtype`` (an assembled one), or with every product cast
+        to ``dtype`` (a matvec-only one -- its own arithmetic is whatever the matvec does). The sparsity
+        pattern and the transpose flag are kept."""
+        if self._A is not None:
+            A = self._A
+            if hasattr(A, "todense") and hasattr(A, "data"):
+                import jax.experimental.sparse as jsp
+
+                B = jsp.BCOO(
+                    (A.data.astype(dtype), A.indices),
+                    shape=A.shape,
+                    indices_sorted=getattr(A, "indices_sorted", False),
+                    unique_indices=getattr(A, "unique_indices", False),
+                )
+            else:
+                B = jnp.asarray(A).astype(dtype)
+            op = LinearOperator(B, _transposed=self._transposed)
+            if hasattr(B, "todense") and op._split is None:
+                from .linear import _plain_bcoo, sparse_matvec
+
+                if _plain_bcoo(B):
+                    # Products in the measured-fastest storage even for a concrete copy: BCOO's own `@` is a
+                    # scatter-add, which in float32 compiles to a compare-and-swap loop on GPUs -- measured
+                    # 0.91x (slower than float64) for a float32 Chebyshev preconditioner before this.
+                    # ...and in the copy's own precision whatever arrives (a spectrum probe, say, in float64).
+                    fwd, rev = sparse_matvec(B), sparse_matvec(B, transpose=True)
+                    op._split = (lambda v: fwd(jnp.asarray(v).astype(dtype)), lambda v: rev(jnp.asarray(v).astype(dtype)))
+            return op
+
+        def cast(f):
+            return None if f is None else (lambda *a: jnp.asarray(f(*a)).astype(dtype))
+
+        return LinearOperator.from_matvec(
+            cast(self._mv),
+            t_mv=cast(self._t_mv),
+            diag_fn=cast(self._diag_fn),
+            dense_fn=cast(self._dense_fn),
+            shape=self._shape,
+            _transposed=self._transposed,
+        )
 
 
 def _slice_bcoo(src, si: slice, sj: slice):
@@ -1448,7 +1493,9 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     step_solve.wants_operator = True
     # Value identity for the march cache (`backend_blocks._value_identity`): a fresh closure per fem.solve, but
     # the same solver and preconditioner for the same block (the cache lives on the block) is the same step.
-    step_solve.cache_key = ("transient_step", repr(solver), repr(precond), getattr(precond, "key", None))
+    step_solve.cache_key = (
+        "transient_step", repr(solver), repr(precond), getattr(precond, "key", None), getattr(precond, "float32", False)
+    )  # fmt: skip
     return step_solve, None
 
 

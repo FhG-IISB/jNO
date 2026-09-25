@@ -150,10 +150,18 @@ def build_hierarchy(
         )
     ml = pyamg.smoothed_aggregation_solver(_A_csr, max_levels=max_levels, max_coarse=coarse_size)
     levels: List[dict] = []
+    # Every level in the INPUT operator's precision: pyamg builds some prolongators in float64 whatever it
+    # is given, and a float32 hierarchy (jno.precond.amg(float32=True)) mixing the two fails the CSR
+    # product's dtype check -- or, worse, silently promotes the V-cycle back to float64.
+    dt = _A_csr.dtype
+
+    def _bcoo(M):
+        return jsp.BCOO.from_scipy_sparse(M.tocoo().astype(dt))
+
     for lvl in ml.levels[:-1]:
-        A_l = jsp.BCOO.from_scipy_sparse(lvl.A.tocoo())
-        P = jsp.BCOO.from_scipy_sparse(lvl.P.tocoo())
-        R = jsp.BCOO.from_scipy_sparse(lvl.R.tocoo())
+        A_l = _bcoo(lvl.A)
+        P = _bcoo(lvl.P)
+        R = _bcoo(lvl.R)
         lmax = _smoother_lmax(lvl.A, A_l, safety=safety, iters=bound_iters, degree=smoother_degree, lmin_ratio=lmin_ratio)
         levels.append({"A": A_l, "P": P, "R": R, "lmin": lmin_ratio * lmax, "lmax": lmax, "degree": smoother_degree})
     # Each level's A / P / R in the storage MEASURED fastest for it on this device (CSR or split COO,
@@ -172,7 +180,7 @@ def build_hierarchy(
         f"jno AMG hierarchy: {len(levels)} levels + coarse solve; level storage (A/P/R, measured on each level "
         f"matrix): {', '.join(formats)}"
     )
-    A_c = np.asarray(ml.levels[-1].A.todense())
+    A_c = np.asarray(ml.levels[-1].A.todense()).astype(dt)
     if not np.isfinite(A_c).all() or not np.abs(A_c).max() > 0:
         raise ValueError(
             "jno.precond.amg(): the coarsest-grid operator came out "
@@ -180,7 +188,7 @@ def build_hierarchy(
             "coarse-grid correction would contribute nothing. The aggregation did not find usable "
             "structure in this operator -- see the diagonal check above for the usual cause."
         )
-    levels.append({"Ainv": jnp.asarray(np.linalg.pinv(A_c))})  # pinv: robust to a gauge null space
+    levels.append({"Ainv": jnp.asarray(np.linalg.pinv(A_c).astype(dt))})  # pinv: robust to a gauge null space
     return levels
 
 
