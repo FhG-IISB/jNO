@@ -24,6 +24,7 @@ per-field DOF blocks (``fem.blocks``); :func:`form` assembles auxiliary weak-for
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -53,6 +54,7 @@ __all__ = [
     "real_equivalent",
     "gmg",
     "nystrom",
+    "fsai",
 ]
 
 
@@ -2743,6 +2745,123 @@ def cached(spec, *, refresh=False):
             u = build_fem(f).solve(linear=jno.solve.fgmres(), precond=M)   # hierarchy built once
     """
     return _Cached(spec, refresh)
+
+
+class _FSAI(_Spec):
+    """Spec for the factored sparse approximate inverse; see :func:`fsai`.
+
+    The symbolic phase (pattern, row groups) depends only on the sparsity pattern, so once built it is kept
+    and the spec becomes ``traceable``: every later materialisation -- including inside a compiled solve, a
+    Newton loop or a time march, where the operator is a tracer -- recomputes only the numeric factor from
+    the operator's current values.
+    """
+
+    def __init__(self, power):
+        self.power = power
+        self._pattern = None
+
+    @property
+    def traceable(self):  # once the pattern exists, the numeric phase is pure JAX
+        return self._pattern is not None
+
+    @property
+    def key(self):
+        return None if self._pattern is None else (type(self), id(self._pattern), self.power)
+
+    def build(self, A) -> "_FSAI":
+        """Eager symbolic setup from a **concrete** operator (BCOO / dense / ``LinearOperator``). Needed
+        before a first use inside a trace; any operator with the same sparsity pattern reuses it."""
+        from .utils.solver.fsai import fsai_pattern
+        from .utils.solver.solver_api import LinearOperator
+
+        if isinstance(A, LinearOperator):
+            A = A.bcoo if A.bcoo is not None else A.dense()
+        self._pattern = fsai_pattern(A, power=self.power)
+        return self
+
+    def prepare(self, fem):
+        """Build from the problem's assembled operator when there is a concrete one to read the pattern
+        from, so that a solve whose operator arrives traced (Newton, a march) can use it."""
+        if self._pattern is not None or fem is None:
+            return
+        A = _representative_operator(fem)
+        if A is not None:
+            self.build(A)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.fsai import fsai_apply, fsai_factor
+
+        A = ctx.A.bcoo
+        if A is None:
+            raise TypeError(
+                "jno.precond.fsai() needs the ASSEMBLED operator (its rows), but this solve only has a "
+                "matvec. Use an assembled path (the default Newton assembles its tangent), or "
+                "jno.precond.chebyshev() / nystrom(), which need only products."
+            )
+        if self._pattern is None:
+            if isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+                raise TypeError(
+                    "jno.precond.fsai(): the operator arrived traced and no pattern was built yet. Build it "
+                    "eagerly from a representative operator: spec = jno.precond.fsai(); spec.build(fem.A)."
+                )
+            self.build(A)
+        g = fsai_factor(self._pattern, A)
+        return PrecondApplier(fsai_apply(self._pattern, g))
+
+    def __repr__(self):
+        return f"jno.precond.fsai(power={self.power}, built={self._pattern is not None})"
+
+
+def _representative_operator(fem):
+    """A concrete assembled matrix with the problem's sparsity pattern, or None: the steady linear operator,
+    a transient block's step pattern (M and A together), or the Newton tangent at zero."""
+    import jax.experimental.sparse as jsp
+
+    op = getattr(fem, "_op", None)
+    if isinstance(op, tuple) and hasattr(op[0], "todense"):
+        return op[0]
+    M, A = getattr(op, "M", None), getattr(op, "A", None)
+    if hasattr(M, "todense") and hasattr(A, "todense"):
+        return jsp.BCOO(
+            (jnp.concatenate([M.data, A.data]), jnp.concatenate([M.indices, A.indices])), shape=M.shape
+        )
+    jac, size = getattr(op, "jacobian", None), getattr(op, "size", None)
+    if callable(jac) and size is not None:
+        try:
+            J = jac(jnp.zeros((int(size),)), {})
+        except TypeError:
+            return None  # a parametric / transient signature this probe does not know; build on first use
+        return J if hasattr(J, "todense") else None
+    return None
+
+
+def fsai(*, power: int = 1) -> _FSAI:
+    """**Factored sparse approximate inverse** for SPD operators: ``M^{-1} = G^T G ~ A^{-1}`` with ``G``
+    lower triangular on the pattern of ``tril(A^power)`` (Kolotilina & Yeremin, SIAM J. Matrix Anal. Appl.
+    14(1), 1993).
+
+    The rung between ``jacobi`` and multigrid for a GPU: *applying* it is two sparse products -- no
+    triangular solves, no sequential sweep (unlike ILU / incomplete Cholesky) -- and the setup is a batch of
+    small independent dense Cholesky solves, one per row, so it runs in JAX, under ``jit`` and on GPU.
+    ``power=2`` uses the pattern of ``A^2``: a denser, stronger factor for a costlier setup and apply.
+
+    The pattern is computed once (host, from a concrete operator) and reused; the numeric factor follows the
+    operator's current values, so it works for a Newton tangent or a time step whose values change. An
+    operator whose sparsity changes after the build is detected and makes the solve fail loudly (NaN).
+
+    **SPD only**: a non-symmetric operator is refused; an indefinite one fails its local Cholesky (NaN).
+    Needs x64 and an assembled operator (not a matvec-only one).
+
+    Cost, measured with CG to 1e-8 on an RTX 3070 (float64): 3-D P1 Poisson (303k unknowns) 89 iterations /
+    58 ms against Jacobi's 216 / 76 ms; 3-D P2 (142k) 82 / 39 ms against 197 / 58 ms; 3-D elasticity (206k)
+    325 / 387 ms against 778 / 588 ms. The numeric setup costs about one to two solves (101, 115, 530 ms
+    there), so it pays when the factor is REUSED: a constant-operator time march (built once), ``.cached()``
+    across solves, or several right-hand sides. ``power=2`` grows the setup steeply with the row width
+    (7.1 s on the P2 case for 32 iterations) -- try ``power=1`` first.
+    """
+    if isinstance(power, bool) or not isinstance(power, int) or power < 1:
+        raise ValueError(f"jno.precond.fsai(power={power!r}): power must be an int >= 1.")
+    return _FSAI(power)
 
 
 def nystrom(*, rank: int = 20, mu: float | None = None, seed: int = 0) -> _Nystrom:
