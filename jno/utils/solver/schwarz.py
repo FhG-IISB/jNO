@@ -49,6 +49,9 @@ class SchwarzPattern(NamedTuple):
     lpos: jnp.ndarray  # (p, L) int32
     part: jnp.ndarray  # (n,) int32 owner of each unknown
     crow: jnp.ndarray  # (nnz,) int32 coarse index part[r] * p + part[c] of each unique entry
+    erow: jnp.ndarray  # (nnz,) int32 row of each unique entry
+    ecol: jnp.ndarray  # (nnz,) int32 column of each unique entry
+    null: jnp.ndarray  # (n, k) the near-null-space vectors the coarse space carries per part (k = 1: Nicolaides)
 
 
 def _bisect(G, nodes, parts, out, first):
@@ -86,7 +89,7 @@ def _bisect(G, nodes, parts, out, first):
     _bisect(G, nodes[order[cut:]], parts - left, out, first + left)
 
 
-def schwarz_pattern(A, *, parts: int, overlap: int = 1) -> SchwarzPattern:
+def schwarz_pattern(A, *, parts: int, overlap: int = 1, nullspace=None) -> SchwarzPattern:
     """Symbolic phase from a CONCRETE operator."""
     import scipy.sparse as sp
 
@@ -135,6 +138,7 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1) -> SchwarzPattern:
         return np.stack([np.concatenate([x, np.full(L - x.size, fill)]) for x in xs])
 
     ku = keys // n, keys % n
+    null = np.ones((n, 1)) if nullspace is None else np.asarray(nullspace, np.float64).reshape(n, -1)
     return SchwarzPattern(
         n,
         parts,
@@ -148,6 +152,9 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1) -> SchwarzPattern:
         jnp.asarray(stack(poss, keys.size), jnp.int32),  # padding entries read the zero slot
         jnp.asarray(part, jnp.int32),
         jnp.asarray(part[ku[0]] * parts + part[ku[1]], jnp.int32),
+        jnp.asarray(ku[0], jnp.int32),
+        jnp.asarray(ku[1], jnp.int32),
+        jnp.asarray(null),
     )
 
 
@@ -166,8 +173,21 @@ def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool):
     local = jnp.linalg.inv(blk)
     if not coarse:
         return local, None
-    Ac = jax.ops.segment_sum(vals, pat.crow, num_segments=pat.p * pat.p).reshape(pat.p, pat.p)
-    return local, jnp.linalg.inv(Ac)  # applied twice per application: a gemv, not two triangular solves
+    # A_c = Z^T A Z with Z = the near-null-space vectors restricted to each part (one column per part and
+    # vector). Entry by entry: A_c[(i,a), (j,b)] = sum over A's entries (r, c) with part(r) = i, part(c) = j of
+    # N[r,a] A_rc N[c,b] -- k^2 streaming segment sums over the entries, no (nnz x k^2) intermediate.
+    k = pat.null.shape[1]
+    N = pat.null.astype(vals.dtype)
+    Nr, Nc = N[pat.erow], N[pat.ecol]
+    blocks = [
+        [jax.ops.segment_sum(vals * Nr[:, a] * Nc[:, b], pat.crow, num_segments=pat.p * pat.p) for b in range(k)]
+        for a in range(k)
+    ]
+    Ac = jnp.stack([jnp.stack(row, -1) for row in blocks], -2)  # (p*p, k, k)
+    Ac = Ac.reshape(pat.p, pat.p, k, k).transpose(0, 2, 1, 3).reshape(pat.p * k, pat.p * k)
+    # pinv: a part whose modes are pinned by Dirichlet rows (or that has fewer unknowns than modes) makes A_c
+    # singular; the pseudo-inverse drops those directions instead of dividing by zero.
+    return local, jnp.linalg.pinv(Ac, hermitian=not jnp.iscomplexobj(Ac))
 
 
 def schwarz_apply(pat: SchwarzPattern, factors, *, restricted: bool, mv=None):
@@ -187,9 +207,14 @@ def schwarz_apply(pat: SchwarzPattern, factors, *, restricted: bool, mv=None):
     if coarse is None:
         return locals_
 
+    N = pat.null
+    k = N.shape[1]
+
     def coarse_(r):
-        rc = jax.ops.segment_sum(r, pat.part, num_segments=p)
-        return (coarse @ rc)[pat.part]
+        Nr = N.astype(r.dtype)
+        rc = jax.ops.segment_sum(Nr * r[:, None], pat.part, num_segments=p).reshape(-1)  # Z^T r, (p*k,)
+        xc = (coarse @ rc).reshape(p, k)
+        return jnp.sum(Nr * xc[pat.part], axis=1)  # Z x_c
 
     if mv is None:
         return lambda r: coarse_(r) + locals_(r)

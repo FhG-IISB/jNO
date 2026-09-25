@@ -2950,8 +2950,9 @@ def _representative_operator(fem):
 class _Schwarz(_Spec):
     """Spec for the algebraic overlapping Schwarz preconditioner; see :func:`schwarz`."""
 
-    def __init__(self, parts, overlap, coarse, restricted):
+    def __init__(self, parts, overlap, coarse, restricted, nullspace):
         self.parts, self.overlap, self.coarse, self.restricted = parts, overlap, coarse, restricted
+        self.nullspace = nullspace
         self._pattern = None
 
     @property
@@ -2962,9 +2963,10 @@ class _Schwarz(_Spec):
     def key(self):
         return None if self._pattern is None else (type(self), id(self._pattern), self.coarse, self.restricted)
 
-    def build(self, A) -> "_Schwarz":
+    def build(self, A, fem=None) -> "_Schwarz":
         """Eager symbolic setup (partition, overlap, index tables) from a CONCRETE operator; any operator with
-        the same sparsity pattern reuses it."""
+        the same sparsity pattern reuses it. ``fem`` is needed for ``nullspace="rigid"`` (it holds the DOF
+        coordinates and the field layout)."""
         from .utils.solver.schwarz import schwarz_pattern
         from .utils.solver.solver_api import LinearOperator
 
@@ -2972,7 +2974,17 @@ class _Schwarz(_Spec):
             A = A.bcoo if A.bcoo is not None else A.dense()
         n = int(A.shape[0])
         parts = self.parts if self.parts is not None else max(1, -(-n // 256))
-        pat = schwarz_pattern(A, parts=parts, overlap=self.overlap)
+        null = self.nullspace
+        if isinstance(null, str):
+            if null != "rigid":
+                raise ValueError(f"jno.precond.schwarz(nullspace={null!r}): must be 'rigid', an (n, k) array or None.")
+            if fem is None:
+                raise ValueError(
+                    "jno.precond.schwarz(nullspace='rigid') builds its modes from the problem's DOF coordinates: "
+                    "pass it through fem.solve(precond=...), or call spec.build(A, fem=fem)."
+                )
+            null = _near_null_space(fem, n)
+        pat = schwarz_pattern(A, parts=parts, overlap=self.overlap, nullspace=null)
         need = pat.p * pat.m * pat.m * jnp.dtype(A.dtype).itemsize
         dev = jax.devices()[0]
         cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
@@ -2989,7 +3001,7 @@ class _Schwarz(_Spec):
         if self._pattern is None and fem is not None:
             A = _representative_operator(fem)
             if A is not None:
-                self.build(A)
+                self.build(A, fem)
 
     def materialize(self, ctx: PrecondContext):
         from .utils.solver.schwarz import schwarz_apply, schwarz_factor
@@ -3006,7 +3018,7 @@ class _Schwarz(_Spec):
                     "jno.precond.schwarz(): the operator arrived traced and no partition was built yet. Build it "
                     "eagerly: spec = jno.precond.schwarz(); spec.build(fem.A)."
                 )
-            self.build(A)
+            self.build(A, ctx.fem)
         factors = schwarz_factor(self._pattern, A, coarse=self.coarse)
         fwd = schwarz_apply(self._pattern, factors, restricted=self.restricted, mv=ctx.A.mv if self.coarse else None)
         applier = PrecondApplier(fwd)
@@ -3020,8 +3032,55 @@ class _Schwarz(_Spec):
         )
 
 
+def _near_null_space(fem, n):
+    """Per field block: RIGID-BODY modes for a field with as many components as the space has dimensions (a
+    displacement: translations and infinitesimal rotations), else one constant per component. The kernel of the
+    unconstrained operator for elasticity, and of any diffusion-type block -- what a coarse space must represent
+    for the iteration count to stay independent of the number of parts."""
+    import numpy as np
+
+    pts_all = [np.asarray(p) for p in (fem.field_points or [])]
+    blocks = fem.blocks or [slice(0, n)]
+    if len(pts_all) != len(blocks):
+        raise ValueError(
+            "jno.precond.schwarz(nullspace='rigid'): the problem's field coordinates do not line up with its "
+            "field blocks; pass the near-null space explicitly as an (n, k) array."
+        )
+    cols = []
+    for pts, blk in zip(pts_all, blocks):
+        size, nodes = blk.stop - blk.start, pts.shape[0]
+        vec, dim = size // max(nodes, 1), pts.shape[1]
+        if vec * nodes != size:
+            raise ValueError(
+                f"jno.precond.schwarz(nullspace='rigid'): a field block of {size} unknowns on {nodes} nodes is not "
+                "node-major with a whole number of components; pass the near-null space explicitly."
+            )
+        modes = []
+        for c in range(vec):  # translations / constants
+            m = np.zeros((nodes, vec))
+            m[:, c] = 1.0
+            modes.append(m)
+        if vec == dim and dim in (2, 3):  # infinitesimal rotations x -> w x (x - x0)
+            x = pts - pts.mean(axis=0)
+            for i, j in ([(0, 1)] if dim == 2 else [(0, 1), (1, 2), (0, 2)]):
+                m = np.zeros((nodes, vec))
+                m[:, i], m[:, j] = -x[:, j], x[:, i]
+                modes.append(m)
+        for m in modes:
+            col = np.zeros(n)
+            col[blk] = m.reshape(-1)  # node-major, components interleaved: node * vec + component
+            cols.append(col)
+    return np.stack(cols, axis=1)
+
+
 def schwarz(
-    *, parts: int | None = None, overlap: int = 1, coarse: bool = True, restricted: bool = False, float32: bool = False
+    *,
+    parts: int | None = None,
+    overlap: int = 1,
+    coarse: bool = True,
+    restricted: bool = False,
+    nullspace=None,
+    float32: bool = False,
 ) -> _Schwarz:
     """**Overlapping Schwarz** domain decomposition, algebraic: built from the assembled operator alone, so it
     applies to any FEM/FDM system (Toselli & Widlund, *Domain Decomposition Methods*, 2005; restricted variant:
@@ -3034,15 +3093,19 @@ def schwarz(
     of parts. ``restricted=True`` is RAS -- usually fewer iterations, but non-symmetric (use bicgstab/gmres;
     ``cg`` switches to flexible CG); the default is the symmetric additive form, fit for ``cg``.
 
-    Works best for elliptic, positive-definite problems (diffusion, elasticity, implicit time steps); a
-    piecewise-constant coarse space does not capture elasticity's rigid-body modes, and indefinite problems
-    (Helmholtz, saddle points as a whole) are outside what Schwarz handles robustly.
+    ``nullspace`` sets what the coarse space carries per part: ``None`` one constant (Nicolaides); ``"rigid"``
+    the near-null space built from the problem -- rigid-body modes for a displacement-like field (as many
+    components as dimensions), one constant per component otherwise -- which is what elasticity needs; or an
+    explicit ``(n, k)`` array.
+
+    Works best for elliptic, positive-definite problems (diffusion, elasticity, implicit time steps); indefinite
+    problems (Helmholtz, saddle points as a whole) are outside what Schwarz handles robustly.
     """
     if parts is not None and (isinstance(parts, bool) or not isinstance(parts, int) or parts < 1):
         raise ValueError(f"jno.precond.schwarz(parts={parts!r}): must be a positive int or None.")
     if isinstance(overlap, bool) or not isinstance(overlap, int) or overlap < 0:
         raise ValueError(f"jno.precond.schwarz(overlap={overlap!r}): must be an int >= 0.")
-    return _precision(_Schwarz(parts, overlap, bool(coarse), bool(restricted)), float32)
+    return _precision(_Schwarz(parts, overlap, bool(coarse), bool(restricted), nullspace), float32)
 
 
 def fsai(*, power: int = 1, float32: bool = False) -> _FSAI:

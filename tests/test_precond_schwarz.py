@@ -42,7 +42,8 @@ def _leaf(sol):
 
 
 def _pcg_iterations(A, b, spec):
-    spec.build(A)
+    if spec._pattern is None:
+        spec.build(A)
     pat = spec._pattern
     mv = sparse_matvec(A)
 
@@ -130,3 +131,47 @@ def test_refusals():
     op = LinearOperator.from_matvec(lambda v: 2 * v, shape=(4, 4))
     with pytest.raises(TypeError, match="ASSEMBLED"):
         jno.precond.schwarz().materialize(PrecondContext(op, None))
+
+
+def _cantilever(size=0.05):
+    d = jno.shape.rect(0.0, 0.0, 4.0, 1.0, size=size).domain()
+    x, y = d.variable("interior", split=True)[:2]
+    cl = d.variable("left", where=lambda X, Y: X < 1e-9, split=True)
+    u, v = d.fem_symbols(value_shape=(2,))
+    eu, ev = jno.np.symgrad(u, [x, y]), jno.np.symgrad(v, [x, y])
+    dd = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    vb = v.bind(x=x, y=y)
+    return jno.fem(
+        [
+            2.0 * dd(eu, ev) + jno.np.trace(eu) * jno.np.trace(ev) + 0.1 * vb[1],
+            u(cl[0], cl[1])[0] - 0.0,
+            u(cl[0], cl[1])[1] - 0.0,
+        ]
+    )
+
+
+def test_rigid_body_modes_make_elasticity_scale():
+    """Constants alone cannot represent rotations: elasticity iterations then grow with the parts
+    (measured 154 -> 256 for 16 -> 256 parts); with the rigid-body modes they do not (103 -> 56)."""
+    fem = _cantilever(0.04)
+    A, b = fem._op
+    b = jnp.asarray(b).reshape(-1)
+    its = {}
+    for p in (16, 128):
+        for ns in (None, "rigid"):
+            spec = jno.precond.schwarz(parts=p, nullspace=ns)
+            spec.build(A, fem=fem)
+            its[p, ns] = _pcg_iterations(A, b, spec)
+    assert its[128, "rigid"] <= its[16, "rigid"] and its[128, "rigid"] < 0.6 * its[128, None], its
+
+
+def test_rigid_through_fem_solve_gives_the_default_answer():
+    fem = _cantilever()
+    ref = _leaf(fem.solve())
+    got = _leaf(fem.solve(linear=jno.solve.cg(tol=1e-11), precond=jno.precond.schwarz(parts=16, nullspace="rigid")))
+    np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6 * np.abs(ref).max())  # the default solves to 1e-8
+
+
+def test_rigid_without_a_problem_is_refused():
+    with pytest.raises(ValueError, match="rigid"):
+        jno.precond.schwarz(nullspace="rigid").build(_poisson()._op[0])
