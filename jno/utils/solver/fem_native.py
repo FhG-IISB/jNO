@@ -3101,14 +3101,14 @@ def assemble_fem_native(
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             for coeff, tfi, rnames in typed_with_masks:
-                elem = _elem_map(
+                R = _elem_map(
                     lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(
                         c, la, _e, _t, _r, t, args, pts_dyn, cl_d, clf_d
                     ),
                     (jnp.arange(n_cells), local_all),
                     _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
+                    scatter=(R, cd_d[tfi]),
                 )
-                R = R.at[cd_d[tfi].reshape(-1)].add(elem.reshape(-1))
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
