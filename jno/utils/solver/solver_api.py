@@ -1059,6 +1059,9 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
     # ``direct=None`` (newton's default) assembles the tangent whenever one is offered, so it wants it too.
     _composed.wants_jacobian = getattr(nonlinear, "direct", False) is not False
+    # ...but only ``direct=True`` cannot run WITHOUT one. A caller that cannot assemble the tangent (the
+    # compiled load-path contact march, whose gap tables are traced) may still use the others matrix-free.
+    _composed.needs_jacobian = getattr(nonlinear, "direct", False) is True
     # An over-relaxed driver steps past its sub-solve's answer and needs the box projector to stay
     # feasible; the `bounds` wrapper is the only thing that owns one.
     _composed.wants_project = bool(getattr(nonlinear, "wants_project", False))
