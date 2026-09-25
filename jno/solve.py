@@ -65,6 +65,7 @@ __all__ = [
     "svd",
     "lstsq",
     "bdf2",
+    "sdirk",
     "theta",
     "exponential",
     "adaptive",
@@ -1736,6 +1737,30 @@ def bdf2():
     from .utils.solver.timeschemes import _BDF2Scheme
 
     return _BDF2Scheme()
+
+
+def sdirk(order: int = 3):
+    """**SDIRK** time scheme for ``fem.solve(time=...)``: a singly diagonally implicit Runge-Kutta method,
+    stiffly accurate and L-stable -- Alexander's 2-stage order-2 (``order=2``) or 3-stage order-3
+    (``order=3``, default) method (R. Alexander, SIAM J. Numer. Anal. 14(6), 1977).
+
+    Third order where ``theta``/``bdf2`` stop at second: for a smooth solution the same accuracy at far
+    larger steps. Each stage is one implicit solve of the same kind the backward-Euler march takes (a
+    linear solve, or a Newton solve for a nonlinear block), all with the SAME step operator
+    ``M + gamma*dt*A`` -- so ``linear=``/``precond=`` slots, a sparse-direct factorisation and a constant
+    preconditioner are built once. Stiffly accurate, so Dirichlet / algebraic (zero-mass) rows are exact
+    at every step, and L-stable, so it damps stiff transients the way backward Euler does (unlike
+    Crank-Nicolson). Composes with ``.adaptive(...)`` (step doubling with exponent ``1/(order+1)``).
+
+    Costs ``order`` implicit solves per step. A state-dependent mass ``c(u) u_t`` is integrated in its
+    non-conservative form (as ``bdf2`` does). Refuses a second-order-in-time (``u_tt``) block: an L-stable
+    scheme would damp the undamped wave.
+    """
+    from .utils.solver.timeschemes import _SDIRKScheme
+
+    if isinstance(order, bool) or order not in (2, 3):
+        raise ValueError(f"jno.solve.sdirk(order={order!r}): order must be 2 or 3.")
+    return _SDIRKScheme(order)
 
 
 def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):

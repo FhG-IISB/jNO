@@ -53,11 +53,14 @@ def _final_state(n_steps, scheme):
             u(x0, y0) - jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [x0, y0]),
         ]
     )
-    sol = fem.solve(time=jno.solve.bdf2()) if scheme == "bdf2" else fem.solve()
+    schemes = {"bdf2": jno.solve.bdf2, "sdirk2": lambda: jno.solve.sdirk(2), "sdirk3": lambda: jno.solve.sdirk(3)}
+    sol = fem.solve(time=schemes[scheme]()) if scheme in schemes else fem.solve()
     return np.asarray(jno.core([sol.mse]).eval([sol]))[-1].reshape(-1)
 
 
-@pytest.mark.parametrize("scheme, order", [("bdf2", 2.0), ("backward_euler", 1.0)])
+@pytest.mark.parametrize(
+    "scheme, order", [("bdf2", 2.0), ("backward_euler", 1.0), ("sdirk2", 2.0), ("sdirk3", 3.0)]
+)
 def test_temporal_order_with_a_state_dependent_mass(scheme, order):
     ref = _final_state(256, scheme)
     errs = np.array([np.linalg.norm(_final_state(n, scheme) - ref) for n in (8, 16, 32)])

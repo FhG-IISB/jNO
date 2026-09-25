@@ -261,6 +261,155 @@ class _BDF2Scheme(_TimeScheme):
         return "jno.solve.bdf2()"
 
 
+def _sdirk_tableau(order):
+    """Alexander's stiffly-accurate, L-stable SDIRK methods (SIAM J. Numer. Anal. 14(6), 1977, Table 1 / Sec. 2):
+    ``(A, c, gamma)`` with ``b`` = the last row of ``A`` (stiff accuracy: the step's answer IS the last stage)."""
+    import numpy as np
+
+    if order == 2:
+        g = 1.0 - 1.0 / np.sqrt(2.0)
+        A = np.array([[g, 0.0], [1.0 - g, g]])
+    elif order == 3:
+        # gamma: the root in (1/6, 1/2) of x^3 - 3x^2 + 3x/2 - 1/6, which makes the method L-stable
+        g = float([r.real for r in np.roots([1.0, -3.0, 1.5, -1.0 / 6.0]) if abs(r.imag) < 1e-12 and 1 / 6 < r.real < 0.5][0])
+        tau = (1.0 + g) / 2.0
+        b1 = -(6.0 * g * g - 16.0 * g + 1.0) / 4.0
+        b2 = (6.0 * g * g - 20.0 * g + 5.0) / 4.0
+        A = np.array([[g, 0.0, 0.0], [tau - g, g, 0.0], [b1, b2, g]])
+    else:
+        raise ValueError(f"jno.solve.sdirk(order={order!r}): order must be 2 or 3.")
+    return A, A.sum(axis=1), float(g)
+
+
+def _sdirk_shift(A):
+    """``D`` with ``u*_i = u_n + sum_{k<i} D[i, k] Z_k`` (``Z_k = U_k - u_n``) -- the start state that turns stage
+    ``i`` into one backward-Euler step of size ``gamma*dt``. From ``M Z = dt (A (x) I) F``: ``dt F_j = sum_k
+    (A^-1)_jk M Z_k``, so the explicit part ``dt sum_{j<i} a_ij F_j = M sum_k D_ik Z_k`` needs no ``M^-1``."""
+    import numpy as np
+
+    Ainv = np.linalg.inv(A)
+    s = A.shape[0]
+    D = np.zeros_like(A)
+    for i in range(s):
+        for k in range(i):
+            D[i, k] = sum(A[i, j] * Ainv[j, k] for j in range(k, i))
+    return D
+
+
+class _SDIRKScheme(_TimeScheme):
+    """Singly diagonally implicit Runge-Kutta; see :func:`jno.solve.sdirk`.
+
+    Implemented by REDUCTION, like BDF2: every stage is exactly one backward-Euler :meth:`step` of size
+    ``gamma*dt`` from a shifted start state (``_sdirk_shift``), so the Dirichlet / zero-mass (DAE) rows, the
+    solver slots, the Newton driver, the complex 2n path and the Krylov rescue all come from ``step``
+    unchanged -- and all stages share ONE step operator ``M + gamma*dt*A``.
+    """
+
+    def __init__(self, order):
+        self.order = int(order)
+        self.A, self.c, self.gamma = _sdirk_tableau(self.order)
+        self.D = _sdirk_shift(self.A)
+
+    @property
+    def step_order(self):
+        return self.order
+
+    def step_scales(self, block):
+        return (self.gamma * float(block.dt),)
+
+    def _refuse(self, block):
+        if (block.metadata or {}).get("second_order"):
+            raise NotImplementedError(
+                "jno.solve.sdirk(): a second-order-in-time (u_tt) block is assembled with theta=1/2 because it "
+                "must NOT be damped, and this SDIRK is L-stable -- it would damp an undamped wave silently. "
+                "Use the block's own scheme, or jno.solve.theta(0.5)."
+            )
+
+    def _one_step(self, blk, u, t, dt, args, linear_solve, nonlinear_solve, report):
+        """One SDIRK step from ``u`` at ``t`` over ``dt``; returns ``u(t+dt)`` (and the stages' norms)."""
+        s = self.A.shape[0]
+        Z, reports = [], []
+        for i in range(s):
+            u_star = u
+            for k in range(i):
+                if self.D[i, k] != 0.0:
+                    u_star = u_star + float(self.D[i, k]) * Z[k]
+            h = self.gamma * dt
+            out = blk.step(
+                u_star,
+                t + float(self.c[i]) * dt - h,
+                h,
+                args=args,
+                theta=1.0,
+                linear_solve=linear_solve,
+                nonlinear_solve=nonlinear_solve,
+                report=report,
+            )
+            if report:
+                out, r_end, r_start = out
+                reports.append((r_end, r_start))
+            Z.append(out - u)
+        return u + Z[-1], reports  # stiffly accurate: the last stage is the step's answer
+
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        self._refuse(block)
+        return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve, nonlinear_solve, False)[0]
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        import jax
+        import jax.numpy as jnp
+
+        from .backend_blocks import _cached_march, _resample_trajectory, hoist_time_invariant
+        from .matvec_format import prime
+
+        self._refuse(block)
+        prime(block.M, getattr(block, "A", None))
+        _s0f = getattr(block, "state0_fn", None)
+        s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
+        dtype = s0.dtype
+        import numpy as np
+
+        dt = float(block.dt)
+        # The grid on the HOST (numpy), as BDF2 does: under `jno.core` a jnp.linspace is staged, and the
+        # per-stage convergence record below needs concrete times.
+        t0, t1 = float(block.t0), float(block.t1)
+        grid_np = np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
+        grid_ts = jnp.asarray(grid_np, dtype)
+        judge = bool(block.is_nonlinear())
+
+        def march(s0, grid_ts, args):
+            blk = hoist_time_invariant(block, args, grid_ts[0])
+
+            def step(u, t_next):
+                un, reps = self._one_step(blk, u, t_next - dt, dt, args, linear_solve, nonlinear_solve, judge)
+                if not judge:
+                    return un, un
+                return un, (un, jnp.stack([r[0] for r in reps]), jnp.stack([r[1] for r in reps]))
+
+            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+
+        ys = _cached_march(block, (linear_solve, nonlinear_solve, repr(self), dt), march, s0, grid_ts, args)
+        if judge:
+            from .history_march import _TRANSIENT_ADVICE, _check_march_converged
+
+            ys, r_end, r_start = ys
+            s = self.A.shape[0]
+            _check_march_converged(
+                r_end.reshape(-1),  # one entry per STAGE: every stage is a Newton solve that must converge
+                r_start.reshape(-1),
+                np.repeat(grid_np[1:], s),
+                nonlinear_solve,
+                what=f"transient march ({self!r}, per stage)",
+                coord="t",
+                advice=_TRANSIENT_ADVICE,
+            )
+        traj = jnp.concatenate([s0[None, :], ys], axis=0)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+    def __repr__(self):
+        return f"jno.solve.sdirk(order={self.order})"
+
+
 class _AdaptiveScheme(_TimeScheme):
     """Step-size **policy** wrapping a base scheme — step-doubling (Richardson) error control on that
     scheme's implicit step, so it inherits the block's DAE handling and works for a linear or nonlinear
