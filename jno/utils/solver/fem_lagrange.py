@@ -378,8 +378,12 @@ def identity_pushforward(
     phi = ref_values[..., 0]  # (n_quad, n_dof)
     dphi_ref = ref_grads[..., 0, :]  # (n_quad, n_dof, tdim)
     # One inverse per quadrature point when the geometry is curved; one for the whole cell when affine.
-    spec = "qnd,qdD->qnD" if K.ndim == 3 else "qnd,dD->qnD"
-    dphi_phys = jnp.einsum(spec, dphi_ref, K)  # (n_quad, n_dof, tdim)
+    # Written as multiply-and-sum, NOT an einsum: vmapped over cells, the einsum lowers to a batched GEMM of
+    # (n_dof x tdim) @ (tdim x tdim) blocks with layout transposes around it -- a 4x3 @ 3x3 product per cell,
+    # the worst shape a GEMM kernel can get. The broadcast form is an elementwise loop XLA fuses with its
+    # neighbours.
+    Kq = K[:, None, :, :] if K.ndim == 3 else K[None, None, :, :]  # (q|1, 1, d, D)
+    dphi_phys = jnp.sum(dphi_ref[..., :, None] * Kq, axis=-2)  # (n_quad, n_dof, tdim)
     return phi, dphi_phys
 
 
