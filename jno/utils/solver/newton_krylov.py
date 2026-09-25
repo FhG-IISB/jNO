@@ -250,9 +250,14 @@ def _retreat(accept, *, hi, lo, max_halvings, dtype):
     return a
 
 
+def _armijo_ok(r_new_norm, rn, a, *, ls_c):
+    """The residual-norm Armijo test itself: sufficient decrease from ``rn`` for a step of length ``a``."""
+    return r_new_norm <= (1.0 - ls_c * a) * rn
+
+
 def _armijo(f, x, delta, rn, *, ls_c):
     """The residual-norm Armijo predicate shared by every Newton-type step: ``accept(a)``."""
-    return lambda a: jnp.linalg.norm(f(x + a * delta)) <= (1.0 - ls_c * a) * rn
+    return lambda a: _armijo_ok(jnp.linalg.norm(f(x + a * delta)), rn, a, ls_c=ls_c)
 
 
 def _bisect_slope(f, x, delta, *, atol, rtol, max_iters, dtype):
@@ -456,6 +461,69 @@ def _step_and_tangent(linear_solve, who, *, tol, maxit):
     return step, tangent
 
 
+def _anderson_solve(plain, f, x0, *, m, rtol, atol, max_steps, ls_c, ls_max):
+    """Safeguarded **Anderson acceleration** (type II; Walker & Ni, SIAM J. Numer. Anal. 49(4), 2011, Alg. AA)
+    of the fixed-point iteration ``x <- plain(x, f(x))`` -- the loop body of a ``custom_root`` ``solve``.
+
+    With ``g(x) = plain(x) - x`` and the last ``m`` differences ``dX``, ``dG`` of iterates and of ``g``, the
+    accelerated point is ``x + g - (dX + dG) gamma`` with ``gamma = argmin ||g - dG gamma||`` (a thin QR of
+    the ``n x m`` history, then an ``m x m`` least squares that tolerates the zero columns of the first ``m``
+    steps). It is taken when it decreases the residual (the ``_armijo`` test); otherwise the step retreats
+    through ``_retreat`` toward the PLAIN iterate, which is what the unaccelerated driver would have done
+    -- so the acceleration can make an iteration faster, never worse.
+
+    Fixed shapes (``2 m n`` of history), so it runs under ``jit``/``vmap``/``scan``. Returns
+    ``(x, (steps, ||r_end||, ||r0||))`` like the drivers' plain loops.
+    """
+    dtype = x0.dtype
+    r_start = f(x0)
+    r0n = jnp.linalg.norm(r_start)
+    n = x0.shape[0]
+
+    def cond(state):
+        _x, r, k = state[:3]
+        return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
+
+    def body(state):
+        x, r, k, dX, dG, x_prev, g_prev = state
+        u_plain = plain(x, r)
+        g = u_plain - x
+        # Row-major history (m, n): column `(k-1) % m` holds the newest difference; order is irrelevant to
+        # the least-squares problem. Step 0 has no difference yet and writes nothing.
+        col = (k - 1) % m
+        have = k > 0
+        dX = dX.at[col].set(jnp.where(have, x - x_prev, dX[col]))
+        dG = dG.at[col].set(jnp.where(have, g - g_prev, dG[col]))
+        q, rr = jnp.linalg.qr(dG.T)  # (n, m), (m, m)
+        gamma = jnp.linalg.lstsq(rr, q.T @ g)[0]  # rank-tolerant: an all-zero history gives gamma = 0
+        u_aa = x + g - (dX + dG).T @ gamma
+        rn = jnp.linalg.norm(r)
+        r_aa = f(u_aa)
+        # The full extrapolation first, on the residual already in hand (NaN-safe: rejected if not finite).
+        ok = _armijo_ok(jnp.linalg.norm(r_aa), rn, 1.0, ls_c=ls_c)
+
+        def _retreat_to_plain():
+            step = u_aa - u_plain
+            t = _retreat(_armijo(f, u_plain, step, rn, ls_c=ls_c), hi=0.5, lo=0.0, max_halvings=ls_max, dtype=dtype)
+            u = u_plain + t * step
+            return u, f(u)
+
+        x_new, r_new = jax.lax.cond(ok, lambda: (u_aa, r_aa), _retreat_to_plain)
+        return x_new, r_new, k + 1, dX, dG, x, g
+
+    zeros = jnp.zeros((m, n), dtype)
+    x, r, k, *_ = jax.lax.while_loop(cond, body, (x0, r_start, 0, zeros, zeros, x0, jnp.zeros_like(x0)))
+    return x, (k.astype(r0n.dtype), jnp.linalg.norm(r), r0n)
+
+
+def _check_anderson(anderson):
+    if isinstance(anderson, bool) or not isinstance(anderson, int) or anderson < 0:
+        raise ValueError(
+            f"anderson={anderson!r}: the Anderson history depth must be an int >= 0 (0 = off; 3-10 is usual)."
+        )
+    return anderson
+
+
 def newton_krylov(
     residual_fn,
     u0,
@@ -470,6 +538,7 @@ def newton_krylov(
     line_search=False,
     ls_max=25,
     ls_c=1e-4,
+    anderson=0,
 ):
     """Root-find ``residual_fn(u) = 0`` from guess ``u0``; differentiable w.r.t. any value
     ``residual_fn`` closes over. Drop-in for the ``(residual_fn, u0) -> u`` solver contract.
@@ -514,7 +583,20 @@ def newton_krylov(
         """First ``alpha`` in ``damping * 0.5^i`` meeting residual-norm Armijo; else the last (tiny)."""
         return _retreat(_armijo(f, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
+    anderson = _check_anderson(anderson)
+
+    def _update(f, u):
+        ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
+        delta = inner_step(jvp, -ru)
+        alpha = _backtrack(f, u, delta, jnp.linalg.norm(ru)) if line_search else damping
+        return u + alpha * delta
+
     def solve(f, x0):
+        if anderson:
+            return _anderson_solve(
+                lambda u, _r: _update(f, u), f, x0, m=anderson, rtol=rtol, atol=atol, max_steps=max_steps,
+                ls_c=ls_c, ls_max=ls_max,
+            )  # fmt: skip
         r_start = f(x0)
         r0n = jnp.linalg.norm(r_start)
 
@@ -524,10 +606,7 @@ def newton_krylov(
 
         def body(state):
             u, _r, k = state
-            ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
-            delta = inner_step(jvp, -ru)
-            alpha = _backtrack(f, u, delta, jnp.linalg.norm(ru)) if line_search else damping
-            u = u + alpha * delta
+            u = _update(f, u)
             return u, f(u), k + 1
 
         u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
@@ -763,6 +842,7 @@ def staggered_newton(
     line_search=False,
     ls_max=25,
     ls_c=1e-4,
+    anderson=0,
 ):
     """**Alternate minimization** (staggered / operator-split) root find over a block-partitioned system.
 
@@ -976,7 +1056,14 @@ def staggered_newton(
             return _retreat(_armijo(f, x, dx, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=x.dtype)
         return damping * _bisect_slope(f, x, dx, atol=atol, rtol=ls_c, max_iters=ls_max, dtype=x.dtype)
 
+    anderson = _check_anderson(anderson)
+
     def solve(f, x0):
+        if anderson:  # accelerate the SWEEP: it is the fixed-point map
+            return _anderson_solve(
+                lambda u, _r: _sweep(u), f, x0, m=anderson, rtol=rtol, atol=atol, max_steps=max_sweeps,
+                ls_c=ls_c, ls_max=ls_max,
+            )  # fmt: skip
         r_start = f(x0)
         r0n = jnp.linalg.norm(r_start)
 

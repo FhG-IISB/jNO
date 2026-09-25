@@ -196,3 +196,44 @@ def test_picard_reports_its_step_count():
     fem.solve(nonlinear=jno.solve.picard())
     st = fem.stats["nonlinear"]
     assert st["converged"] and isinstance(st["steps"], int) and st["steps"] >= 2
+
+
+def _slow_picard(c=5.0, f=30.0, size=0.1):
+    """-div((1 + c u^2) grad u) = f with the coefficient lagged: plain Picard needs ~33 steps here."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    x, y = d.variable("interior", split=True)[:2]
+    u, phi = d.fem_symbols()
+    cb = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=x, y=y), phi.bind(x=x, y=y)
+    return jno.fem([jno.lag(1 + c * ui * ui) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(cb[0], cb[1]) - 0.0])
+
+
+def test_anderson_reaches_the_same_root_in_far_fewer_steps():
+    """Anderson acceleration of the Picard fixed point (Walker & Ni 2011). Oracle: full Newton."""
+    fem = _slow_picard()
+    tight = dict(rtol=1e-11, atol=1e-13)
+    u_newton = np.asarray(fem.solve(nonlinear=jno.solve.newton(**tight))).reshape(-1)
+    np.asarray(fem.solve(nonlinear=jno.solve.picard(**tight)))
+    plain = fem.stats["nonlinear"]["steps"]
+    u_aa = np.asarray(fem.solve(nonlinear=jno.solve.picard(anderson=5, **tight))).reshape(-1)
+    fast = fem.stats["nonlinear"]["steps"]
+    assert np.abs(u_aa - u_newton).max() < 1e-9 * np.abs(u_newton).max()
+    assert fast < 0.6 * plain, (fast, plain)
+
+
+def test_anderson_converges_where_plain_picard_does_not():
+    fem = _slow_picard(c=20.0, f=50.0)
+    with pytest.raises(RuntimeError, match="did not converge"):
+        fem.solve(nonlinear=jno.solve.picard(max_steps=200))
+    fem.solve(nonlinear=jno.solve.picard(anderson=5, max_steps=200))
+    assert fem.stats["nonlinear"]["converged"]
+
+
+def test_anderson_zero_is_the_plain_iteration_and_bad_depths_are_refused():
+    fem = _nonlinear_diffusion(lagged=True)
+    a = np.asarray(fem.solve(nonlinear=jno.solve.picard()))
+    b = np.asarray(fem.solve(nonlinear=jno.solve.picard(anderson=0)))
+    np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-15)  # GPU scatter-add order only
+    for bad in (-1, 2.5, True):
+        with pytest.raises(ValueError, match="anderson"):
+            fem.solve(nonlinear=jno.solve.picard(anderson=bad))

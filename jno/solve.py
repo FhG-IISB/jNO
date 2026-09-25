@@ -497,8 +497,9 @@ def amg(
 
 
 def _root_driver(
-    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False, reuse=False
-) -> NonlinearSolver:
+    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False,
+    reuse=False, anderson=0,
+) -> NonlinearSolver:  # fmt: skip
     if reuse and direct is not True:
         raise ValueError(
             f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED, factorized tangent between steps, and only "
@@ -571,6 +572,7 @@ def _root_driver(
             line_search=line_search,
             ls_max=ls_max,
             ls_c=ls_c,
+            anderson=anderson,
         )
 
     # The tolerances travel WITH the spec, not just inside the closure: a driver run under `lax.scan`
@@ -580,6 +582,10 @@ def _root_driver(
         damping=damping, rtol=rtol, atol=atol, max_steps=max_steps, inner_tol=inner_tol, inner_maxit=inner_maxit,
         line_search=line_search, ls_max=ls_max, ls_c=ls_c, direct=direct,
     )  # fmt: skip
+    if anderson:
+        config["anderson"] = anderson
+    if reuse:
+        config["reuse"] = reuse
     return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol}, config=config)
 
 
@@ -653,6 +659,7 @@ def picard(
     line_search: bool = False,
     ls_max: int = 25,
     ls_c: float = 1e-4,
+    anderson: int = 0,
 ) -> NonlinearSolver:
     """Damped Picard (lagged-coefficient / fixed-point) iteration — pair with :func:`jno.lag`.
 
@@ -671,9 +678,18 @@ def picard(
     rigid-plastic cold start whose effective viscosity spans orders of magnitude), where fixed
     damping alone either diverges or crawls. See the ``jno.lag`` docstring for the inverse-problem
     (Picard-adjoint) caveat.
+
+    ``anderson=m`` (``m >= 1``; 0 = off) applies **Anderson acceleration** over the last ``m`` iterates
+    (Walker & Ni, SIAM J. Numer. Anal. 49(4), 2011): each step extrapolates from the history of Picard
+    updates, which often turns linear convergence into much faster convergence for the same one linear
+    solve per step. Safeguarded: an extrapolated point that does not decrease the residual retreats toward
+    the plain Picard iterate, so it is never worse than ``anderson=0``. Costs ``2 m`` vectors of memory and
+    one thin QR of an ``n x m`` matrix per step; ``m`` of 3-10 is usual. Gradients are unchanged (implicit
+    differentiation at the root).
     """
     return _root_driver(
         "picard",
+        anderson=anderson,
         damping=damping,
         rtol=rtol,
         atol=atol,
@@ -732,6 +748,7 @@ def staggered(
     ls_c: float = 1e-4,
     direct: bool = False,
     over_relax: float = 1.0,
+    anderson: int = 0,
 ) -> NonlinearSolver:
     """**Alternate minimization** — solve a coupled system one field at a time, sweeping until the full
     residual converges. ``fields`` is the trial symbols in the order to sweep them::
@@ -792,6 +809,12 @@ def staggered(
     default puts *unpreconditioned* BiCGStab on a saddle block, for the reason given above — a sub-solve
     is a restriction closure and a ``precond=`` spec has no operator to materialize against. This is
     documented rather than enforced; ``fem.solve``'s own saddle warning already fires on that shape.
+
+    ``anderson=m`` (``m >= 1``; 0 = off) applies **Anderson acceleration** to the sweep, which is the
+    fixed-point map (Walker & Ni, SIAM J. Numer. Anal. 49(4), 2011) -- the standard remedy for the slow,
+    linear convergence of alternate minimization. Safeguarded: an extrapolated point that does not
+    decrease the full residual retreats toward the plain sweep's answer. It composes with ``over_relax``
+    (the over-relaxed sweep is then the map being accelerated). Memory ``2 m`` vectors.
     """
     resolved: dict = {"blocks": None, "names": None, "constrained": None}
 
@@ -887,6 +910,7 @@ def staggered(
             line_search=line_search,
             ls_max=ls_max,
             ls_c=ls_c,
+            anderson=anderson,
         )
 
     def _label(f):  # a field's value identity for the repr; an unnamed one falls back to its repr (never equal)
@@ -899,6 +923,8 @@ def staggered(
         inner_steps=inner_steps, inner_tol=inner_tol, inner_maxit=inner_maxit, line_search=line_search,
         damping=damping, ls_max=ls_max, ls_c=ls_c, direct=direct, over_relax=over_relax,
     )  # fmt: skip
+    if anderson:
+        config["anderson"] = anderson
     spec = NonlinearSolver(
         _fn,
         name="staggered",
