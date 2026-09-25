@@ -43,6 +43,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import jax
 import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
+
+from .small_linalg import small_det, small_inv
 import numpy as np
 
 from .fem_1d import (
@@ -668,7 +670,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     def _cell(c):
         verts = pts_j[cells_p1_j[c]]  # (dim+1, dim) — P1 geometry vertices
         J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
-        detJ = jnp.linalg.det(J)
+        detJ = small_det(J)
         phi, dphi = identity_pushforward(ref_vals, ref_grads, J, detJ)  # (n_q,n_dof), (n_q,n_dof,dim)
         JxW = qw * jnp.abs(detJ)  # (n_q,)
         xq = verts[0] + qp @ J.T  # (n_q, dim)
@@ -732,7 +734,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
             def _face(c, k, n_vec, _fp=fp_phi, _fd=fp_dphi_ref, _fq=fp_qp, _ft=fp_tangs, _gw=gw_face):
                 verts = pts_j[cells_p1_j[c]]
                 J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
-                K = jnp.linalg.inv(J)
+                K = small_inv(J)
                 phi_f = _fp[k]  # (n_fq, n_dof)
                 dphi_f = jnp.einsum("qnd,dD->qnD", _fd[k], K)  # (n_fq, n_dof, dim)
                 jac_f = _facet_area_element(J, _ft[k])  # edge length (2D) / face area (3D)
@@ -1964,12 +1966,12 @@ def assemble_fem_native(
             # bilinear/trilinear tensor-product cell without knowing which it has.
             gverts = pts[cells_f[_geom_field][c]]  # (n_geom, dim)
             J = jnp.einsum("ad,qan->qdn", gverts, ref_grads_all[_geom_field][..., 0, :])  # (n_q, dim, dim)
-            detJ = jnp.linalg.det(J)  # (n_q,)
+            detJ = small_det(J)  # (n_q,)
             xq = ref_vals_all[_geom_field][..., 0] @ gverts  # (n_q, dim)
         else:
             verts = pts[cells[c]]  # (dim+1, dim)
             J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
-            detJ = jnp.linalg.det(J)
+            detJ = small_det(J)
             xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
         meas = jnp.abs(detJ)  # scalar (affine) or (n_quad,) (curved)
 
@@ -2005,7 +2007,7 @@ def assemble_fem_native(
         Jacobian treats both as constants -- and unused symbols are dead code XLA drops."""
         n_q = qw_shared.shape[0]
         h_qp = jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (n_q, 1))
-        K = jnp.linalg.inv(J)  # dxi/dx: (dim, dim) affine, (n_q, dim, dim) curved
+        K = small_inv(J)  # dxi/dx: (dim, dim) affine, (n_q, dim, dim) curved
         G_qp = jnp.broadcast_to(jnp.swapaxes(K, -1, -2) @ K, (n_q, dim, dim))
         return h_qp, G_qp
 
@@ -2747,10 +2749,10 @@ def assemble_fem_native(
             _, fd_g, _, _, _ = face_tables_per_field[_geom_field]
             Jq = jnp.einsum("ad,qan->qdn", gverts, fd_g[k])  # (n_q, dim, dim)
             xq = face_tables_per_field[_geom_field][0][k] @ gverts  # (n_q, dim): x = sum_a N_a x_a
-            return Jq, jnp.linalg.inv(Jq), xq
+            return Jq, small_inv(Jq), xq
         verts = pts_src[(cells_j if cells is None else cells)[c]]
         Jc = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
-        return Jc, jnp.linalg.inv(Jc), None  # xq is formed by the caller from its own facet points
+        return Jc, small_inv(Jc), None  # xq is formed by the caller from its own facet points
 
     def _surf_elem_res(
         fi,

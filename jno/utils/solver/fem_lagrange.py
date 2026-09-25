@@ -24,6 +24,8 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import jax.numpy as jnp
+
+from .small_linalg import small_inv
 import numpy as np
 
 from .fem_elements import ElementSpec
@@ -372,7 +374,7 @@ def identity_pushforward(
     phi       : ``(n_quad, n_dof)``  physical shape values (``= ref_values[..., 0]``).
     dphi_phys : ``(n_quad, n_dof, tdim)``  physical gradients ``∂φ/∂x``.
     """
-    K = jnp.linalg.inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
+    K = small_inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
     phi = ref_values[..., 0]  # (n_quad, n_dof)
     dphi_ref = ref_grads[..., 0, :]  # (n_quad, n_dof, tdim)
     # One inverse per quadrature point when the geometry is curved; one for the whole cell when affine.
@@ -411,5 +413,5 @@ def identity_pushforward_hess(ref_hess: jnp.ndarray, J: jnp.ndarray) -> jnp.ndar
     hess_phys : ``(n_quad, n_dof, tdim, tdim)``  physical Hessian ``∂²φ/∂x∂x`` (symmetric).
     """
     _refuse_curved_hessian(J)
-    K = jnp.linalg.inv(J)  # J⁻¹
+    K = small_inv(J)  # J⁻¹
     return jnp.einsum("qnij,ia,jb->qnab", ref_hess[..., 0, :, :], K, K)

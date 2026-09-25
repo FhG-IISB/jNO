@@ -34,6 +34,8 @@ from __future__ import annotations
 from typing import Any, NamedTuple, Optional, Tuple
 
 import jax.numpy as jnp
+
+from .small_linalg import small_inv
 import numpy as np
 
 from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES
@@ -128,7 +130,7 @@ def piola_contravariant_grad(ref_grads: jnp.ndarray, J: jnp.ndarray, detJ: jnp.n
     ``(n_quad, n_dof, value_size i, tdim l)`` with the per-DOF orientation ``signs`` applied.
     Tracing over ``(i, l)`` recovers the RT divergence (the invariant the test pins).
     """
-    K = jnp.linalg.inv(J)
+    K = small_inv(J)
     grad = jnp.einsum("ik,qnkm,ml->qnil", J, ref_grads, K) / detJ
     return grad * signs[None, :, None, None]
 
@@ -207,7 +209,7 @@ def piola_covariant(
     *vector* recovered downstream from the physical gradient, so pass ``ref_curl=None`` and the second
     output is ``None``. ``signs`` is the per-DOF edge orientation ``(n_dof,)``, applied to both outputs.
     """
-    K = jnp.linalg.inv(J)  # J^{-1}; the covariant map J^{-T} gives Phi_phys_i = K_ji Phi_ref_j
+    K = small_inv(J)  # J^{-1}; the covariant map J^{-T} gives Phi_phys_i = K_ji Phi_ref_j
     s = signs[None, :]  # (1, n_dof)
     values = jnp.einsum("ji,qnj->qni", K, ref_values) * s[:, :, None]
     curl = None if ref_curl is None else ref_curl / detJ * s
@@ -223,7 +225,7 @@ def piola_covariant_grad(ref_grads: jnp.ndarray, J: jnp.ndarray, detJ: jnp.ndarr
     with the per-DOF ``signs`` applied. The off-diagonal ``grad[..., 1, 0] - grad[..., 0, 1]`` recovers
     the physical curl ``(1/detJ) curl_ref`` (the invariant the test pins).
     """
-    K = jnp.linalg.inv(J)
+    K = small_inv(J)
     grad = jnp.einsum("ji,qnjm,ml->qnil", K, ref_grads, K)
     return grad * signs[None, :, None, None]
 
@@ -286,7 +288,7 @@ def hermite_pushforward(ref_values, ref_grads, ref_hess, J, detJ, signs):
     Hermite field exactly like a scalar Lagrange one (the ``signs`` arg is unused -- Hermite has no edge
     orientation -- kept for a uniform push-forward signature)."""
     M = hermite_M(J)
-    K = jnp.linalg.inv(J)
+    K = small_inv(J)
     phi = jnp.einsum("ab,qb->qa", M, ref_values[..., 0])  # (n_quad, n_dof)
     dphys = jnp.einsum("qbi,id->qbd", ref_grads[..., 0, :], K)  # reference grad -> physical (chain rule)
     grad = jnp.einsum("ab,qbd->qad", M, dphys)  # (n_quad, n_dof, tdim)
@@ -462,7 +464,7 @@ def argyris_pushforward(ref_values, ref_grads, ref_hess, J, detJ, edge_normals, 
     :func:`argyris_triangle`; ``edge_normals`` is the cell's ``(3, 2)`` physical edge normals (one per local
     edge ``k``, globally oriented)."""
     nv_val, nv_grad, nv_hess, ne_grad = nodal
-    K = jnp.linalg.inv(J)
+    K = small_inv(J)
     # M(cell): assemble the 21 functional rows column-blockwise over the basis index k.
     vg = jnp.einsum("lm,vkl->vkm", K, nv_grad)  # (3,21,2) Kᵀ∇ at each vertex
     vh = jnp.einsum("pa,vkpq,qb->vkab", K, nv_hess, K)  # (3,21,2,2) Kᵀ H K at each vertex
@@ -604,7 +606,7 @@ def morley_pushforward(ref_values, ref_grads, ref_hess, J, detJ, edge_normals, n
     ``nodal = (nv_val, ne_grad)`` are the reference nodal tabulations from :func:`morley_triangle`;
     ``edge_normals`` is the cell's ``(3, 2)`` physical edge normals (one per local edge ``k``)."""
     nv_val, ne_grad = nodal
-    K = jnp.linalg.inv(J)
+    K = small_inv(J)
     eg = jnp.einsum("lm,ekl->ekm", K, ne_grad)  # (3, 6, 2) Kᵀ∇ at each edge midpoint
     en = jnp.einsum("em,ekm->ek", edge_normals, eg)  # (3, 6) n_e · Kᵀ∇
     M = jnp.concatenate([jnp.asarray(nv_val), en], axis=0)  # (6, 6): 3 vertex-value rows + 3 edge-normal rows
