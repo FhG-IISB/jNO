@@ -2951,10 +2951,15 @@ class FEM:
             # (or the operator's default Newton) so it operates on the reduced residual.
             from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic, restrict_state_periodic
 
-            periodic = self._periodic
+            periodic_static = self._periodic
             user_fn = solve_fn
 
-            def _reduced(residual_fn, y0, jacobian=None):
+            def _reduced(residual_fn, y0, jacobian=None, args=None):
+                # A slip surface on runtime coordinates: P for THIS solve's coordinates (unchanged otherwise).
+                from .utils.solver.slip_runtime import bind_periodic
+
+                periodic = bind_periodic(periodic_static, args)
+
                 def _base(rf, y, jac=None):
                     if user_fn is not None:
                         # A sparse-direct Newton asks for the ASSEMBLED tangent; hand it the REDUCED one,
@@ -2993,6 +2998,8 @@ class FEM:
 
             # Propagate the flag so the operator hands `_reduced` the full tangent to reduce.
             _reduced.wants_jacobian = bool(getattr(user_fn, "wants_jacobian", False))
+            _reduced.wants_args = True  # so a runtime-coordinate slip P can be rebuilt (see bind_periodic)
+            periodic = periodic_static
             # Carry the composed solver's value-identity through the reduction wrapper, so a cached
             # compiled solve is still recognised as the same solver on a constrained problem.
             _k = getattr(user_fn, "cache_key", None)
@@ -3037,9 +3044,15 @@ class FEM:
         full residual of a constrained problem keeps the constraint's reaction, which is physical and
         stays O(1) however well converged the solve is.
         """
+        from .utils.solver.slip_runtime import bind_periodic
         from .utils.solver.solver_api import record_nonlinear_verdict
 
         op, per, vals = self._op, self._periodic, kwargs["values"]
+        if per is not None:
+            from .utils.solver.slip_runtime import check_pruned
+
+            check_pruned(per, vals)  # eager: a pruned P entry must still be zero at these coordinates
+        per = bind_periodic(per, vals) if per is not None else None
         u = jnp.asarray(out).reshape(-1)
         zero = jnp.zeros((int(op.size),), dtype=jnp.result_type(float))
         u0 = jnp.asarray(kwargs.get("u0", zero)).reshape(-1)
@@ -4735,6 +4748,7 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
         by_field.setdefault(int(idx), []).append(str(region))
 
     blocks, off_full, off_red = [], [0], [0]
+    runtime = None  # set when a slip surface moves with runtime coordinates (see `slip_runtime`)
     for i in range(n_fields):
         n_i = int(offsets[i + 1] - offsets[i]) if offsets.size > 1 else int(fem_obj.dofs)
         if i not in by_field:
@@ -4774,6 +4788,33 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
         node_dofs = np.asarray([[n * vec_i + c for c in range(vec_i)] for n in nodes], dtype=np.int64)
         coeff_blocks = [np.stack(merged[n], axis=0) for n in nodes]
         pro = build_slip_prolongation(n_i, node_dofs, coeff_blocks)
+        from .utils.solver import slip_runtime as _srt
+
+        if _srt.runtime_info(domain, pts_i, np.asarray(pts_i)[nodes]):
+            # The slip surface moves with runtime coordinates: keep P's STRUCTURE, rebuild its values per
+            # solve (see `slip_runtime`). The plan's P at the build coordinates must equal the reference.
+            if runtime is not None:
+                raise NotImplementedError(
+                    "jno.fem: runtime (trainable) coordinates move the slip surfaces of more than one field; "
+                    "only one moving slip field is supported."
+                )
+            refs = [_region_node_normals(domain, pts_i, cells_i, order_i, rg) for rg in by_field[i]]
+            plan = _srt.build_plan(
+                domain, pts_i, cells_i, order_i, by_field[i], nodes, node_dofs, refs, pro["kept_nodes"], n_i, pro["n_red"]
+            )
+            I_rt, D_rt = _srt.plan_P(plan, None, xp=np)
+            import scipy.sparse as _sp
+
+            P_ref = pro["P"]
+            A_ref = _sp.coo_matrix(
+                (np.asarray(P_ref.data), (np.asarray(P_ref.indices)[:, 0], np.asarray(P_ref.indices)[:, 1])),
+                shape=P_ref.shape,
+            ).tocsr()
+            A_new = _sp.coo_matrix((np.asarray(D_rt), (I_rt[:, 0], I_rt[:, 1])), shape=P_ref.shape).tocsr()
+            if abs(A_ref - A_new).max() > 1e-10:
+                raise AssertionError("jno.fem: the runtime slip prolongation does not reproduce the build-time one")
+            pro["P"] = jsparse.BCOO((jnp.asarray(D_rt), jnp.asarray(I_rt)), shape=P_ref.shape)
+            runtime = {"block": len(blocks), "plan": plan, "P_indices": I_rt}
         from .utils.logger import get_logger
 
         get_logger().info(
@@ -4786,7 +4827,7 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
 
     if len(blocks) == 1:
         b = blocks[0]
-        return {
+        out = {
             "P": b["P"],
             "P_node": b["P"],
             "kept_nodes": b["kept"],
@@ -4797,6 +4838,9 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
             "is_bloch": False,
             "coupling": "slip",
         }
+        if runtime is not None:
+            out["slip_runtime"] = runtime
+        return out
     from .utils.solver.fem_utils import _blockdiag_bcoo
 
     off_full_a = np.asarray(off_full, dtype=np.int64)
@@ -4812,6 +4856,7 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
         "P_blockdiag": _blockdiag_bcoo([b["P"] for b in blocks], off_full_a, off_red_a),
         "is_bloch": False,
         "coupling": "slip",
+        **({"slip_runtime": runtime} if runtime is not None else {}),
     }
 
 
@@ -6135,6 +6180,18 @@ def _fem_impl(
                 exclude_dofs=[int(d) for d, _g in _dpairs] + _tvdofs,
             )
         periodic = _annotate_reduced_dirichlet(periodic, _dpairs, _tvdofs)
+        from .utils.solver import slip_runtime as _srt
+
+        if _srt.is_runtime(periodic):
+            if fem_obj._mode != "nonlinear":
+                raise NotImplementedError(
+                    f"jno.fem: this slip surface moves with runtime (trainable) coordinates, which is supported "
+                    f"on the steady NONLINEAR path only (its prolongation is rebuilt per solve there); this "
+                    f"problem is {fem_obj._mode!r}. Rebuild jno.fem on the moved mesh, or keep the slip "
+                    "surface's vertices out of the trainable region."
+                )
+            # From here on the build-time P must not be used: every consumer binds the solve's coordinates.
+            periodic = _srt.install_sentinels(periodic)
         if periodic.get("is_bloch") and fem_obj._mode in ("linear", "nonlinear"):
             # A REAL form with a Bloch tie: the complex phase makes the field complex anyway, and the
             # real path would reduce with the bilinear Pᵀ A P — which for a complex P is NOT a Galerkin

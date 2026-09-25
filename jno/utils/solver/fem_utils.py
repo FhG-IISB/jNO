@@ -5148,15 +5148,18 @@ def _remap_bcoo_weighted(mat, P, conj=False):
     Stays sparse (no dense ``n_full × n_full`` intermediate); ``D = max mains/secondary`` (small: the
     nodes of a main facet). Returns ``None`` if ``P``'s indices are not concrete (built under trace),
     so the caller falls back to the dense product -- the nonconforming reduction is built eagerly."""
+    # Only P's PATTERN must be concrete: it decides the output pattern, host-side. Its VALUES enter as
+    # gathered products, so they may be traced -- a slip P rebuilt per solve from runtime coordinates
+    # (`slip_runtime`) has static indices and traced data, and must not fall back to the dense product.
     try:
         pidx = np.asarray(P.indices)  # concrete only; a tracer raises
-        pdat = np.asarray(P.data)
     except Exception:
         return None
+    pdat = jnp.asarray(P.data)
     n_full, n_red = int(mat.shape[0]), int(P.shape[1])
     rows, cols = pidx[:, 0], pidx[:, 1]
     order = np.argsort(rows, kind="stable")
-    rows, cols, wts = rows[order], cols[order], pdat[order]
+    rows, cols = rows[order], cols[order]
     if len(rows) == 0:
         return jsparse.BCOO((jnp.zeros(0), jnp.zeros((0, 2), jnp.int32)), shape=(n_red, n_red))
     is_new = np.concatenate([[True], rows[1:] != rows[:-1]])
@@ -5164,8 +5167,10 @@ def _remap_bcoo_weighted(mat, P, conj=False):
     D = int(slot.max()) + 1
     main = np.zeros((n_full, D), np.int64)
     main[rows, slot] = cols
-    weight = np.zeros((n_full, D), np.complex128 if np.iscomplexobj(pdat) else np.float64)
-    weight[rows, slot] = wts
+    # position of each (row, slot) entry in P.data; the extra last slot of `pdat_z` is the zero weight
+    epos = np.full((n_full, D), pdat.shape[0], np.int64)
+    epos[rows, slot] = order
+    pdat_z = jnp.concatenate([pdat, jnp.zeros((1,), pdat.dtype)])
     deg = np.bincount(rows, minlength=n_full)  # entries of P per full DOF (1 almost everywhere)
 
     # Expand each mat triplet (r, c, v) over the REAL (a, b) pairs of its row and column only.
@@ -5183,7 +5188,7 @@ def _remap_bcoo_weighted(mat, P, conj=False):
         # Fall back to the dense D x D broadcast, which needs no concrete indices. It costs nnz*D^2
         # (the memory this branch exists to avoid), but it is correct, and duplicates are left in place
         # exactly as `_remap_bcoo` leaves them -- fine for a matvec, and the only option under trace.
-        mj, wj = jnp.asarray(main), jnp.asarray(weight)
+        mj, wj = jnp.asarray(main), pdat_z[jnp.asarray(epos)]
         r, c, v = mat.indices[:, 0], mat.indices[:, 1], mat.data
         mr, wr, mc, wc = mj[r], wj[r], mj[c], wj[c]
         if conj:
@@ -5203,12 +5208,12 @@ def _remap_bcoo_weighted(mat, P, conj=False):
     bi = pos % np.repeat(dc, counts)  # slot in the column's P entries
     out_r = main[r_h[src], ai]
     out_c = main[c_h[src], bi]
-    w_row = weight[r_h[src], ai]
+    w_row = pdat_z[jnp.asarray(epos[r_h[src], ai])]
     if conj:  # P^H mat P conjugates the row (left) weights
-        w_row = np.conj(w_row)
-    w_prod = w_row * weight[c_h[src], bi]
+        w_row = jnp.conj(w_row)
+    w_prod = w_row * pdat_z[jnp.asarray(epos[c_h[src], bi])]
 
-    data = mat.data[jnp.asarray(src)] * jnp.asarray(w_prod)
+    data = mat.data[jnp.asarray(src)] * w_prod
     idx = jnp.asarray(np.stack([out_r, out_c], axis=1)).astype(mat.indices.dtype)
     # `sum_duplicates()` decides `nse` from the DATA, so under trace it has no concrete count and the
     # result poisons anything downstream that needs one -- `sparse_lu_solve` raised

@@ -30,6 +30,7 @@ path is unaffected.
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
+| Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | `jno.derived` nonlocal fields | nodal Lagrange `on=` only; no chained derived fields; host geometry closed over by the rule is **frozen at build**, so it goes stale on a moving mesh | raises, except the moving mesh — **silent** |
