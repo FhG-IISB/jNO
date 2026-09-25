@@ -490,8 +490,9 @@ class SemidiscreteTimeBlock:
             if self.jacobian is not None:
                 from .solver_api import _add_step_operator
 
-                def jac_default(wn):
-                    return _add_step_operator(self.jacobian(wn, t_next, args), M_t, 1.0 / dt)
+                def jac_default(wn):  # the same ∂G/∂wn = M/dt + diag(w)·J_R as `jac_step`
+                    J = self.jacobian(wn, t_next, args)
+                    return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt)
 
                 return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
             return _verdict(G, u, newton_krylov(G, u), report)

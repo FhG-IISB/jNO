@@ -59,3 +59,27 @@ def test_an_adaptive_march_solves_its_own_step_operator_with_a_slot():
     ref = _march(sch, fem.operator, fem, None)
     got = _march(sch, fem.operator, fem, jno.solve.bicgstab(tol=1e-12))
     np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-9)
+
+
+@pytest.mark.parametrize("theta", [0.5, 1.0])
+def test_the_nonlinear_step_tangent_carries_theta(theta):
+    """G = M(w-u)/dt + theta R(w) + ... has Jacobian M/dt + theta J. Built as M/dt + J, a Crank-Nicolson
+    march's Newton ran on the wrong tangent and custom_root's GRADIENT came out 7.7% wrong."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_fem_sdirk import _heat
+
+    fem = _heat(6, T=0.05, nonlinear=True)
+    blk = fem.operator
+    save = jnp.linspace(blk.t0, blk.t1, 3)
+    sch = jno.solve.theta(theta)
+
+    def loss(s):
+        b = dataclasses.replace(blk, state0=s * blk.state0)
+        return jnp.sum(sch.integrate(b, {}, save, linear_solve=None, nonlinear_solve=None) ** 2)
+
+    g = float(jax.grad(loss)(1.3))
+    fd = float((loss(1.3 + 1e-6) - loss(1.3 - 1e-6)) / 2e-6)
+    np.testing.assert_allclose(g, fd, rtol=1e-6)
