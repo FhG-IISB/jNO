@@ -70,6 +70,71 @@ def _theta_row_weights(M, theta, n, dtype):
     return jnp.where(_algebraic_rows(M, n, dtype), jnp.asarray(1.0, dtype), jnp.asarray(theta, dtype))
 
 
+def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
+    """jNO's default solve of one implicit step ``step_op(w) = rhs`` -- Jacobi-preconditioned BiCGStab with a
+    verified GMRES rescue (GMRES outright when the assembly asks for it via ``metadata["krylov"]``).
+
+    Shared by :meth:`SemidiscreteTimeBlock.step` and the Rosenbrock stages, whose stage operator is the same
+    kind of ``M + scale*J`` step operator. ``diag`` is that operator's diagonal (zero entries left unscaled).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from .krylov import gmres as _scaled_gmres  # scale-invariant: JAX's Arnoldi zeroes a tiny ||b||
+
+    n = rhs.shape[0]
+    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
+    # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
+    # the default and is right for the symmetric real blocks; the complex real-equivalent block
+    # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
+    # down there. Restart is capped at 40 (as the dedicated complex marcher used) to bound memory.
+    if krylov == "gmres":
+        # The tolerance must be REACHABLE in the working precision. jNO defaults to float32 (x64 is
+        # opt-in), whose eps is 1.2e-7, so the 1e-10 relative target asked for here could never be
+        # met -- the termination test never fired, and GMRES, which has no other way out, paid its
+        # full ``10*n`` restarts every step however easy the system. Measured on a 377-dof parametric
+        # transient: **5485.6 ms/step -> 20.0 ms/step (249x)**, for the same answer (final |u|
+        # 0.141276836 vs 0.141276851).
+        #
+        # Scaled to the dtype rather than capped by ``maxiter``: an easy system then exits as soon as
+        # it converges and a hard one keeps working, where a fixed cap would silently under-solve the
+        # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
+        # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
+        ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
+        wn, _ = _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)
+        return wn
+    # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
+    # its breakdown test fires once the residual stalls at the float32 noise floor, so the effect is
+    # "solve as tightly as this precision allows" -- 1.0 ms/step here, i.e. the defect is masked at no
+    # measurable cost. Giving it the reachable tolerance measured 0.6 ms/step but moved every real
+    # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
+    # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
+    # becomes the GMRES bug and wants the same `ktol`.
+    wn, _ = jax.scipy.sparse.linalg.bicgstab(
+        step_op, rhs, x0=x0, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
+    )
+    # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
+    # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
+    # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
+    # outright (exact mid-iteration convergence makes ``omega = 0/0``, and NaN passes jax's
+    # ``omega != 0`` breakdown test), and with a healthy warm start it EXITS SILENTLY at ~1e-2
+    # relative residual — each step slightly wrong, compounding to 1e62 over 60 steps. The steady
+    # default would have raised (its eager residual check); a traced scan cannot raise, so VERIFY
+    # the step and re-solve with GMRES when the residual is not small — GMRES has no breakdown
+    # division and measured 1e-16 per step on the same block. Cost: one extra matvec + one scalar
+    # reduce per step; the comparison is False for a NaN residual too, so both failure modes take
+    # the rescue. The healthy stall floor (measured 8e-11 in f64, ~1e-5 in f32) sits well under
+    # the dtype-scaled threshold, so a symmetric march never pays the GMRES.
+    eps = float(jnp.finfo(rhs.dtype).eps)
+    r_rel = jnp.linalg.norm(step_op(wn) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
+    ktol = max(1e-10, 100.0 * eps)
+    return jax.lax.cond(
+        r_rel < max(1e-9, 1e4 * eps),
+        lambda: wn,
+        lambda: _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)[0],
+    )
+
+
 @dataclass
 class SemidiscreteTimeBlock:
     """
@@ -431,7 +496,6 @@ class SemidiscreteTimeBlock:
                 return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
             return _verdict(G, u, newton_krylov(G, u), report)
 
-        from .krylov import gmres as _scaled_gmres
         from .linear import matrix_diagonal, sparse_matvec
 
         th = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
@@ -482,56 +546,7 @@ class SemidiscreteTimeBlock:
             return linear_solve(step_op, rhs, u, _diag)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
-        inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
-        # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
-        # the default and is right for the symmetric real blocks; the complex real-equivalent block
-        # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
-        # down there. Restart is capped at 40 (as the dedicated complex marcher used) to bound memory.
-        if (self.metadata or {}).get("krylov") == "gmres":
-            # The tolerance must be REACHABLE in the working precision. jNO defaults to float32 (x64 is
-            # opt-in), whose eps is 1.2e-7, so the 1e-10 relative target asked for here could never be
-            # met -- the termination test never fired, and GMRES, which has no other way out, paid its
-            # full ``10*n`` restarts every step however easy the system. Measured on a 377-dof parametric
-            # transient: **5485.6 ms/step -> 20.0 ms/step (249x)**, for the same answer (final |u|
-            # 0.141276836 vs 0.141276851).
-            #
-            # Scaled to the dtype rather than capped by ``maxiter``: an easy system then exits as soon as
-            # it converges and a hard one keeps working, where a fixed cap would silently under-solve the
-            # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
-            # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
-            ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
-            wn, _ = _scaled_gmres(step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)
-            return wn
-        # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
-        # its breakdown test fires once the residual stalls at the float32 noise floor, so the effect is
-        # "solve as tightly as this precision allows" -- 1.0 ms/step here, i.e. the defect is masked at no
-        # measurable cost. Giving it the reachable tolerance measured 0.6 ms/step but moved every real
-        # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
-        # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
-        # becomes the GMRES bug and wants the same `ktol`.
-        wn, _ = jax.scipy.sparse.linalg.bicgstab(
-            step_op, rhs, x0=u, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
-        )
-        # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
-        # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
-        # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
-        # outright (exact mid-iteration convergence makes ``omega = 0/0``, and NaN passes jax's
-        # ``omega != 0`` breakdown test), and with a healthy warm start it EXITS SILENTLY at ~1e-2
-        # relative residual — each step slightly wrong, compounding to 1e62 over 60 steps. The steady
-        # default would have raised (its eager residual check); a traced scan cannot raise, so VERIFY
-        # the step and re-solve with GMRES when the residual is not small — GMRES has no breakdown
-        # division and measured 1e-16 per step on the same block. Cost: one extra matvec + one scalar
-        # reduce per step; the comparison is False for a NaN residual too, so both failure modes take
-        # the rescue. The healthy stall floor (measured 8e-11 in f64, ~1e-5 in f32) sits well under
-        # the dtype-scaled threshold, so a symmetric march never pays the GMRES.
-        eps = float(jnp.finfo(rhs.dtype).eps)
-        r_rel = jnp.linalg.norm(step_op(wn) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
-        ktol = max(1e-10, 100.0 * eps)
-        return jax.lax.cond(
-            r_rel < max(1e-9, 1e4 * eps),
-            lambda: wn,
-            lambda: _scaled_gmres(step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)[0],
-        )
+        return _default_step_solve(step_op, rhs, u, d, krylov=(self.metadata or {}).get("krylov"))
 
     def solve(self, solve_fn=None, *, save_ts=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a

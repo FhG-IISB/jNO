@@ -1347,7 +1347,11 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     # theta*dt. BDF2 takes 2dt/3 after a full-dt startup step, so it uses two; building the block's
     # default for both would silently solve the wrong system.
     _static: dict = {}
-    _constant_operator = block.operator_fn is None and block.A is not None and block.dt is not None
+    # ...and a constant MASS: a `mass_fn` re-assembles M per step, and a prebuilt `block.M + kA` would then
+    # disagree with the right-hand side the step forms from it -- a different system, solved silently.
+    _constant_operator = (
+        block.operator_fn is None and block.mass_fn is None and block.A is not None and block.dt is not None
+    )
     _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
     def _build(key):
@@ -1383,6 +1387,9 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         hit = _static.get(key) if key is not None else None
         if hit is not None:
             return hit
+        # A scale nobody prebuilt, or a traced one: no operator, so the step solves with its OWN product
+        # (the prebuilt default-scale operator would be a different system, solved without complaint). The
+        # prebuilt preconditioner is kept: for a nearby operator it changes only the convergence speed.
         return None, (_static.get(_default_scale) or (None, None))[1]
 
     def step_solve(matvec, rhs, x0, diag_fn, scale=None):
