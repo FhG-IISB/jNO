@@ -2950,6 +2950,9 @@ def _representative_operator(fem):
 class _Schwarz(_Spec):
     """Spec for the algebraic overlapping Schwarz preconditioner; see :func:`schwarz`."""
 
+    #: Distributes itself in a sharded solve: its subdomains are partitioned over the device mesh.
+    shardable = True
+
     def __init__(self, parts, overlap, coarse, restricted, nullspace):
         self.parts, self.overlap, self.coarse, self.restricted = parts, overlap, coarse, restricted
         self.nullspace = nullspace
@@ -2973,7 +2976,11 @@ class _Schwarz(_Spec):
         if isinstance(A, LinearOperator):
             A = A.bcoo if A.bcoo is not None else A.dense()
         n = int(A.shape[0])
-        parts = self.parts if self.parts is not None else max(1, -(-n // 256))
+        parts = self.parts
+        if parts is None:
+            # ~256 unknowns per part, rounded up to whole blocks per device (unchanged on one device).
+            ndev = jax.device_count()
+            parts = -(-max(1, -(-n // 256)) // ndev) * ndev
         null = self.nullspace
         if isinstance(null, str):
             if null != "rigid":
@@ -3019,7 +3026,7 @@ class _Schwarz(_Spec):
                     "eagerly: spec = jno.precond.schwarz(); spec.build(fem.A)."
                 )
             self.build(A, ctx.fem)
-        factors = schwarz_factor(self._pattern, A, coarse=self.coarse)
+        factors = schwarz_factor(self._pattern, A, coarse=self.coarse, mesh=getattr(ctx, "mesh", None))
         fwd = schwarz_apply(self._pattern, factors, restricted=self.restricted, mv=ctx.A.mv if self.coarse else None)
         applier = PrecondApplier(fwd)
         applier.nonsymmetric = self.restricted
@@ -3087,8 +3094,8 @@ def schwarz(
     Cai & Sarkis, SIAM J. Sci. Comput. 21(2), 1999; coarse space: Nicolaides, SIAM J. Numer. Anal. 24(2), 1987).
 
     The unknowns are split into ``parts`` pieces by recursive bisection of the operator's graph (default: one
-    part per ~256 unknowns), each grown by ``overlap`` layers of neighbours; every local problem is solved
-    exactly (batched dense LU). ``coarse=True`` adds the two-level coarse correction (one constant per part,
+    part per ~256 unknowns, rounded up to a multiple of the device count), each grown by ``overlap`` layers of
+    neighbours; every local problem is solved exactly (the local inverses, applied as one batched product). ``coarse=True`` adds the two-level coarse correction (one constant per part,
     applied in the balanced hybrid form), which is what keeps the iteration count from growing with the number
     of parts. ``restricted=True`` is RAS -- usually fewer iterations, but non-symmetric (use bicgstab/gmres;
     ``cg`` switches to flexible CG); the default is the symmetric additive form, fit for ``cg``.
@@ -3100,6 +3107,15 @@ def schwarz(
 
     Works best for elliptic, positive-definite problems (diffusion, elasticity, implicit time steps); indefinite
     problems (Helmholtz, saddle points as a whole) are outside what Schwarz handles robustly.
+
+    **Several devices** (``fem.solve(shard=...)``, concrete or traced operator): the subdomains are split into
+    one block per device; each device builds, inverts and applies only its own, and their contributions are
+    combined by an all-reduce of an n-vector (three per application in the two-level form). The coarse matrix
+    and the vectors are replicated. Two caveats: the numeric setup gathers the operator's pattern keys and
+    values onto every device, once per factorisation (O(nnz) there, transiently -- the O(parts * m^2) local
+    matrices are what gets split); and a ``parts`` that is not a multiple of the device count leaves padded,
+    idle block slots on some devices. Verified on simulated CPU devices (placement and answers), not timed on
+    real multi-GPU hardware. On ONE GPU it is slower than ``amg``.
     """
     if parts is not None and (isinstance(parts, bool) or not isinstance(parts, int) or parts < 1):
         raise ValueError(f"jno.precond.schwarz(parts={parts!r}): must be a positive int or None.")

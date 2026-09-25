@@ -121,7 +121,7 @@ def shard_triplets(data, indices, mesh: Mesh):
     return jax.device_put(data, spec), jax.device_put(indices, spec)
 
 
-def sharded_solve(A, b, solve_fn, devices, *, precond_fn=None, x0=None):
+def sharded_solve(A, b, solve_fn, devices, *, precond_fn=None, x0=None, precond_spec=None, fem=None):
     """Run ``solve_fn`` with the operator partitioned across ``devices``.
 
     ``A`` is the assembled BCOO; ``solve_fn(op_matvec, rhs, M, x0) -> x`` is any matvec-based solver.
@@ -148,6 +148,15 @@ def sharded_solve(A, b, solve_fn, devices, *, precond_fn=None, x0=None):
         if precond_fn is not None:
             diag = jax.ops.segment_sum(jnp.where(rows == cols, d, 0.0), rows, num_segments=n)
             M = precond_fn(diag)
+        elif precond_spec is not None:
+            # A spec that distributes itself (``shardable``, e.g. jno.precond.schwarz): materialised HERE, from
+            # the sharded triplets, with the mesh in its context so it can partition its own data by device.
+            import jax.experimental.sparse as jsp
+
+            from .solver_api import LinearOperator, PrecondContext
+
+            op = LinearOperator(jsp.BCOO((d, idx), shape=(n, n)))
+            M = precond_spec.materialize(PrecondContext(op, fem, mesh=mesh))
         return solve_fn(matvec, rhs, M, guess)
 
     in_shardings = (shard_spec, shard_spec, repl, None if x0_s is None else repl)

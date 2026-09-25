@@ -627,10 +627,13 @@ class PrecondContext:
     forms" primitive (weighted mass matrices, low-order proxies, shifted operators).
     """
 
-    def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None):
+    def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None, mesh: Any = None):
         self.A = A
         self.fem = fem
         self._grid = grid
+        # The device mesh of a SHARDED solve (``None`` otherwise): a spec that distributes itself partitions
+        # its own data over it (see ``sharding.sharded_solve``).
+        self.mesh = mesh
 
     def diag(self):
         return self.A.diag()
@@ -824,6 +827,8 @@ def _shardable(op: LinearOperator, linear, precond) -> bool:
       preconditioner drags a full copy along saves nothing. Jacobi is the exception because it needs
       only the diagonal, and the diagonal is the same scatter-add the matvec already performs -- so it
       is computed *from the sharded triplets* and never touches an assembled matrix.
+      Also admitted: a spec that distributes ITSELF (``shardable = True``, :func:`jno.precond.schwarz`),
+      materialised inside the sharded run from the sharded operator and handed the device mesh.
     A **traced** operator is covered, by a different mechanism: ``device_put`` cannot place a tracer,
     so the parametric and differentiate-through paths take the ``with_sharding_constraint`` route in
     :func:`~.sharding.constrain_operator` instead of the ``device_put`` + ``in_shardings`` one.
@@ -839,7 +844,10 @@ def _shardable(op: LinearOperator, linear, precond) -> bool:
         return False
     if getattr(linear, "direct", False):
         return False
-    return precond is None or isinstance(precond, _Jacobi)
+    # ...and a spec that distributes ITSELF: it is materialised inside the sharded run, from the sharded
+    # triplets, and partitions its own data over the device mesh (jno.precond.schwarz: one block of
+    # subdomains per device).
+    return precond is None or isinstance(precond, _Jacobi) or bool(getattr(precond, "shardable", False))
 
 
 def _is_traced(A) -> bool:
@@ -975,7 +983,13 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
             n = int(op.shape[0])
             matvec, diag_fn = constrain_operator(op.bcoo, devices)
             mf = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(n, n))
-            M = materialize_precond(precond, PrecondContext(mf, fem)) if precond is not None else None
+            if getattr(precond, "shardable", False):
+                # Factored from the operator's values (not its matvec), partitioned over the same mesh.
+                from .sharding import operator_mesh
+
+                M = materialize_precond(precond, PrecondContext(op, fem, mesh=operator_mesh(devices)))
+            else:
+                M = materialize_precond(precond, PrecondContext(mf, fem)) if precond is not None else None
             return linear(mf, rhs, M=M, x0=x0_flat)
         if devices and not _traced and _shardable(op, linear, precond):
             from .sharding import jacobi_from_diagonal, sharded_solve
@@ -985,12 +999,17 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
             def _run(matvec, r, M, guess):
                 return linear(LinearOperator.from_matvec(matvec, shape=(n, n)), r, M=M, x0=guess)
 
+            from ...precond import _Jacobi
+
+            is_jacobi = isinstance(precond, _Jacobi)
             return sharded_solve(
                 op.bcoo,
                 rhs,
                 _run,
                 devices,
-                precond_fn=None if precond is None else jacobi_from_diagonal,
+                precond_fn=jacobi_from_diagonal if is_jacobi else None,
+                precond_spec=None if (precond is None or is_jacobi) else precond,
+                fem=fem,
                 x0=x0_flat,
             )
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None

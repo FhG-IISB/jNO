@@ -158,7 +158,7 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1, nullspace=None) -> Schwa
     )
 
 
-def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool):
+def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool, mesh=None):
     """Numeric phase (traceable): the inverse of every local matrix and, two-level, of the coarse matrix."""
     from .fsai import FsaiPattern, _keys_and_values
 
@@ -166,6 +166,15 @@ def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool):
     ext = jnp.concatenate([vals, jnp.zeros((1,), vals.dtype), jnp.ones((1,), vals.dtype)])
     blk = jnp.zeros((pat.p, pat.m, pat.m), vals.dtype)
     blk = jax.vmap(lambda b, r, c, q: b.at[r, c].add(ext[q]))(blk, pat.lrow, pat.lcol, pat.lpos)
+    if mesh is not None:
+        # One block of subdomains per device: each builds, inverts and stores only its own (p/devices of
+        # them), and the application's scatter-add of their results becomes one all-reduce.
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from .sharding import SHARD_AXIS
+
+        blk = jax.lax.with_sharding_constraint(blk, NamedSharding(mesh, P(SHARD_AXIS, None, None)))
     # The local INVERSES, not LU factors: applying them is then one batched dense matrix-vector product, where
     # batched triangular solves of small blocks are among the slowest kernels a GPU runs (measured ~1 ms per
     # application for 256 blocks of 102). Same memory (m^2 per part); the blocks are small principal
