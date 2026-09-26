@@ -127,8 +127,7 @@ def test_a_slip_reduced_system_can_be_continued():
     assert fem._periodic is not None, "this problem is meant to be slip-reduced"
     out = np.asarray(
         fem.solve(
-            # matrix-free Newton: the continuation driver hands the solver a residual and no
-            # assembled tangent, so `newton(direct=True)` refuses here (see the xfail below).
+            # matrix-free Newton here; the direct Newton under a march is covered further down
             continuation=jno.solve.continuation(visc=np.linspace(0.0, 1.0, 3)),
         )
     ).reshape(-1)
@@ -237,3 +236,35 @@ def test_an_empty_value_sequence_is_refused_by_name():
     fem = _nonlinear_diffusion()
     with pytest.raises(ValueError, match="length >= 1"):
         fem.solve(continuation=jno.solve.continuation(k=[]))
+
+
+def test_a_full_state_warm_start_seeds_a_reduced_march():
+    """`x0` is a FULL state (what fem.solve returns); the reduced march must restrict it, not choke on its
+    size. Re-marching from the march's own answer must return that answer."""
+    from jno.domain.geometries import Geometries
+
+    mesh, _, _ = Geometries.equi_distant_box(nx=2, ny=2, nz=2)(None)
+    d = jno.domain(lambda g: (mesh, 3, 0.5), compute_mesh_connectivity=True)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+    p_, q = d.fem_symbols(names=("p", "q"), order=1)
+    x, y, z, _ = d.variable("interior", split=True)
+    eu, ev = jno.np.symgrad(u, [x, y, z]), jno.np.symgrad(v, [x, y, z])
+    dd = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    pp, qq = p_.bind(x=x, y=y, z=z), q.bind(x=x, y=y, z=z)
+    c = d.variable("boundary", normals=True, split=True)
+    ur = u.bind(x=c[0], y=c[1], z=c[2])
+    k = jno.np.parameter((1,), name="visc")
+    fem = jno.fem(
+        [
+            2.0 * (1.0 + k * dd(eu, eu)) * dd(eu, ev) - pp * jno.np.trace(ev) - 1.0 * v.bind(x=x, y=y, z=z)[0],
+            -qq * jno.np.trace(eu),
+            c[-3] * ur[0] + c[-2] * ur[1] + c[-1] * ur[2] - 0.0,
+            p_.pin(),
+        ]
+    )
+    nl = jno.solve.newton(direct=True, rtol=1e-12, atol=1e-12)
+    first = np.asarray(fem.solve(continuation=jno.solve.continuation(visc=[0.0, 1.0]), nonlinear=nl)).reshape(-1)
+    again = np.asarray(fem.solve(continuation=jno.solve.continuation(visc=[1.0]), nonlinear=nl, x0=first)).reshape(-1)
+    assert np.linalg.norm(again - first) <= 1e-9 * np.linalg.norm(first)
+    with pytest.raises(ValueError, match="full state"):
+        fem.solve(continuation=jno.solve.continuation(visc=[1.0]), nonlinear=nl, x0=first[:-3])

@@ -27,7 +27,9 @@ across a remesh in a transient / moving-mesh loop), ``zz_error_indicators``, ``d
 from __future__ import annotations
 
 import copy
+import gc
 import itertools
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -885,6 +887,77 @@ def _cell_patch_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.nd
     # produces a singular solve -- the same convention `_one_ring_cells` uses
     cand = np.where(mask, cand, cand[:, :1])
     return cand, mask
+
+
+def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts, dst_cells, dst_layout, dim, *, total_dst):
+    """Conservative L2 projection of a P1 state from one mesh onto a DIFFERENT one: the Galerkin
+    transfer ``M(dst) u_new = b``, ``b_i = int_{Omega_dst} u_old phi_i^dst``.
+
+    :func:`_l2_transfer_jax` already does this for mesh MOTION, but it requires both meshes to share one
+    cell array -- its point location is a one-ring search, which is right when vertices have shifted a
+    little and useless when the mesh has been rebuilt. So a remesh fell back to pointwise nodal
+    interpolation (``_eval_fe_fields_at_points``), which is what `_l2_transfer_jax`'s own docstring warns
+    about: on a translating Gaussian it lost **27.6 % of the peak over 2 steps**.
+
+    Measured on a laser-heated drop, where the field is a 300 -> 3000 K layer a few cells thick, the
+    pointwise transfer cost **540 K of peak and 6 % of the thermal energy at a single remesh** -- the melt
+    pool visibly collapsed. This routine is conservative by construction: integrating against the new
+    basis preserves ``int u`` exactly, up to quadrature.
+
+    Host-side (a KD-tree point location, :func:`_locate_in_cells`), which is where a remesh happens
+    anyway -- that is precisely the constraint that forced the traced version to use a one-ring search.
+
+    P1 only: the stencil `_locate_in_cells` returns is the P1 shape function over the containing cell, so
+    a higher-order SOURCE field cannot be evaluated through it. The caller falls back for those.
+    """
+    import numpy as _np
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import spsolve
+
+    # degree-4 rule on the reference triangle (weights sum to 1; scaled by the physical area below).
+    # Degree 4 rather than the 2 a P1 mass matrix needs: `u_old` is piecewise linear on the OTHER mesh,
+    # so on a destination cell it is not a polynomial and the load vector is the inexact part.
+    a1, b1, w1 = 0.816847572980459, 0.091576213509771, 0.109951743655322
+    a2, b2, w2 = 0.108103018168070, 0.445948490915965, 0.223381589678011
+    bary = _np.array([[a1, b1, b1], [b1, a1, b1], [b1, b1, a1], [a2, b2, b2], [b2, a2, b2], [b2, b2, a2]])
+    wq = _np.array([w1, w1, w1, w2, w2, w2])
+
+    P_s, C_s = _np.asarray(src_pts)[:, :dim], _np.asarray(src_cells)
+    P_d, C_d = _np.asarray(dst_pts)[:, :dim], _np.asarray(dst_cells)
+    u_src = _np.asarray(src_state)
+    nd = len(P_d)
+
+    V = P_d[C_d]  # (n_cell, 3, dim)
+    area = 0.5 * _np.abs(
+        (V[:, 1, 0] - V[:, 0, 0]) * (V[:, 2, 1] - V[:, 0, 1]) - (V[:, 2, 0] - V[:, 0, 0]) * (V[:, 1, 1] - V[:, 0, 1])
+    )
+    qx = _np.einsum("qa,cad->qcd", bary, V)  # (n_q, n_cell, dim) physical quad points
+    loc = _locate_in_cells(P_s, C_s, qx.reshape(-1, dim), tol=1e-9, k=12)
+    cell_idx, wts = _np.asarray(loc[0]), _np.asarray(loc[1])
+
+    # consistent mass on the destination mesh: M_ij = sum_q w_q |T| N_i N_j
+    rows, cols, vals = [], [], []
+    for i in range(3):
+        for j in range(3):
+            rows.append(C_d[:, i])
+            cols.append(C_d[:, j])
+            vals.append(_np.einsum("q,q,q->", wq, bary[:, i], bary[:, j]) * area)
+    M = coo_matrix((_np.concatenate(vals), (_np.concatenate(rows), _np.concatenate(cols))), shape=(nd, nd)).tocsr()
+
+    out = []
+    offs, vecs = src_layout["offsets"], src_layout["vecs"]
+    for f in range(len(vecs)):
+        blk = u_src[int(offs[f]) : int(offs[f + 1])].reshape(-1, int(vecs[f]))
+        comp = []
+        for c in range(int(vecs[f])):
+            src_nodal = blk[:, c]
+            uq = _np.einsum("qa,qa->q", wts, src_nodal[C_s[cell_idx]]).reshape(len(wq), -1)
+            b = _np.zeros(nd)
+            for i in range(3):
+                _np.add.at(b, C_d[:, i], _np.einsum("q,q,qc->c", wq, bary[:, i], uq) * area)
+            comp.append(spsolve(M, b))
+        out.append(_np.stack(comp, axis=1) if int(vecs[f]) > 1 else comp[0][:, None])
+    return _np.concatenate([o.reshape(-1) for o in out])[:total_dst]
 
 
 def _l2_transfer_jax(
@@ -2157,6 +2230,48 @@ def _hold_vertex_budget(domain: Any, size: np.ndarray, *, target: float, hmin: f
     return np.clip(np.sqrt(lo * hi) * size, hmin, hmax)
 
 
+def _per_node_edge_length(domain: Any) -> np.ndarray:
+    """Mean incident edge length PER NODE -- the alpha filter's length scale on a graded mesh.
+
+    `alpha_reconnect` compares each cell's circumradius against `alpha * h`. With one global `h` a
+    graded mesh fails at both ends: in the coarse region every cell exceeds the threshold and its
+    nodes are reported as free particles, and in the fine region the coarse value fuses surfaces that
+    are genuinely apart. Measured on two rod tips graded 50 -> 500 um: a scalar mean h (98 um) drops
+    50 of 363 nodes, while the per-node field reconnects all of them and keeps the two rods separate.
+
+    Taken from the mesh the march STARTS on and carried, not recomputed as the mesh deforms, for the
+    same reason the scalar version was fixed once: a threshold that drifts with the cells it is
+    meant to police stops being a threshold.
+    """
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim]
+    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
+    n_local = tris.shape[1]
+    acc = np.zeros(pts.shape[0])
+    cnt = np.zeros(pts.shape[0])
+    for a in range(n_local):
+        for b in range(a + 1, n_local):
+            ln = np.linalg.norm(pts[tris[:, a]] - pts[tris[:, b]], axis=1)
+            for k in (a, b):
+                np.add.at(acc, tris[:, k], ln)
+                np.add.at(cnt, tris[:, k], 1.0)
+    out = acc / np.maximum(cnt, 1.0)
+    bad = cnt == 0
+    if bad.any():
+        out[bad] = float(out[~bad].mean()) if (~bad).any() else 1.0
+    return out
+
+
+def _resample_h(h_old, pts_old: np.ndarray, pts_new: np.ndarray):
+    """Carry a per-node length scale onto a changed node set by nearest neighbour."""
+    h_old = np.asarray(h_old, dtype=float)
+    if h_old.ndim == 0 or pts_new.shape[0] == pts_old.shape[0]:
+        return h_old
+    from scipy.spatial import cKDTree  # noqa: PLC0415
+
+    return h_old[cKDTree(np.asarray(pts_old)).query(np.asarray(pts_new))[1]]
+
+
 def _mean_edge_length(domain: Any) -> float:
     """Mean triangle-edge length of the current mesh (a size scale for metric clamps)."""
     dim = int(domain.dimension)
@@ -2632,6 +2747,28 @@ class AdaptSpec:
     ma_dt: float = 0.1
     """``relocate_method="monge_ampere"`` only: the relaxation pseudo-step ``Δt`` of eq. (3.7). Larger
     converges faster and can overshoot; the nonlinearity is carried entirely by this outer relaxation."""
+    escalate_growth: float = 1.2
+    """Relocation only: the factor the vertex budget grows by at each :attr:`escalate`. Capped by
+    :attr:`max_dofs` when that is set.
+
+    The default is the largest growth measured to survive the default cadence. An escalated mesh is
+    finer, so it accumulates more strain between adaptation rounds, and past some refinement it tangles
+    before the next round can relieve it. On the 600 W melt ball (74 nodes, ``every=20``, 800 steps):
+    growth 1.2 (-> 112 nodes) completes; growth 1.5 (-> 125 nodes) tangles at ``every=20`` and
+    ``every=10``, and completes only at ``every=5``. Refine harder than this and shorten ``every`` to
+    match."""
+    escalate: float | None = None
+    """Relocation only: **escalate from r- to h-adaptivity** when the mesh can no longer represent the
+    solution, measured as the p90 of :func:`_interp_error_indicator` — the P1 interpolation error
+    relative to the field's range. ``None`` (the default) never escalates: relocation holds the node
+    set for the whole march. A value such as ``0.2`` means "if 10 % of cells misrepresent the field by
+    more than 20 % of its span, stop moving nodes and add some", which then takes the anisotropic
+    ``mmg`` path so the new elements are stretched along the feature rather than shrunk in every
+    direction.
+
+    This is deliberately **not** a shape-quality floor. On an anisotropically adapted mesh an isotropic
+    quality measure is anti-correlated with the mesh being good (see :func:`_interp_error_indicator`),
+    so escalating on one refines a mesh that is already right."""
     relocate_method: str = "descent"
     remesh_spec: Any = None
     """Set by :meth:`remesh`: an h-adaptive spec to interleave into a relocation march."""
@@ -3262,6 +3399,175 @@ def _huang_ea_jax(pts, pts0, u_nodal, cells, dim, *, theta=1.0 / 3.0, p=1.5):
     return jnp.sum(vol * (theta * align + (1.0 - 2.0 * theta) * dim ** (dim * p / 2.0) * equi))
 
 
+_MA_JIT_CACHE: dict = {}
+
+
+def _ma_round_jitted(cells_np, n_verts: int, dim: int, n_relax: int, dt: float):
+    """A jitted ``(monitor, ops...) -> displacement`` for one Monge-Ampere round, cached by SHAPE.
+
+    ``n_relax`` is a PYTHON loop bound inside :func:`_monge_ampere_displacement`, so the traced graph is
+    proportional to it. Called bare, every round retraces and recompiles that whole unrolled relaxation:
+    measured ~3.5 s a round at ``relax=60`` on a 74-node mesh -- XLA compilation, not arithmetic, which
+    is why dropping to ``relax=10`` looked like a 6x speedup when it was really a 6x smaller graph.
+
+    The steady driver avoids this by calling it inside its own ``@jax.jit`` (`_ma_round`). A march has no
+    such enclosing jit, so cache one here. The key is shapes only -- the mesh GEOMETRY changes every
+    round and rightly so (unlike the steady case, a marching mesh moves by physics between rounds, so
+    the computational mesh cannot be hoisted), but geometry rides through as a traced value.
+    """
+    import jax as _jax  # this module imports jax per-function, not at top level
+
+    # SHAPES only: geometry and connectivity both ride through as traced values, so neither the mesh
+    # moving each round nor a reconnection changing the elements forces a recompile.
+    key = (
+        int(n_verts),
+        int(np.asarray(cells_np).shape[0]),
+        int(np.asarray(cells_np).shape[1]),
+        int(dim),
+        int(n_relax),
+        float(dt),
+    )
+    fn = _MA_JIT_CACHE.get(key)
+    if fn is None:
+
+        def _round(monitor, sg, meas, wsum, kmat, cells_j):
+            return _monge_ampere_displacement(monitor, (sg, meas, wsum, kmat), cells_j, dim, n_relax=n_relax, dt=dt)
+
+        fn = _jax.jit(_round)
+        _MA_JIT_CACHE[key] = fn
+    return fn
+
+
+def _constrain_boundary_slide(disp, pts, cells, dim):
+    """Project boundary-vertex displacements onto the chord joining their neighbours; interior free.
+
+    A moving mesh must not let relocation change the BODY, only the sampling of it. The exact statement
+    in 2-D: the polygon area
+
+        A = 1/2 sum_i (x_i y_{i+1} - x_{i+1} y_i)
+
+    is a LINEAR function of each vertex, so dA/dP is a fixed vector perpendicular to the chord joining
+    P's two boundary neighbours. Moving P parallel to that chord therefore changes the enclosed area by
+    EXACTLY zero -- not to first order, exactly -- while still letting the node slide to where the
+    monitor wants it. Perimeter is not conserved by this and should not be: a free surface stretches.
+
+    Interior vertices keep the full displacement. In 3-D the same argument needs the vertex's incident
+    boundary-triangle fan, which is not wired here, so boundary vertices are simply pinned.
+    """
+    out = np.array(disp, dtype=float, copy=True)
+    bnd = _boundary_edges_from_triangles(cells) if dim == 2 else None
+    if bnd is None or len(bnd) == 0:
+        return out
+    bnd = np.asarray(bnd)
+    nb: dict[int, list[int]] = {}
+    for a, b in bnd:
+        nb.setdefault(int(a), []).append(int(b))
+        nb.setdefault(int(b), []).append(int(a))
+    for v, ns in nb.items():
+        if len(ns) != 2:  # a corner where three boundary edges meet: pin it, the chord is ambiguous
+            out[v] = 0.0
+            continue
+        chord = pts[ns[1]] - pts[ns[0]]
+        n2 = float(chord @ chord)
+        out[v] = 0.0 if n2 <= 0.0 else chord * (float(out[v] @ chord) / n2)
+
+    # The chord projection kills the FIRST-order area change only. Area is linear in each vertex
+    # SEPARATELY, so one vertex sliding is exact -- but all of them sliding at once leaves the quadratic
+    # cross terms (1/2) sum d_i x d_{i+1}. Measured: 4.7e-3 relative on a 0.05 move, i.e. O(|d|^2) as
+    # that predicts. So drive it out: offset the boundary along its outward normal by the uniform amount
+    # that restores the area, and repeat. Each pass is first-order in a residual that is already
+    # second-order, so a couple of rounds reach machine precision.
+    vs = sorted(nb)
+    a0 = _tri_area(pts, cells)
+    for _ in range(8):
+        cur = pts + out
+        da = a0 - _tri_area(cur, cells)
+        if abs(da) <= 1e-15 * max(abs(a0), 1e-300):
+            break
+        # normals and perimeter from the MOVED boundary, not the original -- recomputing them is what
+        # lets the correction converge past its own linearisation error (4.6e-7 -> machine, measured).
+        nrm = np.zeros((len(vs), 2))
+        for k, v in enumerate(vs):
+            e = cur[nb[v][1]] - cur[nb[v][0]]
+            t = e / max(float(np.hypot(*e)), 1e-300)
+            nrm[k] = (t[1], -t[0])
+        if float(((cur[vs] - cur[vs].mean(axis=0)) * nrm).sum()) < 0.0:
+            nrm = -nrm  # outward
+        per = float(np.hypot(*(cur[bnd[:, 1]] - cur[bnd[:, 0]]).T).sum())
+        if per <= 0.0:
+            break
+        out[vs] += (da / per) * nrm
+    return out
+
+
+def _tri_area(pts, cells):
+    """Total area of the triangulation -- the meshed body's area, which is what mass conservation sees."""
+    a, b, c = pts[cells[:, 0]], pts[cells[:, 1]], pts[cells[:, 2]]
+    return float(0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])).sum())
+
+
+def _interp_error_indicator(pts, cells, u_nodal, dim):
+    """Per-cell **P1 interpolation error**, relative to the field's range — the r→h escalation signal.
+
+    For a P1 space the interpolation error on a cell is bounded by the solution's curvature measured
+    ALONG that cell's own edges: ``max_e eᵀ|H|e`` over the cell's edge vectors ``e``, with ``|H|`` the
+    Hessian made positive by taking ``|λ|`` in its own eigenbasis (Alauzet & Loseille, *J. Comput.
+    Phys.* **229** (2010) §2.2). Pairing each curvature with the extent **in its own direction** is the
+    whole point: an element stretched ALONG an isotherm is long where the solution is flat and short
+    where it curves, so it carries a small error despite a large aspect ratio. Multiplying the largest
+    curvature by the longest edge regardless of direction — which is what an isotropic measure amounts
+    to — reports the opposite and penalises exactly the elements that are doing their job.
+
+    Divided by the field's range so the result is dimensionless and comparable across time, fields and
+    meshes: 0.1 means the worst cell misrepresents the field by ~10 % of its span.
+
+    Why this and not a shape-quality floor. Measured on the 600 W melt ball at three resolutions, the
+    p90 of this indicator falls 0.306 → 0.172 → 0.078 as the mesh goes 26 → 74 → 163 nodes, while the
+    number of cells an isotropic floor (``4√3A/Σl²`` < 0.2) rejects RISES 1 → 5 → 8. On an
+    anisotropically adapted mesh the isotropic ruler is anti-correlated with the mesh being good, so
+    triggering h-refinement on it refines a mesh that is already right.
+
+    The Hessian is recovered from the P1 gradients (constant per cell) by area-weighted patch averaging
+    to the vertices and one further differentiation — the standard Zienkiewicz–Zhu route, and the only
+    one available when the basis has no second derivative of its own.
+    """
+    pts = np.asarray(pts, dtype=float)[:, :dim]
+    cells = np.asarray(cells, dtype=np.int64)
+    u = np.asarray(u_nodal, dtype=float).reshape(-1)[: len(pts)]
+    if dim != 2 or cells.shape[1] != 3:
+        raise NotImplementedError(
+            f"_interp_error_indicator: P1 triangles in 2-D; got dim={dim}, {cells.shape[1]} nodes per cell."
+        )
+    a, b, c = pts[cells[:, 0]], pts[cells[:, 1]], pts[cells[:, 2]]
+    jac = np.stack([b - a, c - a], axis=-1)  # (nc, 2, 2)
+    area = 0.5 * np.abs(np.linalg.det(jac))
+    jt = np.transpose(jac, (0, 2, 1))
+    du = np.stack([u[cells[:, 1]] - u[cells[:, 0]], u[cells[:, 2]] - u[cells[:, 0]]], axis=-1)
+    grad = np.linalg.solve(jt, du[..., None])[..., 0]  # (nc, 2), constant per cell
+
+    gv = np.zeros((len(pts), 2))
+    wt = np.zeros(len(pts))
+    for k in range(3):  # area-weighted patch recovery to the vertices
+        np.add.at(gv, cells[:, k], grad * area[:, None])
+        np.add.at(wt, cells[:, k], area)
+    gv /= np.maximum(wt, 1e-300)[:, None]
+
+    hess = np.zeros((len(cells), 2, 2))
+    for comp in range(2):  # differentiate each recovered gradient component again
+        dg = np.stack(
+            [gv[cells[:, 1], comp] - gv[cells[:, 0], comp], gv[cells[:, 2], comp] - gv[cells[:, 0], comp]], axis=-1
+        )
+        hess[:, comp, :] = np.linalg.solve(jt, dg[..., None])[..., 0]
+    hess = 0.5 * (hess + np.transpose(hess, (0, 2, 1)))
+
+    ev, evec = np.linalg.eigh(hess)
+    habs = np.einsum("cij,cj,ckj->cik", evec, np.abs(ev), evec)  # |H| = V|Λ|Vᵀ
+    edges = (b - a, c - b, a - c)
+    err = np.max([np.einsum("ci,cij,cj->c", e, habs, e) for e in edges], axis=0)
+    span = float(np.nanmax(u) - np.nanmin(u))
+    return err / max(span, 1e-300)
+
+
 def _p1_operators(pts, cells, dim):
     """Constant P1 operators on a **fixed** mesh: ``(sg, measure, wsum, stiffness+null-space shift)``.
 
@@ -3294,7 +3600,48 @@ def _p1_operators(pts, cells, dim):
     for a in range(dim + 1):
         for b in range(dim + 1):
             np.add.at(k, (cells[:, a], cells[:, b]), loc[:, a, b])
-    return sg, measure, np.maximum(wsum, 1e-300), k + 1.0 / n
+    # The shift must remove ONE constant mode PER CONNECTED COMPONENT, not one overall: `K·1_c = 0`
+    # holds separately on each component, so a mesh of `m` disjoint bodies has an m-dimensional null
+    # space and a single rank-one `(1/n)·11ᵀ` leaves m-1 of it. Verified on two disjoint disks: null
+    # dim 1 survives the flat shift (smallest singular value 8.1e-17) and 0 with this one. Left
+    # singular, the Monge-Ampère potential is undetermined by a constant per body -- an arbitrary
+    # RELATIVE DISPLACEMENT between them -- which showed up as a relocation round that would have
+    # inverted 116 of 296 cells on a two-ball melt problem.
+    comp = _connected_components(cells, n)
+    k = k + _component_mean_shift(comp, n)
+    return sg, measure, np.maximum(wsum, 1e-300), k
+
+
+def _connected_components(cells, n_vert: int) -> np.ndarray:
+    """Component id per vertex, by union-find over the cells. Vertices in no cell get their own id."""
+    parent = np.arange(int(n_vert), dtype=np.int64)
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = int(parent[a])
+        return int(a)
+
+    cl = np.asarray(cells, dtype=np.int64)
+    for tri in cl:
+        r = find(int(tri[0]))
+        for v in tri[1:]:
+            rv = find(int(v))
+            if rv != r:
+                parent[rv] = r
+    roots = np.array([find(int(i)) for i in range(int(n_vert))], dtype=np.int64)
+    _, comp = np.unique(roots, return_inverse=True)
+    return comp.astype(np.int64)
+
+
+def _component_mean_shift(comp: np.ndarray, n_vert: int) -> np.ndarray:
+    """``Σ_c (1/n_c)·1_c 1_cᵀ`` -- the projector-scaled shift that kills every component constant."""
+    out = np.zeros((int(n_vert), int(n_vert)), dtype=float)
+    for c in range(int(comp.max()) + 1 if comp.size else 0):
+        idx = np.flatnonzero(comp == c)
+        if idx.size:
+            out[np.ix_(idx, idx)] += 1.0 / idx.size
+    return out
 
 
 def _nodal_grad_jax(f, sg_j, meas_j, wsum_j, cells_j, n_local, dim):
@@ -3401,12 +3748,21 @@ def _monge_ampere_displacement(monitor, ops, cells, dim, *, n_relax=60, dt=0.1):
     cells_j = jnp.asarray(cells)
     lu = jax.scipy.linalg.lu_factor(jnp.asarray(k_shift))  # constant mesh ⇒ factorize ONCE
     n_vert = wsum.shape[0]
-    total = float(measure.sum())
+    # GEOMETRY stays traceable; only CONNECTIVITY is host-side. The steady driver can hand this
+    # function numpy operators because its computational mesh never moves, so they constant-fold. A
+    # MARCHING mesh moves by physics between rounds, so the operators change every round -- and
+    # `float(measure.sum())` alone forced them concrete, which meant the whole relaxation had to be
+    # re-traced each time (measured ~3.5 s a round at relax=60 on 74 nodes: compilation, not
+    # arithmetic). `counts` genuinely needs concrete `cells`, and connectivity IS fixed across a
+    # relocation, so that one stays on the host.
+    total = jnp.sum(jnp.asarray(measure))
 
-    counts = np.zeros(n_vert)  # incident element count per vertex (patch arity)
-    np.add.at(counts, cells.ravel(), 1.0)
-    k_comp = wsum / np.maximum(counts, 1.0)  # mean incident element volume = local computational cell size
-    monitor = monitor * jnp.asarray(k_comp / k_comp.mean())  # a global scale cancels in θ; kept O(1) for dt
+    # `.at[].add` takes TRACED indices, so the patch arity needs no host round-trip either -- which
+    # leaves nothing in this function that has to be concrete, and lets a caller jit it once per SHAPE
+    # rather than once per mesh.
+    counts = jnp.zeros((n_vert,)).at[jnp.asarray(cells).ravel()].add(1.0)  # incident elements per vertex
+    k_comp = jnp.asarray(wsum) / jnp.maximum(counts, 1.0)  # mean incident element volume
+    monitor = monitor * (k_comp / jnp.mean(k_comp))  # a global scale cancels in θ; kept O(1) for dt
     fac = 1.0 / ((dim + 1) * (dim + 2))  # P1 consistent mass: ∫φᵢφⱼ = |K|·(1+δᵢⱼ)/((d+1)(d+2))
 
     n_local = cells.shape[1]
@@ -4029,6 +4385,90 @@ def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, his
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u_final
+
+
+def _drop_region_pools(d, tag: str) -> None:
+    """Forget a region's sampled pools, so the next ``d.variable(tag, ...)`` REPLACES rather than aliases.
+
+    ``Domain.sample`` refuses to clobber an existing sample: it walks ``tag``, ``tag_0``, ``tag_1`` ...
+    until it finds a free name (`domain_class.py:5202`). That is right for a caller taking two different
+    draws of one region, and wrong for a march, which re-samples the SAME region every time the mesh
+    changes. Two consequences, both measured:
+
+      * every rebuild adds another full pool -- shaped ``(1, n_steps+1, n_points, dim)``, so it grows
+        with the time grid AND with the rebuild count -- and the old ones are never released;
+      * the BASE name, which is what the constraints reference, keeps the OLD mesh's points, because the
+        fresh sample went to the alias instead.
+
+    Dropping the pools first makes the loop find ``tag`` free, so the new sample lands on the base name.
+    """
+    ctx = getattr(d, "context", None)
+    if ctx is None:
+        return
+    for _pre in (tag, f"n_{tag}", f"v_{tag}", f"f_{tag}"):
+        ctx.pop(_pre, None)
+        _i = 0
+        while ctx.pop(f"{_pre}_{_i}", None) is not None:
+            _i += 1
+    ctx.pop(f"__time_{tag}__", None)
+
+
+def _march_mem_probe(tag: str, d=None) -> None:
+    """Env-gated (``JNO_MARCH_MEMDEBUG=1``) breakdown of where a rebuilding march's memory sits.
+
+    Diagnostic only -- the residual per-rebuild growth was chased twice by REASONING about which
+    reference was retained, and both guesses were wrong. Measure the split instead: JAX device buffers
+    vs Python heap vs the rest of RSS.
+    """
+    if os.environ.get("JNO_MARCH_MEMDEBUG", "") not in ("1", "true", "yes"):
+        return
+    import gc as _gc
+
+    import jax as _jax
+
+    try:
+        _rss = int(open("/proc/self/statm").read().split()[1]) * os.sysconf("SC_PAGESIZE") / 2**30
+    except Exception:  # noqa: BLE001
+        _rss = float("nan")
+    _live = _jax.live_arrays()
+    _dev = sum(int(getattr(a, "nbytes", 0)) for a in _live) / 2**30
+    _counts: dict[str, int] = {}
+    for o in _gc.get_objects():
+        _t = type(o).__name__
+        if _t in ("ndarray", "ArrayImpl", "function", "dict", "list", "Mesh", "Domain", "FEM"):
+            _counts[_t] = _counts.get(_t, 0) + 1
+    # The biggest live buffers, grouped by shape+dtype: a handful of LARGE arrays, not the many tiny
+    # trajectory frames, is what actually moves RSS -- so print sizes, not just counts.
+    _by: dict = {}
+    for _a in _live:
+        _k = (tuple(getattr(_a, "shape", ())), str(getattr(_a, "dtype", "?")))
+        _n, _b = _by.get(_k, (0, 0))
+        _by[_k] = (_n + 1, _b + int(getattr(_a, "nbytes", 0)))
+    _top = sorted(_by.items(), key=lambda kv: -kv[1][1])[:6]
+    _fmt = "  ".join(f"{k[0]}{k[1][:3]}x{v[0]}={v[1] / 2**20:.0f}MB" for k, v in _top)
+    print(
+        f"[memdebug {tag}] rss={_rss:.3f}GB jax_live={len(_live)} ({_dev:.3f}GB) "
+        f"objs={ {k: _counts[k] for k in sorted(_counts)} } gc_tracked={len(_gc.get_objects())}\n"
+        f"    top buffers: {_fmt}\n"
+        f"    domain.context={len(getattr(d, 'context', {}) or {})} keys={sorted(getattr(d, 'context', {}) or {})[:14]}",
+        flush=True,
+    )
+
+
+def _cp_take(cp, T_frames, u_frames, X_frames, _cells_for, layout, n_local, **flush_kw):
+    """Hand the buffered frame tail to the checkpoint store, write it, and release it.
+
+    ``n_local`` is how many frames this SEGMENT has emitted. The tail's segment-local frame indices --
+    which is what ``_cells_for`` is keyed on -- therefore run ``n_local - len(X_frames) + k + 1``; the
+    buffer is cleared each time, so it cannot be indexed by ``len(u_frames)`` any more.
+    """
+    base = n_local - len(X_frames)
+    for k in range(len(X_frames)):
+        cp.append(T_frames[k], u_frames[k], X_frames[k], _cells_for(base + k + 1), layout)
+    cp.flush(**flush_kw)
+    T_frames.clear()
+    u_frames.clear()
+    X_frames.clear()
 
 
 @dataclass
@@ -5044,7 +5484,14 @@ def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
         "jno.fem: on a moving mesh, adapt= rebuilds the mesh when a mesh-geometry CONDITION breaks -- "
         "`fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0)))`. "
     )
-    kinds = {"split": "refine()", "enrich": "enrich()", "relocate": "relocate()", "anisotropic": "remesh(anisotropic=True)"}
+    # `relocate()` is NOT in here: r-adaptivity is the one kind that composes cheaply with a moving
+    # mesh. Vertex positions ride the CARRY, so relocating is a new `X` for the same compiled program --
+    # no new nodes, no new connectivity, no rebuild and no XLA compilation. h-adaptivity is the opposite:
+    # it changes shapes, which is what costs 8-15 s a time.
+    # `anisotropic=True` is NOT in here either: it is the same mmg rebuild the criterion path
+    # already takes, with a Hessian METRIC instead of a scalar size -- so it costs what an isotropic
+    # remesh costs and buys direction. It still needs a criterion to say WHEN (see below).
+    kinds = {"split": "refine()", "enrich": "enrich()"}
     kind = next((name for flag, name in kinds.items() if getattr(adapt, flag, False)), None)
     if kind is not None:
         raise NotImplementedError(head + f"jno.solve.{kind} is not supported with a geometry term.")
@@ -5061,6 +5508,15 @@ def _moving_mesh_condition(fem: Any, adapt: Any, d: Any, kwargs: dict) -> Any:
                 "jno.solve.remesh(alpha=..., criterion=...): reconnection (re-triangulating the moved nodes) "
                 "and a condition-triggered remesh (meshing the geometry afresh) are different operations, "
                 "and combining them is not supported. Use one per solve."
+            )
+    elif getattr(adapt, "relocate", False):
+        # r-ADAPTIVITY: like alpha, the trigger is the cadence `every`, not a condition -- there is no
+        # "has the mesh gone bad" test to make, the vertices simply slide down the monitor each round.
+        if int(d.dimension) != 2:
+            raise NotImplementedError(
+                f"jno.solve.relocate() on a moving mesh is 2-D only; this domain is {int(d.dimension)}-D. "
+                "The area-preserving boundary slide needs the vertex's two boundary neighbours, which in "
+                "3-D is an incident-triangle fan and is not wired."
             )
     else:
         if adapt.criterion is None:
@@ -5109,6 +5565,7 @@ def run_mesh_motion(
     nonlinear: Any = None,
     linear: Any = None,
     precond: Any = None,
+    checkpoint: Any = None,
     _resume: Any = None,
     **kwargs: Any,
 ) -> "AdaptiveTrajectory":
@@ -5223,9 +5680,56 @@ def run_mesh_motion(
     dim = int(d.dimension)
     if dim not in (2, 3):
         raise NotImplementedError(f"mesh motion supports 2D/3D simplicial meshes; got dimension {dim}.")
+    _cp_resumed = False
+    if checkpoint is not None and _resume is None and getattr(checkpoint, "resume", True):
+        # Continue an interrupted march rather than starting over. `latest.npz` holds both the SOURCE
+        # mesh+state the next segment transfers FROM and the domain it starts ON -- restore the domain,
+        # then hand the rest to the ordinary resume path, the same one every rebuild takes.
+        from .march_checkpoint import load as _cp_load
+
+        # Only a MISSING store means "start fresh". A store that exists but cannot be read is a
+        # broken checkpoint, and silently restarting would throw away the run it was meant to save --
+        # so that raises. (It used to be swallowed, and a tuple budget that failed to deserialise
+        # restarted the march without a word.)
+        if os.path.exists(os.path.join(os.path.expanduser(checkpoint.path), "manifest.json")):
+            _man_r, _res_r, _ = _cp_load(checkpoint.path)
+        else:
+            _res_r = None
+        if _res_r is not None:
+            _dm = _res_r.pop("domain", None)
+            if _dm is not None:
+                _dc = np.asarray(_dm[1]).astype(np.int64)
+                _domain_from_arrays(d, np.asarray(_dm[0]), _dc, _boundary_edges_from_triangles(_dc), copy=False)
+            _resume, _cp_resumed = _res_r, True
     _cond = _moving_mesh_condition(fem, adapt, d, kwargs)
 
     cons, kw = fem._constraints, fem._fem_kwargs
+    if _cp_resumed:
+        # The domain now carries the CHECKPOINT's mesh, but its region pools still hold the sample
+        # points of the mesh this process meshed at startup, and a geometry law bound to those would
+        # read seed positions for the whole march. Re-tag and re-sample before anything binds -- the
+        # same refresh a rebuild does after it swaps the mesh, just driven off the constraints because
+        # the motion specs do not exist yet.
+        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+            d.tag(_name, _pred)
+        d.__dict__.pop("_gauge_pin_coords", None)
+        # Re-sample what the domain ACTUALLY holds. The motion specs do not exist yet, so there is no
+        # spec list to read tags off; `context` is the set of regions already materialised on the old
+        # mesh, which is exactly the set that is now stale. `initial_0`/`initial_1` are split
+        # components of `initial` -- refreshing the base tag regenerates them.
+        _ctx = {k for k in getattr(d, "context", {}) if not k.startswith("__")}
+        _bases = set()
+        for _k in _ctx:
+            _h = _k.rsplit("_", 1)
+            _bases.add(_h[0] if len(_h) == 2 and _h[1].isdigit() else _k)
+        for _tag in sorted(_bases & (_ctx | set(getattr(d, "_mesh_pool", {}) or {}))):
+            _drop_region_pools(d, _tag)
+            for _kw in ({"normals": True, "split": True}, {"split": True}):
+                try:
+                    d.variable(_tag, **_kw)
+                    break
+                except Exception:  # noqa: BLE001 -- an interior region has no normals; coordinates suffice
+                    continue
     block = fem._op
     n_verts = int(np.asarray(d.mesh.points).shape[0])
     state = jnp.asarray(block.state0).reshape(-1)
@@ -5300,22 +5804,42 @@ def run_mesh_motion(
         # so a P1 state is already the state on the new mesh. Nothing to interpolate, nothing to lose.
         state = jnp.asarray(_resume["old"][2])
     elif _resume is not None:
-        # A segment after a remesh: carry the state the previous segment ended with across the change of
-        # mesh -- each old field evaluated at its new DOF points with its own element basis (the transfer
-        # the transient remesher uses). `_l2_transfer_jax` cannot: it shares one cell array between meshes.
+        # A segment after a remesh: carry the state across a CHANGED NODE SET. Pointwise nodal
+        # interpolation is what `_l2_transfer_jax`'s docstring warns about (27.6 % of a peak over 2
+        # steps), and it showed: on a laser-heated drop, whose field is a 300 -> 3000 K layer a few
+        # cells thick, one remesh cost 540 K of peak and 6 % of the thermal energy. Use the conservative
+        # Galerkin projection where it applies -- P1 only, because the point-location stencil is P1.
         _opts, _ocells, _ostate, _olay = _resume["old"]
-        _vals = _eval_fe_fields_at_points(
-            _opts,
-            _ocells,
-            jnp.asarray(_ostate),
-            _olay["offsets"],
-            _olay["orders"],
-            _olay["cells_f"],
-            _olay["vecs"],
-            layout["field_points"],
-            dim=dim,
-        )
-        state = jnp.concatenate([jnp.asarray(v).reshape(-1) for v in _vals])
+        _p1_ok = all(int(o) == 1 for o in _olay["orders"]) and all(int(o) == 1 for o in layout["orders"])
+        # `key` is resolved further down; this block is guarded to dim == 2, so the cell type is known.
+        _new_cells_now = np.asarray(d.mesh.cells_dict["triangle"]).astype(np.int64) if dim == 2 else None
+        if _p1_ok and dim == 2:
+            state = jnp.asarray(
+                _l2_project_across_meshes(
+                    np.asarray(_opts),
+                    np.asarray(_ocells),
+                    np.asarray(_ostate),
+                    _olay,
+                    np.asarray(d.mesh.points),
+                    _new_cells_now,
+                    layout,
+                    dim,
+                    total_dst=int(layout["offsets"][-1]),
+                )
+            )
+        else:
+            _vals = _eval_fe_fields_at_points(
+                _opts,
+                _ocells,
+                jnp.asarray(_ostate),
+                _olay["offsets"],
+                _olay["orders"],
+                _olay["cells_f"],
+                _olay["vecs"],
+                layout["field_points"],
+                dim=dim,
+            )
+            state = jnp.concatenate([jnp.asarray(v).reshape(-1) for v in _vals])
 
     # Runtime parameter VALUES (a coefficient, a neural field) travel with the coordinates. Without this
     # they were accepted by `**kwargs` and silently discarded: the block exposes them in
@@ -5409,10 +5933,13 @@ def run_mesh_motion(
         # The remesh budget is fixed ONCE, from the mesh the march started on, exactly as the transient
         # remesher fixes it: each remesh redistributes the same vertex count inside the same edge window.
         if _resume is None:
-            _h0 = _mean_edge_length(d)
+            # Two different length scales, deliberately. The mmg CLAMPS are global bounds on what the
+            # mesher may produce, so they stay scalars; the ALPHA FILTER's threshold is per-cell and on
+            # a graded mesh has no single value, so slot 3 is a per-node field.
+            _h0 = _per_node_edge_length(d)
             _budget = (
-                _cond.hmin if _cond.hmin is not None else _h0 / 50.0,
-                _cond.hmax if _cond.hmax is not None else 2.0 * _h0,
+                _cond.hmin if _cond.hmin is not None else float(np.min(_h0)) / 50.0,
+                _cond.hmax if _cond.hmax is not None else 2.0 * float(np.max(_h0)),
                 float(_cond.max_dofs) if _cond.max_dofs is not None else float(n_verts),
                 _h0,  # the STARTING length scale: the alpha filter's threshold must not drift as cells stretch
             )
@@ -5509,7 +6036,6 @@ def run_mesh_motion(
         named_np[sp["ids"]] = True
     named_j = jnp.asarray(named_np)
 
-    cells_j = jnp.asarray(shared_cells)
     # Only an INTERIOR cell whose quadrature leaves the old mesh is a fault: a cell touching the boundary
     # genuinely leaves it when that boundary moves outward, and the transfer clamps those to the nearest
     # simplex as the pointwise route did. Boundary-ness is connectivity, so it is hoisted.
@@ -5517,7 +6043,6 @@ def run_mesh_motion(
     _on_bnd = np.zeros(n_verts, dtype=bool)
     _on_bnd[np.unique(np.asarray(_bfac).reshape(-1))] = True
     interior_cell_j = jnp.asarray(~_on_bnd[shared_cells].any(axis=1))
-    sgn0 = jnp.sign(_signed_simplex_measures_jax(X0, cells_j, dim))  # orientation baseline is the START, not the seed mesh
     # ALE: a weak form that reads `coord.d(t)` states the transport relative to the moving mesh itself
     # (`u_t + (c - w).grad u`), so the nodal values RIDE with their vertices -- transferring them as well
     # would count the mesh advection twice. jno.fem rewrote those rates into this one vertex field; each
@@ -5526,7 +6051,11 @@ def run_mesh_motion(
     _mv_fid = None if _mv is None else _mv.frozen_id
 
     def _march_step(carry, t0c):
-        u_c, X_c, bad = carry
+        # `topo` rides the CARRY rather than the closure, so the connectivity reaches the compiled scan as
+        # a TRACER. A reconnection that keeps every shape (a Delaunay edge flip -- measured, the common
+        # case by 6:1) then swaps values in the carry and the same compiled program serves it. Closing
+        # over it instead is what used to force a rebuild, at one XLA compilation and ~31 s per flip.
+        u_c, X_c, bad, topo = carry
         # 1) MOVE: each geometry term drives its own vertices along its own axis; everything the terms do
         #    not name relaxes harmonically around them (so a moving boundary drags the interior smoothly,
         #    and a moving interior region lets the mesh around it accommodate).
@@ -5536,11 +6065,11 @@ def run_mesh_motion(
             # documented scheme and what `test_prescribed_motion_converges_first_order_to_the_analytic_domain`
             # pins -- it asserts the march reproduces forward Euler exactly.
             disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c, _law_args, t0c), dtype=X_c.dtype) * dt)
-        X_n = X_c + _harmonic_extension_jax(X_c, shared_cells, dim, disp, named_j)
+        X_n = X_c + _harmonic_extension_jax(X_c, topo["cells"], dim, disp, named_j)
 
         # A tangled step cannot `raise` from inside a trace, so it is carried out and raised after the
         # march -- the failure stays loud, the trace stays valid.
-        tangled = jnp.any(jnp.sign(_signed_simplex_measures_jax(X_n, cells_j, dim)) != sgn0)
+        tangled = jnp.any(jnp.sign(_signed_simplex_measures_jax(X_n, topo["cells"], dim)) != topo["sgn"])
 
         # 2) carry the state onto the moved mesh -- a CONSERVATIVE L2 projection, which transports the
         #    field under the motion; this IS the ALE convective term, treated semi-Lagrangian. The
@@ -5572,6 +6101,9 @@ def run_mesh_motion(
         #    inside the step, through `args` -- `_apply_coord_params` scatters them into the P1 geometry
         #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
         step_args = _coord_args(X_n)
+        if topo.get("bundle") is not None:
+            # Same channel as the moved vertices above: a value this evaluation is handed.
+            step_args[_TOPOLOGY_ARG] = topo["bundle"]
         if _mv_fid is not None:
             # MERGE, never replace: the load-path channel carries more than the mesh velocity (a
             # `freeze_path` field, a `jno.derived(every="step")` rule), and an assignment here would drop
@@ -5590,7 +6122,7 @@ def run_mesh_motion(
             nonlinear_solve=nonlin_s,
         )
         bad = (bad[0] | tangled, bad[1] | jnp.any(esc_cell))
-        return (u_n, X_n, bad), (u_n, X_n)
+        return (u_n, X_n, bad, topo), (u_n, X_n)
 
     def _raise_if_bad(tangled, escaped):
         if bool(tangled):
@@ -5612,8 +6144,51 @@ def run_mesh_motion(
                 "time step, or refine the mesh where the motion is fastest."
             )
 
-    carry = (state, X0, (jnp.array(False), jnp.array(False)))
+    # ---- runtime connectivity ---------------------------------------------------------------------
+    # Available only when the operator was assembled with `dynamic_topology` (it publishes its bundle
+    # builder on the domain). Without it this is None everywhere and the driver behaves exactly as it did:
+    # every reconnection rebuilds.
+    from .fem_facets import build_facet_connectivity  # noqa: PLC0415
+    from .fem_native import TOPOLOGY_ARG as _TOPOLOGY_ARG  # noqa: PLC0415 -- avoids an import cycle
+
+    _topo_build = getattr(d, "_fem_native_topology_bundle", None)
+
+    def _make_topo(cells_host, X_ref):
+        """The carry's topology for ``cells_host``: what the mesh kernels index with, plus the operator's
+        bundle. ``sgn`` is re-read on the NEW cells because a flip can reverse a cell's orientation, and
+        the tangle test compares against it."""
+        cj = jnp.asarray(cells_host)
+        out = {"cells": cj, "sgn": jnp.sign(_signed_simplex_measures_jax(X_ref, cj, dim)), "bundle": None}
+        if _topo_build is not None:
+            cn = build_facet_connectivity(np.asarray(cells_host), key)
+            out["bundle"] = _topo_build(
+                cells_host,
+                [cells_host] * len(layout["cells_f"]),
+                cn.parent_cell,
+                cn.face_nodes,
+                cn.local_face,
+            )
+        return out
+
+    # meshes index -> the connectivity in force from that frame on (see the swap below). One entry
+    # unless a same-shape reconnection happens, which is exactly the old "one shared cell array" case.
+
+    _cells_at = {0: shared_cells}
+
+    def _cells_for(k):
+        return _cells_at[max(i for i in _cells_at if i <= k)]
+
+    carry = (state, X0, (jnp.array(False), jnp.array(False)), _make_topo(shared_cells, X0))
+    _cp, T_frames, _nlocal = None, [], 0
     if _cond is None:
+        if checkpoint is not None:
+            raise NotImplementedError(
+                "fem.solve(checkpoint=): this march has no adapt= condition, so it runs as ONE compiled "
+                "scan over the whole time grid. There is no host-side boundary at which a partial "
+                "trajectory could be written, and a crash inside the scan would lose it anyway. "
+                "Checkpointing is wired for the adaptive march -- adapt=jno.solve.remesh(...) -- which "
+                "steps in host-visible chunks."
+            )
         carry, (u_hist, X_hist) = jax.lax.scan(_march_step, carry, jnp.asarray(ts[:-1]))
         _raise_if_bad(*carry[2])
         u_frames = [u_hist[i] for i in range(n_steps)]
@@ -5627,6 +6202,25 @@ def run_mesh_motion(
         # there and the state carried across). Frames and history of both segments are joined.
         _scan = jax.jit(lambda c, tt: jax.lax.scan(_march_step, c, tt))
         u_frames, X_frames, history, i = [], [], [], 0
+        # One store for the whole march: a rebuild re-enters this function, so the writer is created at
+        # the top and handed down the resume chain rather than made afresh per segment.
+        _cp = _resume.get("_writer") if isinstance(_resume, dict) else None
+        if checkpoint is not None and _cp is None:
+            from .march_checkpoint import MarchCheckpoint
+
+            _cp = MarchCheckpoint(
+                checkpoint,
+                meta={
+                    "dt": float(dt),
+                    "t0": float(ts[0]),
+                    "t1": float(ts[-1]),
+                    "n_steps": int(n_steps),
+                    "dim": int(dim),
+                },
+                reopen=_cp_resumed,
+            )
+            if not _cp_resumed:  # on a resume the stored tail IS frame 0; writing it again duplicates it
+                _cp.append(float(ts[0]), state, X0, _cells_for(0), layout)
         while i < n_steps:
             m = min(_every, n_steps - i)
             carry, (uh, Xh) = _scan(carry, jnp.asarray(ts[i : i + m]))
@@ -5634,7 +6228,11 @@ def run_mesh_motion(
             u_frames += [uh[j] for j in range(m)]
             X_frames += [Xh[j] for j in range(m)]
             history += [{"t": float(ts[i + j + 1]), "n_dofs": int(off[-1]), "remeshed": False} for j in range(m)]
+            T_frames += [float(ts[i + j + 1]) for j in range(m)]
+            _nlocal += m
             i += m
+            if _cp is not None and len(X_frames) >= int(checkpoint.every):
+                _cp_take(_cp, T_frames, u_frames, X_frames, _cells_for, layout, _nlocal)
             if i >= n_steps:
                 break
             X_now = np.asarray(carry[1])
@@ -5648,7 +6246,10 @@ def run_mesh_motion(
                 # `previous=` is what stops the filter FLICKERING: a cell already in use is held until it
                 # exceeds a wider threshold, so the free surface does not lose and regain wedges from one
                 # step to the next (measured: the perimeter swung +22 % and back -18 % without it).
-                new_pts, new_cells, new_bf = alpha_reconnect(X_now, _budget[3], float(_cond.alpha), previous=shared_cells)
+                _halpha = _resample_h(_budget[3], X_now, X_now)
+                new_pts, new_cells, new_bf = alpha_reconnect(X_now, _halpha, float(_cond.alpha), previous=shared_cells)
+                if np.asarray(_budget[3]).ndim and new_pts.shape[0] != X_now.shape[0]:
+                    _budget = (_budget[0], _budget[1], _budget[2], _resample_h(_budget[3], X_now, new_pts))
                 _nodes_changed = new_pts.shape != X_now.shape or not np.array_equal(new_pts, X_now)
                 _same = (
                     not _nodes_changed
@@ -5659,22 +6260,284 @@ def run_mesh_motion(
                 )
                 if _same:
                     continue  # the same elements on the same nodes: nothing to rebuild
+                if not _nodes_changed and _topo_build is not None and new_cells.shape == shared_cells.shape:
+                    # Same NODES, different elements -- a Delaunay edge flip. The compiled program depends
+                    # on shapes, not on these values, so hand the new connectivity to the carry and keep
+                    # marching: no rebuild, no trace, no XLA compilation (~0.13 s against ~31 s). Gated on
+                    # the node set holding, because `manage=True` also inserts and drops nodes, and that
+                    # genuinely is a different problem.
+                    try:
+                        _new_topo = _make_topo(new_cells.astype(np.int64), X_now)
+                        _pl = (_new_topo.get("bundle") or {}).get("plans") or []
+                        if any(_p is None for _p in _pl):
+                            # A Jacobian's nonzero COUNT moved. `num_segments` is static in the compiled
+                            # scatter, so that really is a different program: rebuild rather than fall back
+                            # to the uncompressed path, which would cost more than the rebuild saves.
+                            _new_topo = None
+                    except ValueError:
+                        _new_topo = None  # the bundle refused (boundary moved): fall through and rebuild
+                    if _new_topo is not None:
+                        shared_cells = new_cells.astype(np.int64)
+                        # Frames ALREADY emitted keep the connectivity they were computed on; the new one
+                        # applies from the next frame, or the trajectory would be labelled with a
+                        # triangulation its earlier frames were never solved on.
+                        _cells_at[_nlocal + 1] = shared_cells
+                        carry = (carry[0], carry[1], carry[2], _new_topo)
+                        history[-1]["remeshed"] = True
+                        history[-1]["rebuilt"] = False
+                        continue
                 history[-1]["remeshed"] = True
                 _domain_from_arrays(d, new_pts, new_cells, new_bf, copy=False)
                 # Nodes kept: the P1 state already IS the state on the new mesh. Nodes inserted or dropped
                 # (PFEM node management, which is what keeps the elements usable): it has to be carried the
-                # way a remesh carries it, each old field read at the new DOF points.
+                # way a remesh carries it -- and that transfer is now the conservative L2 projection, which
+                # matters far more here than it did when only a rare mmg remesh triggered it.
                 _carry = "interpolate" if _nodes_changed else "identity"
+            elif getattr(_cond, "relocate", False):
+                # r-ADAPTIVITY, and the reason it belongs on a moving mesh: vertex positions ride the
+                # CARRY, so a relocation is a new `X` handed to the SAME compiled program. No new nodes,
+                # no new connectivity, no rebuild, no XLA compilation -- against 8-15 s for the
+                # h-adaptive alternative. The state is carried by the conservative L2 projection, and
+                # boundary vertices may only slide along the chord between their neighbours, which leaves
+                # the enclosed area EXACTLY unchanged (polygon area is linear in each vertex).
+                # A SLIVER IS A CONNECTIVITY DEFECT -- the wrong three nodes forming a triangle -- and
+                # moving nodes cannot repair it; only retriangulation can. Measured: the Monge-Ampere
+                # operator inverts every cell's edge matrix, so one cell at 3e-4 of the mean area makes
+                # the displacement non-finite and relocation dies. So when the spec chains a
+                # `.remesh(alpha=...)`, RECONNECT FIRST at a FIXED node set (`manage=False`): the
+                # topology swap serves a new connectivity on the same nodes without a rebuild, which is
+                # what makes "reconnect every step, relocate periodically" cost nothing.
+                _relocate_rebuild = False
+                _rs = getattr(_cond, "remesh_spec", None)
+                if _rs is not None and getattr(_rs, "alpha", None) is not None and _topo_build is not None:
+                    from .reconnect import alpha_reconnect
+
+                    # `manage=False` keeps the node set, which is what makes the swap free -- but the
+                    # alpha filter then REFUSES a node it would have to drop ("free particles, further
+                    # than about 1.2 h from the rest"). That is the filter being strict, not the mesh
+                    # being broken: a wider alpha keeps the same nodes and still triangulates them. So
+                    # widen until it accepts, and if it never does, march on the old connectivity rather
+                    # than fail -- the physics is untouched, only this round's maintenance is skipped.
+                    _rp = _rc = None
+                    for _af in (1.0, 1.4, 2.0, 3.0):
+                        try:
+                            _rp, _rc, _rb = alpha_reconnect(
+                                X_now,
+                                _budget[3],
+                                float(_rs.alpha) * _af,
+                                previous=shared_cells,
+                                # manage=True lets the fallback INSERT nodes when relocation cannot hold
+                                # the quality -- measured: redistributing 74 nodes saturates at min
+                                # quality 0.135 however often it runs, while h-adaptivity reaches 0.332
+                                # by adding 4. Insertion changes shapes and costs a rebuild, so it is
+                                # the expensive half and belongs behind the cheap one.
+                                manage=bool(int(os.environ.get("JNO_RELOCATE_MANAGE", "0"))),
+                            )
+                            break
+                        except ValueError:
+                            _rp = _rc = None
+                    _key = lambda c: np.sort(np.sort(np.asarray(c), axis=1), axis=0)  # noqa: E731
+                    if _rc is not None and _rp.shape != X_now.shape:
+                        # Node management inserted or dropped: shapes moved, so this really is a
+                        # different compiled program. Hand it to the SHARED rebuild path below -- the
+                        # same one the alpha branch uses -- by setting the carry mode and NOT
+                        # continuing. This is the expensive half, and it now only runs when relocation
+                        # could not hold the mesh on its own.
+                        history[-1]["remeshed"] = True
+                        history[-1]["relocate_gave_up"] = True
+                        _domain_from_arrays(d, _rp, np.asarray(_rc).astype(np.int64), _rb, copy=False)
+                        _carry = "interpolate"
+                        _relocate_rebuild = True
+                    elif _rc is not None and not np.array_equal(_key(_rc), _key(shared_cells)):
+                        try:
+                            _tp = _make_topo(np.asarray(_rc).astype(np.int64), X_now)
+                            if not any(_q is None for _q in ((_tp.get("bundle") or {}).get("plans") or [])):
+                                shared_cells = np.asarray(_rc).astype(np.int64)
+                                _cells_at[_nlocal + 1] = shared_cells
+                                carry = (carry[0], carry[1], carry[2], _tp)
+                                history[-1]["reconnected"] = True
+                        except ValueError:
+                            pass  # the bundle refused: keep the old connectivity and relocate anyway
+                import time as _t
+
+                _T0 = _t.perf_counter()
+                # Relocation only runs if the fallback did NOT change the node set. When it did,
+                # shapes moved and this is a different compiled program, so fall through to the
+                # shared rebuild path below -- the expensive half, now reached only when moving
+                # nodes could no longer hold the mesh.
+                if not _relocate_rebuild:
+                    _u_now = np.asarray(carry[0])
+                    _T_pull = _t.perf_counter() - _T0
+                    _T0 = _t.perf_counter()
+                    _ops = _p1_operators(X_now, shared_cells, dim)
+                    _sg, _meas, _wsum = (jnp.asarray(_o) for _o in _ops[:3])
+                    _mon = _arclength_monitor_jax(
+                        jnp.asarray(_u_now[:n_verts]),
+                        _sg,
+                        _meas,
+                        _wsum,
+                        jnp.asarray(shared_cells),
+                        int(shared_cells.shape[1]),
+                        dim,
+                    )
+                    _nrx = int(getattr(_cond, "ma_relax", 60) or 60)
+                    _mdt = float(getattr(_cond, "ma_dt", 0.1) or 0.1)
+                    _ma = _ma_round_jitted(shared_cells, n_verts, dim, _nrx, _mdt)
+                    _T_ops = _t.perf_counter() - _T0
+                    _T0 = _t.perf_counter()
+                    _disp = np.asarray(_ma(_mon, _sg, _meas, _wsum, jnp.asarray(_ops[3]), jnp.asarray(shared_cells)))
+                    _T_ma = _t.perf_counter() - _T0
+                    _T0 = _t.perf_counter()
+                    _disp = _constrain_boundary_slide(_disp, X_now, shared_cells, dim)
+                    _T_slide = _t.perf_counter() - _T0
+                    _Xr = X_now + _disp
+                    # Relocation keeps the CELLS, so it must also keep their orientation: an inverted
+                    # cell here is a tangle, not a flip. It has to be caught against the sign the carry
+                    # already holds, because `_make_topo` re-reads `sgn` from whatever mesh it is given
+                    # -- right after a reconnection, where a flip legitimately reverses a cell, and
+                    # wrong after a relocation, where it would record the inversion as the new
+                    # reference and silently disarm the march's tangle test for good. Measured cost of
+                    # not doing this: a 600 W run lost 55 % of its domain area over ~1 ms and ~4000
+                    # frames with nothing raised, temperatures still in a plausible band throughout.
+                    _sgn_ref = np.asarray(carry[3]["sgn"]) if isinstance(carry[3], dict) else None
+                    if _sgn_ref is not None and _sgn_ref.shape[0] == shared_cells.shape[0]:
+                        _sgn_new = np.sign(
+                            np.asarray(_signed_simplex_measures_jax(jnp.asarray(_Xr), jnp.asarray(shared_cells), dim))
+                        )
+                        if not np.array_equal(_sgn_new, _sgn_ref):
+                            _n_inv = int((_sgn_new != _sgn_ref).sum())
+                            if bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
+                                raise FloatingPointError(
+                                    f"jno.solve.relocate: the displacement inverts {_n_inv}/{len(shared_cells)} "
+                                    "cells. Relocation keeps the connectivity, so an orientation change is a "
+                                    "tangled mesh, not a flip."
+                                )
+                            _lg = getattr(getattr(fem, "domain", None), "log", None)
+                            if _lg is not None:
+                                _lg.warning(f"jno.solve.relocate: skipped one round -- it would invert {_n_inv} cell(s).")
+                            history[-1]["relocate_skipped"] = True
+                            history[-1]["relocate_would_invert"] = _n_inv
+                            continue
+                    if not np.isfinite(_Xr).all() and not bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
+                        # One degenerate cell is enough to make the Monge-Ampere operator singular. Skipping
+                        # this round leaves the mesh exactly as the march produced it -- valid, just not
+                        # re-equidistributed -- which is a far better failure than losing the run. Set
+                        # JNO_RELOCATE_STRICT=1 to raise instead (the message reports the offending cell).
+                        _lg = getattr(getattr(fem, "domain", None), "log", None)
+                        if _lg is not None:
+                            _lg.warning("jno.solve.relocate: skipped one round -- Monge-Ampere operator not finite.")
+                        history[-1]["relocate_skipped"] = True
+                        continue
+                    if not np.isfinite(_Xr).all():
+                        _ar = _tri_area(X_now, shared_cells)
+                        _a, _b, _c = X_now[shared_cells[:, 0]], X_now[shared_cells[:, 1]], X_now[shared_cells[:, 2]]
+                        _ca = 0.5 * np.abs(
+                            (_b[:, 0] - _a[:, 0]) * (_c[:, 1] - _a[:, 1]) - (_b[:, 1] - _a[:, 1]) * (_c[:, 0] - _a[:, 0])
+                        )
+                        raise FloatingPointError(
+                            "jno.solve.relocate: the Monge-Ampere displacement is not finite. "
+                            f"mesh: {len(X_now)} nodes, {len(shared_cells)} cells, total area {_ar:.3e}, "
+                            f"smallest cell {_ca.min():.3e} ({_ca.min() / max(_ca.mean(), 1e-300):.2e} of mean); "
+                            f"monitor finite={bool(np.isfinite(np.asarray(_mon)).all())} "
+                            f"range [{float(np.asarray(_mon).min()):.3e}, {float(np.asarray(_mon).max()):.3e}]; "
+                            f"field finite={bool(np.isfinite(_u_now[:n_verts]).all())}. "
+                            "A near-degenerate cell makes the barycentric-gradient inverse blow up, which is "
+                            "what `_p1_operators` builds the Monge-Ampere operator from."
+                        )
+                    _T0 = _t.perf_counter()
+                    _u_r = _l2_project_across_meshes(
+                        X_now, shared_cells, _u_now, layout, _Xr, shared_cells, layout, dim, total_dst=int(off[-1])
+                    )
+                    _T_l2 = _t.perf_counter() - _T0
+                    if os.environ.get("JNO_RELOCATE_TIMING", ""):
+                        print(
+                            f"[relocate] pull={_T_pull * 1e3:7.1f}ms ops={_T_ops * 1e3:7.1f}ms "
+                            f"ma={_T_ma * 1e3:7.1f}ms slide={_T_slide * 1e3:7.1f}ms l2={_T_l2 * 1e3:8.1f}ms",
+                            flush=True,
+                        )
+                    move_mesh(d, _Xr - np.asarray(d.mesh.points)[:, :dim], copy=False, check=False)
+                    X_now = _Xr
+                    carry = (jnp.asarray(_u_r), jnp.asarray(_Xr), carry[2], _make_topo(shared_cells, _Xr))
+                    history[-1]["remeshed"] = True
+                    history[-1]["relocated"] = True
+                    history[-1]["rebuilt"] = False
+                    # ESCALATE r -> h, but only when the RELOCATED mesh still cannot represent the
+                    # solution. Relocation gets first refusal because it is ~0.4 ms against the 8-15 s a
+                    # node-set change costs; escalating measures whether that was enough rather than
+                    # assuming it. The signal is the P1 interpolation error, NOT a shape-quality floor --
+                    # on an anisotropically adapted mesh the latter is anti-correlated with the mesh being
+                    # good, so it would refine a mesh that is already right (see the indicator's
+                    # docstring for the three-resolution measurement).
+                    _esc = getattr(_cond, "escalate", None)
+                    if _esc is not None and dim == 2 and shared_cells.shape[1] == 3:
+                        _ind = _interp_error_indicator(_Xr, shared_cells, np.asarray(_u_r), dim)
+                        _p90 = float(np.percentile(_ind, 90.0))
+                        history[-1]["interp_error_p90"] = _p90
+                        _tgt = float(_budget[2]) * float(getattr(_cond, "escalate_growth", 1.2) or 1.2)
+                        if _cond.max_dofs is not None:
+                            _tgt = min(_tgt, float(_cond.max_dofs))
+                        if _p90 > float(_esc) and _tgt > float(_budget[2]) + 0.5:
+                            # Grow the vertex budget and hand the mesh to the ANISOTROPIC mmg path, so the
+                            # nodes that get added are stretched along the feature. The budget growth is
+                            # self-limiting: more vertices lower the indicator, so the gate stops tripping.
+                            try:
+                                _met = hessian_metric(
+                                    d,
+                                    np.asarray(_u_r)[:n_verts].astype(float),
+                                    target_complexity=_tgt,
+                                    hmin=float(_budget[0]),
+                                    hmax=float(_budget[1]),
+                                )
+                                remesh_with_mmg(d, _met, copy=False)
+                            except (RuntimeError, ValueError) as _exc:
+                                # mmg can refuse a metric it cannot mesh. Escalation optimises the
+                                # DISCRETISATION, never the physics, so declining it leaves a mesh that is
+                                # merely under-resolved rather than losing the whole march -- the same
+                                # trade the relocation round itself makes. Visible in the history, and
+                                # JNO_RELOCATE_STRICT=1 raises instead.
+                                if bool(int(os.environ.get("JNO_RELOCATE_STRICT", "0"))):
+                                    raise
+                                _lg = getattr(getattr(fem, "domain", None), "log", None)
+                                if _lg is not None:
+                                    _lg.warning(
+                                        f"jno.solve.relocate(escalate=): mmg refused the escalation "
+                                        f"({type(_exc).__name__}); continuing on the relocated mesh."
+                                    )
+                                history[-1]["escalate_failed"] = True
+                            else:
+                                _budget = (_budget[0], _budget[1], _tgt, _budget[3])
+                                history[-1]["escalated"] = True
+                                history[-1]["rebuilt"] = True
+                                _carry = "interpolate"
+                                _relocate_rebuild = True
+                    if not _relocate_rebuild:
+                        continue
             else:
                 margin = np.asarray(_mesh_margin_now(cur, _cond.criterion)).reshape(-1)
                 if not (margin > 0.0).any():
                     continue
                 history[-1]["remeshed"] = True
-                marked = np.flatnonzero(margin > 0.0).astype(np.int64)
-                size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
-                remesh_with_mmg(
-                    d, _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]), copy=False
-                )
+                if getattr(_cond, "anisotropic", False):
+                    # ANISOTROPIC: a Hessian metric sets the direction as well as the size, so a
+                    # directional feature -- a thermal boundary layer, a recoil crater -- is resolved by
+                    # elements stretched ALONG it rather than by shrinking them in every direction.
+                    # Measured on the melt ball, the stretched cells a purely r-adaptive march produces
+                    # already align with the isotherms (|long axis . grad T| = 0.125), which says the
+                    # feature IS directional; what r-adaptivity cannot do is BOUND the aspect ratio, and
+                    # a metric does exactly that through hmin/hmax.
+                    _uv = np.asarray(carry[0])[:n_verts].astype(float)
+                    _met = hessian_metric(
+                        d, _uv, target_complexity=float(_budget[2]), hmin=float(_budget[0]), hmax=float(_budget[1])
+                    )
+                    remesh_with_mmg(d, _met, copy=False)
+                else:
+                    marked = np.flatnonzero(margin > 0.0).astype(np.int64)
+                    size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
+                    remesh_with_mmg(
+                        d,
+                        _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]),
+                        copy=False,
+                    )
                 _carry = "interpolate"
             for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
                 d.tag(_name, _pred)
@@ -5684,10 +6547,57 @@ def run_mesh_motion(
             for _tag in {
                 tg for sp in specs for tg in _tags_read(sp["term"]) if not tg.startswith(("__time", "n_", "cell_"))
             }:
+                _drop_region_pools(d, _tag)  # replace, do not alias: see the docstring there
                 try:
                     d.variable(_tag, normals=True, split=True)
                 except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
                     d.variable(_tag, split=True)
+            # The resume is a RECURSIVE call, so every level of the chain holds its own stack frame --
+            # and with it that segment's compiled `_scan` executable and assembled operators. Measured on
+            # a laser-melt march: RSS flat to 2 MB across 752 rebuild-free steps, then +0.5-2 GB per
+            # rebuild (the growth scales with the accumulated trajectory, so deeper chains cost more),
+            # and a 29-rebuild run was OOM-killed at 54.9 GB with all of its output lost.
+            #
+            # Nothing below this point reads them: the trajectory is rebuilt from `u_frames`/`X_frames`/
+            # `ts`, which are plain lists of arrays, and `_cells_for` closes only over `_cells_at`. So
+            # freeze the resume's (already concrete) inputs, then drop this segment's heavy objects and
+            # collect before descending.
+            _resume_arg = {
+                "start": _start + i,
+                "old": (X_now, shared_cells, np.asarray(carry[0]), layout),
+                "budget": _budget,
+                "carry": _carry,
+            }
+            if _cp is not None:
+                # A rebuild is the natural checkpoint: it is where the layout changes, and where a
+                # restart would have to begin. Write the frames AND the resume payload, then hand the
+                # writer down so the next segment appends to the same store.
+                _cp_take(
+                    _cp,
+                    T_frames,
+                    u_frames,
+                    X_frames,
+                    _cells_for,
+                    layout,
+                    _nlocal,
+                    resume=_resume_arg,
+                    domain=(np.asarray(d.mesh.points)[:, :dim], np.asarray(d.mesh.cells_dict[key])),
+                )
+                _resume_arg["_writer"] = _cp
+            _march_mem_probe("before-release", d)
+            # `vel_fns` is the expensive one: each geometry-velocity closure captures that segment's
+            # SAMPLED REGION POOLS, shaped (1, n_steps+1, n_points, dim) -- 3.6 MB apiece here, and
+            # proportional to the whole time grid, so they grow with steps AND with rebuilds. Measured
+            # by dumping the largest live buffers: (1,1401,163,2) x4 -> x6 -> x8 across three rebuilds.
+            # That product is the `steps x rebuilds` scaling behind the 54.9 GB OOM.
+            _scan = _march_step = cur = specs = carry = _topo_build = vel_fns = None
+            # Dropping the Python references is NOT enough: measured, the per-rebuild growth stayed at
+            # ~0.35 GB (vs 0.36 unpatched). The executables are retained by JAX's own jaxpr/lowering/
+            # compiled caches, which a local rebinding cannot reach -- so clear them. This segment's
+            # program is dead either way; the child recompiles regardless, so nothing is re-paid.
+            jax.clear_caches()
+            gc.collect()
+            _march_mem_probe("after-release", d)
             rest = run_mesh_motion(
                 fem,
                 adapt=adapt,
@@ -5695,26 +6605,26 @@ def run_mesh_motion(
                 nonlinear=nonlinear,
                 linear=linear,
                 precond=precond,
-                _resume={
-                    "start": _start + i,
-                    "old": (X_now, shared_cells, np.asarray(carry[0]), layout),
-                    "budget": _budget,
-                    "carry": _carry,
-                },
+                checkpoint=checkpoint,
+                _resume=_resume_arg,
                 **kwargs,
             )
             fem.adapt_history = history + list(fem.adapt_history)
+            if _cp is not None:
+                # Every segment wrote into the SAME store, so the child's trajectory already spans the
+                # whole march; concatenating this segment on top would double it (and it was released).
+                return rest
             return AdaptiveTrajectory(
                 np.concatenate([np.asarray(ts[: i + 1], dtype=float), np.asarray(rest.times[1:], dtype=float)]),
                 [state] + u_frames + list(rest.states[1:]),
-                [(X0, shared_cells)] + [(x, shared_cells) for x in X_frames] + list(rest.meshes[1:]),
+                [(X0, _cells_for(0))] + [(x, _cells_for(k + 1)) for k, x in enumerate(X_frames)] + list(rest.meshes[1:]),
                 layouts=[layout] * (i + 1) + list(rest.layouts[1:]),
             )
     _X_f = carry[1]
 
     times = [float(t) for t in ts]
     states = [state] + u_frames
-    meshes = [(X0, shared_cells)] + [(x, shared_cells) for x in X_frames]
+    meshes = [(X0, _cells_for(0))] + [(x, _cells_for(k + 1)) for k, x in enumerate(X_frames)]
 
     # Leave the domain on the final moved mesh, as the eager driver did -- callers inspect `fem.points`
     # after a solve. Host state, so it can only take a concrete value: inside `jax.grad` the final
@@ -5737,12 +6647,19 @@ def run_mesh_motion(
         for _name, _pred in _preds.items() if hasattr(_preds, "items") else []:
             d.tag(_name, _pred)
         for _tag in {sp["coord"].tag for sp in specs}:
+            _drop_region_pools(d, _tag)
             try:
                 d.variable(_tag, normals=True, split=True)  # keep the normals a Stefan-type law reads
             except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
                 d.variable(_tag, split=True)
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
+    if _cp is not None:
+        _cp_take(_cp, T_frames, u_frames, X_frames, _cells_for, layout, _nlocal, complete=True)
+        _t, _st, _ms, _lay = _cp.frames()
+        if getattr(checkpoint, "keep", "last") == "all":
+            _st, _ms, _lay = list(_st), list(_ms), list(_lay)  # materialise: caller asked to stay in RAM
+        return AdaptiveTrajectory(_t, _st, _ms, layouts=_lay)
     # One layout, repeated: the move preserves topology, so every frame has the same per-field orders,
     # value shapes and connectivity. Carrying it is what lets `AdaptiveTrajectory.resample` take its
     # basis-aware branch -- without it a P2 or vector trajectory falls to the legacy scalar-P1 path, which

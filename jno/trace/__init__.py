@@ -1071,7 +1071,30 @@ class Placeholder:
         Chain with spatial integration for space-time integrals::
 
             space_time_integral = u_net(x, t).integrate().integrate(t)
+
+        **FEM integral** (``var=fem`` — a ``jno.fem(...)`` object):
+        Integrates an expression built from that FEM's own symbols over its basis, at its
+        solution, returning a differentiable scalar. This is the FEM twin of the collocation
+        integral above: where Deep Ritz integrates a network's energy density at the mesh
+        quadrature points, this integrates a *solved field's*::
+
+            C = inner(sig(u, rho), eps(u)).integrate(fem)      # compliance, an energy integral
+            V = rho.integrate(fem) / (VOLFRAC * d.measure())   # the volume fraction
+            jno.core([C, jno.le(V, 1.0)], domain=d).solve(400)
+
+        The ``fem`` is named because it is the one thing the expression cannot supply. The BASIS
+        is inferred -- a trial symbol carries its ``order``, ``space`` and ``_domain`` -- but the
+        solution values, the assembly quadrature degree and the system to differentiate through
+        are not on the symbol, and a domain may carry more than one ``jno.fem``.
+
+        ``quadrature=`` does not apply: a FEM functional inherits the rule its operator was
+        assembled with, which is what makes ``∫ σ(u):ε(u) dΩ`` equal ``uᵀKu`` exactly. Every
+        functional over one ``fem`` shares a single solve. See :meth:`jno.fem.eval` for the eager
+        form and for the scope limits (whole volume and tagged boundary regions, steady
+        native-Lagrange problems).
         """
+        if var is not None and hasattr(var, "_integral_node"):
+            return var._integral_node(self)
         if var is not None and getattr(var, "axis", None) == "temporal":
             return IntegralTime(self, time_var=var)
         return Integral(self, integration_var=var, quadrature=quadrature)
@@ -3896,6 +3919,10 @@ class FemResidualOperator:
         names = list(self.runtime_parameter_exprs)
         params = [self.runtime_parameter_exprs[n] for n in names]
 
+        # A solver that flags ``wants_args`` also receives the runtime parameter values: the reduced-space
+        # wrapper needs them when a slip surface moves with runtime coordinates (its P is rebuilt per solve).
+        _xa = (lambda a: {"args": a}) if getattr(solve_fn, "wants_args", False) else (lambda a: {})  # noqa: E731
+
         def _solve(*values):
             args = dict(zip(names, values))
             residual_fn = lambda u: self.residual(u, args)  # noqa: E731
@@ -3903,8 +3930,8 @@ class FemResidualOperator:
             # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
             # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
             if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args))
-            return solve_fn(residual_fn, u0)
+                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+            return solve_fn(residual_fn, u0, **_xa(args))
 
         if values is None:
             return FunctionCall(_solve, params, name="fem_solve")
@@ -3941,8 +3968,8 @@ class FemResidualOperator:
                 args = dict(zip(names, value_args))
                 rf = lambda u: self.residual(u, args)  # noqa: E731
                 if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args))
-                return solve_fn(rf, u0_arg)
+                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+                return solve_fn(rf, u0_arg, **_xa(args))
 
             fn = cache[key] = jax.jit(_run)
         return fn(u0_t, *vals_t)

@@ -36,11 +36,11 @@ constraint values and gradients that a scalar-loss transform never sees.
 Free nodal movement will happily invert an element, so the mesh needs its own constraints — minimum
 interior angle, and maximum/minimum element volume (their eq. 24/26/28), aggregated with a $p=50$
 norm. `d.cell_angles()` and `d.cell_volume()` are trace nodes, so they are differentiable in the
-nodal coordinates, which is exactly what makes them usable as constraints:
+nodal coordinates, which is exactly what makes them usable as constraints — and being nodes, they
+are written as the arithmetic they are:
 
 ```python
-g_ang = jno.fn(lambda th: ((2*jnp.pi - th) / (2*jnp.pi - THETA_MIN)).reshape(-1),
-               [d.cell_angles()], name="g1").pnorm(50.0, normalize=True)
+g_ang = ((2*jnp.pi - d.cell_angles()) / (2*jnp.pi - THETA_MIN)).reshape(-1).pnorm(50.0, normalize=True)
 crux = jno.core([compliance, jno.le(volume, 1.0), jno.le(g_ang, 1.0), ...], domain=...)
 ```
 
@@ -78,6 +78,41 @@ callbacks.append(jno.optimizers.geometric_decay(beta_p, 0.997, start=BETA, minim
 not a detail: a plain `log(max(P* - P, eps))` is **constant** above the bound, so its gradient there
 is exactly zero and the barrier silently stops doing anything — the failure mode is a satisfied-looking
 run whose perimeter sits far above target.
+
+## The objective is an integral
+
+Compliance is the strain energy `C = a(u,u) = ∫ σ(u):ε(u) dΩ`, and it is written as exactly that —
+the same bilinear form the weak statement is built from, integrated at the solution:
+
+```python
+eps = lambda w: symgrad(w, [xi, yi])
+a   = lambda p, q: LAM*trace(p)*trace(q) + 2*MU*inner(p, q, n_contract=2)
+E   = lambda r: EMIN + r**penal_p * (E0 - EMIN)
+
+fem        = jno.fem([E(rho) * a(eps(u), eps(phi)), ...])
+compliance = (E(rho) * a(eps(u), eps(u))).integrate(fem)
+volume     = (rho * cellv).sum / (VOLFRAC * cellv.sum)     # NOT an .integrate(fem) — see below
+```
+
+`.integrate(fem)` inherits the quadrature the operator was assembled with, so this equals `f·u`
+exactly rather than to within a quadrature error nothing reports. The `fem` is named because it is
+the one thing the expression cannot supply: a trial symbol carries its basis, but not the solution
+values, the assembly quadrature, or which system to differentiate through. Every functional over one
+`fem` shares a single solve.
+
+**Use it where quadrature is actually needed.** `rho.integrate(fem)` gives the right volume, but ρ is
+piecewise constant, so `∫ρ dΩ` is exactly `Σ ρ_k |K|` — and routing it through the functional runs a
+full element map, plus its backward pass, to compute a weighted sum. Measured on this problem, at 400
+iterations: compliance as an integral costs **84 s against 80 s** for the frozen-load-vector version,
+about 4 %; adding the volume as an integral too pushed the same run past **7 minutes**. The rule that
+falls out is not "avoid the functional" but "use it for what has an integrand" — an energy density
+needs the basis and the quadrature, a per-element sum does not.
+
+This matters past tidiness. The objective used to be a dot product against a load vector evaluated
+outside the trace, and the volume a lambda over `cell_volume()` — so every new objective needed its
+own reduction over the DOF vector. As integrals, a stress constraint
+(`((sigma_vm/SIG_Y)**p).integrate(fem)`), a compliant mechanism's output displacement, and multiple
+load cases are all the same one construct.
 
 ## Every sensitivity is automatic
 
@@ -124,21 +159,58 @@ control is how a load-application bug or a plain refinement effect gets reported
 
 ![Top: the optimised physical density on the deformed mesh, a cantilever truss with thick well-defined members. Middle: the optimised mesh with interior nodes coloured by how far they moved, showing movement concentrated along the structural members. Bottom left: bar chart of compliance on its own mesh, the value expected on a clean mesh after correcting for discretisation, and the value actually measured. Bottom right: histogram of element densities, strongly bimodal at 0 and 1.](/jNO/assets/topology_optimisation_cantilever.png)
 
-4,226 elements, 4,408 dofs, 400 iterations, ~160 s on CPU:
+4,226 elements, 4,408 dofs, 400 iterations, ~3 min on CPU:
 
 | quantity | value |
 |---|---|
-| compliance, own deformed mesh | $78.45$ |
-| compliance, clean mesh (16,824 elements) | $89.86$ &nbsp; (raw gap $+14.5\%$) |
+| compliance, own deformed mesh | $78.41$ |
+| compliance, clean mesh (16,828 elements) | $82.43$ &nbsp; (raw gap $+5.1\%$) |
 | control, uniform density, no distortion | $661.28 \to 666.87$ &nbsp; ($+0.8\%$ discretisation) |
-| **over-report attributable to the moved nodes** | $\mathbf{+13.6\%}$ |
-| perimeter $P$ | $587.2$ against target $P^\*=650$ |
-| volume fraction / $M_{nd}$ / inverted elements | $0.400$ / $0.075$ / $0$ |
+| over-report attributable to the moved nodes | $+4.2\%$ &nbsp; (**but see below**) |
+| perimeter $P$ | $445.9$ against target $P^\*=650$ |
+| volume fraction / $M_{nd}$ / inverted elements | $0.4000$ / $0.062$ / $0$ |
 
-Perimeter control earns its place. Running the same script with `PSTAR = 0.0` gives $P=849.2$,
-$C=80.23$, $M_{nd}=0.127$ and an over-report of $+21.6\%$ — so constraining the perimeter produced a
-design that is **more binary and substantially more honest about its own stiffness**, because it has
-fewer fine features with which to farm discretisation error.
+### Which of these numbers are reproducible
+
+Not all of them, and the difference matters more than any single value. Four runs of this script —
+one before the objective was rewritten as an integral, two after, differing only in the Python
+and JAX build they ran on, and run D on a later jNO (parameters float64 since #123), which is the one
+in the table and the figure above:
+
+| | run A | run B | run C | run D |
+|---|---|---|---|---|
+| compliance | $78.45$ | $78.33$ | $78.64$ | $78.41$ |
+| volume fraction | $0.400$ | $0.3998$ | $0.3999$ | $0.4000$ |
+| $M_{nd}$ | $0.075$ | $0.066$ | $0.071$ | $0.062$ |
+| perimeter $P$ | $587.2$ | $504.1$ | $530.7$ | $445.9$ |
+| over-report | $+13.6\%$ | $+5.4\%$ | $+10.2\%$ | $+4.2\%$ |
+
+**Compliance and volume fraction are stable** to a fraction of a percent — they are what the problem
+actually pins down. **The perimeter and the reanalysis gap are not**: they span $446$–$587$ and
+$+4.2$–$+13.6\%$. Runs B and C are the *same source code*, so this is not the rewrite; it is the
+problem. It is non-convex, and MMA's asymptote update is *history-dependent with a branch in it* — a
+variable that just reversed direction has its asymptotes pulled in, one moving steadily has them
+pushed out — so a change in the last bit of a floating-point operation flips that test for some
+variable, and the trajectories separate from there into different local optima.
+
+(It is **not** the SIMP continuation, which would be the obvious suspect. Measured on this
+configuration: `penal` stays at $3.0$ and the continuation fires **zero** times in 400 iterations —
+see the note below.)
+
+The practical consequence: quote the over-report as a range, "$+4$ to $+14\%$", and not to three figures, and
+treat a single run's perimeter as one sample rather than a measurement. ($C = f\cdot u$ and
+$C = \int \sigma(u){:}\varepsilon(u)\,d\Omega$ agree in value and in gradient analytically — both
+reduce to $-u^{\mathsf T}(\partial K/\partial\rho)u$ — so the rewrite changes the arithmetic path,
+not the objective.)
+
+Perimeter control earns its place, though not in every column. Running the same script with
+`PSTAR = 0.0` gives $P=849.2$, $C=80.23$, $M_{nd}=0.127$ and an over-report of $+21.6\%$ (measured on
+the previous spelling of the objective and not re-run since). Against the spread above, the
+**binariness** separates cleanly — $M_{nd}$ $0.127$ uncontrolled against $0.062$–$0.075$ controlled —
+and the perimeter obviously does. The **over-report comparison does not**: $+21.6\%$ against a
+controlled range of $+4.2$–$+13.6\%$ is a difference of the same size as the run-to-run scatter, so
+one uncontrolled run is not enough to claim it. What survives is the binariness, and the mechanism
+behind it: a design held to a length scale has fewer fine features to farm discretisation error with.
 
 Do **not** read the accompanying drop in compliance ($80.23 \to 78.45$) as perimeter control being
 free. Without a length-scale restriction the continuum problem is not well posed — that is exactly

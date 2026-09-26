@@ -101,13 +101,11 @@ argument and jit keys on shape, not on value; `x0=` warm-starts across the sweep
     Checked on the linear Poisson above, where `u` scales as `1/k`: `max(u)·k` across the six-step
     family is `0.072561` at every step, constant to six digits.
 
-    It is **steady only** (linear or nonlinear, real or fused-complex), and it cannot serve a reduced
-    slip/periodic system — that driver hands its solver no assembled tangent, which is exactly what
-    `newton(direct=True)` needs there. Use the manual loop for those.
+    It is **steady only** (linear or nonlinear, real or fused-complex). A reduced slip/periodic system is
+    served on the nonlinear path, with `newton(direct=True)` factorizing the reduced tangent `PᵀJP`.
 
 It composes with everything the ordinary solve does, including `newton(direct=True)` on a **reduced**
-(slip / periodic) system — the case `fem.solve(continuation=...)` still cannot serve, since that driver
-hands its solver no assembled tangent. `fem.stats` reports the verdict as usual: the jit hides the
+(slip / periodic) system. `fem.stats` reports the verdict as usual: the jit hides the
 driver's own convergence check, so the judgement is remade outside it, on the *reduced* residual where
 there is one.
 

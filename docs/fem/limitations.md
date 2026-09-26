@@ -30,11 +30,14 @@ path is unaffected.
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
+| Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | `jno.derived` nonlocal fields | nodal Lagrange `on=` only; no chained derived fields; host geometry closed over by the rule is **frozen at build**, so it goes stale on a moving mesh | raises, except the moving mesh — **silent** |
 | Plasticity | small-strain, isotropic, linear-hardening | raises |
+| Adapting a moving mesh | `relocate` fails on two separate bodies (use `alpha`); `enrich()` (p) is not wired; `checkpoint=` needs `adapt=`; runtime connectivity is affine-simplex only | raises |
 | Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
+| FEM functionals (`fem.eval(F, u)` with a test-free `F`, `expr.integrate(fem)`) | steady, native Lagrange; the whole volume or a tagged boundary region — not a sub-region; not transient, complex, 1-D, non-nodal or VPINN (use `sum(fem.eval(F * phi, u))` there) | raises |
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
 | `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |

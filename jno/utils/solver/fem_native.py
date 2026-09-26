@@ -878,6 +878,10 @@ def _declared_parameter_size(expr):
         return None
 
 
+TOPOLOGY_ARG = "__topology__"
+"""``args`` key carrying a runtime CONNECTIVITY bundle -- see ``assemble_fem_native(dynamic_topology=)``."""
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -890,6 +894,7 @@ def assemble_fem_native(
     evolution: Optional[Dict[Any, Any]] = None,
     bounded: bool = False,
     tv_dirichlet_external: bool = False,
+    dynamic_topology: bool = False,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
@@ -1111,6 +1116,38 @@ def assemble_fem_native(
         comp = jnp.arange(vecs[i])
         cd = offs[i] + cells_f_j[i][:, :, None] * vecs[i] + comp[None, None, :]
         cdofs.append(cd.reshape(n_cells, -1))
+
+    # ---- dynamic topology -----------------------------------------------------------------------
+    # Connectivity is baked into the traced program by default. A march that RECONNECTS (PFEM alpha
+    # reconnection, ``fem_adapt.remesh(alpha=)``) therefore rebuilds and RE-COMPILES whenever a Delaunay
+    # edge flips -- measured at 31 s per flip, exactly one XLA compilation each, for a flip that changes
+    # 2-6 cells out of 568 and leaves every array SHAPE identical. Nothing requires that: ``segment_sum``
+    # and ``.at[].add`` take TRACED index arrays and recompile only on a shape change. The arrays simply
+    # arrive as constants instead of arguments.
+    #
+    # ``dynamic_topology=True`` routes them through the same runtime channel the moved vertices already
+    # use (``_apply_coord_params``): the caller delivers a bundle in ``args[TOPOLOGY_ARG]`` and each
+    # evaluation resolves it there. Shapes still fix the program, so a reconnection that changes the CELL
+    # COUNT (two bodies merging) still rebuilds -- only same-shape flips become free.
+    # Requested on the DOMAIN as well as by keyword: the reconnecting march driver reaches this through
+    # several `_fem.py` entry points (single-field, multifield steady, multifield transient), and threading
+    # a keyword through all of them buys nothing over one attribute the driver already owns.
+    dynamic_topology = bool(dynamic_topology or getattr(domain, "_fem_want_dynamic_topology", False))
+    _auto_dyn = getattr(domain, "_fem_auto_dynamic_topology", False)
+    if dynamic_topology and _auto_dyn and (_nonaffine or any(int(f["order"]) != 1 for f in fields)):
+        # Inferred from a geometry term, not asked for. This form cannot take the runtime-connectivity
+        # path -- a curved mesh, or a higher-order field whose edge nodes a reconnection would re-decide
+        # -- so fall back to the baked one rather than raising at a caller who never requested it. The
+        # higher-order case was missing: every P2/P3 moving-mesh march raised "P1 fields only" once the
+        # inference became the default (test_fem_geometry_terms, 6 failures).
+        dynamic_topology = False
+    if dynamic_topology and _nonaffine:
+        raise NotImplementedError(
+            "assemble_fem_native(dynamic_topology=True): only affine simplices are supported -- a curved "
+            "or tensor-product cell gathers its geometry through `cells_f_j[_geom_field]` per quadrature "
+            "point, which this path does not thread yet. Use a straight-sided simplex mesh, or leave "
+            "`dynamic_topology=False` and pay the rebuild."
+        )
 
     # -------------------------------------------------------------------------
     # Per-region masks (collected from all volume terms)
@@ -1473,10 +1510,16 @@ def assemble_fem_native(
 
     # Per-field facet tables (one set per distinct element order). These tabulate the parent basis on
     # the simplex facets for surface (Neumann/Robin) integration -- a triangle's 3 edges in 2D, a tet's
-    # 4 triangular faces in 3D -- so they are skipped when there are no boundary terms.
+    # 4 triangular faces in 3D.
+    #
+    # Built whenever the cell type supports a facet rule, not only when the FORM carries a boundary term:
+    # a boundary FUNCTIONAL (`fem.eval` on a test-free expression, e.g. a mechanism's output displacement
+    # ∮ u·e ds) asks for a facet the equations never integrated over, and gating on `boundary_terms` left
+    # it unpackable-None. These are REFERENCE-space tables -- shape (n_faces, n_q, n_dof) per element
+    # order -- so the cost is independent of the mesh size and paid once at build.
     face_tables_per_field = (
         [_build_face_tables(f["order"], quad_degree, dim, _cell_type) for f in fields]
-        if (boundary_terms and not _refuse_tensor_product_surface(_cell_type))
+        if not _refuse_tensor_product_surface(_cell_type)
         else [None] * len(fields)
     )
     # face_tables_per_field[i] = (face_phi, face_dphi_ref, face_ref_qp, face_ref_tangs, face_w);
@@ -1900,7 +1943,7 @@ def assemble_fem_native(
                 pts = pts.at[_ids, _axis].set(jnp.asarray(args[_name], dtype=pts.dtype).reshape(-1))
         return pts
 
-    def _cell_fields(c, cell_sols, pts=pts_j):
+    def _cell_fields(c, cell_sols, pts=pts_j, cells=None, cells_f=None):
         """Per-field ``(phi, dphi_phys, cell_sol)`` and shared ``(xq, meas)`` for cell c.
 
         ``cell_sols`` is a list of this cell's local DOF values per field, shape
@@ -1908,19 +1951,23 @@ def assemble_fem_native(
         per-cell Jacobian path passes a *differentiated* local slice so ``jax.jacfwd`` sees
         an element-sized (not global) input — keeping the AD intermediate O(n_local), not
         O(n_dofs). ``pts`` is the (possibly coordinate-parameter-scattered) P1 geometry points;
-        it defaults to the static mesh and is overridden per-eval when coordinates are trainable."""
+        it defaults to the static mesh and is overridden per-eval when coordinates are trainable.
+        ``cells`` / ``cells_f`` are the CONNECTIVITY, same convention (``None`` -> the baked arrays); a
+        reconnecting march overrides them per-eval so an edge flip needs no new program."""
+        cells = cells_j if cells is None else cells
+        cells_f = cells_f_j if cells_f is None else cells_f
         if _nonaffine:
             # x(ξ) = Σ_a x_a N_a(ξ) over the geometry nodes, so J_dn(ξ) = Σ_a x_a[d] ∂N_a/∂ξ_n is a
             # function of ξ. Everything downstream that was one number per cell -- detJ, the
             # measure, the push-forward's J⁻¹ -- becomes one per quadrature point. This branch is
             # the general isoparametric map: it serves an order-2 curved simplex and a
             # bilinear/trilinear tensor-product cell without knowing which it has.
-            gverts = pts[cells_f_j[_geom_field][c]]  # (n_geom, dim)
+            gverts = pts[cells_f[_geom_field][c]]  # (n_geom, dim)
             J = jnp.einsum("ad,qan->qdn", gverts, ref_grads_all[_geom_field][..., 0, :])  # (n_q, dim, dim)
             detJ = jnp.linalg.det(J)  # (n_q,)
             xq = ref_vals_all[_geom_field][..., 0] @ gverts  # (n_q, dim)
         else:
-            verts = pts[cells_j[c]]  # (dim+1, dim)
+            verts = pts[cells[c]]  # (dim+1, dim)
             J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
             detJ = jnp.linalg.det(J)
             xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
@@ -1934,7 +1981,7 @@ def assemble_fem_native(
                 # shared face, because the two cells disagree about ξ. Tagged "Lagrange" below so
                 # the shared integrand evaluator serves the wider tables unchanged, exactly as the
                 # M(cell)-transform families do.
-                _cn = cells_j[c]
+                _cn = cells[c]
                 phi, dphi = expand_cover(phi, dphi, xq, pts[_cn], _cover_scale_j[_cn])
             fd = _CellFieldData(
                 {"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"},
@@ -1970,6 +2017,118 @@ def assemble_fem_native(
     for i in range(len(fields)):
         loc_seg.append(loc_seg[-1] + n_local_f[i] * vecs[i])
     cell_all_dofs = jnp.concatenate(cdofs, axis=1) if len(cdofs) > 1 else cdofs[0]  # (n_cell, n_local_all)
+
+    if dynamic_topology and _auto_dyn and (_gap_tables or _surf_region_faces):
+        # Same downgrade, decided here because contact gaps and surface readouts are only known now --
+        # and it must precede the bundle published below, or a stale one would outlive the decision.
+        dynamic_topology = False
+
+    def _apply_topology(args):
+        """``(cells, cells_f, cdofs, cell_all_dofs, parent, lface)`` for this evaluation.
+
+        The baked arrays unless the caller delivered a runtime bundle under ``TOPOLOGY_ARG``. This is the
+        connectivity counterpart of :func:`_apply_coord_params`, which does exactly this for the vertex
+        POSITIONS -- same channel, same "``None`` -> static mesh" convention, so a reconnecting march can
+        hand over a new triangulation without the program changing. A no-op (and free) by default."""
+        if not dynamic_topology or not args or TOPOLOGY_ARG not in args:
+            return cells_j, cells_f_j, cdofs, cell_all_dofs, parent_j, lface_j
+        b = args[TOPOLOGY_ARG]
+        return b["cells"], b["cells_f"], b["cdofs"], b["cell_all_dofs"], b["parent"], b["lface"]
+
+    # One compression plan per assembled Jacobian: `_make_jacobian` runs up to four times (mass, spatial,
+    # temporal, main) and each has its OWN term set and therefore its own sparsity pattern. A single
+    # published plan would be right for one of them and quietly wrong for the rest.
+    _plan_builders: List[Any] = []
+
+    def _faces_in_build_order(face_nodes_new, *arrays):
+        """Reindex per-face ``arrays`` from a new triangulation's face order into the BUILD-time order.
+
+        A reconnection re-indexes the boundary faces even when it leaves the face SET alone -- measured on
+        one edge flip: 62 of 64 ``parent_cell`` entries and 34 of 64 ``local_face`` entries move. Every
+        other per-face array here (``normals_j``, ``_facet_verts_j``, ``_facet_sign_j``, and each region's
+        ``face_ids``) is baked in the build order, so handing over ``parent``/``lface`` in the NEW order
+        mixes two indexings: face ``i`` would take its parent element from one face and its normal from
+        another. Nothing raises; the tractions just come out slightly wrong.
+
+        Returns the arrays permuted so index ``i`` means the same physical face it meant at build time."""
+        want = {tuple(sorted(r)): i for i, r in enumerate(np.asarray(conn.face_nodes).tolist())}
+        got = [tuple(sorted(r)) for r in np.asarray(face_nodes_new).tolist()]
+        if len(got) != len(want) or any(g not in want for g in got):
+            raise ValueError("topology_bundle: the boundary face set changed; this needs a rebuild.")
+        perm = np.fromiter((want[g] for g in got), dtype=np.int64, count=len(got))
+        out = []
+        for arr in arrays:
+            a = np.asarray(arr)
+            dst = np.empty_like(a)
+            dst[perm] = a
+            out.append(dst)
+        return out
+
+    def topology_bundle(cells_p1_new, cells_f_new, parent_new=None, face_nodes_new=None, lface_new=None):
+        """Build the ``args[TOPOLOGY_ARG]`` bundle for a NEW triangulation of the same node set.
+
+        The caller (the reconnecting march driver) recomputes the host-side connectivity -- cheap, it is
+        a scipy Delaunay plus a boundary walk -- and passes the result here. Shapes must match the mesh
+        this operator was assembled on; a cell-count change needs a rebuild, and is refused loudly rather
+        than silently recompiling or, worse, indexing out of range.
+
+        ``parent_new`` is the face -> parent-cell map for the NEW cell numbering. It is not optional when
+        the form has surface terms: a reconnection renumbers cells, so the baked ``parent_cell`` would
+        point every boundary face at the wrong element while every shape still matched -- silently wrong
+        answers, the worst failure available here. ``face_nodes_new`` is checked against the boundary this
+        operator was built on, because the facet tables (normals, signs, region face ids) are NOT rebuilt:
+        if the boundary moved, this must be a rebuild."""
+        cf = [jnp.asarray(c, dtype=jnp.int32) for c in cells_f_new]
+        if len(cf) != len(cells_f_j) or any(a.shape != b.shape for a, b in zip(cf, cells_f_j)):
+            raise ValueError(
+                "topology_bundle: the new connectivity has a different SHAPE than the mesh this operator "
+                f"was assembled on ({[tuple(a.shape) for a in cf]} vs "
+                f"{[tuple(b.shape) for b in cells_f_j]}). Shapes fix the compiled program, so this needs a "
+                "rebuild, not a bundle."
+            )
+        if face_nodes_new is not None and conn.n_bfaces > 0:
+            _old_b = np.sort(np.asarray(conn.face_nodes), axis=1)
+            _new_b = np.sort(np.asarray(face_nodes_new), axis=1)
+            if _old_b.shape != _new_b.shape or not np.array_equal(
+                _old_b[np.lexsort(_old_b.T)], _new_b[np.lexsort(_new_b.T)]
+            ):
+                raise ValueError(
+                    "topology_bundle: the BOUNDARY changed. The facet tables (normals, signs, per-region "
+                    "face ids) are baked and are not rebuilt by a bundle, so this needs a rebuild."
+                )
+        if conn.n_bfaces > 0 and parent_new is None and face_nodes_new is not None:
+            raise ValueError(
+                "topology_bundle: `parent_new` is required on a mesh with boundary faces -- a reconnection "
+                "renumbers cells, so the baked face -> parent-cell map would silently address the wrong "
+                "elements while every shape still matched."
+            )
+        _pf = None
+        if parent_new is not None and face_nodes_new is not None and conn.n_bfaces > 0:
+            _pf = _faces_in_build_order(
+                face_nodes_new, parent_new, lface_new if lface_new is not None else np.asarray(lface_j)
+            )
+        cd = []
+        for i in range(len(fields)):
+            comp_i = jnp.arange(vecs[i])
+            cd.append((offs[i] + cf[i][:, :, None] * vecs[i] + comp_i[None, None, :]).reshape(n_cells, -1))
+        return {
+            "cells": jnp.asarray(cells_p1_new, dtype=jnp.int32),
+            "cells_f": cf,
+            "cdofs": cd,
+            "cell_all_dofs": jnp.concatenate(cd, axis=1) if len(cd) > 1 else cd[0],
+            "parent": parent_j if _pf is None else jnp.asarray(_pf[0], dtype=jnp.int32),
+            # Which local edge of the parent cell the face is: renumbers with the cells, exactly as
+            # `parent` does, and is read by `_facet_geometry` to pick the facet off the element.
+            "lface": lface_j if _pf is None else jnp.asarray(_pf[1], dtype=jnp.int32),
+            # Compressed pattern per Jacobian, decided on the HOST where the cells are concrete. `None`
+            # for an entry means its `nse` moved, which the static `num_segments` cannot express -- the
+            # caller must rebuild rather than swap.
+            "plans": [pb(cells_p1_new) for pb in _plan_builders],
+        }
+
+    # Published the same way as `_fem_native_assembly_cells` above: the reconnecting march driver needs to
+    # BUILD a bundle for the triangulation it just decided on, and it holds the domain, not this closure.
+    domain._fem_native_topology_bundle = topology_bundle if dynamic_topology else None
 
     # A LOAD-PATH field (``freeze_path``) is a FrozenField whose nodal values vary per load step: split it
     # out of the compile-time frozen gather, keep only its per-cell connectivity, and let the load-step
@@ -2017,6 +2176,10 @@ def assemble_fem_native(
     # shape functions, and gather its per-cell nodal slice on the same connectivity. Values arrive per step
     # from args; a spec (the full frame stack) rides the driver's scan.
     _path_conn: Dict[Any, Any] = {}
+    # Field index per load-path field, so the gather can resolve a RUNTIME connectivity: the ALE
+    # march delivers the mesh velocity on this channel, and a reconnection renumbers the cells it
+    # gathers through. Baked, this reads each cell's nodal slice from the wrong cell after a swap.
+    _path_conn_fidx: Dict[Any, int] = {}
     path_specs: Dict[Any, Any] = {}
     if _path_nodes:
         _p1_idx = next(
@@ -2034,6 +2197,7 @@ def assemble_fem_native(
             # uses the same shape functions); the driver delivers the per-step slice (n_nodes[, vec]).
             field_index[_fnode.field_key] = _p1_idx  # resolve the load-path field's basis to the P1 field
             _path_conn[_fid] = cells_f_j[_p1_idx]  # scalar P1 vertex connectivity (n_cell, n_local)
+            _path_conn_fidx[_fid] = _p1_idx
             path_specs[_fid] = {"name": _fnode.name, "frames": jnp.asarray(_fnode.path_frames), "n_steps": _fnode.n_steps}
 
     # The mesh velocity w lives on the mesh VERTICES (the driver delivers (X_n - X_c)/dt as (n_verts, dim)),
@@ -2055,6 +2219,7 @@ def assemble_fem_native(
         for _fid, _fnode in _mv_nodes.items():
             field_index[_fnode.field_key] = _p1_mv
             _path_conn[_fid] = cells_f_j[_p1_mv]
+            _path_conn_fidx[_fid] = _p1_mv
             _mvc = cells_f_j[_p1_mv]
             _frozen_gathered[_fid] = jnp.zeros((_mvc.shape[0], _mvc.shape[1], _fnode.num_components))
 
@@ -2142,7 +2307,10 @@ def assemble_fem_native(
         if not pbuf:
             return
         fz = dict(loc.get("frozen_fields", {}))
+        _clf_dyn = _apply_topology(args)[1] if dynamic_topology else None
         for _fid, _conn in _path_conn.items():
+            if _clf_dyn is not None and _fid in _path_conn_fidx:
+                _conn = _clf_dyn[_path_conn_fidx[_fid]]
             if _fid in pbuf:
                 _arr = jnp.asarray(pbuf[_fid])
                 # scalar field: (n_nodes,) -> per-cell (n_local, 1); vector field (prev-state mass):
@@ -2271,7 +2439,7 @@ def assemble_fem_native(
         un = jax.lax.dynamic_slice(u_flat, (offs[fidx],), (n_geom * vt,)).reshape(n_geom, vt)
         return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
 
-    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None):
+    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None):
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
@@ -2279,7 +2447,7 @@ def assemble_fem_native(
         per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
         region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh)."""
         cell_sols = _split_cell_local(local_all)
-        per, xq, meas, _J = _cell_fields(c, cell_sols, pts_j if pts is None else pts)
+        per, xq, meas, _J = _cell_fields(c, cell_sols, pts_j if pts is None else pts, cells, cells_f)
         # The `dom.cell_size` / `dom.cell_metric` geometry symbols a stabilized form reads.
         h_qp, G_qp = _cell_geometry_symbols(meas, _J)
         cell_masks = tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
@@ -2319,16 +2487,20 @@ def assemble_fem_native(
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
-    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
-        """Per-quadrature-point VALUE of an evolution formula on cell ``c`` -> ``(n_quad, *value_shape)``.
+    def _vol_readout_loc(c, local_all, t=0.0, args=None, pts=None, rnames=()):
+        """The per-cell ``loc`` a TEST-FREE volume expression is evaluated in, plus the geometric measure
+        ``meas`` at the quadrature points.
 
-        Same field / parameter / frozen / history ``loc`` as :func:`_vol_elem_res` (so the formula reads
-        the solved unknown through ``ε(u)`` and the previous state through ``ep.i(-1)``), but the formula
-        carries NO test function, so it is *evaluated* at the quad points (``_eval_integrand``) rather than
-        integrated. This is the internal-state update the load-step march applies after each solve.
-        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
+        Shared by the two things that consume a test-free formula: the state readout, which *evaluates* it
+        per quadrature point, and the functional, which *integrates* it. Everything up to that final
+        reduction is identical -- and identical to :func:`_vol_elem_res` bar the test field -- so one
+        builder is what stops the three drifting apart.
+
+        ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh); pass it and
+        ``∂/∂X`` flows through ``|det J|``. ``rnames`` are the region masks restricting a sub-domain
+        integral, exactly as in :func:`_vol_elem_res`."""
         cell_sols = _split_cell_local(local_all)
-        per, xq, meas, _J = _cell_fields(c, cell_sols)
+        per, xq, meas, _J = _cell_fields(c, cell_sols, pts_j if pts is None else pts)
         h_qp, G_qp = _cell_geometry_symbols(meas, _J)
         loc = {
             "physical_quad_points": xq,
@@ -2339,8 +2511,9 @@ def assemble_fem_native(
             "domain_context": {**ctx, "cell_size": h_qp, "cell_metric": G_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
-            "region_mask_names": (),
-            "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            "region_mask_names": rnames,
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype)
+            + tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames),
             "trial_value_shape": fields[0]["value_shape"],
             "trial_vec": vecs[0],
         }
@@ -2359,7 +2532,26 @@ def assemble_fem_native(
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
+        return loc, meas
+
+    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
+        """Per-quadrature-point VALUE of an evolution formula on cell ``c`` -> ``(n_quad, *value_shape)``.
+
+        The formula carries NO test function, so it is *evaluated* at the quad points rather than
+        integrated -- this is the internal-state update the load-step march applies after each solve.
+        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
+        loc, _meas = _vol_readout_loc(c, local_all, t, args)
         return _eval_integrand(domain, formula, loc)
+
+    def _vol_elem_functional(c, local_all, formula, rnames=(), t=0.0, args=None, pts=None):
+        """``∫_K F dΩ`` over cell ``c`` -> ``(1,)``, for a test-free ``formula``.
+
+        The same integration the residual performs, minus the test function: with no test index the
+        integrand is one value per quadrature point, so ``_integrate_term`` contracts it against
+        ``w · |det J|`` to a single number per cell rather than an element block. Differentiable in the
+        solved DOFs, in the runtime parameters, and -- once ``pts`` is threaded -- in the mesh."""
+        loc, meas = _vol_readout_loc(c, local_all, t, args, pts, rnames)
+        return _integrate_term(domain, formula, loc, qw_shared * meas)
 
     def state_readout(u_flat, t=0.0, args=None):
         """Advance every buffered state one load step: evaluate each key's readout formula at the
@@ -2540,7 +2732,7 @@ def assemble_fem_native(
             if _sk in _declared_slides:
                 loc["domain_context"][_sk] = _jump - _jn[:, None] * _nrm2
 
-    def _facet_geometry(c, k, pts_src):
+    def _facet_geometry(c, k, pts_src, cells=None, cells_f=None):
         """``(J, K, xq)`` for facet ``k`` of cell ``c`` -- one per quadrature point when the cell's
         map is not affine.
 
@@ -2551,17 +2743,31 @@ def assemble_fem_native(
         in basix vertex order -- the same array the basis was tabulated against.
         """
         if _tensor_product:
-            gverts = pts_src[cells_f_j[_geom_field][c]]  # (n_geom, dim), basix order
+            gverts = pts_src[(cells_f_j if cells_f is None else cells_f)[_geom_field][c]]  # (n_geom, dim), basix order
             _, fd_g, _, _, _ = face_tables_per_field[_geom_field]
             Jq = jnp.einsum("ad,qan->qdn", gverts, fd_g[k])  # (n_q, dim, dim)
             xq = face_tables_per_field[_geom_field][0][k] @ gverts  # (n_q, dim): x = sum_a N_a x_a
             return Jq, jnp.linalg.inv(Jq), xq
-        verts = pts_src[cells_j[c]]
+        verts = pts_src[(cells_j if cells is None else cells)[c]]
         Jc = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
         return Jc, jnp.linalg.inv(Jc), None  # xq is formed by the caller from its own facet points
 
     def _surf_elem_res(
-        fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None, gaps=None, test_vals=None
+        fi,
+        local_all,
+        bcoeff,
+        btfi,
+        region,
+        t=0.0,
+        args=None,
+        pts=None,
+        normals=None,
+        gaps=None,
+        test_vals=None,
+        cells=None,
+        cells_f=None,
+        parent=None,
+        lface=None,
     ):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
         cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``. ``pts`` / ``normals``
@@ -2570,13 +2776,16 @@ def assemble_fem_native(
         ``test_vals`` substitutes the test field's shape table (the trial values keep the real one). The
         contact reaction passes ``eye(n_q)``, which makes the return the per-quadrature-point weighted
         traction ``w_q * tau_q`` instead of a nodal residual -- see :func:`_contact_reaction`."""
-        c = parent_j[fi]
-        k = lface_j[fi]
+        # A reconnection renumbers cells, so BOTH the parent element of this face and which local edge
+        # of it the face is move -- with every shape unchanged. Read them from the runtime bundle when
+        # there is one; `None` keeps the baked arrays, i.e. bit-identical to before.
+        c = (parent_j if parent is None else parent)[fi]
+        k = (lface_j if lface is None else lface)[fi]
         n_vec = (normals_j if normals is None else normals)[fi]  # (dim,) outward unit normal
         cell_sols = _split_cell_local(local_all)
         _pts_src = pts_j if pts is None else pts
-        verts = _pts_src[cells_j[c]]
-        J, K, _xq_tp = _facet_geometry(c, k, _pts_src)
+        verts = _pts_src[(cells_j if cells is None else cells)[c]]
+        J, K, _xq_tp = _facet_geometry(c, k, _pts_src, cells, cells_f)
         if _curved_facet:
             # A hexahedron's facet is a bilinear SURFACE: its normal turns across the facet, so one
             # frozen vector per facet is not enough. Nanson's formula gives it at each quadrature
@@ -2643,18 +2852,25 @@ def assemble_fem_native(
                 loc["qp_history"] = {k: sbuf[k][fi] for k in surface_history_specs if k in sbuf}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
-    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None, gaps=None):
-        """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
+    def _surf_readout_loc(fi, local_all, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
+        """The per-face ``loc`` a TEST-FREE surface expression is evaluated in, plus the facet quadrature
+        weights ``w · |dS|``.
 
-        The surface analogue of :func:`_vol_elem_readout`: the same surface ``loc`` as ``_surf_elem_res``
-        (fields, outward normal, per-face surface history), but the formula carries no test function, so it
-        is *evaluated* (``_eval_integrand``), not integrated -- the advance for a surface state (a slip)."""
+        The surface twin of :func:`_vol_readout_loc`, and the same ``loc`` :func:`_surf_elem_res` builds bar
+        the test field: fields restricted to the facet, the outward normal, per-face surface history.
+        ``pts`` / ``normals`` are the coordinate-parameter-scattered geometry (``None`` -> static mesh), so a
+        functional over a moving boundary differentiates in the mesh."""
         c = parent_j[fi]
         k = lface_j[fi]
-        n_vec = normals_j[fi]
+        n_vec = (normals_j if normals is None else normals)[fi]
         cell_sols = _split_cell_local(local_all)
-        verts = pts_j[cells_j[c]]
-        J, Kmat, _xq_tp = _facet_geometry(c, k, pts_j)
+        _pts_src = pts_j if pts is None else pts
+        verts = _pts_src[cells_j[c]]
+        J, Kmat, _xq_tp = _facet_geometry(c, k, _pts_src)
+        if _curved_facet:
+            # Matches _surf_elem_res: a bilinear facet's normal turns across it, so the frozen per-facet
+            # vector is wrong there. Straight facets keep it, where it is exact.
+            n_vec = _facet_nanson_normal(J, face_tables_per_field[0][3][k], _facet_sign_j[fi])
         per_f = []
         for i in range(len(fields)):
             fp_i, fd_i, _, _, _ = face_tables_per_field[i]
@@ -2666,7 +2882,8 @@ def assemble_fem_native(
                     "space": "Lagrange",
                 }
             )
-        _, _, fp_qp, _fp_tangs, _fw = face_tables_per_field[0]
+        _, _, fp_qp, fp_tangs, face_w = face_tables_per_field[0]
+        jac_f = _facet_area_element(J, fp_tangs[k])  # physical edge length (2D) / face area (3D)
         xq_f = _xq_tp if _xq_tp is not None else verts[0] + fp_qp[k] @ J.T
         loc = {
             "physical_quad_points": xq_f,
@@ -2695,7 +2912,23 @@ def assemble_fem_native(
             sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
             if sbuf:
                 loc["qp_history"] = {kk: sbuf[kk][fi] for kk in surface_history_specs if kk in sbuf}
+        return loc, face_w * jac_f
+
+    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None, gaps=None):
+        """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
+
+        The formula carries no test function, so it is *evaluated*, not integrated -- the advance for a
+        surface state (a slip)."""
+        loc, _w = _surf_readout_loc(fi, local_all, region, t, args, gaps=gaps)
         return _eval_integrand(domain, formula, loc)
+
+    def _surf_elem_functional(fi, local_all, formula, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
+        """``∫_F F ds`` over boundary face ``fi`` -> ``(1,)``, for a test-free ``formula``.
+
+        The surface twin of :func:`_vol_elem_functional`: the facet integration ``_surf_elem_res`` performs,
+        contracted against ``w · |dS|`` to one number per face instead of an element block."""
+        loc, w = _surf_readout_loc(fi, local_all, region, t, args, pts, normals, gaps)
+        return _integrate_term(domain, formula, loc, w)
 
     def surface_state_readout(u_flat, t=0.0, args=None):
         """Advance each SURFACE state one load step: evaluate its evolves formula on its region's faces.
@@ -2834,6 +3067,20 @@ def assemble_fem_native(
 
     _elem_map = elem_map
 
+    if dynamic_topology and any(int(f["order"]) != 1 for f in fields):
+        raise NotImplementedError(
+            "assemble_fem_native(dynamic_topology=True): P1 fields only. A higher-order field carries nodes "
+            "on EDGES, and a reconnection re-decides the edges -- so the node set itself changes and the "
+            "shapes with it, which a runtime bundle cannot express. This needs a rebuild."
+        )
+    if dynamic_topology and (_gap_tables or _surf_region_faces):
+        raise NotImplementedError(
+            "assemble_fem_native(dynamic_topology=True): contact gaps and surface STATE readouts are not "
+            "threaded to the runtime connectivity (`_contact_reaction`, `_surf_elem_readout` still read the "
+            "baked `parent_cell` / `local_face`). A reconnection renumbers those, so they would address the "
+            "wrong elements with every shape still matching -- refused rather than answered wrongly."
+        )
+
     def _make_residual(terms, bterms=None):
         """Build the free global residual ``R(u_flat) -> (total,)`` (volume + optional surface).
 
@@ -2845,16 +3092,21 @@ def assemble_fem_native(
         def residual(u_flat, t=0.0, args=None):
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             R = jnp.zeros(total, dtype=u_flat.dtype)
-            local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+            # Connectivity and geometry resolve the same way, out of the same `args`: both are values this
+            # evaluation may be HANDED, rather than ones the compiled program was built around.
+            cl_d, clf_d, cd_d, cad_d, par_d, lf_d = _apply_topology(args)
+            local_all = u_flat[cad_d]  # (n_cell, n_local_all)
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             for coeff, tfi, rnames in typed_with_masks:
                 elem = _elem_map(
-                    lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, t, args, pts_dyn),
+                    lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(
+                        c, la, _e, _t, _r, t, args, pts_dyn, cl_d, clf_d
+                    ),
                     (jnp.arange(n_cells), local_all),
-                    _cell_chunk(n_cells, cdofs[tfi].shape[1], cell_all_dofs.shape[1]),
+                    _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
                 )
-                R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
+                R = R.at[cd_d[tfi].reshape(-1)].add(elem.reshape(-1))
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
@@ -2867,18 +3119,31 @@ def assemble_fem_native(
             gap_um = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
-                pcells = parent_j[fids]
-                lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
+                pcells = par_d[fids]
+                lv = u_flat[cad_d[pcells]]  # (n_face, n_local_all)
                 gslice = _gap_slices(region, fids, gap_um, args)  # {key: (g0, u_m)} for THIS region's faces
                 for bcoeff, btfi in btyped:
                     contribs = _elem_map(
                         lambda fi, la, gp, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
-                            fi, la, _e, _t, _r, t, args, pts_dyn, _nrm_for(_r), gp
+                            fi,
+                            la,
+                            _e,
+                            _t,
+                            _r,
+                            t,
+                            args,
+                            pts_dyn,
+                            _nrm_for(_r),
+                            gp,
+                            cells=cl_d,
+                            cells_f=clf_d,
+                            parent=par_d,
+                            lface=lf_d,
                         ),
                         (fids, lv, gslice),
-                        _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                        _cell_chunk(int(fids.shape[0]), cd_d[btfi].shape[1], cad_d.shape[1]),
                     )
-                    R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
+                    R = R.at[cd_d[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
                     _rk = _gaps_in(bcoeff, region)
                     if _rk:
                         R = _contact_reaction(
@@ -2899,7 +3164,60 @@ def assemble_fem_native(
 
         return residual
 
+    def _make_functional(terms, bterms=None):
+        """Build the scalar functional ``F(u_flat, t, args) -> ()`` of TEST-FREE expressions.
+
+        This is the reduction a weak term does not have. A term carrying a test function integrates to one
+        value per test DOF and scatters into a residual vector; an expression *without* one is an energy or
+        stress density, so each element contributes a single number ``∫_K F dΩ`` and the answer is their
+        sum. ``terms`` are volume integrands and ``bterms`` a ``{region: [exprs]}`` dict of surface ones --
+        the same two buckets :func:`_make_residual` takes, so the region resolution upstream is shared.
+
+        It integrates on the SAME quadrature the operator was assembled with, which is what makes
+        ``∫ σ(u):ε(u) dΩ`` equal ``u·(Ku)`` exactly rather than to within a quadrature error nothing
+        reports. Differentiable in ``u_flat``, in the runtime parameters, and in the mesh -- ``pts_dyn`` is
+        threaded so ``∂/∂X`` flows through ``|det J|`` and through the facet area element."""
+
+        def functional(u_flat, t=0.0, args=None):
+            local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+            pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
+            out = jnp.zeros((), dtype=u_flat.dtype)
+
+            for expr in terms or ():
+                # n_test = 1 in the chunk estimate: there is no element block here, only one number per
+                # cell, so a test-DOF's worth of cost is the honest proxy (as in `state_readout`).
+                per_cell = _elem_map(
+                    lambda c, la, _e=expr: _vol_elem_functional(c, la, _e, (), t, args, pts_dyn),
+                    (jnp.arange(n_cells), local_all),
+                    _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
+                )
+                out = out + jnp.sum(per_cell)
+
+            if bterms:
+                normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coord motion
+                gap_um = {k: _gap_gather(u_flat, k) for k in _gap_tables}
+                for region, exprs in bterms.items():
+                    face_ids = _region_faces(region)
+                    if len(face_ids) == 0:
+                        continue
+                    fids = jnp.asarray(face_ids, dtype=jnp.int32)
+                    lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face, n_local_all)
+                    gslice = _gap_slices(region, fids, gap_um)  # {key: (g0, u_m)} for THIS region's faces
+                    for expr in exprs:
+                        per_face = _elem_map(
+                            lambda fi, la, gp, _e=expr, _r=region: _surf_elem_functional(
+                                fi, la, _e, _r, t, args, pts_dyn, normals_dyn, gp
+                            ),
+                            (fids, lv, gslice),
+                            _cell_chunk(int(fids.shape[0]), 1, cell_all_dofs.shape[1]),
+                        )
+                        out = out + jnp.sum(per_face)
+            return out
+
+        return functional
+
     def _make_jacobian(terms, bterms=None):
+        _NSE0: List[Any] = [None]  # this Jacobian's nonzero count, fixed by its first pattern
         """Build the dense Jacobian ``J(u_flat) -> (total, total)`` by *per-element* forward-mode AD.
 
         Each cell's (and boundary face's) element matrix is ``jacfwd`` of its element residual w.r.t.
@@ -3012,7 +3330,13 @@ def assemble_fem_native(
             static ``nse`` and the traced assembly is unaffected.
             """
             live = _pairing_of(args)
-            if _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
+            # A call carrying a runtime CONNECTIVITY bundle must never be served from the cache: the cache
+            # keys on the contact pairing, which does not move when the triangulation does, so a cached
+            # entry would hand back the pattern of a different mesh. (Measured: with the build-time entry
+            # cached, the bundle call returned the baked pattern and the assembled Jacobian went wrong by
+            # 2.9e-2 while every shape still matched.)
+            _has_bundle = dynamic_topology and bool(args) and TOPOLOGY_ARG in args
+            if not _has_bundle and _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
                 return _pattern_cache["val"]
             _idx_rows, _idx_cols = [], []
             # int32 SOURCES, not an int32 cast of the result. Under x64 `cdofs` / `cell_all_dofs` are
@@ -3047,6 +3371,30 @@ def assemble_fem_native(
                             _idx_rows.append(_gs["rows_mm"])
                             _idx_cols.append(_gs["cols_mm"])
             _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
+            if dynamic_topology:
+                b = (args or {}).get(TOPOLOGY_ARG)
+                _pl = (b or {}).get("plans", [None] * (_my_plan_idx + 1))[_my_plan_idx] if b else None
+                if _pl is not None:
+                    # The driver compressed this triangulation's pattern ON THE HOST and shipped the
+                    # result. `uniq` and `inv` ride the bundle as TRACED arrays -- baking them would be
+                    # a new constant and a new program, i.e. the thing this whole path exists to avoid.
+                    # Only `nse` is static, and the driver refuses a swap that would change it.
+                    _uniq, _inv = _pl
+                    # NOT cached: these are tracers, and `_pattern_cache` outlives the trace -- storing
+                    # them would leak a tracer into the next one. Rebuilding this tuple is free.
+                    return (_uniq, (_uniq, _inv, int(_NSE0[0])), _blk_sizes)
+                if b is not None:
+                    # A bundle with no usable plan: take the uncompressed fallback this function already
+                    # documents. `_emit` scatters raw triplets whose indices come from the bundle, and
+                    # BCOO sums the duplicates on matvec/todense as it does for neighbouring cells.
+                    # `_blk_sizes` comes from SHAPES alone, so it stays valid either way.
+                    return (None, None, _blk_sizes)
+                # NO bundle -- a BUILD-time call. `_static_idx_for()` freezes the published pattern here and
+                # `_dirichlet_jac_rows` plans the Dirichlet-augmented compression from it; at build the
+                # operator really is on the baked cells. Returning "uncompressed" here published a NULL
+                # pattern and sent the Dirichlet rows down a different route than the baseline's, which is
+                # measurable: every assembled piece matched bit-for-bit while the STEP differed by 2.6e-3.
+                # So fall through to the ordinary path.
             _idx_static = (
                 jnp.stack(
                     [jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
@@ -3075,6 +3423,58 @@ def assemble_fem_native(
             _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
             return _pattern_cache["val"]
 
+        def _host_plan(cells_host):
+            """``(uniq, inv, nse)`` for a NEW triangulation, compressed on the host.
+
+            The same pattern ``_pattern`` builds, in NumPy, from concrete cells -- which the reconnecting
+            driver has and the trace does not. Deciding it here is what lets the traced assembly keep the
+            fast ``segment_sum`` scatter instead of falling back to raw triplets (measured: the
+            uncompressed fallback cost 1.54 s a step against 0.056 s, and ate the speedup it enabled)."""
+            ch = np.asarray(cells_host, dtype=np.int64)
+            cdh = [
+                (np.asarray(offs[i]) + ch[:, :, None] * vecs[i] + np.arange(vecs[i])).reshape(n_cells, -1)
+                for i in range(len(fields))
+            ]
+            cadh = np.concatenate(cdh, axis=1) if len(cdh) > 1 else cdh[0]
+            cn = build_facet_connectivity(ch, cell_key)
+            # Build order, for the same reason the bundle uses it: each region's `face_ids` below index
+            # the BUILD-time faces, so the parent map must agree with them.
+            ph = np.asarray(
+                _faces_in_build_order(cn.face_nodes, cn.parent_cell)[0] if conn.n_bfaces > 0 else cn.parent_cell,
+                dtype=np.int64,
+            )
+            rows, cols = [], []
+            for _c_s, _tfi_s, _rn_s in typed_with_masks:
+                sh = (n_cells, cdh[_tfi_s].shape[1], cadh.shape[1])
+                rows.append(np.broadcast_to(cdh[_tfi_s][:, :, None], sh).reshape(-1))
+                cols.append(np.broadcast_to(cadh[:, None, :], sh).reshape(-1))
+            for _r_s, _fids_s, _bt_s in surface_work:
+                pc = ph[np.asarray(_fids_s, dtype=np.int64)]
+                fcols = cadh[pc]
+                for _bc_s, _btfi_s in _bt_s:
+                    sh = (pc.shape[0], cdh[_btfi_s].shape[1], cadh.shape[1])
+                    rows.append(np.broadcast_to(cdh[_btfi_s][pc][:, :, None], sh).reshape(-1))
+                    cols.append(np.broadcast_to(fcols[:, None, :], sh).reshape(-1))
+            if not rows:
+                return None
+            idx = np.stack([np.concatenate(rows).astype(np.int32), np.concatenate(cols).astype(np.int32)], axis=1)
+            pl = compress_plan(idx)
+            if pl is None:
+                return None
+            if _NSE0[0] is None:
+                _NSE0[0] = int(pl[2])
+            elif int(pl[2]) != _NSE0[0]:
+                # `num_segments` is a STATIC argument of the scatter, so a different nonzero count is a
+                # different program. Refuse; the driver falls back to a rebuild, which is correct.
+                return None
+            # Arrays ONLY: this rides the scan carry, and an `nse` in there would be a TRACER where the
+            # scatter needs a static `num_segments`. It is `_NSE0[0]`, guaranteed equal by the check above.
+            return (jnp.asarray(pl[0]), jnp.asarray(pl[1]))
+
+        _my_plan_idx = len(_plan_builders)
+        if dynamic_topology:
+            _plan_builders.append(_host_plan)
+
         def jacobian(u_flat, t=0.0, args=None):
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
@@ -3094,7 +3494,10 @@ def assemble_fem_native(
             _off = [0]
             _nblk = [0]
             rows_l, cols_l, data_l = [], [], []
-            local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+            # Same resolution as the residual: the tangent must linearize the SAME function the
+            # residual evaluates, so it must read the SAME connectivity.
+            cl_d, clf_d, cd_d, cad_d, par_d, lf_d = _apply_topology(args)
+            local_all = u_flat[cad_d]  # (n_cell, n_local_all)
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             def _emit(flat, rows_fn, cols_fn):
@@ -3113,17 +3516,17 @@ def assemble_fem_native(
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p))(la)
+                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d))(la)
 
                 Ke = _elem_map(  # (n_cell, n_test_tfi, n_local_all)
                     _ke,
                     (jnp.arange(n_cells), local_all),
-                    _cell_chunk(n_cells, cdofs[tfi].shape[1], cell_all_dofs.shape[1]),
+                    _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
                 )
                 _emit(
                     Ke.reshape(-1),
-                    lambda _K=Ke, _t=tfi: jnp.broadcast_to(cdofs[_t][:, :, None], _K.shape).reshape(-1),
-                    lambda _K=Ke: jnp.broadcast_to(cell_all_dofs[:, None, :], _K.shape).reshape(-1),
+                    lambda _K=Ke, _t=tfi: jnp.broadcast_to(cd_d[_t][:, :, None], _K.shape).reshape(-1),
+                    lambda _K=Ke: jnp.broadcast_to(cad_d[:, None, :], _K.shape).reshape(-1),
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
@@ -3137,9 +3540,9 @@ def assemble_fem_native(
             gap_um_j = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
-                pcells = parent_j[fids]
-                lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
-                fcols = cell_all_dofs[pcells]  # (n_face, n_local_all)
+                pcells = par_d[fids]
+                lv = u_flat[cad_d[pcells]]  # (n_face, n_local_all)
+                fcols = cad_d[pcells]  # (n_face, n_local_all)
                 gslice = _gap_slices(region, fids, gap_um_j, args)  # {key: (g0, u_m)} or None
                 for bcoeff, btfi in btyped:
 
@@ -3147,25 +3550,40 @@ def assemble_fem_native(
                         _n = _nrm_for(_r) if _n is None else _n
                         # gaps PACKED: the local block then carries d(traction)/du_s THROUGH the gap,
                         # exactly as `jax.linearize` of the residual would.
-                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n, gp))(la)
+                        return jax.jacfwd(
+                            lambda v: _surf_elem_res(
+                                fi,
+                                v,
+                                _e,
+                                _t,
+                                _r,
+                                t,
+                                args,
+                                _p,
+                                _n,
+                                gp,
+                                cells=cl_d,
+                                cells_f=clf_d,
+                                parent=par_d,
+                                lface=lf_d,
+                            )
+                        )(la)
 
                     if gslice:
                         Kef = _elem_map(
                             _kef,
                             (fids, lv, gslice),
-                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                            _cell_chunk(int(fids.shape[0]), cd_d[btfi].shape[1], cad_d.shape[1]),
                         )
                     else:
                         Kef = _elem_map(  # (n_face, n_test_btfi, n_local_all)
                             _kef,
                             (fids, lv),
-                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                            _cell_chunk(int(fids.shape[0]), cd_d[btfi].shape[1], cad_d.shape[1]),
                         )
                     _emit(
                         Kef.reshape(-1),
-                        lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cdofs[_t][_p][:, :, None], _K.shape).reshape(
-                            -1
-                        ),
+                        lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cd_d[_t][_p][:, :, None], _K.shape).reshape(-1),
                         lambda _K=Kef, _f=fcols: jnp.broadcast_to(_f[:, None, :], _K.shape).reshape(-1),
                     )
 
@@ -3187,7 +3605,7 @@ def assemble_fem_native(
                         Kem = _elem_map(  # (n_face, n_test, n_q, vt)
                             _kem,
                             (fids, lv, g0_sl, um_sl),
-                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], n_q * vt),
+                            _cell_chunk(int(fids.shape[0]), cd_d[btfi].shape[1], n_q * vt),
                         )
                         d_sm = jnp.einsum("frqv,fqk->frqkv", Kem.reshape(Kem.shape[0], Kem.shape[1], n_q, vt), w_f)
                         _emit(d_sm.reshape(-1), lambda _g=gs: _g["rows_sm"], lambda _g=gs: _g["cols_sm"])
@@ -3213,7 +3631,7 @@ def assemble_fem_native(
                                 )
                                 return jnp.asarray(out).reshape(n_q, vt)
 
-                            n_local_all = int(cell_all_dofs.shape[1])
+                            n_local_all = int(cad_d.shape[1])
                             Dls = _elem_map(
                                 lambda fi, la, g0f, umf: jax.jacfwd(lambda v: _tau(fi, v, g0f, umf))(la),
                                 (fids, lv, g0_sl, um_sl),
@@ -3803,11 +4221,15 @@ def assemble_fem_native(
     # it unset, so `fem.eval` refused every transient problem, and a transient build on a domain that had
     # earlier hosted a steady one would have snapshotted THAT build's stale factory.
     domain._fem_native_term_residual = _make_residual
-    # Whether the FACET tables exist. They are tabulated only when the FORM carries a surface term
-    # (see `face_tables_per_field`), so a later `fem.eval` of a surface term on a problem with no
-    # boundary terms has nothing to integrate against -- it must say so rather than fail deep inside
-    # the element kernel on `NoneType` unpacking.
-    domain._fem_native_has_facet_tables = bool(boundary_terms)
+    # Whether the FACET tables exist, so a later `fem.eval` of a surface term says so rather than failing
+    # deep inside the element kernel on `NoneType` unpacking. This tracks `face_tables_per_field`, which
+    # is built for every cell type that HAS a facet rule -- NOT only when the form carries a boundary
+    # term. Gating it on `bool(boundary_terms)` (as the tables once were) refused a surface readout, or a
+    # boundary functional, that the tables can serve.
+    domain._fem_native_has_facet_tables = face_tables_per_field[0] is not None
+    # Cleared on every build, set by the steady route only: a transient build on a domain that earlier
+    # hosted a steady one must not inherit THAT build's functional factory.
+    domain._fem_native_term_functional = None
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
@@ -3983,6 +4405,7 @@ def assemble_fem_native(
                     # The prev-state field carries the source field's OWN key/basis, so it resolves the field's
                     # own shape data (P1 or P2, scalar or vector) — no P1 aliasing (unlike a load-path field).
                     _path_conn[pf.frozen_id] = cells_f_j[fidx]  # the field's own vertex connectivity
+                    _path_conn_fidx[pf.frozen_id] = fidx
                     # (frozen_id, dof-slice into the flat state, n_components) — the step delivers this slice
                     # reshaped to (n_nodes, vec) on the load-path channel each backward-Euler step.
                     prev_state_slices.append((int(pf.frozen_id), int(offs[fidx]), int(offs[fidx + 1]), int(vecs[fidx])))
@@ -4217,7 +4640,9 @@ def assemble_fem_native(
     _tv_dirichlet = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])
     residual = _make_residual(volume_terms, boundary_terms)
     # (the free-residual factory behind `FEM.eval` and the facet-tables flag are published above, before
-    # the transient branch, so that both routes carry them)
+    # the transient branch, so that both routes carry them.) The functional factory behind a test-free
+    # `fem.eval` / `expr.integrate(fem)` is STEADY-only, so it is published here and cleared above.
+    domain._fem_native_term_functional = _make_functional
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a

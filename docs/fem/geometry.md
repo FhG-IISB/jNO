@@ -109,6 +109,25 @@ Xx = xi.trainable()                                # ONLY the x-positions of the
     *relocation*, not remeshing (h-remeshing stays the non-differentiable outer AFEM loop); it is differentiable
     on valid meshes, with element inversion (tangling) the boundary of that regime.
 
+!!! note "Moving a slip surface (`n·u = 0`) with runtime coordinates"
+    The exact slip elimination carries `u = P ũ` with `P` built from the surface's per-node normals
+    `N_i = ∫ φ_i n ds`. When the slip surface's own vertices are trainable, those normals move, so `P` is
+    **rebuilt for each solve** from the coordinates it is given: same sparsity (the build-time pivots and
+    facets), new values, pure JAX, differentiable in the coordinates. Checked against a fresh build of the
+    moved mesh (1e-16 on a tilted 2-D surface, 2e-11 m/s on a 3-D rolling model) and against the flux
+    `Σ u_i·N_i` through the moved surface, which stays at round-off. Scope: the **steady nonlinear** solve
+    (`fem.solve(param=...)`, `continuation=`); a linear or transient form with a moving slip surface raises
+    at build. Before this, the build-time normals were used silently (3e-4 relative error on the rolling
+    model) — the reason one build could not serve a sequence of remeshed geometries.
+
+    Entries of `P` that the allowed motion cannot make nonzero (the z-part of a normal on a surface
+    `y = f(x)` when only z is trainable) are left out of its pattern — detected at build by evaluating `P` at
+    random perturbations of the trainable axes, and re-checked after every eager solve, which raises if one
+    is nonzero after all. Keeping them quadrupled the reduced tangent on the rolling model (the sparse
+    reduction expands each triplet over the square of `P`'s entries per row) and made each factorization
+    5.5x slower; pruned, a moved-mesh solve costs what a fresh build's does (23.6 s vs 22.5 s for its
+    137-step continuation) and a re-solve after the mesh moves takes 1.1 s instead of a 7.6 s rebuild.
+
 **r-adaptivity in one call.** Tagging coordinates `.trainable()` and driving the relocation yourself is the
 low-level path; the packaged form reuses the **same `adapt=` slot** as h-refinement:
 
@@ -342,7 +361,7 @@ zero), the rate of a normal or of `cell_size`, and the mesh acceleration `xi.d(t
 Moving a mesh cannot change its topology: two droplets meshed as separate bodies in a void can approach
 forever and stay two meshes. `alpha=` re-decides which nodes form elements, instead of meshing the geometry
 afresh — a Delaunay triangulation of the nodes where the motion left them, keeping only the triangles whose
-circumradius is below `alpha` × the starting mean edge length (the **alpha shape**, the remeshing step of the
+circumradius is below `alpha` × the local mean edge length (the **alpha shape**, the remeshing step of the
 Particle Finite Element Method):
 
 ```python
@@ -423,6 +442,137 @@ silently permute the state.
       unchanged**, so the seed assembly's tables stay valid for the whole march and the moved DOF
       *coordinates* are never needed at all. The quadrature degree follows the order (`2k`), because the mass
       `∫φᵢφⱼ` must be integrated exactly or the solve is not a projection.
+
+### Reconnecting without recompiling — runtime connectivity
+
+A Delaunay flip changes which nodes form a cell, but not how many cells there are, so no array changes
+shape. A march with a geometry term therefore assembles against a **runtime** connectivity: the cell
+array rides the same argument channel the moved vertices already use, and a reconnection that keeps
+every shape hands the compiled program a new triangulation instead of rebuilding it.
+
+It is inferred: `coord.d(t) - velocity` already states that the mesh moves, and that is the only case
+in which the connectivity can change under a fixed node set. `Domain.dynamic_topology()` is the explicit
+spelling, and `dynamic_topology(False)` opts out.
+
+!!! measured "Runtime connectivity, on a geometry-term march"
+    | | baked connectivity | runtime connectivity |
+    |---|---|---|
+    | one reconnection | one XLA compilation, ~31 s | 0.13 s |
+    | two-drop coalescence, whole march | 1587 s | **69.8 s** (22.7×), trajectory identical to 1.1e-16 |
+    | `relocate`, no reconnection at all (41 frames) | 1.6 s | 1.0 s |
+    | `remesh(alpha=1.2, every=1)` (41 frames) | 3.5 s | 0.9 s |
+
+    It is faster even when nothing reconnects, which is why it is the default: the gather goes through
+    the index array the moved vertices travel on anyway.
+
+Only same-shape changes become free. A reconnection that changes the **cell count** (two bodies merging,
+node management inserting a node) still rebuilds. Affine simplices only: on a curved or tensor-product
+mesh an explicit `dynamic_topology()` raises, and the inferred one falls back to the baked connectivity.
+
+When the node set does change, the state is carried by a **conservative L2 projection** onto the new
+mesh rather than by pointwise interpolation. On a laser-heated drop, whose hot layer is a few cells
+thick, one remesh used to cost 540 K of peak temperature and 6 % of the thermal energy; it now costs
+6 K and +0.5 %.
+
+### Adapting a moving mesh — `relocate`, `escalate=`, anisotropic `remesh`
+
+All three adaptivity kinds that move or add nodes compose with a geometry-term march.
+
+**r-adaptivity is nearly free here.** Vertex positions ride the scan carry, so a relocation hands a new
+`X` to the same compiled program: no new nodes, no new connectivity, no rebuild.
+
+```python
+traj = fem.solve(adapt=jno.solve.relocate(method="monge_ampere", every=20))
+```
+
+!!! measured "600 W melt ball (R = 150 µm, h = 40 µm), 800 steps"
+    | adaptivity | nodes | wall | p90 interpolation error | dent |
+    |---|---|---|---|---|
+    | `remesh(alpha=1.2, every=1)` | 78 | 129 s | 0.1720 | −22.78 µm |
+    | `relocate(every=20)` | 74 | **34 s** | 0.1722 | −22.23 µm |
+    | `relocate(every=20, escalate=0.5)` | 112 | 61 s | **0.1124** | −26.18 µm |
+
+    How often it relocates is free once the Monge–Ampère round is compiled: `every=100/50/20/10` all
+    cost 34–35 s.
+
+- **Area is conserved; perimeter is not.** A boundary vertex slides only along the chord joining its
+  two boundary neighbours, which leaves the enclosed area unchanged to first order, and an iterated
+  normal correction removes the rest (4.7e-3 → 4.2e-11 relative). A free surface stretches, so its
+  perimeter is left free.
+- **A sliver is a connectivity defect.** Moving nodes cannot repair it, so `relocate().remesh(alpha=...)`
+  reconnects first, at a fixed node set, and then relocates.
+- **A relocation that would invert a cell is rejected**, not applied. Relocation optimises the
+  discretisation, never the physics, so skipping a round is harmless and visible in the trajectory's
+  records (`relocate_skipped`, `relocate_would_invert`). `JNO_RELOCATE_STRICT=1` raises instead. Before
+  this guard, a 600 W run reported 10,201 plausible frames while 98 % of its cells had inverted, and
+  its temperatures stayed in range throughout. Only the area and the orientation revealed it.
+- **`escalate=tol` adds nodes only when moving them was not enough.** After each relocation the march
+  measures the interpolation error, and above `tol` (relative to the field's range) it adds vertices
+  along the anisotropic `mmg` path. The error indicator pairs each curvature with the element's extent in
+  its own direction (Alauzet & Loseille, *J. Comput. Phys.* **229** (2010) §2.2). An isotropic shape
+  measure is deliberately not the trigger: on an anisotropically adapted mesh it flags the stretched
+  cells that are doing their job. The loop is self-limiting. Above, it fired once, at the error peak.
+
+**Anisotropic h-adaptivity** is `remesh(anisotropic=True)` with a criterion that says *when* to remesh,
+and a Hessian metric that says *how*. On a squeezed disk carrying a sharp front, it produced elements with
+aspect ratio 9.04 lying along the level sets (`|long axis · ∇u|` = 0.046, against 0.330 for an isotropic
+remesh).
+
+**Not wired, and the reasons are substantive:**
+
+- **p-adaptivity (`enrich()`)** needs a `space="cover"` field, whose degrees of freedom are not nodal
+  values. Plain P2 does march on a moving mesh.
+- **r-adaptivity on two separate bodies** still fails. On a two-ball problem, 399 of 400 relocation
+  rounds would invert cells and are rejected. Use `alpha`, which is also the only adaptivity that can
+  merge bodies.
+
+### A graded mesh reconnects on its own length scale
+
+The `alpha` filter keeps a triangle when its circumradius is below `alpha` × a length scale, and that
+scale is now each node's own mean edge length, not one number for the whole mesh. On a graded mesh a
+single value fails at both ends: coarse cells all exceed it, and their nodes become free particles; in
+the fine region, the coarse value fuses surfaces that are really apart. Two rod tips graded 50 → 500 µm:
+the scalar mean (98 µm) stranded 50 of 363 nodes; the per-node scale triangulates all of them and keeps
+the rods apart. An inserted midpoint inherits the mean of the two nodes it splits.
+
+### A march that survives being killed — `checkpoint=`
+
+A march holds every frame and returns them only when `solve()` returns, so a run killed by an OOM, a
+signal or a reboot used to return nothing, however far it had got. `checkpoint=` writes frames to disk as
+they are produced:
+
+```python
+traj = fem.solve(
+    nonlinear=jno.solve.newton(direct=True),
+    adapt=jno.solve.remesh(alpha=1.2, every=1),
+    checkpoint=jno.solve.checkpoint("runs/ball", every=500),
+)
+```
+
+- **`every`** is the number of steps between writes. A write also happens at every rebuild, because
+  that is where a restart has to begin anyway.
+- **`keep="last"`** (the default) drops each written chunk from memory, and the returned trajectory
+  loads its frames from disk on demand, so a march no longer has to fit in RAM. `keep="all"` keeps
+  everything resident and checkpoints only for crash safety.
+- **`resume=True`** continues an unfinished run in `path`. A run marked complete is never resumed;
+  delete the directory to redo it.
+
+The restart state is the one a rebuild already re-enters the march with, plus the domain the next
+segment starts on. Trajectories are bit-identical with and without checkpointing, including across
+rebuilds (600 and 1,400 steps on a melt ball; `max |Δstate| = max |Δpoints| = 0`).
+
+`checkpoint=` needs `adapt=`, and is refused otherwise. A plain march is one compiled `lax.scan` with no
+host-side boundary to write at; extending it would cost end-to-end reverse-mode differentiation (#141).
+
+Two memory leaks in the rebuild path were fixed with it:
+
+- a closure kept each segment's sampled point pools alive;
+- re-sampling a region wrote to a fresh alias instead of the region's own name, which also left the
+  constraints reading the old points.
+
+Per-rebuild memory growth fell from 0.361 GB to 0.027 GB, and device memory now stays flat.
+`JNO_MARCH_MEMDEBUG=1` prints the per-rebuild breakdown (RSS, live JAX buffers by shape, Python heap,
+`domain.context`) that found both leaks.
 
 ---
 

@@ -122,10 +122,14 @@ def test_fem_eval_assembles_a_surface_term_exactly():
     assert np.asarray(fem.eval([1.0 * vi, 1.0 * vt], sol)).sum() == pytest.approx(4.0, rel=1e-10)
 
 
-def test_a_surface_term_without_facet_tables_refuses_by_name():
-    """The tables are tabulated at BUILD time and only when the form itself carries a surface term, so
-    a surface readout on a purely-volume problem has nothing to integrate against. It must say that
-    rather than fail on `NoneType` unpacking six frames inside the element kernel."""
+def test_a_surface_readout_on_a_purely_volume_form_is_integrated_correctly():
+    """A surface readout on a form with NO surface term assembles against the facet tables.
+
+    This test used to demand a refusal, written when the tables were built only for a form carrying a
+    surface term. They are now built for every cell type with a facet rule, and the flag gating the
+    refusal was still keyed on the form's boundary terms, so a readout the tables could serve was refused.
+    Oracle: the basis is a partition of unity, so the readout sums to the edge length and lives on the
+    top edge's nodes only."""
     d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.3).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
@@ -135,8 +139,10 @@ def test_a_surface_term_without_facet_tables_refuses_by_name():
     vt = phi.bind(x=ct[0], y=ct[1])
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0], quad_degree=3)
     sol = fem.solve()
-    with pytest.raises(NotImplementedError, match="facet quadrature tables were never built"):
-        fem.eval(1.0 * vt, sol)
+    R = np.asarray(fem.eval(1.0 * vt, sol))
+    on_top = np.abs(np.asarray(fem.points)[:, 1] - 1.0) < 1e-9
+    assert R.sum() == pytest.approx(2.0, rel=1e-12)  # the top edge's length
+    assert np.abs(R[~on_top]).max() < 1e-14 and np.all(np.abs(R[on_top]) > 0)
 
 
 def test_an_unknown_string_objective_is_still_refused():
