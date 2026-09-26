@@ -124,6 +124,8 @@ def test_refusals():
     xb, yb, _ = d.variable("boundary", split=True)
     x0, y0, t0 = d.variable("initial", split=True)
     ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
-    wave = jno.fem([ui.tt * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(x0, y0) - 0.0, u.bind(x=x0, y=y0, t=t0).t - 0.0])
+    wave = jno.fem(
+        [ui.tt * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(x0, y0) - 0.0, u.bind(x=x0, y=y0, t=t0).t - 0.0]
+    )
     with pytest.raises(NotImplementedError, match="undamped"):
         wave.solve(time=jno.solve.sdirk(3)).fn()

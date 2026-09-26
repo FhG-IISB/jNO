@@ -43,8 +43,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import jax
 import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
-
-from .small_linalg import small_det, small_inv
 import numpy as np
 
 from .fem_1d import (
@@ -91,6 +89,7 @@ from .fem_utils import (
     elem_map,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
+from .small_linalg import small_det, small_inv
 from .weak_form import (
     _apply_sign,
     _contains_temporal_derivative,

@@ -25,12 +25,11 @@ from typing import Any, Callable, List, Tuple
 
 import jax
 import jax.numpy as jnp
-
-from .small_linalg import small_det, small_inv
 import numpy as np
 
 from .fem_elements import ElementSpec, piola_contravariant, raviart_thomas_triangle
 from .fem_topology import EdgeTopology, build_edge_topology
+from .small_linalg import small_det, small_inv
 
 ScalarField = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]  # (x, y) -> values
 

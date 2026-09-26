@@ -84,7 +84,11 @@ def test_the_march_uploads_its_constants_once_and_configurations_share_them():
     b = np.asarray(fem.solve().fn())
     np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-15)
     blocks = [v for v in fem.__dict__.values() if hasattr(v, "__dict__") and "_march_cache" in v.__dict__]
-    blocks += [v for v in vars(fem._op).values() if hasattr(v, "__dict__") and "_march_cache" in v.__dict__] if hasattr(fem._op, "__dict__") else []
+    blocks += (
+        [v for v in vars(fem._op).values() if hasattr(v, "__dict__") and "_march_cache" in v.__dict__]
+        if hasattr(fem._op, "__dict__")
+        else []
+    )
     if not blocks:
         pytest.skip("could not reach the transient block from the fem object")
     for blk in blocks:

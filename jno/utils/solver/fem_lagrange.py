@@ -24,8 +24,6 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import jax.numpy as jnp
-
-from .small_linalg import small_inv
 import numpy as np
 
 from .fem_elements import ElementSpec
@@ -35,6 +33,7 @@ from .fem_elements import ElementSpec
 # (2,3),(1,3),(1,2),(0,3),(0,2),(0,1). ``_promote_to_quadratic`` appends midpoint nodes in this order,
 # so a mismatch silently scrambles the P2 local DOFs against the tabulated basis.
 from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES
+from .small_linalg import small_inv
 
 
 def _lagrange_basix(cell_type, degree: int):

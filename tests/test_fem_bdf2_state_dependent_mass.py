@@ -58,9 +58,7 @@ def _final_state(n_steps, scheme):
     return np.asarray(jno.core([sol.mse]).eval([sol]))[-1].reshape(-1)
 
 
-@pytest.mark.parametrize(
-    "scheme, order", [("bdf2", 2.0), ("backward_euler", 1.0), ("sdirk2", 2.0), ("sdirk3", 3.0)]
-)
+@pytest.mark.parametrize("scheme, order", [("bdf2", 2.0), ("backward_euler", 1.0), ("sdirk2", 2.0), ("sdirk3", 3.0)])
 def test_temporal_order_with_a_state_dependent_mass(scheme, order):
     ref = _final_state(256, scheme)
     errs = np.array([np.linalg.norm(_final_state(n, scheme) - ref) for n in (8, 16, 32)])

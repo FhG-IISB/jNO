@@ -125,7 +125,11 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
         # through the residual's temporal coordinate (and the load-path field slices its frames); jacfwd
         # sees the buffers (volume AND surface) and the path slice as constants → the consistent tangent.
         # `matrix_free`: the compiled contact march below, where the tangent cannot be assembled.
-        _jac = (lambda u: op.jacobian(u, args, tau_k)) if getattr(op, "jacobian", None) is not None and not matrix_free else None
+        _jac = (
+            (lambda u: op.jacobian(u, args, tau_k))
+            if getattr(op, "jacobian", None) is not None and not matrix_free
+            else None
+        )
         u = _newton(lambda u: op.residual(u, args, tau_k), u_prev, _jac)
         # Advance every buffered state: volume states via their `.evolves` formula / a primary-unknown
         # history; surface states (a friction slip) via the surface readout on the region's faces.

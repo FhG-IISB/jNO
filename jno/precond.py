@@ -1952,7 +1952,9 @@ class _Saddle(_Spec):
         return f"jno.precond.saddle(mass_weight={self.mass_weight}{lw}{sc})"
 
 
-def saddle(*, mass_weight: float = 1.0, laplace_weight: float | None = None, schur: str = "mass", float32: bool = False) -> _Saddle:
+def saddle(
+    *, mass_weight: float = 1.0, laplace_weight: float | None = None, schur: str = "mass", float32: bool = False
+) -> _Saddle:
     """The standard **saddle-point** preconditioner, as one call.
 
     Composes the classical Stokes recipe over the system's own block structure -- algebraic multigrid
@@ -2103,7 +2105,11 @@ class _AMG(_Spec):
         if isinstance(A, LinearOperator):
             A = A.bcoo if A.bcoo is not None else A.dense()
         if self.float32:  # an explicit build honours the flag too: the hierarchy IS the preconditioner
-            A = LinearOperator(A).astype(_low_precision(A.dtype)).bcoo if hasattr(A, "todense") else A.astype(_low_precision(A.dtype))
+            A = (
+                LinearOperator(A).astype(_low_precision(A.dtype)).bcoo
+                if hasattr(A, "todense")
+                else A.astype(_low_precision(A.dtype))
+            )
         self._levels = build_hierarchy(
             A,
             max_levels=self.max_levels,
@@ -2138,7 +2144,9 @@ class _AMG(_Spec):
         return f"jno.precond.amg(cycles={self.cycles}, built={self._levels is not None})"
 
 
-def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smoother_degree: int = 3, float32: bool = False) -> _AMG:
+def amg(
+    *, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smoother_degree: int = 3, float32: bool = False
+) -> _AMG:
     """Hybrid **algebraic multigrid**: smoothed-aggregation setup by the optional ``pyamg``
     (Vaněk, Mandel & Brezina, Computing 56, 1996; Bell et al., JOSS 8(87):5495, 2023), applied as
     a pure-JAX V-cycle with Chebyshev polynomial smoothing (Adams et al., JCP 188, 2003) — see
@@ -2934,9 +2942,7 @@ def _representative_operator(fem):
         return op[0]
     M, A = getattr(op, "M", None), getattr(op, "A", None)
     if hasattr(M, "todense") and hasattr(A, "todense"):
-        return jsp.BCOO(
-            (jnp.concatenate([M.data, A.data]), jnp.concatenate([M.indices, A.indices])), shape=M.shape
-        )
+        return jsp.BCOO((jnp.concatenate([M.data, A.data]), jnp.concatenate([M.indices, A.indices])), shape=M.shape)
     jac, size = getattr(op, "jacobian", None), getattr(op, "size", None)
     if callable(jac) and size is not None:
         try:
@@ -3069,7 +3075,7 @@ def _near_null_space(fem, n):
             modes.append(m)
         if vec == dim and dim in (2, 3):  # infinitesimal rotations x -> w x (x - x0)
             x = pts - pts.mean(axis=0)
-            for i, j in ([(0, 1)] if dim == 2 else [(0, 1), (1, 2), (0, 2)]):
+            for i, j in [(0, 1)] if dim == 2 else [(0, 1), (1, 2), (0, 2)]:
                 m = np.zeros((nodes, vec))
                 m[:, i], m[:, j] = -x[:, j], x[:, i]
                 modes.append(m)
@@ -3195,7 +3201,9 @@ def chebyshev(
     lmax: float | None = None,
     lmin_ratio: float = 1.0 / 30.0,
     safety: float = 1.05,
-    bound_iters: int = 30, float32: bool = False) -> _Chebyshev:
+    bound_iters: int = 30,
+    float32: bool = False,
+) -> _Chebyshev:
     """Fixed-degree Chebyshev **polynomial** preconditioner ``M^{-1} = p_degree(A) ≈ A^{-1}``
     for SPD operators (Saad 2003, §12.3 / Golub & Varga 1961 — the same recurrence as
     ``jno.solve.chebyshev``, truncated at ``degree`` with no convergence test, which keeps the

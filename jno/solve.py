@@ -516,6 +516,7 @@ def _root_driver(
             f"the sparse-direct driver has one: pass direct=True as well. The default iterative and the "
             f"matrix-free modes never factorize the tangent, so there is nothing to reuse."
         )
+
     # direct: True = assembled tangent + sparse LU; None = assembled tangent + iterative inner solve when the
     # assembler provides one, matrix-free otherwise (newton's default); False = always matrix-free.
     def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):

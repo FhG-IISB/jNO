@@ -35,7 +35,10 @@ def _x64():
 @pytest.mark.parametrize("nonlinear", [False, True])
 def test_rosenbrock_has_its_order(method, order, nonlinear):
     ref = _final(_heat(320, nonlinear=nonlinear), time=jno.solve.sdirk(3))
-    errs = [float(np.linalg.norm(_final(_heat(n, nonlinear=nonlinear), time=jno.solve.rosenbrock(method)) - ref)) for n in (5, 10, 20)]
+    errs = [
+        float(np.linalg.norm(_final(_heat(n, nonlinear=nonlinear), time=jno.solve.rosenbrock(method)) - ref))
+        for n in (5, 10, 20)
+    ]
     rates = [np.log2(errs[i] / errs[i + 1]) for i in range(2)]
     assert rates[-1] > order - 0.35, f"{method}: rates {rates} from errors {errs}"
 

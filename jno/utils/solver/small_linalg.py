@@ -42,9 +42,7 @@ def small_inv(J):
         return 1.0 / J
     if n == 2:
         det = small_det(J)[..., None, None]
-        adj = jnp.stack(
-            [jnp.stack([J[..., 1, 1], -J[..., 0, 1]], -1), jnp.stack([-J[..., 1, 0], J[..., 0, 0]], -1)], -2
-        )
+        adj = jnp.stack([jnp.stack([J[..., 1, 1], -J[..., 0, 1]], -1), jnp.stack([-J[..., 1, 0], J[..., 0, 0]], -1)], -2)
         return adj / det
     if n == 3:
         a, b, c = J[..., 0, 0], J[..., 0, 1], J[..., 0, 2]

@@ -110,9 +110,7 @@ def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
     # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
     # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
     # becomes the GMRES bug and wants the same `ktol`.
-    wn, _ = jax.scipy.sparse.linalg.bicgstab(
-        step_op, rhs, x0=x0, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
-    )
+    wn, _ = jax.scipy.sparse.linalg.bicgstab(step_op, rhs, x0=x0, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x)
     # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
     # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
     # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
@@ -372,7 +370,6 @@ class SemidiscreteTimeBlock:
           step, so a marcher can judge the step outside the trace -- see :func:`_verdict`. A
           linear step is a linear solve with its own guard and ignores the flag.
         """
-        import jax
         import jax.numpy as jnp
 
         args = args or {}

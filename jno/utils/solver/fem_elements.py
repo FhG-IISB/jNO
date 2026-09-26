@@ -34,11 +34,10 @@ from __future__ import annotations
 from typing import Any, NamedTuple, Optional, Tuple
 
 import jax.numpy as jnp
-
-from .small_linalg import small_inv
 import numpy as np
 
 from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES
+from .small_linalg import small_inv
 
 
 class ElementSpec(NamedTuple):

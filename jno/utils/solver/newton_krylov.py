@@ -518,9 +518,7 @@ def _anderson_solve(plain, f, x0, *, m, rtol, atol, max_steps, ls_c, ls_max):
 
 def _check_anderson(anderson):
     if isinstance(anderson, bool) or not isinstance(anderson, int) or anderson < 0:
-        raise ValueError(
-            f"anderson={anderson!r}: the Anderson history depth must be an int >= 0 (0 = off; 3-10 is usual)."
-        )
+        raise ValueError(f"anderson={anderson!r}: the Anderson history depth must be an int >= 0 (0 = off; 3-10 is usual).")
     return anderson
 
 

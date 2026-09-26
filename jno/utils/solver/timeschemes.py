@@ -275,7 +275,9 @@ def _sdirk_tableau(order):
         A = np.array([[g, 0.0], [1.0 - g, g]])
     elif order == 3:
         # gamma: the root in (1/6, 1/2) of x^3 - 3x^2 + 3x/2 - 1/6, which makes the method L-stable
-        g = float([r.real for r in np.roots([1.0, -3.0, 1.5, -1.0 / 6.0]) if abs(r.imag) < 1e-12 and 1 / 6 < r.real < 0.5][0])
+        g = float(
+            [r.real for r in np.roots([1.0, -3.0, 1.5, -1.0 / 6.0]) if abs(r.imag) < 1e-12 and 1 / 6 < r.real < 0.5][0]
+        )
         tau = (1.0 + g) / 2.0
         b1 = -(6.0 * g * g - 16.0 * g + 1.0) / 4.0
         b2 = (6.0 * g * g - 20.0 * g + 5.0) / 4.0
@@ -506,6 +508,7 @@ class _RosenbrockScheme(_TimeScheme):
                 (lambda u, t: blk.jacobian(u, t, args)) if blk.jacobian is not None else None,
                 lambda t: blk.mass(t, args),
             )
+
         def A_of(t):
             return blk.operator_fn(t, args) if blk.operator_fn is not None else blk.A
 
