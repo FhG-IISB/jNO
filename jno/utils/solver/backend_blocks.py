@@ -775,16 +775,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # this library targets (an un-checkpointed 6000-step × 18k-DOF case failed to allocate 5.72 GiB
     # on an 8 GB card — see the sampling note below). A pure forward solve pays nothing — checkpoint
     # is the identity outside differentiation.
-    from .sharding import element_devices
-
-    # A nonlinear march may split its element loops over devices (`_element_split_devices`): the split is
-    # read while the march is TRACED, so it is active around the (cached) trace and part of the cache key --
-    # a program traced for one device must not be reused for a split run, or the reverse.
-    split = _element_split_devices(block, args)
-    with element_devices(split):
-        ys = _cached_march(
-            block, (linear_solve, nonlinear_solve, theta, dt, tuple(d.id for d in split)), march, s0, grid_ts, args
-        )
+    ys = _split_cached_march(block, args, (linear_solve, nonlinear_solve, theta, dt), march, s0, grid_ts, args)
     if _judge:
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -1006,7 +997,33 @@ class _TripletOperator:
         return jax.ops.segment_sum(self.data * v[self.indices[:, 1]], self.indices[:, 0], num_segments=self.shape[0])
 
 
-def _sharded_transient(block, args, save_ts, linear_solve, nonlinear_solve, theta):
+def _split_cached_march(block, args, config, march, *inputs):
+    """:func:`_cached_march` with the block's element loops split over devices when it is a nonlinear march
+    that takes the split (:func:`_element_split_devices`) -- shared by every time scheme. The split is read
+    while the march is TRACED, so it is active around the (cached) trace and part of the cache key: a program
+    traced for one device must not be reused for a split run, or the reverse."""
+    from .sharding import element_devices
+
+    split = _element_split_devices(block, args)
+    with element_devices(split):
+        return _cached_march(block, (*config, tuple(d.id for d in split)), march, *inputs)
+
+
+def _scheme_sharded(scheme, block, args, save_ts, linear_solve, nonlinear_solve):
+    """:func:`_sharded_transient` for a time scheme's own ``integrate`` (BDF2, SDIRK, Rosenbrock): the scheme
+    marches the operator-split block exactly as it marches the plain one."""
+    return _sharded_transient(
+        block,
+        args,
+        save_ts,
+        linear_solve,
+        nonlinear_solve,
+        None,
+        integrate=lambda local: scheme.integrate(local, args, save_ts, linear_solve=None, nonlinear_solve=None),
+    )
+
+
+def _sharded_transient(block, args, save_ts, linear_solve, nonlinear_solve, theta, integrate=None):
     """Run a LINEAR march across every visible device, or return ``None`` to stay on one.
 
     The assembled ``M`` and ``A`` are partitioned on their nonzero axis and passed into the compiled
@@ -1060,6 +1077,8 @@ def _sharded_transient(block, args, save_ts, linear_solve, nonlinear_solve, thet
         local = copy.copy(block)
         local.M, local.A = _TripletOperator(md, mi, shape_m), _TripletOperator(ad, ai, shape_a)
         local.metadata = {**(block.metadata or {}), "shard": False}  # the recursion runs the plain scan
+        if integrate is not None:  # a time scheme's own march (`_scheme_sharded`)
+            return integrate(local)
         return _default_transient_integrate(local, args, save_ts, theta=theta)
 
     return jax.jit(march, in_shardings=(split, split, split, split), out_shardings=repl)(Md, Mi, Ad, Ai)

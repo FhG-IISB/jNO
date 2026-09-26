@@ -51,7 +51,11 @@ _INNER = textwrap.dedent(
     ui, vi = u.bind(x=c[0], y=c[1], t=c[2]), v.bind(x=c[0], y=c[1], t=c[2])
     fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(cb[0], cb[1]) - 0.0,
                    u(ci[0], ci[1]) - jno.np.sin(np.pi * ci[0]) * jno.np.sin(np.pi * ci[1])])
-    s = fem.solve(shard=None if len(sys.argv) < 2 else False)
+    import os
+    scheme = {"theta": None, "bdf2": jno.solve.bdf2(), "sdirk": jno.solve.sdirk(3),
+              "rosenbrock": jno.solve.rosenbrock()}[os.environ.get("JNO_TEST_SCHEME", "theta")]
+    kw = {} if scheme is None else {"time": scheme}
+    s = fem.solve(shard=None if len(sys.argv) < 2 else False, **kw)
     traj = np.asarray(s.fn() if hasattr(s, "fn") else s)
     text = hlo[0] if hlo else ""
     print("RESULT " + json.dumps({"traj": traj[-1].tolist(), "placed": placed,
@@ -60,8 +64,13 @@ _INNER = textwrap.dedent(
 )
 
 
-def _run(n_dev, opt_out=False):
-    env = {**os.environ, "XLA_FLAGS": f"--xla_force_host_platform_device_count={n_dev}", "JAX_PLATFORMS": "cpu"}
+def _run(n_dev, opt_out=False, scheme="theta"):
+    env = {
+        **os.environ,
+        "XLA_FLAGS": f"--xla_force_host_platform_device_count={n_dev}",
+        "JAX_PLATFORMS": "cpu",
+        "JNO_TEST_SCHEME": scheme,
+    }
     argv = [sys.executable, "-c", _INNER] + (["opt-out"] if opt_out else [])
     r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=900)
     assert r.returncode == 0, r.stderr[-3000:]
@@ -90,3 +99,19 @@ def test_a_linear_march_splits_the_operator_and_keeps_the_answer(one, n_dev):
 def test_shard_false_keeps_one_device():
     r = _run(4, opt_out=True)
     assert not r["compiled"] and not r["placed"]
+
+
+@pytest.mark.parametrize("scheme", ["bdf2", "sdirk", "rosenbrock"])
+def test_every_time_scheme_splits_a_linear_march(scheme):
+    """BDF2, SDIRK and Rosenbrock march the operator-split block with their own integrator: the same split
+    (every device holds 1/n of M's and A's triplets), one all-reduce per product and nothing gathered --
+    Rosenbrock applies its stage matrix as M v + γh A v, never concatenating M and A -- and the answer of
+    the one-device march."""
+    ref = _run(1, scheme=scheme)
+    assert not ref["compiled"], "one device must take the plain march"
+    r = _run(4, scheme=scheme)
+    assert r["compiled"], f"{scheme}: the sharded march was not taken"
+    for total, per_device in r["placed"]:
+        assert per_device == total // 4, (scheme, total, per_device)
+    assert r["all_reduce"] and not r["all_gather"], f"{scheme}: the operator must never be gathered"
+    np.testing.assert_allclose(r["traj"], ref["traj"], rtol=0, atol=1e-12)

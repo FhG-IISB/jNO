@@ -144,6 +144,9 @@ operators with the default step solve: `M` and `A` are partitioned on their nonz
 the compiled `lax.scan` as arguments, the state stays replicated, and every step's Krylov solve is
 unchanged. Verified on simulated devices: each device holds exactly `nnz/n` of each operator, the
 compiled march emits `all-reduce` and no `all-gather`, and the trajectory matches one device to 1e-13.
+Every time scheme marches the split operators with its own integrator: `theta` (the default), `bdf2()`,
+`sdirk()` and `rosenbrock()` (whose stage matrix is applied as `M v + γh A v`, never concatenated), each
+checked the same way on simulated devices.
 
 **A nonlinear solve splits its cells.** A Jacobian-free Newton has no assembled operator to
 partition, so the element axis is split instead: each device evaluates the element kernel on its share of
@@ -153,7 +156,9 @@ Newton nor its inner solver changes. This covers the default solve, `nonlinear=j
 (its residual splits; see the table for its tangent), and a parametric solve given its values
 (`fem.solve(k=2.0)`), which jNO compiles itself. A **nonlinear march** (a Newton solve per time step,
 as in the Rayleigh--Bénard and melt-pool tutorials) splits every step's residual the same way inside
-its scan, when it is evaluated eagerly and has no `adapt=` or moving geometry. Verified on simulated devices: the compiled `J·v` has
+its scan, when it is evaluated eagerly and has no `adapt=` or moving geometry -- under any time scheme
+(`theta`, `bdf2()`, `sdirk()`, and `rosenbrock()`, where the residuals split and the stage matrix is assembled
+on one device, as `newton(direct=True)`'s tangent is). Verified on simulated devices: the compiled `J·v` has
 exactly one `all-reduce` and no other collective, each device's scratch falls to about `1/n`, and the
 answer matches one device to the solver's tolerance (round-off on an SPD problem, 1.2e-11 on a
 Navier--Stokes saddle point). A cell count the device count does not divide is handled by a

@@ -110,6 +110,11 @@ _INNER = textwrap.dedent(
     out["march"], out["march_devices"], out["march_split"] = np.asarray(m).tolist(), placed(m), len(calls)
     del calls[:]
     out["march_opt_out_devices"], out["march_opt_out_split"] = placed(run(shard=False)), len(calls)
+    # ...and every other time scheme's march splits its residuals the same way
+    for name, scheme in (("bdf2", jno.solve.bdf2()), ("sdirk", jno.solve.sdirk(3)), ("rosenbrock", jno.solve.rosenbrock())):
+        del calls[:]
+        ms = run(time=scheme)
+        out[f"march_{name}"], out[f"march_{name}_split"] = np.asarray(ms).tolist(), len(calls)
     print("RESULT " + json.dumps(out))
     """
 )
@@ -156,3 +161,7 @@ def test_the_split_solve_matches_one_device(one, n_dev):
     # the march split its residual inside the scan, and opting out did not
     assert many["march_devices"] == n_dev and many["march_split"] > 0
     assert many["march_opt_out_devices"] == 1 and many["march_opt_out_split"] == 0
+    # BDF2, SDIRK and Rosenbrock take the same split (Rosenbrock: its residuals; the stage matrix is one device's)
+    for name in ("bdf2", "sdirk", "rosenbrock"):
+        assert one[f"march_{name}_split"] == 0 and many[f"march_{name}_split"] > 0, name
+        np.testing.assert_allclose(many[f"march_{name}"], one[f"march_{name}"], rtol=0, atol=1e-11, err_msg=name)
