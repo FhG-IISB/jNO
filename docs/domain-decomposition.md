@@ -6,6 +6,11 @@ a boundary layer that needs FEM next to a bulk that a finite-difference stencil 
 subdomain where you only have a trained network, or a material interface across which the coefficient
 jumps.
 
+!!! note "Looking for domain decomposition as a *preconditioner*?"
+    This page couples different methods on different regions. To split one assembled system into
+    subdomains to accelerate — and distribute — a Krylov solve, use
+    [`jno.precond.schwarz()`](solvers.md#overlapping-schwarz-jnoprecondschwarz).
+
 The coupling is a **fixed point**: each subdomain solves its own problem with the neighbour's data as
 boundary data, and the exchange repeats until the two agree. jNO drives that loop for you, and — the
 part that matters for inverse problems — differentiates *through* the converged fixed point rather than

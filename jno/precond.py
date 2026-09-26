@@ -2998,7 +2998,7 @@ class _Schwarz(_Spec):
         if cap and need > 0.25 * cap:
             raise ValueError(
                 f"jno.precond.schwarz(parts={pat.p}, overlap={self.overlap}): the local problems are solved "
-                f"exactly with dense LU, {pat.p} blocks of {pat.m}x{pat.m} = {need / 2**30:.1f} GiB -- over a "
+                f"exactly with dense inverses, {pat.p} blocks of {pat.m}x{pat.m} = {need / 2**30:.1f} GiB -- over a "
                 f"quarter of this device's memory. Use more parts (smaller blocks), overlap=0/1, or float32=True."
             )
         self._pattern = pat
