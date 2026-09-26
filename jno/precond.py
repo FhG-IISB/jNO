@@ -3097,7 +3097,8 @@ def schwarz(
     part per ~256 unknowns, rounded up to a multiple of the device count), each grown by ``overlap`` layers of
     neighbours; every local problem is solved exactly (the local inverses, applied as one batched product).
     Unknowns with no neighbours (eliminated Dirichlet rows) are left out of the partition and solved by their
-    diagonal. ``coarse=True`` adds the two-level coarse correction (one constant per part,
+    diagonal. The partition needs METIS: ``pip install "jax-numerical-operators[fem]"`` (or ``[fdm]``,
+    or ``[metis]``); without it, building the preconditioner raises an ``ImportError`` saying so. ``coarse=True`` adds the two-level coarse correction (one constant per part,
     applied in the balanced hybrid form), which is what keeps the iteration count from growing with the number
     of parts. ``restricted=True`` is RAS -- usually fewer iterations, but non-symmetric (use bicgstab/gmres;
     ``cg`` switches to flexible CG); the default is the symmetric additive form, fit for ``cg``.

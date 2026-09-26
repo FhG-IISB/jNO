@@ -5606,10 +5606,11 @@ packages:
   - blackjax>=1.2
   - fenics-basix
   - matfree>=0.6.1,<0.7
-  - pymetis>=2025.1
   - jax[cuda]>=0.10.1,<0.11 ; extra == 'cuda'
   - jaxamg[cuda13]>=0.1.3,<0.2 ; extra == 'amg'
-  - jax-numerical-operators[mesh,pardiso,cudss] ; extra == 'fem'
+  - jax-numerical-operators[mesh,pardiso,cudss,metis] ; extra == 'fem'
+  - jax-numerical-operators[metis] ; extra == 'fdm'
+  - pymetis>=2025.1 ; extra == 'metis'
   - mmgpy ; extra == 'mesh'
   - pypardiso>=0.4.4 ; platform_machine == 'x86_64' and extra == 'pardiso'
   - nvmath-python>=1.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cudss'

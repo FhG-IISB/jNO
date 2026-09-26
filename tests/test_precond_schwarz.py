@@ -17,6 +17,8 @@ from jno.utils.solver.linear import sparse_matvec
 from jno.utils.solver.schwarz import schwarz_apply, schwarz_factor
 from jno.utils.solver.solver_api import LinearOperator, PrecondContext
 
+pytest.importorskip("pymetis", reason="jno.precond.schwarz() partitions with METIS: the [metis] extra")
+
 
 @pytest.fixture(autouse=True)
 def _x64():

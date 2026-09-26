@@ -65,7 +65,13 @@ def _partition(G, parts: int) -> np.ndarray:
     cannot honour it otherwise). Seeded, so the same operator always gets the same partition."""
     if parts == 1:
         return np.zeros(G.shape[0], np.int64)
-    import pymetis
+    try:
+        import pymetis
+    except ImportError as e:
+        raise ImportError(
+            "jno.precond.schwarz() partitions the operator with METIS, which is not installed. Install it with "
+            'pip install "jax-numerical-operators[fem]" (or [fdm], or just [metis]).'
+        ) from e
     from scipy.sparse.csgraph import connected_components
 
     connected = connected_components(G, directed=False, return_labels=False) == 1

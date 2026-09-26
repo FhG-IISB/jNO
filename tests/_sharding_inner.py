@@ -190,52 +190,56 @@ def main(n_dev: int) -> None:
     assert "all-reduce" not in hlo_a, "automatic must not shard a TRACED operator -- it can break crux"
 
     # --- 7. jno.precond.schwarz distributes its subdomains ---------------------------------------
-    # Its value is placement: each device builds, inverts and applies only its own block of subdomains.
-    # Checked on the compiled program (per-device block count, all-reduce) and on answers and gradients,
-    # concrete and traced, two-level (hybrid) so the coarse solve rides along.
-    import re
+    # (only with the [metis] extra installed: the partition is METIS)
+    import importlib.util
 
-    import scipy.sparse as _sp
+    if importlib.util.find_spec("pymetis") is not None:
+        # Its value is placement: each device builds, inverts and applies only its own block of subdomains.
+        # Checked on the compiled program (per-device block count, all-reduce) and on answers and gradients,
+        # concrete and traced, two-level (hybrid) so the coarse solve rides along.
+        import re
 
-    k = 40
-    T = _sp.diags([-1.0, 2.0, -1.0], [-1, 0, 1], (k, k))
-    P2 = (_sp.kron(T, _sp.eye(k)) + _sp.kron(_sp.eye(k), T)).tocoo()
-    n2 = P2.shape[0]
-    idx2 = jnp.asarray(np.stack([P2.row, P2.col], 1).astype(np.int32))
-    B2 = _jsp.BCOO((jnp.asarray(P2.data), idx2), shape=(n2, n2))
-    b2 = jnp.asarray(rng.standard_normal(n2))
-    x2_ref = np.asarray(_sp.linalg.spsolve(P2.tocsc(), np.asarray(b2)))
-    parts = 4 * n_dev
-    spec = jno.precond.schwarz(parts=parts)
-    spec.build(B2)
-    solve = _compose(jno.solve.cg(tol=1e-12, maxiter=500), spec, None, None, shard=n_dev)
-    x2 = solve(B2, b2)
-    assert np.max(np.abs(np.asarray(x2) - x2_ref)) < 1e-8 * np.max(np.abs(x2_ref)), "sharded schwarz: wrong answer"
+        import scipy.sparse as _sp
 
-    from jno.utils.solver.sharding import operator_mesh
-    from jno.utils.solver.solver_api import LinearOperator, PrecondContext
+        k = 40
+        T = _sp.diags([-1.0, 2.0, -1.0], [-1, 0, 1], (k, k))
+        P2 = (_sp.kron(T, _sp.eye(k)) + _sp.kron(_sp.eye(k), T)).tocoo()
+        n2 = P2.shape[0]
+        idx2 = jnp.asarray(np.stack([P2.row, P2.col], 1).astype(np.int32))
+        B2 = _jsp.BCOO((jnp.asarray(P2.data), idx2), shape=(n2, n2))
+        b2 = jnp.asarray(rng.standard_normal(n2))
+        x2_ref = np.asarray(_sp.linalg.spsolve(P2.tocsc(), np.asarray(b2)))
+        parts = 4 * n_dev
+        spec = jno.precond.schwarz(parts=parts)
+        spec.build(B2)
+        solve = _compose(jno.solve.cg(tol=1e-12, maxiter=500), spec, None, None, shard=n_dev)
+        x2 = solve(B2, b2)
+        assert np.max(np.abs(np.asarray(x2) - x2_ref)) < 1e-8 * np.max(np.abs(x2_ref)), "sharded schwarz: wrong answer"
 
-    mesh2 = operator_mesh(devices)
-    d2, i2, _ = pad_triplets(B2.data, B2.indices, n_dev)
-    d2, i2 = shard_triplets(d2, i2, mesh2)
-    apply = lambda d, i, r: spec.materialize(  # noqa: E731
-        PrecondContext(LinearOperator(_jsp.BCOO((d, i), shape=(n2, n2))), None, mesh=mesh2)
-    )(r)
-    hlo2 = jax.jit(apply).lower(d2, i2, jax.device_put(b2, repl)).compile().as_text()
-    m2 = spec._pattern.m
-    counts = set(re.findall(rf"f64\[(\d+),{m2},{m2}\]", hlo2))
-    assert counts == {str(parts // n_dev)}, f"local blocks per device {counts}, want {parts // n_dev}"
-    if n_dev > 1:
-        assert "all-reduce" in hlo2, "the per-device subdomain contributions must be combined by an all-reduce"
+        from jno.utils.solver.sharding import operator_mesh
+        from jno.utils.solver.solver_api import LinearOperator, PrecondContext
 
-    # traced: an explicit shard= under jit + grad (the operator scales with a parameter)
-    ft = lambda th: jnp.sum(solve(_jsp.BCOO((th * B2.data, idx2), shape=(n2, n2)), b2))  # noqa: E731
-    val, g = jax.jit(jax.value_and_grad(ft))(jnp.asarray(2.0))
-    assert abs(float(val) - x2_ref.sum() / 2) < 1e-8 * abs(x2_ref.sum()), "traced sharded schwarz: wrong answer"
-    assert abs(float(g) + x2_ref.sum() / 4) < 1e-6 * abs(x2_ref.sum()), "traced sharded schwarz: wrong gradient"
-    hlo_t2 = jax.jit(ft).lower(jnp.asarray(2.0)).compile().as_text()
-    counts_t = set(re.findall(rf"f64\[(\d+),{m2},{m2}\]", hlo_t2))
-    assert counts_t == {str(parts // n_dev)}, f"traced: local blocks per device {counts_t}, want {parts // n_dev}"
+        mesh2 = operator_mesh(devices)
+        d2, i2, _ = pad_triplets(B2.data, B2.indices, n_dev)
+        d2, i2 = shard_triplets(d2, i2, mesh2)
+        apply = lambda d, i, r: spec.materialize(  # noqa: E731
+            PrecondContext(LinearOperator(_jsp.BCOO((d, i), shape=(n2, n2))), None, mesh=mesh2)
+        )(r)
+        hlo2 = jax.jit(apply).lower(d2, i2, jax.device_put(b2, repl)).compile().as_text()
+        m2 = spec._pattern.m
+        counts = set(re.findall(rf"f64\[(\d+),{m2},{m2}\]", hlo2))
+        assert counts == {str(parts // n_dev)}, f"local blocks per device {counts}, want {parts // n_dev}"
+        if n_dev > 1:
+            assert "all-reduce" in hlo2, "the per-device subdomain contributions must be combined by an all-reduce"
+
+        # traced: an explicit shard= under jit + grad (the operator scales with a parameter)
+        ft = lambda th: jnp.sum(solve(_jsp.BCOO((th * B2.data, idx2), shape=(n2, n2)), b2))  # noqa: E731
+        val, g = jax.jit(jax.value_and_grad(ft))(jnp.asarray(2.0))
+        assert abs(float(val) - x2_ref.sum() / 2) < 1e-8 * abs(x2_ref.sum()), "traced sharded schwarz: wrong answer"
+        assert abs(float(g) + x2_ref.sum() / 4) < 1e-6 * abs(x2_ref.sum()), "traced sharded schwarz: wrong gradient"
+        hlo_t2 = jax.jit(ft).lower(jnp.asarray(2.0)).compile().as_text()
+        counts_t = set(re.findall(rf"f64\[(\d+),{m2},{m2}\]", hlo_t2))
+        assert counts_t == {str(parts // n_dev)}, f"traced: local blocks per device {counts_t}, want {parts // n_dev}"
 
     print(f"OK n_devices={n_dev} per_device_nnz={per_device} pad={n_pad}")
 
