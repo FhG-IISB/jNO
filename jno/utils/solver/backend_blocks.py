@@ -70,6 +70,69 @@ def _theta_row_weights(M, theta, n, dtype):
     return jnp.where(_algebraic_rows(M, n, dtype), jnp.asarray(1.0, dtype), jnp.asarray(theta, dtype))
 
 
+def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
+    """jNO's default solve of one implicit step ``step_op(w) = rhs`` -- Jacobi-preconditioned BiCGStab with a
+    verified GMRES rescue (GMRES outright when the assembly asks for it via ``metadata["krylov"]``).
+
+    Shared by :meth:`SemidiscreteTimeBlock.step` and the Rosenbrock stages, whose stage operator is the same
+    kind of ``M + scale*J`` step operator. ``diag`` is that operator's diagonal (zero entries left unscaled).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from .krylov import gmres as _scaled_gmres  # scale-invariant: JAX's Arnoldi zeroes a tiny ||b||
+
+    n = rhs.shape[0]
+    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
+    # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
+    # the default and is right for the symmetric real blocks; the complex real-equivalent block
+    # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
+    # down there. Restart is capped at 40 (as the dedicated complex marcher used) to bound memory.
+    if krylov == "gmres":
+        # The tolerance must be REACHABLE in the working precision. jNO defaults to float32 (x64 is
+        # opt-in), whose eps is 1.2e-7, so the 1e-10 relative target asked for here could never be
+        # met -- the termination test never fired, and GMRES, which has no other way out, paid its
+        # full ``10*n`` restarts every step however easy the system. Measured on a 377-dof parametric
+        # transient: **5485.6 ms/step -> 20.0 ms/step (249x)**, for the same answer (final |u|
+        # 0.141276836 vs 0.141276851).
+        #
+        # Scaled to the dtype rather than capped by ``maxiter``: an easy system then exits as soon as
+        # it converges and a hard one keeps working, where a fixed cap would silently under-solve the
+        # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
+        # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
+        ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
+        wn, _ = _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)
+        return wn
+    # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
+    # its breakdown test fires once the residual stalls at the float32 noise floor, so the effect is
+    # "solve as tightly as this precision allows" -- 1.0 ms/step here, i.e. the defect is masked at no
+    # measurable cost. Giving it the reachable tolerance measured 0.6 ms/step but moved every real
+    # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
+    # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
+    # becomes the GMRES bug and wants the same `ktol`.
+    wn, _ = jax.scipy.sparse.linalg.bicgstab(step_op, rhs, x0=x0, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x)
+    # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
+    # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
+    # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
+    # outright (exact mid-iteration convergence makes ``omega = 0/0``, and NaN passes jax's
+    # ``omega != 0`` breakdown test), and with a healthy warm start it EXITS SILENTLY at ~1e-2
+    # relative residual — each step slightly wrong, compounding to 1e62 over 60 steps. The steady
+    # default would have raised (its eager residual check); a traced scan cannot raise, so VERIFY
+    # the step and re-solve with GMRES when the residual is not small — GMRES has no breakdown
+    # division and measured 1e-16 per step on the same block. Cost: one extra matvec + one scalar
+    # reduce per step; the comparison is False for a NaN residual too, so both failure modes take
+    # the rescue. The healthy stall floor (measured 8e-11 in f64, ~1e-5 in f32) sits well under
+    # the dtype-scaled threshold, so a symmetric march never pays the GMRES.
+    eps = float(jnp.finfo(rhs.dtype).eps)
+    r_rel = jnp.linalg.norm(step_op(wn) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
+    ktol = max(1e-10, 100.0 * eps)
+    return jax.lax.cond(
+        r_rel < max(1e-9, 1e4 * eps),
+        lambda: wn,
+        lambda: _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)[0],
+    )
+
+
 @dataclass
 class SemidiscreteTimeBlock:
     """
@@ -307,7 +370,6 @@ class SemidiscreteTimeBlock:
           step, so a marcher can judge the step outside the trace -- see :func:`_verdict`. A
           linear step is a linear solve with its own guard and ignores the flag.
         """
-        import jax
         import jax.numpy as jnp
 
         args = args or {}
@@ -335,7 +397,7 @@ class SemidiscreteTimeBlock:
             return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
 
         if self.is_nonlinear():
-            from .newton_krylov import newton_krylov
+            from .newton_krylov import newton_default, newton_krylov
 
             # θ-method: M(y⁺−y)/dt + θ R(y⁺) + (1−θ) R(y) = 0. θ=1 (default) is backward Euler — the
             # existing first-order behaviour; a second-order (u_tt) block sets θ=½ (trapezoidal /
@@ -383,6 +445,16 @@ class SemidiscreteTimeBlock:
 
                         return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
                     return _verdict(G, u, nonlinear_solve(G, u), report)
+                # default Newton: on the assembled step tangent when both Jacobians exist
+                if self.jacobian is not None and self.mass_residual_jac is not None:
+                    from .solver_api import _add_step_operator
+
+                    def jac_default(wn):
+                        return _add_step_operator(
+                            self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
+                        )
+
+                    return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
                 return _verdict(G, u, newton_krylov(G, u), report)
 
             M_t = _operand(self.mass(t_next, args))
@@ -411,10 +483,18 @@ class SemidiscreteTimeBlock:
 
                     return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
                 return _verdict(G, u, nonlinear_solve(G, u), report)
+            # default Newton: on the assembled step tangent M/dt + J when the assembler provides J
+            if self.jacobian is not None:
+                from .solver_api import _add_step_operator
+
+                def jac_default(wn):  # the same ∂G/∂wn = M/dt + diag(w)·J_R as `jac_step`
+                    J = self.jacobian(wn, t_next, args)
+                    return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt)
+
+                return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
             return _verdict(G, u, newton_krylov(G, u), report)
 
-        from .krylov import gmres as _scaled_gmres
-        from .linear import matrix_diagonal
+        from .linear import matrix_diagonal, sparse_matvec
 
         th = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
         # A parametric mass (``mass_fn``) is re-assembled from ``args`` each step (unknown-density inverse);
@@ -432,8 +512,11 @@ class SemidiscreteTimeBlock:
         # (M + theta dt A) u_next = (M - (1-theta) dt A) u + dt c + dt(theta f_next + (1-theta) f_now)
         f_next = _forcing(t_next)
         f_avg = th * f_next + (1.0 - th) * _forcing(t)
-        rhs = M @ u - (1.0 - th) * dt * (A @ u) + dt * c + dt * f_avg
-        step_op = lambda wn: M @ wn + th * dt * (A @ wn)  # noqa: E731  the theta-method step operator
+        # Index work split once per step, outside the Krylov loop that applies `step_op` (BCOO's own `@`
+        # redoes it on every call; see `sparse_matvec`).
+        mv_M, mv_A = sparse_matvec(M), sparse_matvec(A)
+        rhs = mv_M(u) - (1.0 - th) * dt * mv_A(u) + dt * c + dt * f_avg
+        step_op = lambda wn: mv_M(wn) + th * dt * mv_A(wn)  # noqa: E731  the theta-method step operator
         a_scale = th * dt  # the coefficient of A in the step operator, per row where it differs
         w = _theta_row_weights(M, th, n, dtype)
         if w is not None:
@@ -444,7 +527,7 @@ class SemidiscreteTimeBlock:
             alg = w == 1.0  # θ < 1 here, so weight 1 marks exactly the constraint rows
             rhs = jnp.where(alg, kappa * dt * (c + f_next), rhs)
             if th == 0.0:
-                step_op = lambda wn: M @ wn + dt * (w * (A @ wn))  # noqa: E731
+                step_op = lambda wn: mv_M(wn) + dt * (w * mv_A(wn))  # noqa: E731
                 a_scale = dt * w
         if linear_solve is not None:
             # slot-composed per-step solve; the exact step diagonal keeps jacobi-type specs exact
@@ -461,56 +544,7 @@ class SemidiscreteTimeBlock:
             return linear_solve(step_op, rhs, u, _diag)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
-        inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
-        # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
-        # the default and is right for the symmetric real blocks; the complex real-equivalent block
-        # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
-        # down there. Restart is capped at 40 (as the dedicated complex marcher used) to bound memory.
-        if (self.metadata or {}).get("krylov") == "gmres":
-            # The tolerance must be REACHABLE in the working precision. jNO defaults to float32 (x64 is
-            # opt-in), whose eps is 1.2e-7, so the 1e-10 relative target asked for here could never be
-            # met -- the termination test never fired, and GMRES, which has no other way out, paid its
-            # full ``10*n`` restarts every step however easy the system. Measured on a 377-dof parametric
-            # transient: **5485.6 ms/step -> 20.0 ms/step (249x)**, for the same answer (final |u|
-            # 0.141276836 vs 0.141276851).
-            #
-            # Scaled to the dtype rather than capped by ``maxiter``: an easy system then exits as soon as
-            # it converges and a hard one keeps working, where a fixed cap would silently under-solve the
-            # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
-            # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
-            ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
-            wn, _ = _scaled_gmres(step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)
-            return wn
-        # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
-        # its breakdown test fires once the residual stalls at the float32 noise floor, so the effect is
-        # "solve as tightly as this precision allows" -- 1.0 ms/step here, i.e. the defect is masked at no
-        # measurable cost. Giving it the reachable tolerance measured 0.6 ms/step but moved every real
-        # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
-        # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
-        # becomes the GMRES bug and wants the same `ktol`.
-        wn, _ = jax.scipy.sparse.linalg.bicgstab(
-            step_op, rhs, x0=u, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
-        )
-        # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
-        # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
-        # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
-        # outright (exact mid-iteration convergence makes ``omega = 0/0``, and NaN passes jax's
-        # ``omega != 0`` breakdown test), and with a healthy warm start it EXITS SILENTLY at ~1e-2
-        # relative residual — each step slightly wrong, compounding to 1e62 over 60 steps. The steady
-        # default would have raised (its eager residual check); a traced scan cannot raise, so VERIFY
-        # the step and re-solve with GMRES when the residual is not small — GMRES has no breakdown
-        # division and measured 1e-16 per step on the same block. Cost: one extra matvec + one scalar
-        # reduce per step; the comparison is False for a NaN residual too, so both failure modes take
-        # the rescue. The healthy stall floor (measured 8e-11 in f64, ~1e-5 in f32) sits well under
-        # the dtype-scaled threshold, so a symmetric march never pays the GMRES.
-        eps = float(jnp.finfo(rhs.dtype).eps)
-        r_rel = jnp.linalg.norm(step_op(wn) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
-        ktol = max(1e-10, 100.0 * eps)
-        return jax.lax.cond(
-            r_rel < max(1e-9, 1e4 * eps),
-            lambda: wn,
-            lambda: _scaled_gmres(step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)[0],
-        )
+        return _default_step_solve(step_op, rhs, u, d, krylov=(self.metadata or {}).get("krylov"))
 
     def solve(self, solve_fn=None, *, save_ts=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
@@ -684,6 +718,9 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     import jax
     import jax.numpy as jnp
 
+    from .matvec_format import prime
+
+    prime(block.M, getattr(block, "A", None))  # CSR or COO, measured on the real (concrete) operators
     _s0f = getattr(block, "state0_fn", None)  # parametric initial state (net-valued IC): re-form from args
     s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
     dtype = s0.dtype
@@ -703,21 +740,26 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # step is a linear solve with its own guard and is not judged here.
     _judge = bool(block.is_nonlinear())
 
-    def step(w, t_next):
-        out = block.step(
-            w,
-            t_next - dt,
-            dt,
-            args=args,
-            theta=theta,
-            linear_solve=linear_solve,
-            nonlinear_solve=nonlinear_solve,
-            report=_judge,
-        )
-        if not _judge:
-            return out, out
-        wn, r_end, r_start = out
-        return wn, (wn, r_end, r_start)
+    def march(s0, grid_ts, args):
+        blk = hoist_time_invariant(block, args, grid_ts[0])  # static loads/operators: once, not per step
+
+        def step(w, t_next):
+            out = blk.step(
+                w,
+                t_next - dt,
+                dt,
+                args=args,
+                theta=theta,
+                linear_solve=linear_solve,
+                nonlinear_solve=nonlinear_solve,
+                report=_judge,
+            )
+            if not _judge:
+                return out, out
+            wn, r_end, r_start = out
+            return wn, (wn, r_end, r_start)
+
+        return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
 
     # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
     # residuals (the rhs, the θ-combination, the Krylov solve's saved primals — measured ~32 vectors
@@ -729,7 +771,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # this library targets (an un-checkpointed 6000-step × 18k-DOF case failed to allocate 5.72 GiB
     # on an 8 GB card — see the sampling note below). A pure forward solve pays nothing — checkpoint
     # is the identity outside differentiation.
-    _, ys = jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])
+    ys = _cached_march(block, (linear_solve, nonlinear_solve, theta, dt), march, s0, grid_ts, args)
     if _judge:
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -747,6 +789,167 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+
+_PER_STEP_CALLABLES = ("forcing_vector_fn", "operator_fn", "mass_fn", "mass")
+
+
+def hoist_time_invariant(block, args, t0):
+    """``block`` with every per-step ``f(t, args)`` that does not depend on ``t`` evaluated ONCE.
+
+    The step re-evaluates ``forcing_vector_fn``, ``operator_fn`` and ``mass_fn`` (linear route) or
+    ``mass`` (nonlinear route) at every step -- the forcing twice, at ``t`` and ``t + dt``. The assembled
+    forcing is ``-R(0, t)``: the WHOLE spatial residual re-assembled at zero state, element loop and
+    Jacobian inverses included, whether or not the problem has a source. Measured on a 69k-DOF P1 heat
+    march with no source: removing it took the march 511 -> 235 ms. In a parametric/inverse march
+    ``operator_fn(t, args)`` re-assembles the operator every step for the same reason.
+
+    Independence is decided EXACTLY, not guessed: each callable is traced at ``(t, args)`` and
+    dead-code-eliminated; ``t`` is independent only when no surviving equation reads it (assembly threads
+    ``t`` through the quadrature points even when no term uses it, so "t appears" would never hoist).
+    A hoisted value is computed from the march's own ``args``, so gradients with respect to them flow
+    through it unchanged. Anything that does depend on ``t`` (a time-dependent source or Dirichlet
+    value) -- or whose independence cannot be proven -- keeps its per-step evaluation.
+
+    Call it inside the march, before the time loop. Returns ``block`` itself when nothing hoists.
+    """
+    import dataclasses
+
+    changes = {}
+    for name in _PER_STEP_CALLABLES:
+        fn = getattr(block, name, None)
+        if not callable(fn) or not _independent_of_t(fn, t0, args):
+            continue
+        value = fn(t0, args)
+        changes[name] = lambda t, a=None, _v=value: _v
+    if not changes or not dataclasses.is_dataclass(block):
+        return block
+    return dataclasses.replace(block, **changes)
+
+
+def _independent_of_t(fn, t0, args) -> bool:
+    import jax
+
+    try:
+        closed = jax.make_jaxpr(lambda t: fn(t, args))(t0)
+        from jax._src.interpreters import partial_eval as pe
+
+        _, used = pe.dce_jaxpr(closed.jaxpr, [True] * len(closed.jaxpr.outvars))
+        return not used[0]
+    except Exception:  # noqa: BLE001 -- cannot prove independence: keep the per-step evaluation
+        return False
+
+
+_MARCH_CACHE_SIZE = 4  # per block: the configurations re-evaluated in turn (e.g. two solver slots)
+
+
+def _cached_march(block, config, march, *inputs):
+    """Run ``march(*inputs)``, reusing its trace and compiled program across EAGER evaluations.
+
+    Called eagerly (``fem.solve().fn()``), ``jax.lax.scan`` traces its body into a fresh jaxpr on every
+    call, so JAX's dispatch cache never hits and each evaluation re-traces ``block.step``, re-lowers the
+    march and re-fetches the executable. Measured on a 19k-DOF, 19-step P1 heat march (RTX 3070): ~160 ms
+    tracing + ~120 ms lowering + ~60 ms cache fetch against ~115 ms of GPU work -- the same cost for a
+    brand-new node and for re-evaluating the same one.
+
+    Here the march is traced ONCE per (block, configuration, input shapes) with ``make_jaxpr`` and run
+    through a ``jax.jit`` of ``eval_jaxpr`` that takes the jaxpr's constants as ARGUMENTS. Jitting the
+    closure directly would bake the operators and mesh arrays into the executable as constants; as
+    arguments they stay the block's own device buffers.
+
+    Only the eager path is cached. Under an outer trace (``jno.core``, ``jax.grad``, ``vmap``) an input
+    is a tracer and the march runs inline exactly as before -- the enclosing ``jit`` owns caching there.
+    The cache lives on the block and is keyed on the identity of the block's public fields, so
+    reassigning any of them (jNO does, e.g. for contact and coupled residuals) re-traces rather than
+    reusing stale constants. At most ``_MARCH_CACHE_SIZE`` configurations are kept per block.
+    """
+    import collections
+
+    import jax
+    import jax.numpy as jnp
+
+    leaves, treedef = jax.tree_util.tree_flatten(inputs)
+    if any(isinstance(x, jax.core.Tracer) for x in leaves):
+        return march(*inputs)
+    sig = (
+        _value_identity(config),
+        treedef,
+        tuple((jnp.shape(x), jnp.result_type(x)) for x in leaves),
+        _block_fingerprint(block),
+        _trace_time_settings(),
+    )
+    cache = block.__dict__.setdefault("_march_cache", collections.OrderedDict())
+    hit = cache.get(sig)
+    if hit is None:
+        closed, out_shape = jax.make_jaxpr(march, return_shape=True)(*inputs)
+        if any(isinstance(c, jax.core.Tracer) for c in closed.consts):  # the block itself holds tracers
+            return march(*inputs)
+        jaxpr = closed.jaxpr
+        from .placement import to_solve_device
+
+        # The constants (operators, mesh arrays) move to the solving device ONCE, here, instead of being
+        # copied from the host on every run; configurations cached on the same block share the copies.
+        hit = (
+            to_solve_device(list(closed.consts), block.__dict__.setdefault("_device_consts", {}), numpy=True),
+            jax.jit(lambda consts, flat: jax.core.eval_jaxpr(jaxpr, consts, *flat)),
+            jax.tree_util.tree_structure(out_shape),
+        )
+        cache[sig] = hit
+        while len(cache) > _MARCH_CACHE_SIZE:
+            cache.popitem(last=False)
+            # ...and the device copies only the evicted configuration used go with it.
+            live = {id(c) for h in cache.values() for c in h[0]}
+            memo = block.__dict__["_device_consts"]
+            for k in [k for k, (_, moved) in memo.items() if id(moved) not in live]:
+                del memo[k]
+    else:
+        cache.move_to_end(sig)
+    consts, run, out_tree = hit
+    return jax.tree_util.tree_unflatten(out_tree, run(consts, leaves))
+
+
+def _value_identity(config):
+    """``config`` with each composed solver replaced by its VALUE identity (``cache_key``) where it has one.
+
+    ``fem.solve`` composes fresh per-step solvers on every call, so keying the march cache on the objects
+    themselves missed every time: a warm nonlinear march with ``time=`` (or any solver slot) re-traced and
+    re-compiled on every call -- measured ~1.1 s per call on a 3k-DOF 2-D problem whose march takes 30 ms.
+    The value identity describes the solver completely (the compiled-solve caches already key on it).
+    """
+    if not isinstance(config, tuple):
+        return config
+    out = []
+    for c in config:
+        k = getattr(c, "cache_key", None)
+        out.append(("cache_key", k) if k is not None else c)
+    return tuple(out)
+
+
+def _trace_time_settings():
+    """The ``jno.setup`` settings a march bakes in when it is TRACED: the sparse-operator storage
+    (``matvec_format``) and how many systems a vmapped device LU stacks (``lu_stack``). Their setters
+    clear JAX's caches, which does not reach this block-level cache -- so they are part of its key, or a
+    changed setting would silently keep the old one for any block that had already marched."""
+    from . import matvec_format, sparse_batching
+
+    return (matvec_format._FORMAT, sparse_batching._LU_STACK)
+
+
+def _block_fingerprint(block):
+    """Identity of every public field (dict fields one level deep). Private attributes are excluded:
+    the evaluation bookkeeping (``_n_evaluations``, ``_last_evaluation``) changes on every call."""
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(block)} if dataclasses.is_dataclass(block) else set()
+    out = []
+    for k, v in sorted(vars(block).items()):
+        if k.startswith("_") and k not in fields:
+            continue
+        if isinstance(v, dict):
+            out.append((k, tuple(sorted((str(kk), id(vv)) for kk, vv in v.items()))))
+        else:
+            out.append((k, id(v)))
+    return tuple(out)
 
 
 def _resample_trajectory(traj, grid_ts, save_ts, dtype):

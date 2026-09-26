@@ -2625,6 +2625,57 @@ class _TraceFDM:
                 "any assembled operator."
             )
 
+    def _prepare_steady_slots(self, linear, precond):
+        """The eager half of a PARAMETRIC steady solve through the slots, run when its trace node is made -- the
+        steady counterpart of the transient warm-up march. Inside a ``jno.core`` step the operator is traced, so
+        whatever needs concrete values is done here: the structural decisions (affinity, sparsity pattern, and
+        for ``cg``/``minres`` symmetry -- whose probe failed on a traced ``float()``, cg + any preconditioner
+        under crux) and a preconditioner's structural setup (``schwarz``, ``fsai``, ``amg`` build from a matrix).
+
+        That matrix is taken at a PERTURBED parameter value (:meth:`_perturbed_params`), not the current one: a
+        parameter is a placeholder 0 until ``jno.core`` initialises it, and a trainable coefficient at 0 makes the
+        operator singular (``-s·Δu = f``). Only the pattern and the graph matter to the setup; the numeric phase
+        follows every training step's values."""
+        import jax
+
+        from .utils.solver.solver_api import prepare_precond
+
+        zeros = jnp.zeros(self._Ntot)
+        make_probe = lambda: self._steady_residual(self._current_params())  # noqa: E731
+        with jax.ensure_compile_time_eval():
+            probe = make_probe()
+            linear_problem = self._is_affine("steady", make_probe, self._Ntot)
+            self._sparsity("steady", probe, zeros, make=make_probe)
+            if linear_problem:
+                self._require_symmetric(
+                    linear,
+                    lambda: self._dirichlet_lift("steady", self._sparse_operator("steady", make_probe(), zeros))[0],
+                    key="steady",
+                )
+            with self._perturbed_params():  # built AND evaluated here: the jitted probe keeps its first trace
+                K = self._sparse_operator("steady", make_probe(), zeros)
+                if linear_problem:
+                    K = self._dirichlet_lift("steady", K)[0]
+        self._representative = K
+        prepare_precond(precond, self)
+
+    def _representative_operator(self):
+        """A concrete assembled operator with the steady system's sparsity pattern, for a preconditioner that
+        builds its structure from a matrix before a solve whose operator arrives traced (see
+        :meth:`_prepare_steady_slots`). ``None`` when none was prepared: an eager solve hands the
+        preconditioner its concrete operator directly, and a transient march builds its step operator itself."""
+        return self.__dict__.get("_representative")
+
+    def _dof_layout(self):
+        """Per unknown: ``(points (N, dim), index (N, n_components))`` -- which DOF holds component ``c`` at
+        node ``i``. FDM keeps one block of ``N`` per component (``block * N + node``), unlike FEM's
+        node-major interleaving, so a near-null space built from coordinates must ask."""
+        pts = np.asarray(self._pts)
+        nodes = np.arange(self._N)
+        return [
+            (pts, np.stack([b * self._N + nodes for b in self._blocks_of(k)], axis=1)) for k in range(len(self.unknowns))
+        ]
+
     def _steady_residual(self, extra_params=None, extra_pins=None):
         """The steady residual with every boundary row folded in, as a function of the DOF vector."""
         import jax
@@ -2975,6 +3026,8 @@ class _TraceFDM:
             # values (linearity, sparsity pattern, symmetry, time-variance, the u-independence of the time
             # coefficients); each is cached, so the traced march below only reuses them. Costs one solve.
             self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
+        elif linear is not None or precond is not None:
+            self._prepare_steady_slots(linear, precond)
 
         def _solve(*values):  # values = the parameters' current (crux-trained) values
             extra = {

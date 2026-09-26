@@ -203,49 +203,57 @@ class _BDF2Scheme(_TimeScheme):
         # its residual norms and they are judged below -- as in the theta march and the load path.
         _judge = bool(block.is_nonlinear())
 
-        def _advance(u_prev, t_land, h):
-            """One implicit step landing at ``t_land`` from ``u_prev`` over an effective step ``h``."""
-            return block.step(
-                u_prev,
-                t_land - h,
-                h,
-                args=args,
-                theta=1.0,
-                linear_solve=linear_solve,
-                nonlinear_solve=nonlinear_solve,
-                report=_judge,
-            )
-
-        # Startup: plain backward Euler, OUTSIDE the scan. Being outside it, its iterate is CONCRETE,
-        # so the driver's own `_convergence_check` fires there in the ordinary eager path and this
-        # march needs no second check for it -- only the norms discarded. (Under an outer jit both
-        # self-disable together, which is the documented limit, not a hole this could plug.)
-        s1 = _advance(s0, float(grid_ts[1]), dt)
-        if _judge:
-            s1 = s1[0]
+        from .backend_blocks import _cached_march, hoist_time_invariant
 
         dt_eff = 2.0 * dt / 3.0
 
-        def step(carry, t_next):
-            u_n, u_nm1 = carry
-            u_star = (4.0 * u_n - u_nm1) / 3.0
-            out = _advance(u_star, t_next, dt_eff)
-            if not _judge:
-                return (out, u_n), out
-            wn, r_end, r_start = out
-            return (wn, u_n), (wn, r_end, r_start)
+        def march(s0, grid, args):
+            blk = hoist_time_invariant(block, args, grid[0])  # static loads/operators: once per march
 
-        # Checkpointed for the same reason the theta march is: reverse mode would otherwise keep every
-        # step's internal Krylov/Newton residuals.
-        _, ys = jax.lax.scan(jax.checkpoint(step), (s1, s0), grid_ts[2:])
+            def _advance(u_prev, t_land, h):
+                """One implicit step landing at ``t_land`` from ``u_prev`` over an effective step ``h``."""
+                return blk.step(
+                    u_prev,
+                    t_land - h,
+                    h,
+                    args=args,
+                    theta=1.0,
+                    linear_solve=linear_solve,
+                    nonlinear_solve=nonlinear_solve,
+                    report=_judge,
+                )
+
+            # Startup: plain backward Euler, then the BDF2 steps. Its norms are judged with the others.
+            s1 = _advance(s0, grid[1], dt)
+
+            def step(carry, t_next):
+                u_n, u_nm1 = carry
+                u_star = (4.0 * u_n - u_nm1) / 3.0
+                out = _advance(u_star, t_next, dt_eff)
+                if not _judge:
+                    return (out, u_n), out
+                wn, r_end, r_start = out
+                return (wn, u_n), (wn, r_end, r_start)
+
+            # Checkpointed for the same reason the theta march is: reverse mode would otherwise keep every
+            # step's internal Krylov/Newton residuals.
+            first = s1[0] if _judge else s1
+            _, ys = jax.lax.scan(jax.checkpoint(step), (first, s0), grid[2:])
+            return s1, ys
+
+        # Traced ONCE per block and configuration (see `_cached_march`): an eager BDF2 march used to re-trace
+        # its scan on every call -- measured ~0.3 s per warm call of a 12k-DOF heat march.
+        s1, ys = _cached_march(
+            block, (linear_solve, nonlinear_solve, "bdf2", dt), march, s0, jnp.asarray(grid_ts, dtype), args
+        )
         if _judge:
-            ys, _r_end, _r_start = ys
+            (s1, r1_end, r1_start), (ys, _r_end, _r_start) = s1, ys
             _check_march_converged(
-                _r_end,
-                _r_start,
-                grid_ts[2:],
+                jnp.concatenate([jnp.reshape(r1_end, (1,)), _r_end]),
+                jnp.concatenate([jnp.reshape(r1_start, (1,)), _r_start]),
+                grid_ts[1:],
                 nonlinear_solve,
-                states=ys,
+                states=jnp.concatenate([s1[None, :], ys], axis=0),
                 what="transient march (BDF2)",
                 coord="t",
                 advice=_TRANSIENT_ADVICE,
@@ -255,6 +263,369 @@ class _BDF2Scheme(_TimeScheme):
 
     def __repr__(self):
         return "jno.solve.bdf2()"
+
+
+def _sdirk_tableau(order):
+    """Alexander's stiffly-accurate, L-stable SDIRK methods (SIAM J. Numer. Anal. 14(6), 1977, Table 1 / Sec. 2):
+    ``(A, c, gamma)`` with ``b`` = the last row of ``A`` (stiff accuracy: the step's answer IS the last stage)."""
+    import numpy as np
+
+    if order == 2:
+        g = 1.0 - 1.0 / np.sqrt(2.0)
+        A = np.array([[g, 0.0], [1.0 - g, g]])
+    elif order == 3:
+        # gamma: the root in (1/6, 1/2) of x^3 - 3x^2 + 3x/2 - 1/6, which makes the method L-stable
+        g = float(
+            [r.real for r in np.roots([1.0, -3.0, 1.5, -1.0 / 6.0]) if abs(r.imag) < 1e-12 and 1 / 6 < r.real < 0.5][0]
+        )
+        tau = (1.0 + g) / 2.0
+        b1 = -(6.0 * g * g - 16.0 * g + 1.0) / 4.0
+        b2 = (6.0 * g * g - 20.0 * g + 5.0) / 4.0
+        A = np.array([[g, 0.0, 0.0], [tau - g, g, 0.0], [b1, b2, g]])
+    else:
+        raise ValueError(f"jno.solve.sdirk(order={order!r}): order must be 2 or 3.")
+    return A, A.sum(axis=1), float(g)
+
+
+def _sdirk_shift(A):
+    """``D`` with ``u*_i = u_n + sum_{k<i} D[i, k] Z_k`` (``Z_k = U_k - u_n``) -- the start state that turns stage
+    ``i`` into one backward-Euler step of size ``gamma*dt``. From ``M Z = dt (A (x) I) F``: ``dt F_j = sum_k
+    (A^-1)_jk M Z_k``, so the explicit part ``dt sum_{j<i} a_ij F_j = M sum_k D_ik Z_k`` needs no ``M^-1``."""
+    import numpy as np
+
+    Ainv = np.linalg.inv(A)
+    s = A.shape[0]
+    D = np.zeros_like(A)
+    for i in range(s):
+        for k in range(i):
+            D[i, k] = sum(A[i, j] * Ainv[j, k] for j in range(k, i))
+    return D
+
+
+class _SDIRKScheme(_TimeScheme):
+    """Singly diagonally implicit Runge-Kutta; see :func:`jno.solve.sdirk`.
+
+    Implemented by REDUCTION, like BDF2: every stage is exactly one backward-Euler :meth:`step` of size
+    ``gamma*dt`` from a shifted start state (``_sdirk_shift``), so the Dirichlet / zero-mass (DAE) rows, the
+    solver slots, the Newton driver, the complex 2n path and the Krylov rescue all come from ``step``
+    unchanged -- and all stages share ONE step operator ``M + gamma*dt*A``.
+    """
+
+    def __init__(self, order):
+        self.order = int(order)
+        self.A, self.c, self.gamma = _sdirk_tableau(self.order)
+        self.D = _sdirk_shift(self.A)
+
+    @property
+    def step_order(self):
+        return self.order
+
+    def step_scales(self, block):
+        return (self.gamma * float(block.dt),)
+
+    def _refuse(self, block):
+        if (block.metadata or {}).get("second_order"):
+            raise NotImplementedError(
+                "jno.solve.sdirk(): a second-order-in-time (u_tt) block is assembled with theta=1/2 because it "
+                "must NOT be damped, and this SDIRK is L-stable -- it would damp an undamped wave silently. "
+                "Use the block's own scheme, or jno.solve.theta(0.5)."
+            )
+
+    def _one_step(self, blk, u, t, dt, args, linear_solve, nonlinear_solve, report):
+        """One SDIRK step from ``u`` at ``t`` over ``dt``; returns ``u(t+dt)`` (and the stages' norms)."""
+        s = self.A.shape[0]
+        Z, reports = [], []
+        for i in range(s):
+            u_star = u
+            for k in range(i):
+                if self.D[i, k] != 0.0:
+                    u_star = u_star + float(self.D[i, k]) * Z[k]
+            h = self.gamma * dt
+            out = blk.step(
+                u_star,
+                t + float(self.c[i]) * dt - h,
+                h,
+                args=args,
+                theta=1.0,
+                linear_solve=linear_solve,
+                nonlinear_solve=nonlinear_solve,
+                report=report,
+            )
+            if report:
+                out, r_end, r_start = out
+                reports.append((r_end, r_start))
+            Z.append(out - u)
+        return u + Z[-1], reports  # stiffly accurate: the last stage is the step's answer
+
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        self._refuse(block)
+        return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve, nonlinear_solve, False)[0]
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        import jax
+        import jax.numpy as jnp
+
+        from .backend_blocks import _cached_march, _resample_trajectory, hoist_time_invariant
+        from .matvec_format import prime
+
+        self._refuse(block)
+        prime(block.M, getattr(block, "A", None))
+        _s0f = getattr(block, "state0_fn", None)
+        s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
+        dtype = s0.dtype
+        import numpy as np
+
+        dt = float(block.dt)
+        # The grid on the HOST (numpy), as BDF2 does: under `jno.core` a jnp.linspace is staged, and the
+        # per-stage convergence record below needs concrete times.
+        t0, t1 = float(block.t0), float(block.t1)
+        grid_np = np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
+        grid_ts = jnp.asarray(grid_np, dtype)
+        judge = bool(block.is_nonlinear())
+
+        def march(s0, grid_ts, args):
+            blk = hoist_time_invariant(block, args, grid_ts[0])
+
+            def step(u, t_next):
+                un, reps = self._one_step(blk, u, t_next - dt, dt, args, linear_solve, nonlinear_solve, judge)
+                if not judge:
+                    return un, un
+                return un, (un, jnp.stack([r[0] for r in reps]), jnp.stack([r[1] for r in reps]))
+
+            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+
+        ys = _cached_march(block, (linear_solve, nonlinear_solve, repr(self), dt), march, s0, grid_ts, args)
+        if judge:
+            from .history_march import _TRANSIENT_ADVICE, _check_march_converged
+
+            ys, r_end, r_start = ys
+            s = self.A.shape[0]
+            _check_march_converged(
+                r_end.reshape(-1),  # one entry per STAGE: every stage is a Newton solve that must converge
+                r_start.reshape(-1),
+                np.repeat(grid_np[1:], s),
+                nonlinear_solve,
+                what=f"transient march ({self!r}, per stage)",
+                coord="t",
+                advice=_TRANSIENT_ADVICE,
+            )
+        traj = jnp.concatenate([s0[None, :], ys], axis=0)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+    def __repr__(self):
+        return f"jno.solve.sdirk(order={self.order})"
+
+
+def _rosenbrock_tableau(method):
+    """Standard-form Rosenbrock coefficients ``(a, g, b, order)`` (Hairer & Wanner II, Sec. IV.7, eq. (7.4)):
+    ``a`` strictly lower (stage points), ``g`` lower with the constant diagonal ``gamma`` (Jacobian couplings).
+
+    * ``ros34pw2`` -- Rang & Angermann, BIT Numer. Math. 45 (2005) 761-787: 4 stages, order 3, stiffly
+      accurate (``b`` is the last row of ``a + g``), L-stable, a W-method (an approximate Jacobian keeps the
+      order) and consistent for index-1 DAEs, i.e. algebraic (zero-mass) rows.
+    * ``ros2`` -- 2 stages, order 2, L-stable with ``gamma = 1 + 1/sqrt(2)`` (Verwer, Spee, Blom & Hundsdorfer,
+      SIAM J. Sci. Comput. 20(4), 1999): ``a21 = 1``, ``g21 = -2 gamma``, ``b = (1/2, 1/2)`` -- the standard-form
+      solution of the order conditions ``sum b = 1``, ``b2 (a21 + g21) = 1/2 - gamma``. Not stiffly accurate.
+    """
+    import numpy as np
+
+    if method == "ros34pw2":
+        g0 = 4.3586652150845900e-01
+        a = np.array(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [8.7173304301691801e-01, 0.0, 0.0, 0.0],
+                [8.4457060015369423e-01, -1.1299064236484185e-01, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ]
+        )
+        g = np.array(
+            [
+                [g0, 0.0, 0.0, 0.0],
+                [-8.7173304301691801e-01, g0, 0.0, 0.0],
+                [-9.0338057013044082e-01, 5.4180672388095326e-02, g0, 0.0],
+                [2.4212380706095346e-01, -1.2232505839045147e00, 5.4526025533510214e-01, g0],
+            ]
+        )
+        b = np.array([2.4212380706095346e-01, -1.2232505839045147e00, 1.5452602553351020e00, 4.3586652150845900e-01])
+        return a, g, b, 3
+    if method == "ros2":
+        gam = 1.0 + 1.0 / np.sqrt(2.0)
+        return np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([[gam, 0.0], [-2.0 * gam, gam]]), np.array([0.5, 0.5]), 2
+    raise ValueError(f"jno.solve.rosenbrock(method={method!r}): method must be 'ros34pw2' or 'ros2'.")
+
+
+class _RosenbrockScheme(_TimeScheme):
+    """Linearly implicit Rosenbrock(-W) time scheme; see :func:`jno.solve.rosenbrock`.
+
+    With ``R`` the block's residual (``M u' = -R(u, t)``) and ``J = dR/du`` at the step's start, every stage is
+    ONE linear solve with the same matrix ``W = M + gamma h J``:
+
+        ``W k_i = -h R(t_n + alpha_i h, u_n + sum_j a_ij k_j) - h J sum_{j<i} g_ij k_j - gamma_i h^2 R_t``,
+        ``u_{n+1} = u_n + sum_i b_i k_i``,
+
+    ``alpha_i = sum_j a_ij``, ``gamma_i = sum_{j<=i} g_ij`` -- no Newton loop at all.
+    """
+
+    needs_linear_step = True  # a nonlinear block still gets a LINEAR step solve (see compose_transient_step_solvers)
+
+    def __init__(self, method):
+        self.method = method
+        self.a, self.g, self.b, self.order = _rosenbrock_tableau(method)
+        self.gamma = float(self.g[0, 0])
+        self.alpha = self.a.sum(axis=1)
+        self.gsum = self.g.sum(axis=1)
+
+    @property
+    def step_order(self):
+        return self.order
+
+    def step_scales(self, block):
+        return (self.gamma * float(block.dt),)
+
+    def _refuse(self, block):
+        md = block.metadata or {}
+        if md.get("second_order"):
+            raise NotImplementedError(
+                f"{self!r}: a second-order-in-time (u_tt) block must NOT be damped, and this scheme is L-stable. "
+                "Use the block's own scheme, or jno.solve.theta(0.5)."
+            )
+        if getattr(block, "mass_residual", None) is not None:
+            raise NotImplementedError(
+                f"{self!r}: a state-dependent mass c(u) u_t needs the dM/du term a linearly implicit scheme does "
+                "not carry. Use jno.solve.sdirk() or bdf2(), which treat it by a Newton solve per stage."
+            )
+
+    def _pieces(self, blk, args):
+        """``(R(u, t), J(u, t) -> BCOO | None, M(t))`` for a linear or a nonlinear block."""
+        import jax.numpy as jnp
+
+        from .linear import sparse_matvec
+
+        if blk.is_nonlinear():
+            return (
+                lambda u, t: jnp.asarray(blk.residual(u, t, args)).reshape(-1),
+                (lambda u, t: blk.jacobian(u, t, args)) if blk.jacobian is not None else None,
+                lambda t: blk.mass(t, args),
+            )
+
+        def A_of(t):
+            return blk.operator_fn(t, args) if blk.operator_fn is not None else blk.A
+
+        def R(u, t):
+            r = sparse_matvec(A_of(t))(u) if hasattr(A_of(t), "todense") else jnp.asarray(A_of(t)) @ u
+            if blk.affine_bias is not None:
+                r = r - jnp.asarray(blk.affine_bias, u.dtype).reshape(-1)
+            if blk.forcing_vector_fn is not None:
+                r = r - jnp.asarray(blk.forcing_vector_fn(t, args), u.dtype).reshape(-1)
+            return r
+
+        return R, (lambda u, t: A_of(t)), (lambda t: blk.mass_fn(t, args) if blk.mass_fn is not None else blk.M)
+
+    def _one_step(self, blk, u, t, h, args, linear_solve):
+        import jax
+        import jax.numpy as jnp
+
+        from .backend_blocks import _default_step_solve
+        from .linear import matrix_diagonal, sparse_matvec
+        from .solver_api import _add_step_operator
+
+        R, jac, mass = self._pieces(blk, args)
+        M = mass(t)
+        J = jac(u, t) if jac is not None else None
+        mv_M = sparse_matvec(M) if hasattr(M, "todense") else (lambda v: jnp.asarray(M) @ v)
+        if J is not None and hasattr(J, "todense"):
+            mv_J = sparse_matvec(J)
+        elif J is not None:
+            mv_J = lambda v: jnp.asarray(J) @ v  # noqa: E731
+        else:  # matrix-free tangent: a JVP of the residual
+            mv_J = lambda v: jax.jvp(lambda w: R(w, t), (u,), (v,))[1]  # noqa: E731
+        s = h * self.gamma
+        W_mv = lambda v: mv_M(v) + s * mv_J(v)  # noqa: E731
+        diag = matrix_diagonal(M) + (s * matrix_diagonal(J) if J is not None else 0.0)
+        R_t = jax.jvp(lambda tt: R(u, tt), (t,), (jnp.ones_like(t),))[1]
+        W_op = None
+        if linear_solve is not None and getattr(linear_solve, "wants_operator", False) and hasattr(J, "todense"):
+            W_op = _add_step_operator(M, J, s) if hasattr(M, "todense") else None
+        krylov = (blk.metadata or {}).get("krylov")
+
+        def solve(rhs, x0):
+            if linear_solve is None:
+                return _default_step_solve(W_mv, rhs, x0, diag, krylov=krylov)
+            kw = {}
+            if getattr(linear_solve, "wants_scale", False):
+                kw["scale"] = s
+            if W_op is not None:
+                kw["operator"] = W_op
+            return linear_solve(W_mv, rhs, x0, lambda: diag, **kw)
+
+        ks = []
+        for i in range(self.a.shape[0]):
+            Y = u
+            coupled = jnp.zeros_like(u)
+            for j in range(i):
+                if self.a[i, j] != 0.0:
+                    Y = Y + float(self.a[i, j]) * ks[j]
+                if self.g[i, j] != 0.0:
+                    coupled = coupled + float(self.g[i, j]) * ks[j]
+            rhs = -h * R(Y, t + float(self.alpha[i]) * h) - float(self.gsum[i]) * h * h * R_t
+            if i:
+                rhs = rhs - h * mv_J(coupled)
+            ks.append(solve(rhs, ks[-1] if ks else jnp.zeros_like(u)))
+        out = u
+        for i, k in enumerate(ks):
+            out = out + float(self.b[i]) * k
+        return out
+
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        self._refuse(block)
+        return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve)
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        from .backend_blocks import _cached_march, _resample_trajectory, hoist_time_invariant
+        from .matvec_format import prime
+
+        self._refuse(block)
+        if nonlinear_solve is not None:
+            raise ValueError(f"{self!r} is linearly implicit: there is no Newton solve for nonlinear= to drive.")
+        prime(block.M, getattr(block, "A", None))
+        _s0f = getattr(block, "state0_fn", None)
+        s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
+        dtype = s0.dtype
+        dt = float(block.dt)
+        t0, t1 = float(block.t0), float(block.t1)
+        grid_ts = jnp.asarray(np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1), dtype)
+
+        def march(s0, grid_ts, args):
+            blk = hoist_time_invariant(block, args, grid_ts[0])
+            if block.is_nonlinear():
+                if block.mass is not None and blk.mass is block.mass:
+                    raise NotImplementedError(
+                        f"{self!r}: the mass matrix depends on time, which a linearly implicit scheme would need an "
+                        "M'(t) u term for. Use jno.solve.sdirk() or bdf2()."
+                    )
+            elif block.mass_fn is not None and blk.mass_fn is block.mass_fn:
+                raise NotImplementedError(
+                    f"{self!r}: the mass matrix depends on time (or on a parameter), which a linearly implicit "
+                    "scheme would need an M'(t) u term for. Use jno.solve.sdirk() or bdf2()."
+                )
+
+            def step(u, t_next):
+                un = self._one_step(blk, u, t_next - dt, dt, args, linear_solve)
+                return un, un
+
+            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+
+        ys = _cached_march(block, (linear_solve, repr(self), dt), march, s0, grid_ts, args)
+        traj = jnp.concatenate([s0[None, :], ys], axis=0)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+    def __repr__(self):
+        return f"jno.solve.rosenbrock(method={self.method!r})"
 
 
 class _AdaptiveScheme(_TimeScheme):

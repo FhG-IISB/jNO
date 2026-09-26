@@ -31,10 +31,12 @@ backend raises a clear `ImportError` naming the extra that provides it. Install 
 | Extra | Enables | Pulls in |
 |---|---|---|
 | `[cuda]` | **NVIDIA GPU support** — swaps in the CUDA-capable JAX build (same version pin as the core `jax`) | `jax[cuda]` |
-| `[fem]` | **Everything `jno.fem` reaches for beyond the core** — the one-liner. Meta-extra = `[mesh]` + `[pardiso]` + `[cudss]`. | see the three below |
+| `[fem]` | **Everything `jno.fem` reaches for beyond the core** — the one-liner. Meta-extra = `[mesh]` + `[pardiso]` + `[cudss]` + `[metis]`. | see the four below |
+| `[fdm]` | What `jno.fdm` solves reach for beyond the core (finite differences themselves are core). Meta-extra = `[metis]`. | `pymetis` |
 | `[mesh]` | Adaptive/anisotropic remeshing behind `fem.solve(adapt=...)` | `mmgpy` |
 | `[pardiso]` | `jno.solve.lu(backend="pardiso")` — Intel MKL PARDISO, multithreaded CPU sparse-direct. The fastest factorization measured here, and the answer when a factorization exceeds GPU memory. x86-64 only. | `pypardiso` |
 | `[cudss]` | `jno.solve.lu(backend="cudss")` — NVIDIA cuDSS, the fastest **repeated solve** (shift-invert eigensolves, constant-operator transients). Linux x86-64. | `nvmath-python`, `nvidia-cudss-cu12`, `cupy` |
+| `[metis]` | The graph partition behind `jno.precond.schwarz()` (METIS) | `pymetis` |
 | `[rcwa]` | The [RCWA solver](rcwa.md) (`jno.rcwa`, periodic-layered electromagnetics) | `fmmax` |
 | `[amg]` | GPU algebraic multigrid — `jno.solve.amg` / `jno.precond.ams` | `jaxamg` (builds a CUDA extension against a prebuilt AmgX 2.5+; needs that toolchain) |
 | `[iree]` | `model.to_iree(...)` export | `iree-base-compiler`, `iree-base-runtime` |
@@ -46,7 +48,8 @@ pip install "jax-numerical-operators[rcwa]"       # + the Fourier-modal EM solve
 pip install "jax-numerical-operators[fem,rcwa]"   # combine freely
 ```
 
-There is deliberately **no `[fdm]` extra** — finite differences ship in the core install.
+Finite differences ship in the core install; `[fdm]` only adds the solver back-ends an FDM solve can use
+(today: METIS for `jno.precond.schwarz()`).
 
 The platform markers are part of the design: on a machine where a backend cannot run (PARDISO on
 arm64, cuDSS on macOS) the extra installs cleanly and simply lands without it — no resolver

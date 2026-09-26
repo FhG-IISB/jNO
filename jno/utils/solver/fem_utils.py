@@ -4709,7 +4709,31 @@ def _bake_fingerprint(fn, chunk):
     return (fn.__code__, treedef, tuple(id(leaf) for leaf in leaves), chunk), leaves
 
 
-def elem_map(fn, xs, chunk):
+def _chunked_scatter(fn, xs, c, out, index):
+    """``out.at[index].add(vmap(fn)(*xs))`` in chunks of ``c`` cells, WITHOUT materialising the per-cell
+    result: each chunk scatter-adds straight into ``out``. Padding rows repeat the last cell and scatter to
+    an out-of-range index, which ``mode="drop"`` discards."""
+    n = xs[0].shape[0]
+    nb = -(-n // c)
+    pad = nb * c - n
+
+    def padded(x, fill):
+        if not pad:
+            return x
+        return jnp.concatenate([x, jnp.broadcast_to(fill, (pad,) + x.shape[1:]).astype(x.dtype)])
+
+    xs_p = [padded(x, x[-1]) for x in xs]
+    idx_p = padded(index, out.shape[0])
+    blocks = tuple(x.reshape((nb, c) + x.shape[1:]) for x in xs_p) + (idx_p.reshape((nb, c) + index.shape[1:]),)
+
+    def body(acc, blk):
+        r = jax.vmap(fn)(*blk[:-1])
+        return acc.at[blk[-1].reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
+
+    return jax.lax.scan(body, out, blocks)[0]
+
+
+def elem_map(fn, xs, chunk, *, scatter=None):
     """``vmap(fn)`` over the leading axis, in chunks of ``chunk`` when one is set -- COMPILED.
 
     ``jax.vmap`` batches, it does not compile. Without an enclosing ``jit`` every batched primitive
@@ -4747,7 +4771,20 @@ def elem_map(fn, xs, chunk):
     The regression the naive ``jax.jit(jax.vmap(fn))`` caused -- repeat solve 522 -> 1233 ms -- does
     not appear; repeats are faster than before the change, not slower.
     """
-    if chunk is None:
+    if scatter is not None:
+        # ``scatter=(out, index)``: return ``out.at[index].add(per_cell)`` instead of the per-cell array.
+        # Chunked, the per-cell array is never built: stacking it through ``lax.map`` cost one write of the
+        # WHOLE (n_cell, n_local) buffer per chunk -- measured ~62 us a chunk, 1.8 ms of a 5.9 ms residual on
+        # a 491k-cell mesh, and the reason chunking cost 1.7x over one vmap.
+        out, index = scatter
+        if chunk is None:
+            run = lambda *a: a[-2].at[a[-1].reshape(-1)].add(jax.vmap(fn)(*a[:-2]).reshape(-1).astype(a[-2].dtype))  # noqa: E731
+        else:
+            c = int(chunk)
+            run = lambda *a: _chunked_scatter(fn, a[:-2], c, a[-2], a[-1])  # noqa: E731
+        arrays = tuple(xs) + (out, index)
+        chunk = ("scatter", chunk)  # part of the compile-cache key: a different program
+    elif chunk is None:
         run, arrays = jax.vmap(fn), xs
     else:
         c = int(chunk)

@@ -29,6 +29,7 @@ import numpy as np
 
 from .fem_elements import ElementSpec, piola_contravariant, raviart_thomas_triangle
 from .fem_topology import EdgeTopology, build_edge_topology
+from .small_linalg import small_det, small_inv
 
 ScalarField = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]  # (x, y) -> values
 
@@ -36,7 +37,7 @@ ScalarField = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]  # (x, y) -> val
 def _cell_jacobian(verts: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Affine triangle Jacobian ``J = [v1-v0, v2-v0]`` and its (signed) determinant."""
     J = jnp.stack([verts[1] - verts[0], verts[2] - verts[0]], axis=1)  # (2, 2)
-    return J, jnp.linalg.det(J)
+    return J, small_det(J)
 
 
 def assemble_mixed_poisson_rt(
@@ -641,7 +642,7 @@ def assemble_fem_nonnodal(
             pts_dyn = pts
         verts = pts_dyn[cells_j[c]]
         J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)  # (dim, dim): 2x2 tri / 3x3 tet
-        detJ = jnp.linalg.det(J)
+        detJ = small_det(J)
         per = []
         for i, s in enumerate(spaces):
             if s == "Lagrange":
@@ -651,7 +652,7 @@ def assemble_fem_nonnodal(
                 # `cell_sol` takes the [:, None] SCALAR convention Hermite/Argyris/Morley use (vec = 1
                 # as an explicit column); only the vector families (RT/N1E) pass it flat.
                 g_ref = jnp.concatenate([-jnp.ones((1, dim)), jnp.eye(dim)], axis=0)  # (dim+1, dim)
-                g = g_ref @ jnp.linalg.inv(J)  # (dim+1, dim)
+                g = g_ref @ small_inv(J)  # (dim+1, dim)
                 per.append(
                     {
                         "shape_vals": p1_shape_vals,  # (n_quad, dim+1)
@@ -2446,7 +2447,7 @@ def n1e_field_at_tet_centroids(
 
     def _tet_jac(verts):
         J = jnp.stack([verts[1] - verts[0], verts[2] - verts[0], verts[3] - verts[0]], axis=1)  # (3, 3)
-        return J, jnp.linalg.det(J)
+        return J, small_det(J)
 
     def _val(cell, sgn, c):
         J, detJ = _tet_jac(pts[cell])

@@ -4102,11 +4102,12 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
                 return sparse_lu_solve(a_mat, b)  # reverse-mode diff in A(X)'s values and b, so ∂u/∂X still flows
             return jnp.linalg.solve(jnp.asarray(a_mat), b)  # already dense (vertex C¹ / 1D): small, keep dense
         if mode == "nonlinear":
-            from .newton_krylov import newton_krylov
+            from .newton_krylov import newton_default
 
             op = fem.operator
             u0 = jnp.zeros((int(op.size),), dtype=jnp.result_type(float))
-            return newton_krylov(lambda uu: op.residual(uu, vals), u0)
+            jac = (lambda uu: op.jacobian(uu, vals)) if getattr(op, "jacobian", None) is not None else None
+            return newton_default(lambda uu: op.residual(uu, vals), u0, jacobian=jac)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
     # A TRACED objective: any weak-form expression, assembled like a `criterion=` and summed to the

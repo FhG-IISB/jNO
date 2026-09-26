@@ -89,6 +89,7 @@ from .fem_utils import (
     elem_map,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
+from .small_linalg import small_det, small_inv
 from .weak_form import (
     _apply_sign,
     _contains_temporal_derivative,
@@ -668,7 +669,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     def _cell(c):
         verts = pts_j[cells_p1_j[c]]  # (dim+1, dim) — P1 geometry vertices
         J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
-        detJ = jnp.linalg.det(J)
+        detJ = small_det(J)
         phi, dphi = identity_pushforward(ref_vals, ref_grads, J, detJ)  # (n_q,n_dof), (n_q,n_dof,dim)
         JxW = qw * jnp.abs(detJ)  # (n_q,)
         xq = verts[0] + qp @ J.T  # (n_q, dim)
@@ -732,7 +733,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
             def _face(c, k, n_vec, _fp=fp_phi, _fd=fp_dphi_ref, _fq=fp_qp, _ft=fp_tangs, _gw=gw_face):
                 verts = pts_j[cells_p1_j[c]]
                 J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
-                K = jnp.linalg.inv(J)
+                K = small_inv(J)
                 phi_f = _fp[k]  # (n_fq, n_dof)
                 dphi_f = jnp.einsum("qnd,dD->qnD", _fd[k], K)  # (n_fq, n_dof, dim)
                 jac_f = _facet_area_element(J, _ft[k])  # edge length (2D) / face area (3D)
@@ -1943,6 +1944,31 @@ def assemble_fem_native(
                 pts = pts.at[_ids, _axis].set(jnp.asarray(args[_name], dtype=pts.dtype).reshape(-1))
         return pts
 
+    _geo_cache: list = []
+    # Only where the residual and tangent are evaluated at EVERY step of a march (a `time=` or `tau=` grid):
+    # measured on a 46k-DOF nonlinear 3-D heat march, first march 5.14 -> 4.30 s and every later one
+    # 2.06 -> 1.75 s. A single steady solve gains 6% warm but compiles 0.6 s longer, so it is left alone.
+    _geo_cache_on = getattr(domain, "time", None) is not None
+
+    def _static_geometry():
+        """``(J⁻¹, det J)`` of every affine cell of the BAKED mesh, computed once and reused by every residual
+        and tangent evaluation of a march (``_geo_cache_on``). Recomputing the inverse per call was ~1 ms of a
+        5.8 ms residual on a 491k-cell 3-D P1 mesh. Costs ``(dim² + 1)`` numbers per cell (80 bytes in 3-D). Built under
+        ``ensure_compile_time_eval`` so the first request -- usually inside a trace -- computes it eagerly,
+        with exactly the arithmetic of the per-call path (the values are bitwise the same)."""
+        if not _geo_cache:
+
+            def build(P, C):
+                verts = P[C]  # (n_cell, dim+1, dim)
+                Jall = jnp.stack([verts[:, i + 1] - verts[:, 0] for i in range(dim)], axis=2)
+                return small_inv(Jall), small_det(Jall)
+
+            # ONE compiled program, run eagerly: op by op, each primitive compiled on its own and cost ~0.8 s
+            # of cold start on a 491k-cell mesh.
+            with jax.ensure_compile_time_eval():
+                _geo_cache.append(jax.jit(build)(pts_j, cells_j))
+        return _geo_cache[0]
+
     def _cell_fields(c, cell_sols, pts=pts_j, cells=None, cells_f=None):
         """Per-field ``(phi, dphi_phys, cell_sol)`` and shared ``(xq, meas)`` for cell c.
 
@@ -1956,6 +1982,7 @@ def assemble_fem_native(
         reconnecting march overrides them per-eval so an edge flip needs no new program."""
         cells = cells_j if cells is None else cells
         cells_f = cells_f_j if cells_f is None else cells_f
+        K_cell = None  # the cached J⁻¹ when the static-geometry path applies
         if _nonaffine:
             # x(ξ) = Σ_a x_a N_a(ξ) over the geometry nodes, so J_dn(ξ) = Σ_a x_a[d] ∂N_a/∂ξ_n is a
             # function of ξ. Everything downstream that was one number per cell -- detJ, the
@@ -1964,18 +1991,24 @@ def assemble_fem_native(
             # bilinear/trilinear tensor-product cell without knowing which it has.
             gverts = pts[cells_f[_geom_field][c]]  # (n_geom, dim)
             J = jnp.einsum("ad,qan->qdn", gverts, ref_grads_all[_geom_field][..., 0, :])  # (n_q, dim, dim)
-            detJ = jnp.linalg.det(J)  # (n_q,)
+            detJ = small_det(J)  # (n_q,)
             xq = ref_vals_all[_geom_field][..., 0] @ gverts  # (n_q, dim)
         else:
             verts = pts[cells[c]]  # (dim+1, dim)
             J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
-            detJ = jnp.linalg.det(J)
             xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
+            # The baked mesh (no trainable coordinates, no runtime connectivity -- both hand in OTHER arrays):
+            # its inverse and determinant are cached. Anything else recomputes them from these vertices.
+            if _geo_cache_on and pts is pts_j and cells is cells_j:
+                K_all, det_all = _static_geometry()
+                K_cell, detJ = K_all[c], det_all[c]
+            else:
+                detJ = small_det(J)
         meas = jnp.abs(detJ)  # scalar (affine) or (n_quad,) (curved)
 
         per = []
         for i in range(len(fields)):
-            phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ)
+            phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ, K_cell)
             if _cblk[i] > 1:
                 # Enrich in PHYSICAL coordinates -- h_i(ξ)(ξ - ξ_i) would be discontinuous across a
                 # shared face, because the two cells disagree about ξ. Tagged "Lagrange" below so
@@ -2005,7 +2038,7 @@ def assemble_fem_native(
         Jacobian treats both as constants -- and unused symbols are dead code XLA drops."""
         n_q = qw_shared.shape[0]
         h_qp = jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (n_q, 1))
-        K = jnp.linalg.inv(J)  # dxi/dx: (dim, dim) affine, (n_q, dim, dim) curved
+        K = small_inv(J)  # dxi/dx: (dim, dim) affine, (n_q, dim, dim) curved
         G_qp = jnp.broadcast_to(jnp.swapaxes(K, -1, -2) @ K, (n_q, dim, dim))
         return h_qp, G_qp
 
@@ -2747,10 +2780,10 @@ def assemble_fem_native(
             _, fd_g, _, _, _ = face_tables_per_field[_geom_field]
             Jq = jnp.einsum("ad,qan->qdn", gverts, fd_g[k])  # (n_q, dim, dim)
             xq = face_tables_per_field[_geom_field][0][k] @ gverts  # (n_q, dim): x = sum_a N_a x_a
-            return Jq, jnp.linalg.inv(Jq), xq
+            return Jq, small_inv(Jq), xq
         verts = pts_src[(cells_j if cells is None else cells)[c]]
         Jc = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
-        return Jc, jnp.linalg.inv(Jc), None  # xq is formed by the caller from its own facet points
+        return Jc, small_inv(Jc), None  # xq is formed by the caller from its own facet points
 
     def _surf_elem_res(
         fi,
@@ -3099,14 +3132,14 @@ def assemble_fem_native(
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             for coeff, tfi, rnames in typed_with_masks:
-                elem = _elem_map(
+                R = _elem_map(
                     lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(
                         c, la, _e, _t, _r, t, args, pts_dyn, cl_d, clf_d
                     ),
                     (jnp.arange(n_cells), local_all),
                     _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
+                    scatter=(R, cd_d[tfi]),
                 )
-                R = R.at[cd_d[tfi].reshape(-1)].add(elem.reshape(-1))
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
@@ -3256,7 +3289,7 @@ def assemble_fem_native(
             """
             return args.get("__gap_tables__") if isinstance(args, dict) else None
 
-        def _gap_static(region, face_ids, btfi, args=None):
+        def _gap_static_impl(region, face_ids, btfi, args=None):
             """Concrete index/weight geometry of a region's gap blocks, for the pairing in ``args`` —
             shared by the pattern hoist and the traced assembly so the two cannot drift. The three
             nonlocal blocks, flat index arrays in emission order:
@@ -3318,9 +3351,16 @@ def assemble_fem_native(
             _gap_static_cache[cache_key] = out
             return out
 
+        def _gap_static(region, face_ids, btfi, args=None):
+            # Built from the pairing's CONCRETE tables and cached across calls, so it must be concrete even when
+            # its first call is inside a trace (a compiled Newton solve assembles the tangent inside its loop):
+            # staged there, the cached arrays would be that trace's tracers and leak into the next one.
+            with jax.ensure_compile_time_eval():
+                return _gap_static_impl(region, face_ids, btfi, args)
+
         _pattern_cache: Dict[str, Any] = {"tag": object(), "val": None}
 
-        def _pattern(args=None):
+        def _pattern_impl(args=None):
             """``(idx_static, plan, blk_sizes)`` for the pairing in ``args``.
 
             The sparsity pattern is derived from the pairing's concrete node ids, so it moves when the
@@ -3422,6 +3462,12 @@ def assemble_fem_native(
             _host_idx = None
             _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
             return _pattern_cache["val"]
+
+        def _pattern(args=None):
+            # Cached across calls: concrete even when first built inside a trace (see `_gap_static`). Ops on a
+            # traced runtime-connectivity bundle are still staged -- and that case is never cached.
+            with jax.ensure_compile_time_eval():
+                return _pattern_impl(args)
 
         def _host_plan(cells_host):
             """``(uniq, inv, nse)`` for a NEW triangulation, compressed on the host.

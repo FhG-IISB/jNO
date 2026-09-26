@@ -397,9 +397,9 @@ def make_per_loss_grad_fn(
         else:
             selected, held_fixed = trainable, None
 
-        # (N, P_mask), one row per loss term. NOT `jax.jacrev`: it vmaps its pullback across
-        # the output basis, and a trace containing `fem.solve()` bottoms out in `spsolve`,
-        # which has no batching rule — see `rowwise_jacobian` for the full story. Equinox
+        # (N, P_mask), one row per loss term. Not `jax.jacrev`: it vmaps its pullback across the
+        # output basis, which through `fem.solve()` holds one copy of the operator per row at once
+        # -- see `rowwise_jacobian` for the full story. Equinox
         # sentinels at frozen/non-selected positions are empty pytrees, so `tree_leaves` skips
         # them and only gradient arrays reach the concatenation.
         G = rowwise_jacobian(

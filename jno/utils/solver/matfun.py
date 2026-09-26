@@ -17,6 +17,8 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from .linear import sparse_matvec
+
 
 def _require_matfree():
     try:
@@ -33,7 +35,7 @@ def _operator(A):
     """(matvec, n, dtype) for a jNO ``LinearOperator`` / BCOO / dense matrix — the matrix-free view."""
     from .solver_api import LinearOperator
 
-    mv = A.mv if isinstance(A, LinearOperator) or hasattr(A, "mv") else (lambda v: A @ v)
+    mv = A.mv if isinstance(A, LinearOperator) or hasattr(A, "mv") else sparse_matvec(A)
     n = A.shape[0]
     dtype = jax.eval_shape(mv, jnp.zeros(n)).dtype  # matches the operator's field (real / complex)
     return mv, n, dtype
@@ -345,7 +347,7 @@ def svd(A, *, k: int = 6, depth: int | None = None, v0=None):
     from matfree import decomp, eig
 
     m, n = A.shape
-    mv = A.mv if hasattr(A, "mv") else (lambda v: A @ v)
+    mv = A.mv if hasattr(A, "mv") else sparse_matvec(A)
     dtype = jax.eval_shape(mv, jnp.zeros(n)).dtype
     p = int(min(m, n))
     k = int(k)
@@ -379,7 +381,7 @@ def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, ma
     from matfree import lstsq as _lstsq
 
     m, n = A.shape
-    mv = A.mv if hasattr(A, "mv") else (lambda v: A @ v)
+    mv = A.mv if hasattr(A, "mv") else sparse_matvec(A)
     dtype = jax.eval_shape(mv, jnp.zeros(n)).dtype
     # LSMR wants the vector–matrix product v ↦ vᵀA; get it as the transpose of the matvec (matrix-free)
     vecmat = lambda v: jax.linear_transpose(mv, jnp.zeros(n, dtype))(v)[0]  # noqa: E731

@@ -155,7 +155,9 @@ def test_staggered_solves_the_non_convex_energy_that_monolithic_cannot():
 # Oracle 3 — differentiability. The alternating structure must be absent from the derivative: at the
 # root the implicit-function theorem acts on the FULL Jacobian regardless of how the root was reached.
 # --------------------------------------------------------------------------------------------------
-def test_gradient_flows_through_the_sweep():
+@pytest.mark.parametrize("anderson", [0, 5])
+def test_gradient_flows_through_the_sweep(anderson):
+    """``anderson`` changes only the path to the root; the implicit gradient at the root is the same."""
     grad, inner = _aliases()
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
     d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
@@ -183,7 +185,7 @@ def test_gradient_flows_through_the_sweep():
 
     def norm_at(kv):
         args = {"k": jnp.reshape(kv, (1,))}
-        sol = staggered_newton(lambda z: op.residual(z, args), u0, blocks, rtol=1e-12, atol=1e-14)
+        sol = staggered_newton(lambda z: op.residual(z, args), u0, blocks, rtol=1e-12, atol=1e-14, anderson=anderson)
         return jnp.sum(sol**2)
 
     g = jax.grad(norm_at)(0.3)
@@ -538,3 +540,22 @@ def test_there_is_exactly_one_armijo_implementation():
     assert src.count("1.0 - ls_c") == 1, "the Armijo predicate is written more than once — reuse `_armijo`"
     assert src.count("jax.lax.while_loop(cond, body") >= 1
     assert src.count("def _retreat(") == 1, "there must be exactly one retreat helper"
+
+
+def test_staggered_reports_its_sweep_count():
+    fem, a, b = _convex_pair()
+    fem.solve(nonlinear=jno.solve.staggered([a, b]))
+    st = fem.stats["nonlinear"]
+    assert st["converged"] and isinstance(st["steps"], int) and st["steps"] >= 2
+
+
+def test_anderson_accelerated_sweeps_reach_the_monolithic_root_faster():
+    fem, a, b = _convex_pair()
+    ref = np.asarray(fem.solve(nonlinear=jno.solve.newton(rtol=1e-11, atol=1e-13))).reshape(-1)
+    tight = dict(rtol=1e-11, atol=1e-13)
+    fem.solve(nonlinear=jno.solve.staggered([a, b], **tight))
+    plain = fem.stats["nonlinear"]["steps"]
+    u = np.asarray(fem.solve(nonlinear=jno.solve.staggered([a, b], anderson=5, **tight))).reshape(-1)
+    fast = fem.stats["nonlinear"]["steps"]
+    assert np.linalg.norm(u - ref) / np.linalg.norm(ref) < 1e-8
+    assert fast < plain, (fast, plain)

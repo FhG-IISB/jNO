@@ -3905,12 +3905,14 @@ class FemResidualOperator:
 
         if solve_fn is None:
 
-            def solve_fn(residual_fn, y0):
-                # Default: matrix-free Jacobian-free Newton-Krylov (no optimistix dependency).
-                # Implicit-diff via custom_root, so the gradient still reaches the parameters.
-                from ..utils.solver.newton_krylov import newton_krylov
+            def solve_fn(residual_fn, y0, *, jacobian=None):
+                # Default: Newton on the ASSEMBLED tangent (this operator's ``jacobian``) when there is
+                # one, else matrix-free Newton-Krylov. Implicit-diff via custom_root either way.
+                from ..utils.solver.newton_krylov import newton_default
 
-                return newton_krylov(residual_fn, y0)
+                return newton_default(residual_fn, y0, jacobian=jacobian)
+
+            solve_fn.wants_jacobian = True
 
             # The default solver is one fixed function, so it gets one fixed identity -- built fresh
             # per call, it would otherwise defeat the compiled-solve cache below on every call.
@@ -3971,8 +3973,23 @@ class FemResidualOperator:
                     return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
                 return solve_fn(rf, u0_arg, **_xa(args))
 
-            fn = cache[key] = jax.jit(_run)
-        return fn(u0_t, *vals_t)
+            if names:
+                fn = cache[key] = jax.jit(_run)
+            else:
+                # Nothing parametric: this is the plain `fem.solve()` of a nonlinear problem, which used to
+                # run eagerly and so kept the drivers' convergence check (it raises on a solve that left on
+                # its step cap). Compiled, the check travels out of the program as outputs and is made here.
+                from ..utils.solver.newton_krylov import compiled_with_verdicts
+
+                fn = cache[key] = compiled_with_verdicts(_run)
+        if names:
+            return fn(u0_t, *vals_t)
+        from ..utils.solver.newton_krylov import judge_verdicts
+
+        u, verdicts = fn(u0_t)
+        if not isinstance(u, jax.core.Tracer):  # a caller tracing the solve (grad/vmap) gets the cap only
+            judge_verdicts(verdicts)
+        return u
 
     def __repr__(self):
         return (

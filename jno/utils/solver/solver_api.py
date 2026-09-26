@@ -66,18 +66,58 @@ class PrecondApplier:
     callable preconditioner (no ``.T``) still works: callers fall back to reusing ``M``.
     """
 
-    __slots__ = ("_fwd", "_t")
+    __slots__ = ("_fwd", "_t", "low_precision", "nonsymmetric")
 
-    def __init__(self, fwd, t=None):
+    def __init__(self, fwd, t=None, *, low_precision=False):
         self._fwd = fwd
         self._t = t
+        # Applied in a lower precision than the solve (``float32=True`` on the spec): its rounding makes it
+        # only APPROXIMATELY symmetric and linear, which `jno.solve.cg` answers with flexible CG.
+        self.low_precision = low_precision
+        # A deliberately non-symmetric preconditioner (restricted Schwarz): `jno.solve.cg` needs flexible CG.
+        self.nonsymmetric = False
 
     def __call__(self, v):
         return self._fwd(v)
 
     @property
     def T(self) -> "PrecondApplier":
-        return self if self._t is None else PrecondApplier(self._t, self._fwd)
+        return self if self._t is None else PrecondApplier(self._t, self._fwd, low_precision=self.low_precision)
+
+
+def _concrete_matvecs(A):
+    """For a CONCRETE plain BCOO: ``(A @ v, A^T @ v)`` in the measured-fastest storage, built once, lazily --
+    or ``None`` (not a plain BCOO, or traced: :func:`_split_matvecs` handles that at construction).
+
+    BCOO's own ``@`` is a scatter-add re-deriving its indices on every product. Inside a jitted solve a
+    concrete operator is a constant, so the index work folds away, but the scatter stays -- where CSR is
+    measured faster, every product paid the difference: a float64 Chebyshev preconditioner (8 products per
+    application) on 3-D elasticity ran 1029 ms against 344 ms once its products went through
+    ``sparse_matvec``. Built under ``ensure_compile_time_eval`` so the conversion happens once, eagerly,
+    even when the first product is requested inside a trace; the operator keeps it for its lifetime."""
+    from .linear import _plain_bcoo, sparse_matvec
+
+    if not _plain_bcoo(A) or isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+        return None
+    with jax.ensure_compile_time_eval():
+        return sparse_matvec(A), sparse_matvec(A, transpose=True)
+
+
+def _split_matvecs(A):
+    """``(A @ v, A^T @ v)`` closures with the index split done now, or ``None`` to keep ``A``'s own ``@``.
+
+    Only for a BCOO whose indices are TRACED -- the operator arrived as a ``jit`` argument, which is how
+    every compiled solve (:func:`_compiled_linear_solve`, the default solve) receives it. There the
+    split must be made here, once, because BCOO re-derives it on every ``@`` and XLA does not hoist
+    that out of the Krylov loop (see :func:`jno.utils.solver.linear.sparse_matvec`). A CONCRETE
+    operator is left alone: inside a trace it is a compile-time constant, XLA folds the same index work
+    away (measured: the same 630 -> 352 us per matvec), and a cached split would hold 8 bytes/nonzero of
+    device memory for as long as the operator lives, for nothing."""
+    from .linear import _plain_bcoo, sparse_matvec
+
+    if not _plain_bcoo(A) or not isinstance(A.indices, jax.core.Tracer):
+        return None
+    return sparse_matvec(A), sparse_matvec(A, transpose=True)
 
 
 class LinearOperator:
@@ -100,6 +140,7 @@ class LinearOperator:
         self._dense_fn = None
         self._shape = None
         self._transposed = _transposed
+        self._split = _split_matvecs(A)
 
     @classmethod
     def from_matvec(
@@ -144,6 +185,11 @@ class LinearOperator:
                 (out,) = jax.linear_transpose(self._mv, jnp.zeros_like(v))(v)
                 return out
             return self._mv(v)
+        if self._split is None and jnp.ndim(v) == 1:
+            self._split = _concrete_matvecs(self._A)
+        if self._split is not None and jnp.ndim(v) == 1:
+            fwd, rev = self._split
+            return rev(v) if self._transposed else fwd(v)
         # ``v @ A`` is the transposed matvec for both BCOO and dense -- no transpose materialised
         return (v @ self._A) if self._transposed else (self._A @ v)
 
@@ -162,7 +208,10 @@ class LinearOperator:
                 _transposed=not self._transposed,
             )
             return op
-        return LinearOperator(self._A, _transposed=not self._transposed)
+        op = LinearOperator.__new__(LinearOperator)
+        op.__dict__.update(self.__dict__)
+        op._transposed = not self._transposed  # shares the prepared split: no second index slice
+        return op
 
     def diag(self):
         if self._A is None:
@@ -183,6 +232,48 @@ class LinearOperator:
     @property
     def bcoo(self):
         return self._A if hasattr(self._A, "todense") else None
+
+    def astype(self, dtype) -> "LinearOperator":
+        """This operator with its STORED values in ``dtype`` (an assembled one), or with every product cast
+        to ``dtype`` (a matvec-only one -- its own arithmetic is whatever the matvec does). The sparsity
+        pattern and the transpose flag are kept."""
+        if self._A is not None:
+            A = self._A
+            if hasattr(A, "todense") and hasattr(A, "data"):
+                import jax.experimental.sparse as jsp
+
+                B = jsp.BCOO(
+                    (A.data.astype(dtype), A.indices),
+                    shape=A.shape,
+                    indices_sorted=getattr(A, "indices_sorted", False),
+                    unique_indices=getattr(A, "unique_indices", False),
+                )
+            else:
+                B = jnp.asarray(A).astype(dtype)
+            op = LinearOperator(B, _transposed=self._transposed)
+            if hasattr(B, "todense") and op._split is None:
+                from .linear import _plain_bcoo, sparse_matvec
+
+                if _plain_bcoo(B):
+                    # Products in the measured-fastest storage even for a concrete copy: BCOO's own `@` is a
+                    # scatter-add, which in float32 compiles to a compare-and-swap loop on GPUs -- measured
+                    # 0.91x (slower than float64) for a float32 Chebyshev preconditioner before this.
+                    # ...and in the copy's own precision whatever arrives (a spectrum probe, say, in float64).
+                    fwd, rev = sparse_matvec(B), sparse_matvec(B, transpose=True)
+                    op._split = (lambda v: fwd(jnp.asarray(v).astype(dtype)), lambda v: rev(jnp.asarray(v).astype(dtype)))
+            return op
+
+        def cast(f):
+            return None if f is None else (lambda *a: jnp.asarray(f(*a)).astype(dtype))
+
+        return LinearOperator.from_matvec(
+            cast(self._mv),
+            t_mv=cast(self._t_mv),
+            diag_fn=cast(self._diag_fn),
+            dense_fn=cast(self._dense_fn),
+            shape=self._shape,
+            _transposed=self._transposed,
+        )
 
 
 def _slice_bcoo(src, si: slice, sj: slice):
@@ -493,18 +584,30 @@ class NonlinearSolver:
     stepper), which threads it in via ``jacobian=``.
     """
 
-    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: bool = False):
+    def __init__(
+        self,
+        fn: Callable,
+        *,
+        name: str,
+        traits: Optional[dict] = None,
+        direct: Optional[bool] = False,
+        config: Optional[dict] = None,
+    ):
         self._fn = fn
         self.name = name
         self.direct = direct
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
+        # Every constructor argument, for the repr -- which is the solver's VALUE identity: the compiled-solve
+        # caches key on it (`_composed.cache_key`), so two specs that differ in any argument must print
+        # differently or the second silently reuses the first's compiled solve.
+        self.config = dict(config or {})
 
     def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None, project=None):
         kw = {"project": project} if project is not None else {}
         return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian, **kw)
 
     def __repr__(self):
-        return f"jno.solve.{self.name}()"
+        return f"jno.solve.{self.name}({', '.join(f'{k}={v!r}' for k, v in self.config.items())})"
 
 
 class PrecondContext:
@@ -524,10 +627,13 @@ class PrecondContext:
     forms" primitive (weighted mass matrices, low-order proxies, shifted operators).
     """
 
-    def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None):
+    def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None, mesh: Any = None):
         self.A = A
         self.fem = fem
         self._grid = grid
+        # The device mesh of a SHARDED solve (``None`` otherwise): a spec that distributes itself partitions
+        # its own data over it (see ``sharding.sharded_solve``).
+        self.mesh = mesh
 
     def diag(self):
         return self.A.diag()
@@ -721,6 +827,8 @@ def _shardable(op: LinearOperator, linear, precond) -> bool:
       preconditioner drags a full copy along saves nothing. Jacobi is the exception because it needs
       only the diagonal, and the diagonal is the same scatter-add the matvec already performs -- so it
       is computed *from the sharded triplets* and never touches an assembled matrix.
+      Also admitted: a spec that distributes ITSELF (``shardable = True``, :func:`jno.precond.schwarz`),
+      materialised inside the sharded run from the sharded operator and handed the device mesh.
     A **traced** operator is covered, by a different mechanism: ``device_put`` cannot place a tracer,
     so the parametric and differentiate-through paths take the ``with_sharding_constraint`` route in
     :func:`~.sharding.constrain_operator` instead of the ``device_put`` + ``in_shardings`` one.
@@ -736,7 +844,10 @@ def _shardable(op: LinearOperator, linear, precond) -> bool:
         return False
     if getattr(linear, "direct", False):
         return False
-    return precond is None or isinstance(precond, _Jacobi)
+    # ...and a spec that distributes ITSELF: it is materialised inside the sharded run, from the sharded
+    # triplets, and partitions its own data over the device mesh (jno.precond.schwarz: one block of
+    # subdomains per device).
+    return precond is None or isinstance(precond, _Jacobi) or bool(getattr(precond, "shardable", False))
 
 
 def _is_traced(A) -> bool:
@@ -872,7 +983,13 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
             n = int(op.shape[0])
             matvec, diag_fn = constrain_operator(op.bcoo, devices)
             mf = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(n, n))
-            M = materialize_precond(precond, PrecondContext(mf, fem)) if precond is not None else None
+            if getattr(precond, "shardable", False):
+                # Factored from the operator's values (not its matvec), partitioned over the same mesh.
+                from .sharding import operator_mesh
+
+                M = materialize_precond(precond, PrecondContext(op, fem, mesh=operator_mesh(devices)))
+            else:
+                M = materialize_precond(precond, PrecondContext(mf, fem)) if precond is not None else None
             return linear(mf, rhs, M=M, x0=x0_flat)
         if devices and not _traced and _shardable(op, linear, precond):
             from .sharding import jacobi_from_diagonal, sharded_solve
@@ -882,12 +999,17 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
             def _run(matvec, r, M, guess):
                 return linear(LinearOperator.from_matvec(matvec, shape=(n, n)), r, M=M, x0=guess)
 
+            from ...precond import _Jacobi
+
+            is_jacobi = isinstance(precond, _Jacobi)
             return sharded_solve(
                 op.bcoo,
                 rhs,
                 _run,
                 devices,
-                precond_fn=None if precond is None else jacobi_from_diagonal,
+                precond_fn=jacobi_from_diagonal if is_jacobi else None,
+                precond_spec=None if (precond is None or is_jacobi) else precond,
+                fem=fem,
                 x0=x0_flat,
             )
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
@@ -922,6 +1044,9 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
         """
         if isinstance(A, LinearOperator):
             return composed(A, b)
+        from .matvec_format import prime
+
+        prime(A)  # CSR or COO, measured on THIS operator before the compiled solve traces it
         op = LinearOperator(A)
         if devices and _shardable(op, linear, precond):
             return composed(A, b)
@@ -975,8 +1100,9 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     # ``LinearSolver.direct`` is exactly the "needs an assembled operator" flag: lu, dense, amg.
     needs_assembled = bool(getattr(linear, "direct", False))
     if nonlinear is None:
-        nonlinear = _solve_ns.newton(direct=needs_assembled)
-    elif needs_assembled and not bool(getattr(nonlinear, "direct", False)):
+        # the assembled tangent by default (direct=None); a direct linear slot pins the sparse-direct mode
+        nonlinear = _solve_ns.newton(direct=True if needs_assembled else None)
+    elif needs_assembled and getattr(nonlinear, "direct", False) is False:
         raise ValueError(
             f"fem.solve: linear={getattr(linear, 'name', linear)!r} is a DIRECT solver and needs the "
             f"assembled tangent, but nonlinear={getattr(nonlinear, 'name', nonlinear)!r} linearizes "
@@ -1029,7 +1155,11 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
 
     # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller
     # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
-    _composed.wants_jacobian = bool(getattr(nonlinear, "direct", False))
+    # ``direct=None`` (newton's default) assembles the tangent whenever one is offered, so it wants it too.
+    _composed.wants_jacobian = getattr(nonlinear, "direct", False) is not False
+    # ...but only ``direct=True`` cannot run WITHOUT one. A caller that cannot assemble the tangent (the
+    # compiled load-path contact march, whose gap tables are traced) may still use the others matrix-free.
+    _composed.needs_jacobian = getattr(nonlinear, "direct", False) is True
     # An over-relaxed driver steps past its sub-solve's answer and needs the box projector to stay
     # feasible; the `bounds` wrapper is the only thing that owns one.
     _composed.wants_project = bool(getattr(nonlinear, "wants_project", False))
@@ -1281,6 +1411,7 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
       time-dependent ``operator_fn(t, args)`` falls back to per-step materialization against a
       matvec-only operator that still exposes the exact step diagonal (so ``jacobi`` works).
     """
+    linear_step = bool(getattr(scheme, "needs_linear_step", False))
     if block.is_nonlinear():
         # A preconditioner that must SEE a matrix cannot be materialized in here: the per-step solve runs
         # inside the march's scan, so both the matrix-free JVP and the `direct=True` assembled tangent are
@@ -1290,8 +1421,17 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # BDF2 steps (the last of `step_scales`, which every step but the first uses).
         scales = tuple(scheme.step_scales(block)) if scheme is not None and hasattr(scheme, "step_scales") else ()
         precond = _freeze_precond_for_march(precond, fem, block, state, scale=scales[-1] if scales else None)
-        return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
-    if nonlinear is not None:
+        if not linear_step:
+            return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
+        # A LINEARLY implicit scheme (Rosenbrock) solves linear systems with the stage matrix even on a
+        # nonlinear block: it takes the linear step solve composed below, not a Newton driver.
+        if nonlinear is not None:
+            raise ValueError(
+                f"fem.solve(time={scheme!r}): this scheme is linearly implicit -- one linear solve per stage, no "
+                "Newton -- so nonlinear= has nothing to drive. Drop nonlinear=, or use jno.solve.sdirk() / "
+                "bdf2() / theta() for a Newton-per-step scheme."
+            )
+    elif nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
 
     if linear is None and precond is None:
@@ -1315,7 +1455,11 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     # theta*dt. BDF2 takes 2dt/3 after a full-dt startup step, so it uses two; building the block's
     # default for both would silently solve the wrong system.
     _static: dict = {}
-    _constant_operator = block.operator_fn is None and block.A is not None and block.dt is not None
+    # ...and a constant MASS: a `mass_fn` re-assembles M per step, and a prebuilt `block.M + kA` would then
+    # disagree with the right-hand side the step forms from it -- a different system, solved silently.
+    _constant_operator = (
+        block.operator_fn is None and block.mass_fn is None and block.A is not None and block.dt is not None
+    )
     _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
     def _build(key):
@@ -1351,12 +1495,22 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         hit = _static.get(key) if key is not None else None
         if hit is not None:
             return hit
+        # A scale nobody prebuilt, or a traced one: no operator, so the step solves with its OWN product
+        # (the prebuilt default-scale operator would be a different system, solved without complaint). The
+        # prebuilt preconditioner is kept: for a nearby operator it changes only the convergence speed.
         return None, (_static.get(_default_scale) or (None, None))[1]
 
-    def step_solve(matvec, rhs, x0, diag_fn, scale=None):
+    def step_solve(matvec, rhs, x0, diag_fn, scale=None, operator=None):
         op, M = _static_for(scale)
         if op is None:
-            op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
+            # `operator`: the ASSEMBLED step matrix when the scheme has one (a Rosenbrock stage matrix built
+            # from an assembled tangent) -- a direct solver can factorise it and a matrix-reading
+            # preconditioner can see it; otherwise only the matvec is known.
+            op = (
+                LinearOperator(operator)
+                if operator is not None
+                else LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
+            )
             if M is None:
                 M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         if getattr(solver, "direct", False):
@@ -1377,6 +1531,12 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     # bring-your-own solver that implements exactly that signature (caught by the moving-mesh march,
     # whose `_step_solve` takes the four documented arguments and nothing else).
     step_solve.wants_scale = True
+    step_solve.wants_operator = True
+    # Value identity for the march cache (`backend_blocks._value_identity`): a fresh closure per fem.solve, but
+    # the same solver and preconditioner for the same block (the cache lives on the block) is the same step.
+    step_solve.cache_key = (
+        "transient_step", repr(solver), repr(precond), getattr(precond, "key", None), getattr(precond, "float32", False)
+    )  # fmt: skip
     return step_solve, None
 
 

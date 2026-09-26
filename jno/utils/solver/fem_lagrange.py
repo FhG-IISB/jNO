@@ -33,6 +33,7 @@ from .fem_elements import ElementSpec
 # (2,3),(1,3),(1,2),(0,3),(0,2),(0,1). ``_promote_to_quadratic`` appends midpoint nodes in this order,
 # so a mismatch silently scrambles the P2 local DOFs against the tabulated basis.
 from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES
+from .small_linalg import small_inv
 
 
 def _lagrange_basix(cell_type, degree: int):
@@ -350,6 +351,7 @@ def identity_pushforward(
     ref_grads: jnp.ndarray,
     J: jnp.ndarray,
     detJ: jnp.ndarray,
+    K: jnp.ndarray | None = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Isoparametric push-forward of scalar Lagrange basis data to a physical cell.
 
@@ -372,12 +374,17 @@ def identity_pushforward(
     phi       : ``(n_quad, n_dof)``  physical shape values (``= ref_values[..., 0]``).
     dphi_phys : ``(n_quad, n_dof, tdim)``  physical gradients ``∂φ/∂x``.
     """
-    K = jnp.linalg.inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
+    if K is None:  # a caller with a static mesh passes its cached J⁻¹ (see fem_native `_static_geometry`)
+        K = small_inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
     phi = ref_values[..., 0]  # (n_quad, n_dof)
     dphi_ref = ref_grads[..., 0, :]  # (n_quad, n_dof, tdim)
     # One inverse per quadrature point when the geometry is curved; one for the whole cell when affine.
-    spec = "qnd,qdD->qnD" if K.ndim == 3 else "qnd,dD->qnD"
-    dphi_phys = jnp.einsum(spec, dphi_ref, K)  # (n_quad, n_dof, tdim)
+    # Written as multiply-and-sum, NOT an einsum: vmapped over cells, the einsum lowers to a batched GEMM of
+    # (n_dof x tdim) @ (tdim x tdim) blocks with layout transposes around it -- a 4x3 @ 3x3 product per cell,
+    # the worst shape a GEMM kernel can get. The broadcast form is an elementwise loop XLA fuses with its
+    # neighbours.
+    Kq = K[:, None, :, :] if K.ndim == 3 else K[None, None, :, :]  # (q|1, 1, d, D)
+    dphi_phys = jnp.sum(dphi_ref[..., :, None] * Kq, axis=-2)  # (n_quad, n_dof, tdim)
     return phi, dphi_phys
 
 
@@ -411,5 +418,5 @@ def identity_pushforward_hess(ref_hess: jnp.ndarray, J: jnp.ndarray) -> jnp.ndar
     hess_phys : ``(n_quad, n_dof, tdim, tdim)``  physical Hessian ``∂²φ/∂x∂x`` (symmetric).
     """
     _refuse_curved_hessian(J)
-    K = jnp.linalg.inv(J)  # J⁻¹
+    K = small_inv(J)  # J⁻¹
     return jnp.einsum("qnij,ia,jb->qnab", ref_hess[..., 0, :, :], K, K)
