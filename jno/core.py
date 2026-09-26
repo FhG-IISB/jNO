@@ -730,40 +730,68 @@ class core:
         return self._shard_data(jax.device_put(out))
 
     def _shard_data(self, data: Dict) -> Dict:
-        """Apply sharding to training data.
+        """Place training data on the device mesh, split over its ``"batch"`` axis.
 
-        Spatial arrays ``(B, T, N, D)`` are sharded along the batch axis.
-        The shared ``__time__`` array ``(T, 1)`` is fully replicated.
+        A context array is ``(B, T, N, D)``: samples, time slices, points, features. It is split along
+        the axis that has the work in it:
+
+        * **samples** ``B`` when there are at least as many as devices and they divide evenly -- operator
+          learning, where each device takes its share of the functions;
+        * otherwise **points** ``N``, when they divide evenly -- a PINN, whose single sample holds all the
+          collocation points. Each device then evaluates the residual on ``N/n`` points and the loss's
+          mean is one all-reduce (GSPMD inserts it; a term that couples points gets the collectives it
+          needs, so the answer is unchanged but for reduction order);
+        * otherwise the array is **replicated**, and the log says which tag and why.
+
+        This used to tile a PINN's single sample to one copy per device and split the copies, so every
+        device held and evaluated ALL the points: measured on 8 simulated devices, a (1, 1, 4096, 2)
+        ``interior`` became (8, 1, 4096, 2) with a full (1, 1, 4096, 2) on each device -- eight GPUs doing
+        one GPU's work. The shared ``__time__`` array is replicated.
         """
+        n = int(self.mesh.shape["batch"])
+        notes = self.__dict__.setdefault("_placement_notes", {})
+
+        def spec_for(key, x):
+            if key == "__time__":
+                return P(*([None] * x.ndim))
+            if n == 1:  # one device: the placement it always had (a size-1 axis splits nothing)
+                return P("batch", *([None] * (x.ndim - 1)))
+            if x.ndim == 1:
+                return P("batch") if x.shape[0] % n == 0 else P()
+            if x.shape[0] >= n and x.shape[0] % n == 0:
+                return P("batch", *([None] * (x.ndim - 1)))
+            if x.ndim >= 3 and x.shape[2] % n == 0:
+                return P(None, None, "batch", *([None] * (x.ndim - 3)))
+            return None  # replicated, with a note
 
         def shard_leaf(key, x):
+            if isinstance(x, np.ndarray):
+                x = jnp.asarray(x)
             if isinstance(x, jnp.ndarray):
                 if x.ndim == 0:
                     return x
-                # __time__ is shared across batches — replicate
-                if key == "__time__":
-                    spec = P(*([None] * x.ndim))
-                elif x.ndim == 1:
-                    spec = P("batch")
-                else:
-                    spec = P("batch", *([None] * (x.ndim - 1)))
+                spec = spec_for(key, x)
+                if spec is None:
+                    if key not in notes:
+                        notes[key] = (
+                            f"data-parallel: '{key}' {tuple(x.shape)} is replicated on all {n} devices -- neither "
+                            f"its {x.shape[0]} sample(s) nor its {x.shape[2] if x.ndim >= 3 else '-'} point(s) divide "
+                            f"by {n}; a count that does lets every device take a share of the work"
+                        )
+                        self.log.info(notes[key])
+                    spec = P()
                 return jax.device_put(x, NamedSharding(self.mesh, spec))
             return x
 
         return {k: shard_leaf(k, v) for k, v in data.items()}
 
     def _replicate_for_devices(self, data: Dict, n_devices: int) -> Dict:
-        """Tile data to have leading dimension matching device count for data parallelism."""
+        """Kept for callers; no longer tiles.
 
-        def tile_if_needed(x):
-            if isinstance(x, jnp.ndarray) and x.ndim >= 1:
-                # Check if we need to tile along batch dimension
-                if x.shape[0] < n_devices:
-                    reps = (n_devices // x.shape[0],) + (1,) * (x.ndim - 1)
-                    return jnp.tile(x, reps)
-            return x
-
-        return jax.tree_util.tree_map(tile_if_needed, data)
+        Tiling a sample to one copy per device made every device process all of the data (see
+        :meth:`_shard_data`, which now splits the points of a single sample instead). A leading axis
+        shorter than the device count is left as it is and placed by :meth:`_shard_data`."""
+        return data
 
     def wrap_constraints(self, constraints: List) -> List:
         """Auto-wrap raw expressions in OperationDef."""

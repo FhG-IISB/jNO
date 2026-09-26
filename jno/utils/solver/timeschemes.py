@@ -166,9 +166,12 @@ class _BDF2Scheme(_TimeScheme):
         import jax
         import jax.numpy as jnp
 
-        from .backend_blocks import _resample_trajectory
+        from .backend_blocks import _resample_trajectory, _scheme_sharded
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
+        sharded = _scheme_sharded(self, block, args, save_ts, linear_solve, nonlinear_solve)
+        if sharded is not None:  # a linear march, its operators split over the devices
+            return sharded
         md = block.metadata or {}
         # A STATE-DEPENDENT mass `c(u)*u_t` needs nothing extra here. Its mass action is assembled as
         # `c(u)(u - u_prev)/h` with `u_prev` the step's own starting state (see `SemidiscreteTimeBlock.step`),
@@ -203,7 +206,7 @@ class _BDF2Scheme(_TimeScheme):
         # its residual norms and they are judged below -- as in the theta march and the load path.
         _judge = bool(block.is_nonlinear())
 
-        from .backend_blocks import _cached_march, hoist_time_invariant
+        from .backend_blocks import _split_cached_march, hoist_time_invariant
 
         dt_eff = 2.0 * dt / 3.0
 
@@ -243,8 +246,8 @@ class _BDF2Scheme(_TimeScheme):
 
         # Traced ONCE per block and configuration (see `_cached_march`): an eager BDF2 march used to re-trace
         # its scan on every call -- measured ~0.3 s per warm call of a 12k-DOF heat march.
-        s1, ys = _cached_march(
-            block, (linear_solve, nonlinear_solve, "bdf2", dt), march, s0, jnp.asarray(grid_ts, dtype), args
+        s1, ys = _split_cached_march(
+            block, args, (linear_solve, nonlinear_solve, "bdf2", dt), march, s0, jnp.asarray(grid_ts, dtype), args
         )
         if _judge:
             (s1, r1_end, r1_start), (ys, _r_end, _r_start) = s1, ys
@@ -365,10 +368,13 @@ class _SDIRKScheme(_TimeScheme):
         import jax
         import jax.numpy as jnp
 
-        from .backend_blocks import _cached_march, _resample_trajectory, hoist_time_invariant
+        from .backend_blocks import _resample_trajectory, _scheme_sharded, _split_cached_march, hoist_time_invariant
         from .matvec_format import prime
 
         self._refuse(block)
+        sharded = _scheme_sharded(self, block, args, save_ts, linear_solve, nonlinear_solve)
+        if sharded is not None:  # a linear march, its operators split over the devices
+            return sharded
         prime(block.M, getattr(block, "A", None))
         _s0f = getattr(block, "state0_fn", None)
         s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
@@ -394,7 +400,7 @@ class _SDIRKScheme(_TimeScheme):
 
             return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
 
-        ys = _cached_march(block, (linear_solve, nonlinear_solve, repr(self), dt), march, s0, grid_ts, args)
+        ys = _split_cached_march(block, args, (linear_solve, nonlinear_solve, repr(self), dt), march, s0, grid_ts, args)
         if judge:
             from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -586,10 +592,13 @@ class _RosenbrockScheme(_TimeScheme):
         import jax.numpy as jnp
         import numpy as np
 
-        from .backend_blocks import _cached_march, _resample_trajectory, hoist_time_invariant
+        from .backend_blocks import _resample_trajectory, _scheme_sharded, _split_cached_march, hoist_time_invariant
         from .matvec_format import prime
 
         self._refuse(block)
+        sharded = _scheme_sharded(self, block, args, save_ts, linear_solve, nonlinear_solve)
+        if sharded is not None:  # a linear march, its operators split over the devices
+            return sharded
         if nonlinear_solve is not None:
             raise ValueError(f"{self!r} is linearly implicit: there is no Newton solve for nonlinear= to drive.")
         prime(block.M, getattr(block, "A", None))
@@ -620,7 +629,7 @@ class _RosenbrockScheme(_TimeScheme):
 
             return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
 
-        ys = _cached_march(block, (linear_solve, repr(self), dt), march, s0, grid_ts, args)
+        ys = _split_cached_march(block, args, (linear_solve, repr(self), dt), march, s0, grid_ts, args)
         traj = jnp.concatenate([s0[None, :], ys], axis=0)
         return _resample_trajectory(traj, grid_ts, save_ts, dtype)
 

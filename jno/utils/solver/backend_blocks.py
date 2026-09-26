@@ -718,6 +718,10 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     import jax
     import jax.numpy as jnp
 
+    sharded = _sharded_transient(block, args, save_ts, linear_solve, nonlinear_solve, theta)
+    if sharded is not None:
+        return sharded
+
     from .matvec_format import prime
 
     prime(block.M, getattr(block, "A", None))  # CSR or COO, measured on the real (concrete) operators
@@ -771,7 +775,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # this library targets (an un-checkpointed 6000-step × 18k-DOF case failed to allocate 5.72 GiB
     # on an 8 GB card — see the sampling note below). A pure forward solve pays nothing — checkpoint
     # is the identity outside differentiation.
-    ys = _cached_march(block, (linear_solve, nonlinear_solve, theta, dt), march, s0, grid_ts, args)
+    ys = _split_cached_march(block, args, (linear_solve, nonlinear_solve, theta, dt), march, s0, grid_ts, args)
     if _judge:
         from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -950,6 +954,134 @@ def _block_fingerprint(block):
         else:
             out.append((k, id(v)))
     return tuple(out)
+
+
+def _element_split_devices(block, args):
+    """The devices a NONLINEAR march splits its cells over, or ``[]`` to stay on one.
+
+    A Newton step has no assembled operator to partition, so each residual (and each ``J.v``) is
+    evaluated per device on a share of the elements, with one all-reduce -- the steady nonlinear route,
+    applied inside the scan (:func:`jno.utils.solver.sharding.sharded_element_add`). Taken for a march the
+    FEM dispatch marked plain (``split_cells``: no ``adapt=``, no moving geometry), evaluated eagerly:
+    under a trace the constraint would have to agree with the device commitments of the caller's ``jit``,
+    which cannot be known here (``docs/fem/inverse.md``)."""
+    import jax
+
+    from .sharding import resolve_devices
+
+    md = getattr(block, "metadata", None) or {}
+    if not (block.is_nonlinear() and md.get("split_cells")):
+        return []
+    if any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(args)):
+        return []
+    return resolve_devices(md.get("shard"))
+
+
+class _TripletOperator:
+    """An assembled operator as its ``(data, row, col)`` triplets, applied by an explicit segment-sum.
+
+    Stands in for the BCOO inside a sharded march: with the triplets partitioned on their nonzero axis
+    the segment-sum is partial per device and XLA combines it with one all-reduce -- exactly the
+    matvec :func:`jno.utils.solver.sharding.sharded_solve` uses. ``todense`` marks it as an operator
+    (not an array) for :meth:`SemidiscreteTimeBlock.step`, and ``matrix_diagonal`` reads it through
+    ``indices``/``data``/``shape`` as it reads a BCOO."""
+
+    todense = None
+
+    def __init__(self, data, indices, shape):
+        self.data, self.indices, self.shape = data, indices, tuple(shape)
+
+    def __matmul__(self, v):
+        import jax
+
+        return jax.ops.segment_sum(self.data * v[self.indices[:, 1]], self.indices[:, 0], num_segments=self.shape[0])
+
+
+def _split_cached_march(block, args, config, march, *inputs):
+    """:func:`_cached_march` with the block's element loops split over devices when it is a nonlinear march
+    that takes the split (:func:`_element_split_devices`) -- shared by every time scheme. The split is read
+    while the march is TRACED, so it is active around the (cached) trace and part of the cache key: a program
+    traced for one device must not be reused for a split run, or the reverse."""
+    from .sharding import element_devices
+
+    split = _element_split_devices(block, args)
+    with element_devices(split):
+        return _cached_march(block, (*config, tuple(d.id for d in split)), march, *inputs)
+
+
+def _scheme_sharded(scheme, block, args, save_ts, linear_solve, nonlinear_solve):
+    """:func:`_sharded_transient` for a time scheme's own ``integrate`` (BDF2, SDIRK, Rosenbrock): the scheme
+    marches the operator-split block exactly as it marches the plain one."""
+    return _sharded_transient(
+        block,
+        args,
+        save_ts,
+        linear_solve,
+        nonlinear_solve,
+        None,
+        integrate=lambda local: scheme.integrate(local, args, save_ts, linear_solve=None, nonlinear_solve=None),
+    )
+
+
+def _sharded_transient(block, args, save_ts, linear_solve, nonlinear_solve, theta, integrate=None):
+    """Run a LINEAR march across every visible device, or return ``None`` to stay on one.
+
+    The assembled ``M`` and ``A`` are partitioned on their nonzero axis and passed into the compiled
+    scan as jit ARGUMENTS -- closed over, they would be baked in as constants and replicated to every
+    device, with the right answer and no memory saving. The state vector stays replicated, so each
+    step's Krylov solve is unchanged: every matvec is partial per device plus one all-reduce, every
+    vector operation identical on all devices. The answer moves only by reduction order.
+
+    Taken automatically (``fem.solve(shard=...)`` opts out or pins devices, as for a steady solve) for
+    a linear, non-parametric march on assembled operators with the default step solve, evaluated
+    eagerly. A nonlinear march, a parametric operator, solver slots or a traced evaluation keep the
+    single-device path."""
+    import jax
+
+    from .sharding import SHARD_AXIS, operator_mesh, pad_triplets, resolve_devices, shard_triplets
+
+    shard = (getattr(block, "metadata", None) or {}).get("shard")
+    if shard is False or shard == 1:
+        return None
+    eligible = (
+        not block.is_nonlinear()
+        and getattr(block, "mass_fn", None) is None
+        and getattr(block, "operator_fn", None) is None
+        and getattr(block, "state0_fn", None) is None
+        and linear_solve is None
+        and nonlinear_solve is None
+        and hasattr(block.M, "indices")
+        and hasattr(block.A, "indices")
+        and not any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(args))
+    )
+    if not eligible:
+        return None
+    devices = resolve_devices(shard)
+    if not devices:
+        return None
+    import copy
+
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    mesh = operator_mesh(devices)
+    nd = len(devices)
+    Md, Mi, _ = pad_triplets(block.M.data, block.M.indices, nd)
+    Ad, Ai, _ = pad_triplets(block.A.data, block.A.indices, nd)
+    Md, Mi = shard_triplets(Md, Mi, mesh)
+    Ad, Ai = shard_triplets(Ad, Ai, mesh)
+    split, repl = NamedSharding(mesh, P(SHARD_AXIS)), NamedSharding(mesh, P())
+    shape_m, shape_a = block.M.shape, block.A.shape
+
+    def march(md, mi, ad, ai):
+        local = copy.copy(block)
+        local.M, local.A = _TripletOperator(md, mi, shape_m), _TripletOperator(ad, ai, shape_a)
+        local.metadata = {**(block.metadata or {}), "shard": False}  # the recursion runs the plain scan
+        if integrate is not None:  # a time scheme's own march (`_scheme_sharded`)
+            return integrate(local)
+        return _default_transient_integrate(local, args, save_ts, theta=theta)
+
+    return jax.jit(march, in_shardings=(split, split, split, split), out_shardings=repl)(Md, Mi, Ad, Ai)
 
 
 def _resample_trajectory(traj, grid_ts, save_ts, dtype):

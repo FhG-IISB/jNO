@@ -138,8 +138,32 @@ exchange, no ghost DOFs, no DOF renumbering. Every Krylov step is either a matve
 `all-reduce` inside) or a vector operation on replicated data (identical on every device, no
 communication).
 
-**What shards:** the default steady-linear solve, and the slot-composed solve
-(`linear=` any Krylov solver, with `precond=None` or `jno.precond.jacobi()`).
+**What shards:** the default steady-linear solve, the slot-composed solve (`linear=` any Krylov
+solver, with `precond=None` or `jno.precond.jacobi()`), and a **linear transient march** on assembled
+operators with the default step solve: `M` and `A` are partitioned on their nonzero axis and passed into
+the compiled `lax.scan` as arguments, the state stays replicated, and every step's Krylov solve is
+unchanged. Verified on simulated devices: each device holds exactly `nnz/n` of each operator, the
+compiled march emits `all-reduce` and no `all-gather`, and the trajectory matches one device to 1e-13.
+Every time scheme marches the split operators with its own integrator: `theta` (the default), `bdf2()`,
+`sdirk()` and `rosenbrock()` (whose stage matrix is applied as `M v + γh A v`, never concatenated), each
+checked the same way on simulated devices.
+
+**A nonlinear solve splits its cells.** A Jacobian-free Newton has no assembled operator to
+partition, so the element axis is split instead: each device evaluates the element kernel on its share of
+the cells into its own partial residual, and one `all-reduce` per evaluation combines them. `J·v` is the
+linearisation of that map and splits the same way, while the Krylov vectors stay replicated -- so neither
+Newton nor its inner solver changes. This covers the default solve, `nonlinear=jno.solve.newton(direct=True)`
+(its residual splits; see the table for its tangent), and a parametric solve given its values
+(`fem.solve(k=2.0)`), which jNO compiles itself. A **nonlinear march** (a Newton solve per time step,
+as in the Rayleigh--Bénard and melt-pool tutorials) splits every step's residual the same way inside
+its scan, when it is evaluated eagerly and has no `adapt=` or moving geometry -- under any time scheme
+(`theta`, `bdf2()`, `sdirk()`, and `rosenbrock()`, where the residuals split and the stage matrix is assembled
+on one device, as `newton(direct=True)`'s tangent is). Verified on simulated devices: the compiled `J·v` has
+exactly one `all-reduce` and no other collective, each device's scratch falls to about `1/n`, and the
+answer matches one device to the solver's tolerance (round-off on an SPD problem, 1.2e-11 on a
+Navier--Stokes saddle point). A cell count the device count does not divide is handled by a
+compile-time index table whose spare slots repeat the last cell and are dropped by the scatter -- the two
+obvious alternatives, padding and a replicated tail, each cost extra collectives in the compiled program.
 
 **Parametric / differentiate-through solves shard too, but only on an explicit `shard=`:**
 
@@ -176,7 +200,11 @@ placement leaves traced operators alone; an explicit `shard=` is a request you c
 | `precond=chebyshev()` / `form()` | not wired yet, and **not** a hard limit — Chebyshev is matvec-only by construction (spectral bounds by power iteration), so it composes with the sharded matvec directly; `form`'s auxiliary operator is just another assembled BCOO |
 | other `precond=` | the applier closes over the assembled operator, so a full copy would be replicated anyway. Jacobi is the exception: it needs only the diagonal, computed from the *sharded* triplets |
 | parametric / differentiate-through solves | **opt-in only** — needs an explicit `shard=`, see below |
-| transient | not wired yet. A sharding constraint inside the `lax.scan` body already produces the right collectives with the operator still closed over; threading it in as a jit argument additionally makes the per-device footprint provable (measured: exactly `nnz/N` per device) |
+| a LINEAR march that is parametric (`mass_fn`/`operator_fn`), uses solver slots, or is evaluated inside a trace | not wired yet; the linear, non-parametric march shards (above) |
+| a NONLINEAR march evaluated inside a trace, or with `adapt=` / moving geometry | stays on one device; a plain nonlinear march splits its cells (above) |
+| `newton(direct=True)`'s tangent | assembled and factorised on one device; only its residual splits |
+| nonlinear surface (boundary-integral) terms | evaluated on every device -- a surface has far fewer cells than the volume |
+| steady nonlinear with `adapt=`, or a deferred nonlinear node that `crux` evaluates | not wired; the node is traced inside `crux`'s `jit`, the conflict described above |
 
 No speedup figure is quoted here because none has been measured — the development machine has one
 GPU. What *is* verified, on simulated devices, is correctness, the even split, that XLA emits
