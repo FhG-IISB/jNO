@@ -778,7 +778,8 @@ def newton_direct(
             # the last refresh; `fresh` says whether it was assembled at THIS iterate.
             u, r, k, J, fresh, nfact = state
             rn = jnp.linalg.norm(r)
-            delta = linear_solve(J, -r)
+            with gate_suspended():  # as in `body`: no host callback inside the loop (reverse mode, remat)
+                delta = linear_solve(J, -r)
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u_try = u + alpha * delta
             r_try = f_fwd(u_try)

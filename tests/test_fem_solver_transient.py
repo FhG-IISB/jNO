@@ -129,7 +129,17 @@ def test_nonlinear_transient_direct_newton_inverse():
     assert abs(a - 1.0) < 0.05, f"alpha not recovered through the transient DIRECT Newton adjoint: {a}"
 
 
-def test_nonlinear_transient_inverse_through_slots():
+@pytest.mark.parametrize(
+    "make_nonlinear",
+    [
+        lambda: jno.solve.newton(),
+        # the lagged-Jacobian loop runs its step solve in its own while_loop body: it must suspend the slot's
+        # residual gate there too, or rematerialising the checkpointed march fails in JAX's loop rules
+        lambda: jno.solve.newton(direct=True, reuse=True),
+    ],
+    ids=["newton", "newton-direct-reuse"],
+)
+def test_nonlinear_transient_inverse_through_slots(make_nonlinear):
     """Reverse-mode adjoint through a NONLINEAR transient inverse with a *slot* inner solver.
 
     Regression for the transient-nonlinear adjoint: each per-step Newton solve reuses the inner
@@ -159,7 +169,7 @@ def test_nonlinear_transient_inverse_through_slots():
     assert not fem.is_linear
     u_obs = jnp.asarray(_heat(nonlinear=True, mesh_size=0.25, time=(0.0, 0.2, 11)).solve().fn())  # alpha_true = 1
 
-    node = fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.gmres(maxiter=2000))
+    node = fem.solve(nonlinear=make_nonlinear(), linear=jno.solve.gmres(maxiter=2000))
     dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
     crux = jno.core([(node - u_obs).mse], domain=dummy)
     crux.solve(120)
