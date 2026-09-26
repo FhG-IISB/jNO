@@ -10,7 +10,17 @@ import pytest
 import jno
 from jno.utils.solver.lattice import apply_stencil, offsets, probe
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """Float64 per test, restored afterwards: set at module scope it ran at import, for every module in the
+    selection, and could not be undone (tests/test_x64_isolation.py)."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _laplacian_matvec(shape, h):
