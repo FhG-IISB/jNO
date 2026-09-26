@@ -734,6 +734,38 @@ def test_constraint_list_inverse_via_crux():
     assert abs(rec - 1.0) < 2e-2, f"crux did not recover the source amplitude: s={rec:.4f}"
 
 
+@pytest.mark.parametrize("trainable", ["source", "diffusivity"])
+def test_cg_with_a_preconditioner_inside_a_crux_step(trainable):
+    """A parametric steady solve through the slots is traced inside jno.core, where cg's symmetry probe
+    (``float()`` of a matrix product) cannot run: cg + any preconditioner raised a ConcretizationTypeError.
+    The structural decisions are now made eagerly when the node is created. ``diffusivity`` puts the
+    parameter IN the operator, which is a placeholder 0 until jno.core initialises it -- a probe at that
+    value would see a singular operator, so the setup matrix is taken at a perturbed value."""
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    lap = ui.d2(x) + ui.d2(y)
+    observed = jnp.asarray(jno.fdm([-lap - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(2.5 if trainable == "source" else 0.5))
+    s.optimizer(optax.adam(1e-1 if trainable == "source" else 3e-2))
+    pde = -lap - s * f if trainable == "source" else -s * lap - f
+    node = jno.fdm([pde, u(xb, yb) - 0.0]).solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.jacobi())
+    crux = jno.core([(node - observed).mse])
+    crux.solve(120)
+    rec = float(np.asarray(crux.eval([s])).reshape(-1)[0])
+    assert abs(rec - 1.0) < 2e-2, f"crux did not recover {trainable} through cg + jacobi: s={rec:.4f}"
+
+
 def test_dirichlet_value_from_nodal_field():
     """A Dirichlet value can be a **known nodal field** (a `jno.np.parameter` carrying data, no
     optimizer) — its per-node values are gathered at the boundary. This is the symbolic path a coupled

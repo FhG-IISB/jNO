@@ -2625,6 +2625,30 @@ class _TraceFDM:
                 "any assembled operator."
             )
 
+    def _prepare_steady_slots(self, linear, precond):
+        """The eager half of a PARAMETRIC steady solve through the slots, run when its trace node is made -- the
+        steady counterpart of the transient warm-up march. Inside a ``jno.core`` step the operator is traced, so
+        whatever needs concrete values is done here: the structural decisions (affinity, sparsity pattern, and
+        for ``cg``/``minres`` symmetry -- whose probe failed on a traced ``float()``, cg + any preconditioner
+        under crux) and a preconditioner's eager preparation."""
+        import jax
+
+        from .utils.solver.solver_api import prepare_precond
+
+        zeros = jnp.zeros(self._Ntot)
+        make_probe = lambda: self._steady_residual(self._current_params())  # noqa: E731
+        with jax.ensure_compile_time_eval():
+            probe = make_probe()
+            linear_problem = self._is_affine("steady", make_probe, self._Ntot)
+            self._sparsity("steady", probe, zeros, make=make_probe)
+            if linear_problem:
+                self._require_symmetric(
+                    linear,
+                    lambda: self._dirichlet_lift("steady", self._sparse_operator("steady", make_probe(), zeros))[0],
+                    key="steady",
+                )
+        prepare_precond(precond, self)
+
     def _steady_residual(self, extra_params=None, extra_pins=None):
         """The steady residual with every boundary row folded in, as a function of the DOF vector."""
         import jax
@@ -2975,6 +2999,8 @@ class _TraceFDM:
             # values (linearity, sparsity pattern, symmetry, time-variance, the u-independence of the time
             # coefficients); each is cached, so the traced march below only reuses them. Costs one solve.
             self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond)
+        elif linear is not None or precond is not None:
+            self._prepare_steady_slots(linear, precond)
 
         def _solve(*values):  # values = the parameters' current (crux-trained) values
             extra = {
