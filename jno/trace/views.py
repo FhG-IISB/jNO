@@ -612,8 +612,15 @@ class VectorView(_DelegatesToPlaceholder):
         automatic-differentiation derivative of an expression built from finite-difference partials -- a
         thing the guard refuses, with a message about `u.x.d(x)` that named nothing the caller wrote.
         """
-        from . import TemporalDerivative
+        from ..utils.solver.solver_helper import contains_node_type
+        from . import TemporalDerivative, TrialFunction
 
+        if contains_node_type(self._expr, TrialFunction):
+            # A jno.fem trial: its own `.tt`, the automatic-differentiation time derivative the weak-form
+            # classifier reads as a second-order-in-time term. The chained TemporalDerivative below is the
+            # finite-difference form only jno.fdm reads; given to jno.fem, the block was not recognised as
+            # second order and its initial velocity `ui0.t - v0` was rejected as a malformed initial condition.
+            return getattr(self._expr, "tt")
         cv = object.__getattribute__(self, "_coord_vars") or {}
         temporal = [v for v in cv.values() if getattr(v, "axis", None) == "temporal"]
         if not temporal:
