@@ -46,6 +46,8 @@ dependencies = [
     "blackjax>=1.2",
 
     "fenics-basix", "matfree>=0.6.1,<0.7",
+    # jno.precond.schwarz(): the graph partition (METIS). Binary wheels for Linux, macOS and Windows.
+    "pymetis>=2025.1",
 ]
 
 [project.urls]

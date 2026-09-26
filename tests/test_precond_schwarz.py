@@ -2,7 +2,7 @@
 
 Oracles: the default solve (a preconditioner never changes the answer), the defining property of the two-level
 method (iterations do not grow with the number of parts; without the coarse space they do), and the partition's
-own contract (contiguous parts).
+own contract (contiguous, balanced parts; Dirichlet rows left to their diagonal).
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def test_the_coarse_space_keeps_iterations_flat_as_parts_grow():
     assert two[1] < 1.3 * two[0] and two[1] < 0.7 * one[1], (one, two)
 
 
-def test_parts_are_contiguous_even_with_isolated_dirichlet_rows():
+def test_dirichlet_rows_are_solved_by_their_diagonal_and_the_parts_are_contiguous():
     from scipy.sparse.csgraph import connected_components
 
     from jno.utils.solver.amg import _to_scipy_csr
@@ -99,15 +99,19 @@ def test_parts_are_contiguous_even_with_isolated_dirichlet_rows():
     A = _poisson()._op[0]
     spec = jno.precond.schwarz(parts=16, overlap=0)
     spec.build(A)
+    pat = spec._pattern
     S = _to_scipy_csr(A)
     G = (abs(S) + abs(S).T).tocsr()
-    part = np.asarray(spec._pattern.part)
-    diag_only = np.diff(G.indptr) == 1  # eliminated Dirichlet rows: isolated nodes
-    for i in range(16):
-        nodes = np.nonzero((part == i) & ~diag_only)[0]
-        # BFS level-set bisection can leave a part in two pieces where a cut falls mid-level; the bug this
-        # guards against left one in 568 (it ordered unreached nodes by raw index).
-        assert connected_components(G[nodes][:, nodes])[0] <= 2
+    isolated = np.diff(G.indptr) == 1  # an eliminated Dirichlet row: only its diagonal
+    part = np.asarray(pat.part)
+    # Not partitioned: they formed whole subdomains of identity rows (2 of 16 on a 514-unknown square).
+    assert np.array_equal(np.sort(np.asarray(pat.diso)), np.nonzero(isolated)[0])
+    assert np.all(part[isolated] == pat.p) and np.all(part[~isolated] < pat.p)
+    sizes = np.bincount(part[~isolated], minlength=pat.p)
+    assert sizes.min() > 0.8 * sizes.mean(), sizes  # balanced, none empty
+    for i in range(pat.p):
+        nodes = np.nonzero(part == i)[0]
+        assert connected_components(G[nodes][:, nodes])[0] == 1, f"part {i} is not contiguous"
 
 
 def test_a_transient_march():
