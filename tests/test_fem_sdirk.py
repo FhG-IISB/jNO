@@ -56,12 +56,18 @@ def test_sdirk_has_its_order(order):
 
 @pytest.mark.parametrize("order", [2, 3])
 def test_sdirk_is_l_stable(order):
-    """A stiff, boundary-incompatible start: Crank-Nicolson inverts it at full amplitude, SDIRK damps it."""
+    """A stiff, boundary-incompatible start (amplitude 1, 8 steps): Crank-Nicolson, A-stable only, rings and has
+    not decayed by the end; an L-stable SDIRK damps the stiff modes to nothing.
+
+    Judged against the initial amplitude, not against CN's dip: CN's ringing depends on how constraint rows are
+    stepped (it dipped to -1.0 while they were theta-averaged, -0.70 once they are imposed at the new time), and
+    a bound relative to it moved with that. Measured: SDIRK2 dips to -0.086 and ends at 0.0000, SDIRK3 -0.041 and
+    0.0000, against CN's -0.70 and 0.33."""
     cn = np.asarray(_heat(8, T=0.5, h=0.14, ic_one=True).solve(time=jno.solve.theta(0.5)).fn())
     sd = np.asarray(_heat(8, T=0.5, h=0.14, ic_one=True).solve(time=jno.solve.sdirk(order)).fn())
-    assert cn.min() < -0.5
-    # L-stable is damped, not monotone: SDIRK2 dips to -0.086 and SDIRK3 less, against CN's -1.0
-    assert abs(sd.min()) < 0.1 * abs(cn.min()) and np.abs(sd[-1]).max() < 0.2 * np.abs(cn[-1]).max()
+    assert cn.min() < -0.5 and np.abs(cn[-1]).max() > 0.2  # the start really is stiff for an A-stable scheme
+    assert abs(sd.min()) < 0.1  # damped, not monotone: a bounded dip, a tenth of the initial amplitude
+    assert np.abs(sd[-1]).max() < 1e-2 * np.abs(cn[-1]).max()  # L-stability: the stiff modes are gone
 
 
 def test_nonlinear_block_and_solver_slots_agree_with_a_fine_reference():
