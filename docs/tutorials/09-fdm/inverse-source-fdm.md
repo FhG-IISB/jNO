@@ -30,7 +30,7 @@ s = jno.np.parameter((1,), name="s")
 s.optimizer(optax.adam(1e-1))
 u = d.unknown(); ui = u.bind(x=x, y=y)
 
-solve = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()   # a trace node
+solve = jno.fdm([-ui.xx - ui.yy - s * f_base, u(xb, yb) - 0.0]).solve()   # a trace node
 crux  = jno.core([(solve - observed).mse])          # domain inferred from the graph
 crux.solve(150)
 ```

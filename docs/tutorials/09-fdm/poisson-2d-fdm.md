@@ -21,7 +21,7 @@ finite-difference Laplacian.
 ## The constraint list
 
 `u = domain.unknown()` is a valued nodal field — the strong-form counterpart of `fem_symbols()`.
-Binding it gives the FD derivative views (`ui.d2(x)` is the finite-difference second derivative, no
+Binding it gives the FD derivative views (`ui.xx` is the finite-difference second derivative, no
 `scheme=` needed), and the Dirichlet condition is the term `u(region) - g`:
 
 ```python
@@ -29,7 +29,7 @@ u  = d.unknown()
 ui = u.bind(x=x, y=y)
 f  = 2.0 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
 sol = jno.fdm([
-    -ui.d2(x) - ui.d2(y) - f,   # -Delta u = f
+    -ui.xx - ui.yy - f,         # -Delta u = f
     u(xb, yb) - 0.0,            # Dirichlet u = 0
 ]).solve()
 ```

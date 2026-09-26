@@ -9,10 +9,10 @@ Steady conduction on the unit square with the manufactured field ``u*(x, y) = y^
 
 A flux boundary condition is written with **that edge's own tags** -- bind the field to the edge
 (``ur = u.bind(x=xr, y=yr)``) and take its normal derivative ``ur.d(nr)`` against the outward normal
-``nr = domain.variable(region, normals=True)``. Any condition **affine in** ``du/dn`` works the same
-way: Neumann ``ur.d(n) - h``, Robin ``ur.d(n) + alpha*(u - u_inf)``, either sign -- ``jno.fdm`` reads
-the coefficient of ``du/dn`` directly, no special BC objects. Corner nodes shared by two flux edges
-fall back to the interior PDE residual.
+``nr = domain.variable(region, normals=True)``. Neumann ``ur.d(n) - h``, Robin
+``ur.d(n) + alpha*(u - u_inf)`` and nonlinear conditions work the same way: the term becomes the boundary
+node's equation, no special BC objects. A corner node shared by two flux edges carries both conditions,
+summed, each with its own edge's normal.
 """
 
 import jax
@@ -41,7 +41,7 @@ ut = u.bind(x=xt, y=yt)
 
 sol = jno.fdm(
     [
-        -ui.d2(x) - ui.d2(y) + 2.0,  # -Delta u = -2   (manufactured u = y^2)
+        -ui.xx - ui.yy + 2.0,  # -Delta u = -2   (manufactured u = y^2)
         u(xbo, ybo) - 0.0,  # Dirichlet: bottom held at 0
         ul.d(nl) - 0.0,  # Neumann: left insulated (du/dn = 0)
         ur.d(nr) - 0.0,  # Neumann: right insulated
@@ -94,7 +94,7 @@ def _solve_mixed(size):
     ut2 = uu.bind(x=xt2, y=yt2)
     s2 = jno.fdm(
         [
-            -uui.d2(xx) - uui.d2(yy) + 2.0,
+            -uui.xx - uui.yy + 2.0,
             uu(xbo2, ybo2) - 0.0,
             ul2.d(nl2) - 0.0,
             ur2.d(nr2) - 0.0,

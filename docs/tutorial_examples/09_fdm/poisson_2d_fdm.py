@@ -7,7 +7,7 @@
 ``jno.fdm`` is the **strong-form sibling** of ``jno.fem``: author the PDE and its boundary
 conditions as the *same* constraint list, with ``u = domain.unknown()`` (a valued nodal field, the
 counterpart of ``fem_symbols()``). Instead of a weak form with test functions and quadrature, the
-strong residual is collocated at the mesh nodes with finite-difference stencils -- so ``ui.d2(x)`` is
+strong residual is collocated at the mesh nodes with finite-difference stencils -- so ``ui.xx`` is
 the FD second derivative (autodiff is meaningless on a discrete field, so FD is the default; no
 ``scheme=`` needed). The Dirichlet condition is the term ``u(region) - g``, exactly as in ``jno.fem``.
 """
@@ -30,7 +30,7 @@ ui = u.bind(x=x, y=y)  # bound view with .d / .d2 (FD by default)
 f = 2.0 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
 sol = jno.fdm(
     [
-        -ui.d2(x) - ui.d2(y) - f,  # -Delta u = f   (finite differences at the mesh nodes)
+        -ui.xx - ui.yy - f,  # -Delta u = f   (finite differences at the mesh nodes)
         u(xb, yb) - 0.0,  # Dirichlet u = 0 on the boundary
     ]
 ).solve()
@@ -70,7 +70,7 @@ def _solve_poisson(size):
     uu = dm.unknown()
     uui = uu.bind(x=xx, y=yy)
     ff = 2.0 * np.pi**2 * jnn.sin(np.pi * xx) * jnn.sin(np.pi * yy)
-    s2 = jno.fdm([-uui.d2(xx) - uui.d2(yy) - ff, uu(xxb, yyb) - 0.0]).solve()
+    s2 = jno.fdm([-uui.xx - uui.yy - ff, uu(xxb, yyb) - 0.0]).solve()
     pp = np.asarray(dm.mesh_connectivity["points"])[:, :2]
     ex = np.sin(np.pi * pp[:, 0]) * np.sin(np.pi * pp[:, 1])
     r = float(np.linalg.norm(np.asarray(s2).reshape(-1) - ex) / np.linalg.norm(ex))

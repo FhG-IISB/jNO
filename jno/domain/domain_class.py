@@ -835,9 +835,10 @@ class domain(MeshIOMixin):
         # boundary) and by tag() to build the sampling pool.
         self._tag_predicates: Dict[str, Any] = {}
         # Precomputed simplex pools (segments / triangles + optional normals)
-        # for in-JIT collocation sampling — populated by ``_build_simplex_pools``
-        # after each ``_apply_mesh``.
-        self._simplex_pools: Dict[str, SimplexPool] = {}
+        # for in-JIT collocation sampling — built by ``_build_simplex_pools`` on FIRST ACCESS to
+        # ``_simplex_pools``, not at mesh-apply time (see the property below).
+        self._simplex_pool_store: Dict[str, SimplexPool] = {}
+        self._simplex_pools_built = True  # nothing to build until a mesh is applied
         # self._boundary_predicates: Dict[str, Callable] = {}
 
         # Neural operator storage
@@ -3101,10 +3102,21 @@ class domain(MeshIOMixin):
                 self.log.info(f"Derived mesh regions {_added} (not defined by the file)")
             self.mesh = mesh
             boundary_indices = self._extract_points_from_mesh(mesh)
-            self._build_simplex_pools()
+            # Deferred: the pools are a precompute for in-JIT collocation sampling, and building them
+            # was 0.45 s of a 4.1 s build at 4.2M nodes (measured) for a dict no caller reads yet.
+            # `_simplex_pools` builds them on first access, so the capability costs nothing until used.
+            self._simplex_pools_built = False
 
         if mesh is not None and self.compute_mesh_connectivity:
-            self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(mesh, self.dimension, boundary_indices)
+            # A structured grid repeats one voxel's cells everywhere (2 triangles per square, 6 Kuhn
+            # tetrahedra per cube, 1 quad/hex), so its quality line needs only the first block.
+            congruent = None
+            if getattr(self, "_structured_grid", None) is not None:
+                kinds = {c.type for c in mesh.cells}
+                congruent = 6 if "tetra" in kinds else 2 if "triangle" in kinds and self.dimension == 2 else 1
+            self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(
+                mesh, self.dimension, boundary_indices, congruent_cells=congruent
+            )
             self.log.info(msg)
 
     def _reset_custom_tag_state(self) -> None:
@@ -3203,6 +3215,49 @@ class domain(MeshIOMixin):
                 return np.asarray(facets)
         return None
 
+    @property
+    def _simplex_pools(self) -> Dict[str, SimplexPool]:
+        """The tags' collocation-sampling pools, built on first read.
+
+        Building them walks every tag's facets, which cost 0.45 s of a 4.1 s domain build at 4.2M nodes
+        (measured) -- paid by every build, while the dict is consulted only by a caller that samples a
+        tag. Reading it here gives the same pools, at the moment they are wanted."""
+        if not self._simplex_pools_built:
+            self._simplex_pools_built = True
+            self._build_simplex_pools()
+        return self._simplex_pool_store
+
+    @_simplex_pools.setter
+    def _simplex_pools(self, value: Dict[str, SimplexPool]) -> None:
+        self._simplex_pool_store = value
+        self._simplex_pools_built = True
+
+    def _lattice_boundary_nodes(self, points):
+        """Which nodes lie on the boundary, in closed form, or ``None`` when this domain is not a full
+        lattice.
+
+        A full tensor grid fills its bounding box, so a node is on the boundary exactly when one of its
+        coordinates is that axis' first or last -- the coordinates come from a ``linspace``, so the
+        comparison is exact. The guard is ``prod(shape) == n_points``: a lattice MASKED to some other
+        shape has boundary nodes strictly inside the bounding box, and a predicate that missed them would
+        drop real boundary faces rather than merely fail to prune.
+
+        It only ever prunes (:func:`jno.utils.solver.fem_facets._boundary_faces` counts what survives),
+        so the faces, their order and their normals are exactly what the unpruned count gives.
+        """
+        grid = getattr(self, "_structured_grid", None)
+        if not grid:
+            return None
+        shape = tuple(int(s) for s in grid.get("shape", ()) or ())
+        dim = int(self.dimension)
+        if len(shape) != dim or int(np.prod(shape)) != len(points):
+            return None
+        on = np.zeros(len(points), dtype=bool)
+        for axis in range(dim):
+            col = np.asarray(points)[:, axis]
+            on |= (col == col.min()) | (col == col.max())
+        return on
+
     def _build_simplex_pools(self) -> None:
         """Populate ``self._simplex_pools`` from ``_tag_edges`` / ``_tag_triangles``.
 
@@ -3244,7 +3299,7 @@ class domain(MeshIOMixin):
         for tag, tri_indices in self._tag_triangles.items():
             tri_coords = points_d[tri_indices]
             if tri_coords.ndim == 3 and tri_coords.shape[1] == 3 and tri_coords.shape[2] == 2:
-                self._simplex_pools[tag] = SimplexPool.from_triangles(tri_coords)
+                self._simplex_pool_store[tag] = SimplexPool.from_triangles(tri_coords)
                 triangle_tags_this_build.add(tag)
 
         # 1-D interior + 2-D boundary tags (segment pool, with normals on dim=2).
@@ -3268,7 +3323,7 @@ class domain(MeshIOMixin):
                 cand[flip] *= -1.0
                 normals = cand.astype(np.float32)
 
-            self._simplex_pools[tag] = SimplexPool.from_segments(seg_coords, normals=normals)
+            self._simplex_pool_store[tag] = SimplexPool.from_segments(seg_coords, normals=normals)
 
     @staticmethod
     def _cells_of(block_data, indices, offset):
@@ -3297,7 +3352,9 @@ class domain(MeshIOMixin):
         self._boundary_regions = {}
 
         if self.dimension > 1:
-            boundary_normals, boundary_indices = self.get_boundary_normals(mesh)
+            boundary_normals, boundary_indices = self.get_boundary_normals(
+                mesh, boundary_nodes=self._lattice_boundary_nodes(points)
+            )
             boundary_normals = boundary_normals[:, : self.dimension]
         else:
             left_boundary = np.where(points[:, 0] == np.min(points[:, 0]))[0]
@@ -3424,8 +3481,18 @@ class domain(MeshIOMixin):
                 tag_edges = np.concatenate(tag_edge_blocks, axis=0) if tag_edge_blocks else np.zeros((0, 2), int)
                 tag_tris = np.concatenate(tag_tri_blocks, axis=0) if tag_tri_blocks else np.zeros((0, 3), int)
                 tag_quads = np.concatenate(tag_quad_blocks, axis=0) if tag_quad_blocks else np.zeros((0, 4), int)
-                # np.unique both de-duplicates and sorts, which is what `sorted(set(...))` did
-                tag_points = np.unique(np.concatenate(tag_point_blocks)) if tag_point_blocks else np.zeros(0, int)
+                # De-duplicated and sorted, which is what `sorted(set(...))` did -- but by marking a
+                # boolean over the node ids rather than by `np.unique`, which sorts. The ids are bounded
+                # by the node count, so a scatter plus `flatnonzero` is linear where a sort is N log N,
+                # and the interior tag holds EVERY cell: 25M ids at 4.2M nodes in 2-D, where the sort was
+                # the single largest line of the build (measured: 1.0 s of 5.9 s).
+                if tag_point_blocks:
+                    seen = np.zeros(len(points), dtype=bool)
+                    for _blk in tag_point_blocks:
+                        seen[_blk] = True
+                    tag_points = np.flatnonzero(seen)
+                else:
+                    tag_points = np.zeros(0, int)
 
                 if len(tag_quads):
                     self._tag_quads[name] = np.asarray(tag_quads, dtype=int)
@@ -3445,7 +3512,12 @@ class domain(MeshIOMixin):
                         # interior free. Append rather than merge, so the ordered loop stays a prefix
                         # for the consumers that rely on it. Empty for a straight mesh, where the chain
                         # already covers every node, so this path is unchanged there.
-                        _extra = np.setdiff1d(tag_points, np.asarray(indices_list, dtype=int))
+                        # marked over the node ids rather than `np.setdiff1d`, which sorts both sides;
+                        # `tag_points` is already sorted and unique, so the result is identical
+                        _seen = np.zeros(len(points), dtype=bool)
+                        _seen[np.asarray(tag_points, dtype=int)] = True
+                        _seen[np.asarray(indices_list, dtype=int)] = False
+                        _extra = np.flatnonzero(_seen)
                         if _extra.size:
                             indices_list = np.concatenate([np.asarray(indices_list, dtype=int), _extra])
                     else:
@@ -3632,6 +3704,10 @@ class domain(MeshIOMixin):
         trial/test gradient, so a stabilized term still classifies (``term_kind``) by its u/v
         gradient structure, and ``h`` is geometry (constant w.r.t. the unknown) so differentiable
         assembly is unaffected. (Not meaningful for PINN / boundary-facet terms.)
+
+        In ``jno.fdm`` it is the per-node **spacing** ``h`` instead — the mean of ``(d!·|K|)^(1/d)`` over
+        the node's cells, exactly the grid spacing on a structured grid (``h/√2`` here would break
+        stencil identities such as upwinding, ``b*ui.x - abs(b)*h/2*ui.xx``).
         """
         if "cell_size" not in self.context:
             # Placeholder so the Variable constructs; the real per-cell h is packed at assembly time

@@ -321,10 +321,11 @@ def test_bdf2_damps_the_stiff_modes_crank_nicolson_rings_on():
     Measured with 8 steps over T = 0.5, an initial condition incompatible with the boundary (so the
     stiffest modes are excited), and a solution that is physically dead long before the end:
 
-        Crank-Nicolson   min u = -1.00   (the IC amplitude -- undecayed, just inverted)
+        Crank-Nicolson   min u = -0.70   (interior; the final field still carries 0.33)
         BDF2             min u = -0.023
 
-    A 43x smaller spurious excursion, and the final field is decayed rather than ringing. It is stated
+    (It read -1.00 before the constraint rows were imposed at the new time: that was the boundary node
+    flipping sign, not the stiff modes.) A 30x smaller spurious excursion, and the final field is decayed rather than ringing. It is stated
     as an amplitude and not as "no oscillation": BDF2 is not monotone either, it is *damped*.
     """
     n, T = 8, 0.5
@@ -411,3 +412,26 @@ def test_the_default_save_grid_returns_the_trajectory_without_resampling(monkeyp
         fired.clear()
         _heat(6).solve(time=scheme).fn()
         assert fired == [True], f"{scheme!r}: the identity fast path did not fire ({fired})"
+
+
+def _on_boundary(fem):
+    p = np.asarray(fem.domain.mesh_connectivity["points"])[:, :2]
+    return (np.minimum(p[:, 0], 1.0 - p[:, 0]) < 1e-9) | (np.minimum(p[:, 1], 1.0 - p[:, 1]) < 1e-9)
+
+
+def test_crank_nicolson_imposes_the_boundary_at_the_new_time():
+    """A Dirichlet row has no mass, so it is a constraint. Crank–Nicolson averaged it over the step,
+    ½u⁺ + ½u = g, and a boundary started off its value (IC = 1, g = 0) flipped sign every step at full
+    amplitude. It is now imposed at t + Δt, as backward Euler does (Hairer & Wanner II, §VI.1)."""
+    fem = _rough_heat(8, 0.5)
+    traj = np.asarray(fem.solve(time=jno.solve.theta(0.5)).fn())
+    assert np.abs(traj[1:, _on_boundary(fem)]).max() < 1e-10
+
+
+def test_forward_euler_through_a_solver_slot():
+    """θ = 0: the pre-built step matrix M + 0·A has empty constraint rows; it carries Δt·A there."""
+    fem = _heat(400, T=0.01)
+    ref = np.asarray(fem.solve(time=jno.solve.theta(0.0)).fn())
+    got = np.asarray(fem.solve(time=jno.solve.theta(0.0), linear=jno.solve.gmres()).fn())
+    assert np.isfinite(got).all() and np.abs(got - ref).max() < 1e-8
+    assert np.abs(got[1:, _on_boundary(fem)]).max() < 1e-12

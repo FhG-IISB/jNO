@@ -28,8 +28,20 @@ This page is the complete menu of what you can do to one, in two families:
 
 ### Differentiation
 
-Every expression carries derivative methods; the differentiation **scheme rides on the call**. The
-method forms and the `jno.numpy` (`jnn`) free-function forms are equivalent:
+Bind a field to its coordinates once, then write derivatives as they appear on paper. This is the form
+the docs use throughout, for PINNs, `jno.fem` and `jno.fdm` alike:
+
+```python
+u = net(jnn.concat([x, y], axis=-1)).scalar.bind(x=x, y=y)   # a network; d.unknown().bind(...) for FDM
+u.x, u.y                          # ∂u/∂x, ∂u/∂y
+u.xx, u.xy, u.yy                  # second derivatives; u.xx + u.yy is the Laplacian
+u.t, u.tt                         # time derivatives (bind t=t)
+u.d(n)                            # directional / normal derivative
+u = U.bind(x=x, y=y, scheme=jno.fd(order=4))   # a scheme on the binding: every .x/.xx of u uses it
+```
+
+The method forms below are the same operators, useful as shorthand (`.grad()`, `.div()`, `.laplacian()`)
+or to put a scheme on a single call. They and the `jno.numpy` (`jnn`) free functions are equivalent:
 
 ```python
 import jno.numpy as jnn
@@ -58,6 +70,7 @@ Vector-calculus helpers live on `jnn`: `jnn.jacobian`, `jnn.divergence`, `jnn.cu
 | `"finite_difference:cotangent"` | — | ✅ | Cotangent Laplacian; **2D only** |
 | `"spectral"` | ✅ | ✅ | FFT along the grid axes; **uniform grid**, assumes periodicity |
 | `"spectral:cosine"` | ✅ | ✅ | Even extension instead — for fields with `u' = 0` at both ends |
+| `jno.fd(order=, points=, weights=, boundary=, upwind=, average=, fit=, rings=)` | ✅ | ✅ | Any finite-difference stencil, described by its mathematics — see [FDM: any stencil](fdm.md#any-stencil-jnofd) |
 
 Set a project-wide default with `jno.setup(__file__, diff_type="spectral")` — `diff_type` takes
 either a whole scheme or an AD sub-mode (`"forward"` / `"reverse"`, its original meaning). A
@@ -119,7 +132,7 @@ not a blanket upgrade — a residual usually has different boundary behaviour al
 On `−∇²u = 5π² sin(2πx) sin(πy)`, periodic in `x` and Dirichlet in `y`:
 
 ```python
-res = -ui.d2(x, scheme="spectral") - ui.d2(y) - f     # exact basis in x, stencil in y
+res = -ui.d2(x, scheme="spectral") - ui.yy - f        # exact basis in x, stencil in y
 ```
 
 | | rel-L2 |
@@ -148,8 +161,8 @@ for every `finite_difference` scheme (`:cotangent` returns the whole Laplacian f
 dimension, so folding would halve it). FEM weak forms are left untouched — the variational route
 lowers them by pattern.
 
-**FEM weak forms — `.bind` then attribute derivatives.** A finite-element trial/test symbol is bound to
-its quadrature coordinates once, after which derivatives read as plain attributes:
+**FEM weak forms — `.bind` then attribute derivatives.** A finite-element trial/test symbol is bound the
+same way, to its quadrature coordinates:
 
 ```python
 ui = u.bind(x=xi, y=yi, t=ti)     # bind the symbol to coordinates
@@ -245,8 +258,8 @@ rewrites it to a well-scaled `O(1)` form.
 
 ```python
 x = x.unit("m").scale(L)          # dimension + characteristic length
-u = net(x, t).unit("K").scale(U)  # dimension + characteristic magnitude of the field
-res = u.d(t) - alpha * u.d2(x)
+u = net(x, t).unit("K").scale(U).scalar.bind(x=x, t=t)  # dimension + characteristic magnitude of the field
+res = u.t - alpha * u.xx
 
 jno.units.check(res)                       # audit dimensional consistency (.warnings is empty if OK)
 jno.units.infer(res)                       # the inferred Unit of an expression

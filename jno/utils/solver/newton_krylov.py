@@ -24,6 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .krylov import gmres as _scaled_gmres
+
 __all__ = ["newton_krylov", "newton_direct", "staggered_newton", "bicgstab"]
 
 _EPS = 1e-300
@@ -53,8 +55,11 @@ def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, fac
     """
     if any(isinstance(v, jax.core.Tracer) for v in (u, u0)):
         return u
-    rn = float(jnp.linalg.norm(f0(u)))
-    bound = atol + rtol * float(jnp.linalg.norm(f0(u0)))
+    r, r0 = f0(u), f0(u0)
+    if any(isinstance(v, jax.core.Tracer) for v in (r, r0)):  # a concrete root of a residual under `grad`
+        return u
+    rn = float(jnp.linalg.norm(r))
+    bound = atol + rtol * float(jnp.linalg.norm(r0))
     LAST_NEWTON_STATS.clear()
     LAST_NEWTON_STATS.update(
         driver=who,
@@ -214,15 +219,33 @@ def bicgstab(matvec, b, *, tol=1e-10, maxit=2000):
         x, r, rhat, rho, alpha, omega, v, p, k = s
         rho_new = rhat @ r
         beta = (rho_new / (rho + _EPS)) * (alpha / (omega + _EPS))
-        p = r + beta * (p - omega * v)
-        v = matvec(p)
-        alpha = rho_new / (rhat @ v + _EPS)
-        sv = r - alpha * v
+        p1 = r + beta * (p - omega * v)
+        v1 = matvec(p1)
+        alpha1 = rho_new / (rhat @ v1 + _EPS)
+        sv = r - alpha1 * v1
         t = matvec(sv)
-        omega = (t @ sv) / (t @ t + _EPS)
-        x = x + alpha * p + omega * sv
-        r = sv - omega * t
-        return x, r, rhat, rho_new, alpha, omega, v, p, k + 1
+        omega1 = (t @ sv) / (t @ t + _EPS)
+        x1 = x + alpha1 * p1 + omega1 * sv
+        r1 = sv - omega1 * t
+        # Breakdown: r̂·v = 0 (or ρ = 0) makes alpha overflow, and the iterate went NaN. Measured on a
+        # 401² heat step at Δt = 0.1: r̂·v hit exactly 0 at iteration 1722 with the residual stalled just
+        # above its target, alpha = 2e275, then NaN. The standard remedy is a restart with a fresh shadow
+        # residual r̂ = r (x and r kept); a half-step that already converged (s = 0) is taken as is.
+        half = jnp.linalg.norm(sv) <= tol * bnorm
+        x1, r1 = jnp.where(half, x + alpha1 * p1, x1), jnp.where(half, sv, r1)
+        ok = jnp.isfinite(jnp.linalg.norm(x1)) & jnp.isfinite(jnp.linalg.norm(r1)) & (rho_new != 0)
+        keep = lambda new, old: jnp.where(ok, new, old)  # noqa: E731
+        return (
+            keep(x1, x),
+            keep(r1, r),
+            keep(rhat, r),
+            keep(rho_new, one),
+            keep(alpha1, one),
+            keep(omega1, one),
+            keep(v1, z),
+            keep(p1, z),
+            k + 1,
+        )
 
     z = jnp.zeros_like(b)
     one = jnp.array(1.0, b.dtype)
@@ -262,7 +285,24 @@ def _linsolve(matvec, b, *, tol, maxit, gate_forward=True):
     solve = lambda mv, rhs: bicgstab(mv, rhs, tol=tol, maxit=maxit)
     who = "the newton_krylov inner BiCGStab"
     fwd = _gated(solve, who, "forward") if gate_forward else solve
-    return jax.lax.custom_linear_solve(matvec, b, fwd, transpose_solve=_gated(solve, who, "transpose"))
+    rescued = lambda mv, rhs: _with_gmres_rescue(mv, rhs, bicgstab(mv, rhs, tol=tol, maxit=maxit), tol=tol)
+    return jax.lax.custom_linear_solve(matvec, b, fwd, transpose_solve=_gated(rescued, who, "transpose"))
+
+
+def _with_gmres_rescue(mv, rhs, x, *, tol):
+    """``x`` if it solves ``mv(x) = rhs`` to ``tol`` (true residual), else a GMRES re-solve.
+
+    Only the TRANSPOSE (adjoint) solve takes this path. BiCGStab can break down on ``Aᵀ`` while converging on
+    ``A``: on an FDM time step, whose algebraic boundary rows make the operator non-symmetric, it returned a
+    NaN, and a crux inverse for a diffusivity died on it. GMRES has no breakdown division. The forward
+    solve keeps plain BiCGStab, so a march that is not being differentiated pays nothing."""
+    eps = float(jnp.finfo(rhs.dtype).eps)
+    rel = jnp.linalg.norm(mv(x) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
+    return jax.lax.cond(
+        rel < max(10.0 * tol, 1e4 * eps),
+        lambda: x,
+        lambda: _scaled_gmres(mv, rhs, tol=tol, atol=0.0, restart=30)[0],
+    )
 
 
 def _step_and_tangent(linear_solve, who, *, tol, maxit):
@@ -455,11 +495,22 @@ def newton_direct(
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
     u0 = jnp.asarray(u0).reshape(-1)
 
+    # The forward loop must carry no tangents: the gradient comes from `custom_root` below, never from
+    # the loop. Closed over directly, the residual's parameters made `jax.grad` trace the loop, which it
+    # cannot transpose ("Reverse-mode differentiation does not work for lax.while_loop"). `lu` got away
+    # with it because those tangents were dead code; a Krylov slot's residual gate keeps them alive, so
+    # every iterative `linear=` on this path was not differentiable.
+    f_c, f_consts = jax.closure_convert(f0, u0)
+    J_c, J_consts = jax.closure_convert(jacobian_fn, u0)
+    f_consts, J_consts = jax.lax.stop_gradient((f_consts, J_consts))
+    f_fwd = lambda u: f_c(u, *f_consts)  # noqa: E731
+    J_fwd = lambda u: J_c(u, *J_consts)  # noqa: E731
+
     def _backtrack(u, delta, rn):  # residual-norm Armijo -- the same retreat newton_krylov uses
-        return _retreat(_armijo(f0, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
+        return _retreat(_armijo(f_fwd, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
     def _forward(x0):
-        r0n = jnp.linalg.norm(f0(x0))
+        r0n = jnp.linalg.norm(f_fwd(x0))
 
         def cond(state):
             _u, r, k = state[:3]
@@ -467,14 +518,14 @@ def newton_direct(
 
         def body(state):
             u, _r, k = state
-            r = f0(u)
-            delta = linear_solve(jacobian_fn(u), -r)  # DIRECT solve of the assembled tangent
+            r = f_fwd(u)
+            delta = linear_solve(J_fwd(u), -r)  # DIRECT solve of the assembled tangent
             alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
             u = u + alpha * delta
-            return u, f0(u), k + 1
+            return u, f_fwd(u), k + 1
 
         if not reuse:
-            u, _r, k = jax.lax.while_loop(cond, body, (x0, f0(x0), 0))
+            u, _r, k = jax.lax.while_loop(cond, body, (x0, f_fwd(x0), 0))
             return u, k, k
 
         def body_reuse(state):
@@ -485,7 +536,7 @@ def newton_direct(
             delta = linear_solve(J, -r)
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u_try = u + alpha * delta
-            r_try = f0(u_try)
+            r_try = f_fwd(u_try)
             theta = jnp.linalg.norm(r_try) / rn
             stale = jnp.logical_not(fresh)
             # NaN-safe by construction: `not (theta < x)` is True for a NaN contraction.
@@ -493,10 +544,10 @@ def newton_direct(
             refresh = stale & jnp.logical_not(theta < 0.5)
             u_new = jnp.where(reject, u, u_try)
             r_new = jnp.where(reject, r, r_try)
-            J_new = jax.lax.cond(refresh, lambda: jacobian_fn(u_new), lambda: J)
+            J_new = jax.lax.cond(refresh, lambda: J_fwd(u_new), lambda: J)
             return u_new, r_new, k + 1, J_new, refresh, nfact + refresh.astype(jnp.int32)
 
-        state0 = (x0, f0(x0), 0, jacobian_fn(x0), jnp.asarray(True), jnp.asarray(1, jnp.int32))
+        state0 = (x0, f_fwd(x0), 0, J_fwd(x0), jnp.asarray(True), jnp.asarray(1, jnp.int32))
         u, _r, k, _J, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
         return u, k, nfact
 

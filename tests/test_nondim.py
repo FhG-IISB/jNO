@@ -76,6 +76,23 @@ class TestDimensionlessGroups:
         # both terms are dimensionally identical (K/s) — the physics is in π
         assert terms[0].unit == terms[1].unit == Unit.parse("K/s")
 
+    def test_bound_attribute_form_splits_like_the_method_form(self):
+        # `u.bind(...)` then `u.t - α·u.xx` is a typed view wrapping the `-`; the split must see through
+        # the view. It used to return ONE term (the whole view), so the Fourier number was lost.
+        L, tau, U, alpha0 = 0.1, 5.0, 50.0, 1e-5
+        x = make_var("x").unit("m").scale(L)
+        t = make_var("t").unit("s").scale(tau)
+        u = make_var("u").unit("K").scale(U)
+        alpha = make_var("alpha").unit("m^2/s").scale(alpha0)
+
+        ub = u.scalar.bind(x=x, t=t)
+        terms = jno.units.nondimensionalize(ub.t - alpha * ub.xx).residuals[0].terms
+        ref = jno.units.nondimensionalize(u.d(t) - alpha * u.d2(x)).residuals[0].terms
+        assert len(terms) == len(ref) == 2
+        assert [tm.sign for tm in terms] == [tm.sign for tm in ref]
+        assert math.isclose(terms[1].pi / terms[0].pi, alpha0 * tau / L**2, rel_tol=1e-9)
+        assert terms[0].unit == terms[1].unit == Unit.parse("K/s")
+
     def test_advection_diffusion_peclet_number(self):
         # ∂u/∂t + V ∂u/∂x = α ∂²u/∂x²  →  Péclet Pe = V L / α₀
         L, tau, U, V0, alpha0 = 0.2, 3.0, 50.0, 2.0, 1e-4

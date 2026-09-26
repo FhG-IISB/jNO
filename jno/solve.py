@@ -225,6 +225,19 @@ def dense() -> LinearSolver:
     return LinearSolver(_fn, name="dense", direct=True)  # one LAPACK call: no iteration to compile away
 
 
+def _unit_scaled(M, b):
+    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for ``jax.scipy.sparse.linalg.gmres``.
+
+    JAX's GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below ``tol·‖b‖``, an
+    UNpreconditioned norm. A preconditioner far from unit scale moves that test by its scale: with Jacobi
+    on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of 1.5e-4 read as 7.5e-9
+    and was returned without a single iteration. A constant multiple of ``M`` leaves the Krylov iterates
+    unchanged and puts both norms on the same scale, so ``tol`` means what it says."""
+    Mb = jnp.linalg.norm(M(b))
+    scale = jnp.where(Mb > 0, jnp.linalg.norm(b) / jnp.where(Mb > 0, Mb, 1.0), 1.0)
+    return lambda r: scale * M(r)
+
+
 def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed):
     # Routed through `_firewalled` for the same reason the raw solvers are: `jax.scipy.sparse.linalg`
     # wraps itself in `custom_linear_solve`, so its transpose solve is JAX's -- out of reach, and
@@ -233,13 +246,25 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
     # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
-        method = getattr(jax.scipy.sparse.linalg, name)
-        raw = lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+        from .utils.solver.krylov import gmres as _scaled_gmres
+
+        method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
+
+        def raw(mv, rhs, M, x0):
+            if name == "gmres" and M is not None:
+                M = _unit_scaled(M, rhs)
+            return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
-    return LinearSolver(_fn, name=name, key=(tol, atol, maxiter, tuple(sorted(fixed.items()))))
+    return LinearSolver(
+        _fn,
+        name=name,
+        key=(tol, atol, maxiter, tuple(sorted(fixed.items()))),
+        settings=dict(tol=tol, atol=atol, maxiter=maxiter, **fixed),
+    )
 
 
 def cg(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = 20_000) -> LinearSolver:
@@ -326,7 +351,7 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
         raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
 
-    return LinearSolver(_fn, name="minres", key=(tol, maxiter))
+    return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
 
 
 def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
@@ -350,7 +375,7 @@ def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
         # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg")
 
-    return LinearSolver(_fn, name="cocg", key=(tol, maxiter))
+    return LinearSolver(_fn, name="cocg", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
 
 
 def chebyshev(

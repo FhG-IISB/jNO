@@ -56,8 +56,31 @@ The default ``"finite_difference"`` (no suffix) keeps the existing
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+def _mesh_route(method, grid):
+    """For a ``jno.fd(...)`` spec on an unstructured mesh: ``"fit"`` (a polynomial least-squares fit),
+    ``"default"`` (grid-only options such as ``average=`` only: the kernel's default stencil), or raise for
+    options that exist only on a grid. ``None`` on a structured grid or for a scheme string."""
+    if grid is not None or not _is_stencil(method):
+        return None
+    return method.mesh_route()
+
+
+def _mesh_fit(u, points, cells, spec, axes):
+    from .stencils import mesh_fit_derivative
+
+    return mesh_fit_derivative(u, points, cells, spec, axes)
+
+
+def _is_stencil(method) -> bool:
+    """Is ``method`` a ``jno.fd(...)`` stencil spec?"""
+    from .stencils import FDStencil
+
+    return isinstance(method, FDStencil)
 
 
 class DifferentialOperators:
@@ -192,6 +215,32 @@ class DifferentialOperators:
     # ══════════════════════════════════════════════════════════════════
 
     @staticmethod
+    def _grid_stencil_diff(field, h: float, axis: int, deriv: int, spec, periodic: bool = False):
+        """``∂^deriv/∂x_axis^deriv`` of a field on a regular grid with the stencil ``spec`` (a
+        :class:`jno.stencils.FDStencil`): the interior stencil on every node it fits, a one-sided one of order
+        ``spec.boundary`` near the ends, or the interior stencil wrapped on a periodic axis. Differentiable."""
+        u = jnp.moveaxis(jnp.asarray(field), axis, 0)
+        scale = 1.0 / (h**deriv)
+        if periodic:  # the N unique nodes; the redundant last node (x = L ≡ x = 0) is re-appended equal to node 0
+            uu = u[:-1]
+            offs, w = spec.stencils(deriv, uu.shape[0], periodic=True)[0]
+            d = sum(float(wk) * jnp.roll(uu, -int(o), 0) for o, wk in zip(offs, w)) * scale
+            return jnp.moveaxis(jnp.concatenate([d, d[:1]], axis=0), 0, axis)
+        n = u.shape[0]
+        per_node = spec.stencils(deriv, n)
+        offs, w = per_node[n // 2] if n > 0 else per_node[0]
+        lo, hi = min(offs), max(offs)
+        out = jnp.zeros_like(u)
+        first, last = -lo, n - 1 - hi  # the nodes the interior stencil fits
+        if last >= first:
+            core = sum(float(wk) * u[first + o : last + 1 + o] for o, wk in zip(offs, w))
+            out = out.at[first : last + 1].set(core)
+        for i in list(range(0, max(first, 0))) + list(range(max(last + 1, 0), n)):
+            o_i, w_i = per_node[i]
+            out = out.at[i].set(sum(float(wk) * u[i + o] for o, wk in zip(o_i, w_i)))
+        return jnp.moveaxis(out * scale, 0, axis)
+
+    @staticmethod
     def _grid_second_diff(field: jnp.ndarray, h: float, axis: int, periodic: bool = False) -> jnp.ndarray:
         """Second derivative ``∂²/∂x_axis²`` of a field sampled on a **regular grid** — the 3-point
         central stencil ``(u₊ − 2u + u₋)/h²`` in the interior, and a 3-point one-sided stencil at the two
@@ -208,11 +257,29 @@ class DifferentialOperators:
             uu = u[:-1]  # the N unique nodes (drop the redundant x=L ≡ x=0)
             d2u = (jnp.roll(uu, -1, 0) + jnp.roll(uu, 1, 0) - 2.0 * uu) * inv  # wrap-central
             return jnp.moveaxis(jnp.concatenate([d2u, d2u[:1]], axis=0), 0, axis)  # node N ≡ node 0
-        d2 = jnp.zeros_like(u)
-        d2 = d2.at[1:-1].set((u[2:] - 2.0 * u[1:-1] + u[:-2]) * inv)  # central interior
-        d2 = d2.at[0].set((u[0] - 2.0 * u[1] + u[2]) * inv)  # forward one-sided
-        d2 = d2.at[-1].set((u[-1] - 2.0 * u[-2] + u[-3]) * inv)  # backward one-sided
-        return jnp.moveaxis(d2, 0, axis)
+        f = jnp.asarray(field)
+
+        def _scatter(f):  # CPU: XLA multithreads this form (44 GB/s on a 4096² grid, i.e. DRAM bandwidth)
+            u = jnp.moveaxis(f, axis, 0)
+            d2 = jnp.zeros_like(u)
+            d2 = d2.at[1:-1].set((u[2:] - 2.0 * u[1:-1] + u[:-2]) * inv)  # central interior
+            d2 = d2.at[0].set((u[0] - 2.0 * u[1] + u[2]) * inv)  # forward one-sided
+            d2 = d2.at[-1].set((u[-1] - 2.0 * u[-2] + u[-3]) * inv)  # backward one-sided
+            return jnp.moveaxis(d2, 0, axis)
+
+        def _edge_pad(f):  # GPU: fuses into one kernel (172 GB/s vs 127 for the scatter form, RTX 3070)
+            # The one-sided difference at an end node IS the central difference at its neighbour
+            # ((u0 − 2u1 + u2) either way), so the result is the central interior with its edges repeated.
+            sl = lambda a, b: jax.lax.slice_in_dim(f, a, b, axis=axis)  # noqa: E731
+            n = f.shape[axis]
+            interior = (sl(2, n) - 2.0 * sl(1, n - 1) + sl(0, n - 2)) * inv
+            pad = [(0, 0)] * f.ndim
+            pad[axis] = (1, 1)
+            return jnp.pad(interior, pad, mode="edge")
+
+        # Same stencil, two spellings: each backend fuses a different one. On CPU the edge pad ran on one
+        # thread (14.5 GB/s); on GPU the scatters did not fuse. The results agree to rounding.
+        return jax.lax.platform_dependent(f, cpu=_scatter, default=_edge_pad)
 
     @staticmethod
     def compute_fd_gradient_2d_simple(
@@ -245,6 +312,11 @@ class DifferentialOperators:
         Returns:
             ``∂u/∂x_dim`` at each point, shape ``(N,)``.
         """
+        route = _mesh_route(method, grid)
+        if route == "fit":  # `jno.fd(order=/fit=)` on a mesh: a local polynomial least-squares fit
+            return _mesh_fit(u_values, points, triangles, method, (dim,))
+        if route == "default":
+            method = "area_weighted"
         if grid is not None:
             # Promote against the mesh-coordinate dtype — exactly what the triangle path gets by
             # multiplying the field against the float64 point coords: a float32 field lifts to float64
@@ -253,6 +325,10 @@ class DifferentialOperators:
             # cast to real. ``jnp.gradient``/roll stencils are themselves dtype-preserving.
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             _per = grid.get("periodic") or (False,) * len(grid["shape"])
+            if _is_stencil(method):  # `jno.fd(...)`
+                return DifferentialOperators._grid_stencil_diff(
+                    U, grid["spacing"][dim], dim, 1, method, periodic=_per[dim]
+                ).reshape(-1)
             if _per[dim]:  # wrap-central over the unique nodes (periodic axis)
                 uu = jnp.moveaxis(U, dim, 0)[:-1]
                 g = (jnp.roll(uu, -1, 0) - jnp.roll(uu, 1, 0)) / (2.0 * grid["spacing"][dim])
@@ -397,12 +473,20 @@ class DifferentialOperators:
         Returns:
             Laplacian, shape ``(N,)``.
         """
+        route = _mesh_route(method, grid)
+        if route == "fit":
+            return sum(_mesh_fit(u_values, points, triangles, method, (d, d)) for d in dims)
+        if route == "default":
+            method = "gradient_of_gradient"
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
             per = grid.get("periodic") or (False,) * len(grid["shape"])
             out = jnp.zeros_like(U)
             for d in dims:
-                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d, periodic=per[d])
+                if _is_stencil(method):  # `jno.fd(...)`
+                    out = out + DifferentialOperators._grid_stencil_diff(U, grid["spacing"][d], d, 2, method, per[d])
+                else:
+                    out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d, periodic=per[d])
             return out.reshape(-1)
         if method == "cotangent":
             return DifferentialOperators.compute_laplacian_2d_cotangent(u_values, points, triangles)
@@ -454,7 +538,11 @@ class DifferentialOperators:
 
         cross = (p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - (p1[:, 1] - p0[:, 1]) * (p2[:, 0] - p0[:, 0])
         two_area = jnp.abs(cross)
-        safe_2A = jnp.where(two_area > 1e-12, two_area, 1.0)
+        # Degenerate (zero-area) triangles carry no weight. "Zero" is relative to the triangle's own size and
+        # the dtype's precision, not an absolute 1e-12, which a mesh in micrometres (areas ~1e-12) crossed.
+        size2 = jnp.sum((p1 - p0) ** 2, axis=1) + jnp.sum((p2 - p0) ** 2, axis=1)
+        live = two_area > 64 * jnp.finfo(two_area.dtype).eps * size2
+        safe_2A = jnp.where(live, two_area, 1.0)
 
         # Cotangents via dot / (2*area)
         e01x = p1[:, 0] - p0[:, 0]
@@ -475,10 +563,11 @@ class DifferentialOperators:
         e21y = p1[:, 1] - p2[:, 1]
         cot2 = (e20x * e21x + e20y * e21y) / safe_2A  # angle at vertex 2
 
-        # Clamp to avoid issues with flat / obtuse triangles
-        cot0 = jnp.clip(cot0, -10.0, 10.0)
-        cot1 = jnp.clip(cot1, -10.0, 10.0)
-        cot2 = jnp.clip(cot2, -10.0, 10.0)
+        # The exact P1 cotangent weights, for any non-degenerate triangle. They used to be clipped to ±10 (an
+        # angle under 5.7° or over 174.3°), which silently replaced the operator by another one on such a
+        # triangle. No jNO-generated mesh reached the clip (max |cot| 1.25 on box, disk, L-shape and structured
+        # meshes); only imported sliver meshes did, and there the P1 operator is still the consistent one.
+        cot0, cot1, cot2 = (jnp.where(live, c, 0.0) for c in (cot0, cot1, cot2))
 
         # Accumulate: edge (i,j) opposite k → weight cot2, etc.
         lap = (
@@ -502,8 +591,8 @@ class DifferentialOperators:
         # with A_i = (1/3) * Σ area.  Equivalently: normalise by (2/3)*Σ area.
         area_sum = jnp.zeros(N).at[i_idx].add(two_area / 2.0).at[j_idx].add(two_area / 2.0).at[k_idx].add(two_area / 2.0)
         A_i = area_sum * 2.0 / 3.0
-        safe_A = jnp.where(A_i > 1e-12, A_i, 1.0)
-        return jnp.where(A_i > 1e-12, lap / safe_A, 0.0)
+        safe_A = jnp.where(A_i > 0, A_i, 1.0)  # a node in no (live) triangle has no row
+        return jnp.where(A_i > 0, lap / safe_A, 0.0)
 
     @staticmethod
     def compute_fd_hessian_2d_simple(
@@ -512,6 +601,7 @@ class DifferentialOperators:
         triangles: jnp.ndarray,
         var_dims: list,
         grid: dict | None = None,
+        method=None,
     ) -> jnp.ndarray:
         """Hessian on a 2-D triangular mesh (area-weighted FD).
 
@@ -533,6 +623,12 @@ class DifferentialOperators:
         N = points.shape[0]
         n_vars = int(jnp.sqrt(len(var_dims)))
 
+        if _mesh_route(method, grid) == "fit":
+            n_v = int(round(len(var_dims) ** 0.5))
+            out = jnp.zeros((points.shape[0], n_v, n_v))
+            for i, vi_dim, j, vj_dim in var_dims:
+                out = out.at[:, i, j].set(_mesh_fit(u_values, points, triangles, method, (vi_dim, vj_dim)))
+            return out
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
             sp = grid["spacing"]
@@ -545,7 +641,16 @@ class DifferentialOperators:
             def _component(a, b):
                 key = (a, b) if a <= b else (b, a)
                 if key not in comps:
-                    if key[0] == key[1]:
+                    if _is_stencil(method) and key[0] == key[1]:  # `jno.fd(...)`
+                        comps[key] = DifferentialOperators._grid_stencil_diff(
+                            U, sp[key[0]], key[0], 2, method, per[key[0]]
+                        ).reshape(-1)
+                    elif _is_stencil(method):  # mixed: the first-derivative stencil along each axis
+                        first = DifferentialOperators._grid_stencil_diff(U, sp[key[0]], key[0], 1, method, per[key[0]])
+                        comps[key] = DifferentialOperators._grid_stencil_diff(
+                            first, sp[key[1]], key[1], 1, method, per[key[1]]
+                        ).reshape(-1)
+                    elif key[0] == key[1]:
                         comps[key] = DifferentialOperators._grid_second_diff(
                             U, sp[key[0]], key[0], periodic=per[key[0]]
                         ).reshape(-1)
@@ -610,9 +715,18 @@ class DifferentialOperators:
             ``∂u/∂x_dim`` at each point, shape ``(N,)``. When ``grid`` is a structured-grid descriptor
             the reshaped central difference is used (see the 2-D gradient); ``tetrahedra`` is ignored.
         """
+        route = _mesh_route(method, grid)
+        if route == "fit":
+            return _mesh_fit(u_values, points, tetrahedra, method, (dim,))
+        if route == "default":
+            method = "area_weighted"
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             _per = grid.get("periodic") or (False,) * len(grid["shape"])
+            if _is_stencil(method):  # `jno.fd(...)`
+                return DifferentialOperators._grid_stencil_diff(
+                    U, grid["spacing"][dim], dim, 1, method, periodic=_per[dim]
+                ).reshape(-1)
             if _per[dim]:  # wrap-central over the unique nodes (periodic axis)
                 uu = jnp.moveaxis(U, dim, 0)[:-1]
                 g = (jnp.roll(uu, -1, 0) - jnp.roll(uu, 1, 0)) / (2.0 * grid["spacing"][dim])
@@ -829,7 +943,10 @@ class DifferentialOperators:
         # Jacobian with columns e1, e2, e3 = p1-p0, p2-p0, p3-p0
         jac = jnp.stack([pts[i1] - p0, pts[i2] - p0, pts[i3] - p0], axis=2)  # (M, 3, 3)
         det = jnp.linalg.det(jac)
-        good = jnp.abs(det) > 1e-14  # guard sliver / degenerate tets against a singular inverse
+        # guard degenerate tets against a singular inverse -- relative to the tet's own size and the dtype, not
+        # an absolute 1e-14 (a millimetre-scale mesh has volumes ~1e-9 and a micrometre one ~1e-18)
+        edge3 = jnp.sum(jac**2, axis=(1, 2)) ** 1.5
+        good = jnp.abs(det) > 64 * jnp.finfo(det.dtype).eps * edge3
         vol = jnp.where(good, jnp.abs(det) / 6.0, 0.0)
         jinv = jnp.linalg.inv(jnp.where(good[:, None, None], jac, jnp.eye(3, dtype=jac.dtype)))
         g1, g2, g3 = jinv[:, 0, :], jinv[:, 1, :], jinv[:, 2, :]  # ∇λ_1, ∇λ_2, ∇λ_3 (rows of J⁻¹)
@@ -849,8 +966,8 @@ class DifferentialOperators:
         )
         quarter = vol / 4.0
         mass = jnp.zeros(n).at[i0].add(quarter).at[i1].add(quarter).at[i2].add(quarter).at[i3].add(quarter)
-        safe_mass = jnp.where(mass > 1e-14, mass, 1.0)
-        return jnp.where(mass > 1e-14, -ku / safe_mass, 0.0)
+        safe_mass = jnp.where(mass > 0, mass, 1.0)  # a node in no (live) tet has no row
+        return jnp.where(mass > 0, -ku / safe_mass, 0.0)
 
     @staticmethod
     def compute_fd_laplacian_3d_simple(
@@ -874,12 +991,20 @@ class DifferentialOperators:
         Returns:
             Laplacian, shape ``(N,)``.
         """
+        route = _mesh_route(method, grid)
+        if route == "fit":
+            return sum(_mesh_fit(u_values, points, tetrahedra, method, (d, d)) for d in dims)
+        if route == "default":
+            method = "gradient_of_gradient"
         if grid is not None:  # structured-grid 7-point stencil (Σ_d central 2nd difference), assembly-free
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             per = grid.get("periodic") or (False,) * len(grid["shape"])
             out = jnp.zeros_like(U)
             for d in dims:
-                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d, periodic=per[d])
+                if _is_stencil(method):  # `jno.fd(...)`
+                    out = out + DifferentialOperators._grid_stencil_diff(U, grid["spacing"][d], d, 2, method, per[d])
+                else:
+                    out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d, periodic=per[d])
             return out.reshape(-1)
         if method == "cotangent":
             return DifferentialOperators.compute_laplacian_3d_cotangent(u_values, points, tetrahedra)
@@ -902,6 +1027,7 @@ class DifferentialOperators:
         tetrahedra: jnp.ndarray,
         var_dims: list,
         grid: dict | None = None,
+        method=None,
     ) -> jnp.ndarray:
         """Hessian on a 3-D tetrahedral mesh (volume-weighted FD).
 
@@ -917,6 +1043,12 @@ class DifferentialOperators:
         N = points.shape[0]
         n_vars = int(jnp.sqrt(len(var_dims)))
 
+        if _mesh_route(method, grid) == "fit":
+            n_v = int(round(len(var_dims) ** 0.5))
+            out = jnp.zeros((points.shape[0], n_v, n_v))
+            for i, vi_dim, j, vj_dim in var_dims:
+                out = out.at[:, i, j].set(_mesh_fit(u_values, points, tetrahedra, method, (vi_dim, vj_dim)))
+            return out
         if grid is not None:  # structured grid: only the requested second-derivative components (see 2-D)
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             sp = grid["spacing"]
@@ -926,7 +1058,16 @@ class DifferentialOperators:
             def _component(a, b):
                 key = (a, b) if a <= b else (b, a)
                 if key not in comps:
-                    if key[0] == key[1]:
+                    if _is_stencil(method) and key[0] == key[1]:  # `jno.fd(...)`
+                        comps[key] = DifferentialOperators._grid_stencil_diff(
+                            U, sp[key[0]], key[0], 2, method, per[key[0]]
+                        ).reshape(-1)
+                    elif _is_stencil(method):  # mixed: the first-derivative stencil along each axis
+                        first = DifferentialOperators._grid_stencil_diff(U, sp[key[0]], key[0], 1, method, per[key[0]])
+                        comps[key] = DifferentialOperators._grid_stencil_diff(
+                            first, sp[key[1]], key[1], 1, method, per[key[1]]
+                        ).reshape(-1)
+                    elif key[0] == key[1]:
                         comps[key] = DifferentialOperators._grid_second_diff(
                             U, sp[key[0]], key[0], periodic=per[key[0]]
                         ).reshape(-1)
@@ -998,8 +1139,11 @@ class DifferentialOperators:
         Returns:
             Tuple ``(main_scheme, grad_method, lap_method)``.
         """
+        from .stencils import FDStencil
         from .utils.schemes import scheme_family
 
+        if isinstance(scheme, FDStencil):  # `jno.fd(...)`: the kernels read its options
+            return "finite_difference", scheme, scheme
         # Resolve the FAMILY first. This used to default ANY unrecognised family to the
         # finite-difference settings, and to hand an unknown `family:sub` straight to the FD
         # kernel as `method=sub` -- both silent.
@@ -1015,5 +1159,11 @@ class DifferentialOperators:
             return main, "area_weighted", "cotangent"
         if sub in ("lsq", "least_squares"):
             return main, "least_squares", "lsq_of_gradient"
-        # uniform / inverse_distance / area_weighted
-        return main, sub, "gradient_of_gradient"
+        if sub in ("uniform", "inverse_distance", "area_weighted") or main != "finite_difference":
+            return main, sub, "gradient_of_gradient"
+        # An unknown sub-scheme used to reach the kernel as `method=sub`, whose final `else` branch is
+        # area-weighted -- so `":upwind"` or a typo silently gave the default stencil.
+        raise ValueError(
+            f"Unknown finite-difference sub-scheme {sub!r} (from scheme={scheme!r}). Known: 'cotangent', "
+            "'lsq' (or 'least_squares'), 'uniform', 'inverse_distance', 'area_weighted'."
+        )

@@ -156,6 +156,7 @@ Every differential operator (`.d`, `.diff`, `.d2`, `.dd`, `.laplacian`,
 | `"finite_difference"` | central-difference stencils on mesh (with `:lsq` / `:uniform` / `:inverse_distance` / `:cotangent` sub-schemes) |
 | `"spectral"` | FFT along the grid axes — exact for band-limited periodic fields; **uniform grid only** |
 | `"spectral:cosine"` | even (mirror) extension — for fields with vanishing odd derivatives at both ends |
+| `jno.fd(order=4)`, `jno.fd(points=…)`, `jno.fd(weights=…)`, `boundary=`, `upwind=`, `average=`, `fit=`, `rings=` | any finite-difference stencil: on a structured grid by its order or its points (Fornberg weights), on an unstructured mesh by a local polynomial fit; also `u.bind(x=x, y=y, scheme=jno.fd(...))` for every `.x`/`.xx` of that binding |
 
 Forward-mode is typically cheaper when the input dim (≤ 3 spatial dims for
 PINNs) is ≤ the output dim; reverse-mode is cheaper for scalar losses with
@@ -560,6 +561,10 @@ reference.
 ### `jno.fdm`
 
 ::: jno.fdm.fdm
+
+### `jno.fd`
+
+::: jno.stencils.fd
 
 ### `jno.rcwa`
 

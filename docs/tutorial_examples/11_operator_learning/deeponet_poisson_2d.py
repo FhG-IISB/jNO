@@ -35,8 +35,8 @@ net = jno.nn(
 net.optimizer(optax.adam(optax.cosine_decay_schedule(1e-3, EPOCHS, alpha=1e-5 / 1e-3)))
 
 # ── Hard BC ansatz + PDE residual ────────────────────────────────────────────
-u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
-pde = k * (u.d2(x) + u.d2(y)) + 1.0
+u = (net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
+pde = k * (u.xx + u.yy) + 1.0
 
 # ── Solve ────────────────────────────────────────────────────────────────────
 crux = jno.core(constraints=[pde.mse])
