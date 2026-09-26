@@ -666,6 +666,14 @@ fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(nullspace="
 fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(), shard=4)          # 4 devices
 ```
 
+On `jno.fdm` it composes the same way, on the operator FDM assembles for the slots
+([FDM solver slots](fdm.md#solver-slots-linear-and-precond)), including inside a `jno.core` training step
+and for vector unknowns with `nullspace="rigid"`:
+
+```python
+jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
+```
+
 | Argument | Meaning |
 |---|---|
 | `parts` | number of subdomains; default ~256 unknowns each, rounded up to a multiple of the device count |

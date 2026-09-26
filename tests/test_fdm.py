@@ -1541,6 +1541,7 @@ _SLOTS = {
     "lu": lambda: dict(linear=jno.solve.lu()),
     "bicgstab+jacobi": lambda: dict(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi()),
     "gmres+amg": lambda: dict(linear=jno.solve.gmres(), precond=jno.precond.amg()),
+    "gmres+schwarz": lambda: dict(linear=jno.solve.gmres(), precond=jno.precond.schwarz(parts=8)),
 }
 
 
@@ -1554,6 +1555,8 @@ def _max_rel(a, b):
 def test_solver_slots_reach_the_default_answer(slot, case):
     if slot == "gmres+amg":
         pytest.importorskip("pyamg")
+    if slot == "gmres+schwarz":
+        pytest.importorskip("pymetis")
     time = None if case.startswith("steady") else (0.0, 0.1, 21)
     make = _slot_problem(time=time, order=2 if case == "wave" else 1, nonlinear=case == "steady-nonlinear")
     kw = _SLOTS[slot]()

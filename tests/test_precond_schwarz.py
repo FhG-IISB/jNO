@@ -181,3 +181,78 @@ def test_rigid_through_fem_solve_gives_the_default_answer():
 def test_rigid_without_a_problem_is_refused():
     with pytest.raises(ValueError, match="rigid"):
         jno.precond.schwarz(nullspace="rigid").build(_poisson()._op[0])
+
+
+# --- jno.fdm: the same slots, on the operator FDM assembles by colouring ---------------------------------------
+
+
+def _fdm_vector_poisson():
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    U = d.unknown(value_shape=(2,))
+    Ui = U.vector.bind(x=x, y=y)
+    f = jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    zero = jno.np.stack([0.0 * xb, 0.0 * xb], axis=-1)
+    return jno.fdm([-Ui.laplacian() - jno.np.stack([f, 2.0 * f], axis=-1), U(xb, yb) - zero])
+
+
+def test_fdm_rigid_modes_follow_fdms_component_blocks():
+    """FDM stores one block of N per component (FEM interleaves them per node), so the rigid-body modes are
+    built from the problem's own layout: translation c is 1 on block c only, the rotation is (-y, x) about
+    the centroid on blocks (0, 1)."""
+    from jno.precond import _near_null_space
+
+    prob = _fdm_vector_poisson()
+    N = prob._N
+    Z = _near_null_space(prob, prob._Ntot)
+    assert Z.shape == (2 * N, 3)
+    np.testing.assert_array_equal(Z[:N, 0], 1.0)
+    np.testing.assert_array_equal(Z[N:, 0], 0.0)
+    np.testing.assert_array_equal(Z[:N, 1], 0.0)
+    np.testing.assert_array_equal(Z[N:, 1], 1.0)
+    xc = np.asarray(prob._pts) - np.asarray(prob._pts).mean(axis=0)
+    np.testing.assert_allclose(Z[:N, 2], -xc[:, 1])
+    np.testing.assert_allclose(Z[N:, 2], xc[:, 0])
+
+
+def test_fdm_vector_problem_with_rigid_modes_gives_the_default_answer():
+    prob = _fdm_vector_poisson()
+    ref = np.asarray(prob.solve())
+    got = np.asarray(prob.solve(linear=jno.solve.gmres(), precond=jno.precond.schwarz(parts=4, nullspace="rigid")))
+    assert np.abs(got - ref).max() < 1e-8 * np.abs(ref).max()
+
+
+@pytest.mark.parametrize("trainable", ["source", "diffusivity"])
+def test_fdm_schwarz_inside_a_crux_training_step(trainable):
+    """The solve inside jno.core runs on a TRACED operator, where Schwarz cannot build its partition. A
+    parametric FDM solve through the slots now makes its structural decisions eagerly, at the parameters'
+    current values (as the transient path already did), and Schwarz builds there; the numeric phase then
+    follows every training step's values. ``diffusivity`` puts the parameter IN the operator, so no concrete
+    matrix exists inside the trace at all. Also covers cg + a preconditioner under crux, whose symmetry
+    probe used to fail on a traced value."""
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    lap = ui.d2(x) + ui.d2(y)
+    observed = jnp.asarray(jno.fdm([-lap - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(2.5 if trainable == "source" else 0.5))
+    s.optimizer(optax.adam(1e-1 if trainable == "source" else 3e-2))
+    pde = -lap - s * f if trainable == "source" else -s * lap - f
+    node = jno.fdm([pde, u(xb, yb) - 0.0]).solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.schwarz(parts=4))
+    crux = jno.core([(node - observed).mse])
+    crux.solve(120)
+    rec = float(np.asarray(crux.eval([s])).reshape(-1)[0])
+    assert abs(rec - 1.0) < 2e-2, f"crux did not recover {trainable} through the Schwarz solve: s={rec:.4f}"

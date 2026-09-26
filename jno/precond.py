@@ -2896,7 +2896,8 @@ class _FSAI(_Spec):
 
         if isinstance(A, LinearOperator):
             A = A.bcoo if A.bcoo is not None else A.dense()
-        self._pattern = fsai_pattern(A, power=self.power)
+        with jax.ensure_compile_time_eval():  # concrete tables even when built from inside a trace (see _Schwarz)
+            self._pattern = fsai_pattern(A, power=self.power)
         return self
 
     def prepare(self, fem):
@@ -2937,6 +2938,9 @@ def _representative_operator(fem):
     a transient block's step pattern (M and A together), or the Newton tangent at zero."""
     import jax.experimental.sparse as jsp
 
+    hook = getattr(fem, "_representative_operator", None)  # a problem that says it itself (jno.fdm)
+    if callable(hook):
+        return hook()
     op = getattr(fem, "_op", None)
     if isinstance(op, tuple) and hasattr(op[0], "todense"):
         return op[0]
@@ -2997,7 +3001,10 @@ class _Schwarz(_Spec):
                     "pass it through fem.solve(precond=...), or call spec.build(A, fem=fem)."
                 )
             null = _near_null_space(fem, n)
-        pat = schwarz_pattern(A, parts=parts, overlap=self.overlap, nullspace=null)
+        # Host-side, and CONCRETE even when asked from inside a trace (a jno.core step preparing the solve): a
+        # dtype conversion there would be staged, and the cached index tables would be that trace's tracers.
+        with jax.ensure_compile_time_eval():
+            pat = schwarz_pattern(A, parts=parts, overlap=self.overlap, nullspace=null)
         need = pat.p * pat.m * pat.m * jnp.dtype(A.dtype).itemsize
         dev = jax.devices()[0]
         cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
@@ -3045,43 +3052,59 @@ class _Schwarz(_Spec):
         )
 
 
-def _near_null_space(fem, n):
-    """Per field block: RIGID-BODY modes for a field with as many components as the space has dimensions (a
-    displacement: translations and infinitesimal rotations), else one constant per component. The kernel of the
-    unconstrained operator for elasticity, and of any diffusion-type block -- what a coarse space must represent
-    for the iteration count to stay independent of the number of parts."""
+def _dof_layout(fem, n):
+    """Per field block: ``(points (nodes, dim), index (nodes, n_components))``, the DOF of component ``c`` at
+    node ``i``. A problem may state it (``_dof_layout()``, jno.fdm: one block per component); a FEM problem's
+    blocks are node-major with the components interleaved."""
     import numpy as np
 
-    pts_all = [np.asarray(p) for p in (fem.field_points or [])]
-    blocks = fem.blocks or [slice(0, n)]
+    hook = getattr(fem, "_dof_layout", None)
+    if callable(hook):
+        return hook()
+    pts_all = [np.asarray(p) for p in (getattr(fem, "field_points", None) or [])]
+    blocks = getattr(fem, "blocks", None) or [slice(0, n)]
     if len(pts_all) != len(blocks):
         raise ValueError(
             "jno.precond.schwarz(nullspace='rigid'): the problem's field coordinates do not line up with its "
             "field blocks; pass the near-null space explicitly as an (n, k) array."
         )
-    cols = []
+    out = []
     for pts, blk in zip(pts_all, blocks):
         size, nodes = blk.stop - blk.start, pts.shape[0]
-        vec, dim = size // max(nodes, 1), pts.shape[1]
+        vec = size // max(nodes, 1)
         if vec * nodes != size:
             raise ValueError(
                 f"jno.precond.schwarz(nullspace='rigid'): a field block of {size} unknowns on {nodes} nodes is not "
                 "node-major with a whole number of components; pass the near-null space explicitly."
             )
+        out.append((pts, blk.start + np.arange(nodes)[:, None] * vec + np.arange(vec)[None, :]))
+    return out
+
+
+def _near_null_space(fem, n):
+    """Per field: RIGID-BODY modes for a field with as many components as the space has dimensions (a
+    displacement: translations and infinitesimal rotations), else one constant per component. The kernel of the
+    unconstrained operator for elasticity, and of any diffusion-type block -- what a coarse space must represent
+    for the iteration count to stay independent of the number of parts."""
+    import numpy as np
+
+    cols = []
+    for pts, idx in _dof_layout(fem, n):
+        vec, dim = idx.shape[1], pts.shape[1]
         modes = []
         for c in range(vec):  # translations / constants
-            m = np.zeros((nodes, vec))
+            m = np.zeros(idx.shape)
             m[:, c] = 1.0
             modes.append(m)
         if vec == dim and dim in (2, 3):  # infinitesimal rotations x -> w x (x - x0)
             x = pts - pts.mean(axis=0)
             for i, j in [(0, 1)] if dim == 2 else [(0, 1), (1, 2), (0, 2)]:
-                m = np.zeros((nodes, vec))
+                m = np.zeros(idx.shape)
                 m[:, i], m[:, j] = -x[:, j], x[:, i]
                 modes.append(m)
         for m in modes:
             col = np.zeros(n)
-            col[blk] = m.reshape(-1)  # node-major, components interleaved: node * vec + component
+            col[idx.reshape(-1)] = m.reshape(-1)
             cols.append(col)
     return np.stack(cols, axis=1)
 
