@@ -200,3 +200,57 @@ def test_coordinate_tag_normals_survive_a_rebuild_from_arrays():
     n = np.asarray(d.normals_by_tag["ztop"])
     assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-9)
     assert np.allclose(n.mean(0), [0, 0, 1], atol=1e-9), f"outward +z expected, got {n.mean(0)}"
+
+
+@pytest.mark.parametrize(
+    "shape_of",
+    [
+        lambda: jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16),
+        lambda: jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=1 / 24),
+        lambda: jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=1 / 8),
+    ],
+)
+def test_the_lattice_boundary_hint_changes_nothing(shape_of):
+    """A lattice knows its boundary nodes in closed form, and `_boundary_faces` uses that to prune the
+    faces it counts -- a boundary face's nodes all lie on the boundary, so a face with any other node is
+    interior. The pruning must be invisible: same faces, same order, same normals, same node ids.
+
+    It is what makes the count linear in the PERIMETER instead of in the cells: 25M faces become 8k at
+    4.2M nodes, and a 3-D structured build went from 6.92 s to 3.07 s at 2.1M nodes."""
+    from jno.domain.mesh_utils import p1_cells_dict
+    from jno.utils.solver.fem_facets import _FACET_CACHE, _LOCAL_FACES_TET, _LOCAL_FACES_TRI, _boundary_faces
+
+    d = shape_of().structured().domain()
+    points = np.asarray(d.mesh.points)[:, : d.dimension]
+    hint = d._lattice_boundary_nodes(points)
+    assert hint is not None, "a full box lattice must know its boundary nodes"
+    # the hint is exactly the boundary of the bounding box, so it may only ever over-cover
+    assert hint.sum() < len(points)
+
+    cells_dict = p1_cells_dict(d.mesh)
+    table, n_face_nodes, key = (_LOCAL_FACES_TRI, 2, "triangle") if d.dimension == 2 else (_LOCAL_FACES_TET, 3, "tetra")
+    cells = np.asarray(cells_dict[key], dtype=np.int64)
+
+    _FACET_CACHE.clear()
+    flat_a, sel_a, n_a = _boundary_faces(cells, table, n_face_nodes)
+    _FACET_CACHE.clear()
+    flat_b, sel_b, n_b = _boundary_faces(cells, table, n_face_nodes, hint)
+    assert n_a == n_b and np.array_equal(flat_a, flat_b) and np.array_equal(sel_a, sel_b)
+
+    _FACET_CACHE.clear()
+    normals_a, idx_a = MeshUtils.get_boundary_normals(d.mesh)
+    _FACET_CACHE.clear()
+    normals_b, idx_b = MeshUtils.get_boundary_normals(d.mesh, boundary_nodes=hint)
+    assert np.array_equal(idx_a, idx_b)
+    np.testing.assert_array_equal(np.asarray(normals_a), np.asarray(normals_b))
+
+
+def test_a_mesh_that_is_not_a_lattice_gets_no_boundary_hint():
+    """The hint is only sound where the grid FILLS its bounding box: a lattice masked to some other shape
+    has boundary nodes strictly inside the box, and a predicate that missed them would drop real boundary
+    faces. An unstructured mesh has no grid at all, so it declines."""
+    d = jno.shape.disk(0.5, 0.5, 0.4, size=0.05).domain()
+    points = np.asarray(d.mesh.points)[:, : d.dimension]
+    assert d._lattice_boundary_nodes(points) is None
+    with pytest.raises(NotImplementedError, match="single axis-aligned rect/box"):
+        jno.shape.disk(0.5, 0.5, 0.4, size=0.05).structured().domain()

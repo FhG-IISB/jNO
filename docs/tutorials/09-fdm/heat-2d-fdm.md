@@ -34,7 +34,7 @@ xi, yi, _ = d.variable("initial",  split=True)     # the t = t0 slice
 ui = u.bind(x=x, y=y, t=t)
 
 traj = jno.fdm([
-    ui.t - nu * (ui.d2(x) + ui.d2(y)),                 # u_t = nu * Delta u
+    ui.t - nu * (ui.xx + ui.yy),                       # u_t = nu * Delta u
     u(xb, yb) - 0.0,                                   # Dirichlet
     u(xi, yi) - jnn.sin(np.pi*xi) * jnn.sin(np.pi*yi), # initial condition
 ]).solve()

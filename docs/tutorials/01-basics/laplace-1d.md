@@ -46,10 +46,11 @@ Why this works:
 ## Step 3: Build the PDE Residual
 
 ```python
-pde = u.d2(x)  # Laplace: u'' = 0
+u = u.scalar.bind(x=x)  # bind the field to its coordinate
+pde = u.xx              # Laplace: u'' = 0
 ```
 
-`.d2(x)` is the second-derivative shortcut on any `Placeholder`. Equivalent to `u.d(x).d(x)` but more compact.
+`.bind(x=x)` names the coordinate once; after that `u.x` and `u.xx` are ∂u/∂x and ∂²u/∂x², written as on paper.
 
 ## Step 4: Solve
 

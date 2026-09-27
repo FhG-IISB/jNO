@@ -38,7 +38,7 @@ u_fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi,   # ∫∇u·∇v − ∫
 # FDM — the STRONG form: the same term list, no test function, collocated at the nodes:
 w  = d.unknown()
 wi = w.bind(x=xi, y=yi)
-u_fdm = jno.fdm([-wi.d2(xi) - wi.d2(yi) - 1.0,           # −Δu = 1
+u_fdm = jno.fdm([-wi.xx - wi.yy - 1.0,                   # −Δu = 1
                  w(xb, yb) - 0.0]).solve()
 ```
 
@@ -84,7 +84,7 @@ Maturity is stated per capability; each link goes to the page that documents it.
 | **FEM, nodal** — `jno.fem` | [stable](fem/index.md) | Lagrange P1 / P2 / P3+, **2-D & 3-D**; steady (linear + Newton), transient (θ-method), **second-order-in-time** (wave / elastodynamics), complex, periodic, coupled multifield |
 | **FEM, non-nodal** — H(div) / H(curl) / C¹ | [experimental](fem/elements.md) | **Raviart–Thomas** (H(div)) and **Nédélec edge** (H(curl) — Maxwell, eddy currents) elements; **C¹ Hermite / Argyris / Morley** (plates, biharmonic) |
 | **Quadrilateral & hexahedral cells** | [beta](fem/elements.md) | Tensor-product cells with local refinement and hanging nodes |
-| **FDM** — `jno.fdm` | [stable](fdm.md) | Strong-form collocation from a term list; **structured grids + geometric multigrid**; unstructured meshes; periodic, coupled, flux BCs; 2-D & 3-D |
+| **FDM** — `jno.fdm` | [stable](fdm.md) | Strong-form collocation from a term list; **structured grids + geometric multigrid**; unstructured meshes; periodic, coupled, flux BCs; **vector unknowns** (Navier–Stokes, elasticity); stencils chosen with `jno.fd(order=, points=, upwind=, fit=, …)`; 2-D & 3-D |
 | **Spectral / RCWA** — `jno.rcwa` | [stable](rcwa.md) | Vector-Maxwell RCWA, anisotropic media, Jones / polarization readout |
 | **Linear & nonlinear solvers** — `jno.solve` / `jno.precond` | [stable](solvers.md) | Sparse-direct LU, Jacobi-BiCGStab, GMRES, CG, MINRES, Chebyshev, geometric multigrid, optional GPU **AMG** — matrix-free and differentiable |
 | **Generalized eigenproblems** — `fem.eigs` | [beta](API.md#solvers-and-preconditioners) | `K x = λ M x`, differentiable, M-orthonormal |

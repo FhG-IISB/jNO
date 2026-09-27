@@ -29,7 +29,7 @@ u = d.unknown()
 ui = u.bind(x=x, y=y)
 
 # Synthetic observation: the forward solve at the true amplitude s = 1 (a plain float -> eager array).
-observed = jnp.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - 1.0 * f_base, u(xb, yb) - 0.0]).solve()).reshape(-1)
+observed = jnp.asarray(jno.fdm([-ui.xx - ui.yy - 1.0 * f_base, u(xb, yb) - 0.0]).solve()).reshape(-1)
 
 # Recover s: a trainable parameter with an attached optimizer, driven by crux through the data misfit.
 s = jno.np.parameter((1,), name="s")
@@ -39,7 +39,7 @@ s.initialize(jax.nn.initializers.constant(2.5))  # deliberately wrong start
 # straight to the minimum. Adam's per-parameter moment adaptation is counter-productive here — it
 # oscillates and can settle at a spurious fixed point away from the true amplitude.
 s.optimizer(optax.sgd(1.0))
-solve = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()  # a differentiable trace node
+solve = jno.fdm([-ui.xx - ui.yy - s * f_base, u(xb, yb) - 0.0]).solve()  # a differentiable trace node
 crux = jno.core([(solve - observed).mse])  # domain inferred from the graph — no explicit domain= needed
 crux.solve(150)
 
@@ -68,7 +68,7 @@ plt.rcParams.update(
 )
 
 # The forward field at the recovered amplitude (the model's OWN computed output at s = s_rec).
-u_rec = np.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - rec * f_base, u(xb, yb) - 0.0]).solve()).reshape(-1)
+u_rec = np.asarray(jno.fdm([-ui.xx - ui.yy - rec * f_base, u(xb, yb) - 0.0]).solve()).reshape(-1)
 obs = np.asarray(observed).reshape(-1)
 
 # An independent re-run (same SGD(1.0) optimizer) to capture the recovered scalar's convergence.
@@ -80,7 +80,7 @@ s2 = jno.np.parameter((1,), name="s_conv")
 s2.dtype(jnp.float64)
 s2.initialize(jax.nn.initializers.constant(2.5))
 s2.optimizer(optax.sgd(1.0))
-solve2 = jno.fdm([-ui.d2(x) - ui.d2(y) - s2 * f_base, u(xb, yb) - 0.0]).solve()
+solve2 = jno.fdm([-ui.xx - ui.yy - s2 * f_base, u(xb, yb) - 0.0]).solve()
 crux2 = jno.core([(solve2 - observed).mse])
 s_hist = [2.5]
 n_epochs = 18  # descent to the ~1e-4 tolerance floor (before the noise-floor limit cycle)

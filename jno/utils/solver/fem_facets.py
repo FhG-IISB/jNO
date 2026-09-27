@@ -103,7 +103,7 @@ _FACET_CACHE_MAX = 8
 
 
 def pack_face_keys(canonical: np.ndarray):
-    """One ``int64`` per already-sorted face row, or ``None`` if the id range would overflow it.
+    """One ``int64`` per already-sorted face row (``None`` only past 2³¹ nodes).
 
     ``np.unique(..., axis=0)`` sorts a VOID VIEW of the rows, and its argsort is the single most
     expensive thing anyone does with a face table here: 2.32 s (a quarter of a 424k-tet domain
@@ -119,19 +119,34 @@ def pack_face_keys(canonical: np.ndarray):
     if canonical.size == 0:
         return np.zeros(len(canonical), dtype=np.int64)
     n_pts = int(canonical.max()) + 1
-    if n_pts ** canonical.shape[1] >= 2**62:
-        return None  # caller falls back to the row-wise unique
+    if n_pts >= 2**31:
+        return None  # a single column no longer leaves room to pack; the row-wise unique handles it
     keys = np.zeros(len(canonical), dtype=np.int64)
     for j in range(canonical.shape[1]):
+        if (int(keys.max()) + 1) * n_pts >= 2**62:
+            # Replace the partial key by its DENSE RANK before packing on: ranks keep the order, so the
+            # final key is still exactly lexicographic, and they stay below the row count. Without this
+            # a 4.2M-node tetrahedral grid overflowed n³ and fell back to the row-wise unique -- a void
+            # argsort that took 111 s of a 152 s domain build (measured, 160³).
+            keys = np.unique(keys, return_inverse=True)[1].reshape(-1).astype(np.int64)
         keys = keys * n_pts + canonical[:, j]
     return keys
 
 
-def _boundary_faces(cells: np.ndarray, local_faces, n_face_nodes: int):
+def _boundary_faces(cells: np.ndarray, local_faces, n_face_nodes: int, boundary_nodes=None):
     """``(flat, sel, n_local)``: every (cell, local face) row, and which rows are on the boundary.
 
     ``flat`` is CELL-MAJOR, so a row index ``r`` decodes as cell ``r // n_local``, local face
     ``r % n_local``. ``sel`` indexes the rows whose canonical (sorted) key occurs exactly once.
+
+    ``boundary_nodes`` is an optional boolean over node ids that is **true for at least every node on
+    the boundary**. Every node of a boundary face lies on the boundary, so a face with any node outside
+    that set is interior and cannot be a singleton -- it can be dropped before the count. The count over
+    what is left is unchanged, because the two copies of an interior face are the same node set and are
+    therefore kept or dropped together, so ``sel`` is identical with the hint and without it. A caller
+    that knows the set cheaply (a lattice: a node is on the boundary iff a grid index is first or last)
+    turns a count over every face into one over the perimeter -- measured on a 2-D unit square at 4.2M
+    nodes, 25M faces become 8k.
     """
     import hashlib
 
@@ -144,14 +159,17 @@ def _boundary_faces(cells: np.ndarray, local_faces, n_face_nodes: int):
     idx = np.asarray(local_faces, dtype=np.int64)[:, :n_face_nodes]
     n_local = idx.shape[0]
     flat = cells[:, idx].reshape(-1, n_face_nodes).astype(np.int64, copy=False)
-    canonical = np.sort(flat, axis=1)
+
+    rows = None if boundary_nodes is None else np.flatnonzero(np.asarray(boundary_nodes, dtype=bool)[flat].all(axis=1))
+    canonical = np.sort(flat if rows is None else flat[rows], axis=1)
 
     keys = pack_face_keys(canonical)
     if keys is not None:
         _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
     else:
         _, inverse, counts = np.unique(canonical, axis=0, return_inverse=True, return_counts=True)
-    sel = np.flatnonzero(counts[np.asarray(inverse).ravel()] == 1)
+    once = np.flatnonzero(counts[np.asarray(inverse).ravel()] == 1)
+    sel = once if rows is None else rows[once]  # back to row indices of `flat`, still ascending
 
     value = (flat, sel, n_local)
     if len(_FACET_CACHE) >= _FACET_CACHE_MAX:

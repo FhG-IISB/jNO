@@ -252,8 +252,8 @@ constants `pi e inf nan`. Vector calculus: `jno.np.jacobian/divergence/curl_2d/c
 
 ### Differentiation schemes
 
-The scheme rides on the call: `u.d(x, scheme="finite_difference")`. (Attribute derivatives use the
-default; drop to the method form only when you need a non-default scheme.)
+The scheme rides on the call, `u.d(x, scheme="finite_difference")`, or on the binding,
+`u.bind(x=x, y=y, scheme=jno.fd(order=4))`, after which the attribute derivatives use it.
 
 | Scheme string | Grad | Lap/Hess | Notes |
 |---|:--:|:--:|---|
@@ -263,13 +263,14 @@ default; drop to the method form only when you need a non-default scheme.)
 | `"finite_difference"` | ✅ | ✅ | area-weighted, unstructured meshes |
 | `":lsq"` / `":uniform"` / `":inverse_distance"` | ✅ | ✅ | |
 | `":cotangent"` | — | ✅ | cotangent Laplacian, **2-D only** |
+| `jno.fd(order=, points=, weights=, boundary=, upwind=, average=, fit=, rings=)` | ✅ | ✅ | any FD stencil; also on `.bind(..., scheme=)` — see §8 |
 
 Forward mode is cheaper when input dim ≤ output dim (typical for PINNs); reverse for scalar losses
 with many inputs. Project-wide default via `.jno.toml` or
 `jno.setup(__file__, diff_type="forward", hessian_type="fwd-over-rev")`.
 
-> **Trap.** `":cotangent"` and `":lsq"` return the **whole** Laplacian in one shot, so
-> `u.d2(x, scheme="finite_difference:cotangent") + u.d2(y, …)` **doubles** it.
+> **Trap.** `":cotangent"` returns the **whole** Laplacian in one shot, so a per-axis sum would
+> double it; `.d2`/`.dd` therefore raise on it. Write `u.laplacian(x, y, scheme="finite_difference:cotangent")`.
 
 ### Units, escape hatch, trackers
 
@@ -548,19 +549,83 @@ problems exactly like `fem.solve()`.
 against a coordinate is meaningless on a discrete field, so the bound view's derivatives are
 **finite differences by default** — no `scheme=` needed.
 
-Flux BCs are written with the edge's own normal; `jno.fdm` handles **any condition affine in
-`∂u/∂n`**, and any mix of Dirichlet/Neumann/Robin composes. A non-affine condition **raises**
-rather than returning a wrong answer. In 2-D a corner node shared by two flux edges has no single
-normal and falls back to the interior residual — give it an explicit Dirichlet value if it needs
-anchoring.
+```python
+u  = d.unknown();  ui = u.bind(x=x, y=y)
+jno.fdm([-ui.xx - ui.yy - f,                 # −Δu = f  (fused into one cotangent Laplacian on a mesh)
+         u(xb, yb) - 0.0]).solve()           # Dirichlet: u(region) − g, also g − u, u + c
+```
+
+**Flux BCs** are written with the edge's own normal, `n = d.variable(edge, normals=True)`, and
+`ur.d(n) - g` (Neumann), `ut.d(nt) + k*(ut - T)` (Robin), or any nonlinear expression. The term
+becomes that boundary node's equation. A condition whose slope in ∂u/∂n vanishes at the initial guess
+(`(∂u/∂n)³ − g³` from zero) fails loudly; give `x0=`. A corner node shared by two flux edges carries both
+conditions, summed, each with its own normal. The components are also available as values:
+`xw, yw, _, nx, ny = d.variable(wall, normals=True, split=True)`, so `nx*uw.x + ny*uw.y - g` is the same
+condition.
+
+**Variable coefficients.** `(κ * ui.x).x` is discretised in conservative flux form, κ taken between
+nodes (exact at half-points when κ depends on the coordinates only). A layered κ is then exact.
+
+**Stencils — `jno.fd(...)`**, accepted wherever `scheme=` is, and on the binding
+(`u.bind(x=x, y=y, scheme=jno.fd(order=4))`, so every `.x/.xx/.xy` of `u` uses it). It is resolved by the
+shared evaluator, so it works for FDM unknowns *and* for PINN losses on a field (a network evaluated on
+the grid or mesh):
+
+```python
+jno.fd(order=4)                       # central, 4th order (Fornberg weights)
+jno.fd(points=(-2, -1, 0, 1))         # any offsets
+jno.fd(weights={-1: -0.5, 1: 0.5})    # explicit weights
+jno.fd(order=4, boundary=2)           # the one-sided stencil order at edges (default: interior order)
+jno.fd(upwind=b, order=2)             # biased against the wind b (an expression), per node
+jno.fd(average="harmonic")            # the coefficient between nodes in (κ·u.x).x: exact/arithmetic/harmonic
+jno.fd(order=4, fit=3, rings=2)       # unstructured mesh: a local polynomial least-squares fit
+```
+
+Options that do not apply raise (`fit=` on a grid; `points=`, `weights=`, `upwind=` on a mesh;
+`points=` with `order=`). Nothing is silently ignored.
+
+**Vector unknowns, Navier–Stokes.** `U = d.unknown(value_shape=(2,))` is one DOF block per component;
+`u = U.vector.bind(x=x, y=y, t=t)`, `u[0]` a component, `u.x` the vector ∂u/∂x, `u.xx + u.yy` the
+component-wise Laplacian. A solve returns components as rows, in declaration order:
+
+```python
+h = d.cell_size
+U, p = d.unknown(value_shape=(2,)), d.unknown()
+u, pi = U.vector.bind(x=x, y=y, t=t), p.bind(x=x, y=y, t=t)
+ux, uy = u[0], u[1]
+jno.fdm([
+    u.t + ux*u.x + uy*u.y + jnn.stack([pi.x, pi.y], axis=-1) - nu*(u.xx + u.yy),
+    ux.x + uy.y - 0.05*h**2*(pi.xx + pi.yy),       # ∇·u = 0 with O(h²) pressure stabilisation (needed)
+    U(xb, yb) - Ub, p(xb, yb) - Pb, U(xi, yi) - U0,
+]).solve(time=jno.solve.bdf2())                   # not Crank–Nicolson: p is algebraic and oscillates
+```
+
+With pressure flux conditions on every wall, fix p at one interior node:
+`d.point_region("gauge", (0.5, 0.5))`, then `p(xg, yg) - 0.0`. A derivative BC on a vector unknown (a
+traction, `ur.d(n) - t`) replaces one row per component.
+
+**Transient and coupled.** A `ui.t` term plus `domain(time=(t0, t1, n))` marches (backward Euler by
+default; `jno.solve.theta`, `bdf2`). Several unknowns in one list are a coupled system; `u.tt` is
+supported for a single field (write a coupled system as first order in `(u, v = u.t)`).
 
 **Structured grids.** `structured=True` on an axis-aligned `shape.rect`/`shape.box` builds a
 uniform grid and switches the interior operators to direct 5-point (2-D) / 7-point (3-D) stencils
-by array reshaping. Same answer as the unstructured cotangent operator, cheaper. The inner Krylov
-defaults to **GMRES + geometric-multigrid V-cycle** because row-replaced Dirichlet makes the
-reduced operator nonsymmetric. Pick a size giving an **even** (ideally power-of-two) cell count per
-axis or multigrid falls back to plain GMRES. Periodic boundaries and complex fields are **not**
-supported in `jno.fdm`.
+by array reshaping. Same answer as the unstructured cotangent operator, cheaper. A **linear** problem is
+one Krylov solve (CG where the eliminated operator probes symmetric, else GMRES); a nonlinear one is
+Newton with the same preconditioner inside. Both use a **V-cycle built from the operator itself**
+(`jno.precond.gmg()`): its per-node stencil is read by colouring, the coarse operators are the variational
+`Pᵀ A P`, and the smoother inverts each node's field block. So a variable coefficient, a jump, an
+anisotropy, a reaction, an advection term, a flux boundary, a periodic axis and a coupled system are all
+preconditioned — a V-cycle built from the grid alone diverges on every one of them. Any cell count
+coarsens (an odd one merges into its neighbour). Complex fields are **not** supported in `jno.fdm`: a
+complex source, coefficient or boundary value raises. An unknown with `value_shape` of rank ≥ 2 raises.
+
+**Weak spots.** A saddle-point system (Navier–Stokes) is preconditioned but still grows faster than
+linearly: the velocity–pressure coupling sits between nodes, where a point-block smoother cannot reach it.
+Pass `linear=jno.solve.lu()` for small problems, march to a steady state instead of solving from zero, and
+continue in Re with `x0=`. Central convection needs cell Reynolds < 2; use `jno.fd(upwind=u, order=k)`
+beyond. The transient march's per-step solve is matrix-free and unpreconditioned, which measures fastest
+on a lattice — reach for `linear=`/`precond=` only when a step is genuinely hard.
 
 ---
 
@@ -1234,7 +1299,7 @@ assert rel < 3e-2
 """FDM with Dirichlet + Neumann + Robin at once. Exact u = y^2.
 
 A flux BC is written with THAT edge's own tags: bind the field to the edge and take its
-normal derivative against the edge's outward normal. Any condition affine in du/dn works.
+normal derivative against the edge's outward normal. Neumann, Robin and nonlinear conditions all work.
 """
 import jax
 jax.config.update("jax_enable_x64", True)

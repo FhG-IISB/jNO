@@ -10,8 +10,8 @@ This section covers every aspect of the jNO training pipeline: constructing the 
 
 1. Builds the symbolic computation graph from your constraints.
 2. Performs common sub-expression elimination (CSE).
-3. Folds a sum of squared partials into one Laplacian node, so `u.xx + u.yy`,
-   `u.d2(x) + u.d2(y)` and `u.laplacian(x, y)` all cost the same
+3. Folds a sum of squared partials into one Laplacian node, so `u.xx + u.yy`
+   and the shorthand `u.laplacian(x, y)` cost the same
    ([details](../operations.md#differentiation)).
 4. Initialises all neural-network parameters.
 5. Compiles a JIT-optimised step function.

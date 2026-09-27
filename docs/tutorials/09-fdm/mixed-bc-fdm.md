@@ -28,8 +28,8 @@ and scatters, as the boundary stencils are re-sampled by each unstructured mesh.
 ## Flux conditions are written with the edge's own tags
 
 Get the outward normal from `domain.variable(region, normals=True)`, bind the field to the edge, and
-take its normal derivative. Any condition **affine in** $\partial_n u$ works the same way — `jno.fdm`
-reads the coefficient of the normal derivative directly, so Neumann and Robin are the same mechanism:
+take its normal derivative. Neumann, Robin and nonlinear flux conditions are the same mechanism: the
+term is the boundary node's equation, with $\partial_n u$ taken by a one-sided stencil:
 
 ```python
 nr = d.variable("right", normals=True)

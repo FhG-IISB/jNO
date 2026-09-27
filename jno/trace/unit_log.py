@@ -500,9 +500,17 @@ def _scale_of(node, coeff_neutral: bool = False) -> Optional[float]:
 
 
 def _additive_terms(node, sign: int = 1) -> List[Tuple[int, object]]:
-    """Flatten the top-level ``+``/``-`` chain into signed additive terms."""
+    """Flatten the top-level ``+``/``-`` chain into signed additive terms.
+
+    Typed views are seen through: a bound ``u.t - α·u.xx`` is a view wrapping the ``-``, and must split
+    like ``u.d(t) - α·u.d2(x)``."""
     from . import BinaryOp
 
+    while True:
+        inner = _unwrap_view(node)
+        if inner is node:
+            break
+        node = inner
     if isinstance(node, BinaryOp) and node.op in ("+", "-"):
         left = _additive_terms(node.left, sign)
         right_sign = sign if node.op == "+" else -sign

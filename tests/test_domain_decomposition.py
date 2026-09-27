@@ -457,7 +457,10 @@ def test_couple_via_jno_core():
     a = jno.fdm([-aa.d2(xa) - aa.d2(ya) - fa, u(xb, yb) - 0.0])  # PDE on region A
     b = jno.fdm([-ab.d2(xb2) - ab.d2(yb2) - fb, u(xb, yb) - 0.0])  # PDE on region B
     assert a.region == "A" and b.region == "B"  # regions inferred from the PDE coords
-    mono = np.asarray(jno.fdm([-ui.d2(xi) - ui.d2(yi) - fi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    # The subdomains (PDE on a named region) keep the per-axis stencil, so the monolithic reference names it
+    # explicitly; the plain whole-domain sum would be fused into the cotangent Laplacian.
+    gog = "finite_difference:area_weighted"
+    mono = np.asarray(jno.fdm([-ui.d2(xi, scheme=gog) - ui.d2(yi, scheme=gog) - fi, u(xb, yb) - 0.0]).solve()).reshape(-1)
 
     sol = np.asarray(jno.core([a, b]).solve())  # the public entry couples the subdomains
     equiv = float(np.linalg.norm(sol - mono) / np.linalg.norm(mono))

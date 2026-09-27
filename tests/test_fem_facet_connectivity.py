@@ -197,12 +197,22 @@ def test_boundary_facets_match_the_row_wise_unique(cells, dim, order):
     assert np.array_equal(got[:, :dim], allf[i_rows[c_rows == 1]])  # a facet has `dim` vertices
 
 
-def test_pack_face_keys_declines_when_the_key_would_overflow():
-    """Ids too large to pack must return None so the caller falls back, not silently collide."""
+def test_pack_face_keys_stays_exact_where_a_direct_pack_would_overflow():
+    """Ids whose cube overflows int64 (a 4.2M-node grid) are packed through dense ranks: still one key per
+    row, still exactly lexicographic, never a collision. They used to make the packer decline, and the
+    row-wise fallback took 111 s of a 152 s domain build at 160³."""
     from jno.utils.solver.fem_facets import pack_face_keys
 
-    assert pack_face_keys(np.array([[0, 1, 2]], dtype=np.int64)) is not None
-    assert pack_face_keys(np.array([[0, 0, 10**7]], dtype=np.int64)) is None  # (1e7)^3 = 1e21 > 2^62
+    rng = np.random.default_rng(0)
+    rows = np.sort(rng.integers(0, 10**7, size=(5000, 3)), axis=1)  # (1e7)^3 = 1e21 > 2^62
+    rows = np.concatenate([rows, rows[:1000]])
+    keys = pack_face_keys(rows)
+    assert keys is not None
+    _, ref_inv, ref_cnt = np.unique(rows, axis=0, return_inverse=True, return_counts=True)
+    _, inv, cnt = np.unique(keys, return_inverse=True, return_counts=True)
+    assert np.array_equal(inv.ravel(), ref_inv.ravel()) and np.array_equal(cnt, ref_cnt)
+    assert np.array_equal(np.argsort(keys, kind="stable"), np.lexsort(rows.T[::-1]))
+    assert pack_face_keys(np.array([[0, 0, 2**31]], dtype=np.int64)) is None  # past 2^31 nodes: the fallback
     assert pack_face_keys(np.zeros((0, 3), dtype=np.int64)).shape == (0,)
 
 

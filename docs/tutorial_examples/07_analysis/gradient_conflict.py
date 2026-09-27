@@ -28,8 +28,8 @@ u_net = jno.nn(
     )
 ).optimizer(optax.adam(1e-3))
 
-u = u_net(x) * x * (1 - x)  # ansatz vanishes at x=0 and x=1
-pde = -u.d2(x) - jno.np.sin(π * x)  # residual — should be 0
+u = (u_net(x) * x * (1 - x)).scalar.bind(x=x)  # ansatz vanishes at x=0 and x=1
+pde = -u.xx - jno.np.sin(π * x)  # residual — should be 0
 
 # ── In-training cosine similarity tracker ─────────────────────────────────────
 # Build a boolean mask selecting only the output-layer weight matrix.
@@ -107,8 +107,8 @@ ax, ay, _ = adom.variable("interior", split=True)
 ax = ax.unit("m").scale(Lx)  # characteristic length along x
 ay = ay.unit("m").scale(Ly)  # 20× shorter characteristic length along y
 au = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(1)))(ax, ay)
-au = au.unit("K").scale(U)  # the field carries a temperature scale U
-aniso = au.d2(ax) + au.d2(ay)  # anisotropic Laplacian — two terms in ONE residual
+au = au.unit("K").scale(U).scalar.bind(x=ax, y=ay)  # the field carries a temperature scale U
+aniso = au.xx + au.yy  # anisotropic Laplacian — two terms in ONE residual
 
 # Phase A — audit + report. check() confirms both terms share a unit (K·m⁻²);
 # nondimensionalize() gives each term's dimensionless magnitude πᵢ = Sᵢ / S_ref.

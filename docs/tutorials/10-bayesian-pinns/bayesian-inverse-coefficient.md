@@ -31,8 +31,8 @@ k = jno.np.parameter((1,), name="k")
 k.bayesian(blackjax.nuts, step_size=1e-2, warmup=300, keep=600,
            num_chains=4, init_jitter=0.5)        # 4 chains ⇒ a meaningful R-hat
 
-uf = u_net(x) * x * (1 - x)
-residual = (-LAMBDA * uf.dd(x) + k * uf - f_known) / SIGMA_PHYS
+uf = (u_net(x) * x * (1 - x)).scalar.bind(x=x)
+residual = (-LAMBDA * uf.xx + k * uf - f_known) / SIGMA_PHYS
 jno.core([residual.mse]).solve(900)              # recovers the posterior over k
 ```
 

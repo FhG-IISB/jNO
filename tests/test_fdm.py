@@ -277,11 +277,48 @@ def test_neumann_linear_exact():
 
 
 def test_neumann_convergence_harmonic():
-    """u = x² − y² is harmonic (−Δu = 0), ∂u/∂n = 2x = 2 on the right edge. The boundary-flux stencil
-    is O(h), so the error decreases under refinement."""
+    """u = x² − y² is harmonic (−Δu = 0), ∂u/∂n = 2x = 2 on the right edge; the error decreases under
+    refinement."""
     errs = [_mixed_dirichlet_neumann(h, lambda x, y: x**2 - y**2, du_dn_right=2.0) for h in (0.1, 0.06, 0.035)]
     assert errs[0] > errs[1] > errs[2], f"not converging: {errs}"
     assert errs[2] < 5e-3
+
+
+def _sin_neumann(h, interior):
+    """−Δu = f with u = sin(πx/2) sin(πy): Dirichlet 0 on left/bottom/top, ∂u/∂n = 0 on the right."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    if interior == "structured":
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+    else:
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+    x, y, _ = d.variable("interior", split=True)
+    (xl, yl, _), (xo, yo, _), (xt, yt, _), (xr, yr, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "top", "right")
+    )
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui, ur = u.bind(x=x, y=y), u.bind(x=xr, y=yr)
+    Δu = ui.laplacian(x, y, scheme=_COT) if interior == "cotangent" else ui.d2(x) + ui.d2(y)
+    f = 1.25 * π**2 * jnn.sin(π * x / 2) * jnn.sin(π * y)
+    sol = jno.fdm([-Δu - f, u(xl, yl) - 0.0, u(xo, yo) - 0.0, u(xt, yt) - 0.0, ur.d(nr) - 0.0]).solve()
+    p = _nodes(d)
+    exact = np.sin(π * p[:, 0] / 2) * np.sin(π * p[:, 1])
+    return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+
+
+@pytest.mark.parametrize("interior", ["d2", "cotangent", "structured"])
+def test_neumann_is_second_order(interior):
+    """The flux row's gradient matches the interior stencil. The cotangent Laplacian never reads the
+    area-weighted boundary gradient, so a flux row built on it (first order at a boundary node) capped the
+    solve at first order: 2.2e-3 at h = 0.025, rate 0.7. It now uses a quadratic least-squares fit over
+    the node's two-ring: 2.3e-3 → 7.4e-4. The default `.d2` (a gradient of that same gradient) keeps it,
+    because there it is the consistent closure: 7.5e-3 → 1.8e-3. The structured grid, which used to drop
+    the flux row altogether, gives 1.7e-3 → 4.3e-4."""
+    e = [_sin_neumann(h, interior) for h in (0.05, 0.025)]
+    assert e[1] < 2e-3, f"error at h = 0.025: {e[1]:.2e}"
+    assert e[0] / e[1] > 2.8, f"expected close to O(h²): {e}"
 
 
 def test_robin_linear_exact():
@@ -343,18 +380,23 @@ def test_mixed_dirichlet_neumann_robin():
     assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-3
 
 
-def test_flux_rejects_nonaffine():
-    """A flux BC nonlinear in ∂u/∂n (here `(∂u/∂n)² − 1`) raises rather than silently returning a secant."""
+def test_nonlinear_flux_condition():
+    """A flux condition need not be affine in ∂u/∂n: the boundary row is evaluated as written and Newton
+    solves it. ∂u/∂n + (∂u/∂n)³ = g + g³ (slope 1 + 3s² > 0) with u = 2x + 3y is recovered to rounding.
+    It used to raise ("must be affine in the normal derivative")."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
     x, y, _ = d.variable("interior", split=True)
-    xl, yl, _ = d.variable("left", split=True)
-    xr, yr, _ = d.variable("right", split=True)
-    nr = d.variable("right", normals=True)
     u = d.unknown()
     ui = u.bind(x=x, y=y)
-    ur = u.bind(x=xr, y=yr)
-    with pytest.raises(ValueError, match="affine"):
-        jno.fdm([-ui.d2(x) - ui.d2(y), u(xl, yl) - 0.0, ur.d(nr) * ur.d(nr) - 1.0]).solve()
+    xl, yl, _ = d.variable("left", split=True)
+    terms = [-ui.d2(x) - ui.d2(y), u(xl, yl) - (2.0 * xl + 3.0 * yl)]
+    for r in ("right", "bottom", "top"):
+        xr, yr, _, nx, ny = d.variable(r, normals=True, split=True)
+        s, g = u.bind(x=xr, y=yr).d(d.variable(r, normals=True)), 2.0 * nx + 3.0 * ny
+        terms.append(s + s**3 - (g + g**3))
+    sol = np.asarray(jno.fdm(terms).solve()).reshape(-1)
+    p = _nodes(d)
+    assert np.abs(sol - (2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < 1e-10
 
 
 @pytest.mark.slow
@@ -439,7 +481,9 @@ def test_coupled_two_field():
 
 
 def test_coupled_guards():
-    """A coupled system is v1-limited to STEADY + Dirichlet with exactly one PDE equation per unknown."""
+    """A coupled system needs one PDE equation per unknown, a flux condition belongs to one unknown, and
+    equation k carries only its own unknown's `u.t` (a non-diagonal mass raises). Second order in time is
+    supported -- see `test_a_coupled_second_order_system_marches`."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -457,15 +501,21 @@ def test_coupled_guards():
     vt = dt.unknown()
     uit = ut.bind(x=xt, y=yt, t=tt)
     vit = vt.bind(x=xt, y=yt, t=tt)
-    with pytest.raises(NotImplementedError, match="coupled"):  # coupled + transient not yet supported
+    with pytest.raises(NotImplementedError, match="time derivative of unknown 1"):  # off-diagonal mass
+        jno.fdm([vit.t - (uit.d2(xt) + uit.d2(yt)), uit.t - (vit.d2(xt) + vit.d2(yt)), ut(xit, yit) - 0.0])
+    xr, yr, _ = d.variable("right", split=True)
+    nr = d.variable("right", normals=True)
+    xl, yl, _ = d.variable("left", split=True)
+    with pytest.raises(ValueError, match="cannot tell which field"):  # two free fields: whose row is it?
         jno.fdm(
             [
-                uit.t - (uit.d2(xt) + uit.d2(yt)) + vit,
-                vit.t - (vit.d2(xt) + vit.d2(yt)) + uit,
-                ut(xit, yit) - 0.0,
-                vt(xit, yit) - 0.0,
+                -ui.d2(x) - ui.d2(y) + vi,
+                -vi.d2(x) - vi.d2(y) + ui,
+                u(xl, yl) - 0.0,
+                v(xl, yl) - 0.0,
+                u.bind(x=xr, y=yr).d(nr) + v.bind(x=xr, y=yr).d(nr) - 1.0,
             ]
-        )
+        ).solve()
 
 
 @pytest.mark.slow
@@ -486,7 +536,7 @@ def test_general_mass_coefficient():
     ui = u.bind(x=x, y=y, t=t)
     u0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
     s = jno.fdm([(1.0 + 0.5 * jnn.sin(np.pi * x)) * ui.t - nu * (ui.d2(x) + ui.d2(y)), u(xb, yb) - 0.0, u(xi, yi) - u0])
-    assert np.max(np.abs(np.asarray(s._mass_coefficient()) - (1.0 + 0.5 * np.sin(np.pi * p[:, 0])))) < 1e-9
+    assert np.max(np.abs(np.asarray(s._mass_coefficient()()) - (1.0 + 0.5 * np.sin(np.pi * p[:, 0])))) < 1e-9
 
     # constant a=2, ν=0.1 ⇒ effective diffusivity ν/a = 0.05
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, T, 60))
@@ -520,6 +570,35 @@ def test_nonlinear_mass_rejected():
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("flux", [2.0, 5.0])
+def test_structured_grid_flux_value_is_applied(flux):
+    """`boundary_edges` indexes the boundary-node list, but the flux normals read it as global node
+    numbers. A gmsh mesh numbers its boundary nodes first, so it worked there by accident; on a structured
+    grid no edge node got a normal, and the flux row was silently dropped: ∂u/∂n = 2 and ∂u/∂n = 5 gave
+    bit-identical answers. Oracle: u = x² + y + (g − 2)·x, with −Δu = −2 and ∂u/∂n = g at x = 1."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    (xl, yl, _), (xo, yo, _), (xt, yt, _), (xr, yr, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "top", "right")
+    )
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui, ur = u.bind(x=x, y=y), u.bind(x=xr, y=yr)
+    exact = lambda x, y: x**2 + y + (flux - 2.0) * x  # noqa: E731
+    sol = jno.fdm(
+        [
+            -(ui.d2(x) + ui.d2(y)) + 2.0,
+            u(xl, yl) - exact(xl, yl),
+            u(xo, yo) - exact(xo, yo),
+            u(xt, yt) - exact(xt, yt),
+            ur.d(nr) - flux,
+        ]
+    ).solve()
+    p = _nodes(d)
+    ref = exact(p[:, 0], p[:, 1])
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - ref) / np.linalg.norm(ref)) < 1e-8
+
+
 def test_periodic_poisson():
     """A periodic tie `u(left) - u(right)` wraps the structured x-axis (the Nx-node periodic 5-point
     stencil), authored exactly as in jno.fem. MMS: -Δu = 5π²·sin(2πx)sin(πy), periodic in x with
@@ -544,6 +623,69 @@ def test_periodic_poisson():
     sx, sy = d.mesh_connectivity["grid"]["shape"]  # the tie holds exactly: left face == right face
     grid_sol = sol.reshape(sx, sy)
     assert float(np.max(np.abs(grid_sol[0, :] - grid_sol[-1, :]))) < 1e-9
+
+
+def test_a_periodic_problem_does_not_leak_into_the_next_one():
+    """A periodic tie belongs to its problem, not to the domain. It used to be written into the domain's shared
+    grid descriptor, so a Dirichlet problem built afterwards on the same grid wrapped its stencils too: with
+    u = x on the boundary (0 on the left face, 1 on the right) its max error went from 2.1e-3 to 0.90, silently.
+    Oracle: -Δu = 2π² sin(πx) sin(πy), u = x on the boundary ⇒ u = sin(πx) sin(πy) + x."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured())
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xa, ya, _ = d.variable("boundary", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+
+    def dirichlet_error():
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = np.asarray(jno.fdm([-ui.xx - ui.yy - f, u(xa, ya) - xa]).solve()).reshape(-1)
+        return float(np.abs(sol - (np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) + p[:, 0])).max())
+
+    before = dirichlet_error()
+    w = d.unknown()
+    wi = w.bind(x=x, y=y)
+    f = 5 * np.pi**2 * jnn.sin(2 * np.pi * x) * jnn.sin(np.pi * y)
+    jno.fdm([-wi.xx - wi.yy - f, w(xl, yl) - w(xr, yr), w(xb, yb) - 0.0, w(xt, yt) - 0.0]).solve()
+    assert not any(d.mesh_connectivity["grid"].get("periodic") or ())
+    assert before < 5e-3
+    assert dirichlet_error() == pytest.approx(before, rel=1e-9)
+
+
+def test_a_pinned_solve_is_the_plain_solve_with_interface_pins():
+    """``pinned_solver`` (the domain-decomposition step) is the plain solve plus pins: pinning a line of
+    interior nodes to the unpinned discrete solution reproduces that solution, on a periodic grid. Pins on a
+    coupled system raise: they index one field's nodes, and only field 0 used to be pinned, silently."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).structured())
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 5 * np.pi**2 * jnn.cos(2 * np.pi * x) * jnn.sin(np.pi * y)  # u = cos(2πx) sin(πy): nonzero at the seam
+    prob = jno.fdm([-ui.xx - ui.yy - f, u(xl, yl) - u(xr, yr), u(xb, yb) - 0.0, u(xt, yt) - 0.0])
+    plain = np.asarray(prob.solve()).reshape(-1)
+    line = np.nonzero(np.isclose(p[:, 1], p[np.argmin(np.abs(p[:, 1] - 0.5)), 1]) & (p[:, 0] > 0) & (p[:, 0] < 1))[0]
+    pinned = np.asarray(prob.pinned_solver(line)(plain[line])).reshape(-1)
+    np.testing.assert_allclose(pinned, plain, atol=1e-7 * np.abs(plain).max())
+
+    w, z = d.unknown(), d.unknown()
+    wi, zi = w.bind(x=x, y=y), z.bind(x=x, y=y)
+    xa, ya, _ = d.variable("boundary", split=True)
+    coupled = jno.fdm([-wi.xx - wi.yy + zi - f, -zi.xx - zi.yy - f, w(xa, ya) - 0.0, z(xa, ya) - 0.0])
+    with pytest.raises(NotImplementedError, match="ONE field"):
+        coupled.pinned_solver(line)(np.zeros(line.size))
 
 
 def test_periodic_requires_structured():
@@ -645,9 +787,14 @@ def _poisson3d(mesh_size, method="cotangent"):
     u = d.unknown()
     ui = u.bind(x=x, y=y, z=z)
     f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
-    # "cotangent" is the whole-Laplacian stencil (one term); "gradient_of_gradient" is the nested
-    # per-axis default, which is what summing d2 gives.
-    lap = ui.laplacian(x, y, z, scheme=_COT) if method == "cotangent" else ui.d2(x) + ui.d2(y) + ui.d2(z)
+    # "cotangent" is the whole-Laplacian stencil (one term); "gradient_of_gradient" is the nested per-axis
+    # stencil, named explicitly — the plain default sum is now fused into the cotangent Laplacian.
+    gog = "finite_difference:area_weighted"
+    lap = (
+        ui.laplacian(x, y, z, scheme=_COT)
+        if method == "cotangent"
+        else ui.d2(x, scheme=gog) + ui.d2(y, scheme=gog) + ui.d2(z, scheme=gog)
+    )
     sol = jno.fdm([-lap - f, u(xb, yb, zb) - 0.0]).solve()
     return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
 
@@ -714,9 +861,28 @@ def test_whole_laplacian_subscheme_rejected_on_per_axis_derivative(method):
         getattr(ui, method)(x, scheme="finite_difference:cotangent")
 
 
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("sub", ["upwind", "bogus"])
+def test_unknown_fd_subscheme_raises(structured, sub):
+    """An unknown `finite_difference:<sub>` used to reach the gradient kernel as `method=sub`, whose
+    final branch is area-weighted: `":upwind"` silently solved with the central default (bit-identical
+    answers on both grids). It now raises and lists the known sub-schemes."""
+    if structured:
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    else:
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    with pytest.raises(ValueError, match=f"Unknown finite-difference sub-scheme '{sub}'"):
+        jno.fdm([-ui.d2(x) - ui.d2(y) + ui.d(x, scheme=f"finite_difference:{sub}") - 1.0, u(xb, yb) - 0.0]).solve()
+
+
 def test_whole_laplacian_subscheme_allowed_on_laplacian():
     """The same sub-scheme is legitimate on `.laplacian`, which takes every coordinate at once so it
-    cannot be double-counted — and it is markedly more accurate than the nested-stencil default."""
+    cannot be double-counted — and it is markedly more accurate than the nested gradient-of-gradient
+    stencil (named explicitly: the plain default sum is fused into the cotangent Laplacian)."""
     import jno.jnp_ops as jnn
 
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
@@ -729,8 +895,11 @@ def test_whole_laplacian_subscheme_allowed_on_laplacian():
     f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
     rel = lambda sol: float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
     cot = rel(jno.fdm([-ui.laplacian(x, y, scheme="finite_difference:cotangent") - f, u(xb, yb) - 0.0]).solve())
-    nested = rel(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve())
+    gog = "finite_difference:area_weighted"
+    nested = rel(jno.fdm([-ui.d2(x, scheme=gog) - ui.d2(y, scheme=gog) - f, u(xb, yb) - 0.0]).solve())
     assert cot < nested / 3, f"cotangent should be several times better: {cot:.3e} vs {nested:.3e}"
+    default = rel(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve())
+    assert abs(default - cot) < 1e-8, "the default ui.d2(x) + ui.d2(y) must be fused into the cotangent Laplacian"
 
 
 def test_every_stencil_adjoint_matches_the_closed_form():
@@ -1022,3 +1191,2118 @@ def test_fdm_poisson_converges_without_raising_on_the_default_stencil():
     sol = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()  # must not raise
     rel = float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
     assert rel < 3e-2, f"the answer must still be accurate: rel {rel:.3e}"
+
+
+# ---- second order in time: `ui.tt` -------------------------------------------------------------------
+# `u.tt` used to be probed as if it were `u.t`, so a wave equation was silently solved as a heat equation
+# (the centre of a standing wave decayed to 8e-5 by t = 0.5 instead of swinging to -0.61). The oracle for
+# the structured 5-point grid is the SEMIDISCRETE mode: sin(πx)sin(πy) is an exact eigenvector with
+# λ_h = 2·(4/h²)·sin²(πh/2), so the spatial error drops out and only the time integration is tested.
+
+_H = 0.1
+
+
+def _wave(n_steps, T=0.5, *, damping=None, velocity=False, time=None):
+    """u_tt [+ c u_t] = Δu on the unit square, u = 0 on ∂Ω, returns (nodes, trajectory)."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=_H).structured(), time=(0.0, T, n_steps))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, ti = d.variable("initial", split=True)
+    u = d.unknown()
+    ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
+    Δu = ui.d2(x) + ui.d2(y)
+    mode0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+
+    pde = ui.tt - Δu if damping is None else ui.tt + damping * ui.t - Δu
+    terms = [pde, u(xb, yb) - 0.0]
+    terms += [u(xi, yi) - 0.0, ui0.t - mode0] if velocity else [u(xi, yi) - mode0]
+    prob = jno.fdm(terms)
+    return _nodes(d), np.asarray(prob.solve() if time is None else prob.solve(time=time))
+
+
+def _mode(p):
+    return np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+
+
+_OMEGA_H = np.sqrt(2 * (4 / _H**2) * np.sin(np.pi * _H / 2) ** 2)  # semidiscrete frequency of the mode
+
+
+def _err(sol, amplitude, p):
+    return float(np.linalg.norm(sol - amplitude * _mode(p)) / np.linalg.norm(_mode(p)))
+
+
+def test_wave_standing_mode_oscillates():
+    p, traj = _wave(51)
+    assert traj.shape == (51, len(p))
+    ts = np.linspace(0.0, 0.5, 51)
+    worst = max(_err(traj[k], np.cos(_OMEGA_H * ts[k]), p) for k in range(len(ts)))
+    assert worst < 1e-3, f"standing wave off the exact cos(ω_h t) mode by {worst:.2e}"
+    assert traj[-1][np.argmax(_mode(p))] < -0.5, "the centre must swing negative, not decay like heat"
+
+
+def test_wave_time_error_is_second_order():
+    """θ = ½ (trapezoidal / Newmark average acceleration) is the default: halving dt quarters the error."""
+    e = [_err(traj[-1], np.cos(_OMEGA_H * 0.5), p) for p, traj in (_wave(n) for n in (26, 51))]
+    assert e[0] / e[1] > 3.5, f"expected O(dt²): errors {e}"
+
+
+def test_wave_initial_velocity():
+    p, traj = _wave(51, velocity=True)
+    assert _err(traj[-1], np.sin(_OMEGA_H * 0.5) / _OMEGA_H, p) < 1e-3
+
+
+def test_wave_damped():
+    c, T = 2.0, 0.5
+    wd = np.sqrt(_OMEGA_H**2 - c**2 / 4)
+    amplitude = np.exp(-c * T / 2) * (np.cos(wd * T) + c / (2 * wd) * np.sin(wd * T))
+    p, traj = _wave(51, damping=c)
+    assert _err(traj[-1], amplitude, p) < 1e-3
+
+
+def test_wave_time_scheme_slot_composes():
+    """`time=jno.solve.theta(1.0)` swaps in backward Euler, which visibly damps an undamped wave."""
+    p, traj = _wave(51, time=jno.solve.theta(1.0))
+    exact = abs(np.cos(_OMEGA_H * 0.5))
+    assert np.abs(traj[-1]).max() < 0.99 * exact
+
+
+def test_wave_neumann_edge():
+    """A flux edge composes with u_tt: u0 = sin(πx/2) sin(πy), insulated at x = 1."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.5, 101))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    (xl, yl, _), (xo, yo, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("left", "bottom", "top"))
+    xr, yr, _ = d.variable("right", split=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui, ur = u.bind(x=x, y=y, t=t), u.bind(x=xr, y=yr)
+    traj = np.asarray(
+        jno.fdm(
+            [
+                ui.tt - ui.d2(x) - ui.d2(y),
+                u(xl, yl) - 0.0,
+                u(xo, yo) - 0.0,
+                u(xt, yt) - 0.0,
+                ur.d(nr) - 0.0,
+                u(xi, yi) - jnn.sin(np.pi * xi / 2) * jnn.sin(np.pi * yi),
+            ]
+        ).solve()
+    )
+    p = _nodes(d)
+    mode = np.sin(np.pi * p[:, 0] / 2) * np.sin(np.pi * p[:, 1])
+    exact = np.cos(np.pi * np.sqrt(1.25) * 0.5) * mode
+    assert float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(mode)) < 1e-2
+
+
+@pytest.mark.parametrize(
+    "case", ["velocity_on_first_order", "velocity_without_displacement", "nonlinear_inertia", "third_order"]
+)
+def test_wave_guards(case):
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).structured(), time=(0.0, 0.1, 5))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, ti = d.variable("initial", split=True)
+    u = d.unknown()
+    ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
+    Δu = ui.d2(x) + ui.d2(y)
+    terms, match = {
+        "velocity_on_first_order": ([ui.t - Δu, u(xi, yi) - 1.0, ui0.t - 1.0], "no `u.tt` term"),
+        "velocity_without_displacement": ([ui.tt - Δu, ui0.t - 1.0], "without an initial displacement"),
+        "nonlinear_inertia": ([(1.0 + ui) * ui.tt - Δu, u(xi, yi) - 1.0], "nonlinear inertia"),
+        "third_order": ([ui.tt.t - Δu, u(xi, yi) - 1.0], "order 3"),
+    }[case]
+    with pytest.raises((ValueError, NotImplementedError), match=match):
+        jno.fdm(terms + [u(xb, yb) - 0.0]).solve()
+
+
+# ---- variable coefficients in divergence form: `(κ * ui.x).x` ------------------------------------------
+
+
+@pytest.mark.parametrize("nonlinear", [False, True])
+def test_divergence_form_coefficient_converges(nonlinear):
+    """−∇·(κ∇u) = f is written with the bound field's partials, `(κ * ui.x).x + (κ * ui.y).y`, for a
+    coordinate coefficient κ = 1 + x and for a nonlinear κ = 1 + u. Manufactured u = sin(πx)sin(πy);
+    both converge at second order (measured 4.9e-2 → 1.2e-2 → 3.1e-3 and 5.1e-2 → 1.2e-2 → 3.0e-3)."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    errs = []
+    for h in (0.1, 0.05):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        ue = jnn.sin(π * x) * jnn.sin(π * y)
+        if nonlinear:  # −∇·((1+u)∇u) = −(1+u)Δu − |∇u|²
+            κ = 1.0 + ui
+            grad2 = π**2 * ((jnn.cos(π * x) * jnn.sin(π * y)) ** 2 + (jnn.sin(π * x) * jnn.cos(π * y)) ** 2)
+            f = (1.0 + ue) * 2 * π**2 * ue - grad2
+        else:  # −∇·((1+x)∇u) = −u_x − (1+x)Δu
+            κ = 1.0 + x
+            f = -π * jnn.cos(π * x) * jnn.sin(π * y) + κ * 2 * π**2 * ue
+        sol = np.asarray(jno.fdm([-(κ * ui.x).x - (κ * ui.y).y - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+        p = _nodes(d)
+        exact = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+        errs.append(float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)))
+    assert errs[1] < 2e-2 and errs[0] / errs[1] > 3.0, f"expected O(h²): {errs}"
+
+
+# ---- `domain.cell_size` in the strong form: the node spacing, so upwinding is written as math ----------
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_cell_size_is_the_grid_spacing_on_a_structured_grid(dim):
+    """FDM resolves `cell_size` per node as the mean of (d!·|K|)^(1/d) over incident cells: exactly the
+    grid spacing on the 2-D right-triangulation and the 3-D Kuhn tets (FEM's |K|^(1/d) is h/√2 in 2-D)."""
+    import importlib
+
+    fdm_mod = importlib.import_module("jno.fdm")
+    h = 0.05 if dim == 2 else 0.25
+    shape = jno.shape.rect(0, 0, 1, 1, size=h) if dim == 2 else jno.shape.box(0, 0, 0, 1, 1, 1, size=h)
+    d = shape.structured().domain()
+    coords = d.variable("interior", split=True)[:dim]
+    u = d.unknown()
+    ui = u.bind(**dict(zip("xyz", coords)))
+    prob = fdm_mod._TraceFDM([-ui.d2(coords[0]) - 1.0, u(*d.variable("boundary", split=True)[:dim]) - 0.0])
+    assert np.allclose(np.asarray(prob._node_spacing()), h, rtol=1e-12)
+
+
+def test_upwinding_written_with_cell_size_matches_the_upwind_matrix():
+    """−εΔu + b·u_x = 1 at cell Péclet bh/2ε = 2.5. Upwinding is the identity
+    (u_i − u_{i−1})/h = central − (h/2)·(second difference), so it is written as the math,
+    `b*ui.x - abs(b)*h/2*ui.xx` with h = d.cell_size. Oracle: the upwind system assembled by hand
+    with numpy. Central differences alone overshoot the exact bound u ≤ 1 (max 1.38 here)."""
+    import jno.jnp_ops as jnn
+
+    ε, b, h = 1e-2, 1.0, 0.05
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    Δu = ui.xx + ui.yy
+    sol = np.asarray(jno.fdm([-ε * Δu + b * ui.x - jnn.abs(b) * d.cell_size / 2 * ui.xx - 1.0, u(xb, yb) - 0.0]).solve())
+
+    n = round(1 / h) - 1  # interior nodes per axis
+    eye = np.eye(n)
+    D2 = (np.diag(-2 * np.ones(n)) + np.diag(np.ones(n - 1), 1) + np.diag(np.ones(n - 1), -1)) / h**2
+    Dm = (np.eye(n) - np.diag(np.ones(n - 1), -1)) / h  # backward difference: the upwind side for b > 0
+    A = -ε * (np.kron(D2, eye) + np.kron(eye, D2)) + b * np.kron(Dm, eye)  # x is the first (slow) index
+    ref_int = np.linalg.solve(A, np.ones(n * n)).reshape(n, n)
+
+    p = _nodes(d)
+    ix, iy = np.rint(p[:, 0] / h).astype(int), np.rint(p[:, 1] / h).astype(int)
+    inner = (ix > 0) & (ix < n + 1) & (iy > 0) & (iy < n + 1)
+    ref = ref_int[ix[inner] - 1, iy[inner] - 1]
+    assert np.allclose(sol[inner], ref, atol=1e-8), np.abs(sol[inner] - ref).max()
+    assert sol.max() < 1.0
+
+
+# ---- the compiled steady solve -------------------------------------------------------------------------
+
+
+def _structured_poisson(h=0.05):
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    return d, u, jno.fdm([-(ui.xx + ui.yy) - f, u(xb, yb) - 0.0])
+
+
+def test_compiled_residual_has_no_all_pairs_distance():
+    """Under `jit` the mesh points used to become tracers, which sent every mesh derivative to the
+    in-graph nearest-node fallback: an N×N×dim distance tensor per residual call. That was 0.2 s per
+    residual at 16k nodes and 3.8 s at 66k, and `origin/main` was killed at 66k. No intermediate of the
+    compiled residual may be quadratic in N."""
+    d, _, prob = _structured_poisson(0.05)
+    n = prob._N
+    jaxpr = jax.make_jaxpr(prob._pde_residual_fn())(jnp.ones(n))
+    biggest = max(int(np.prod(v.aval.shape)) for e in jaxpr.jaxpr.eqns for v in e.outvars if hasattr(v.aval, "shape"))
+    assert biggest < 16 * n, f"an intermediate of size {biggest} for N = {n}"
+
+
+def test_steady_solve_is_compiled_once_and_reused():
+    """A linear problem on a structured grid takes the one-Krylov-solve path; it compiles once."""
+    d, _, prob = _structured_poisson(0.05)
+    first = np.asarray(prob.solve())
+    fn = prob._grid_linear_cache["fn"]
+    second = np.asarray(prob.solve())
+    assert prob._grid_linear_cache["fn"] is fn
+    np.testing.assert_array_equal(first, second)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(second - exact) / np.linalg.norm(exact)) < 5e-3
+
+
+def test_compiled_solve_sees_a_changed_data_field():
+    """A known nodal field is baked into the compiled solve, so its values are part of the cache key:
+    changing them must re-solve with the new data, not silently reuse the old."""
+    import equinox as eqx
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    g = jno.np.parameter((p.shape[0],), name="g")  # data: no optimizer
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-ui.d2(x) - ui.d2(y) + 4.0, u(xb, yb) - g])
+    for shift in (0.0, 1.0):
+        exact = p[:, 0] ** 2 + p[:, 1] ** 2 + shift  # −Δu = −4, u = g on ∂Ω
+        g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(exact))
+        sol = np.asarray(prob.solve()).reshape(-1)
+        assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 1e-2, shift
+
+
+def test_compiled_solve_still_raises_on_a_stalled_newton():
+    """Newton's own guard is blind under `jit`; the compiled path re-checks the concrete result against
+    the spec's tolerances and raises, as the uncompiled path did."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - 5.0 * jnn.exp(ui), u(xb, yb) - 0.0])
+    with pytest.raises(RuntimeError, match="did not converge"):
+        prob.solve(nonlinear=jno.solve.newton(max_steps=1))
+
+
+# ---- fem.solve's solver slots on jno.fdm: linear= / precond= --------------------------------------------
+# Setting either assembles the strong-form operator as a sparse matrix once (coloured JVPs, verified
+# against the matrix-free action), then composes exactly as `fem.solve` does. The oracle throughout is
+# the unchanged matrix-free default: every slot must reach the same answer.
+
+
+def _slot_problem(kind="unstructured", time=None, order=1, nonlinear=False):
+    import jno.jnp_ops as jnn
+
+    kw = {} if time is None else {"time": time}
+    if kind == "structured":
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), **kw)
+    else:
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05, **kw)
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t) if time else u.bind(x=x, y=y)
+    Δu = ui.d2(x) + ui.d2(y) if kind == "structured" else ui.laplacian(x, y, scheme=_COT)
+    if time:
+        xi, yi, _ = d.variable("initial", split=True)
+        u0 = 16 * xi * (1 - xi) * yi * (1 - yi) * jnn.exp(3 * xi)
+        return lambda: jno.fdm([(ui.tt if order == 2 else ui.t) - Δu, u(xb, yb) - 0.0, u(xi, yi) - u0])
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    return lambda: jno.fdm([-Δu - f - (jnn.exp(ui) if nonlinear else 0.0), u(xb, yb) - 0.0])
+
+
+_SLOTS = {
+    "lu": lambda: dict(linear=jno.solve.lu()),
+    "bicgstab+jacobi": lambda: dict(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi()),
+    "gmres+amg": lambda: dict(linear=jno.solve.gmres(), precond=jno.precond.amg()),
+}
+
+
+def _max_rel(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    return float(np.abs(a - b).max() / np.abs(b).max())
+
+
+@pytest.mark.parametrize("slot", list(_SLOTS))
+@pytest.mark.parametrize("case", ["steady", "steady-nonlinear", "heat", "wave"])
+def test_solver_slots_reach_the_default_answer(slot, case):
+    if slot == "gmres+amg":
+        pytest.importorskip("pyamg")
+    time = None if case.startswith("steady") else (0.0, 0.1, 21)
+    make = _slot_problem(time=time, order=2 if case == "wave" else 1, nonlinear=case == "steady-nonlinear")
+    kw = _SLOTS[slot]()
+    ref = make().solve()
+    assert _max_rel(make().solve(**kw), ref) < 1e-7
+
+
+def test_gmg_slot_on_a_structured_grid():
+    for case, time in (("steady", None), ("heat", (0.0, 0.1, 21))):
+        make = _slot_problem("structured", time=time)
+        got = make().solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())
+        assert _max_rel(got, make().solve()) < 1e-7, case
+
+
+def test_wave_slots_on_the_newmark_step():
+    """The default u.tt march solves for the new displacement alone (Newmark), a single scalar field. So
+    gmg now preconditions it, and cg applies: both used to be refused or fail on the non-symmetric,
+    twice-as-large [u; v] system."""
+    make = _slot_problem("structured", time=(0.0, 0.1, 21), order=2)
+    ref = make().solve()
+    for kw in (
+        dict(linear=jno.solve.gmres(), precond=jno.precond.gmg()),
+        dict(linear=jno.solve.cg(), precond=jno.precond.jacobi()),
+    ):
+        assert _max_rel(make().solve(**kw), ref) < 1e-7, kw
+
+
+def test_gmg_preconditions_a_coupled_system():
+    """The V-cycle is built from the operator's own stencil, which carries every field pair, so a coupled
+    system is preconditioned like a scalar one -- it used to raise ("a single scalar field"). Oracle: the
+    default solve, and a direct one."""
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 32).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    terms = [
+        -ui.xx - ui.yy + 2.0 * vi - f,
+        -vi.xx - vi.yy - 0.5 * ui - f,
+        u(xb, yb) - 0.0,
+        v(xb, yb) - 0.0,
+    ]
+    base = np.asarray(jno.fdm(terms).solve())
+    got = np.asarray(jno.fdm(terms).solve(linear=jno.solve.gmres(), precond=jno.precond.gmg()))
+    direct = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    np.testing.assert_allclose(got, base, atol=1e-9)
+    np.testing.assert_allclose(got, direct, atol=1e-9)
+
+
+def test_gmg_refuses_a_system_that_is_not_a_lattice_operator():
+    """It still needs the system to BE fields on the grid: a size that is not a whole number of them raises."""
+    make = _slot_problem("structured")
+    prob = make()
+    with pytest.raises(ValueError, match="whole number of them"):
+        prob._check_precond_shape(jno.precond.gmg(), prob._N + 1)
+
+
+@pytest.mark.parametrize("case", ["steady", "heat", "wave"])
+def test_cg_refuses_a_nonsymmetric_operator(case):
+    """Unstructured FDM operators are not symmetric (cotangent rows are divided by nodal areas), and CG on
+    them converged to an answer ~2e-6 off, inside the residual gate. It now refuses up front."""
+    time = None if case == "steady" else (0.0, 0.1, 21)
+    make = _slot_problem(time=time, order=2 if case == "wave" else 1)
+    with pytest.raises(ValueError, match="needs a symmetric operator"):
+        make().solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
+
+
+def test_cg_on_a_structured_grid_after_the_dirichlet_lift():
+    """On a structured grid the operator is symmetric once the Dirichlet columns are lifted to the
+    right-hand side, so CG applies and reaches the default answer."""
+    for case, time in (("steady", None), ("heat", (0.0, 0.1, 21))):
+        make = _slot_problem("structured", time=time)
+        got = make().solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
+        assert _max_rel(got, make().solve()) < 1e-7, case
+
+
+def test_nonlinear_slot_on_a_linear_problem_raises():
+    with pytest.raises(ValueError, match="this problem is linear"):
+        _slot_problem()().solve(linear=jno.solve.lu(), nonlinear=jno.solve.newton())
+
+
+def test_transient_nonlinear_slot_is_used():
+    """`nonlinear=` on a transient FDM problem used to be accepted and silently ignored. One Newton step
+    cannot converge a cubic reaction, so the march must now refuse."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, 0.1, 6))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    prob = jno.fdm(
+        [ui.t - ui.laplacian(x, y, scheme=_COT) - 5.0 * ui**3, u(xb, yb) - 0.0, u(xi, yi) - 2.0 * jnn.sin(np.pi * xi)]
+    )
+    with pytest.raises(RuntimeError, match="did not converge"):
+        prob.solve(nonlinear=jno.solve.newton(max_steps=1))
+
+
+def test_inverse_through_a_solver_slot():
+    """The assembled operator is traceable, so a crux-driven inverse runs through `linear=` too."""
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    Δu = ui.laplacian(x, y, scheme=_COT)
+    observed = jnp.asarray(jno.fdm([-Δu - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(2.5))
+    s.optimizer(optax.adam(1e-1))
+    node = jno.fdm([-Δu - s * f, u(xb, yb) - 0.0]).solve(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi())
+    crux = jno.core([(node - observed).mse])
+    crux.solve(120)
+    assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - 1.0) < 2e-2
+
+
+def test_exponential_scheme_refused_even_with_a_linear_slot():
+    """With a slot the block is linear and the exponential scheme used to run, 4.8e-3 off a converged
+    reference (Crank-Nicolson at the same step: 2.0e-5): an FDM march is a DAE whose boundary rows have
+    zero mass, and the scheme forms M⁻¹A. It now refuses in both cases."""
+    make = _slot_problem(time=(0.0, 0.1, 21))
+    with pytest.raises(NotImplementedError, match="invertible mass"):
+        make().solve(time=jno.solve.exponential(), linear=jno.solve.gmres())
+
+
+def test_coupled_fields_return_in_declaration_order():
+    """The fields come back in the order they were declared, whatever order the equations are listed in.
+    They used to come back in first-appearance order, so listing the v-equation first swapped u and v."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    U, V = jnn.sin(π * x) * jnn.sin(π * y) + x, x * y + jnn.cos(x)
+    eu = -(ui.xx + ui.yy) + vi - (2 * π**2 * jnn.sin(π * x) * jnn.sin(π * y) + V)
+    ev = -(vi.xx + vi.yy) + ui - (jnn.cos(x) + U)
+    bcs = [u(xb, yb) - (jnn.sin(π * xb) * jnn.sin(π * yb) + xb), v(xb, yb) - (xb * yb + jnn.cos(xb))]
+    p = _nodes(d)
+    Ue = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1]) + p[:, 0]
+    Ve = p[:, 0] * p[:, 1] + np.cos(p[:, 0])
+    for order in ([eu, ev], [ev, eu]):
+        uh, vh = np.asarray(jno.fdm(order + bcs).solve())
+        assert np.linalg.norm(uh - Ue) / np.linalg.norm(Ue) < 5e-3
+        assert np.linalg.norm(vh - Ve) / np.linalg.norm(Ve) < 5e-3
+
+
+def test_structured_box_faces_are_named_like_shape_box():
+    """front/back at y = 0/1 and bottom/top at z = 0/1, on the tet mesh and the structured grid alike.
+    The structured grid used to swap the two pairs, so a condition on "top" moved faces with `.structured()`."""
+    import importlib
+
+    fdm_mod = importlib.import_module("jno.fdm")
+    expected = {"front": (1, 0.0), "back": (1, 1.0), "bottom": (2, 0.0), "top": (2, 1.0)}
+    for structured in (False, True):
+        shape = jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.25)
+        d = shape.structured().domain() if structured else shape.domain()
+        x, y, z, _ = d.variable("interior", split=True)
+        u = d.unknown()
+        prob = fdm_mod._TraceFDM([-u.bind(x=x, y=y, z=z).d2(x) - 1.0, u(*d.variable("boundary", split=True)[:3]) - 0.0])
+        pts = np.asarray(d.mesh_connectivity["points"])[:, :3]
+        for face, (axis, value) in expected.items():
+            d.variable(face, split=True)
+            face_pts = pts[prob._region_nodes(face)]
+            assert np.allclose(face_pts[:, axis], value), (structured, face)
+
+
+@pytest.mark.parametrize("spelling", ["d2", "xx", "laplacian", "scaled"])
+def test_default_laplacian_is_fused_into_cotangent(spelling):
+    """On an unstructured mesh the per-axis default (a gradient of the area-weighted gradient) has a
+    spurious oscillating mode: its lowest Dirichlet eigenvalue on the unit square is ~5.4, not 2π², and it
+    does not refine away. An advection–diffusion solve came out 2.09 off, and Helmholtz at c = 5.41 blew up.
+    Every spelling of the plain Laplacian now fuses into the cotangent one, which has no such mode.
+    Oracle: −Δu − 5.41 u = f with u = sin(πx) sin(πy), sitting right on the old spurious eigenvalue."""
+    import jno.jnp_ops as jnn
+
+    π, c = np.pi, 5.4126
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    Δu = {
+        "d2": ui.d2(x) + ui.d2(y),
+        "xx": ui.xx + ui.yy,
+        "laplacian": ui.laplacian(x, y),
+        "scaled": None,
+    }[spelling]
+    f = (2 * π**2 - c) * jnn.sin(π * x) * jnn.sin(π * y)
+    pde = (-2.0 * ui.xx - 2.0 * ui.yy) / 2.0 - c * ui - f if spelling == "scaled" else -Δu - c * ui - f
+    sol = np.asarray(jno.fdm([pde, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    p = _nodes(d)
+    exact = np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 1e-2
+
+
+# ---- time-dependent data: sources f(x, t), boundary values g(x, t), coefficients κ(t) ------------------
+# A source containing t raised KeyError('__time__'); a boundary value containing t was accepted and then
+# held at its start value (the boundary stayed at 1.0 while g decayed to 0.14; error 3.5 at T).
+
+
+def _heat_with_time_data(n_steps, *, kind, slots=None, structured=True):
+    """u_t − κ(t)Δu = f(x, t) with an exact solution, every datum written with the time variable."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05)
+    d = jno.domain(shape.structured() if structured else shape, time=(0.0, 0.2, n_steps))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    Δu = ui.xx + ui.yy
+    if kind == "source":  # u = e^{-t} sin πx sin πy
+        terms = [
+            ui.t - Δu - (2 * π**2 - 1) * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y),
+            u(xb, yb) - 0.0,
+            u(xi, yi) - jnn.sin(π * xi) * jnn.sin(π * yi),
+        ]
+        exact = lambda p, T: np.exp(-T) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])  # noqa: E731
+    elif kind == "dirichlet":  # u = e^{-π² t} cos πx
+        terms = [ui.t - Δu, u(xb, yb) - jnn.exp(-(π**2) * tb) * jnn.cos(π * xb), u(xi, yi) - jnn.cos(π * xi)]
+        exact = lambda p, T: np.exp(-(π**2) * T) * np.cos(π * p[:, 0])  # noqa: E731
+    else:  # "coefficient": κ(t) = 1 + t, u = e^{-t} sin πx sin πy
+        terms = [
+            ui.t - (1.0 + t) * Δu - (2 * π**2 * (1.0 + t) - 1) * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y),
+            u(xb, yb) - 0.0,
+            u(xi, yi) - jnn.sin(π * xi) * jnn.sin(π * yi),
+        ]
+        exact = lambda p, T: np.exp(-T) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])  # noqa: E731
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5), **(slots or {})))
+    p = _nodes(d)
+    ref = exact(p, 0.2)
+    return float(np.linalg.norm(traj[-1] - ref) / np.linalg.norm(ref))
+
+
+@pytest.mark.parametrize("kind", ["source", "dirichlet", "coefficient"])
+def test_time_dependent_data_converges(kind):
+    """Crank–Nicolson, h = 0.05: the error falls under Δt refinement to the spatial floor."""
+    coarse, fine = _heat_with_time_data(11, kind=kind), _heat_with_time_data(41, kind=kind)
+    # Both sit at or near the spatial error floor (the Dirichlet case is already there at 11 steps).
+    assert fine < 5e-3 and coarse < 2e-2, (coarse, fine)
+
+
+@pytest.mark.parametrize("kind", ["source", "dirichlet", "coefficient"])
+def test_time_dependent_data_through_the_solver_slots(kind):
+    """With linear=/precond= the operator is assembled once: time-dependent data must ride the forcing
+    (it used to be frozen as a constant bias), and a time-varying κ(t) must fall back to the Newton step."""
+    ref = _heat_with_time_data(21, kind=kind, structured=False)
+    got = _heat_with_time_data(
+        21, kind=kind, structured=False, slots=dict(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi())
+    )
+    assert abs(got - ref) < 1e-6 * max(1.0, ref) and got < 1e-2, (got, ref)
+
+
+def test_forced_wave_with_time_dependent_source():
+    """u_tt − Δu = f(x, t) with u = sin(t) sin πx sin πy (u0 = 0, v0 = sin πx sin πy), Newmark default."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    errs = []
+    for n in (21, 41):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 1.0, n))
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, ti = d.variable("initial", split=True)
+        u = d.unknown()
+        ui, ui0 = u.bind(x=x, y=y, t=t), u.bind(x=xi, y=yi, t=ti)
+        f = (2 * π**2 - 1) * jnn.sin(t) * jnn.sin(π * x) * jnn.sin(π * y)
+        traj = np.asarray(
+            jno.fdm(
+                [ui.tt - ui.xx - ui.yy - f, u(xb, yb) - 0.0, u(xi, yi) - 0.0, ui0.t - jnn.sin(π * xi) * jnn.sin(π * yi)]
+            ).solve()
+        )
+        p = _nodes(d)
+        ref = np.sin(1.0) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+        errs.append(float(np.linalg.norm(traj[-1] - ref) / np.linalg.norm(ref)))
+    assert errs[1] < errs[0] and errs[1] < 1e-2, errs
+
+
+def _time_everywhere(kind, h):
+    """u_t − Δu = f with a datum written with t in a flux condition or on the mass; exact solutions:
+    u = e^{-t} x² sin πy (flux on the right edge), u = e^{-t} sin πx sin πy (mass (1 + t)·u_t)."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured(), time=(0.0, 0.2, 41))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    p = _nodes(d)
+    if kind == "mass":
+        xb, yb, _ = d.variable("boundary", split=True)
+        f = (2 * π**2 - (1 + t)) * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y)
+        terms = [(1 + t) * ui.t - ui.xx - ui.yy - f, u(xb, yb) - 0.0, u(xi, yi) - jnn.sin(π * xi) * jnn.sin(π * yi)]
+        exact = np.exp(-0.2) * np.sin(π * p[:, 0]) * np.sin(π * p[:, 1])
+    else:
+        (xl, yl, _), (xo, yo, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("left", "bottom", "top"))
+        xr, yr, tr = d.variable("right", split=True)
+        nr = d.variable("right", normals=True)
+        ur = u.bind(x=xr, y=yr)
+        f = jnn.exp(-t) * ((π**2 - 1) * x**2 - 2) * jnn.sin(π * y)
+        flux = {  # ∂u/∂n = u_x = 2 e^{-t} sin πy at x = 1
+            "neumann": ur.d(nr) - 2 * jnn.exp(-tr) * jnn.sin(π * yr),
+            "robin": ur.d(nr) + (1 + tr) * ur - (3 + tr) * jnn.exp(-tr) * jnn.sin(π * yr),
+        }[kind]
+        terms = [
+            ui.t - ui.xx - ui.yy - f,
+            u(xl, yl) - 0.0,
+            u(xo, yo) - 0.0,
+            u(xt, yt) - 0.0,
+            flux,
+            u(xi, yi) - xi**2 * jnn.sin(π * yi),
+        ]
+        exact = np.exp(-0.2) * p[:, 0] ** 2 * np.sin(π * p[:, 1])
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5)))
+    return float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact))
+
+
+@pytest.mark.parametrize("kind", ["neumann", "robin", "mass"])
+def test_time_dependent_flux_data_and_mass_coefficient(kind):
+    """A datum written with t works wherever it appears: a Neumann value h(t), a Robin α(t), a mass
+    (1 + t)·u_t. They were evaluated once at the start and held: 0.10, 0.12 and 5.8e-3 at T, against
+    1.5e-3, 1.2e-3 and 2.2e-3 now at h = 0.05 — and second order under refinement."""
+    e = [_time_everywhere(kind, h) for h in (0.1, 0.05)]
+    assert e[1] < 1e-2 and e[0] / e[1] > 3.0, e
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_inverse_recovers_a_robin_coefficient(structured):
+    """A trainable α inside a Robin condition, ∂u/∂n + α(u − 0.5) = 0, recovered through jno.core from the
+    field it produces. It crashed: the flux rows' host-side mesh work and their affine check ran inside the
+    crux trace (and on a structured grid, the multigrid setup too)."""
+    import optax
+
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1)
+    d = shape.structured().domain() if structured else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    (xl, yl, _), (xo, yo, _), (xr, yr, _), (xt, yt, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "right", "top")
+    )
+    nt = d.variable("top", normals=True)
+    u = d.unknown()
+    ui, ut = u.bind(x=x, y=y), u.bind(x=xt, y=yt)
+
+    def problem(alpha):
+        return jno.fdm(
+            [-(ui.xx + ui.yy) - 1.0, u(xl, yl) - 0.0, u(xo, yo) - 1.0, u(xr, yr) - 0.0, ut.d(nt) + alpha * (ut - 0.5)]
+        )
+
+    observed = jnp.asarray(problem(2.0).solve()).reshape(-1)
+    a = jno.np.parameter((1,), name="alpha")
+    a.dtype(jnp.float64)
+    a.initialize(jax.nn.initializers.constant(0.5))
+    a.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(a).solve() - observed).mse])
+    crux.solve(300)
+    recovered = float(np.asarray(crux.eval([a])).reshape(-1)[0])
+    assert abs(recovered - 2.0) < 5e-2, recovered
+
+
+@pytest.mark.parametrize("where", ["source", "dirichlet", "neumann"])
+def test_a_trainable_parameter_is_differentiable_wherever_it_appears(where):
+    """Recover s = 1.5 from the field it produces, with s in the source, a Dirichlet value, or a Neumann
+    value. The Dirichlet value used to be read from the parameter's STORED value, so its gradient was zero
+    and the inverse never moved (0.5 stayed 0.5), with no error."""
+    import optax
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    (xl, yl, _), (xo, yo, _), (xr, yr, _), (xt, yt, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "right", "top")
+    )
+    nt = d.variable("top", normals=True)
+    u = d.unknown()
+    ui, ut = u.bind(x=x, y=y), u.bind(x=xt, y=yt)
+    Δu = ui.xx + ui.yy
+
+    def problem(s):
+        if where == "source":
+            return jno.fdm([-Δu - s, u(xb, yb) - 0.0])
+        if where == "dirichlet":
+            return jno.fdm([-Δu - 1.0, u(xb, yb) - s])
+        return jno.fdm([-Δu - 1.0, u(xl, yl) - 0.0, u(xo, yo) - 0.0, u(xr, yr) - 0.0, ut.d(nt) - s])
+
+    observed = jnp.asarray(problem(1.5).solve()).reshape(-1)
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(0.5))
+    s.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(s).solve() - observed).mse])
+    crux.solve(300)
+    assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - 1.5) < 1e-3
+
+
+@pytest.mark.parametrize("kind", ["diffusivity", "source", "dirichlet", "robin", "wave_speed", "slots"])
+def test_transient_inverse_recovers_the_parameter(kind):
+    """A trainable parameter in a TIME-DEPENDENT problem, recovered through jno.core from the trajectory it
+    produces — in the diffusivity, a source f(x, t), a boundary value g(x, t), a Robin coefficient, a wave
+    speed (the Newmark march), and through linear=/precond= slots. This raised "No model for Model N": the
+    march evaluated the residual without the parameter. Every evaluator in the march now reads the injected
+    value, and the march's structural decisions are made once on concrete values."""
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    if kind == "slots":
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, 0.1, 11))
+    else:
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    (xl, yl, _), (xo, yo, _), (xr, yr, _), (xt, yt, _) = (
+        d.variable(r, split=True) for r in ("left", "bottom", "right", "top")
+    )
+    nt = d.variable("top", normals=True)
+    u = d.unknown()
+    ui, ut = u.bind(x=x, y=y, t=t), u.bind(x=xt, y=yt)
+    Δu = ui.xx + ui.yy
+    u0 = 16 * xi * (1 - xi) * yi * (1 - yi)
+
+    def problem(s):
+        if kind in ("diffusivity", "slots"):
+            return jno.fdm([ui.t - s * Δu, u(xb, yb) - 0.0, u(xi, yi) - u0])
+        if kind == "source":
+            return jno.fdm(
+                [ui.t - Δu - s * jnn.exp(-t) * jnn.sin(π * x) * jnn.sin(π * y), u(xb, yb) - 0.0, u(xi, yi) - 0.0]
+            )
+        if kind == "dirichlet":
+            return jno.fdm([ui.t - Δu, u(xb, yb) - s * jnn.exp(-tb) * xb, u(xi, yi) - s * xi])
+        if kind == "robin":
+            return jno.fdm(
+                [ui.t - Δu, u(xl, yl) - 0.0, u(xo, yo) - 0.0, u(xr, yr) - 0.0, ut.d(nt) + s * (ut - 1.0), u(xi, yi) - u0]
+            )
+        return jno.fdm([ui.tt - s * Δu, u(xb, yb) - 0.0, u(xi, yi) - u0])
+
+    slots = dict(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi()) if kind == "slots" else {}
+    true = 3.0 if kind == "robin" else 1.5
+    observed = jnp.asarray(problem(true).solve(**slots))
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(1.0))
+    s.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(s).solve(**slots) - observed).mse])
+    crux.solve(300)
+    assert abs(float(np.asarray(crux.eval([s])).reshape(-1)[0]) - true) < 1e-3
+
+
+# θ-steps on the DAE: the Dirichlet and flux rows carry zero mass, so they are constraints, not ODEs.
+# Forward Euler used to evaluate them only at the OLD state (a singular step: NaN at step 38 once the
+# decaying field reached ~1e-8), and Crank-Nicolson averaged them (a boundary started off its value
+# flipped sign every step and never decayed). They are now imposed at the new time.
+
+
+def _heat_mode(k, n, *, ic_one=False, T=0.02, h=0.1):
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured(), time=(0.0, T, n))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ic = 1.0 + 0.0 * xi if ic_one else jno.np.sin(k * np.pi * xi) * jno.np.sin(k * np.pi * yi)
+    return d, jno.fdm([ui.t - ui.xx - ui.yy, u(xb, yb) - 0.0, u(xi, yi) - ic])
+
+
+@pytest.mark.parametrize("k, slots", [(1, {}), (9, {}), (1, {"linear": "gmres"}), (1, {"linear": "lu"})])
+def test_forward_euler_matches_the_discrete_decay(k, slots):
+    """θ = 0 on a grid mode of the 5-point Laplacian decays by exactly (1 − Δt·λ_h) per step. The k = 9
+    mode (Δt·λ_h = 0.39, stable) is the one that used to abort with a NaN."""
+    n, T, h = 201, 0.02, 0.1
+    d, problem = _heat_mode(k, n, T=T, h=h)
+    slots = {name: getattr(jno.solve, solver)() for name, solver in slots.items()}
+    traj = np.asarray(problem.solve(time=jno.solve.theta(0.0), **slots)).reshape(n, -1)
+    p = _nodes(d)
+    mode = np.sin(k * np.pi * p[:, 0]) * np.sin(k * np.pi * p[:, 1])
+    factor = (1.0 - T / (n - 1) * 8.0 / h**2 * np.sin(k * np.pi * h / 2) ** 2) ** np.arange(n)
+    for i in (10, 50, n - 1):
+        # the step's Newton converges to an absolute tolerance, so a state decayed to 1e-7 is exact to
+        # ~1e-15 absolutely, not to 1e-8 relative to itself
+        assert np.abs(traj[i] - factor[i] * mode).max() < 1e-8 * abs(factor[i]) + 1e-12, (i, factor[i])
+
+
+@pytest.mark.parametrize("theta", [0.0, 0.5])
+def test_theta_step_imposes_the_boundary_at_the_new_time(theta):
+    """An initial state that violates the Dirichlet value (u0 = 1, g = 0) is pulled onto it by the first
+    step, as backward Euler does. Crank–Nicolson held the boundary at |u| = 1 for the whole march."""
+    d, problem = _heat_mode(0, 11, ic_one=True, T=1e-4)
+    traj = np.asarray(problem.solve(time=jno.solve.theta(theta))).reshape(11, -1)
+    p = _nodes(d)
+    on_boundary = (np.minimum(p[:, 0], 1.0 - p[:, 0]) < 1e-9) | (np.minimum(p[:, 1], 1.0 - p[:, 1]) < 1e-9)
+    assert np.abs(traj[1:, on_boundary]).max() < 1e-12
+
+
+def test_nonlinear_crank_nicolson_assembled_tangent():
+    """With a solver slot a nonlinear march uses the assembled step tangent M/Δt + θ·J. It dropped the θ,
+    so Crank–Nicolson's Newton converged on a wrong tangent: 3.3e-11 off the matrix-free march, now 4e-17."""
+
+    def solve(**slots):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.2, 21))
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y, t=t)
+        ic = 3.0 * jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)
+        terms = [ui.t - ui.xx - ui.yy + 30.0 * ui**3, u(xb, yb) - 0.0, u(xi, yi) - ic]
+        return np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5), **slots))[-1]
+
+    assert np.abs(solve(linear=jno.solve.lu()) - solve()).max() < 1e-13
+
+
+def test_a_frozen_march_preconditioner_is_built_for_the_scheme(monkeypatch):
+    """A preconditioner that needs a matrix (gmg, amg) is set up once on the step tangent M + s·J. ``s`` came
+    from ``metadata["theta"]``, which an FDM block does not carry, so a Crank–Nicolson march was preconditioned
+    for backward Euler (s = Δt instead of Δt/2). It is read from the time scheme now. Speed only: the answer
+    never depended on it."""
+    from jno.utils.solver import solver_api
+
+    scales = []
+    real = solver_api._add_step_operator
+
+    def spy(M, A, scale):
+        scales.append(float(scale))
+        return real(M, A, scale)
+
+    monkeypatch.setattr(solver_api, "_add_step_operator", spy)
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured(), time=(0.0, 0.2, 21))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ic = jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)
+    terms = [ui.t - ui.xx - ui.yy + ui**3, u(xb, yb) - 0.0, u(xi, yi) - ic]
+    jno.fdm(terms).solve(time=jno.solve.theta(0.5), linear=jno.solve.gmres(), precond=jno.precond.gmg())
+    dt = 0.2 / 20
+    assert scales and scales[0] == pytest.approx(0.5 * dt)
+
+
+# cg / minres on a Newton path: the assembled tangent keeps the Dirichlet identity rows, whose columns the
+# interior rows still reference, so it is not symmetric and CG returned NaN. The Newton path now solves
+# through the same Dirichlet elimination the linear path uses, exactly, for J and for Jᵀ (the adjoint).
+
+
+def test_dirichlet_elimination_is_exact_for_the_tangent_and_its_transpose():
+    import jax.experimental.sparse as jsp
+
+    from jno.fdm import _TraceFDM
+
+    rng = np.random.default_rng(0)
+    n, is_d = 12, np.zeros(12, dtype=bool)
+    is_d[[0, 5, 11]] = True
+    J = rng.standard_normal((n, n)) + 8.0 * np.eye(n)
+    J[is_d] = 0.0
+    J[is_d, is_d] = rng.uniform(1.0, 3.0, 3)  # pure constraint rows
+    b = rng.standard_normal(n)
+    dense = lambda A_s, rhs: jnp.linalg.solve(A_s.todense(), rhs)  # noqa: E731
+    for A in (J, J.T):
+        _, solve = _TraceFDM._eliminate(jsp.BCOO.fromdense(jnp.asarray(A)), is_d)
+        assert np.abs(np.asarray(solve(dense, jnp.asarray(b))) - np.linalg.solve(A, b)).max() < 1e-12
+
+
+def _bratu(d):
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    S = jno.np.sin(np.pi * x) * jno.np.sin(np.pi * y)
+    f = 2 * np.pi**2 * S - 2.0 * jno.np.exp(S + 0.5 * x * y)
+    return jno.fdm([-(ui.xx + ui.yy) - 2.0 * jno.np.exp(ui) - f, u(xb, yb) - 0.5 * xb * yb])
+
+
+def test_cg_on_a_nonlinear_structured_problem():
+    """Bratu MMS, u = sin πx sin πy + xy/2 on the structured grid: cg matches lu (it returned NaN)."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured().domain()
+    got = np.asarray(_bratu(d).solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())).reshape(-1)
+    ref = np.asarray(_bratu(d).solve(linear=jno.solve.lu())).reshape(-1)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) + 0.5 * p[:, 0] * p[:, 1]
+    assert np.abs(got - ref).max() < 1e-12 and np.abs(got - exact).max() < 5e-3
+
+
+def test_cg_on_a_nonlinear_march():
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ic = jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi) + 0.2
+    terms = [ui.t - ui.xx - ui.yy + ui**3, u(xb, yb) - 0.2, u(xi, yi) - ic]
+    got = np.asarray(jno.fdm(terms).solve(linear=jno.solve.cg()))
+    assert np.abs(got - np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))).max() < 1e-12
+
+
+def test_cg_on_a_nonlinear_unstructured_problem_refuses():
+    """The cotangent rows are divided by nodal areas, so the eliminated tangent is still not symmetric."""
+    with pytest.raises(ValueError, match="needs a symmetric operator"):
+        _bratu(jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)).solve(linear=jno.solve.cg())
+
+
+@pytest.mark.parametrize("linear", ["lu", "gmres", "bicgstab", "cg"])
+def test_gradient_through_a_nonlinear_solve_with_any_linear_slot(linear):
+    """d(mean u²)/dg for a Dirichlet value g·xy on Bratu, against a central difference. With an iterative
+    slot `jax.grad` raised "Reverse-mode differentiation does not work for lax.while_loop": the direct
+    Newton's forward loop closed over the parameter, and the Krylov residual gate kept its tangents alive."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured().domain()
+
+    def solve(g, **slots):
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        S = jno.np.sin(np.pi * x) * jno.np.sin(np.pi * y)
+        f = 2 * np.pi**2 * S - 2.0 * jno.np.exp(S + 0.5 * x * y)
+        terms = [-(ui.xx + ui.yy) - 2.0 * jno.np.exp(ui) - f, u(xb, yb) - g * xb * yb]
+        return jnp.mean(jnp.asarray(jno.fdm(terms).solve(**slots)).reshape(-1) ** 2)
+
+    fd = (float(solve(0.5 + 1e-5)) - float(solve(0.5 - 1e-5))) / 2e-5
+    got = float(jax.grad(lambda g: solve(g, linear=getattr(jno.solve, linear)()))(0.5))
+    assert abs(got - fd) < 1e-8 * abs(fd), (got, fd)
+
+
+def test_all_neumann_structured_grid_keeps_the_mean():
+    """−Δu + u = f with ∂u/∂n = 0 on all four sides, u = cos πx cos πy + ½. The PDE fixes the mean of u only
+    through the reaction term, so a flux error ε shifts the whole solution by ∮ε. The quadratic boundary
+    fit left the mean 0.31 off (0.43 relative error at h = 0.1); a box face's ∂u/∂n is the three-point
+    one-sided difference, which gives 2.4e-3."""
+    import jno.jnp_ops as jnn
+
+    π = np.pi
+    errs = []
+    for h in (0.1, 0.05):
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h).structured().domain()
+        x, y, _ = d.variable("interior", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        flux = []
+        for r in ("left", "right", "bottom", "top"):
+            xr, yr, _ = d.variable(r, split=True)
+            flux.append(u.bind(x=xr, y=yr).d(d.variable(r, normals=True)) - 0.0)
+        f = (2 * π**2 + 1) * jnn.cos(π * x) * jnn.cos(π * y) + 0.5
+        sol = np.asarray(jno.fdm([-(ui.xx + ui.yy) + ui - f, *flux]).solve()).reshape(-1)
+        p = _nodes(d)
+        exact = np.cos(π * p[:, 0]) * np.cos(π * p[:, 1]) + 0.5
+        assert abs(np.mean(sol - exact)) < 1e-3
+        errs.append(float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)))
+    assert errs[0] < 5e-3 and errs[0] / errs[1] > 3.5, errs
+
+
+# Coupled time-dependent systems: the march works on the blocked vector [u_0; …; u_{nf-1}], equation k
+# carrying u_k.t (a diagonal mass); an equation without a time derivative makes its field algebraic.
+
+
+def _coupled_rotation(h, n, *, structured=True, T=0.1, **slots):
+    """u_t = Δu − v, v_t = Δv + u: u = e^{−2π²t} S cos t, v = e^{−2π²t} S sin t, S = sin πx sin πy."""
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=h)
+    d = jno.domain(shape.structured() if structured else shape, time=(0.0, T, n))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    terms = [
+        ui.t - (ui.xx + ui.yy) + vi,
+        vi.t - (vi.xx + vi.yy) - ui,
+        u(xb, yb) - 0.0,
+        v(xb, yb) - 0.0,
+        u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+        v(xi, yi) - 0.0,
+    ]
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5), **slots))
+    p = _nodes(d)
+    S = np.exp(-2 * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    exact = np.stack([S * np.cos(T), S * np.sin(T)])
+    assert traj.shape == (n, 2, len(p))  # (step, field, node), fields in declaration order
+    return float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact))
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_coupled_march_converges(structured):
+    """Crank–Nicolson with Δt ∝ h: 1.0e-2 → 2.5e-3 structured, 1.7e-2 → 4.4e-3 unstructured (rate 2)."""
+    e = [_coupled_rotation(h, n, structured=structured) for h, n in ((0.1, 11), (0.05, 21))]
+    assert e[1] < 5e-3 and e[0] / e[1] > 3.5, e
+
+
+def test_coupled_march_through_the_solver_slots():
+    ref = _coupled_rotation(0.1, 11)
+    assert abs(_coupled_rotation(0.1, 11, linear=jno.solve.gmres(), precond=jno.precond.jacobi()) - ref) < 1e-10
+
+
+def test_coupled_march_with_an_algebraic_field():
+    """u_t = Δu + w with −Δw = 2π²u: w has no time derivative, so it is a constraint at every step (a
+    DAE). u = w = e^{(1−2π²)t} S. Crank–Nicolson, 1.7e-3 at h = 0.05."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.1, 21))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, w = d.unknown(), d.unknown()
+    ui, wi = u.bind(x=x, y=y, t=t), w.bind(x=x, y=y, t=t)
+    terms = [
+        ui.t - (ui.xx + ui.yy) - wi,
+        -(wi.xx + wi.yy) - 2 * np.pi**2 * ui,
+        u(xb, yb) - 0.0,
+        w(xb, yb) - 0.0,
+        u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+    ]
+    traj = np.asarray(jno.fdm(terms).solve(time=jno.solve.theta(0.5)))
+    p = _nodes(d)
+    exact = np.exp((1 - 2 * np.pi**2) * 0.1) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert np.abs(traj[-1] - exact).max() / np.abs(exact).max() < 3e-3
+
+
+def test_coupled_nonlinear_march():
+    """A Gray–Scott reaction–diffusion pair: the matrix-free Newton march and the lu slot agree."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.5, 26))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    bump = jno.np.exp(-40.0 * ((xi - 0.5) ** 2 + (yi - 0.5) ** 2))
+    terms = [
+        ui.t - 0.02 * (ui.xx + ui.yy) + ui * vi**2 - 0.04 * (1.0 - ui),
+        vi.t - 0.01 * (vi.xx + vi.yy) - ui * vi**2 + 0.1 * vi,
+        u(xb, yb) - 1.0,
+        v(xb, yb) - 0.0,
+        u(xi, yi) - (1.0 - 0.5 * bump),
+        v(xi, yi) - 0.25 * bump,
+    ]
+    a = np.asarray(jno.fdm(terms).solve())
+    b = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    assert np.isfinite(a).all() and np.abs(a - b).max() < 1e-12
+
+
+def test_coupled_march_inverse_recovers_the_coupling():
+    """A trainable coupling strength ω in u_t = Δu − ωv, v_t = Δv + ωu, recovered through jno.core."""
+    import optax
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+
+    def problem(omega):
+        return jno.fdm(
+            [
+                ui.t - (ui.xx + ui.yy) + omega * vi,
+                vi.t - (vi.xx + vi.yy) - omega * ui,
+                u(xb, yb) - 0.0,
+                v(xb, yb) - 0.0,
+                u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+                v(xi, yi) - 0.0,
+            ]
+        )
+
+    observed = jnp.asarray(problem(6.0).solve())
+    w = jno.np.parameter((1,), name="omega")
+    w.dtype(jnp.float64)
+    w.initialize(jax.nn.initializers.constant(4.0))
+    w.optimizer(optax.adam(5e-2))
+    crux = jno.core([(problem(w).solve() - observed).mse])
+    crux.solve(300)
+    assert abs(float(np.asarray(crux.eval([w])).reshape(-1)[0]) - 6.0) < 1e-2
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_save_ts_samples_the_march(order):
+    """`save_ts=` as in fem.solve: the march keeps its own Δt, and the trajectory is sampled at the given
+    times. Every 5th step is exactly those rows of the full trajectory, for heat and for the Newmark wave;
+    a time between steps is the linear interpolation of its two neighbours."""
+    n = 41
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.2, n))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    lhs = ui.t.t if order == 2 else ui.t
+    problem = jno.fdm([lhs - ui.xx - ui.yy, u(xb, yb) - 0.0, u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)])
+    ts = np.linspace(0.0, 0.2, n)
+    full = np.asarray(problem.solve())
+    assert np.abs(np.asarray(problem.solve(save_ts=ts[::5])) - full[::5]).max() < 1e-12
+    mid = np.asarray(problem.solve(save_ts=[0.5 * (ts[3] + ts[4])]))[0]
+    assert np.abs(mid - 0.5 * (full[3] + full[4])).max() < 1e-12
+
+
+def test_save_ts_on_a_coupled_march_and_a_steady_refusal():
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.1, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y, t=t)
+    ic = jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi)
+    terms = [ui.t - (ui.xx + ui.yy) + vi, vi.t - (vi.xx + vi.yy) - ui, u(xb, yb) - 0.0, v(xb, yb) - 0.0, u(xi, yi) - ic]
+    full = np.asarray(jno.fdm(terms).solve())
+    got = np.asarray(jno.fdm(terms).solve(save_ts=np.linspace(0.0, 0.1, 11)[::2]))
+    assert got.shape == (6, 2, full.shape[2]) and np.abs(got - full[::2]).max() < 1e-12
+    ds = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    xs, ys_, _ = ds.variable("interior", split=True)
+    xsb, ysb, _ = ds.variable("boundary", split=True)
+    w = ds.unknown()
+    wi = w.bind(x=xs, y=ys_)
+    with pytest.raises(ValueError, match="steady"):
+        jno.fdm([-(wi.xx + wi.yy) - 1.0, w(xsb, ysb) - 0.0]).solve(save_ts=[0.0])
+
+
+# Incompressible Navier–Stokes in primitive variables. On one collocated grid, central differences leave
+# the pressure in four decoupled sub-lattices; the continuity equation is written with an O(h²) pressure
+# Laplacian (pressure stabilisation, Brezzi & Pitkäranta 1984) — ∇·u − ε h² Δp — which vanishes as h → 0.
+# Measured on Kovasznay flow: without it the pressure stalls at 1e-1; with ε = 0.05 it converges.
+
+
+def _kovasznay(h, pressure):
+    """Kovasznay flow, Re = 40 (Kovasznay 1948), on [-0.5, 1] × [-0.5, 1.5]. ``pressure``: the pressure
+    boundary condition — ``"dirichlet"`` everywhere, or ``"wall"``: p on the left edge and the momentum
+    balance ∂p/∂n = n·(νΔu − u·∇u) on the other three (a flux condition reading the velocity)."""
+    import jno.jnp_ops as jnn
+
+    Re, π = 40.0, np.pi
+    nu, lam = 1.0 / Re, Re / 2 - np.sqrt(Re**2 / 4 + 4 * π**2)
+    U = lambda x, y, m: 1 - m.exp(lam * x) * m.cos(2 * π * y)  # noqa: E731
+    V = lambda x, y, m: lam / (2 * π) * m.exp(lam * x) * m.sin(2 * π * y)  # noqa: E731
+    P = lambda x, y, m: 0.5 * (1 - m.exp(2 * lam * x))  # noqa: E731
+    d = jno.shape.rect(-0.5, -0.5, 1.0, 1.5, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v, p = d.unknown(), d.unknown(), d.unknown()
+    ui, vi, pi = u.bind(x=x, y=y), v.bind(x=x, y=y), p.bind(x=x, y=y)
+    terms = [
+        ui * ui.x + vi * ui.y + pi.x - nu * (ui.xx + ui.yy),
+        ui * vi.x + vi * vi.y + pi.y - nu * (vi.xx + vi.yy),
+        ui.x + vi.y - 0.05 * d.cell_size**2 * (pi.xx + pi.yy),
+        u(xb, yb) - U(xb, yb, jnn),
+        v(xb, yb) - V(xb, yb, jnn),
+    ]
+    if pressure == "dirichlet":
+        terms.append(p(xb, yb) - P(xb, yb, jnn))
+    else:
+        xl, yl, _ = d.variable("left", split=True)
+        terms.append(p(xl, yl) - P(xl, yl, jnn))
+        for r in ("right", "bottom", "top"):
+            X, Y, _ = d.variable(r, split=True)
+            ub, vb, pb = u.bind(x=X, y=Y), v.bind(x=X, y=Y), p.bind(x=X, y=Y)
+            mx = nu * (ub.xx + ub.yy) - (ub * ub.x + vb * ub.y)
+            my = nu * (vb.xx + vb.yy) - (ub * vb.x + vb * vb.y)
+            terms.append(pb.d(d.variable(r, normals=True)) - {"right": mx, "bottom": -my, "top": my}[r])
+    sol = np.asarray(jno.fdm(terms).solve())
+    pts = _nodes(d)
+    exact_u, exact_p = U(pts[:, 0], pts[:, 1], np), P(pts[:, 0], pts[:, 1], np)
+    rel = lambda a, b: float(np.linalg.norm(a - b) / np.linalg.norm(b))  # noqa: E731
+    return rel(sol[0], exact_u), rel(sol[2], exact_p)
+
+
+@pytest.mark.parametrize("pressure", ["dirichlet", "wall"])
+def test_navier_stokes_kovasznay(pressure):
+    """Velocity second order, pressure converging, with either pressure boundary condition. The wall
+    condition is a flux condition on a coupled system whose value reads another field's derivatives."""
+    (u0, p0), (u1, p1) = _kovasznay(0.1, pressure), _kovasznay(0.05, pressure)
+    assert u1 < 3e-3 and u0 / u1 > 3.4, (u0, u1)
+    assert p1 < 3e-2 and p0 / p1 > 2.3, (p0, p1)
+
+
+def _cavity(n, Re=100.0):
+    """Lid-driven cavity: u = (1, 0) on the lid, no slip elsewhere, ∂p/∂n from the momentum balance on
+    every wall. The pressure is then defined up to a constant, and `domain.point_region` fixes it at one
+    interior node — that row replaces the continuity equation there, which is the dependent one."""
+    nu = 1.0 / Re
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1.0 / n).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    u, v, p = d.unknown(), d.unknown(), d.unknown()
+    ui, vi, pi = u.bind(x=x, y=y), v.bind(x=x, y=y), p.bind(x=x, y=y)
+    terms = [
+        ui * ui.x + vi * ui.y + pi.x - nu * (ui.xx + ui.yy),
+        ui * vi.x + vi * vi.y + pi.y - nu * (vi.xx + vi.yy),
+        ui.x + vi.y - 0.05 * d.cell_size**2 * (pi.xx + pi.yy),
+    ]
+    d.point_region("gauge", (0.5, 0.5))
+    xg, yg, _ = d.variable("gauge", split=True)
+    terms.append(p(xg, yg) - 0.0)
+    for r in ("left", "right", "bottom", "top"):
+        X, Y, _, nx, ny = d.variable(r, normals=True, split=True)
+        ub, vb, pb = u.bind(x=X, y=Y), v.bind(x=X, y=Y), p.bind(x=X, y=Y)
+        mx = nu * (ub.xx + ub.yy) - (ub * ub.x + vb * ub.y)  # ν Δu − (u·∇)u, the wall momentum balance
+        my = nu * (vb.xx + vb.yy) - (ub * vb.x + vb * vb.y)
+        lid = 1.0 if r == "top" else 0.0
+        terms += [u(X, Y) - lid, v(X, Y) - 0.0, pb.d(d.variable(r, normals=True)) - (nx * mx + ny * my)]
+    sol = np.asarray(jno.fdm(terms).solve())
+    nx, ny = d.mesh_connectivity["grid"]["shape"]
+    centre = sol[0].reshape(nx, ny)[nx // 2]  # u(0.5, y)
+    # Ghia, Ghia & Shin, J. Comput. Phys. 48 (1982), Table I, Re = 100
+    gy = np.array([0.0547, 0.1719, 0.2813, 0.4531, 0.5, 0.6172, 0.7344, 0.8516, 0.9531, 0.9766])
+    gu = np.array([-0.03717, -0.10150, -0.15662, -0.21090, -0.20581, -0.13641, 0.00332, 0.23151, 0.68717, 0.84123])
+    return float(np.abs(np.interp(gy, np.linspace(0.0, 1.0, ny), centre) - gu).max()), sol
+
+
+def test_navier_stokes_lid_driven_cavity():
+    """Re = 100 on 33²: within 0.02 of Ghia et al. (0.0019 on 65², the slow test)."""
+    err, sol = _cavity(32)
+    assert err < 0.02 and np.isfinite(sol).all(), err
+
+
+@pytest.mark.slow
+def test_navier_stokes_lid_driven_cavity_fine():
+    err, _ = _cavity(64)
+    assert err < 3e-3, err
+
+
+def test_unknown_region_tag_raises_and_a_point_region_pins_one_node():
+    """An unrecognised region tag used to resolve to the WHOLE boundary, so a `point_region` pin fixed
+    every wall node (the cavity came out 0.016 off Ghia instead of 0.0019)."""
+    from jno.fdm import _TraceFDM
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    d.point_region("pin", (0.5, 0.5))
+    xp, yp, _ = d.variable("pin", split=True)
+    f = jno.fdm([-(ui.xx + ui.yy) - 1.0, u(xb, yb) - 0.0, u(xp, yp) - 0.0])
+    assert list(f._region_nodes("pin")) == [int(np.argmin(np.linalg.norm(_nodes(d) - [0.5, 0.5], axis=1)))]
+    with pytest.raises(ValueError, match="no mesh nodes found"):
+        _TraceFDM._region_nodes(f, "no-such-region")
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_normal_components_in_a_flux_value(structured):
+    """`nx, ny` from `d.variable(region, normals=True, split=True)` are the outward normal at the flux
+    nodes, so `ub.d(n) - (a nx + b ny)` is exactly ∂u/∂n for u = a x + b y. They were missing from the
+    evaluation context (KeyError)."""
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25 if structured else 0.15)
+    d = shape.structured().domain() if structured else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    x, y, _ = d.variable("interior", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    xl, yl, _ = d.variable("left", split=True)
+    terms = [-(ui.xx + ui.yy), u(xl, yl) - (2.0 * xl + 3.0 * yl)]
+    for r in ("right", "bottom", "top"):
+        xr, yr, _, nx, ny = d.variable(r, normals=True, split=True)
+        terms.append(u.bind(x=xr, y=yr).d(d.variable(r, normals=True)) - (2.0 * nx + 3.0 * ny))
+    sol = np.asarray(jno.fdm(terms).solve()).reshape(-1)
+    p = _nodes(d)
+    assert np.abs(sol - (2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < (1e-10 if structured else 1e-6)
+
+
+@pytest.mark.parametrize("spelling", ["d(n)", "d((nx, ny))", "components", "oblique"])
+@pytest.mark.parametrize("structured", [True, False])
+def test_every_spelling_of_a_flux_condition(spelling, structured):
+    """∂u/∂n written three ways — `ub.d(n)`, `ub.d((nx, ny))`, `nx*ub.x + ny*ub.y` — and an oblique
+    condition mixing ∂u/∂x in, all recover u = 2x + 3y. The component spelling used to be read as a second
+    PDE and summed into the first."""
+    d = (
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+        if structured
+        else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    )
+    x, y, _ = d.variable("interior", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    xl, yl, _ = d.variable("left", split=True)
+    terms = [-(ui.xx + ui.yy), u(xl, yl) - (2.0 * xl + 3.0 * yl)]
+    for r in ("right", "bottom", "top"):
+        xr, yr, _, nx, ny = d.variable(r, normals=True, split=True)
+        n, ub, g = d.variable(r, normals=True), u.bind(x=xr, y=yr), 2.0 * nx + 3.0 * ny
+        terms.append(
+            {
+                "d(n)": ub.d(n) - g,
+                "d((nx, ny))": ub.d((nx, ny)) - g,
+                "components": nx * ub.x + ny * ub.y - g,
+                "oblique": (ub.x - 2.0) + 0.5 * (ub.d(n) - g),
+            }[spelling]
+        )
+    sol = np.asarray(jno.fdm(terms).solve()).reshape(-1)
+    p = _nodes(d)
+    assert np.abs(sol - (2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < (1e-10 if structured else 1e-6)
+
+
+def test_a_direction_needs_one_component_per_coordinate():
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    xr, yr, _, nx, ny = d.variable("right", normals=True, split=True)
+    with pytest.raises(ValueError, match="one component"):
+        d.unknown().bind(x=xr, y=yr).d((nx,))
+
+
+# Vector unknowns: `domain.unknown(value_shape=(2,))` is one field with two components, differentiated
+# with the vector views (`.grad()`, `.div()`, `.laplacian()`, `@`). It used to allocate one value per node
+# (silently scalar-sized), and every vector-view derivative of a nodal field took automatic
+# differentiation and came back as zeros.
+
+
+def test_vector_nodal_field_derivatives():
+    """Every vector-view derivative of a nodal field, on U = (x², xy), against its exact value."""
+    from jno.fdm import _unwrap
+    from jno.trace_evaluator import TraceEvaluator
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    U, p = d.unknown(value_shape=(2,)), d.unknown()
+    assert np.shape(U.model.module.value) == (25, 2)
+    Ui, pb = U.vector.bind(x=x, y=y), p.bind(x=x, y=y)
+    f = jno.fdm([Ui.laplacian(), pb.laplacian()])
+    P = _nodes(d)
+    X, Y = P[:, 0], P[:, 1]
+    dofs = jnp.concatenate([jnp.asarray(X**2), jnp.asarray(X * Y), jnp.asarray(X + 2 * Y)])
+    ev = TraceEvaluator(params={**f._params_scope(), **f._inject(dofs)})
+    ctx = f._eval_context({"interior"})
+    at = lambda e: np.asarray(ev.evaluate(_unwrap(e), context=ctx, var_bindings={})).reshape(25, -1)[12]  # (0.5, 0.5)
+    np.testing.assert_allclose(at(Ui.x), [1.0, 0.5], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.xx), [2.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.grad()), [1.0, 0.0, 0.5, 0.5], atol=1e-12)  # J[i, j] = ∂u_i/∂x_j
+    np.testing.assert_allclose(at(Ui.div()), [1.5], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.laplacian()), [2.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(at(Ui.grad() @ Ui), [0.25, 0.25], atol=1e-12)  # (u·∇)u
+    np.testing.assert_allclose(at(Ui[0].x), [1.0], atol=1e-12)
+    # a component of a nodal vector field keeps its axis, (N, 1), so `u[0] * x` stays (N, 1), not (N, N)
+    assert np.asarray(ev.evaluate(_unwrap(Ui[0] * x), context=ctx, var_bindings={})).shape == (25, 1)
+    np.testing.assert_allclose(at(pb.grad()), [1.0, 2.0], atol=1e-12)
+
+
+def _kovasznay_vector(h):
+    import jno.jnp_ops as jnn
+
+    Re, π = 40.0, np.pi
+    nu, lam = 1.0 / Re, Re / 2 - np.sqrt(Re**2 / 4 + 4 * π**2)
+    Ux = lambda x, y, m: 1 - m.exp(lam * x) * m.cos(2 * π * y)  # noqa: E731
+    Uy = lambda x, y, m: lam / (2 * π) * m.exp(lam * x) * m.sin(2 * π * y)  # noqa: E731
+    P = lambda x, y, m: 0.5 * (1 - m.exp(2 * lam * x))  # noqa: E731
+    d = jno.shape.rect(-0.5, -0.5, 1.0, 1.5, size=h).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    U, p = d.unknown(value_shape=(2,)), d.unknown()
+    Ui, pi = U.vector.bind(x=x, y=y), p.bind(x=x, y=y)
+    sol = np.asarray(
+        jno.fdm(
+            [
+                Ui.grad() @ Ui + pi.grad() - nu * Ui.laplacian(),  # (u·∇)u + ∇p − νΔu
+                Ui.div() - 0.05 * d.cell_size**2 * pi.laplacian(),
+                U(xb, yb) - jnn.stack([Ux(xb, yb, jnn), Uy(xb, yb, jnn)], axis=-1),
+                p(xb, yb) - P(xb, yb, jnn),
+            ]
+        ).solve()
+    )
+    pts = _nodes(d)
+    return sol, (Ux(pts[:, 0], pts[:, 1], np), Uy(pts[:, 0], pts[:, 1], np), P(pts[:, 0], pts[:, 1], np))
+
+
+def test_navier_stokes_with_a_vector_velocity():
+    """The vector form is the same discretisation as three scalar unknowns, written once: it converges the
+    same way (u 8.1e-3 → 2.1e-3, p 3.4e-2 → 1.0e-2), and the solution rows are [u_x, u_y, p]."""
+    rel = lambda a, b: float(np.linalg.norm(a - b) / np.linalg.norm(b))  # noqa: E731
+    (s0, e0), (s1, e1) = _kovasznay_vector(0.1), _kovasznay_vector(0.05)
+    assert s1.shape == (3, len(e1[0]))
+    u0, u1, p0, p1 = rel(s0[0], e0[0]), rel(s1[0], e1[0]), rel(s0[2], e0[2]), rel(s1[2], e1[2])
+    assert u1 < 3e-3 and u0 / u1 > 3.4 and p1 < 2e-2 and p0 / p1 > 2.3, (u0, u1, p0, p1)
+    assert rel(s1[1], e1[1]) < 2e-2
+
+
+def test_vector_taylor_green_march():
+    """A vector unknown in a march: Taylor–Green with BDF2, second order in the velocity."""
+    import jno.jnp_ops as jnn
+
+    nu, T = 0.1, 1.0
+
+    def run(n):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, np.pi, np.pi, size=np.pi / n).structured(), time=(0.0, T, n + 1))
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, tb = d.variable("boundary", split=True)
+        x0, y0, _ = d.variable("initial", split=True)
+        U, p = d.unknown(value_shape=(2,)), d.unknown()
+        Ui, pi = U.vector.bind(x=x, y=y, t=t), p.bind(x=x, y=y, t=t)
+        E = lambda s, k=2: jnn.exp(-k * nu * s)  # noqa: E731
+        Uex = lambda X, Y, s: jnn.stack([-jnn.cos(X) * jnn.sin(Y) * E(s), jnn.sin(X) * jnn.cos(Y) * E(s)], axis=-1)  # noqa: E731
+        Pex = lambda X, Y, s: -0.25 * (jnn.cos(2 * X) + jnn.cos(2 * Y)) * E(s, 4)  # noqa: E731
+        traj = np.asarray(
+            jno.fdm(
+                [
+                    Ui.t + Ui.grad() @ Ui + pi.grad() - nu * Ui.laplacian(),
+                    Ui.div() - 0.05 * d.cell_size**2 * pi.laplacian(),
+                    U(xb, yb) - Uex(xb, yb, tb),
+                    p(xb, yb) - Pex(xb, yb, tb),
+                    U(x0, y0) - Uex(x0, y0, 0.0),
+                ]
+            ).solve(time=jno.solve.bdf2())
+        )
+        P = _nodes(d)
+        exact = -np.cos(P[:, 0]) * np.sin(P[:, 1]) * np.exp(-2 * nu * T)
+        assert traj.shape == (n + 1, 3, len(P))
+        return float(np.linalg.norm(traj[-1, 0] - exact) / np.linalg.norm(exact))
+
+    e0, e1 = run(10), run(20)
+    assert e1 < 2e-3 and e0 / e1 > 3.4, (e0, e1)
+
+
+def test_vector_equation_component_mismatch_raises():
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    U = d.unknown(value_shape=(2,))
+    Ui = U.vector.bind(x=x, y=y)
+    with pytest.raises(ValueError, match="component"):  # a scalar equation for a 2-component unknown
+        jno.fdm([Ui.div(), U(xb, yb) - jno.np.stack([0.0 * xb, 0.0 * xb], axis=-1)]).solve()
+
+
+def test_vector_attribute_form_equals_the_shorthand():
+    """The term-by-term spelling and the vector-calculus shorthand are the same stencils: (u·∇)u, ∇p, Δu
+    and ∇·u agree exactly on the Kovasznay field. `u.xx` on a vector field used to chain two first
+    derivatives (the wide stencil, 24 off the Laplacian at the boundary) and Newton diverged."""
+    import jno.jnp_ops as jnn
+    from jno.fdm import _unwrap
+    from jno.trace_evaluator import TraceEvaluator
+
+    lam = 20.0 - np.sqrt(400.0 + 4 * np.pi**2)
+    d = jno.shape.rect(-0.5, -0.5, 1.0, 1.5, size=0.1).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    U, p = d.unknown(value_shape=(2,)), d.unknown()
+    u, pi = U.vector.bind(x=x, y=y), p.bind(x=x, y=y)
+    ux, uy = u[0], u[1]
+    f = jno.fdm([u.laplacian(), pi.laplacian()])
+    P = _nodes(d)
+    X, Y = P[:, 0], P[:, 1]
+    fields = [1 - np.exp(lam * X) * np.cos(2 * np.pi * Y), lam / (2 * np.pi) * np.exp(lam * X) * np.sin(2 * np.pi * Y)]
+    dofs = jnp.concatenate([jnp.asarray(fields[0]), jnp.asarray(fields[1]), jnp.asarray(0.5 * (1 - np.exp(2 * lam * X)))])
+    ev = TraceEvaluator(params={**f._params_scope(), **f._inject(dofs)})
+    ctx = f._eval_context({"interior"})
+    val = lambda e: np.asarray(ev.evaluate(_unwrap(e), context=ctx, var_bindings={}))  # noqa: E731
+    pairs = [
+        (ux * u.x + uy * u.y, u.grad() @ u),
+        (jnn.stack([pi.x, pi.y], axis=-1), pi.grad()),
+        (u.xx + u.yy, u.laplacian()),
+        (ux.x + uy.y, u.div()),
+    ]
+    for full, short in pairs:
+        a, b = val(full), val(short)
+        assert np.abs(a.reshape(b.shape) - b).max() < 1e-12
+
+
+def test_point_region_on_a_long_time_dependent_domain():
+    """A time-dependent domain stores a `point_region` once per time step; with 101 steps the node match
+    used to give up (it only handled pools under 64 points) and the gauge raised "no mesh nodes"."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured(), time=(0.0, 1.0, 101))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    d.point_region("pin", (0.5, 0.5))
+    xp, yp, _ = d.variable("pin", split=True)
+    f = jno.fdm([ui.t - (ui.xx + ui.yy), u(xp, yp) - 0.0, u(xi, yi) - 1.0])
+    assert list(f._region_nodes("pin")) == [int(np.argmin(np.linalg.norm(_nodes(d) - [0.5, 0.5], axis=1)))]
+
+
+@pytest.mark.parametrize("spelling", ["u - g", "g - u", "u + v"])
+def test_value_conditions_in_every_natural_form(spelling):
+    """`u(xb, yb) + 1.0` used to be imposed as u = 0: only the `-` form was read, anything else silently
+    gave g = 0. Each natural form now reads u = g."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    bc = {"u - g": u(xb, yb) - (-1.0), "g - u": -1.0 - u(xb, yb), "u + v": u(xb, yb) + 1.0}[spelling]
+    sol = np.asarray(jno.fdm([ui.xx + ui.yy, bc]).solve()).reshape(-1)
+    assert np.abs(sol + 1.0).max() < 1e-10  # harmonic with u = −1 on the boundary: u ≡ −1
+    # a factor on the unknown is the same condition, and is read as one -- see
+    # test_every_affine_spelling_of_a_value_condition
+    scaled = np.asarray(jno.fdm([ui.xx + ui.yy, 2.0 * u(xb, yb) - 2.0 * (-1.0)]).solve()).reshape(-1)
+    assert np.abs(scaled + 1.0).max() < 1e-10
+
+
+def test_a_data_field_as_a_pde_coefficient():
+    """A known nodal field (a `jno.np.parameter` holding data, no optimizer) inside the PDE failed with
+    "No model for Model N": only trainable parameters were in the evaluation scope. −∇·(κ∇u) = f with
+    κ = 1 + x² given as nodal data reproduces the formula-κ solve."""
+    import equinox as eqx
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    P = _nodes(d)
+    K = jno.np.parameter((len(P),), name="kappa")
+    K.model.module = eqx.tree_at(lambda m: m.value, K.model.module, jnp.asarray(1 + P[:, 0] ** 2))
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 1.0 + 0.0 * x
+    data = np.asarray(jno.fdm([-(K * ui.x).x - (K * ui.y).y - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    k = 1 + x**2
+    formula = np.asarray(
+        jno.fdm([-(k * ui.x).d(x, scheme=jno.fd(average="arithmetic")) - (k * ui.y).y - f, u(xb, yb) - 0.0]).solve()
+    ).reshape(-1)
+    assert np.isfinite(data).all() and np.abs(data - formula).max() < 1e-10 and np.abs(data).max() > 1e-3
+
+
+@pytest.mark.parametrize("where", ["source", "dirichlet", "coefficient"])
+def test_complex_data_on_a_real_unknown_raises(where):
+    """jno.fdm has no complex fields. Complex Dirichlet data used to be solved with its imaginary part
+    dropped (a real answer, a warning at most), and a complex source or coefficient failed inside JAX with a
+    tangent-dtype error that named neither. Each now raises and says what to do."""
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 8).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    terms = {
+        "source": [-ui.xx - ui.yy - (1.0 + 1j) * jnn.sin(x), u(xb, yb) - 0.0],
+        "dirichlet": [-ui.xx - ui.yy - 1.0, u(xb, yb) - (1j + 0.0 * xb)],
+        "coefficient": [-(1.0 + 0.5j) * (ui.xx + ui.yy) - 1.0, u(xb, yb) - 0.0],
+    }[where]
+    with pytest.raises(NotImplementedError, match="complex, but the unknown is real"):
+        jno.fdm(terms).solve()
+
+
+def test_equal_solver_specs_share_the_compiled_solve():
+    """The solve caches were keyed on ``id(spec)``, so every fresh ``jno.solve.gmres()`` (equal to the last one)
+    recompiled. They key on the spec now: equal keyed specs share the compiled solve, a different one does not."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-ui.xx - ui.yy - 1.0, u(xb, yb) - 0.0])
+    a = np.asarray(prob.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg()))
+    fn = prob._grid_linear_cache["fn"]
+    b = np.asarray(prob.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg()))
+    assert prob._grid_linear_cache["fn"] is fn
+    np.testing.assert_array_equal(a, b)
+    prob.solve(linear=jno.solve.gmres(tol=1e-10), precond=jno.precond.gmg())
+    assert prob._grid_linear_cache["fn"] is not fn
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_the_cotangent_laplacian_does_not_depend_on_the_mesh_units(dim):
+    """Degenerate elements were detected with an ABSOLUTE threshold (2·area < 1e-12, |det| < 1e-14), so on a
+    mesh in micrometres every element counted as degenerate and the Laplacian was identically zero. The test is
+    now relative to each element's own size. Oracle: Δ(|x|²) = 2·dim at interior nodes, at any scale."""
+    from jno.differential_operators import DifferentialOperators as D
+
+    shape = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1) if dim == 2 else jno.shape.box(0, 0, 0, 1, 1, 1, size=0.25)
+    d = shape.structured().domain()
+    mc = d.mesh_connectivity
+    pts = np.asarray(mc["points"])[:, :dim]
+    interior = np.all((pts > 1e-9) & (pts < 1 - 1e-9), axis=1)
+    for scale in (1.0, 1e-6):
+        p = jnp.asarray(pts * scale)
+        u = jnp.sum(p**2, axis=1)
+        if dim == 2:
+            lap = D.compute_fd_laplacian_2d_simple(u, p, mc["triangles"], dims=(0, 1), method="cotangent")
+        else:
+            lap = D.compute_fd_laplacian_3d_simple(u, p, mc["tetrahedra"], dims=(0, 1, 2), method="cotangent")
+        np.testing.assert_allclose(np.asarray(lap)[interior], 2.0 * dim, rtol=1e-6)
+
+
+def test_a_vector_wave_marches_every_component():
+    """`u.tt` on a vector unknown: a standing wave U = (S, 2S)·cos(√2 π t) with S = sin πx sin πy. A coupled
+    or vector second-order system used to raise ("marched to first order in time only"), and `.tt` on a
+    vector view raised about automatic differentiation over finite-difference partials."""
+    import jno.jnp_ops as jnn
+
+    T, errs = 0.25, []
+    for n in (16, 24):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured(), time=(0.0, T, 81))
+        p = _nodes(d)
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        U = d.unknown(value_shape=(2,))
+        u = U.vector.bind(x=x, y=y, t=t)
+        S0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+        zero = 0.0 * xb
+        traj = np.asarray(
+            jno.fdm(
+                [
+                    u.tt - u.xx - u.yy,
+                    U(xb, yb) - jnn.stack([zero, zero], axis=-1),
+                    U(xi, yi) - jnn.stack([S0, 2 * S0], axis=-1),
+                ]
+            ).solve()
+        )
+        assert traj.shape[1:] == (2, len(p))  # (steps, field, node)
+        S = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.cos(np.sqrt(2) * np.pi * T)
+        errs.append(max(np.abs(traj[-1][0] - S).max(), np.abs(traj[-1][1] - 2 * S).max() / 2))
+    assert errs[1] < errs[0], errs  # converging under refinement
+    assert errs[1] < 2e-3, errs
+
+
+def test_an_indefinite_helmholtz_solves_on_the_structured_path():
+    """`-Δu - k²u = f` with k² past the first eigenvalue of -Δ (2π² ≈ 19.7) is symmetric INDEFINITE, the
+    case the textbook rule sends to MINRES. Measured, CG with the operator V-cycle reaches the structured
+    path's 1e-12 tolerance here while MINRES stalls at 1e-5 (it needs an SPD preconditioner, and a V-cycle
+    built on an indefinite operator is not one), so CG keeps it and the gate raises if it ever breaks down.
+
+    Oracle: u = sin πx sin πy, for which -Δu - k²u = (2π² - k²)u exactly."""
+    import jno.jnp_ops as jnn
+
+    errs = []
+    for n in (16, 32):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured())
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        p = _nodes(d)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        k2 = 50.0
+        f = (2 * np.pi**2 - k2) * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = np.asarray(jno.fdm([-(ui.xx + ui.yy) - k2 * ui - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+        errs.append(np.abs(sol - np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])).max())
+    assert errs[1] < errs[0] / 3, errs  # second order in h, so the solve really converged
+    assert errs[1] < 1e-3, errs
+
+
+def test_an_algebraic_equation_needs_no_derivative():
+    """A coupled system may close with an ALGEBRAIC equation -- a constitutive law, carrying no derivative
+    at all. `v - u**2` used to be classified as a value pin (only a derivative-bearing constraint counted as
+    an equation), and the system was then rejected for having "1 PDE equation" for two unknowns. A
+    value-only constraint on the same region as the differential equations is one more equation.
+
+    Oracle: -Δu = 2π² sin πx sin πy with u = 0 on the boundary gives u = sin πx sin πy, so v = u²."""
+    import jno.jnp_ops as jnn
+
+    errs = []
+    for n in (10, 20):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured())
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        p = _nodes(d)
+        u, v = d.unknown(), d.unknown()
+        ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+        f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = np.asarray(jno.fdm([-(ui.xx + ui.yy) - f, vi - ui**2, u(xb, yb) - 0.0, v(xb, yb) - 0.0]).solve())
+        exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+        errs.append((np.abs(sol[0] - exact).max(), np.abs(sol[1] - exact**2).max()))
+    assert errs[1][0] < errs[0][0] / 3 and errs[1][1] < errs[0][1] / 3, errs  # second order in h
+    assert errs[1][0] < 3e-3 and errs[1][1] < 5e-3, errs
+
+
+def test_a_coupled_system_is_preconditioned_by_the_operator_v_cycle():
+    """A coupled system gets the operator-dependent V-cycle: the Newton and structured-linear paths used to
+    gate it on a single field, although the smoother has inverted each node's whole block since the
+    point-block commit. Unpreconditioned, this two-field system takes 55 s at 32x32 and does not converge at
+    all at 64x64; the oracle here is the manufactured solution plus the V-cycle's measured contraction."""
+    import jax
+    import jax.numpy as jnp
+
+    import jno.jnp_ops as jnn
+    from jno.utils.solver.lattice_mg import contraction
+
+    n = 24
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    u, v = d.unknown(), d.unknown()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    U = lambda a, b: jnn.sin(np.pi * a) * jnn.sin(np.pi * b)  # noqa: E731
+    V = lambda a, b: a * (1 - a) * b * (1 - b)  # noqa: E731
+    f1 = 2 * np.pi**2 * U(x, y) + U(x, y) - V(x, y)
+    f2 = 2 * (x * (1 - x) + y * (1 - y)) + 2 * V(x, y) - U(x, y)
+    s = jno.fdm(
+        [
+            -(ui.xx + ui.yy) + ui - vi - f1,
+            -(vi.xx + vi.yy) + 2 * vi - ui - f2,
+            u(xb, yb) - U(xb, yb),
+            v(xb, yb) - V(xb, yb),
+        ]
+    )
+    sol = np.asarray(s.solve())
+    np.testing.assert_allclose(sol[0], np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]), atol=2e-3)
+    np.testing.assert_allclose(sol[1], p[:, 0] * (1 - p[:, 0]) * p[:, 1] * (1 - p[:, 1]), atol=2e-3)
+
+    # the V-cycle this path builds really contracts on the two-field operator
+    residual = s._steady_residual()
+    mask = np.ones(s._Ntot)
+    for b, idx, _vals in s._dirichlet_rows():
+        mask[b * s._N + np.asarray(idx, dtype=int)] = 0.0
+    mask = jnp.asarray(mask)
+    matvec = lambda w: jax.jvp(residual, (jnp.zeros(s._Ntot),), (w * mask,))[1] * mask  # noqa: E731
+    apply = s._grid_vcycle(residual, jnp.zeros(s._Ntot))
+    assert apply is not None, "a coupled lattice operator must get a V-cycle"
+    assert contraction(apply, matvec, s._Ntot) < 0.5
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["u - g", "nested subtract", "scaled", "g - u", "divided", "plus form"],
+)
+def test_every_affine_spelling_of_a_value_condition(spelling):
+    """A value condition is any expression affine in the unknown. `u(xb, yb) - xb - 2*yb` (a nested
+    subtraction) and `2*u(xb, yb) - 2*g` (a scaled one) used to raise, the second telling the caller to
+    divide the factor out by hand. Oracle: the harmonic u = x + 2y, which the 5-point Laplacian represents
+    exactly, so every spelling of the same condition must return it."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    g = xb + 2 * yb
+    bc = {
+        "u - g": lambda: u(xb, yb) - g,
+        "nested subtract": lambda: u(xb, yb) - xb - 2 * yb,
+        "scaled": lambda: 2 * u(xb, yb) - 2 * g,
+        "g - u": lambda: g - u(xb, yb),
+        "divided": lambda: (u(xb, yb) - g) / 3.0,
+        "plus form": lambda: u(xb, yb) + (-xb - 2 * yb),
+    }[spelling]()
+    sol = np.asarray(jno.fdm([ui.xx + ui.yy, bc]).solve())
+    np.testing.assert_allclose(sol, p[:, 0] + 2 * p[:, 1], atol=1e-5)
+
+
+def test_a_value_condition_must_be_affine_in_the_unknown():
+    """A condition the unknown enters nonlinearly is not a value condition, and says so rather than
+    imposing some side of it."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    with pytest.raises(ValueError, match="must be AFFINE in the unknown"):
+        jno.fdm([ui.xx + ui.yy, u(xb, yb) ** 2 - 1.0]).solve()
+
+
+def test_a_coupled_second_order_system_marches():
+    """`u.tt` on a system of separate unknowns, which used to raise ("marched to first order in time only").
+    Oracle: two membranes coupled by their difference, `ui.tt - Δu + (u - w)`, started equal -- the coupling
+    term is identically zero along the solution, so each is the standing wave `sin πx sin πy cos(√2 π t)`."""
+    import jno.jnp_ops as jnn
+
+    T, errs = 0.25, []
+    for n in (16, 24):
+        d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured(), time=(0.0, T, 81))
+        p = _nodes(d)
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        u, w = d.unknown(), d.unknown()
+        ui, wi = u.bind(x=x, y=y, t=t), w.bind(x=x, y=y, t=t)
+        S0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+        traj = np.asarray(
+            jno.fdm(
+                [
+                    ui.tt - (ui.xx + ui.yy) + (ui - wi),
+                    wi.tt - (wi.xx + wi.yy) + (wi - ui),
+                    u(xb, yb) - 0.0,
+                    w(xb, yb) - 0.0,
+                    u(xi, yi) - S0,
+                    w(xi, yi) - S0,
+                ]
+            ).solve()
+        )
+        assert traj.shape[1:] == (2, len(p))  # (steps, field, node)
+        S = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.cos(np.sqrt(2) * np.pi * T)
+        errs.append(max(np.abs(traj[-1][0] - S).max(), np.abs(traj[-1][1] - S).max()))
+    assert errs[1] < errs[0], errs  # converging under refinement
+    assert errs[1] < 2e-3, errs
+
+
+def test_a_derivative_condition_on_a_vector_unknown():
+    """A traction -- a derivative boundary condition on a vector field -- used to raise ("not supported yet.
+    Give the vector field Dirichlet values"). It replaces one row per component now. Oracle: the manufactured
+    solution u = (sin πx sin πy, xy) of -Δu = f, prescribed on the right wall by its normal derivative;
+    second order in the first component, exact in the second (a bilinear field)."""
+    import jno.jnp_ops as jnn
+
+    errs = []
+    for n in (16, 32):
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / n).structured().domain()
+        p = _nodes(d)
+        x, y, _ = d.variable("interior", split=True)
+        (xl, yl, _), (xb, yb, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("left", "bottom", "top"))
+        xr, yr, _ = d.variable("right", split=True)
+        nr = d.variable("right", normals=True)
+        U = d.unknown(value_shape=(2,))
+        u, ur = U.vector.bind(x=x, y=y), U.vector.bind(x=xr, y=yr)
+        f = jnn.stack([2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y), 0.0 * x], axis=-1)
+        g = lambda X, Y: jnn.stack([jnn.sin(np.pi * X) * jnn.sin(np.pi * Y), X * Y], axis=-1)  # noqa: E731
+        sol = np.asarray(
+            jno.fdm(
+                [
+                    -u.xx - u.yy - f,
+                    U(xl, yl) - g(xl, yl),
+                    U(xb, yb) - g(xb, yb),
+                    U(xt, yt) - g(xt, yt),
+                    ur.d(nr) - jnn.stack([np.pi * jnn.cos(np.pi * xr) * jnn.sin(np.pi * yr), yr], axis=-1),
+                ]
+            ).solve()
+        )
+        exact0 = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+        errs.append(np.abs(sol[0] - exact0).max())
+        assert np.abs(sol[1] - p[:, 0] * p[:, 1]).max() < 1e-8  # bilinear: exact on this stencil
+    assert errs[0] / errs[1] > 3.5, errs  # second order
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_a_matrix_unknown_equals_the_same_components_as_scalars(structured):
+    """`domain.unknown(value_shape=(2, 2))` -- a tensor field, e.g. a stress or a conformation tensor -- is
+    four scalars that travel together: coupled through their equation, differentiated component-wise. It used
+    to fail inside the kernels with a reshape or broadcasting error, because they take one channel axis.
+    Oracle: the same system written as four scalar unknowns."""
+    import jno.jnp_ops as jnn
+
+    d = (
+        jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured().domain()
+        if structured
+        else jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12)
+    )
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    rhs = [(k + 1.0) * f for k in range(4)]  # one source per component
+
+    T = d.unknown(value_shape=(2, 2))
+    Ti = T.bind(x=x, y=y)
+    zero = 0.0 * xb
+    F = jnn.stack([jnn.stack([rhs[0], rhs[1]], axis=-1), jnn.stack([rhs[2], rhs[3]], axis=-1)], axis=-2)
+    Z = jnn.stack([jnn.stack([zero, zero], axis=-1), jnn.stack([zero, zero], axis=-1)], axis=-2)
+    tensor = np.asarray(jno.fdm([-Ti.xx - Ti.yy - F, T(xb, yb) - Z]).solve())
+
+    scalars = []
+    for k in range(4):
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        scalars.append(np.asarray(jno.fdm([-ui.xx - ui.yy - rhs[k], u(xb, yb) - 0.0]).solve()).reshape(-1))
+    assert tensor.shape == (4, len(scalars[0]))
+    for k in range(4):
+        np.testing.assert_allclose(tensor[k], scalars[k], atol=1e-8 * max(np.abs(scalars[k]).max(), 1e-30))
+
+
+def test_a_matrix_unknown_couples_its_components_through_a_tensor_product():
+    """A tensor equation may mix the components: `-ΔT + T·C = F`. Oracle: T = sin(πx) sin(πy)·M solves it
+    exactly for F = 2π² S·M + S·(M·C), so the discrete answer is that field to second order."""
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 24).structured().domain()
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    M = np.array([[1.0, 2.0], [3.0, 4.0]])
+    C = np.array([[0.0, 1.0], [1.0, 0.0]])  # swaps the columns: (0,0) couples to (0,1), (1,0) to (1,1)
+    S = jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    one = 0.0 * x + 1.0
+
+    def const(A):  # a constant 2x2 matrix as a per-node field
+        return jnn.stack([jnn.stack([A[i, j] * one for j in range(2)], axis=-1) for i in range(2)], axis=-2)
+
+    def scaled(A):  # A[i, j] * S as a per-node field (a scalar point quantity is (N, 1) and does not
+        return jnn.stack(  # broadcast against an (N, 2, 2) field, so the components are built one by one)
+            [jnn.stack([A[i, j] * S for j in range(2)], axis=-1) for i in range(2)], axis=-2
+        )
+
+    T = d.unknown(value_shape=(2, 2))
+    Ti = T.bind(x=x, y=y)
+    src = scaled(2 * np.pi**2 * M) + scaled(M @ C)
+    zero = 0.0 * xb
+    Z = jnn.stack([jnn.stack([zero, zero], axis=-1), jnn.stack([zero, zero], axis=-1)], axis=-2)
+    sol = np.asarray(jno.fdm([-Ti.xx - Ti.yy + Ti @ const(C) - src, T(xb, yb) - Z]).solve())
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    for k, (i, j) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+        assert np.abs(sol[k] - M[i, j] * exact).max() < 8e-3 * M[i, j], (k, np.abs(sol[k] - M[i, j] * exact).max())
+
+
+def test_a_repeat_solve_reads_a_swapped_data_field():
+    """The documented eager swap ``K.model.module = eqx.tree_at(...)`` of a data field must reach the next
+    solve. The problem cached the modules it first read, so after κ went 1 → 2 the repeat solve returned the
+    κ = 1 answer (max u 0.0734 instead of 0.0367), with no error. Oracle: −∇·(κ∇u) = 1 with constant κ scales
+    as 1/κ."""
+    import equinox as eqx
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    n = len(_nodes(d))
+    K = jno.np.parameter((n,), name="kappa")
+    K.model.module = eqx.tree_at(lambda m: m.value, K.model.module, jnp.ones(n))
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-(K * ui.x).x - (K * ui.y).y - 1.0, u(xb, yb) - 0.0])
+    one = np.asarray(prob.solve()).reshape(-1)
+    K.model.module = eqx.tree_at(lambda m: m.value, K.model.module, jnp.full((n,), 2.0))
+    two = np.asarray(prob.solve()).reshape(-1)
+    np.testing.assert_allclose(two, one / 2, rtol=1e-8, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------------------------------
+# a linear problem on a structured grid: one Krylov solve, no Newton
+# ---------------------------------------------------------------------------------------------------
+def _grid_problem(n, terms_of, dim=2):
+    d = (
+        (
+            jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1.0 / n)
+            if dim == 2
+            else jno.shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=1.0 / n)
+        )
+        .structured()
+        .domain()
+    )
+    c = d.variable("interior", split=True)
+    cb = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(**dict(zip("xyz", c[:dim])))
+    return d, jno.fdm(terms_of(u, ui, c, cb))
+
+
+def test_a_linear_grid_problem_is_one_conjugate_gradient_solve():
+    """-Δu = f with u = 0: symmetric after the Dirichlet rows are eliminated, so conjugate gradients with the
+    multigrid V-cycle -- the same second-order answer the Newton path gave."""
+    import jno.jnp_ops as jnn
+
+    d, prob = _grid_problem(
+        32,
+        lambda u, ui, c, cb: [
+            -ui.d2(c[0]) - ui.d2(c[1]) - 2 * np.pi**2 * jnn.sin(np.pi * c[0]) * jnn.sin(np.pi * c[1]),
+            u(cb[0], cb[1]) - 0.0,
+        ],
+    )
+    sol = np.asarray(prob.solve()).reshape(-1)
+    assert prob._grid_linear_ok() and prob._grid_linear_symmetric_flag
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 1e-3
+
+
+def test_an_advection_diffusion_grid_problem_takes_gmres():
+    """-Δu + b·∇u = f is not symmetric: the probe sees it, and GMRES (checking every iteration) solves it.
+    Manufactured u = sin(πx) sin(πy) with b = (1, 2)."""
+    import jno.jnp_ops as jnn
+
+    def terms(u, ui, c, cb):
+        s, co = jnn.sin, jnn.cos
+        f = (
+            2 * np.pi**2 * s(np.pi * c[0]) * s(np.pi * c[1])
+            + np.pi * co(np.pi * c[0]) * s(np.pi * c[1])
+            + 2 * np.pi * s(np.pi * c[0]) * co(np.pi * c[1])
+        )
+        return [-ui.d2(c[0]) - ui.d2(c[1]) + 1.0 * ui.d(c[0]) + 2.0 * ui.d(c[1]) - f, u(cb[0], cb[1]) - 0.0]
+
+    d, prob = _grid_problem(32, terms)
+    sol = np.asarray(prob.solve()).reshape(-1)
+    assert prob._grid_linear_ok() and not prob._grid_linear_symmetric_flag
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 2e-3
+
+
+def test_structure_is_decided_for_every_value_of_a_trainable_parameter():
+    """Whether the residual is affine (one linear solve) or needs Newton used to be decided once, at the trainable
+    parameters' current values. With k starting at 0, ``-Δu + k·u³ = f`` looked affine, and a solve at k = 1
+    returned the LINEAR solution (max error 5.0, true residual 1e4) with no error: in an inverse, k's gradient
+    would have been zero. Oracle: the same problem written with a literal k = 1."""
+    import equinox as eqx
+    import optax
+
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 200.0 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    ref = np.asarray(jno.fdm([-ui.xx - ui.yy + 1.0 * ui**3 - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    k = jno.np.parameter((1,), name="k")
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(0.0))
+    k.optimizer(optax.adam(1e-2))
+    prob = jno.fdm([-ui.xx - ui.yy + k * ui**3 - f, u(xb, yb) - 0.0])
+    prob.solve()  # the deferred node: structure is decided here, with k = 0
+    lid, call = next(iter(prob._trainable_params().items()))
+    at_one = eqx.tree_at(lambda m: m.value, call.model.module, jnp.asarray([1.0]))
+    sol = np.asarray(prob._steady_solve(extra_params={lid: at_one})).reshape(-1)
+    assert not prob._grid_linear
+    np.testing.assert_allclose(sol, ref, atol=1e-8 * np.abs(ref).max())
+
+
+def test_the_grid_linear_path_is_differentiable_in_the_source():
+    """d/da of a misfit through -Δu = a·f on a structured grid: the adjoint through custom_linear_solve
+    against a central difference of the same solve."""
+    import jax
+
+    import jno.jnp_ops as jnn
+
+    obs = None
+
+    def loss(a):
+        _, prob = _grid_problem(
+            16,
+            lambda u, ui, c, cb: [
+                -ui.d2(c[0]) - ui.d2(c[1]) - a * 2 * np.pi**2 * jnn.sin(np.pi * c[0]) * jnn.sin(np.pi * c[1]),
+                u(cb[0], cb[1]) - 0.0,
+            ],
+        )
+        assert prob._grid_linear_ok()
+        sol = jnp.asarray(prob.solve()).reshape(-1)
+        return jnp.mean((sol - obs) ** 2)
+
+    d, prob0 = _grid_problem(16, lambda u, ui, c, cb: [-ui.d2(c[0]) - ui.d2(c[1]) - 1.0, u(cb[0], cb[1]) - 0.0])
+    p = _nodes(d)
+    obs = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+    g = float(jax.grad(loss)(1.5))
+    fd = (float(loss(1.5 + 1e-4)) - float(loss(1.5 - 1e-4))) / 2e-4
+    assert g == pytest.approx(fd, rel=1e-6)
+
+
+def test_a_grid_problem_with_a_flux_boundary_takes_the_linear_path():
+    """A flux boundary and partial Dirichlet data used to force the Newton path, because the V-cycle was
+    built for -Δ with a Dirichlet ring. It is built from the operator now, so those rows are just rows: the
+    problem is one linear solve. Oracle: u = -x²/2 + x solves -u'' = 1 with u(0) = 0 and u'(1) = 0, exactly
+    on this grid, and the Newton path gives the same field."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1.0 / 16).structured().domain()
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    (xb, yb, _), (xt, yt, _) = (d.variable(r, split=True) for r in ("bottom", "top"))
+    nr, nb, nt = (d.variable(r, normals=True) for r in ("right", "bottom", "top"))
+    ur, ub, ut = u.bind(x=xr, y=yr), u.bind(x=xb, y=yb), u.bind(x=xt, y=yt)
+    terms = [
+        -ui.xx - ui.yy - 1.0,
+        u(xl, yl) - 0.0,
+        ur.d(nr) - 0.0,
+        ub.d(nb) - 0.0,
+        ut.d(nt) - 0.0,
+    ]
+    prob = jno.fdm(terms)
+    assert prob._grid_linear_ok()
+    sol = np.asarray(prob.solve()).reshape(-1)
+    exact = -(p[:, 0] ** 2) / 2 + p[:, 0]
+    assert np.abs(sol - exact).max() < 1e-9
+    newton = np.asarray(jno.fdm(terms).solve(nonlinear=jno.solve.newton())).reshape(-1)
+    np.testing.assert_allclose(sol, newton, atol=1e-8)
+
+
+def test_krylov_slots_on_a_grid_stay_matrix_free():
+    """linear=cg / gmres with precond=gmg on a structured linear problem runs on the JVP, not on an assembled
+    matrix (which cost 3x the memory and 25x the time at 1M nodes, measured) -- same answer as the default."""
+    import jno.jnp_ops as jnn
+
+    def terms(u, ui, c, cb):
+        return [
+            -ui.d2(c[0]) - ui.d2(c[1]) - 2 * np.pi**2 * jnn.sin(np.pi * c[0]) * jnn.sin(np.pi * c[1]),
+            u(cb[0], cb[1]) - 0.0,
+        ]
+
+    _, ref = _grid_problem(32, terms)
+    base = np.asarray(ref.solve()).reshape(-1)
+    for linear in (jno.solve.cg(tol=1e-10), jno.solve.gmres(tol=1e-10)):
+        _, prob = _grid_problem(32, terms)
+        sol = np.asarray(prob.solve(linear=linear, precond=jno.precond.gmg())).reshape(-1)
+        assert "_sparsity_cache" not in prob.__dict__, "the slot route assembled a matrix"
+        np.testing.assert_allclose(sol, base, atol=1e-8)
+
+
+def test_cg_on_a_nonsymmetric_grid_problem_raises():
+    import jno.jnp_ops as jnn
+
+    _, prob = _grid_problem(
+        16,
+        lambda u, ui, c, cb: [-ui.d2(c[0]) - ui.d2(c[1]) + 3.0 * ui.d(c[0]) - jnn.sin(np.pi * c[0]), u(cb[0], cb[1]) - 0.0],
+    )
+    with pytest.raises(ValueError, match="symmetric"):
+        prob.solve(linear=jno.solve.cg(), precond=jno.precond.gmg())

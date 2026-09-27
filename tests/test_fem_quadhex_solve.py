@@ -688,7 +688,7 @@ def _periodic_hex(dirs, n=4, cell="hex"):
     ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
     f = jno.np.sin(2 * PI * xi) * jno.np.sin(2 * PI * yi) * jno.np.sin(2 * PI * zi)
     terms = [ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + 1.0 * ui * vi - f * vi]
-    for axis, (lo, hi) in zip("xyz", (("left", "right"), ("bottom", "top"), ("front", "back"))):
+    for axis, (lo, hi) in zip("xyz", (("left", "right"), ("front", "back"), ("bottom", "top"))):
         if axis in dirs:
             terms.append(u(*d.variable(lo)) - u(*d.variable(hi)))
     sol = np.asarray(jno.fem(terms).solve()).ravel()

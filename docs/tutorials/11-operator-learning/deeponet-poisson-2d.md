@@ -51,8 +51,8 @@ net.optimizer(optax.adam(optax.cosine_decay_schedule(1e-3, 2_000, alpha=1e-5 / 1
 ## Step 3: Hard BCs + PDE Residual
 
 ```python
-u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
-pde = k * (u.d2(x) + u.d2(y)) + 1.0
+u = (net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
+pde = k * (u.xx + u.yy) + 1.0
 ```
 
 The multiplicative ansatz `x(2-x)y(1-y)` vanishes on all four edges and enforces the homogeneous Dirichlet BC for **every** sample, so the boundary doesn't need a loss term.

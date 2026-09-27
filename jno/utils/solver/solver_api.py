@@ -416,12 +416,31 @@ class LinearSolver:
     solver is slow until its key is written, never silently wrong.
     """
 
-    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: bool = False, key: Any = None):
+    def __init__(
+        self,
+        fn: Callable,
+        *,
+        name: str,
+        traits: Optional[dict] = None,
+        direct: bool = False,
+        key: Any = None,
+        settings: Optional[dict] = None,
+    ):
         self._fn = fn
         self.name = name
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
         self.direct = direct  # a direct solver ignores x0 and takes no preconditioner
         self.key = None if key is None else (type(self), name, key)
+        # What this spec was configured with, by name: `tol`, `atol`, `maxiter`, and whatever else the
+        # method takes (GMRES's `restart`). A caller that runs its own loop rather than calling `fn` --
+        # jno.fdm's structured paths, which need the true residual and their own preconditioner -- reads
+        # the configuration here instead of unpacking `key` by position or assuming a default.
+        self.settings = dict(settings or {})
+        # The relative tolerance asked for. Falls back to `key`'s first float for a spec that declares no
+        # settings, which is what the older builders pass.
+        self.tolerance = self.settings.get("tol")
+        if self.tolerance is None and isinstance(key, tuple) and key and isinstance(key[0], float):
+            self.tolerance = key[0]
 
     def __call__(self, A, b, *, M=None, x0=None):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
@@ -1093,7 +1112,7 @@ class _FrozenMarchPrecond:
         return f"frozen-for-march({self._of!r})"
 
 
-def _freeze_precond_for_march(precond, fem, block, state=None):
+def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
     """Materialize a NON-traceable preconditioner once, from the step tangent at the initial state.
 
     ``spec.traceable`` is the library's own word for "can materialize inside a trace". ``jacobi`` reads
@@ -1107,9 +1126,11 @@ def _freeze_precond_for_march(precond, fem, block, state=None):
     Krylov solve converges, never what it converges to. It is also what the LINEAR transient path already
     does one branch below, where the step operator is formed once and materialized before the scan.
 
-    Built from ``M + theta*dt*J(u0, t0)``, which is ``dt`` times the true step tangent
-    ``M/dt + theta*J``. A uniform scaling of the operator leaves the Krylov iterates unchanged (it
-    rescales the preconditioned residual, not the subspace), so the extra factor costs nothing.
+    Built from ``M + scale*J(u0, t0)``, which is ``dt`` times the true step tangent ``M/dt + theta*J`` for
+    ``scale = theta*dt``. A uniform scaling of the operator leaves the Krylov iterates unchanged (it
+    rescales the preconditioned residual, not the subspace), so the extra factor costs nothing. ``scale``
+    comes from the time scheme (:meth:`step_scales`); without one, from ``metadata["theta"]`` (default 1).
+    A block whose metadata carried no theta used to be preconditioned for backward Euler under any scheme.
     """
     if precond is None:
         return None
@@ -1145,6 +1166,7 @@ def _freeze_precond_for_march(precond, fem, block, state=None):
     theta = float((block.metadata or {}).get("theta", 1.0))
     t0 = float((block.metadata or {}).get("t0", 0.0))
     dt = float(block.dt)
+    scale = theta * dt if scale is None else float(scale)
     J = block.jacobian(at, t0, None)
     if block.mass is None:
         # STATE-DEPENDENT mass (``c(u) u_t``, e.g. an enthalpy-porosity heat capacity): there is no mass
@@ -1158,14 +1180,14 @@ def _freeze_precond_for_march(precond, fem, block, state=None):
             _slice = _u0[_s0:_s1]
             _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
         J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
-        A_rep = _add_step_operator(J, J_mass, 1.0 / dt)
+        A_rep = _add_step_operator(J, J_mass, 1.0 / scale)  # ∝ J_mass + scale·J; scale = dt for backward Euler
         op = LinearOperator(A_rep)
         prepare_precond(precond, fem)
         applier = materialize_precond(precond, PrecondContext(op, fem))
         _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
         return _FrozenMarchPrecond(applier, precond)
     M = block.mass(t0, None)
-    A_rep = _add_step_operator(M, J, theta * dt)
+    A_rep = _add_step_operator(M, J, scale)
     op = LinearOperator(A_rep)
     prepare_precond(precond, fem)
     applier = materialize_precond(precond, PrecondContext(op, fem))
@@ -1264,7 +1286,10 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # inside the march's scan, so both the matrix-free JVP and the `direct=True` assembled tangent are
         # traced by the time it is asked for. Build it once, now, from the step tangent at the initial
         # state, and freeze it for the march.
-        precond = _freeze_precond_for_march(precond, fem, block, state)
+        # The step operator's coefficient on J, from the scheme: θ·Δt for a θ-scheme, and the 2Δt/3 of the
+        # BDF2 steps (the last of `step_scales`, which every step but the first uses).
+        scales = tuple(scheme.step_scales(block)) if scheme is not None and hasattr(scheme, "step_scales") else ()
+        precond = _freeze_precond_for_march(precond, fem, block, state, scale=scales[-1] if scales else None)
         return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
     if nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
@@ -1294,7 +1319,13 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
     def _build(key):
-        op = LinearOperator(_add_step_operator(block.M, block.A, key))
+        A, scale = block.A, key
+        if key == 0.0:  # forward Euler: the constraint (zero-mass) rows are still imposed at t+dt, with dt·A
+            from .backend_blocks import _algebraic_rows, _row_scaled
+
+            alg = _algebraic_rows(block.M, block.M.shape[0], block.M.dtype)
+            A, scale = _row_scaled(A, alg.astype(block.M.dtype)), float(block.dt)
+        op = LinearOperator(_add_step_operator(block.M, A, scale))
         _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
 
     if _constant_operator:
@@ -1307,19 +1338,27 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
             _build(float(_k))
 
     def _static_for(scale):
+        """``(operator, preconditioner)`` pre-built for this step scale. A scale that was NOT pre-built (a
+        traced adaptive step, or a scheme that did not declare it) gets no operator — the step then uses
+        its own true matvec — but may keep the default scale's preconditioner, which only affects speed.
+        It used to return the default scale's OPERATOR, so the step solved the wrong system."""
         if not _constant_operator:
             return None, None
         try:
             key = float(scale) if scale is not None else _default_scale
         except (TypeError, ValueError):
-            key = _default_scale  # a TRACED step size (an adaptive march): keep the previous behaviour
-        return _static.get(key) or _static.get(_default_scale) or (None, None)
+            key = None  # a TRACED step size (an adaptive march)
+        hit = _static.get(key) if key is not None else None
+        if hit is not None:
+            return hit
+        return None, (_static.get(_default_scale) or (None, None))[1]
 
     def step_solve(matvec, rhs, x0, diag_fn, scale=None):
         op, M = _static_for(scale)
         if op is None:
             op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
-            M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+            if M is None:
+                M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         if getattr(solver, "direct", False):
             # A DIRECT solver (lu/dense) factorizes the step operator itself — it takes no preconditioner,
             # so don't synthesize the Jacobi one below (which it would reject). Needs a materializable

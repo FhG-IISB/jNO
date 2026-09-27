@@ -271,8 +271,12 @@ class MeshUtils:
     _kernel_block_doubles = 2**24
 
     @staticmethod
-    def _preprocess_mesh_connectivity(mesh, dimension, boundary_indices):
-        """Preprocess mesh to build FEM connectivity matrices for finite differences."""
+    def _preprocess_mesh_connectivity(mesh, dimension, boundary_indices, congruent_cells=None):
+        """Preprocess mesh to build FEM connectivity matrices for finite differences.
+
+        ``congruent_cells=k``: the cells repeat in identical blocks of ``k`` (a structured grid: 2 triangles
+        per square, 6 Kuhn tetrahedra per voxel), so the quality line is computed on the first block --
+        it is exact there, and the full pass took 29 s of a 42 s build at 96³ (measured)."""
         if mesh is None:
             return
 
@@ -294,7 +298,7 @@ class MeshUtils:
                 elements = cells_dict["triangle"]
                 element_type = "triangles"
                 cell_type = "triangle"
-                area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
+                pass  # the constant P1 geometry (area, grad_phi) is deferred to first read, below
             elif "quad" in cells_dict:
                 # A quadrilateral mesh carries nodal measures and boundary topology exactly as a
                 # triangular one does. What it cannot carry is `p1_grad_phi`: that is the
@@ -336,20 +340,33 @@ class MeshUtils:
         )
 
         if cell_type == "triangle":
-            mesh_connectivity["p1_area"] = np.array(area)
-            mesh_connectivity["p1_grad_phi"] = np.array(grad_phi)
+            # Deferred: computed on the device, it was a 43-word-per-node transient at every 2-D build
+            # (361 MB at 1M nodes, measured) for a table only some consumers read.
+            _p1 = {}
 
-        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}" + _mesh_quality(
-            points, elements, str(element_type)
-        )
+            def _p1_geometry(key, points=points, elements=elements):
+                if not _p1:
+                    area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
+                    _p1.update(p1_area=np.array(area), p1_grad_phi=np.array(grad_phi))
+                return _p1[key]
 
-        mesh_connectivity["nodal_ds"] = MeshUtils.compute_nodal_ds(mesh_connectivity)
-        mesh_connectivity["nodal_volumes"] = MeshUtils.compute_nodal_volumes(mesh_connectivity)
+            mesh_connectivity.defer("p1_area", lambda: _p1_geometry("p1_area"))
+            mesh_connectivity.defer("p1_grad_phi", lambda: _p1_geometry("p1_grad_phi"))
+
+        # Deferred: a quadrature weight per node, which only an integral reads. Measured on a 2-D
+        # structured build at 4.2M nodes, computing the volumes eagerly was 2.1 s of a 6.3 s build --
+        # a finite-difference solve, which collocates at the nodes and has no quadrature at all,
+        # never asks for them. `IntegrationOperators.nodal_volumes` reads the key when it wants it.
+        mesh_connectivity.defer("nodal_ds", lambda mc=mesh_connectivity: MeshUtils.compute_nodal_ds(mc))
+        mesh_connectivity.defer("nodal_volumes", lambda mc=mesh_connectivity: MeshUtils.compute_nodal_volumes(mc))
         mesh_connectivity["boundary_indices"] = boundary_indices
 
         bp = points[boundary_indices]
-        all_indices = np.arange(len(points))
-        non_boundary_indices = np.setdiff1d(all_indices, boundary_indices)
+        # The complement of a bounded index set: mark and read off, which is linear, rather than
+        # `np.setdiff1d`, which sorts both sides. Same array -- sorted and unique either way.
+        _interior = np.ones(len(points), dtype=bool)
+        _interior[np.asarray(boundary_indices, dtype=int)] = False
+        non_boundary_indices = np.flatnonzero(_interior)
         _bp = points[non_boundary_indices]
 
         mesh_connectivity["boundary_points"] = bp
@@ -386,8 +403,9 @@ class MeshUtils:
             n_bp = len(bp)
             mesh_connectivity.defer("VM", lambda: np.ones((n_bp, n_bp), dtype=np.float32) - np.eye(n_bp, dtype=np.float32))
 
+        sample = elements if not congruent_cells else np.asarray(elements)[: int(congruent_cells)]
         msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}" + _mesh_quality(
-            points, elements, str(element_type)
+            points, sample, str(element_type)
         )
 
         return mesh_connectivity, msg
@@ -506,7 +524,10 @@ class MeshUtils:
         return np.bincount(cells.ravel(), weights=np.repeat(measure / n_local, n_local), minlength=n_points)
 
     @staticmethod
-    def get_boundary_normals(mesh, k=8):
+    def get_boundary_normals(mesh, k=8, boundary_nodes=None):
+        """``boundary_nodes`` is an optional boolean over node ids, true for at least every node on the
+        boundary, which prunes the face count without changing its answer -- see
+        :func:`jno.utils.solver.fem_facets._boundary_faces`."""
         points = mesh.points
         # A curved mesh stores second-order blocks; boundary topology and apex orientation come from
         # the vertices, which `p1_cells_dict` supplies. The normals stay straight-facet for now --
@@ -514,7 +535,7 @@ class MeshUtils:
         # would silently change every flux and radiation term.
         cd = p1_cells_dict(mesh)
         if "tetra" in cd:
-            bfaces, bapex = MeshUtils._boundary_faces_with_apex(cd["tetra"])
+            bfaces, bapex = MeshUtils._boundary_faces_with_apex(cd["tetra"], boundary_nodes)
             return MeshUtils._compute_normals_from_boundary_faces(points, bfaces, apex_points=points[bapex])
         if "hexahedron" in cd:
             # A hex face has no opposite vertex; the owning cell's centroid orients it instead.
@@ -538,7 +559,7 @@ class MeshUtils:
             # normals pointing each way, none of them radial. The 3-D branch's docstring already called
             # the centroid/PCA family "valid only for convex / star-shaped domains"; 2-D simply never got
             # the exact path.
-            bedges, bapex = MeshUtils._boundary_edges_with_apex(cd["triangle"])
+            bedges, bapex = MeshUtils._boundary_edges_with_apex(cd["triangle"], boundary_nodes)
             if len(bedges):
                 return MeshUtils._compute_edge_normals_2d(points, bedges, points[bapex])
             boundary_elements = MeshUtils._get_boundary_elements(cd["triangle"], "triangle")
@@ -550,7 +571,7 @@ class MeshUtils:
         return MeshUtils._compute_normals_pca(points, boundary_indices, actual_dim, k, mesh=mesh)
 
     @staticmethod
-    def _boundary_edges_with_apex(triangle_cells):
+    def _boundary_edges_with_apex(triangle_cells, boundary_nodes=None):
         """Boundary edges of a triangle mesh, each with the apex of its owning element.
 
         The 2-D twin of :meth:`_boundary_faces_with_apex`. ``_LOCAL_FACES_TRI[k]`` already stores the
@@ -560,7 +581,7 @@ class MeshUtils:
         from ..utils.solver.fem_facets import _LOCAL_FACES_TRI, _boundary_faces
 
         cells = np.asarray(triangle_cells, dtype=np.int64)
-        flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TRI, 2)
+        flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TRI, 2, boundary_nodes)
         parent_cell, local_face = sel // n_local, sel % n_local
         apex_local = np.asarray([entry[2] for entry in _LOCAL_FACES_TRI], dtype=np.int64)
         return flat[sel], cells[parent_cell, apex_local[local_face]]
@@ -591,7 +612,7 @@ class MeshUtils:
         return out / (np.linalg.norm(out, axis=1, keepdims=True) + 1e-20), idx
 
     @staticmethod
-    def _boundary_faces_with_apex(tetra_cells):
+    def _boundary_faces_with_apex(tetra_cells, boundary_nodes=None):
         """Boundary faces of a tetrahedral mesh, each with the apex of its owning element.
 
         A boundary face is shared by exactly one tetrahedron; that tet's fourth vertex (the
@@ -606,7 +627,7 @@ class MeshUtils:
         # identical work. ``_LOCAL_FACES_TET[k]`` stores the apex as its 4th entry, so the opposite
         # vertex follows from the local face index without any extra search.
         cells = np.asarray(tetra_cells, dtype=np.int64)
-        flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TET, 3)
+        flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TET, 3, boundary_nodes)
         parent_cell, local_face = sel // n_local, sel % n_local
         apex_local = np.asarray([entry[3] for entry in _LOCAL_FACES_TET], dtype=np.int64)
         return flat[sel], cells[parent_cell, apex_local[local_face]]

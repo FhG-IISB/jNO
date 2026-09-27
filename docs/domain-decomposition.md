@@ -16,7 +16,7 @@ through the sweeps.
     d.region("A", boxA)                     # name the regions
     d.region("B", boxB)
 
-    a = jno.fdm([-aa.d2(xa) - aa.d2(ya) - fa, u(xb, yb) - 0.0])   # each subdomain's own problem,
+    a = jno.fdm([-aa.xx - aa.yy - fa, u(xb, yb) - 0.0])           # each subdomain's own problem,
     b = jno.fem([ub.x * vb.x + ub.y * vb.y - fb * vb, ...])       # authored exactly as it would be alone
 
     sol = jno.core([a, b]).solve()          # jno.core couples them
@@ -41,8 +41,8 @@ xb, yb, _ = d.variable("boundary", split=True)   # the OUTER boundary, shared
 u = d.unknown()
 aa, ab = u.bind(x=xa, y=ya), u.bind(x=xb2, y=yb2)
 
-a = jno.fdm([-aa.d2(xa) - aa.d2(ya) - fa, u(xb, yb) - 0.0])   # PDE on A + outer BC
-b = jno.fdm([-ab.d2(xb2) - ab.d2(yb2) - fb, u(xb, yb) - 0.0])  # PDE on B + outer BC
+a = jno.fdm([-aa.xx - aa.yy - fa, u(xb, yb) - 0.0])           # PDE on A + outer BC
+b = jno.fdm([-ab.xx - ab.yy - fb, u(xb, yb) - 0.0])           # PDE on B + outer BC
 
 a.region, b.region        # 'A', 'B' — inferred from the PDE coordinates, not declared
 sol = jno.core([a, b]).solve()
@@ -98,7 +98,7 @@ solves it best:
 
 ```python
 femL = jno.fem([uif.x * vif.x + uif.y * vif.y - f(xL, yL) * vif, uf(xb, yb) - 0.0])   # FEM on the left
-fdmR = jno.fdm([-uiR.d2(xR) - uiR.d2(yR) - f(xR, yR), u(xb, yb) - 0.0])               # FDM on the right
+fdmR = jno.fdm([-uiR.xx - uiR.yy - f(xR, yR), u(xb, yb) - 0.0])                       # FDM on the right
 
 sol = jno.core([femL, fdmR]).solve()
 ```
@@ -157,7 +157,7 @@ never through the unrolled sweeps:
 kL = jno.np.parameter((1,), name="kL")          # conductivity to recover, in the FEM region
 kx = jnn.where(xi < 0.5, kL, kR)
 femA = jno.fem([kx * (uif.x * vif.x + uif.y * vif.y) - fsrc * vif, uf(xb, yb) - 0.0])
-fdmB = jno.fdm([-kR * (uiB.d2(xi) + uiB.d2(yi)) - fsrc, u(xb, yb) - 0.0])
+fdmB = jno.fdm([-kR * (uiB.xx + uiB.yy) - fsrc, u(xb, yb) - 0.0])
 
 node = couple([(femA, sA), (fdmB, sB)]).solve(tol=1e-9, max_iter=300)
 jno.core([(node - u_obs).mse]).solve(epochs)     # recovers kL THROUGH the coupling

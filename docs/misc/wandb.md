@@ -119,8 +119,8 @@ x, y, _ = dom.variable("interior")
 net = jno.nn(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
 net.optimizer(optax.adam(1e-3))
 
-u = net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)
-crux  = jno.core([(u.dd(x) + u.dd(y) + 1.0).mse])
+u = (net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
+crux  = jno.core([(u.xx + u.yy + 1.0).mse])
 stats = crux.solve(20_000)                     # returns a `statistics` object
 
 wandb_log({"final_loss": float(stats.total_loss)}, step=20_000)

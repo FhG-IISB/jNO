@@ -331,3 +331,13 @@ def test_transient_adjoint_checkpoint_gradient_matches_finite_differences():
     h = 1e-4
     fd = float((loss(jnp.asarray([1.3 + h])) - loss(jnp.asarray([1.3 - h]))) / (2 * h))
     assert abs(g1 - fd) / abs(fd) < 1e-6, f"checkpointed adjoint {g1:.3e} vs FD {fd:.3e}"
+
+
+def test_theta_scheme_with_linear_slots_uses_its_own_step_matrix():
+    """A composed linear solve pre-builds the step matrix M + scale·A. θ-schemes did not declare their
+    scale, so only the block's default (θ = 1) was built and a Crank–Nicolson step was solved with the
+    backward-Euler matrix: error 0.83 against 0.025 for the default path. Both must now agree."""
+    fem = _heat(mesh_size=0.1, time=(0.0, 0.2, 21))
+    a = np.asarray(fem.solve(time=jno.solve.theta(0.5)).fn())
+    b = np.asarray(fem.solve(time=jno.solve.theta(0.5), linear=jno.solve.cg(), precond=jno.precond.jacobi()).fn())
+    assert np.abs(a - b).max() < 1e-7 * np.abs(a).max()

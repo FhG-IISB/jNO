@@ -81,6 +81,12 @@ class _ThetaScheme(_TimeScheme):
             block, args, save_ts, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, theta=self.theta
         )
 
+    def step_scales(self, block):
+        """The coefficient of ``A`` in this scheme's step operator ``M + θ·Δt·A``, so a composed linear
+        solve pre-builds THAT matrix. Without it only the block's default (θ = 1) was built, and a
+        Crank–Nicolson step was solved with the backward-Euler matrix (measured: 0.34 off at T)."""
+        return (self.theta * float(block.dt),) if block.dt is not None else ()
+
     def __repr__(self):
         return f"jno.solve.theta({self.theta})"
 

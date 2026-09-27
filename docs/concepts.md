@@ -10,8 +10,8 @@ trainable parameters are all nodes in one **trace** — a symbolic graph. You ha
 same expression can serve as a residual *loss* during training and as a *quantity of interest* afterwards.
 
 ```python
-u   = net(x)                       # a network call
-pde = (u.dd(x) + f).mse            # a derivative + residual, reduced to a scalar
+u   = net(x).scalar.bind(x=x)      # a network call, bound to its coordinate
+pde = (u.xx + f).mse               # a derivative + residual, reduced to a scalar
 crux = jno.core([pde])             # compile the graph once
 crux.solve(5000)                   # train through it
 field = crux.eval([u])             # read the same graph back
@@ -22,7 +22,7 @@ field = crux.eval([u])             # read the same graph back
 The power of the trace is that four normally-separate workflows are just **different nodes in the same
 graph**, so they compose freely and differentiate uniformly:
 
-- **PINN** — the trial is a network and the loss is a strong-form PDE residual (`u.dd(x) + f`), with
+- **PINN** — the trial is a network and the loss is a strong-form PDE residual (`u.xx + f`), with
   derivatives taken by automatic differentiation.
 - **Plain NN / operator learning** — the loss is a supervised fit (`(pred - data).mse`); the same
   `jno.nn(...)` model, optimizer, and controls apply.

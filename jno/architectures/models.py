@@ -112,7 +112,9 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = 
                     "jno.np.parameter(<symbol>): nodal field parameters support P1 (order=1) "
                     "symbols only for now (higher-order spaces add nodes during init_fem)."
                 )
-            shape = (int(mesh.points.shape[0]),)
+            # A vector/tensor symbol (``domain.unknown(value_shape=(2,))``) carries that many values per
+            # node; it used to be sized as a scalar field, silently, whatever value_shape it was given.
+            shape = (int(mesh.points.shape[0]),) + tuple(int(s) for s in (getattr(sym, "value_shape", ()) or ()))
             fem_field = "node"
         fem_field_key = getattr(sym, "field_key", None)
         fem_field_domain = sym._domain  # so the regularizer can recover the FE space
