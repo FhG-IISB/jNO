@@ -3961,7 +3961,11 @@ class FemResidualOperator:
         # By the solver's VALUE identity where it has one: `fem.solve` builds a fresh composed solver
         # per call, so `id()` alone never matched and every call re-compiled.
         _sk = getattr(solve_fn, "cache_key", None) or id(solve_fn)
-        key = (_sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t))
+        from ..utils.solver.sharding import element_token
+
+        # ... and by the element sharding the residual is traced under: a program compiled across N devices
+        # must not answer a later `shard=False` call (nor the reverse).
+        key = (_sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token())
         cache = self.__dict__.setdefault("_eager_solve_cache", {})
         fn = cache.get(key)
         if fn is None:
