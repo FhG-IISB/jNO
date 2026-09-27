@@ -459,9 +459,10 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
         between rounds. Left alone it would replay round 1's pairing for every later round, and worse,
         an ordinary ``fem.solve()`` afterwards would silently get the searched answer.
 
-        This POP costs nothing on the ordinary (non-parametric) path, which never populates that cache
-        -- ``FemResidualOperator.solve`` returns a ``FunctionCall`` and never reaches it. Do not read
-        that as "a round is free": the steady loop re-enters ``_solve_dispatch`` each round, which
+        The ordinary (non-parametric) nonlinear path populates that cache too: a plain ``fem.solve()``
+        is compiled once and reused (``_fem._solve_dispatch``), so without this pop every round after
+        the first would replay the first round's pairing. With it each round compiles afresh -- which
+        is what it paid before as well: the steady loop re-enters ``_solve_dispatch`` each round, which
         builds fresh closures, so the round is RETRACED regardless of this cache. Measured on the
         stacked-bars fixture, the residual is entered 8 times per round at Python level and the total
         scales linearly with the rounds actually run (16 for 2 rounds, 24 for 3).

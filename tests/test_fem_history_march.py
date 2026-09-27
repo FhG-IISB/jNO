@@ -1057,6 +1057,10 @@ def test_direct_staggered_marches_a_coupled_load_path():
     assert mf[..., fem.blocks[bd]].max() > 1e-2, "no damage — the coupling did nothing"
     assert dr[..., fem.blocks[bd]].max() <= 1.0 + 1e-9, "the bound must hold on the direct route too"
     assert np.abs(dr - mf).max() / np.abs(mf).max() < 1e-6, "direct and matrix-free marches disagree"
+    # Anderson-accelerated sweeps inside the march's scan: same load path, bound still holds at the root
+    aa = np.asarray(fem.solve(nonlinear=jno.solve.staggered([u, dm], anderson=5, **kw)))
+    assert aa[..., fem.blocks[bd]].max() <= 1.0 + 1e-9, "the bound must hold with Anderson acceleration"
+    assert np.abs(aa - mf).max() / np.abs(mf).max() < 1e-6, "Anderson and plain marches disagree"
 
 
 def test_adapt_on_a_march_fails_loud():

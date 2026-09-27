@@ -65,6 +65,8 @@ __all__ = [
     "svd",
     "lstsq",
     "bdf2",
+    "sdirk",
+    "rosenbrock",
     "theta",
     "exponential",
     "adaptive",
@@ -83,8 +85,15 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
     indefinite saddle-point systems where Jacobi-preconditioned Krylov stalls, reverse-mode
     differentiable in the matrix entries and the right-hand side. Direct: ignores ``x0`` and
-    rejects a preconditioner. ``jit`` yes; **no vmap batching rule upstream** (trait
-    ``vmap="no"``) -- use a Krylov solver inside vmapped/batched solves.
+    rejects a preconditioner. ``jit`` yes, and ``vmap`` -- so ``jax.jacrev`` / ``jax.jacfwd`` through
+    a solve -- on every backend. How a batch is solved depends on the backend:
+
+    * ``"host"``, ``"cudss"``, ``"pardiso"`` **factor once** for a batch against one matrix and solve the whole block of
+      right-hand sides in one call -- the batch to pick for Jacobians and sensitivities. Measured
+      (RTX 3070 box, float64, factorising on every call): ``jacrev`` over 32 outputs of a 2-D
+      20k-DOF solve 108 ms against 58 ms for ONE solve, where ``"device"`` took 16.7 s.
+    * ``"device"`` (cuSolver's sparse QR) takes one right-hand side, so it factorises every system:
+      one per call by default, or ``jno.setup(lu_stack=k)`` stacked per call.
 
     Args:
         backend: WHERE the factorization happens. All three obey the same ``(A, b) -> x`` contract and
@@ -204,7 +213,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
     # on the host and cannot go back through JAX -- notably ARPACK's shift-invert OPinv in the
     # non-symmetric eigensolver. "device" has none: it IS a JAX primitive.
     traits = {
-        "vmap": "no",
+        "vmap": "yes",
         "multi_rhs": backend == "cudss",
         "host_kernel": None if backend == "device" else backend,
     }
@@ -246,14 +255,22 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
     # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
-        from .utils.solver.krylov import gmres as _scaled_gmres
+        if name == "cg" and (getattr(M, "low_precision", False) or getattr(M, "nonsymmetric", False)):
+            # A float32 preconditioner is only approximately symmetric: standard CG's beta then loses
+            # conjugacy and was measured stopping at a TRUE residual of 6e-6 against a requested 1e-8
+            # (float32 FSAI, 3-D elasticity), silently. Flexible CG is robust to that at no extra products.
+            from .utils.solver.krylov import flexible_cg
 
-        method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
+            raw = lambda mv, rhs, M, x0: flexible_cg(mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000)  # noqa: E731
+        else:
+            from .utils.solver.krylov import gmres as _scaled_gmres
 
-        def raw(mv, rhs, M, x0):
-            if name == "gmres" and M is not None:
-                M = _unit_scaled(M, rhs)
-            return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+            method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
+
+            def raw(mv, rhs, M, x0):
+                if name == "gmres" and M is not None:
+                    M = _unit_scaled(M, rhs)
+                return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
@@ -490,16 +507,37 @@ def amg(
 
 
 def _root_driver(
-    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False, reuse=False
-) -> NonlinearSolver:
-    if reuse and not direct:
+    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False,
+    reuse=False, anderson=0,
+) -> NonlinearSolver:  # fmt: skip
+    if reuse and direct is not True:
         raise ValueError(
             f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED, factorized tangent between steps, and only "
-            f"the sparse-direct driver has one: pass direct=True as well. The matrix-free default never "
-            f"forms the tangent, so there is nothing to reuse."
+            f"the sparse-direct driver has one: pass direct=True as well. The default iterative and the "
+            f"matrix-free modes never factorize the tangent, so there is nothing to reuse."
         )
 
+    # direct: True = assembled tangent + sparse LU; None = assembled tangent + iterative inner solve when the
+    # assembler provides one, matrix-free otherwise (newton's default); False = always matrix-free.
     def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
+        if direct is None and jacobian is not None:
+            # The default: Newton on the ASSEMBLED tangent, solved iteratively -- the composed
+            # ``linear=``/``precond=`` slots if given, else Jacobi-BiCGStab (see newton_default).
+            from .utils.solver.newton_krylov import assembled_krylov_solve, newton_direct
+
+            return newton_direct(
+                residual_fn,
+                jacobian,
+                u0,
+                rtol=rtol,
+                atol=atol,
+                max_steps=max_steps,
+                damping=damping,
+                line_search=line_search,
+                ls_max=ls_max,
+                ls_c=ls_c,
+                linear_solve=linear_solve if linear_solve is not None else assembled_krylov_solve(inner_tol, inner_maxit),
+            )
         if direct:
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
             # drag where the matrix-free Krylov inner solve stalls). Needs the assembler-provided Jacobian.
@@ -545,12 +583,21 @@ def _root_driver(
             line_search=line_search,
             ls_max=ls_max,
             ls_c=ls_c,
+            anderson=anderson,
         )
 
     # The tolerances travel WITH the spec, not just inside the closure: a driver run under `lax.scan`
     # (the load-path march) cannot raise on non-convergence from inside the trace, so the caller
     # re-checks outside it — and it must judge against the tolerance the user actually asked for.
-    return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol})
+    config = dict(
+        damping=damping, rtol=rtol, atol=atol, max_steps=max_steps, inner_tol=inner_tol, inner_maxit=inner_maxit,
+        line_search=line_search, ls_max=ls_max, ls_c=ls_c, direct=direct,
+    )  # fmt: skip
+    if anderson:
+        config["anderson"] = anderson
+    if reuse:
+        config["reuse"] = reuse
+    return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol}, config=config)
 
 
 def newton(
@@ -564,21 +611,28 @@ def newton(
     line_search: bool = False,
     ls_max: int = 25,
     ls_c: float = 1e-4,
-    direct: bool = False,
+    direct: bool | None = None,
     reuse: bool = False,
 ) -> NonlinearSolver:
-    """Newton root-find, as a configurable slot. Two inner-solve modes:
+    """Newton root-find, as a configurable slot. Three inner-solve modes:
 
-    * **default (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default BiCGStab, or the
-      ``linear=`` slot), implicit differentiation via ``lax.custom_root``. The historic behaviour.
+    * **default (``direct=None``) -- the ASSEMBLED tangent, solved iteratively.** Wherever the assembler
+      provides the tangent (native nonlinear FEM, the transient stepper), each step assembles ``J(u)`` and
+      solves it with the ``linear=``/``precond=`` slots -- by default Jacobi-BiCGStab -- so an inner
+      iteration is one SpMV instead of two Jacobian-vector products through the element loop, and a
+      preconditioner that needs an assembled matrix (``jacobi``, a built ``amg``) composes. Measured on a
+      3-D P1 ``-div((1+u^2) grad u)`` problem (RTX 3070): 2.3-3.4x faster than the matrix-free Newton at
+      10k-87k DOF, same root. A problem with no assembled tangent (a residual-only operator) falls back to
+      the matrix-free mode automatically.
+    * **``direct=False`` (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default BiCGStab,
+      or the ``linear=`` slot). No tangent is ever stored, so it is the choice when the assembled tangent
+      would not fit in memory. The previous default.
     * **``direct=True`` (sparse-direct)** -- factorize the ASSEMBLED tangent each step with a sparse LU
-      instead of an iterative inner solve. Robust on **indefinite / ill-conditioned** systems -- a
-      Taylor-Hood velocity/pressure saddle, a stiff Carman-Kozeny phase-change drag -- where the
-      matrix-free BiCGStab has no saddle-point preconditioner and stalls. Still differentiable (implicit
-      diff with a *direct*, transposable tangent solve at the root). Composes only where the assembler
-      provides the tangent: ``fem.solve(nonlinear=jno.solve.newton(direct=True))`` on a native nonlinear
-      problem (steady or the transient stepper); the ``linear=``/``precond=`` slots are then unused.
+      (or the ``linear=`` slot's direct solver). Robust on **indefinite / ill-conditioned** systems -- a
+      Taylor-Hood velocity/pressure saddle, a stiff Carman-Kozeny phase-change drag -- where an iterative
+      inner solve has no saddle-point preconditioner and stalls.
 
+    All three are differentiable (implicit differentiation via ``lax.custom_root``).
     ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
     to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning.
 
@@ -616,6 +670,7 @@ def picard(
     line_search: bool = False,
     ls_max: int = 25,
     ls_c: float = 1e-4,
+    anderson: int = 0,
 ) -> NonlinearSolver:
     """Damped Picard (lagged-coefficient / fixed-point) iteration — pair with :func:`jno.lag`.
 
@@ -634,9 +689,18 @@ def picard(
     rigid-plastic cold start whose effective viscosity spans orders of magnitude), where fixed
     damping alone either diverges or crawls. See the ``jno.lag`` docstring for the inverse-problem
     (Picard-adjoint) caveat.
+
+    ``anderson=m`` (``m >= 1``; 0 = off) applies **Anderson acceleration** over the last ``m`` iterates
+    (Walker & Ni, SIAM J. Numer. Anal. 49(4), 2011): each step extrapolates from the history of Picard
+    updates, which often turns linear convergence into much faster convergence for the same one linear
+    solve per step. Safeguarded: an extrapolated point that does not decrease the residual retreats toward
+    the plain Picard iterate, so it is never worse than ``anderson=0``. Costs ``2 m`` vectors of memory and
+    one thin QR of an ``n x m`` matrix per step; ``m`` of 3-10 is usual. Gradients are unchanged (implicit
+    differentiation at the root).
     """
     return _root_driver(
         "picard",
+        anderson=anderson,
         damping=damping,
         rtol=rtol,
         atol=atol,
@@ -695,6 +759,7 @@ def staggered(
     ls_c: float = 1e-4,
     direct: bool = False,
     over_relax: float = 1.0,
+    anderson: int = 0,
 ) -> NonlinearSolver:
     """**Alternate minimization** — solve a coupled system one field at a time, sweeping until the full
     residual converges. ``fields`` is the trial symbols in the order to sweep them::
@@ -755,6 +820,12 @@ def staggered(
     default puts *unpreconditioned* BiCGStab on a saddle block, for the reason given above — a sub-solve
     is a restriction closure and a ``precond=`` spec has no operator to materialize against. This is
     documented rather than enforced; ``fem.solve``'s own saddle warning already fires on that shape.
+
+    ``anderson=m`` (``m >= 1``; 0 = off) applies **Anderson acceleration** to the sweep, which is the
+    fixed-point map (Walker & Ni, SIAM J. Numer. Anal. 49(4), 2011) -- the standard remedy for the slow,
+    linear convergence of alternate minimization. Safeguarded: an extrapolated point that does not
+    decrease the full residual retreats toward the plain sweep's answer. It composes with ``over_relax``
+    (the over-relaxed sweep is then the map being accelerated). Memory ``2 m`` vectors.
     """
     resolved: dict = {"blocks": None, "names": None, "constrained": None}
 
@@ -850,10 +921,27 @@ def staggered(
             line_search=line_search,
             ls_max=ls_max,
             ls_c=ls_c,
+            anderson=anderson,
         )
 
+    def _label(f):  # a field's value identity for the repr; an unnamed one falls back to its repr (never equal)
+        if isinstance(f, (list, tuple)):
+            return tuple(_label(g) for g in f)
+        return getattr(f, "name", None) or repr(f)
+
+    config = dict(
+        fields=tuple(_label(f) for f in fields), rtol=rtol, atol=atol, max_sweeps=max_sweeps,
+        inner_steps=inner_steps, inner_tol=inner_tol, inner_maxit=inner_maxit, line_search=line_search,
+        damping=damping, ls_max=ls_max, ls_c=ls_c, direct=direct, over_relax=over_relax,
+    )  # fmt: skip
+    if anderson:
+        config["anderson"] = anderson
     spec = NonlinearSolver(
-        _fn, name="staggered", direct=direct, traits={"vmap": "native", "jit": True, "rtol": rtol, "atol": atol}
+        _fn,
+        name="staggered",
+        direct=direct,
+        traits={"vmap": "native", "jit": True, "rtol": rtol, "atol": atol},
+        config=config,
     )
     # Over-relaxation steps PAST the sub-solve's answer, so a box-constrained field needs the projector
     # the `bounds` wrapper owns; ask for it only when it is actually needed.
@@ -1659,6 +1747,51 @@ def bdf2():
     from .utils.solver.timeschemes import _BDF2Scheme
 
     return _BDF2Scheme()
+
+
+def sdirk(order: int = 3):
+    """**SDIRK** time scheme for ``fem.solve(time=...)``: a singly diagonally implicit Runge-Kutta method,
+    stiffly accurate and L-stable -- Alexander's 2-stage order-2 (``order=2``) or 3-stage order-3
+    (``order=3``, default) method (R. Alexander, SIAM J. Numer. Anal. 14(6), 1977).
+
+    Third order where ``theta``/``bdf2`` stop at second: for a smooth solution the same accuracy at far
+    larger steps. Each stage is one implicit solve of the same kind the backward-Euler march takes (a
+    linear solve, or a Newton solve for a nonlinear block), all with the SAME step operator
+    ``M + gamma*dt*A`` -- so ``linear=``/``precond=`` slots, a sparse-direct factorisation and a constant
+    preconditioner are built once. Stiffly accurate, so Dirichlet / algebraic (zero-mass) rows are exact
+    at every step, and L-stable, so it damps stiff transients the way backward Euler does (unlike
+    Crank-Nicolson). Composes with ``.adaptive(...)`` (step doubling with exponent ``1/(order+1)``).
+
+    Costs ``order`` implicit solves per step. A state-dependent mass ``c(u) u_t`` is integrated in its
+    non-conservative form (as ``bdf2`` does). Refuses a second-order-in-time (``u_tt``) block: an L-stable
+    scheme would damp the undamped wave.
+    """
+    from .utils.solver.timeschemes import _SDIRKScheme
+
+    if isinstance(order, bool) or order not in (2, 3):
+        raise ValueError(f"jno.solve.sdirk(order={order!r}): order must be 2 or 3.")
+    return _SDIRKScheme(order)
+
+
+def rosenbrock(method: str = "ros34pw2"):
+    """**Rosenbrock** (linearly implicit Runge-Kutta) time scheme for ``fem.solve(time=...)``: no Newton loop --
+    each stage is ONE linear solve with the same matrix ``M + gamma*dt*J`` (``J`` the tangent at the step's
+    start), so a nonlinear problem costs a fixed number of linear solves per step.
+
+    * ``"ros34pw2"`` (default) -- Rang & Angermann, BIT Numer. Math. 45 (2005): 4 stages, order 3, stiffly
+      accurate and L-stable, a W-method (order kept with an approximate tangent) and consistent for index-1
+      DAEs, so Dirichlet and algebraic (zero-mass) rows are handled.
+    * ``"ros2"`` -- 2 stages, order 2, L-stable (Verwer et al., SIAM J. Sci. Comput. 20(4), 1999); not
+      stiffly accurate, so prefer ``ros34pw2`` with algebraic rows.
+
+    Composes with ``linear=`` / ``precond=`` (the stage matrix is what they see; on a linear block with a
+    constant operator it is built once) and with ``.adaptive(...)``. Refuses what a linearly implicit form
+    cannot carry: a time-dependent or parameter-dependent mass, a state-dependent mass ``c(u) u_t``, and a
+    second-order-in-time (``u_tt``) block -- use ``sdirk()`` / ``bdf2()`` for the first two.
+    """
+    from .utils.solver.timeschemes import _RosenbrockScheme
+
+    return _RosenbrockScheme(method)
 
 
 def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):

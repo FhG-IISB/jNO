@@ -194,11 +194,11 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Linear — direct** | `lu` (sparse LU), `dense` |
 | **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` (complex-symmetric); `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
-| **Nonlinear** | `newton`, `picard` |
+| **Nonlinear** | `newton`, `picard`, `staggered` — `picard`/`staggered` take `anderson=m` (Anderson acceleration) |
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
-| **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
+| **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
 ### Matrix functions — what `Ax = b` cannot express
 

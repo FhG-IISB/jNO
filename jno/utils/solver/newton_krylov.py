@@ -39,7 +39,30 @@ _EPS = 1e-300
 LAST_NEWTON_STATS: dict = {}
 
 
-def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, factorizations=None):
+#: While a compiled solve is being traced by :func:`compiled_with_verdicts`, the drivers' convergence
+#: checks hand their (traced) residual norms here instead of silently skipping, so the verdict can be
+#: made on the compiled result. ``None`` everywhere else.
+_TRACED_VERDICTS: list | None = None
+
+
+def _judge(rn, bound, *, rtol, atol, max_steps, who, steps, factorizations=None):
+    """Record the outcome in :data:`LAST_NEWTON_STATS` and raise if the loop left on its step cap."""
+    LAST_NEWTON_STATS.clear()
+    LAST_NEWTON_STATS.update(
+        driver=who, residual=rn, bound=bound, steps=steps, converged=bool(math.isfinite(rn) and rn <= bound)
+    )
+    if factorizations is not None:
+        LAST_NEWTON_STATS["factorizations"] = int(factorizations)
+    if not math.isfinite(rn) or rn > bound:
+        raise RuntimeError(
+            f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
+            f"tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, rtol={rtol:g}). The last "
+            "iterate is NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
+            "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0."
+        )
+
+
+def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, norms=None, factorizations=None):
     """Raise (eagerly) if the Newton loop returned on its STEP CAP rather than on the tolerance.
 
     Both drivers below iterate a ``jax.lax.while_loop`` whose condition is
@@ -49,35 +72,132 @@ def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None, fac
     already refuses to do that (``_fem._residual_check`` / ``solver_api._maybe_residual_check``); the
     nonlinear path had no equivalent, which is the gap this closes.
 
-    No-op under ``jit``/``vmap``/``grad``: the test needs a concrete residual, so it would both force a
+    Under ``jit``/``vmap``/``grad`` the test needs a concrete residual, so it would both force a
     device->host sync and fail to concretise. Same guard, and same trade, as the two linear checks --
-    under a transform the solver's own iteration cap is all there is.
+    under a transform the solver's own iteration cap is all there is. The exception is a solve compiled
+    by :func:`compiled_with_verdicts`: there the norms leave the compiled program as outputs and the
+    same judgement is made on them afterwards.
+
+    ``norms=(||r(u)||, ||r(u0)||)``, when the driver already has them from its loop, saves the two
+    residual evaluations (two full passes of the element loop) the check would otherwise make.
     """
+    rn_given, r0_given = norms if norms is not None else (None, None)
     if any(isinstance(v, jax.core.Tracer) for v in (u, u0)):
+        # Only a check made directly in the compiled solve's own trace: one inside an inner trace (a driver
+        # called in a `scan` / `while_loop` body) holds tracers that cannot leave it, and keeps the old
+        # behaviour -- the iteration cap is all there is.
+        if _TRACED_VERDICTS is not None and getattr(u, "_trace", None) is _TRACED_VERDICTS[0]:
+            _TRACED_VERDICTS.append(
+                dict(
+                    rn=rn_given if rn_given is not None else jnp.linalg.norm(f0(u)),
+                    r0=r0_given if r0_given is not None else jnp.linalg.norm(f0(u0)),
+                    steps=None if steps is None else jnp.asarray(steps),
+                    factorizations=None if factorizations is None else jnp.asarray(factorizations),
+                    rtol=rtol,
+                    atol=atol,
+                    max_steps=max_steps,
+                    who=who,
+                )
+            )
         return u
-    r, r0 = f0(u), f0(u0)
-    if any(isinstance(v, jax.core.Tracer) for v in (r, r0)):  # a concrete root of a residual under `grad`
+    rn_v = rn_given if rn_given is not None else jnp.linalg.norm(f0(u))
+    r0_v = r0_given if r0_given is not None else jnp.linalg.norm(f0(u0))
+    if any(isinstance(v, jax.core.Tracer) for v in (rn_v, r0_v)):  # a concrete root of a residual under `grad`
         return u
-    rn = float(jnp.linalg.norm(r))
-    bound = atol + rtol * float(jnp.linalg.norm(r0))
-    LAST_NEWTON_STATS.clear()
-    LAST_NEWTON_STATS.update(
-        driver=who,
-        residual=rn,
-        bound=bound,
+    rn = float(rn_v)
+    bound = atol + rtol * float(r0_v)
+    _judge(
+        rn,
+        bound,
+        rtol=rtol,
+        atol=atol,
+        max_steps=max_steps,
+        who=who,
         steps=None if steps is None or isinstance(steps, jax.core.Tracer) else int(steps),
-        converged=bool(math.isfinite(rn) and rn <= bound),
+        factorizations=None
+        if factorizations is None or isinstance(factorizations, jax.core.Tracer)
+        else int(factorizations),
     )
-    if factorizations is not None and not isinstance(factorizations, jax.core.Tracer):
-        LAST_NEWTON_STATS["factorizations"] = int(factorizations)
-    if not math.isfinite(rn) or rn > bound:
-        raise RuntimeError(
-            f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
-            f"tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, rtol={rtol:g}). The last "
-            "iterate is NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
-            "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0."
-        )
     return u
+
+
+def compiled_with_verdicts(fn):
+    """A compiled, reusable ``fn`` for a solve that must keep the drivers' eager convergence check.
+
+    Running a Newton driver eagerly re-stages its ``while_loop`` and ``custom_root`` on every call and
+    evaluates every residual outside the loop op by op: measured on a 3-D P1 nonlinear Poisson problem
+    (87k DOF, RTX 3070) that was 2.3 s per warm ``fem.solve()`` against ~0.3 s of GPU work. Compiled, the
+    check would silently switch off, so the drivers' residual norms and step counts become extra outputs
+    of the compiled program and :func:`judge_verdicts` makes the same judgement on them.
+
+    Traced ONCE with ``make_jaxpr`` and run through a ``jax.jit`` of ``eval_jaxpr`` that takes the
+    jaxpr's constants (the mesh and operator arrays the residual closes over) as ARGUMENTS, the way
+    ``backend_blocks._cached_march`` does: a plain ``jax.jit`` would bake them into the executable as
+    constants -- a bigger program to compile and to cache, and a second copy of the mesh kept alive by
+    it. The constants move to the solving device once. Under an outer trace (an argument or a constant
+    is a tracer) it runs inline, uncached. Returns ``(*args) -> (fn(*args), verdicts)``.
+    """
+    from .placement import to_solve_device
+
+    static: list = []  # tolerances and driver names, fixed per trace; only the norms are traced outputs
+    state: dict = {}
+
+    def _traced(*args):
+        global _TRACED_VERDICTS
+        from jax._src import core as _core
+
+        # Slot 0 is the trace this solve is staged in; the verdicts follow it.
+        prev, _TRACED_VERDICTS = _TRACED_VERDICTS, [_core.trace_ctx.trace]
+        try:
+            out = fn(*args)
+            found = _TRACED_VERDICTS[1:]
+            static[:] = [{k: v[k] for k in ("rtol", "atol", "max_steps", "who")} for v in found]
+            for m, v in zip(static, found):
+                m["steps"] = v["steps"] is not None
+                m["factorizations"] = v.get("factorizations") is not None
+            return out, [(v["rn"], v["r0"], v["steps"], v.get("factorizations")) for v in found]
+        finally:
+            _TRACED_VERDICTS = prev
+
+    def _label(out, norms):
+        return out, [
+            dict(m, rn=rn, r0=r0, steps=k if m["steps"] else None, factorizations=f if m["factorizations"] else None)
+            for m, (rn, r0, k, f) in zip(static, norms)
+        ]
+
+    def run(*args):
+        flat = jax.tree_util.tree_leaves(args)
+        if any(isinstance(x, jax.core.Tracer) for x in flat):
+            return _label(*_traced(*args))
+        if "prog" not in state:
+            closed, out_shape = jax.make_jaxpr(_traced, return_shape=True)(*args)
+            if any(isinstance(c, jax.core.Tracer) for c in closed.consts):  # closes over an outer trace
+                return _label(*_traced(*args))
+            jaxpr = closed.jaxpr
+            state.update(
+                consts=to_solve_device(list(closed.consts), numpy=True),
+                prog=jax.jit(lambda consts, flat: jax.core.eval_jaxpr(jaxpr, consts, *flat)),
+                out_tree=jax.tree_util.tree_structure(out_shape),
+            )
+        out = jax.tree_util.tree_unflatten(state["out_tree"], state["prog"](state["consts"], flat))
+        return _label(*out)
+
+    return run
+
+
+def judge_verdicts(verdicts):
+    """Apply :func:`_convergence_check`'s judgement to the norms a compiled solve returned."""
+    for v in verdicts:
+        _judge(
+            float(v["rn"]),
+            v["atol"] + v["rtol"] * float(v["r0"]),
+            rtol=v["rtol"],
+            atol=v["atol"],
+            max_steps=v["max_steps"],
+            who=v["who"],
+            steps=None if v["steps"] is None else int(v["steps"]),
+            factorizations=None if v.get("factorizations") is None else int(v["factorizations"]),
+        )
 
 
 def _retreat(accept, *, hi, lo, max_halvings, dtype):
@@ -130,9 +250,14 @@ def _retreat(accept, *, hi, lo, max_halvings, dtype):
     return a
 
 
+def _armijo_ok(r_new_norm, rn, a, *, ls_c):
+    """The residual-norm Armijo test itself: sufficient decrease from ``rn`` for a step of length ``a``."""
+    return r_new_norm <= (1.0 - ls_c * a) * rn
+
+
 def _armijo(f, x, delta, rn, *, ls_c):
     """The residual-norm Armijo predicate shared by every Newton-type step: ``accept(a)``."""
-    return lambda a: jnp.linalg.norm(f(x + a * delta)) <= (1.0 - ls_c * a) * rn
+    return lambda a: _armijo_ok(jnp.linalg.norm(f(x + a * delta)), rn, a, ls_c=ls_c)
 
 
 def _bisect_slope(f, x, delta, *, atol, rtol, max_iters, dtype):
@@ -336,6 +461,67 @@ def _step_and_tangent(linear_solve, who, *, tol, maxit):
     return step, tangent
 
 
+def _anderson_solve(plain, f, x0, *, m, rtol, atol, max_steps, ls_c, ls_max):
+    """Safeguarded **Anderson acceleration** (type II; Walker & Ni, SIAM J. Numer. Anal. 49(4), 2011, Alg. AA)
+    of the fixed-point iteration ``x <- plain(x, f(x))`` -- the loop body of a ``custom_root`` ``solve``.
+
+    With ``g(x) = plain(x) - x`` and the last ``m`` differences ``dX``, ``dG`` of iterates and of ``g``, the
+    accelerated point is ``x + g - (dX + dG) gamma`` with ``gamma = argmin ||g - dG gamma||`` (a thin QR of
+    the ``n x m`` history, then an ``m x m`` least squares that tolerates the zero columns of the first ``m``
+    steps). It is taken when it decreases the residual (the ``_armijo`` test); otherwise the step retreats
+    through ``_retreat`` toward the PLAIN iterate, which is what the unaccelerated driver would have done
+    -- so the acceleration can make an iteration faster, never worse.
+
+    Fixed shapes (``2 m n`` of history), so it runs under ``jit``/``vmap``/``scan``. Returns
+    ``(x, (steps, ||r_end||, ||r0||))`` like the drivers' plain loops.
+    """
+    dtype = x0.dtype
+    r_start = f(x0)
+    r0n = jnp.linalg.norm(r_start)
+    n = x0.shape[0]
+
+    def cond(state):
+        _x, r, k = state[:3]
+        return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
+
+    def body(state):
+        x, r, k, dX, dG, x_prev, g_prev = state
+        u_plain = plain(x, r)
+        g = u_plain - x
+        # Row-major history (m, n): column `(k-1) % m` holds the newest difference; order is irrelevant to
+        # the least-squares problem. Step 0 has no difference yet and writes nothing.
+        col = (k - 1) % m
+        have = k > 0
+        dX = dX.at[col].set(jnp.where(have, x - x_prev, dX[col]))
+        dG = dG.at[col].set(jnp.where(have, g - g_prev, dG[col]))
+        q, rr = jnp.linalg.qr(dG.T)  # (n, m), (m, m)
+        gamma = jnp.linalg.lstsq(rr, q.T @ g)[0]  # rank-tolerant: an all-zero history gives gamma = 0
+        u_aa = x + g - (dX + dG).T @ gamma
+        rn = jnp.linalg.norm(r)
+        r_aa = f(u_aa)
+        # The full extrapolation first, on the residual already in hand (NaN-safe: rejected if not finite).
+        ok = _armijo_ok(jnp.linalg.norm(r_aa), rn, 1.0, ls_c=ls_c)
+
+        def _retreat_to_plain():
+            step = u_aa - u_plain
+            t = _retreat(_armijo(f, u_plain, step, rn, ls_c=ls_c), hi=0.5, lo=0.0, max_halvings=ls_max, dtype=dtype)
+            u = u_plain + t * step
+            return u, f(u)
+
+        x_new, r_new = jax.lax.cond(ok, lambda: (u_aa, r_aa), _retreat_to_plain)
+        return x_new, r_new, k + 1, dX, dG, x, g
+
+    zeros = jnp.zeros((m, n), dtype)
+    x, r, k, *_ = jax.lax.while_loop(cond, body, (x0, r_start, 0, zeros, zeros, x0, jnp.zeros_like(x0)))
+    return x, (k.astype(r0n.dtype), jnp.linalg.norm(r), r0n)
+
+
+def _check_anderson(anderson):
+    if isinstance(anderson, bool) or not isinstance(anderson, int) or anderson < 0:
+        raise ValueError(f"anderson={anderson!r}: the Anderson history depth must be an int >= 0 (0 = off; 3-10 is usual).")
+    return anderson
+
+
 def newton_krylov(
     residual_fn,
     u0,
@@ -350,6 +536,7 @@ def newton_krylov(
     line_search=False,
     ls_max=25,
     ls_c=1e-4,
+    anderson=0,
 ):
     """Root-find ``residual_fn(u) = 0`` from guess ``u0``; differentiable w.r.t. any value
     ``residual_fn`` closes over. Drop-in for the ``(residual_fn, u0) -> u`` solver contract.
@@ -394,8 +581,22 @@ def newton_krylov(
         """First ``alpha`` in ``damping * 0.5^i`` meeting residual-norm Armijo; else the last (tiny)."""
         return _retreat(_armijo(f, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
+    anderson = _check_anderson(anderson)
+
+    def _update(f, u):
+        ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
+        delta = inner_step(jvp, -ru)
+        alpha = _backtrack(f, u, delta, jnp.linalg.norm(ru)) if line_search else damping
+        return u + alpha * delta
+
     def solve(f, x0):
-        r0n = jnp.linalg.norm(f(x0))
+        if anderson:
+            return _anderson_solve(
+                lambda u, _r: _update(f, u), f, x0, m=anderson, rtol=rtol, atol=atol, max_steps=max_steps,
+                ls_c=ls_c, ls_max=ls_max,
+            )  # fmt: skip
+        r_start = f(x0)
+        r0n = jnp.linalg.norm(r_start)
 
         def cond(state):
             _, r, k = state
@@ -403,21 +604,53 @@ def newton_krylov(
 
         def body(state):
             u, _r, k = state
-            ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
-            delta = inner_step(jvp, -ru)
-            alpha = _backtrack(f, u, delta, jnp.linalg.norm(ru)) if line_search else damping
-            u = u + alpha * delta
+            u = _update(f, u)
             return u, f(u), k + 1
 
-        u, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
-        return u
+        u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+        # Diagnostics ride out of custom_root as AUX (never differentiated): the step count for
+        # `fem.stats`, and the two norms the convergence check would otherwise re-evaluate.
+        # The count as a FLOAT: custom_root's JVP gives integer aux an int zero tangent, not float0, and
+        # then rejects it ("Custom JVP rule must produce primal and tangent outputs ... expecting float0").
+        return u, (k.astype(r0n.dtype), jnp.linalg.norm(r), r0n)
 
     tangent_solve = lambda g, y: inner_tangent(g, y)
-    root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
+    root, (steps, rn, r0n) = jax.lax.custom_root(f0, u0, solve, tangent_solve, has_aux=True)
     # Checked OUTSIDE custom_root: everything inside `solve` is traced, so an in-loop guard could
     # never concretise. Here `root` is concrete whenever the caller was eager, which is exactly when
     # the check can do any good.
-    return _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_krylov")
+    return _convergence_check(
+        f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_krylov", steps=steps, norms=(rn, r0n)
+    )
+
+
+def assembled_krylov_solve(tol=1e-10, maxit=2000):
+    """``(J, b) -> x``: Jacobi-preconditioned BiCGStab on an ASSEMBLED tangent -- the same iteration as the
+    steady default (:func:`jno._fem._bicgstab_jacobi`), so ``J`` is applied in the storage measured fastest
+    for it (CSR or split COO) and the Jacobi diagonal comes from the assembled entries. Transposable, as
+    :func:`newton_direct`'s implicit-diff tangent requires (``J.T`` is a BCOO too)."""
+
+    def solve(J, b):
+        from ..._fem import _bicgstab_jacobi
+
+        return _bicgstab_jacobi(J, jnp.asarray(b).reshape(-1), float(tol), int(maxit))
+
+    return solve
+
+
+def newton_default(residual_fn, u0, *, jacobian=None, inner_tol=1e-10, inner_maxit=2000, **kw):
+    """jNO's default Newton: on the ASSEMBLED tangent whenever the assembler provides one, else matrix-free.
+
+    With ``jacobian`` (a callable ``u -> BCOO``, the assembler's tangent): each step assembles ``J(u)`` and
+    solves it with Jacobi-BiCGStab (:func:`assembled_krylov_solve`) -- one SpMV per inner iteration instead
+    of two Jacobian-vector products through the element loop. Measured on a 3-D P1
+    ``-div((1+u^2) grad u)`` problem (RTX 3070, 4 Newton steps, same root to 2e-16): 516 -> 206 ms at
+    10k DOF, 1133 -> 428 ms at 29k, 4025 -> 1181 ms at 87k (2.3-3.4x). Without one (a residual-only
+    problem) it is :func:`newton_krylov`, the previous default. Differentiable either way (implicit
+    diff through ``custom_root``)."""
+    if jacobian is not None:
+        return newton_direct(residual_fn, jacobian, u0, linear_solve=assembled_krylov_solve(inner_tol, inner_maxit), **kw)
+    return newton_krylov(residual_fn, u0, inner_tol=inner_tol, inner_maxit=inner_maxit, **kw)
 
 
 def newton_direct(
@@ -492,6 +725,8 @@ def newton_direct(
 
         linear_solve = sparse_lu_solve
 
+    from .solver_api import gate_suspended
+
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
     u0 = jnp.asarray(u0).reshape(-1)
 
@@ -510,30 +745,39 @@ def newton_direct(
         return _retreat(_armijo(f_fwd, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
     def _forward(x0):
-        r0n = jnp.linalg.norm(f_fwd(x0))
+        # ONE residual evaluation per step: the one taken at the new iterate is carried to the next step
+        # (and to the convergence test) instead of being evaluated again. Every residual is a full pass
+        # of the element loop; re-evaluating them cost ~3 residuals per tangent where 1 is needed.
+        r_start = f_fwd(x0)
+        r0n = jnp.linalg.norm(r_start)
 
         def cond(state):
             _u, r, k = state[:3]
             return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
 
         def body(state):
-            u, _r, k = state
-            r = f_fwd(u)
-            delta = linear_solve(J_fwd(u), -r)  # DIRECT solve of the assembled tangent
+            u, r, k = state
+            # The Newton STEP is not gated (see `_step_and_tangent`: the outer residual is the contract,
+            # judged by `_convergence_check`); only custom_root's tangent below is. Gating it here also put a
+            # host callback inside this while_loop, which JAX's rematerialisation cannot partially evaluate:
+            # reverse mode through a checkpointed time march died on an AssertionError in its loop rules.
+            with gate_suspended():
+                delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
             alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
             u = u + alpha * delta
             return u, f_fwd(u), k + 1
 
         if not reuse:
-            u, _r, k = jax.lax.while_loop(cond, body, (x0, f_fwd(x0), 0))
-            return u, k, k
+            u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+            return u, k, k, jnp.linalg.norm(r), r0n  # a fresh tangent (one factorization) every step
 
         def body_reuse(state):
             # Lagged-Jacobian step: see the docstring for the rule. `J` is the tangent carried from
             # the last refresh; `fresh` says whether it was assembled at THIS iterate.
             u, r, k, J, fresh, nfact = state
             rn = jnp.linalg.norm(r)
-            delta = linear_solve(J, -r)
+            with gate_suspended():  # as in `body`: no host callback inside the loop (reverse mode, remat)
+                delta = linear_solve(J, -r)
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u_try = u + alpha * delta
             r_try = f_fwd(u_try)
@@ -547,13 +791,22 @@ def newton_direct(
             J_new = jax.lax.cond(refresh, lambda: J_fwd(u_new), lambda: J)
             return u_new, r_new, k + 1, J_new, refresh, nfact + refresh.astype(jnp.int32)
 
-        state0 = (x0, f_fwd(x0), 0, J_fwd(x0), jnp.asarray(True), jnp.asarray(1, jnp.int32))
-        u, _r, k, _J, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
-        return u, k, nfact
+        state0 = (x0, r_start, 0, J_fwd(x0), jnp.asarray(True), jnp.asarray(1, jnp.int32))
+        u, r, k, _J, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
+        return u, k, nfact, jnp.linalg.norm(r), r0n
 
-    root, _steps, _nfact = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
+    root, _steps, _nfact, _rn, _r0n = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
     _convergence_check(
-        f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_direct", steps=_steps, factorizations=_nfact
+        f0,
+        u0,
+        root,
+        rtol=rtol,
+        atol=atol,
+        max_steps=max_steps,
+        who="newton_direct",
+        steps=_steps,
+        norms=(_rn, _r0n),
+        factorizations=_nfact,
     )
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
@@ -588,6 +841,7 @@ def staggered_newton(
     line_search=False,
     ls_max=25,
     ls_c=1e-4,
+    anderson=0,
 ):
     """**Alternate minimization** (staggered / operator-split) root find over a block-partitioned system.
 
@@ -801,8 +1055,16 @@ def staggered_newton(
             return _retreat(_armijo(f, x, dx, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=x.dtype)
         return damping * _bisect_slope(f, x, dx, atol=atol, rtol=ls_c, max_iters=ls_max, dtype=x.dtype)
 
+    anderson = _check_anderson(anderson)
+
     def solve(f, x0):
-        r0n = jnp.linalg.norm(f(x0))
+        if anderson:  # accelerate the SWEEP: it is the fixed-point map
+            return _anderson_solve(
+                lambda u, _r: _sweep(u), f, x0, m=anderson, rtol=rtol, atol=atol, max_steps=max_sweeps,
+                ls_c=ls_c, ls_max=ls_max,
+            )  # fmt: skip
+        r_start = f(x0)
+        r0n = jnp.linalg.norm(r_start)
 
         def cond(state):
             _u, r, k = state
@@ -813,8 +1075,9 @@ def staggered_newton(
             u = _sweep(u)
             return u, f(u), k + 1
 
-        u, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
-        return u
+        u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+        # aux: sweeps (as a float -- see newton_krylov) + the norms the convergence check needs
+        return u, (k.astype(r0n.dtype), jnp.linalg.norm(r), r0n)
 
     if direct:
         # Same shape as `newton_direct`: run the sweep undifferentiated, then hang `custom_root` off the
@@ -822,7 +1085,7 @@ def staggered_newton(
         # FULL assembled Jacobian. The alternating structure is absent from the derivative either way --
         # the implicit-function theorem does not care how the root was reached — but a direct tangent is
         # the consistent choice here: the caller picked a direct slot precisely because Krylov stalls.
-        root_val = solve(f0, u0)
+        root_val, (steps, rn, r0n) = solve(f0, u0)
 
         def _tangent(g, y):
             J = jacobian(root_val)
@@ -833,5 +1096,7 @@ def staggered_newton(
         root = jax.lax.custom_root(f0, root_val, lambda _f, _x0: root_val, _tangent)
     else:
         tangent_solve = lambda g, y: inner_tangent(g, y)  # noqa: E731
-        root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
-    return _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_sweeps, who="staggered")
+        root, (steps, rn, r0n) = jax.lax.custom_root(f0, u0, solve, tangent_solve, has_aux=True)
+    return _convergence_check(
+        f0, u0, root, rtol=rtol, atol=atol, max_steps=max_sweeps, who="staggered", steps=steps, norms=(rn, r0n)
+    )

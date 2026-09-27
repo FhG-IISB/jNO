@@ -80,6 +80,10 @@ from .utils.config import (
     wandb_finish,
 )
 from .utils.load_save import load, save
+from .utils.solver import sparse_batching as _sparse_batching
+
+# vmap rules for the JAX sparse primitives that ship without one (process-wide; announced via the log)
+_sparse_batching.install()
 
 # Mirror the submodule on the package namespace and add a short alias.
 numpy = np

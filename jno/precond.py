@@ -24,6 +24,7 @@ per-field DOF blocks (``fem.blocks``); :func:`form` assembles auxiliary weak-for
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -53,6 +54,8 @@ __all__ = [
     "real_equivalent",
     "gmg",
     "nystrom",
+    "fsai",
+    "schwarz",
 ]
 
 
@@ -85,6 +88,27 @@ class _Spec:
     traceable = False
     key = None
     complex_ok = False  # conservative: a consumer reformulates unless the spec says it takes complex
+    #: Build and apply in single precision (see :func:`_materialize_in_float32`). Set by every constructor's
+    #: ``float32=`` flag; part of the spec's value identity, so a float32 and a float64 spec never share a
+    #: compiled program.
+    float32 = False
+
+    def __init_subclass__(cls, **kwargs):
+        # Every spec's `materialize` honours `float32`, whichever path calls it -- fem.solve's slots, a
+        # composite spec materialising its children, `.cached()`, a march freezing it -- because the
+        # precision is applied here, around the subclass's own method, rather than at each call site.
+        super().__init_subclass__(**kwargs)
+        own = cls.__dict__.get("materialize")
+        if own is not None and not getattr(own, "_precision_aware", False):
+
+            def materialize(self, ctx, _own=own):
+                if not getattr(self, "float32", False):
+                    return _own(self, ctx)
+                return _materialize_in_float32(self, _own, ctx)
+
+            materialize._precision_aware = True
+            materialize.__doc__ = own.__doc__
+            cls.materialize = materialize
 
     def cached(self, *, refresh=False):
         """Wrap this preconditioner so its setup is built **once** and reused across solves — the
@@ -96,10 +120,10 @@ class _Spec:
     def __eq__(self, other):
         if self.key is None or not isinstance(other, _Spec) or other.key is None:
             return self is other
-        return self.key == other.key
+        return (self.key, self.float32) == (other.key, other.float32)
 
     def __hash__(self):
-        return id(self) if self.key is None else hash(self.key)
+        return id(self) if self.key is None else hash((self.key, self.float32))
 
     # -- an algebra over preconditioners ----------------------------------------------------------
     # A materialized spec IS a linear map `v -> M^-1 v`, so the classical Schur approximations are
@@ -113,6 +137,44 @@ class _Spec:
     def __matmul__(self, other):
         """``M v = M1(M2 v)`` -- applied right to left, as the operator product reads."""
         return _Product(self, other) if isinstance(other, _Spec) else NotImplemented
+
+
+def _low_precision(dtype):
+    """float64 -> float32, complex128 -> complex64; anything already single stays."""
+    return jnp.complex64 if jnp.issubdtype(dtype, jnp.complexfloating) else jnp.float32
+
+
+def _materialize_in_float32(spec, materialize, ctx):
+    """Build ``spec`` against a single-precision copy of the operator and apply it in single precision.
+
+    A preconditioner changes how fast a Krylov solve converges, never what it converges to: the solve, its
+    residual and its convergence test stay in the working (double) precision, and only ``v -> M^-1 v`` runs
+    in single. That halves the bytes of every product inside the preconditioner -- a Jacobi scale, the
+    V-cycle's SpMVs, an FSAI factor -- and on a GPU whose float64 rate is a fraction of its float32 rate
+    (1/64 on consumer cards) it also speeds up the arithmetic. The applier casts ``v`` down and the result
+    back up, and keeps a structural transpose if the spec built one.
+    """
+    op = ctx.A
+    hi = getattr(op.bcoo, "dtype", None)
+    lo = _low_precision(hi) if hi is not None else jnp.float32
+    lo_ctx = PrecondContext(op.astype(lo), ctx.fem, getattr(ctx, "_grid", None))
+    M = materialize(spec, lo_ctx)
+
+    def cast(f):
+        return lambda v: jnp.asarray(f(jnp.asarray(v).astype(_low_precision(jnp.asarray(v).dtype)))).astype(
+            jnp.asarray(v).dtype
+        )
+
+    t = getattr(M, "_t", None)
+    return PrecondApplier(cast(M), cast(t) if t is not None else None, low_precision=True)
+
+
+def _precision(spec, float32):
+    """Set a spec's precision flag (every constructor's ``float32=``) and return it."""
+    if not isinstance(float32, bool):
+        raise TypeError(f"float32={float32!r}: must be True or False.")
+    spec.float32 = float32
+    return spec
 
 
 class _Combination(_Spec):
@@ -495,7 +557,7 @@ class _Hypre(_Spec):
         return PrecondApplier(apply, apply)
 
 
-def hypre(kind: str = "ams", **options) -> _Hypre:
+def hypre(kind: str = "ams", *, float32: bool = False, **options) -> _Hypre:
     """**hypre** preconditioners (AMS, BoomerAMG) via PETSc — a reference-grade H(curl) solver.
 
     One duck-typed entry for the whole library rather than a wrapper per preconditioner: ``kind`` is
@@ -523,8 +585,11 @@ def hypre(kind: str = "ams", **options) -> _Hypre:
     differentiability: a preconditioner cannot change the solution, so
     :func:`jax.lax.custom_linear_solve` differentiates through the *operator* and never through the
     preconditioner — the same contract the SuperLU, PARDISO and pyamg paths already use.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _Hypre(kind, options)
+    return _precision(_Hypre(kind, options), float32)
 
 
 class _ILU(_Spec):
@@ -652,7 +717,7 @@ class _ILU(_Spec):
         return f"jno.precond.ilu({self.options})"
 
 
-def ilu(**options) -> _ILU:
+def ilu(*, float32: bool = False, **options) -> _ILU:
     """**Incomplete LU** (SuperLU ``spilu``) — the classical preconditioner for the A–V eddy-current
     system, and complex-capable, so it applies to the complex operator directly.
 
@@ -681,11 +746,14 @@ def ilu(**options) -> _ILU:
     differentiability — see :func:`hypre` for the same contract. Memory is the real limit: ``spilu``
     fill grows with ``fill_factor``, so on a large 3-D curl-curl expect to trade ``drop_tol`` against
     RAM before it beats an auxiliary-space method.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _ILU(options)
+    return _precision(_ILU(options), float32)
 
 
-def real_equivalent(inner) -> _RealEquivalent:
+def real_equivalent(inner, *, float32: bool = False) -> _RealEquivalent:
     """Precondition a COMPLEX system through its fused real-equivalent block, with a **real** inner
     solver — so a real-only preconditioner (an AmgX-style GPU multigrid, say) works on it.
 
@@ -727,11 +795,14 @@ def real_equivalent(inner) -> _RealEquivalent:
     *Real valued iterative methods for solving complex symmetric linear systems*, Numer. Linear Algebra
     Appl. 7:197-218, 2000; Benzi & Bertaccini, *Block preconditioning of real-valued iterative
     algorithms for complex linear systems*, IMA J. Numer. Anal. 28:598-618, 2008.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _RealEquivalent(inner)
+    return _precision(_RealEquivalent(inner), float32)
 
 
-def jacobi() -> _Jacobi:
+def jacobi(*, float32: bool = False) -> _Jacobi:
     """Diagonal (Jacobi) preconditioner ``M^{-1} v = v / diag(A)``.
 
     The cheapest useful preconditioner: one elementwise multiply per application, ``jit``- and
@@ -742,11 +813,16 @@ def jacobi() -> _Jacobi:
 
     ``fem.solve(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi())`` reproduces the
     historic steady-linear default exactly.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _Jacobi()
+    return _precision(_Jacobi(), float32)
 
 
-def gmg(*, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int | None = None) -> _GMG:
+def gmg(
+    *, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int | None = None, float32: bool = False
+) -> _GMG:
     """Multigrid V-cycle preconditioner for an operator on a **structured grid**
     (``jno.shape.rect(...).structured().domain()``).
 
@@ -769,8 +845,11 @@ def gmg(*, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size
     References: J. E. Dendy, *Black box multigrid*, J. Comput. Phys. 48 (1982) 366; Trottenberg, Oosterlee &
     Schüller, *Multigrid* (2001) §2.3 for the variational coarse operator; Baker, Falgout, Kolev & Yang,
     *SIAM J. Sci. Comput.* 33 (2011) 2864 for ℓ¹ smoothing.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _GMG(n_pre, n_post, omega, min_size)
+    return _precision(_GMG(n_pre, n_post, omega, min_size), float32)
 
 
 class _Form(_Spec):
@@ -894,7 +973,7 @@ class _Form(_Spec):
         return self.inner is not False
 
 
-def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
+def form(terms, *, inner=None, quad_degree: int = 2, float32: bool = False) -> _Form:
     """**Preconditioners as weak forms**: assemble an auxiliary operator ``Â`` from ordinary
     traced ``jno.fem`` terms and apply ``M^{-1} v = Â^{-1} v`` with ``inner`` (default
     ``jno.solve.lu()``).
@@ -930,8 +1009,11 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
     field's diagonal block inside :func:`block_diag`/:func:`triangular`; a form over all fields
     preconditions the full system. With an *iterative* ``inner``, drive the outer solve with
     ``jno.solve.fgmres()`` (flexible preconditioning).
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _Form(terms, inner, quad_degree)
+    return _precision(_Form(terms, inner, quad_degree), float32)
 
 
 class _InnerSolve(_Spec):
@@ -978,7 +1060,7 @@ def _as_precond(solver, op, v, M=None):
         return solver(op, v, M=M)
 
 
-def inner(solver, *, precond=None) -> _InnerSolve:
+def inner(solver, *, precond=None, float32: bool = False) -> _InnerSolve:
     """Use a ``jno.solve`` linear solver as the preconditioner application ``M^{-1} v ≈ A^{-1} v``
     on whatever operator it is materialized against — the natural way to give a diagonal block of
     :func:`block_diag`/:func:`triangular` an (inexact) block solve, e.g.
@@ -1006,8 +1088,12 @@ def inner(solver, *, precond=None) -> _InnerSolve:
 
     Do not over-tighten it either: ``triangular``'s own note records ``tol=1e-2`` measuring 11x
     slower end-to-end than ``1e-4`` on Taylor–Hood Stokes, the outer paying more extra iterations
-    than the cheaper block solve saves."""
-    return _InnerSolve(solver, precond)
+    than the cheaper block solve saves.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
+    """
+    return _precision(_InnerSolve(solver, precond), float32)
 
 
 def _pairs_to_appliers(pairs, ctx: PrecondContext):
@@ -1152,16 +1238,20 @@ class _Triangular(_Spec):
         return f"jno.precond.triangular(<{len(self.pairs)} blocks>)"
 
 
-def block_diag(*pairs) -> _BlockDiag:
+def block_diag(*pairs, float32: bool = False) -> _BlockDiag:
     """Block-**diagonal** preconditioner over the per-field DOF blocks: each ``(field, spec)``
     pair materializes ``spec`` against that field's diagonal sub-operator (``field`` is the
     trial symbol from ``d.fem_symbols()``, or the integer block index). Cheaper per application
     than :func:`triangular` but ignores the coupling blocks — prefer :func:`triangular` for
-    saddle systems."""
-    return _BlockDiag(list(pairs))
+    saddle systems.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
+    """
+    return _precision(_BlockDiag(list(pairs)), float32)
 
 
-def triangular(*pairs) -> _Triangular:
+def triangular(*pairs, float32: bool = False) -> _Triangular:
     """Block **upper-triangular** preconditioner ``P = [[Â_1, A_12, …], [0, Â_2, …], …]`` over
     the per-field blocks — the standard shape for saddle-point systems (Stokes / Taylor–Hood,
     mixed Poisson, Biot): the last-listed block is solved first, then substituted back through
@@ -1175,8 +1265,12 @@ def triangular(*pairs) -> _Triangular:
     operator — for Stokes the classic pressure choice is the viscosity-weighted **mass matrix**
     ``form([(1/mu) * pi * qi])`` as the Schur-complement approximation; Elman, Silvester & Wathen,
     *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, §9.2). With inexact
-    (iterative) block solves the outer Krylov must be flexible: ``jno.solve.fgmres()``."""
-    return _Triangular(list(pairs))
+    (iterative) block solves the outer Krylov must be flexible: ``jno.solve.fgmres()``.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
+    """
+    return _precision(_Triangular(list(pairs)), float32)
 
 
 class _CahouetChabard(_Spec):
@@ -1351,8 +1445,9 @@ class _LSC(_Spec):
         if B is None or Bt is None or F is None:
             raise NotImplementedError(
                 "jno.precond.lsc(): the system operator is matrix-free, so the divergence and momentum "
-                "blocks cannot be extracted. Use an assembled path -- a steady linear solve, or "
-                "jno.solve.newton(direct=True)."
+                "blocks cannot be extracted. Use an assembled path -- a steady linear solve, or Newton on "
+                "the assembled tangent (jno.solve.newton(), the default, or direct=True); not "
+                "newton(direct=False)."
             )
         self._B, self._Bt, self._F = B, Bt, F
         if self._p_apply is not None:
@@ -1489,7 +1584,7 @@ class _LSC(_Spec):
         return f"jno.precond.lsc(scaled={self.scaled})"
 
 
-def lsc(*, inner=None, scaled: bool = True, velocity=None) -> _LSC:
+def lsc(*, inner=None, scaled: bool = True, velocity=None, float32: bool = False) -> _LSC:
     """**Least-squares commutator** Schur-complement approximation — the convection-aware one.
 
     ``S^-1 ~ (B M^-1 B^T)^-1 (B M^-1 F M^-1 B^T) (B M^-1 B^T)^-1``, where ``B`` is the discrete
@@ -1511,13 +1606,17 @@ def lsc(*, inner=None, scaled: bool = True, velocity=None) -> _LSC:
     whole preconditioner a fixed linear operator). ``scaled=False`` drops the mass scaling (the
     original Elman 1999 commutator) — cheaper to set up, slower to converge.
 
-    Needs an **assembled** operator: a steady linear solve, or ``jno.solve.newton(direct=True)``. A
-    matrix-free path has no blocks to slice and is refused by name. The approximation is
+    Needs an **assembled** operator: a steady linear solve, or Newton on the assembled tangent
+    (``jno.solve.newton()``, the default, or ``direct=True``). A matrix-free path
+    (``newton(direct=False)``) has no blocks to slice and is refused by name. The approximation is
     non-symmetric once convection is on, so drive it with ``gmres``/``fgmres``, not ``cg``/``minres``.
 
     Reference: Elman, Howle, Shadid, Shuttleworth & Tuminaro, *J. Comput. Phys.* **227** (2008) 1790.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _LSC(inner, scaled, velocity)
+    return _precision(_LSC(inner, scaled, velocity), float32)
 
 
 def _symbols_for_block(fem, idx, *, value_shape=(), tag="aux"):
@@ -1700,7 +1799,7 @@ class _PCD(_Spec):
         return f"jno.precond.pcd(viscosity={self.viscosity}, inflow={self.inflow!r})"
 
 
-def pcd(*, viscosity, inflow=None, velocity=None, inner=None) -> _PCD:
+def pcd(*, viscosity, inflow=None, velocity=None, inner=None, float32: bool = False) -> _PCD:
     """**Pressure convection-diffusion** Schur approximation — ``S^-1 ~ A_p^-1 F_p M_p^-1``.
 
     The convection-aware alternative to :func:`lsc`, and the stronger one on the problems it suits::
@@ -1750,8 +1849,11 @@ def pcd(*, viscosity, inflow=None, velocity=None, inner=None) -> _PCD:
 
     Reference: Kay, Loghin & Wathen, *SIAM J. Sci. Comput.* **24** (2002) 237; Elman, Silvester &
     Wathen, 2nd ed., Sec. 9.2.3 for the boundary conditions.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _PCD(viscosity, inflow, velocity, inner)
+    return _precision(_PCD(viscosity, inflow, velocity, inner), float32)
 
 
 class _Saddle(_Spec):
@@ -1850,7 +1952,9 @@ class _Saddle(_Spec):
         return f"jno.precond.saddle(mass_weight={self.mass_weight}{lw}{sc})"
 
 
-def saddle(*, mass_weight: float = 1.0, laplace_weight: float | None = None, schur: str = "mass") -> _Saddle:
+def saddle(
+    *, mass_weight: float = 1.0, laplace_weight: float | None = None, schur: str = "mass", float32: bool = False
+) -> _Saddle:
     """The standard **saddle-point** preconditioner, as one call.
 
     Composes the classical Stokes recipe over the system's own block structure -- algebraic multigrid
@@ -1946,8 +2050,11 @@ def saddle(*, mass_weight: float = 1.0, laplace_weight: float | None = None, sch
     on a very large pressure block, more than one constraint field on mixed spaces, a genuinely
     variable-coefficient Laplacian) compose :func:`triangular` directly; this is a shorthand for the
     common cases, not a replacement for it.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _Saddle(mass_weight, laplace_weight, schur)
+    return _precision(_Saddle(mass_weight, laplace_weight, schur), float32)
 
 
 class _AMG(_Spec):
@@ -1997,6 +2104,12 @@ class _AMG(_Spec):
 
         if isinstance(A, LinearOperator):
             A = A.bcoo if A.bcoo is not None else A.dense()
+        if self.float32:  # an explicit build honours the flag too: the hierarchy IS the preconditioner
+            A = (
+                LinearOperator(A).astype(_low_precision(A.dtype)).bcoo
+                if hasattr(A, "todense")
+                else A.astype(_low_precision(A.dtype))
+            )
         self._levels = build_hierarchy(
             A,
             max_levels=self.max_levels,
@@ -2031,7 +2144,9 @@ class _AMG(_Spec):
         return f"jno.precond.amg(cycles={self.cycles}, built={self._levels is not None})"
 
 
-def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smoother_degree: int = 3) -> _AMG:
+def amg(
+    *, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smoother_degree: int = 3, float32: bool = False
+) -> _AMG:
     """Hybrid **algebraic multigrid**: smoothed-aggregation setup by the optional ``pyamg``
     (Vaněk, Mandel & Brezina, Computing 56, 1996; Bell et al., JOSS 8(87):5495, 2023), applied as
     a pure-JAX V-cycle with Chebyshev polynomial smoothing (Adams et al., JCP 188, 2003) — see
@@ -2051,8 +2166,11 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
     preconditioner while values drift: speed degrades gracefully, correctness never). pyamg is
     imported lazily — without it a clear ``ImportError`` explains the install. On a matvec-only
     sub-block the matrix is recovered via the (dense) block view.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _AMG(cycles, max_levels, coarse_size, smoother_degree)
+    return _precision(_AMG(cycles, max_levels, coarse_size, smoother_degree), float32)
 
 
 def _fem_concrete_operator(fem):
@@ -2489,7 +2607,7 @@ class _AMS(_Spec):
         return f"jno.precond.ams(aux={self.aux!r})"
 
 
-def ams(*, aux=None) -> _AMS:
+def ams(*, aux=None, float32: bool = False) -> _AMS:
     """**AMS** — the auxiliary-space Maxwell preconditioner for H(curl) (Nédélec/N1E) curl-curl
     systems (Hiptmair & Xu, *SIAM J. Numer. Anal.* 45(6):2483, 2007; Kolev & Vassilevski,
     *J. Comput. Math.* 27(5):604, 2009).
@@ -2558,8 +2676,11 @@ def ams(*, aux=None) -> _AMS:
       ``GᵀAG`` invertible. The spec raises if that term is missing.
     * ``G``/``Π`` are built from the **full** edge topology, so this targets weak/penalty (PEC-style)
       boundary terms; Dirichlet-**eliminated** DOFs would need row-masking — out of scope here.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _AMS(aux)
+    return _precision(_AMS(aux), float32)
 
 
 class _JaxAMG(_Spec):
@@ -2599,7 +2720,7 @@ class _JaxAMG(_Spec):
         return f"jno.precond.jaxamg(symmetric={self.symmetric})"
 
 
-def jaxamg(*, config: "dict | None" = None, symmetric: bool = True) -> _JaxAMG:
+def jaxamg(*, config: "dict | None" = None, symmetric: bool = True, float32: bool = False) -> _JaxAMG:
     """GPU AMG **preconditioner** via jaxamg (NVIDIA AmgX wrapped as a JAX primitive) — the
     on-device counterpart of :func:`amg`, and the natural smoother for large elliptic blocks or the
     auxiliary nodal solves of an H(curl) AMS preconditioner on the GPU.
@@ -2621,8 +2742,11 @@ def jaxamg(*, config: "dict | None" = None, symmetric: bool = True) -> _JaxAMG:
 
     Reference: Liu, Fan & Wang, arXiv:2606.09001 (2026), wrapping NVIDIA AmgX (Naumov et al.,
     *SIAM J. Sci. Comput.* 37(5), 2015).
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _JaxAMG(config, symmetric)
+    return _precision(_JaxAMG(config, symmetric), float32)
 
 
 _MISS = object()  # sentinel so the first materialize always builds
@@ -2743,7 +2867,328 @@ def cached(spec, *, refresh=False):
     return _Cached(spec, refresh)
 
 
-def nystrom(*, rank: int = 20, mu: float | None = None, seed: int = 0) -> _Nystrom:
+class _FSAI(_Spec):
+    """Spec for the factored sparse approximate inverse; see :func:`fsai`.
+
+    The symbolic phase (pattern, row groups) depends only on the sparsity pattern, so once built it is kept
+    and the spec becomes ``traceable``: every later materialisation -- including inside a compiled solve, a
+    Newton loop or a time march, where the operator is a tracer -- recomputes only the numeric factor from
+    the operator's current values.
+    """
+
+    def __init__(self, power):
+        self.power = power
+        self._pattern = None
+
+    @property
+    def traceable(self):  # once the pattern exists, the numeric phase is pure JAX
+        return self._pattern is not None
+
+    @property
+    def key(self):
+        return None if self._pattern is None else (type(self), id(self._pattern), self.power)
+
+    def build(self, A) -> "_FSAI":
+        """Eager symbolic setup from a **concrete** operator (BCOO / dense / ``LinearOperator``). Needed
+        before a first use inside a trace; any operator with the same sparsity pattern reuses it."""
+        from .utils.solver.fsai import fsai_pattern
+        from .utils.solver.solver_api import LinearOperator
+
+        if isinstance(A, LinearOperator):
+            A = A.bcoo if A.bcoo is not None else A.dense()
+        with jax.ensure_compile_time_eval():  # concrete tables even when built from inside a trace (see _Schwarz)
+            self._pattern = fsai_pattern(A, power=self.power)
+        return self
+
+    def prepare(self, fem):
+        """Build from the problem's assembled operator when there is a concrete one to read the pattern
+        from, so that a solve whose operator arrives traced (Newton, a march) can use it."""
+        if self._pattern is not None or fem is None:
+            return
+        A = _representative_operator(fem)
+        if A is not None:
+            self.build(A)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.fsai import fsai_apply, fsai_factor
+
+        A = ctx.A.bcoo
+        if A is None:
+            raise TypeError(
+                "jno.precond.fsai() needs the ASSEMBLED operator (its rows), but this solve only has a "
+                "matvec. Use an assembled path (the default Newton assembles its tangent), or "
+                "jno.precond.chebyshev() / nystrom(), which need only products."
+            )
+        if self._pattern is None:
+            if isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+                raise TypeError(
+                    "jno.precond.fsai(): the operator arrived traced and no pattern was built yet. Build it "
+                    "eagerly from a representative operator: spec = jno.precond.fsai(); spec.build(fem.A)."
+                )
+            self.build(A)
+        g = fsai_factor(self._pattern, A)
+        return PrecondApplier(fsai_apply(self._pattern, g))
+
+    def __repr__(self):
+        return f"jno.precond.fsai(power={self.power}, built={self._pattern is not None})"
+
+
+def _representative_operator(fem):
+    """A concrete assembled matrix with the problem's sparsity pattern, or None: the steady linear operator,
+    a transient block's step pattern (M and A together), or the Newton tangent at zero."""
+    import jax.experimental.sparse as jsp
+
+    hook = getattr(fem, "_representative_operator", None)  # a problem that says it itself (jno.fdm)
+    if callable(hook):
+        return hook()
+    op = getattr(fem, "_op", None)
+    if isinstance(op, tuple) and hasattr(op[0], "todense"):
+        return op[0]
+    M, A = getattr(op, "M", None), getattr(op, "A", None)
+    if hasattr(M, "todense") and hasattr(A, "todense"):
+        return jsp.BCOO((jnp.concatenate([M.data, A.data]), jnp.concatenate([M.indices, A.indices])), shape=M.shape)
+    jac, size = getattr(op, "jacobian", None), getattr(op, "size", None)
+    if callable(jac) and size is not None:
+        try:
+            J = jac(jnp.zeros((int(size),)), {})
+        except TypeError:
+            return None  # a parametric / transient signature this probe does not know; build on first use
+        return J if hasattr(J, "todense") else None
+    return None
+
+
+class _Schwarz(_Spec):
+    """Spec for the algebraic overlapping Schwarz preconditioner; see :func:`schwarz`."""
+
+    #: Distributes itself in a sharded solve: its subdomains are partitioned over the device mesh.
+    shardable = True
+
+    def __init__(self, parts, overlap, coarse, restricted, nullspace):
+        self.parts, self.overlap, self.coarse, self.restricted = parts, overlap, coarse, restricted
+        self.nullspace = nullspace
+        self._pattern = None
+
+    @property
+    def traceable(self):
+        return self._pattern is not None
+
+    @property
+    def key(self):
+        return None if self._pattern is None else (type(self), id(self._pattern), self.coarse, self.restricted)
+
+    def build(self, A, fem=None) -> "_Schwarz":
+        """Eager symbolic setup (partition, overlap, index tables) from a CONCRETE operator; any operator with
+        the same sparsity pattern reuses it. ``fem`` is needed for ``nullspace="rigid"`` (it holds the DOF
+        coordinates and the field layout)."""
+        from .utils.solver.schwarz import schwarz_pattern
+        from .utils.solver.solver_api import LinearOperator
+
+        if isinstance(A, LinearOperator):
+            A = A.bcoo if A.bcoo is not None else A.dense()
+        n = int(A.shape[0])
+        parts = self.parts
+        if parts is None:
+            # ~256 unknowns per part, rounded up to whole blocks per device (unchanged on one device).
+            ndev = jax.device_count()
+            parts = -(-max(1, -(-n // 256)) // ndev) * ndev
+        null = self.nullspace
+        if isinstance(null, str):
+            if null != "rigid":
+                raise ValueError(f"jno.precond.schwarz(nullspace={null!r}): must be 'rigid', an (n, k) array or None.")
+            if fem is None:
+                raise ValueError(
+                    "jno.precond.schwarz(nullspace='rigid') builds its modes from the problem's DOF coordinates: "
+                    "pass it through fem.solve(precond=...), or call spec.build(A, fem=fem)."
+                )
+            null = _near_null_space(fem, n)
+        # Host-side, and CONCRETE even when asked from inside a trace (a jno.core step preparing the solve): a
+        # dtype conversion there would be staged, and the cached index tables would be that trace's tracers.
+        with jax.ensure_compile_time_eval():
+            pat = schwarz_pattern(A, parts=parts, overlap=self.overlap, nullspace=null)
+        need = pat.p * pat.m * pat.m * jnp.dtype(A.dtype).itemsize
+        dev = jax.devices()[0]
+        cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
+        if cap and need > 0.25 * cap:
+            raise ValueError(
+                f"jno.precond.schwarz(parts={pat.p}, overlap={self.overlap}): the local problems are solved "
+                f"exactly with dense inverses, {pat.p} blocks of {pat.m}x{pat.m} = {need / 2**30:.1f} GiB -- over a "
+                f"quarter of this device's memory. Use more parts (smaller blocks), overlap=0/1, or float32=True."
+            )
+        self._pattern = pat
+        return self
+
+    def prepare(self, fem):
+        if self._pattern is None and fem is not None:
+            A = _representative_operator(fem)
+            if A is not None:
+                self.build(A, fem)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.schwarz import schwarz_apply, schwarz_factor
+
+        A = ctx.A.bcoo
+        if A is None:
+            raise TypeError(
+                "jno.precond.schwarz() needs the ASSEMBLED operator (its graph and entries), but this solve only "
+                "has a matvec. Use an assembled path, or jno.precond.chebyshev() / nystrom()."
+            )
+        if self._pattern is None:
+            if isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+                raise TypeError(
+                    "jno.precond.schwarz(): the operator arrived traced and no partition was built yet. Build it "
+                    "eagerly: spec = jno.precond.schwarz(); spec.build(fem.A)."
+                )
+            self.build(A, ctx.fem)
+        factors = schwarz_factor(self._pattern, A, coarse=self.coarse, mesh=getattr(ctx, "mesh", None))
+        fwd = schwarz_apply(self._pattern, factors, restricted=self.restricted, mv=ctx.A.mv if self.coarse else None)
+        applier = PrecondApplier(fwd)
+        applier.nonsymmetric = self.restricted
+        return applier
+
+    def __repr__(self):
+        return (
+            f"jno.precond.schwarz(parts={self.parts}, overlap={self.overlap}, coarse={self.coarse}, "
+            f"restricted={self.restricted}, built={self._pattern is not None})"
+        )
+
+
+def _dof_layout(fem, n):
+    """Per field block: ``(points (nodes, dim), index (nodes, n_components))``, the DOF of component ``c`` at
+    node ``i``. A problem may state it (``_dof_layout()``, jno.fdm: one block per component); a FEM problem's
+    blocks are node-major with the components interleaved."""
+    import numpy as np
+
+    hook = getattr(fem, "_dof_layout", None)
+    if callable(hook):
+        return hook()
+    pts_all = [np.asarray(p) for p in (getattr(fem, "field_points", None) or [])]
+    blocks = getattr(fem, "blocks", None) or [slice(0, n)]
+    if len(pts_all) != len(blocks):
+        raise ValueError(
+            "jno.precond.schwarz(nullspace='rigid'): the problem's field coordinates do not line up with its "
+            "field blocks; pass the near-null space explicitly as an (n, k) array."
+        )
+    out = []
+    for pts, blk in zip(pts_all, blocks):
+        size, nodes = blk.stop - blk.start, pts.shape[0]
+        vec = size // max(nodes, 1)
+        if vec * nodes != size:
+            raise ValueError(
+                f"jno.precond.schwarz(nullspace='rigid'): a field block of {size} unknowns on {nodes} nodes is not "
+                "node-major with a whole number of components; pass the near-null space explicitly."
+            )
+        out.append((pts, blk.start + np.arange(nodes)[:, None] * vec + np.arange(vec)[None, :]))
+    return out
+
+
+def _near_null_space(fem, n):
+    """Per field: RIGID-BODY modes for a field with as many components as the space has dimensions (a
+    displacement: translations and infinitesimal rotations), else one constant per component. The kernel of the
+    unconstrained operator for elasticity, and of any diffusion-type block -- what a coarse space must represent
+    for the iteration count to stay independent of the number of parts."""
+    import numpy as np
+
+    cols = []
+    for pts, idx in _dof_layout(fem, n):
+        vec, dim = idx.shape[1], pts.shape[1]
+        modes = []
+        for c in range(vec):  # translations / constants
+            m = np.zeros(idx.shape)
+            m[:, c] = 1.0
+            modes.append(m)
+        if vec == dim and dim in (2, 3):  # infinitesimal rotations x -> w x (x - x0)
+            x = pts - pts.mean(axis=0)
+            for i, j in [(0, 1)] if dim == 2 else [(0, 1), (1, 2), (0, 2)]:
+                m = np.zeros(idx.shape)
+                m[:, i], m[:, j] = -x[:, j], x[:, i]
+                modes.append(m)
+        for m in modes:
+            col = np.zeros(n)
+            col[idx.reshape(-1)] = m.reshape(-1)
+            cols.append(col)
+    return np.stack(cols, axis=1)
+
+
+def schwarz(
+    *,
+    parts: int | None = None,
+    overlap: int = 1,
+    coarse: bool = True,
+    restricted: bool = False,
+    nullspace=None,
+    float32: bool = False,
+) -> _Schwarz:
+    """**Overlapping Schwarz** domain decomposition, algebraic: built from the assembled operator alone, so it
+    applies to any FEM/FDM system (Toselli & Widlund, *Domain Decomposition Methods*, 2005; restricted variant:
+    Cai & Sarkis, SIAM J. Sci. Comput. 21(2), 1999; coarse space: Nicolaides, SIAM J. Numer. Anal. 24(2), 1987).
+
+    The unknowns are split into ``parts`` pieces by METIS on the operator's graph (default: one
+    part per ~256 unknowns, rounded up to a multiple of the device count), each grown by ``overlap`` layers of
+    neighbours; every local problem is solved exactly (the local inverses, applied as one batched product).
+    Unknowns with no neighbours (eliminated Dirichlet rows) are left out of the partition and solved by their
+    diagonal. The partition needs METIS: ``pip install "jax-numerical-operators[fem]"`` (or ``[fdm]``,
+    or ``[metis]``); without it, building the preconditioner raises an ``ImportError`` saying so. ``coarse=True`` adds the two-level coarse correction (one constant per part,
+    applied in the balanced hybrid form), which is what keeps the iteration count from growing with the number
+    of parts. ``restricted=True`` is RAS -- usually fewer iterations, but non-symmetric (use bicgstab/gmres;
+    ``cg`` switches to flexible CG); the default is the symmetric additive form, fit for ``cg``.
+
+    ``nullspace`` sets what the coarse space carries per part: ``None`` one constant (Nicolaides); ``"rigid"``
+    the near-null space built from the problem -- rigid-body modes for a displacement-like field (as many
+    components as dimensions), one constant per component otherwise -- which is what elasticity needs; or an
+    explicit ``(n, k)`` array.
+
+    Works best for elliptic, positive-definite problems (diffusion, elasticity, implicit time steps); indefinite
+    problems (Helmholtz, saddle points as a whole) are outside what Schwarz handles robustly.
+
+    **Several devices** (``fem.solve(shard=...)``, concrete or traced operator): the subdomains are split into
+    one block per device; each device builds, inverts and applies only its own, and their contributions are
+    combined by an all-reduce of an n-vector (three per application in the two-level form). The coarse matrix
+    and the vectors are replicated. Two caveats: the numeric setup gathers the operator's pattern keys and
+    values onto every device, once per factorisation (O(nnz) there, transiently -- the O(parts * m^2) local
+    matrices are what gets split); and a ``parts`` that is not a multiple of the device count leaves padded,
+    idle block slots on some devices. Verified on simulated CPU devices (placement and answers), not timed on
+    real multi-GPU hardware. On ONE GPU it is slower than ``amg``.
+    """
+    if parts is not None and (isinstance(parts, bool) or not isinstance(parts, int) or parts < 1):
+        raise ValueError(f"jno.precond.schwarz(parts={parts!r}): must be a positive int or None.")
+    if isinstance(overlap, bool) or not isinstance(overlap, int) or overlap < 0:
+        raise ValueError(f"jno.precond.schwarz(overlap={overlap!r}): must be an int >= 0.")
+    return _precision(_Schwarz(parts, overlap, bool(coarse), bool(restricted), nullspace), float32)
+
+
+def fsai(*, power: int = 1, float32: bool = False) -> _FSAI:
+    """**Factored sparse approximate inverse** for SPD operators: ``M^{-1} = G^T G ~ A^{-1}`` with ``G``
+    lower triangular on the pattern of ``tril(A^power)`` (Kolotilina & Yeremin, SIAM J. Matrix Anal. Appl.
+    14(1), 1993).
+
+    The rung between ``jacobi`` and multigrid for a GPU: *applying* it is two sparse products -- no
+    triangular solves, no sequential sweep (unlike ILU / incomplete Cholesky) -- and the setup is a batch of
+    small independent dense Cholesky solves, one per row, so it runs in JAX, under ``jit`` and on GPU.
+    ``power=2`` uses the pattern of ``A^2``: a denser, stronger factor for a costlier setup and apply.
+
+    The pattern is computed once (host, from a concrete operator) and reused; the numeric factor follows the
+    operator's current values, so it works for a Newton tangent or a time step whose values change. An
+    operator whose sparsity changes after the build is detected and makes the solve fail loudly (NaN).
+
+    **SPD only**: a non-symmetric operator is refused; an indefinite one fails its local Cholesky (NaN).
+    Needs x64 and an assembled operator (not a matvec-only one).
+
+    Cost, measured with CG to 1e-8 on an RTX 3070 (float64): 3-D P1 Poisson (303k unknowns) 89 iterations /
+    58 ms against Jacobi's 216 / 76 ms; 3-D P2 (142k) 82 / 39 ms against 197 / 58 ms; 3-D elasticity (206k)
+    325 / 387 ms against 778 / 588 ms. The numeric setup costs about one to two solves (101, 115, 530 ms
+    there), so it pays when the factor is REUSED: a constant-operator time march (built once), ``.cached()``
+    across solves, or several right-hand sides. ``power=2`` grows the setup steeply with the row width
+    (7.1 s on the P2 case for 32 iterations) -- try ``power=1`` first.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
+    """
+    if isinstance(power, bool) or not isinstance(power, int) or power < 1:
+        raise ValueError(f"jno.precond.fsai(power={power!r}): power must be an int >= 1.")
+    return _precision(_FSAI(power), float32)
+
+
+def nystrom(*, rank: int = 20, mu: float | None = None, seed: int = 0, float32: bool = False) -> _Nystrom:
     r"""Randomized **Nyström** low-rank preconditioner for SPD operators — the rung between
     ``jacobi`` and a multilevel method.
 
@@ -2765,8 +3210,11 @@ def nystrom(*, rank: int = 20, mu: float | None = None, seed: int = 0) -> _Nystr
     **SPD only.** The sketch takes a Cholesky of ``Omega^T A Omega``, so a non-symmetric or
     indefinite operator will produce NaNs rather than a wrong answer quietly — use ``jacobi`` or
     ``chebyshev`` for those.
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _Nystrom(rank, mu, seed)
+    return _precision(_Nystrom(rank, mu, seed), float32)
 
 
 def chebyshev(
@@ -2777,6 +3225,7 @@ def chebyshev(
     lmin_ratio: float = 1.0 / 30.0,
     safety: float = 1.05,
     bound_iters: int = 30,
+    float32: bool = False,
 ) -> _Chebyshev:
     """Fixed-degree Chebyshev **polynomial** preconditioner ``M^{-1} = p_degree(A) ≈ A^{-1}``
     for SPD operators (Saad 2003, §12.3 / Golub & Varga 1961 — the same recurrence as
@@ -2794,5 +3243,8 @@ def chebyshev(
     eigenvalue, leaves the lowest modes outside that interval where the polynomial amplifies them
     instead of damping. Without the optional :mod:`matfree` package the guess is still the
     fallback (``lmin_ratio`` then applies).
+
+    ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
+    double -- see :func:`_materialize_in_float32`.
     """
-    return _Chebyshev(degree, lmin, lmax, lmin_ratio, safety, bound_iters)
+    return _precision(_Chebyshev(degree, lmin, lmax, lmin_ratio, safety, bound_iters), float32)

@@ -223,6 +223,8 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.block_diag((field, spec), …)` | per-field composition over `fem.blocks` (also `triangular`) | multifield problems |
 | `jno.precond.saddle(mass_weight=…, laplace_weight=…)` | the standard saddle recipe as **one call** | Stokes / Biot — the common case |
 | `jno.precond.lsc()` / `saddle(schur="lsc")` | least-squares commutator — the **convection-aware** Schur factor | Navier–Stokes, where the pressure-mass recipe degrades with Re |
+| `jno.precond.fsai(power=…)` | factored sparse approximate inverse `M⁻¹ = GᵀG` — two sparse products, no triangular solves | **SPD only** — the rung between `jacobi` and multigrid, when the factor is reused ([below](#fsai-jnoprecondfsai)) |
+| `jno.precond.schwarz(parts=…)` | algebraic overlapping Schwarz (domain decomposition), two-level | SPD elliptic systems split across **several devices**; elasticity with `nullspace="rigid"` ([below](#overlapping-schwarz-jnoprecondschwarz)) |
 | `jno.precond.amg(cycles=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `.cached(refresh=…)` | reuse an expensive setup across solves | Newton loops and transients, where the operator barely changes between solves |
@@ -591,6 +593,129 @@ such a menu are things you can write.
                   precond=jno.precond.saddle(mass_weight=1.0/mu, laplace_weight=1.0/alpha))
     ```
 
+### Single precision inside a double solve — `float32=True`
+
+Every `jno.precond` constructor takes `float32=False`. With `True`, the preconditioner is built against a
+single-precision copy of the operator and applied in single precision, while the Krylov solve — its
+residual, its dot products and its convergence test — stays in double. The answer meets the same
+tolerance; only the preconditioner's arithmetic is cheaper.
+
+```python
+fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.amg(float32=True))
+```
+
+A single-precision preconditioner is only approximately symmetric, and standard preconditioned CG
+relies on exact symmetry: it lost conjugacy and stopped at a *true* residual of 6e-6 against a requested
+1e-8 (float32 FSAI, 3-D elasticity), silently. `jno.solve.cg` therefore switches to **flexible CG**
+(Notay, SIAM J. Sci. Comput. 22(4), 2000) whenever the preconditioner is `float32` (or non-symmetric),
+which keeps the requested accuracy.
+
+!!! measured "CG to 1e-8, preconditioner in float32 vs float64 (RTX 3070)"
+    Measured on 3-D P1 (303k), P2 (142k) and elasticity (206k) operators:
+
+    - `amg`: 1.49×, 1.55×, 1.2–1.3×
+    - `chebyshev`: 1.8–3.0×
+    - `fsai`: 1.1–1.2×
+    - `jacobi`: 1.0× — a single scale, nothing to save
+
+    The gain is memory bandwidth: it is largest where the preconditioner dominates the iteration.
+    One device, one precision pair — measure on yours.
+
+### FSAI — `jno.precond.fsai()`
+
+A factored sparse approximate inverse for **SPD** operators: `M⁻¹ = GᵀG ≈ A⁻¹`, with `G` lower
+triangular on the pattern of `tril(A)` (or `tril(A²)` with `power=2`) and each row a small independent
+dense solve (Kolotilina & Yeremin, SIAM J. Matrix Anal. Appl. 14(1), 1993). Applying it is two sparse
+products — no triangular solves and no sequential sweep, unlike ILU — so it runs well on a GPU.
+
+The pattern is computed once on the host; the numeric factor follows the operator's current values
+inside a compiled solve, a Newton loop or a march. A non-symmetric operator is refused, and a changed
+sparsity pattern poisons the factor with NaN rather than applying a stale one.
+
+!!! measured "CG to 1e-8, RTX 3070, float64"
+    | | 3-D P1, 303k | 3-D P2, 142k | 3-D elasticity, 206k |
+    |---|---|---|---|
+    | `jacobi` | 216 its / 76 ms | 197 its / 58 ms | 778 its / 588 ms |
+    | `fsai` | 89 its / 58 ms | 82 its / 39 ms | 325 its / 387 ms |
+    | `amg` | 48 ms | 52 ms | |
+
+    The setup costs about one to two solves (101, 115, 530 ms there), so FSAI pays when the factor is
+    **reused**: a constant-operator march, `.cached()` across solves, several right-hand sides.
+    `power=2` grows the setup steeply (7.1 s on the P2 case, for 32 iterations) — start with `power=1`.
+
+### Overlapping Schwarz — `jno.precond.schwarz()`
+
+Domain decomposition as a **preconditioner**, built from the assembled operator alone: no mesh, no
+physics, so any FEM or FDM system qualifies. (This is not the multi-method coupling of
+[Domain decomposition](domain-decomposition.md), which couples *different solvers* on different regions.)
+
+1. **Partition.** METIS splits the operator's graph into `parts` compact pieces with a minimal cut
+   (default: one per ~256 unknowns). Unknowns with no neighbours — eliminated Dirichlet rows — are left
+   out and solved by their diagonal.
+2. **Overlap.** Each piece grows by `overlap` layers of graph neighbours (default 1).
+3. **Local solves.** Each subdomain's matrix is `A` restricted to its unknowns (a zero-Dirichlet problem on
+   its grown boundary). All of them are solved exactly and together, as one batched product with their
+   inverses. The results are added back, summing where subdomains overlap.
+4. **Coarse correction** (`coarse=True`, the default). One small global problem with a few unknowns per
+   subdomain carries information across the whole domain in one step. Without it, the iteration count
+   grows with the number of parts; with it, it stays flat.
+
+```python
+fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz())
+fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(nullspace="rigid"))  # elasticity
+fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(), shard=4)          # 4 devices
+```
+
+On `jno.fdm` it composes the same way, on the operator FDM assembles for the slots
+([FDM solver slots](fdm.md#solver-slots-linear-and-precond)), including inside a `jno.core` training step
+and for vector unknowns with `nullspace="rigid"`:
+
+```python
+jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
+```
+
+| Argument | Meaning |
+|---|---|
+| `parts` | number of subdomains; default ~256 unknowns each, rounded up to a multiple of the device count |
+| `overlap` | layers of neighbours each subdomain grows by |
+| `coarse` | two-level (default) or one-level |
+| `restricted` | RAS (Cai & Sarkis 1999): usually fewer iterations but **non-symmetric** — `cg` then runs flexible CG |
+| `nullspace` | what the coarse space carries per subdomain: `None` one constant (Nicolaides 1987); `"rigid"` the rigid-body modes of a displacement field (translations + rotations), which elasticity needs; or an explicit `(n, k)` array |
+| `float32` | [single-precision application](#single-precision-inside-a-double-solve-float32true) |
+
+!!! measured "CG to 1e-8, two-level, RTX 3070 — iterations at 64 / 256 parts"
+    | Problem | Iterations | Solve |
+    |---|---|---|
+    | 2-D Poisson, 11.8k | 50 / 43 | 32 / 24 ms |
+    | 2-D cantilever, `nullspace="rigid"` | 57 / 41 | 44 / 55 ms |
+    | 3-D Poisson, 18.9k | 37 / 34 | 130 / 63 ms |
+
+    On the cantilever the coarse space decides the scaling: at 16 / 64 / 256 parts, one constant per part
+    needs 154 / 207 / 256 iterations, the rigid-body modes 103 / 90 / 56.
+
+    On **one** GPU it is slower than `amg` (2-D Poisson 11.8k, 256 parts: 43 its / 24 ms against `amg`'s
+    12 its / 3.6 ms). Its value is placement across devices.
+
+**Several devices** (`fem.solve(shard=…)`, a concrete or a traced operator): the subdomains are split
+into one block per device. Each device builds, inverts and applies only its own, and their contributions
+are combined by an all-reduce of an n-vector (three per application in the two-level form). The coarse
+matrix and the vectors stay replicated. Two limits:
+
+- The numeric setup gathers the operator's pattern and values onto every device, once per
+  factorisation (O(nnz) there, transiently). The O(parts · m²) local matrices are what gets split.
+- Verified on simulated CPU devices (per-device block counts in the compiled program, the all-reduce,
+  answers and a gradient through the traced route on 1, 2 and 4 devices). **Not timed on multi-GPU
+  hardware.**
+
+**Scope.** Schwarz suits elliptic, positive-definite systems: diffusion, elasticity, implicit time steps.
+Indefinite problems (Helmholtz, a saddle point taken as a whole) are outside what it handles robustly.
+It needs x64 and an assembled operator, and METIS: `pip install "jax-numerical-operators[fem]"` (or
+`[fdm]`, or `[metis]`).
+
+References: Toselli & Widlund, *Domain Decomposition Methods*, Springer 2005; Karypis & Kumar, SIAM J.
+Sci. Comput. 20(1), 1998 (METIS); Vaněk, Mandel & Brezina, Computing 56, 1996 (rigid-body near-null
+space).
+
 ## Nonlinear drivers
 
 ### Picard / lagged coefficients — `jno.lag`
@@ -611,6 +736,26 @@ its symmetry/definiteness); the converged solution is identical to full Newton's
 marker, `picard(damping=…)` is exactly damped Newton (`jno.solve.newton(damping=…)`). Caveat for inverse
 problems: implicit differentiation then also uses the lagged Jacobian — drop `lag` when exact parameter
 gradients matter more than per-step solvability.
+
+#### Anderson acceleration — `picard(anderson=m)`, `staggered(anderson=m)`
+
+A fixed-point loop converges only linearly, and slowly when the lagged coupling is strong. `anderson=m`
+mixes the last `m` iterates into each new one (type-II Anderson acceleration, Walker & Ni, SIAM J. Numer.
+Anal. 49(4), 2011). It is safeguarded: a mixed step that does not decrease the residual retreats toward
+the plain iterate, so it is never worse than `anderson=0`, the default. Gradients are unchanged, since
+the converged point is still differentiated through `custom_root`.
+
+```python
+sol = fem.solve(nonlinear=jno.solve.picard(anderson=5))
+sol = fem.solve(nonlinear=jno.solve.staggered([u, d], anderson=5))
+```
+
+!!! measured "`-∇·((1 + c u²)∇u) = f`, lagged coefficient, Picard steps to rtol 1e-8"
+    | `c` | `picard()` | `picard(anderson=5)` |
+    |---|---|---|
+    | 5 | 33 | 11 |
+    | 20 | fails in 400 steps | 14 |
+    | 50 | fails in 400 steps | 20 |
 
 ### Alternate minimization — `jno.solve.staggered([u, d])` / `staggered([[v, p], [T]])`
  Some coupled energies are **non-convex in
@@ -1077,6 +1222,8 @@ The same flag exists on `jno.core(...).solve(profile=True)` (see
 | `jno.solve.theta(1.0)` | 1 | L-stable | the default — robust, damps everything |
 | `jno.solve.theta(0.5)` | 2 | A-stable only | smooth problems; **rings** on stiff modes |
 | `jno.solve.bdf2()` | 2 | **L-stable** | stiff / saddle-point systems — flow's workhorse |
+| `jno.solve.sdirk(order=2\|3)` | 2 or 3 | **L-stable**, stiffly accurate | higher order where BDF2 is not enough; state-dependent mass allowed |
+| `jno.solve.rosenbrock("ros34pw2"\|"ros2")` | 3 or 2 | **L-stable** | nonlinear blocks **without Newton**: one linear solve per stage |
 | `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks |
 | `…​.adaptive(rtol=…)` | wraps a one-step scheme | — | multi-rate transients |
 
@@ -1098,6 +1245,31 @@ A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
 it is not the conservative form an enthalpy mass `H(u)_t` would want. Refused loudly rather than
 mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not damped),
 and `.adaptive()` (step doubling sizes a one-step method).
+
+### Higher order — `sdirk` and `rosenbrock`
+
+`jno.solve.sdirk(order=3)` is Alexander's 3-stage, order-3 SDIRK method (order 2: 2 stages; SIAM J.
+Numer. Anal. 14(6), 1977). Each stage is one backward-Euler step of size `γ·dt` from a shifted start
+state, so everything the default step does carries over: Dirichlet and zero-mass rows, solver slots,
+Newton on a nonlinear block, the complex path. All stages share one step operator, so a constant one is
+built and preconditioned once. A state-dependent mass `c(u)·u_t` is integrated at full order in its
+non-conservative form.
+
+`jno.solve.rosenbrock()` is linearly implicit: every stage is **one linear solve** with the same matrix
+`W = M + γh·J`, `J` the tangent at the step's start — no Newton loop on a nonlinear block. The default
+`"ros34pw2"` (Rang & Angermann, BIT 45, 2005) is order 3, stiffly accurate and consistent for index-1
+DAEs; `"ros2"` (Verwer et al., SIAM J. Sci. Comput. 20(4), 1999) is order 2. Time-varying Dirichlet data
+is exact. It refuses a time-, parameter- or state-dependent mass (use `sdirk` or `bdf2`).
+
+```python
+sol = fem.solve(time=jno.solve.sdirk(order=3))
+sol = fem.solve(time=jno.solve.rosenbrock())                 # ros34pw2
+sol = fem.solve(time=jno.solve.rosenbrock().adaptive(rtol=1e-4))
+```
+
+Both expose a stepper, so `.adaptive()` works, and both refuse second-order-in-time (`u_tt`) blocks.
+On a nonlinear heat problem, ROS34PW2 reached a given accuracy in the least wall time of the schemes
+compared (θ, BDF2, SDIRK, ROS2). Time-to-accuracy depends on the problem, so compare on yours.
 
  The slots configure the *per-step* solves of the default theta-method integrator:
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is

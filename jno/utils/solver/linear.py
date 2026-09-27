@@ -110,6 +110,65 @@ def matrix_diagonal(A):
     return jnp.diagonal(jnp.asarray(A))
 
 
+def sparse_matvec(A, *, transpose: bool = False):
+    """``v -> A @ v`` (or ``A^T @ v``) with the BCOO index work done ONCE, for use inside a solver loop.
+
+    The storage it applies is chosen per operator by :mod:`jno.utils.solver.matvec_format`: cuSPARSE
+    CSR or the split COO below, whichever MEASURES faster on this device for this operator (override:
+    ``jno.setup(matvec_format=...)``). The COO side:
+
+    ``BCOO @ v`` is not only a gather and a scatter-add: each call first splits ``indices`` into its
+    row and column arrays, wraps negative indices and bounds-checks them -- a separate kernel as large
+    as the operator. XLA does not hoist that kernel out of a ``while_loop``, so an iterative solve pays
+    it on every matvec. Measured in a fixed-iteration CG loop (RTX 3070, JAX 0.10.2, float64, 1M-row
+    2-D P1 pattern): it is 150-210 us of an 844 us iteration. Splitting once here and applying
+    ``zeros.at[rows].add(data * v[cols])`` gives 630 -> 352 us per matvec and 844 -> 565 us per CG
+    iteration, within 7 % of cuSPARSE CSR (526 us) while keeping ``vmap``/``jacfwd`` (CSR's matvec has
+    no batching rule).
+
+    Call it OUTSIDE the loop and hand the returned closure to the solver: the split happens where this
+    is called. The map is exactly BCOO's -- duplicates are summed, and out-of-bound (padding) triplets
+    contribute nothing, because the gather fills with zero and the scatter drops. It is reverse- and
+    forward-mode differentiable in both ``A.data`` and ``v`` and batches under ``vmap``.
+
+    Only a plain 2-D BCOO (``n_batch == n_dense == 0``) is rewritten; anything else -- a dense array, a
+    batched BCOO, a jNO ``LinearOperator`` -- falls back to its own ``@`` unchanged. Do not pass
+    ``indices_are_sorted=True`` to the scatter here: XLA's sorted-scatter path measured 4-7x SLOWER.
+    """
+    if not _plain_bcoo(A):
+        if transpose:
+            return lambda v: v @ A if jnp.ndim(v) == 1 else (v.T @ A).T
+        return lambda v: A @ v
+    from . import matvec_format
+
+    if matvec_format.choose(A) == "csr":
+        return matvec_format.csr_matvec(matvec_format.csr_parts(A), tuple(A.shape), transpose)
+    return _split_coo_matvec(A, transpose)
+
+
+def _split_coo_matvec(A, transpose: bool = False):
+    """The COO side of :func:`sparse_matvec`: row/column split once, gather + scatter-add per product."""
+    idx, data = A.indices, A.data
+    out_idx, in_idx = (idx[:, 1], idx[:, 0]) if transpose else (idx[:, 0], idx[:, 1])
+    n_out = A.shape[1] if transpose else A.shape[0]
+
+    def mv(v):
+        v = jnp.asarray(v)
+        gathered = v.at[in_idx].get(mode="fill", fill_value=0)
+        prod = data.reshape(data.shape + (1,) * (v.ndim - 1)) * gathered
+        return jnp.zeros((n_out,) + v.shape[1:], prod.dtype).at[out_idx].add(prod, mode="drop")
+
+    return mv
+
+
+def _plain_bcoo(A) -> bool:
+    try:
+        import jax.experimental.sparse as jsp
+    except ImportError:  # pragma: no cover - jax always ships it
+        return False
+    return isinstance(A, jsp.BCOO) and A.n_batch == 0 and A.n_dense == 0 and A.ndim == 2
+
+
 def jacobi(A):
     """Diagonal (Jacobi) preconditioner ``M^{-1} x ~ x / diag(A)`` for an iterative solver.
 
@@ -560,10 +619,13 @@ def cudss_lu_solve(A, b):
     the cost of one SpMV per step. Only an operator refinement cannot recover (the residual stops
     contracting: a genuinely unconstrained mode) raises.
 
+    **Under ``vmap`` it factors once**: a batch against one matrix (``jax.jacrev`` / ``jax.jacfwd``
+    w.r.t. the right-hand side) arrives as ONE block right-hand side -- see
+    :func:`_vmapped_direct_solve`.
+
     Requires the optional stack (``nvmath-python``, ``cudss``, ``cupy``) and a GPU; raises a clear
-    ``ImportError`` otherwise. Limitations inherited from ``pure_callback``: no ``vmap`` batching
-    rule, and the callback is forward-only (the ``custom_linear_solve`` firewall means it need not be
-    differentiable itself).
+    ``ImportError`` otherwise. The callback is forward-only (the ``custom_linear_solve`` firewall
+    means it need not be differentiable itself).
     """
     import jax
     import jax.experimental.sparse as jsp
@@ -588,11 +650,14 @@ def cudss_lu_solve(A, b):
 
     def _call(rhs, transpose):
         return jax.pure_callback(
-            lambda d, i, r: _cudss_host_solve(d, i, r, shape, transpose),
+            lambda d, i, r: _vmapped_direct_solve(
+                lambda dd, ii, rr, tt: _cudss_host_solve(dd, ii, rr, shape, tt), d, i, r, len(bshape), transpose
+            ),
             jax.ShapeDtypeStruct(bshape, rhs.dtype),
             A.data,
             A.indices,
             rhs,
+            vmap_method="expand_dims",
         )
 
     return jax.lax.custom_linear_solve(
@@ -794,8 +859,11 @@ def pardiso_lu_solve(A, b):
     columns and 1.12x at 32 against the same factorization solved column by column, PARDISO's
     single-RHS solve already being threaded. Only cuDSS advertises ``multi_rhs``.
 
-    Requires ``pypardiso`` (which bundles MKL); raises a clear ``ImportError`` otherwise. Limitations
-    inherited from ``pure_callback``: no ``vmap`` batching rule, and the callback is forward-only.
+    **Under ``vmap`` it factors once**: a batch against one matrix arrives as ONE block right-hand side
+    (see :func:`_vmapped_direct_solve`) -- one factorization, however the solve phase handles the block.
+
+    Requires ``pypardiso`` (which bundles MKL); raises a clear ``ImportError`` otherwise. The callback
+    is forward-only.
     """
     import jax
     import jax.experimental.sparse as jsp
@@ -818,11 +886,14 @@ def pardiso_lu_solve(A, b):
 
     def _call(rhs, transpose):
         return jax.pure_callback(
-            lambda d, i, r: _pardiso_host_solve(d, i, r, shape, transpose),
+            lambda d, i, r: _vmapped_direct_solve(
+                lambda dd, ii, rr, tt: _pardiso_host_solve(dd, ii, rr, shape, tt), d, i, r, len(bshape), transpose
+            ),
             jax.ShapeDtypeStruct(bshape, rhs.dtype),
             A.data,
             A.indices,
             rhs,
+            vmap_method="expand_dims",
         )
 
     return jax.lax.custom_linear_solve(
@@ -831,6 +902,40 @@ def pardiso_lu_solve(A, b):
         lambda _matvec, rhs: _call(rhs, False),
         transpose_solve=lambda _matvec, rhs: _call(rhs, True),
     )
+
+
+def _vmapped_direct_solve(solve, data, indices, rhs, core_ndim, transpose):
+    """The ``pure_callback`` body of a factor-once backend under ``vmap_method="expand_dims"``.
+
+    Every vmapped level adds a leading axis (size 1 on an operand that is not batched). ``rhs``'s last
+    ``core_ndim`` axes are the solve's own right-hand side -- ``(n,)``, or a block ``(n, k)``.
+
+    * one matrix for the whole batch (``jax.jacrev`` / ``jax.jacfwd`` w.r.t. the right-hand side, a vmap
+      over loads): the batch is folded into the columns of ONE block right-hand side, so the backend
+      factors once and solves everything in a single call;
+    * batched matrix values: one solve per item (each backend's cache still catches repeats).
+
+    ``solve(data, indices, rhs, transpose)`` is the backend's single-matrix host solve, which already
+    accepts ``(n,)`` or ``(n, k)``.
+    """
+    import numpy as _np
+
+    data, indices, rhs = _np.asarray(data), _np.asarray(indices), _np.asarray(rhs)
+    core = rhs.shape[rhs.ndim - core_ndim :]
+    batch = _np.broadcast_shapes(data.shape[:-1], indices.shape[:-2], rhs.shape[: rhs.ndim - core_ndim])
+    if not batch:
+        return solve(data, indices, rhs, transpose)
+    n, k = core[0], int(_np.prod(core[1:], dtype=int))
+    B = int(_np.prod(batch))
+    R = _np.broadcast_to(rhs, batch + core).reshape(B, n, k)
+    if all(s == 1 for s in data.shape[:-1] + indices.shape[:-2]):
+        cols = _np.ascontiguousarray(R.transpose(1, 0, 2).reshape(n, B * k))
+        X = _np.asarray(solve(data.reshape(-1), indices.reshape(-1, 2), cols, transpose)).reshape(n, B, k)
+        return _np.ascontiguousarray(X.transpose(1, 0, 2)).reshape(batch + core)
+    D = _np.broadcast_to(data, batch + data.shape[-1:]).reshape(B, -1)
+    Ix = _np.broadcast_to(indices, batch + indices.shape[-2:]).reshape(B, -1, 2)
+    out = [_np.asarray(solve(D[j], Ix[j], R[j].reshape(core), transpose)) for j in range(B)]
+    return _np.stack(out).reshape(batch + core)
 
 
 def host_lu_solve(A, b, *, reuse: bool = True):
@@ -864,9 +969,14 @@ def host_lu_solve(A, b, *, reuse: bool = True):
     which keys its cache on the sparsity and re-uses the plan across a Newton loop -- measured 64.7x
     per step against this function at n=64,000.
 
-    Limitations, all inherited from ``pure_callback``: no ``vmap`` batching rule, and the callback
-    is forward-only, so this cannot appear inside a transformation that needs to differentiate
-    *through* the callback itself (the ``custom_linear_solve`` firewall means it does not have to).
+    **Under ``vmap`` it factors once.** ``jax.jacrev`` / ``jax.jacfwd`` through this solve with respect
+    to the right-hand side, or any vmap over a batch of loads, reaches the host as ONE callback with the
+    whole block of right-hand sides, solved against a single factorization; batched matrix values are
+    factored one by one.
+
+    Limitation inherited from ``pure_callback``: the callback is forward-only, so this cannot appear
+    inside a transformation that needs to differentiate *through* the callback itself (the
+    ``custom_linear_solve`` firewall means it does not have to).
     """
     import jax
     import jax.experimental.sparse as jsp
@@ -925,11 +1035,12 @@ def host_lu_solve(A, b, *, reuse: bool = True):
 
     def _call(rhs, transpose):
         return jax.pure_callback(
-            lambda d, i, r: _host_solve(d, i, r, transpose),
+            lambda d, i, r: _vmapped_direct_solve(_host_solve, d, i, r, 1, transpose),
             jax.ShapeDtypeStruct((n,), rhs.dtype),
             A.data,
             A.indices,
             rhs,
+            vmap_method="expand_dims",
         )
 
     return jax.lax.custom_linear_solve(

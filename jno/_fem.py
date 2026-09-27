@@ -64,14 +64,15 @@ def _any_step_slot(x0, nonlinear, linear, precond, time) -> bool:
     return any(s is not None for s in (x0, nonlinear, linear, precond, time))
 
 
-def _default_newton(residual_fn, u0):
+def _default_newton(residual_fn, u0, *, jacobian=None):
     """The operator's own default nonlinear driver, called explicitly.
 
     ``FemResidualOperator.solve(None)`` picks this internally; the bound wrapper has to name it because
-    it always hands the operator a ``solve_fn``, so "no slot passed" can no longer mean "use the default"."""
-    from .utils.solver.newton_krylov import newton_krylov
+    it always hands the operator a ``solve_fn``, so "no slot passed" can no longer mean "use the default".
+    With the assembler's tangent it is the assembled-tangent Newton (see ``newton_default``)."""
+    from .utils.solver.newton_krylov import newton_default
 
-    return newton_krylov(residual_fn, u0)
+    return newton_default(residual_fn, u0, jacobian=jacobian)
 
 
 def _as_dense(x):
@@ -130,9 +131,11 @@ def _residual_check(A, b, u, who):
 def _bicgstab_jacobi(A, b, tol, maxiter):
     """The default steady-linear iteration, compiled. Split out of :func:`_solve_linear_matrix_free`
     so the Krylov loop is one XLA program while the convergence check stays eager -- see there."""
-    from .utils.solver.linear import jacobi
+    from .utils.solver.linear import jacobi, sparse_matvec
 
-    return jax.scipy.sparse.linalg.bicgstab(lambda v: A @ v, b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))[0]
+    # `sparse_matvec`, not `lambda v: A @ v`: BCOO's matvec re-derives its row/column index arrays on
+    # every call and XLA does not hoist that out of the loop -- 1.5x per iteration at 1M dofs.
+    return jax.scipy.sparse.linalg.bicgstab(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))[0]
 
 
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
@@ -182,6 +185,9 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
     # both convergence checks -- is one compiled program. Measured faster than the split shape it
     # replaces (1.90 ms against 2.73 ms at n=1441), because the eager check's own matvec and host
     # sync go away.
+    from .utils.solver import matvec_format
+
+    matvec_format.prime(A)  # CSR or COO, measured on THIS operator before it becomes a tracer
     return _firewalled_bicgstab(A, b, float(tol), int(maxiter))
 
 
@@ -202,11 +208,12 @@ def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
     the compiled-iteration win it exists for (16x at n=13861) is untouched. The transposed operator
     keeps the same Jacobi preconditioner: ``diag(A^T) == diag(A)``.
     """
+    from .utils.solver.linear import sparse_matvec
     from .utils.solver.solver_api import residual_gate
 
     who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
     AT = A.T
-    mv, mvT = (lambda v: A @ v), (lambda v: AT @ v)
+    mv, mvT = sparse_matvec(A), sparse_matvec(A, transpose=True)  # no re-conversion of A.T
     fwd = lambda _mv, rhs: residual_gate(mv, rhs, _bicgstab_jacobi(A, rhs, tol, maxiter), who, side="forward")
     rev = lambda _mv, rhs: residual_gate(mvT, rhs, _bicgstab_jacobi(AT, rhs, tol, maxiter), who, side="transpose")
     return jax.lax.custom_linear_solve(mv, b, fwd, transpose_solve=rev)
@@ -1266,12 +1273,16 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
         return f"{name} + {_nm(precond, 'jacobi')}"
 
     mode = fem_obj._mode
+    # The default Newton runs on the assembled tangent whenever the assembler provides one (newton_default).
+    _assembled = getattr(getattr(fem_obj, "_op", None), "jacobian", None) is not None
+    _newton = "newton (assembled tangent)" if _assembled else "newton-krylov (JFNK)"
     if mode == "transient":
         step = _nm(time, "theta(1) backward-Euler")
-        inner = _nm(nonlinear, "newton-krylov") if not fem_obj.is_linear else _lin()
+        inner = _nm(nonlinear, _newton) if not fem_obj.is_linear else _lin()
         return f"solve: transient · {step} · per step {inner}"
     if mode == "nonlinear":
-        return f"solve: nonlinear · {_nm(nonlinear, 'newton-krylov (JFNK)')} · inner {_lin()}"
+        default_inner = "bicgstab (assembled)" if _assembled and nonlinear is None else "bicgstab (matrix-free)"
+        return f"solve: nonlinear · {_nm(nonlinear, _newton)} · inner {_lin(default_inner)}"
     return f"solve: {mode} · {_lin()}"
 
 
@@ -2280,8 +2291,11 @@ class FEM:
         default because the alternative on a multi-device box is idle silicon. On a single-device host
         it resolves to the untouched single-device path. ``shard=False`` (or ``1``) opts out,
         ``shard=N`` pins a device count, and a device list pins exactly; over-requesting fails loud.
-        Only the default steady-linear path shards today: sparse-direct branches (periodic, 1-D,
-        fused-complex) cannot, and slot-composed / transient / nonlinear paths are not yet wired.
+        What shards: the steady-linear solve (default or a Krylov slot with Jacobi or no preconditioner), a
+        linear transient march, and a NONLINEAR solve or march -- which has no operator to partition, so
+        its cells are split instead (one all-reduce per residual or ``J.v``). Sparse-direct branches
+        (periodic, 1-D, fused-complex, ``lu``) cannot; ``adapt=``, moving geometry and a deferred node
+        evaluated by ``crux`` are not wired. ``docs/fem/inverse.md`` has the full table.
 
         ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
         count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
@@ -2321,21 +2335,29 @@ class FEM:
                     self._periodic = reduction
             try:
                 self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond)
-                result = self._solve_dispatch(
-                    solve_fn,
-                    adapt=adapt,
-                    checkpoint=checkpoint,
-                    contact=contact,
-                    continuation=continuation,
-                    x0=x0,
-                    nonlinear=nonlinear,
-                    linear=linear,
-                    precond=precond,
-                    time=time,
-                    tau=tau,
-                    shard=shard,
-                    **kwargs,
-                )
+                # A steady NONLINEAR solve has no assembled operator to partition, so its CELLS are split
+                # instead: the residual (and so every Jacobian-free J.v) is evaluated per device on a share
+                # of the elements, one all-reduce per evaluation. Read while the solve traces; a deferred
+                # node that `crux` evaluates later is traced outside this block and stays on one device.
+                from .utils.solver.sharding import element_devices, resolve_devices
+
+                _edev = resolve_devices(shard) if self._mode == "nonlinear" and adapt is None else []
+                with element_devices(_edev):
+                    result = self._solve_dispatch(
+                        solve_fn,
+                        adapt=adapt,
+                        checkpoint=checkpoint,
+                        contact=contact,
+                        continuation=continuation,
+                        x0=x0,
+                        nonlinear=nonlinear,
+                        linear=linear,
+                        precond=precond,
+                        time=time,
+                        tau=tau,
+                        shard=shard,
+                        **kwargs,
+                    )
             finally:
                 # the basis is per-CALL; neither the reduction nor the reduced block sticks to the object.
                 # ONLY when this call installed one, though. Restoring unconditionally also undid a
@@ -2569,6 +2591,11 @@ class FEM:
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
+        if self._mode in ("transient", "complex_transient") and isinstance(getattr(self._op, "metadata", None), dict):
+            # the linear march reads its device placement from the block (see `_sharded_transient`), and a
+            # nonlinear one splits its cells only when it is a plain march (`_element_split_devices`)
+            self._op.metadata["shard"] = shard
+            self._op.metadata["split_cells"] = adapt is None and not getattr(self, "_geometry", None)
         if contact is None and not getattr(self, "_in_contact_loop", False):
             # ... and NOT when the contact driver is re-entering this method for one of its own rounds:
             # it dispatches with `contact=None` by design, so an unguarded check would refuse the very
@@ -2851,6 +2878,11 @@ class FEM:
             # BCOO operator (never densifies -> memory O(nnz); GPU-safe; solves general systems). Pass
             # your own ``solve_fn=(A, b) -> u`` to use a dense / direct solver instead -- it receives
             # the densified (A, b). (The runtime-parametric case is a FemLinearSystem below.)
+            from .utils.solver.placement import to_solve_device
+
+            # Assembled on the host (`_host_assembly_scope`); moved to the solving device once, here,
+            # rather than copied there again by every solve.
+            self._op = to_solve_device(self._op)
             A, b = self._op
             b = jnp.asarray(b).reshape(-1)
             # A fused complex system solves as the real 2n block, so its periodic reduction is
@@ -2969,10 +3001,10 @@ class FEM:
                         if jac is not None and getattr(user_fn, "wants_jacobian", False):
                             return user_fn(rf, y, jacobian=jac)
                         return user_fn(rf, y)
-                    # Matrix-free Newton-Krylov default (no optimistix); implicit-diff preserved.
-                    from .utils.solver.newton_krylov import newton_krylov
+                    # Default Newton: the assembled tangent when there is one, else matrix-free.
+                    from .utils.solver.newton_krylov import newton_default
 
-                    return newton_krylov(rf, y)
+                    return newton_default(rf, y, jacobian=jac)
 
                 red_jac = None
                 if jacobian is not None:
@@ -3022,6 +3054,16 @@ class FEM:
             # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
             # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
             # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
+            if solve_fn is None or (getattr(solve_fn, "cache_key", None) is not None and precond is None):
+                # jNO's own solvers (the default, or one composed from the slots) have a value identity, so
+                # the solve is compiled once and reused: evaluated lazily, every call re-staged the Newton
+                # `while_loop` and `custom_root` and ran each residual op by op -- measured 2.3 s per warm
+                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%.
+                return self._op.solve(solve_fn, values={}, **kwargs)
+            # A user `solve_fn=` has no identity to cache on (a fresh lambda per call would recompile every
+            # time) and may do things that need concrete values, so it keeps running eagerly. So does a
+            # `precond=`: it can hold state built from concrete values (a hierarchy, a Picard-lagged form
+            # refreshed from the entry iterate) that a cached compiled solve would silently keep stale.
             return self._op.solve(solve_fn, **kwargs).fn()
         if self._mode == "transient" and self.is_complex and not self._op.runtime_parameter_exprs:
             # Non-parametric COMPLEX transient: return the concrete complex trajectory eagerly, exactly as
@@ -3890,7 +3932,8 @@ class FEM:
         def _bounded(residual_fn, u0, *, jacobian=None):
             root_fn, start = _prepare_residual(residual_fn, u0)
             if solve_fn is None:
-                return _default_newton(root_fn, start)
+                jac = _prepare_jacobian(residual_fn, jacobian, u0) if jacobian is not None else None
+                return _default_newton(root_fn, start, jacobian=jac)
             extra = {}
             if jacobian is not None and getattr(solve_fn, "wants_jacobian", False):
                 extra["jacobian"] = _prepare_jacobian(residual_fn, jacobian, u0)
@@ -3904,6 +3947,8 @@ class FEM:
         for _attr in ("tolerances", "wants_jacobian", "wants_project"):
             if getattr(solve_fn, _attr, None) is not None:
                 setattr(_bounded, _attr, getattr(solve_fn, _attr))
+        if solve_fn is None:
+            _bounded.wants_jacobian = True  # the default Newton runs on the assembled tangent when offered
         return _bounded
 
     def _resolve_bounds(self, u_warm):

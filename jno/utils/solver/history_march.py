@@ -21,6 +21,7 @@ unless its update names a region -- ``state.evolves(formula, region=...)`` masks
 state outside that region at the value it already has.
 """
 
+import functools
 from typing import Any, Dict
 
 import jax
@@ -97,9 +98,9 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             if jac is not None and getattr(solve_fn, "wants_jacobian", False):
                 return jnp.asarray(solve_fn(res, u_prev, jacobian=jac)).reshape(-1)
             return jnp.asarray(solve_fn(res, u_prev)).reshape(-1)
-        from .newton_krylov import newton_krylov
+        from .newton_krylov import newton_default
 
-        return newton_krylov(res, u_prev)
+        return newton_default(res, u_prev, jacobian=jac)
 
     def _root_of(res, u_prev):
         """``(root_fn, start)`` — the function ``_newton`` above actually drives to zero, and from where.
@@ -114,7 +115,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
     def _roll(buf, nv):
         return _roll_buffer(buf, nv)
 
-    def _step_once(u_prev, buffers, sbuffers, tau_k, path_k, param_args):
+    def _step_once(u_prev, buffers, sbuffers, tau_k, path_k, param_args, matrix_free=False):
         """One accepted load step: equilibrium at ``tau_k``, then advance every buffered state.
 
         The single definition of what a step *is* — the scan body below and the eager pilot both call
@@ -123,7 +124,12 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
         # Equilibrium at this load level, previous state frozen on the buffers. τ enters the load
         # through the residual's temporal coordinate (and the load-path field slices its frames); jacfwd
         # sees the buffers (volume AND surface) and the path slice as constants → the consistent tangent.
-        _jac = (lambda u: op.jacobian(u, args, tau_k)) if getattr(op, "jacobian", None) is not None else None
+        # `matrix_free`: the compiled contact march below, where the tangent cannot be assembled.
+        _jac = (
+            (lambda u: op.jacobian(u, args, tau_k))
+            if getattr(op, "jacobian", None) is not None and not matrix_free
+            else None
+        )
         u = _newton(lambda u: op.residual(u, args, tau_k), u_prev, _jac)
         # Advance every buffered state: volume states via their `.evolves` formula / a primary-unknown
         # history; surface states (a friction slip) via the surface readout on the region's faces.
@@ -221,8 +227,10 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
         # the per-round retrace it always had; the trade it already documents -- faster per solve, more
         # memory -- now also includes this. Measured on a 10-step load-path march, matrix-free:
         # 583 compilations / 18.0 s before, 127 / 1.4 s after, with a BIT-IDENTICAL trajectory.
-        _wants_jac = bool(getattr(solve_fn, "wants_jacobian", False))
-        _step_compiled = _step_once if _wants_jac else jax.jit(_step_once)
+        _wants_jac = bool(getattr(solve_fn, "needs_jacobian", getattr(solve_fn, "wants_jacobian", False)))
+        # The DEFAULT Newton assembles the tangent whenever it is handed one, so the compiled step must
+        # not hand it one: it stays on the matrix-free Newton this compiled path was built for.
+        _step_compiled = _step_once if _wants_jac else jax.jit(functools.partial(_step_once, matrix_free=True))
         # The search applies from the FIRST step, for the same reason it does in the steady driver: the
         # build-time tables are unbounded, so on a closed body the far side pairs through the body.
         relax = float(getattr(spec, "relax", 1.0))

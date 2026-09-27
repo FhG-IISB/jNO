@@ -144,16 +144,16 @@ def rowwise_jacobian(f: Callable[[Any], Any], x: Any, rows: Sequence[int]) -> ja
     """``(len(rows), P)`` reverse-mode Jacobian of ``f: x -> (N,)``, with no ``vmap``.
 
     ``jax.jacrev`` takes one ``vjp`` and then **vmaps the pullback** across the rows of the
-    identity basis. That vmap is the problem, not the differentiation: a differentiable FEM
-    solve bottoms out in ``jax.experimental.sparse.linalg.spsolve``, which has no batching
-    rule, so ``jacrev`` raises ``NotImplementedError: Batching rule for 'spsolve' not
-    implemented`` on any trace containing ``fem.solve()`` -- even when the output is a single
-    scalar, because the basis still carries a leading axis. Forward mode is no escape either
-    (``jacfwd`` hits the same wall at ``csr_matvec``); plain ``jax.grad`` is what works.
+    identity basis. A differentiable FEM solve bottoms out in
+    ``jax.experimental.sparse.linalg.spsolve``, which JAX ships without a batching rule; jNO
+    registers one (:mod:`jno.utils.solver.sparse_batching`), so ``jacrev`` and ``jacfwd`` through
+    ``fem.solve()`` work -- but the batched pullback solves B adjoint systems as one
+    block-diagonal system, factorising the matrix once PER ROW and holding the B copies at once.
 
     This does what ``jacrev`` does minus the vmap: ONE ``jax.vjp``, so the forward pass and
-    its residuals are computed once and shared, followed by one pullback per requested row.
-    The rows are unrolled at trace time.
+    its residuals are computed once and shared, followed by one pullback per requested row --
+    same factorisation count, one copy of the matrix at a time. The rows are unrolled at trace
+    time.
 
     ``rows`` is an explicit sequence of output indices, so a caller that needs only some rows
     -- MMA needs the inequality-constraint rows and not the objective -- pays for those only.

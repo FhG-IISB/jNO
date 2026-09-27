@@ -81,8 +81,15 @@ amg = ["jaxamg[cuda13]>=0.1.3,<0.2"]
 # present; the cudss wheels install on any linux-x86_64 machine and raise at call time on a host
 # with no GPU, which is why `lu(backend=...)` never defaults to them.
 fem = [
-    "jax-numerical-operators[mesh,pardiso,cudss]",
+    "jax-numerical-operators[mesh,pardiso,cudss,metis]",
 ]
+# FDM: finite differences themselves ship in the core; this extra carries what jno.fdm solves reach for
+# beyond it -- today the METIS partition behind jno.precond.schwarz().
+fdm = [
+    "jax-numerical-operators[metis]",
+]
+# jno.precond.schwarz(): the graph partition (METIS, via pymetis). Binary wheels for Linux, macOS, Windows.
+metis = ["pymetis>=2025.1"]
 # Anisotropic/adaptive remeshing behind fem.solve(adapt=...).
 mesh = ["mmgpy"]
 # jno.solve.lu(backend="pardiso") -- Intel MKL PARDISO, multithreaded CPU sparse-direct. The
@@ -183,6 +190,8 @@ jax-numerical-operators = { path = ".", editable = true }
 jax-cuda12-plugin = { version = ">=0.10.1,<0.11", extras = ["with-cuda"] }
 paramax = ">=0.0.5"
 blackjax = ">=1.2"
+# The [metis] extra, for every workspace env: the Schwarz tests run in the default (CI) environment.
+pymetis = ">=2025.1"
 
 [tool.pixi.environments]
 # The default environment is CUDA-capable through the explicit `jax-cuda12-plugin` pypi entry

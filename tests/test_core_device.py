@@ -6,7 +6,7 @@ controls how parameters and data are placed on devices:
 * ``_setup_parallelism`` / mesh creation
 * ``_shard_params``        — parameter device placement
 * ``_shard_data``          — data device placement
-* ``_replicate_for_devices`` — batch-dimension tiling
+* ``_replicate_for_devices`` — a pass-through (it used to tile; see its class docstring)
 
 All tests are intentionally compatible with a single-device (CPU) host so
 they pass in CI without requiring multiple GPUs/TPUs.
@@ -308,52 +308,16 @@ class TestShardData:
 
 
 class TestReplicateForDevices:
-    def test_tiles_leading_dim_when_too_small(self, solver):
-        """An array with batch-dim 1 must be tiled to fill n_devices=4."""
-        x = jnp.ones((1, 4))
-        out = solver._replicate_for_devices({"x": x}, n_devices=4)
-        assert out["x"].shape[0] == 4
+    """``_replicate_for_devices`` no longer tiles. Tiling a PINN's single sample to one copy per device
+    made every device evaluate every collocation point; ``_shard_data`` splits the points instead (the
+    multi-device behaviour is pinned in ``test_core_data_parallel.py``)."""
 
-    def test_no_tile_when_batch_already_large(self, solver):
-        """Arrays whose batch-dim >= n_devices must not be modified."""
-        x = jnp.ones((8, 4))
-        out = solver._replicate_for_devices({"x": x}, n_devices=4)
-        assert out["x"].shape[0] == 8
-
-    def test_exact_match_not_tiled(self, solver):
-        """Batch-dim == n_devices: no extra tiling."""
-        x = jnp.ones((4, 4))
-        out = solver._replicate_for_devices({"x": x}, n_devices=4)
-        assert out["x"].shape[0] == 4
-
-    def test_tiled_values_are_copies(self, solver):
-        """Each tiled row must equal the original row."""
-        x = jnp.arange(4, dtype=jnp.float32).reshape((1, 4))
-        out = solver._replicate_for_devices({"x": x}, n_devices=3)
-        tiled = out["x"]
-        for i in range(tiled.shape[0]):
-            assert jnp.allclose(tiled[i], x[0])
-
-    def test_1d_array_tiled(self, solver):
-        x = jnp.ones((1,))
-        out = solver._replicate_for_devices({"x": x}, n_devices=2)
-        assert out["x"].shape[0] == 2
-
-    def test_scalar_array_not_tiled(self, solver):
-        """Scalar arrays (ndim == 0) must pass through untouched."""
-        s = jnp.float32(3.14)
-        out = solver._replicate_for_devices({"s": s}, n_devices=4)
-        assert out["s"].ndim == 0
-
-    def test_non_array_pass_through(self, solver):
-        out = solver._replicate_for_devices({"label": "batch_data"}, n_devices=2)
-        assert out["label"] == "batch_data"
-
-    def test_n_devices_one_no_tile(self, solver):
-        """With n_devices=1 nothing is ever tiled."""
-        x = jnp.ones((1, 5))
-        out = solver._replicate_for_devices({"x": x}, n_devices=1)
-        assert out["x"].shape[0] == 1
+    @pytest.mark.parametrize("shape", [(1, 4), (8, 4), (4, 4), (1,)])
+    def test_data_passes_through_unchanged(self, solver, shape):
+        x = jnp.arange(int(np.prod(shape)), dtype=jnp.float32).reshape(shape)
+        out = solver._replicate_for_devices({"x": x, "s": jnp.float32(3.0), "label": "batch_data"}, n_devices=4)
+        assert out["x"].shape == shape and jnp.array_equal(out["x"], x)
+        assert out["s"].ndim == 0 and out["label"] == "batch_data"
 
 
 # ---------------------------------------------------------------------------

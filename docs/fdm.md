@@ -594,7 +594,12 @@ ran but came back 4.8e-3 off a converged reference, where Crank–Nicolson at th
 ```python
 sol = jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.amg())       # steady or transient
 sol = jno.fdm([...]).solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())    # structured grid
+sol = jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())   # domain decomposition
 ```
+
+[`jno.precond.schwarz()`](solvers.md#overlapping-schwarz-jnoprecondschwarz) needs METIS
+(`pip install "jax-numerical-operators[fdm]"`). Its rigid-body coarse space (`nullspace="rigid"`) reads
+FDM's layout, one DOF block per component.
 
 Setting either assembles the strong-form operator as a sparse matrix once: one JVP per colour of the
 stencil pattern, checked against the matrix-free action before use. What happens next depends on the
