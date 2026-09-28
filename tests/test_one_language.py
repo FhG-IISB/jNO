@@ -248,13 +248,29 @@ def test_vector_field_laplacian_and_grad_div():
     _vector_case(lambda w, v: 0.0 * v[0])
 
 
-def test_vector_field_cross_component_coupling():
-    """``u[1] * v[0]``, the spelling docs/fem/formulations.md uses for a coupled system on either trial.
+@pytest.mark.parametrize("spelling", ["ellipsis", "view"])
+def test_vector_field_cross_component_coupling(spelling):
+    """A component of the field in another component's equation, ``u[..., 1] * v[0]`` or ``u.vector[1] * v[0]``:
+    the portable spellings (a bare ``u[1]`` indexes the POINT axis of a network's (points, components)
+    output, as NumPy does). Both trials must give the same term; a network's component used to drop its axis
+    and fail to broadcast against the test component."""
+    pick = (lambda w: w[..., 1]) if spelling == "ellipsis" else (lambda w: w.vector[1])
+    _vector_case(lambda w, v: -pick(w) * v[0])
 
-    On the FE trial ``u[1]`` is component 1 (it matches the mass-matrix oracle exactly). On a network trial the
-    same subscript indexes the leading axis of the (points, components) output, i.e. POINT 1, so the coupling
-    term is silently wrong; ``[..., 1]`` and ``.vector[1]`` raise on both trials, so no spelling works on both."""
-    _vector_case(lambda w, v: -w[1] * v[0])
+
+def test_a_gradient_component_is_written_with_an_ellipsis():
+    """``grad(u, [x, y])[..., 0]`` is the x-derivative on any trial, and gives exactly the ``ui.x`` solution. A bare
+    ``grad(u, [x, y])[0]`` indexes the point axis, as in NumPy; on FE symbols it is refused at build time,
+    naming the component spelling, rather than dying in the assembler on a raw broadcast error."""
+    d, xi, yi, xb, yb = _square(0.2)
+    u, phi = d.fem_symbols()
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    g, gv = grad(ui, [xi, yi]), grad(vi, [xi, yi])
+    ref = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).solve())
+    got = np.asarray(jno.fem([g[..., 0] * gv[..., 0] + g[..., 1] * gv[..., 1] - 1.0 * vi, u(xb, yb) - 0.0]).solve())
+    np.testing.assert_allclose(got, ref, rtol=1e-12, atol=1e-14)
+    with pytest.raises(ValueError, match=r"POINT axis.*\[\.\.\., i\]"):
+        jno.fem([g[0] * gv[0] + g[1] * gv[1] - 1.0 * vi, u(xb, yb) - 0.0])
 
 
 def test_three_dimensional_nonlinear_form():

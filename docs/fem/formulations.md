@@ -534,7 +534,7 @@ Without it the loss minimum is *not* the PDE solution.
     | cubic nonlinearity (`+ u³`) | 9.8e-05 |
     | vector Poisson, `u* = (a, 2a)` | 1.3e-04 / 2.8e-04 |
     | Deep Ritz (energy, Gauss quadrature) | 8.8e-04 |
-    | network trial **+ inverse parameter** | `k`: 1.00 → 2.901 (truth 3.00), field 3.4e-02 |
+    | network trial **+ inverse parameter** | `k`: 1.00 → 3.0004 (truth 3.00), field 4.5e-04, data term weighted 100× |
 
     The last row is the combination worth knowing: a network trial and a `jno.np.parameter` train in
     the same loss, so the field and an unknown coefficient are recovered together. Note it needs a
@@ -582,17 +582,24 @@ vi     = phi.bind(x=xi, y=yi)
 #  -Δa = fa + b ,  -Δb = fb
 jno.fem([inner(jac(u_net, X), jac(vi, X), 2)
          - fa * vi[0] - fb * vi[1]      # per-component sources
-         - u_net[1] * vi[0],            # the coupling: b enters a's equation
+         - u_net[..., 1] * vi[0],       # the coupling: b (component 1) enters a's equation
          u(xb, yb) - (0.0, 0.0)])
 ```
 
-!!! measured "The rewrite is exact; the training is the limit"
+!!! measured "The rewrite is exact on both trials"
     Solving that *identical form* with an FEM trial recovers the manufactured `(s, 2s)` to **9.3e-04 /
     9.2e-04**, so the vector rewrite of the coupled system is correct. The network trial on the same
-    form reaches **6.8e-02** on the coupled component and **5.0e-05** on the uncoupled one, and does
-    not improve with more steps — the two component residuals compete under an equal-weight loss.
-    That is loss balancing, a standard PINN concern, not a formulation error; weight the terms if you
-    need the coupled component tighter.
+    form reaches **1.6e-04** on the coupled component and **4.0e-04** on the uncoupled one (`h = 0.08`,
+    a 3 × 32 tanh MLP, 4000 Adam steps).
+
+!!! warning "A component is `[..., i]`; a bare `[i]` on a network is a point"
+    An earlier version of this example wrote the coupling as `u_net[1]`. A subscript indexes the
+    leading axis, as in NumPy, and a network's output is `(points, components)`, so `u_net[1]` is
+    point 1 — and the coupled component stalled at **8.0e-02**, which this page then blamed on loss
+    balancing. Write `u[..., i]` or `u.vector[i]`: component `i` on every trial and path (FE trial,
+    network trial, FDM unknown, PINN), kept as a per-point scalar `(N, 1)`. On an FE symbol a bare
+    `u[i]` is also read as the component; on a derived FE expression such as `grad(u, X)[0]` it is
+    refused at build time, naming `[..., i]`.
 
 Fields that genuinely need **different** test spaces — a Taylor–Hood velocity/pressure pair — have no
 route yet, since the lowering builds one test context.

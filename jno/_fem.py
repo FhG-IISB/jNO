@@ -5742,6 +5742,29 @@ def _host_assembly_scope():
     return jax.default_device(hosts[0]) if hosts else contextlib.nullcontext()
 
 
+def _refuse_point_indexing(constraints: Any) -> None:
+    """Refuse ``expr[i]`` on a derived FE expression, naming ``expr[..., i]``.
+
+    A subscript indexes the leading axis, as in NumPy. On an expression built from FE symbols (``grad(u, X)``,
+    ``u * k``) that axis is the quadrature points at assembly, so ``grad(u, [x, y])[0]`` is not the x-derivative:
+    it used to reach the assembler and die there on a raw broadcast error. The symbols themselves (``u[i]``,
+    ``v[i]``, ``u(region)[i]``, bound views) read an integer subscript as a component and are not affected."""
+    for c in constraints:
+        for node in _walk(_bare(c)):
+            key = getattr(node, "getitem_key", None)
+            if key is None or getattr(node, "_name", None) != "getitem" or any(k is Ellipsis for k in key):
+                continue
+            base = node.args[0] if getattr(node, "args", None) else None
+            if base is None or isinstance(base, (TrialFunction, TestFunction)):
+                continue
+            if any(isinstance(n, (TrialFunction, TestFunction)) for n in _walk(base)):
+                raise ValueError(
+                    f"jno.fem: `expr[{', '.join(map(repr, key))}]` on an expression built from FE symbols indexes "
+                    "its POINT axis (the quadrature points), not a component. For component i write "
+                    "`expr[..., i]`, e.g. `grad(u, [x, y])[..., 0]` for the x-derivative."
+                )
+
+
 def fem(
     constraints: Any,
     *,
@@ -5856,6 +5879,7 @@ def _fem_impl(
     # remeshed in place -- the constraints reference the domain (not a mesh snapshot),
     # so re-tracing them picks up the refined mesh automatically.
     _orig_constraints = list(constraints)
+    _refuse_point_indexing(constraints)
     _orig_fem_kwargs = {"quad_degree": quad_degree}
 
     # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node

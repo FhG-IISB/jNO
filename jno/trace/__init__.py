@@ -433,6 +433,17 @@ class Placeholder:
         if not isinstance(key, tuple):
             key = (key,)
         concrete_key = tuple(None if k is None else k for k in key)
+        if (
+            len(concrete_key) == 2
+            and concrete_key[0] is Ellipsis
+            and isinstance(concrete_key[1], int)
+            and _component_keeps_axis(self)
+        ):
+            # A component of a per-point field is a per-point scalar, (N, 1), like every other one in a trace
+            # (see _component_keeps_axis). ``x[..., i, None]`` also handles a negative ``i``.
+            fc = FunctionCall(lambda x, _i=concrete_key[1]: x[..., _i, None], [self], name="getitem")
+            fc.getitem_key = concrete_key
+            return fc
         fc = FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
         # Record the key so consumers (e.g. the FEM driver) can recover a
         # component index from `u[..., i]` rather than it being hidden in the closure.
@@ -3369,6 +3380,35 @@ class NormalDerivative(Placeholder):
 
     def __repr__(self):
         return f"NormalDerivative({self.target})"
+
+
+def _component_keeps_axis(expr) -> bool:
+    """Whether the component ``expr[..., i]`` keeps its axis, i.e. is ``(N, 1)`` rather than ``(N,)``.
+
+    A per-point field -- a network, a grid unknown (``domain.unknown()``), data, or any expression built from
+    them -- is ``(N, k)``, and every per-point scalar in a trace is ``(N, 1)``. A bare ``(N,)`` component
+    broadcasts against an ``(N, 1)`` coordinate or source to ``(N, N)``, and the residual's ``.mse`` is then a
+    plausible number of the wrong problem. So such a component keeps its axis, on every path (FDM, PINN, and a
+    network trial inside ``jno.fem``), and the same term means the same thing on each.
+
+    FE symbols (trial and test functions), frozen FE solutions (``FrozenField``) and FE fields stored per cell
+    or per quadrature point are the exception: the weak-form assemblers lower them and read the bare
+    component."""
+    from ..utils.solver.solver_helper import iter_children
+
+    seen, stack = set(), [expr]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if isinstance(n, (TrialFunction, TestFunction, FrozenField)):
+            return False
+        fem_field = getattr(getattr(n, "model", None), "_fem_field", None)
+        if fem_field is not None and fem_field != "node":
+            return False
+        stack.extend(iter_children(n) or ())
+    return True
 
 
 class _FieldComponentIndex:

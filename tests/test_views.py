@@ -134,8 +134,10 @@ class TestVectorView:
         c1 = u.vector.component(1)
         assert isinstance(c0, ScalarView)
         assert isinstance(c1, ScalarView)
-        np.testing.assert_allclose(_eval(c0.expr, {"xy": jnp.array([[1.0, 2.0]])}), [1.0])
-        np.testing.assert_allclose(_eval(c1.expr, {"xy": jnp.array([[1.0, 2.0]])}), [2.0])
+        # a component of a per-point field is a per-point scalar, (N, 1): a bare (N,) broadcast against an
+        # (N, 1) coordinate to (N, N) (jno.trace._component_keeps_axis)
+        np.testing.assert_allclose(_eval(c0.expr, {"xy": jnp.array([[1.0, 2.0]])}), [[1.0]])
+        np.testing.assert_allclose(_eval(c1.expr, {"xy": jnp.array([[1.0, 2.0]])}), [[2.0]])
 
     def test_div_of_identity_field_equals_two(self):
         """div((x, y)) = ∂x/∂x + ∂y/∂y = 2 everywhere."""
@@ -240,8 +242,9 @@ class TestComplexView:
         assert isinstance(z.complex.real, ScalarView)
         assert isinstance(z.complex.imag, ScalarView)
         ctx = {"z": jnp.array([[3.0, 4.0]])}
-        np.testing.assert_allclose(_eval(z.complex.real.expr, ctx), [3.0])
-        np.testing.assert_allclose(_eval(z.complex.imag.expr, ctx), [4.0])
+        # the real part of a per-point complex scalar is a per-point scalar, (N, 1)
+        np.testing.assert_allclose(_eval(z.complex.real.expr, ctx), [[3.0]])
+        np.testing.assert_allclose(_eval(z.complex.imag.expr, ctx), [[4.0]])
 
     def test_abs_equals_norm_of_vectorview(self):
         d = _domain_with(("z", 2))
@@ -1002,8 +1005,8 @@ class TestBindKwargsForm:
         nv = v2.vector.coords("x", "y")
         assert isinstance(nv, NamedVectorView)
         ctx = {"xy": jnp.array([[0.3, 0.7]])}
-        np.testing.assert_allclose(_eval(nv.x.expr, ctx), [0.3])
-        np.testing.assert_allclose(_eval(nv.y.expr, ctx), [0.7])
+        np.testing.assert_allclose(_eval(nv.x.expr, ctx), [[0.3]])  # a per-point scalar, (N, 1)
+        np.testing.assert_allclose(_eval(nv.y.expr, ctx), [[0.7]])
 
     def test_matrix_positional_string_form_still_works(self):
         """MatrixView.coords(["x", "y"]) → NamedMatrixView with element access."""

@@ -232,6 +232,13 @@ Typed views reinterpret an expression without copying, exposing the right access
 u.scalar   u.vector   u.complex   u.matrix   u.voigt   u.field
 ```
 
+**Components.** A subscript indexes the leading axis, as in NumPy, and a per-point field is
+`(points, components)`: on a network `u[1]` is point 1. Component `i` is `u[..., i]` or `u.vector[i]`, on
+every trial and path (network, grid unknown, FE trial), and it keeps its axis, `(N, 1)`, like every other
+per-point scalar in a trace. (A bare `(N,)` would broadcast against an `(N, 1)` coordinate to `(N, N)`.) On an
+FE symbol `u[i]` is read as the component too; on a derived FE expression (`grad(u, X)[0]`) `jno.fem` refuses
+it and names `[..., i]`.
+
 Every view supports `.bind(**named_vars)` (alias `.partials(...)`) to attach the coordinate `Variable`s
 a field depends on, so attribute-style derivatives (`.x`, `.t`) work even when those coordinates are not
 the network's own inputs.

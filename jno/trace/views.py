@@ -116,6 +116,13 @@ def _is_periodic_tie_combination(expr_a, expr_b) -> bool:
     return _has_unknown(expr_a) and _has_unknown(expr_b)
 
 
+def _pair_part(expr, k: int) -> FunctionCall:
+    """Part ``k`` (0 real, 1 imaginary) of a complex VECTOR stored ``(..., d, 2)``: drops the pair axis, so the
+    part is the ``(..., d)`` vector. Not a component, so it bypasses ``expr[..., k]``, which keeps its axis on a
+    per-point field (see ``jno.trace._component_keeps_axis``)."""
+    return FunctionCall(lambda x, _k=k: x[..., _k], [expr], name="complex_part")
+
+
 def _nodal_scheme(expr, scheme=None):
     """The derivative scheme to use when none is given: finite differences if ``expr`` contains a nodal
     field (``domain.unknown()`` / ``jno.np.parameter(<fem symbol>)``), which has no function to
@@ -594,6 +601,11 @@ class VectorView(_DelegatesToPlaceholder):
     def expr(self) -> Placeholder:
         return self._expr
 
+    @property
+    def vector(self) -> "VectorView":
+        """Already a vector view: itself. Re-viewing the raw expression would drop a ``.bind(...)``."""
+        return self
+
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
@@ -717,16 +729,10 @@ class VectorView(_DelegatesToPlaceholder):
     # -- component access --
     def _c(self, i: int) -> "ScalarView":
         # The node records the integer key `(..., i)`, which the FEM lowering pattern-matches (`u(region)[i]`
-        # rollers, component gradients), but its value keeps the component axis, (…, 1), like every scalar.
-        # A bare `x[..., i]` gave (N,), so `u[0] * x` against an (N, 1) coordinate broadcast to (N, N).
-        # Only for a NODAL field (strong form: `domain.unknown()`): the FEM weak-form paths evaluate
-        # components of symbols and frozen fields with the bare `[..., i]` and would break.
-        if _nodal_scheme(self._expr) == "finite_difference":
-            fc = FunctionCall(lambda a, _i=i: a[..., _i : _i + 1], [self._expr], name="getitem")
-            fc.getitem_key = (Ellipsis, i)
-            comp = ScalarView(fc)
-        else:
-            comp = ScalarView(self._expr[..., i])
+        # rollers, component gradients). Its value keeps the component axis, (…, 1), for every per-point field
+        # (a network, a grid unknown, data): a bare (N,) broadcast against an (N, 1) coordinate to (N, N).
+        # FE symbols keep the bare component the weak-form lowering reads -- see `_component_keeps_axis`.
+        comp = ScalarView(self._expr[..., i])
         # Preserve the region binding so a bound view's component
         # (e.g. ``u.bind(x=xr, y=yr)[1]``) still carries ``_coord_vars`` — needed
         # for per-component (roller) Dirichlet and vector boundary terms.
@@ -740,7 +746,15 @@ class VectorView(_DelegatesToPlaceholder):
         return self._c(i)
 
     def __getitem__(self, i: int) -> "ScalarView":
-        """``v[i]`` — i-th component (alias for :meth:`component`)."""
+        """``v[i]`` and ``v[..., i]`` — i-th component (alias for :meth:`component`)."""
+        if isinstance(i, tuple):
+            if len(i) == 2 and i[0] is Ellipsis and isinstance(i[1], int):
+                i = i[1]  # the explicit spelling of the same component
+            else:
+                raise TypeError(
+                    f"{type(self).__name__}[{i!r}]: a vector view is indexed by one component, `v[i]` or "
+                    "`v[..., i]`. Index the underlying expression for anything else."
+                )
         return self._c(i)
 
     # -- differential operators --
@@ -1094,12 +1108,12 @@ class ComplexVectorView(_DelegatesToPlaceholder):
     @property
     def real(self) -> "VectorView":
         """Real part ``expr[..., 0]`` (a real ``d``-vector) → VectorView."""
-        return VectorView(self._expr[..., 0])
+        return VectorView(_pair_part(self._expr, 0))
 
     @property
     def imag(self) -> "VectorView":
         """Imaginary part ``expr[..., 1]`` (a real ``d``-vector) → VectorView."""
-        return VectorView(self._expr[..., 1])
+        return VectorView(_pair_part(self._expr, 1))
 
     @property
     def conj(self) -> "ComplexVectorView":
