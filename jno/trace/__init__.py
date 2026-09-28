@@ -5691,6 +5691,11 @@ def collect_tags(expr: Placeholder) -> set:
     def visit(node):
         if isinstance(node, Variable):
             tags.add(node.tag)
+            # a coordinate jno.fem retagged to its quadrature pool also reads the region it was created on
+            # outside FEM assembly (trace_evaluator._context_tag), so that region is in use too
+            region = getattr(node, "_jno_region_tag", None)
+            if region is not None:
+                tags.add(region)
         elif isinstance(node, TensorTag):
             tags.add(node.tag)
         elif isinstance(node, BinaryOp):

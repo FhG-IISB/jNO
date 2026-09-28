@@ -448,6 +448,21 @@ _MESH_FIELD_FAMILIES: Dict[str, "_MeshFieldBackend"] = {
 }
 
 
+def _context_tag(var, context) -> str:
+    """The context key a coordinate Variable reads.
+
+    ``jno.fem`` points a weak term's coordinate Variables at its quadrature pool by retagging them IN PLACE
+    (``"fem_gauss"`` / ``"gauss_<tag>"``, :func:`jno._fem._retag_coords_for_quadrature`), and remembers the
+    region they had as ``_jno_region_tag``. The same Variable objects may then appear in a PINN term, whose
+    context has no quadrature pool: there the Variable reads the region it was created on. (It used to read
+    the missing pool: ``KeyError: 'fem_gauss'``, or no points at all for a second derivative.)"""
+    tag = var.tag
+    if tag in context:
+        return tag
+    region = getattr(var, "_jno_region_tag", None)
+    return region if region is not None and region in context else tag
+
+
 class TraceEvaluator:
     """Evaluates traced expressions - designed for JIT compilation.
 
@@ -1087,7 +1102,7 @@ class TraceEvaluator:
 
     def _eval_variable(self, expr, ctx):
         bound_var = ctx.var_bindings.get(id(expr), expr)
-        tag = bound_var.tag
+        tag = _context_tag(bound_var, ctx.context)
         axis = getattr(bound_var, "axis", "spatial")
 
         def _broadcast_temporal(result):
@@ -1206,7 +1221,7 @@ class TraceEvaluator:
                 if isinstance(arg, Variable):
                     bound_arg = ctx.var_bindings.get(id(arg), arg)
                     axis = getattr(bound_arg, "axis", "spatial")
-                    if axis == "spatial" and bound_arg.tag in ctx.context:
+                    if axis == "spatial" and _context_tag(bound_arg, ctx.context) in ctx.context:
                         is_spatial = True
                     elif axis == "temporal":
                         is_spatial = False
@@ -1999,8 +2014,8 @@ class TraceEvaluator:
             return result[:, jnp.newaxis]
 
         # ── Spatial derivative ──
-        tag = bound_var.tag
-        points = ctx.context[bound_var.tag]
+        tag = _context_tag(bound_var, ctx.context)
+        points = ctx.context[tag]
         while hasattr(points, "ndim") and points.ndim > 2 and points.shape[0] == 1:
             points = jnp.squeeze(points, axis=0)
         # The gradient of a FrozenField is a spatial functional; on a transient domain its target points
@@ -2126,15 +2141,15 @@ class TraceEvaluator:
         bound_var = ctx.var_bindings.get(id(first_var), first_var)
 
         points = None
-        if bound_var.tag in ctx.context:
-            points = ctx.context[bound_var.tag]
+        tag = _context_tag(bound_var, ctx.context)
+        if tag in ctx.context:
+            points = ctx.context[tag]
             # Ensure points is 2D (N, D) — after vmap it may be 1D (D,)
             if points.ndim == 1:
                 points = points[jnp.newaxis, :]
             dims = tuple(v.dim[0] for v in variables)
         else:
             dims = tuple(0 for _ in variables)
-        tag = bound_var.tag
         n = len(variables)
         var_dims = [(i, vi.dim[0], j, vj.dim[0]) for i, vi in enumerate(variables) for j, vj in enumerate(variables)]
 

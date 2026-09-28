@@ -449,21 +449,24 @@ def test_an_initial_condition_may_mention_the_time_coordinate(path):
 @pytest.mark.parametrize("derivative", ["first", "second"])
 def test_a_pinn_residual_on_a_domain_that_already_carries_a_fem_problem(derivative):
     """docs/concepts.md: a PINN residual, a FEM solve and a data term can sit in one ``jno.core``. Building a
-    ``jno.fem`` problem switches its domain to quadrature evaluation, and a PINN residual collocated on that
-    domain afterwards fails (KeyError 'fem_gauss' for a first derivative, AttributeError for a second). The
-    reverse order, PINN first (docs/Getting-Started.md), works."""
+    ``jno.fem`` problem retags the term's coordinate Variables to its quadrature pool, in place; the same
+    Variables in a PINN residual afterwards failed (KeyError 'fem_gauss' for a first derivative,
+    AttributeError for a second). The PINN residual must be the same before and after the FEM problem exists."""
     import foundax
 
     d, xi, yi, xb, yb = _square(0.2)
-    u, phi = d.fem_symbols()
-    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
-    jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])  # building it is enough
     net = jno.nn(foundax.mlp(2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
     up = (net(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))).scalar.bind(x=xi, y=yi)
     res = up.x - 1.0 if derivative == "first" else -(up.xx + up.yy) - 1.0
-    crux = jno.core([res.mse], domain=d)
-    loss = np.asarray(crux.eval([res.mse])).reshape(-1)
-    assert np.all(np.isfinite(loss))
+    before = np.asarray(jno.core([res.mse], domain=d).eval([res])).reshape(-1)
+
+    u, phi = d.fem_symbols()
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])  # building it is enough
+
+    after = np.asarray(jno.core([res.mse], domain=d).eval([res])).reshape(-1)
+    assert np.all(np.isfinite(before)) and before.size > 1
+    np.testing.assert_allclose(after, before, rtol=1e-12, atol=0.0, err_msg="the PINN moved off its points")
 
 
 @pytest.mark.slow
