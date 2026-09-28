@@ -15,6 +15,8 @@ diagonal of their quadrilateral, so the node POSITIONS are untouched and every s
 same situation an alpha reconnection produces.
 """
 
+import os
+
 import jax
 import numpy as np
 import pytest
@@ -206,7 +208,13 @@ def test_a_reconnecting_march_is_unchanged_by_the_runtime_path():
     key = lambda c: set(map(tuple, np.sort(c, axis=1).tolist()))  # noqa: E731
     worst = max(float(np.abs(a[0] - b[0]).max()) for a, b in zip(ref, got))
     scale = float(np.abs(ref[0][0]).max())
-    assert worst / scale < 1e-12, f"trajectories differ by {worst:.3e} (domain scale {scale:.3f})"
+    # Bit-identical under deterministic arithmetic: 0 on CPU (what CI runs) and on a GPU with
+    # --xla_gpu_deterministic_ops=true. A default GPU run is not deterministic -- the same commit alternated
+    # between 0 and 8.1e-10 (2e-9 of the domain) run to run -- so there the bound is reduction-order noise,
+    # still six orders below the stale-index bugs this test exists for. The reconnection steps stay exact.
+    deterministic = jax.default_backend() == "cpu" or "--xla_gpu_deterministic_ops=true" in os.environ.get("XLA_FLAGS", "")
+    bound = 1e-12 if deterministic else 1e-8
+    assert worst / scale < bound, f"trajectories differ by {worst:.3e} (domain scale {scale:.3f})"
     flips_ref = [k for k in range(1, len(ref)) if key(ref[k][1]) != key(ref[k - 1][1])]
     flips_got = [k for k in range(1, len(got)) if key(got[k][1]) != key(got[k - 1][1])]
     assert flips_ref == flips_got, f"reconnections happen at different steps: {flips_ref} vs {flips_got}"
