@@ -720,6 +720,17 @@ At each `crux` step the parameter node resolves to its current value, the solve 
 the optimizer — no adjoint code. With **no** trainable parameter, `.solve()` returns the solution
 array eagerly, as in every section above.
 
+"Trainable" means an optimizer is attached, and `.solve()` reads it when it is called: attach the
+optimizer first. A parameter without one is data (a known field), and a network without one (or
+`.freeze()`d) is a known coefficient at its stored weights. A network coefficient reaches the solve as
+its weights, the way it does in `jno.fem`:
+
+```python
+net = jno.nn.wrap(model)                          # k(x, y), any equinox module
+net.optimizer(optax.adam(2e-2))                   # before .solve()
+node = jno.fdm([-net(x, y) * (ui.xx + ui.yy) - 1.0, u(xb, yb) - 0.0]).solve()   # a trace node
+```
+
 A trainable parameter can appear **anywhere** in the constraint list, and it can be a **time-dependent**
 problem:
 - in the PDE (a coefficient, a source);
@@ -743,6 +754,12 @@ traj  = jno.fdm([ui.t - nu * Δu, u(xb, yb) - 0.0, u(xi, yi) - u0]).solve()     
     Before this, a Robin parameter crashed, a time-dependent inverse raised "No model for Model N", and a
     parameter in a Dirichlet value was read from its stored value, so its gradient was zero and the
     inverse silently never moved.
+
+    A network coefficient `k(x) = a + b·x` is recovered from the field it produces: from `k = 1.3`, both
+    weights come back to within 1e-6 of `(1, 0.5)` (unstructured mesh, h = 0.1), and the gradient
+    `jno.core` takes through the solve matches central finite differences to 1e-6. Before this, a network
+    with its optimizer attached was solved at its stored weights: `.solve()` returned a constant array,
+    and `jno.core` never trained it, without an error.
 
     A time-dependent inverse runs one forward solve at the parameters' current values when it is built.
     That warm-up makes the solver's structural decisions (linearity, sparsity, symmetry, what varies in
