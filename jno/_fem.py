@@ -2984,9 +2984,13 @@ class FEM:
             # Runtime-parametric steady linear: solve A(θ)x=b(θ) as a trace node (∂u/∂θ flows through
             # solve_fn). A periodic tie reduces per-call inside FemLinearSystem.solve, after A(θ) is
             # re-formed: u = P · solve(PᵀA(θ)P, Pᵀb(θ)); self._periodic is None for the untied case.
-            _node = self._op.solve(solve_fn, periodic=self._periodic_2n if self._complex_n else self._periodic)
+            _node = self._op.solve(
+                solve_fn, periodic=self._periodic_2n if self._complex_n else self._periodic, values=kwargs.get("values")
+            )
             if self._complex_n is None:
                 return _node
+            if kwargs.get("values"):  # solved at the given values: an array, recombined directly
+                return _complex_recombine(self._complex_n)(_node)
             # Fused complex inverse: the trace node solves the real 2n block, so recombine INSIDE it —
             # the caller must receive a complex field, and ∂u/∂θ still flows through the wrapped fn.
             from .trace import FunctionCall

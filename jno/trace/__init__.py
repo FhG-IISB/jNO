@@ -3728,7 +3728,7 @@ class FemLinearSystem:
         b = self.b if self.rhs_fn is None else self.rhs_fn(args)
         return A, b
 
-    def solve(self, solve_fn=None, *, periodic=None):
+    def solve(self, solve_fn=None, *, periodic=None, values=None):
         """Differentiable forward solve ``u = solve_fn(A(θ), b(θ))`` as a trace node.
 
         Returns a :class:`FunctionCall` field. When it is evaluated (e.g. inside
@@ -3790,7 +3790,24 @@ class FemLinearSystem:
             A = A if hasattr(A, "todense") else jnp.asarray(A)
             return solve_fn(A, b)
 
-        return FunctionCall(_solve, params, name="fem_solve")
+        if values is None:
+            return FunctionCall(_solve, params, name="fem_solve")
+        # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
+        # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
+        # the parameters' STORED values -- a silently wrong answer.)
+        unknown = sorted(set(values) - set(names))
+        if unknown:
+            raise TypeError(
+                f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
+            )
+        missing = sorted(set(names) - set(values))
+        if missing:
+            raise ValueError(
+                f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
+                f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
+                "let `crux` resolve them (the solve is then a trace node, not an array)."
+            )
+        return _solve(*(jnp.asarray(values[n]) for n in names))
 
     def __iter__(self):
         if self.is_parametric:
