@@ -628,12 +628,32 @@ def assembled_krylov_solve(tol=1e-10, maxit=2000):
     """``(J, b) -> x``: Jacobi-preconditioned BiCGStab on an ASSEMBLED tangent -- the same iteration as the
     steady default (:func:`jno._fem._bicgstab_jacobi`), so ``J`` is applied in the storage measured fastest
     for it (CSR or split COO) and the Jacobi diagonal comes from the assembled entries. Transposable, as
-    :func:`newton_direct`'s implicit-diff tangent requires (``J.T`` is a BCOO too)."""
+    :func:`newton_direct`'s implicit-diff tangent requires (``J.T`` is a BCOO too).
+
+    The answer is VERIFIED and re-solved with Jacobi-GMRES when its residual is not small, as the linear
+    step default does (:func:`backend_blocks._default_step_solve`, which documents the failure). BiCGStab
+    breaks down on non-symmetric tangents -- a coupled first-order system with a velocity identity,
+    ``u.t - w = 0`` -- and exits at a large residual or NaN without a signal; inside Newton that step then
+    diverged the march (measured: residual 6e+90 at the second step, where matrix-free Newton, sparse LU
+    and GMRES all converge to the same trajectory). The check is one SpMV per solve; a healthy solve never
+    pays for the GMRES."""
 
     def solve(J, b):
         from ..._fem import _bicgstab_jacobi
+        from .krylov import gmres as _scaled_gmres
+        from .linear import jacobi, sparse_matvec
 
-        return _bicgstab_jacobi(J, jnp.asarray(b).reshape(-1), float(tol), int(maxit))
+        b = jnp.asarray(b).reshape(-1)
+        x = _bicgstab_jacobi(J, b, float(tol), int(maxit))
+        mv = sparse_matvec(J)
+        eps = float(jnp.finfo(b.dtype).eps)
+        r_rel = jnp.linalg.norm(mv(x) - b) / jnp.maximum(jnp.linalg.norm(b), eps)
+        ktol = max(float(tol), 100.0 * eps)
+        return jax.lax.cond(
+            r_rel < max(1e-9, 1e4 * eps),
+            lambda: x,
+            lambda: _scaled_gmres(mv, b, tol=ktol, atol=0.0, restart=min(int(b.shape[0]), 40), M=jacobi(J))[0],
+        )
 
     return solve
 
