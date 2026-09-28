@@ -688,7 +688,12 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     v_grads_JxW_flat = jnp.broadcast_to(vg, (n_cells, n_q, n_dof, test_vec, dim)).reshape(-1, n_dof, test_vec, dim)
     quad_points = xqs.reshape(-1, dim)
 
-    local_areas = jnp.einsum("cq,cqa->ca", JxWs, phis)  # lumped nodal areas
+    # Nodal areas int |phi_i|: the per-row scale of the VPINN residual (_eval_grouped_assembly). The
+    # absolute value keeps every row positive -- a P2 vertex basis function integrates to ZERO on a
+    # simplex, so the signed int phi_i scaled those rows by 1/round-off -- and changes nothing for P1,
+    # whose basis functions are non-negative. The rule is exact to degree 2*order with positive weights,
+    # so sum_q w_q phi_i^2 = int phi_i^2 > 0: the quadrature of |phi_i| is positive on a proper cell.
+    local_areas = jnp.einsum("cq,cqa->ca", JxWs, jnp.abs(phis))
     global_areas = jax.ops.segment_sum(local_areas.reshape(-1), cells_f_j.reshape(-1), num_segments=num_total_nodes)
 
     dirichlet_nodes = (

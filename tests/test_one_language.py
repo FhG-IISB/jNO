@@ -12,8 +12,9 @@ the FE trial as its nodal interpolant, the network trial as a tiny module that c
 Both then see identical values and gradients at every quadrature point / node, so their residuals must agree to
 round-off, whatever the nonlinearity. Two known, documented differences are accounted for, not hidden:
 
-* the network-trial (VPINN) residual is divided by the lumped nodal area ``∫φ_i`` (a loss scaling), and its
-  Dirichlet test functions are masked to zero rather than replaced by constraint rows;
+* the network-trial (VPINN) residual is divided by the nodal area ``∫|φ_i|`` (a loss scaling; ``= ∫φ_i`` for the
+  non-negative P1 basis the comparisons use), and its Dirichlet test functions are masked to zero rather than
+  replaced by constraint rows;
 * FDM evaluates boundary nodes with one-sided stencils, and those rows are replaced by the boundary conditions
   in any solve, so the strong-form comparison is on interior nodes.
 
@@ -131,7 +132,7 @@ def network_residual(pde, d):
 
 
 def lumped_area(d, xi, yi, zi=None, order=1):
-    """∫ φ_i over the domain, per basis function: the scaling the network-trial residual carries."""
+    """∫ φ_i over the domain, per basis function: for P1 (φ_i >= 0) the ∫|φ_i| the network-trial residual carries."""
     u, phi = d.fem_symbols(order=order)
     kw = dict(x=xi, y=yi) if zi is None else dict(x=xi, y=yi, z=zi)
     _, b = jno.fem([u.bind(**kw) * phi.bind(**kw) - 1.0 * phi.bind(**kw)]).operator
@@ -139,7 +140,7 @@ def lumped_area(d, xi, yi, zi=None, order=1):
 
 
 def assert_same_residual(R_fe, R_nn, area, free, *, ncomp=1):
-    """R_nn = R_fe / ∫φ_i on every free row, to round-off relative to the residual's own size."""
+    """R_nn = R_fe / ∫|φ_i| on every free row, to round-off relative to the residual's own size."""
     R_fe = R_fe.reshape(-1, ncomp)[free]
     R_nn = R_nn.reshape(-1, ncomp)[free]
     scaled = R_fe / (area[free][:, None] + 1e-12)  # jNO adds 1e-12 to the area (trace_evaluator)
@@ -306,8 +307,8 @@ def test_the_exact_solution_is_a_root_of_the_network_loss_with_p2_test_functions
     for P2 test functions (every integrand is a polynomial the quadrature integrates exactly). So the
     network-trial residual of the exact network must vanish, as the FE-trial residual does.
 
-    It does not: the network-trial residual divides every row by ∫φ_i, and P2 vertex basis functions
-    integrate to zero on a triangle, so round-off in those rows is multiplied by ~1e12."""
+    It did not while the network-trial residual divided every row by ∫φ_i: P2 vertex basis functions integrate
+    to zero on a triangle, so round-off in those rows was multiplied by ~1e12. It now divides by ∫|φ_i| > 0."""
     d, xi, yi, xb, yb = _square(0.3)
     u, phi = d.fem_symbols(order=2)
     vi = phi.bind(x=xi, y=yi)

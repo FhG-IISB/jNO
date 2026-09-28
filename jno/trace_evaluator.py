@@ -3281,6 +3281,8 @@ class TraceEvaluator:
             raise ValueError("GroupedAssembly has neither value nor grad nor boundary terms.")
 
         if "global_areas" in ctx.context:
+            # Row i scaled by int |phi_i| (> 0 for every basis, see build_native_fem_context). The 1e-12
+            # is kept only so existing P1 losses stay bit-for-bit; it is not needed for positivity.
             areas = jnp.asarray(ctx.context["global_areas"]).reshape(-1, 1)
             total = total / (areas + 1e-12)
 
