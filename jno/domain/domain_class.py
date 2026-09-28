@@ -986,14 +986,17 @@ class domain(MeshIOMixin):
         """
         shape = tuple(int(s) for s in handle.shape)
         b = self._effective_batch_count()
-        if len(shape) < 4 or shape[0] not in (b, 1):
+        if len(shape) < 3 or shape[0] not in (b, 1):
             return  # not routed as a spatial tensor; nothing to check (see _normalize_tensor_time_axis)
 
         n_t = 1
         if getattr(self, "_is_time_dependent", False):
             t_ctx = self.context.get("__time__")
             n_t = int(t_ctx.shape[0]) if t_ctx is not None and hasattr(t_ctx, "shape") else 1
-        if shape[1] in (n_t, 1):
+        if len(shape) == 3:
+            if not self._rank3_axis1_is_nodes(tag, shape, n_t):
+                return
+        elif shape[1] in (n_t, 1):
             return
 
         raise ValueError(
@@ -1019,18 +1022,22 @@ class domain(MeshIOMixin):
         count, the time extent and the array are all still in hand.
 
         Only tensors the compiler routes as **spatial** (``shape[0] in (B, 1)``) are touched; a
-        "shared" tag is never vmapped and so never reaches the time inference. Tensors of rank < 4
-        are left alone for the same reason: after the batch axis is peeled they fall below the
-        ``ndim >= 3`` test, so a parameter like ``(B, 1, 1)`` is untouched.
+        "shared" tag is never vmapped and so never reaches the time inference. Rank 3 is read too,
+        by :meth:`_rank3_axis1_is_nodes` -- it escapes the ``ndim >= 3`` inference but not the
+        single-window path, which takes axis 1 as time all the same. Rank < 3 is left alone: a
+        ``(B, F)`` parameter reaches the expression whole.
         """
         b = self._effective_batch_count()
-        if tensor.ndim < 4 or tensor.shape[0] not in (b, 1):
+        if tensor.ndim < 3 or tensor.shape[0] not in (b, 1):
             return tensor
 
         n_t = 1
         if getattr(self, "_is_time_dependent", False):
             t_ctx = self.context.get("__time__")
             n_t = int(t_ctx.shape[0]) if t_ctx is not None and hasattr(t_ctx, "shape") else 1
+
+        if tensor.ndim == 3:
+            return tensor[:, None, ...] if self._rank3_axis1_is_nodes(tag, tuple(tensor.shape), n_t) else tensor
 
         if tensor.shape[1] in (n_t, 1):
             return tensor  # already carries a time axis (or a broadcast one)
@@ -1045,6 +1052,62 @@ class domain(MeshIOMixin):
 
         # Steady domain: T is 1 by definition, so there is exactly one thing axis 1 can be.
         return tensor[:, None, ...]
+
+    def _rank3_axis1_is_nodes(self, tag, shape, n_t) -> bool:
+        """Read axis 1 of a rank-3 tensor ``(B, a, k)``: its node axis (True) or its time axis (False).
+
+        With one time window (every steady domain) the compiler hands the expression ``arr[0]`` of
+        each sample's ``(a, k)`` -- axis 1 taken as time -- so a per-node ``(B, n, k)`` arrived as
+        ``(B, k)``, the first node of each sample, and a DeepONet trained on it scored 1.00 relative
+        error with nothing raised.
+
+        ``a == 1`` is a time axis already: ``(B, 1, k)``, a per-sample parameter. Otherwise ``a`` is
+        the node axis only if it is the node count of one of this domain's point sets and cannot also
+        be the timestep count, or ``B`` (a nodes-first ``(n, B, k)`` looks the same). ``a == T`` with
+        no such point set is the per-step layout, left as it is. Anything else is refused.
+        """
+        a = int(shape[1])
+        if a == 1:
+            return False
+        transient = bool(getattr(self, "_is_time_dependent", False))
+        b = self._effective_batch_count()
+        counts = self._node_counts()
+        is_nodes, is_steps = a in counts, transient and a == n_t
+        if is_steps and not is_nodes:
+            return False
+        if is_nodes and not is_steps and not (b > 1 and a == b):
+            return True
+
+        if is_nodes and is_steps:
+            why = f"{a} is both the timestep count and the node count of a point set of this domain"
+        elif is_nodes:
+            why = f"{a} is both the node count of a point set and the batch count B, so (n, B, k) looks the same"
+        else:
+            why = f"{a} is not 1, " + (f"not the timestep count {n_t}, " if transient else "")
+            why += f"and not the node count of any point set of this domain {sorted(counts)}"
+        per_step = f", or {(shape[0], n_t, 1, shape[2])} for one value per timestep" if transient else ""
+        raise ValueError(
+            f"domain.variable({tag!r}, ...): cannot tell what axis 1 of shape {tuple(shape)} holds -- {why}. "
+            f"Context tensors are (B, T, ...), and rank 3 leaves no room for both a time and a node axis. "
+            f"Write them out as (B, T, n, k): {(shape[0], 1) + tuple(shape[1:])} (arr[:, None, ...]) for one "
+            f"value per node, or any other per-sample array{per_step}."
+        )
+
+    def _node_counts(self) -> set:
+        """Node counts of this domain's point sets -- the ``n`` a per-node ``(B, n, k)`` tensor can carry.
+
+        Read from the sampling pools (``(N, D)``, or ``(T, N, D)`` on a time grid) and from the point
+        sets already sampled into the context (``(B, T, N, D)``). Tensor tags are data, not point sets.
+        """
+        pools = list((self.__dict__.get("_mesh_pool") or {}).values())
+        for groups in (self.__dict__.get("_mesh_pool_groups") or {}).values():
+            pools.extend(points for _, points in groups)
+        pools.extend(
+            arr
+            for t, arr in self.context.items()
+            if t not in self._param_tags and not t.startswith("__") and len(getattr(arr, "shape", ())) == 4
+        )
+        return {int(p.shape[-2]) for p in pools if len(getattr(p, "shape", ())) >= 2}
 
     def _effective_batch_count(self) -> int:
         """Infer the current batch size from metadata and existing batched context."""
@@ -4176,6 +4239,11 @@ class domain(MeshIOMixin):
                     exposed at every step (use this for labeled supervised
                     data, lookup tables, or gather indices that are not
                     aligned with the physics batch).
+
+                A routed tensor of rank >= 3 is ``(B, T, ...)``. A missing time axis is
+                inserted where axis 1 cannot be time -- a steady ``(B, H, W, C)``, or
+                per-node data ``(B, n, k)`` whose ``n`` is a point set's node count --
+                and refused where it could be; ``(B, 1, n, k)`` is never ambiguous.
 
             resampling_strategy: Optional ResamplingStrategy for adaptive point selection
             normals: If True, also compute and return normal vectors for this tag

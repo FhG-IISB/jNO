@@ -518,8 +518,9 @@ dom.variable("_f", forcing)          # (256, 64, 64, 1) — the shape you actual
 ```
 
 Context tensors are laid out `(B, T, ...)`. On a **steady** domain the time axis is `1` by
-definition, so it is inserted for you: attach `(B, H, W, C)` and it is stored as `(B, 1, H, W, C)`.
-Writing the axis yourself still works and is left untouched.
+definition, so it is inserted for you: attach `(B, H, W, C)` and it is stored as `(B, 1, H, W, C)`,
+and per-node data `(B, n, k)` as `(B, 1, n, k)`. Writing the axis yourself still works and is left
+untouched.
 
 !!! warning "This is load-bearing, not cosmetic"
 
@@ -530,9 +531,17 @@ Writing the axis yourself still works and is left untouched.
     On a **time-dependent** domain axis 1 is genuinely ambiguous (is it `T`, or a grid axis?), so a
     mismatch raises instead: pass `T` entries, or `1` to share one field across all steps.
 
-    Only tensors of rank ≥ 4 whose leading dimension is `B` or `1` are touched — a parameter like
-    `(B, 1, 1)` or a shared lookup table is left exactly as given. Multiply the domain by `B`
-    **before** attaching, so the batch count is known.
+    Only tensors of rank ≥ 3 whose leading dimension is `B` or `1` are touched — a parameter like
+    `(B, 1, 1)` or `(B, F)`, or a shared lookup table, is left exactly as given. Multiply the domain
+    by `B` **before** attaching, so the batch count is known.
+
+    **Per-node data** `(B, n, k)` — one value per node per sample, the operator-learning target — is
+    stored as `(B, 1, n, k)` when `n` is the node count of one of the domain's point sets. It used to
+    arrive as `(B, k)`, the first node of each sample, with nothing raised. When axis 1 could be read
+    two ways (`n` equals `B` or the timestep count) or matches no point set, the attach raises and
+    names the layout to write instead: `(B, 1, n, k)` for one value per node (or any other per-sample
+    array), `(B, T, 1, k)` for one value per timestep. `(B, T, k)` with no point set of `T` nodes is
+    left as it is.
 
 ### Datasets larger than memory
 

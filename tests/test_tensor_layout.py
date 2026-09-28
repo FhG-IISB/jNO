@@ -112,6 +112,51 @@ class TestTimeDependent:
             dom.variable("_f", _arr(B, H, W, C))
 
 
+class TestPerNode:
+    """Rank 3, ``(B, n, k)``: one value per node per sample, the operator-learning target. The
+    single-window path took axis 1 as time (``arr[0]``), so it arrived as ``(B, k)`` -- node 0 only."""
+
+    def _dom(self, batch=B, n=6):
+        dom = batch * jno.domain.from_array({"nodes": np.random.default_rng(0).random((n, 2))})
+        dom.variable("nodes")
+        return dom
+
+    def test_per_node_data_gets_the_time_axis(self):
+        dom = self._dom()
+        dom.variable("u", _arr(B, 6, 3))
+        assert dom.context["u"].shape == (B, 1, 6, 3)
+
+    def test_attached_before_the_nodes_are_sampled(self):
+        dom = B * jno.domain.from_array({"nodes": np.zeros((6, 2))})
+        dom.variable("u", _arr(B, 6, 1))
+        assert dom.context["u"].shape == (B, 1, 6, 1)
+
+    def test_no_matching_point_set_raises_naming_the_layout(self):
+        dom = self._dom()
+        with pytest.raises(ValueError, match=r"node count.*\(4, 1, 7, 1\)"):
+            dom.variable("u", _arr(B, 7, 1))
+
+    def test_n_equal_to_B_raises(self):
+        dom = self._dom(batch=6)
+        with pytest.raises(ValueError, match="batch count"):
+            dom.variable("u", _arr(6, 6, 1))
+
+    def test_per_step_values_left_alone(self):
+        dom = TestTimeDependent()._dom(3)
+        dom.variable("u", _arr(B, 3, 2))
+        assert dom.context["u"].shape == (B, 3, 2)
+
+    def test_per_node_on_a_time_grid_is_shared_across_steps(self):
+        dom = TestTimeDependent()._dom(3)
+        dom.variable("u", _arr(B, H * W, 2))
+        assert dom.context["u"].shape == (B, 1, H * W, 2)
+
+    def test_timestep_count_equal_to_node_count_raises(self):
+        dom = TestTimeDependent()._dom(H * W)
+        with pytest.raises(ValueError, match="timestep count"):
+            dom.variable("u", _arr(B, H * W, 1))
+
+
 class TestExtremes:
     def test_zero_sized_grid_axis(self):
         dom = _steady()

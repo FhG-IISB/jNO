@@ -15,7 +15,7 @@ import pytest
 
 import jno
 
-B, N, D = 12, 8, 1
+B, N, D = 12, 8, 1  # sources are (B, 1, N, D): a bare (B, N, D) would have its axis 1 read as time
 
 
 class Counting:
@@ -59,24 +59,24 @@ def _train(dom, x, steps=3, batchsize=4, **kw):
 class TestAttach:
     def test_a_duck_typed_source_is_stored_unread(self):
         dom, _ = _dom()
-        src = Counting(_arr(B, N, D))
+        src = Counting(_arr(B, 1, N, D))
         dom.variable("_f", src)
         assert dom.context["_f"] is src, "the handle itself must be stored, not a copy"
         assert src.reads == [], "attaching must not read the source"
 
     def test_np_memmap_attaches(self, tmp_path):
         path = tmp_path / "f.dat"
-        mm = np.memmap(path, dtype=np.float32, mode="w+", shape=(B, N, D))
-        mm[:] = _arr(B, N, D)
+        mm = np.memmap(path, dtype=np.float32, mode="w+", shape=(B, 1, N, D))
+        mm[:] = _arr(B, 1, N, D)
         mm.flush()
         dom, _ = _dom()
-        dom.variable("_f", np.memmap(path, dtype=np.float32, mode="r", shape=(B, N, D)))
-        assert dom.context["_f"].shape == (B, N, D)
+        dom.variable("_f", np.memmap(path, dtype=np.float32, mode="r", shape=(B, 1, N, D)))
+        assert dom.context["_f"].shape == (B, 1, N, D)
 
     def test_eager_arrays_still_take_the_eager_path(self):
         """np.ndarray satisfies the duck-type too — it must NOT be treated as lazy."""
         dom, _ = _dom()
-        dom.variable("_f", _arr(B, N, D))
+        dom.variable("_f", _arr(B, 1, N, D))
         import jax.numpy as jnp
 
         assert isinstance(dom.context["_f"], jnp.ndarray)
@@ -98,7 +98,7 @@ class TestAttach:
 class TestStreaming:
     def test_trains_without_ever_reading_the_whole_source(self):
         dom, x = _dom()
-        src = Counting(_arr(B, N, D))
+        src = Counting(_arr(B, 1, N, D))
         dom.variable("_f", src)
         _train(dom, x, steps=3, offload_data=True)
         assert len(src.gathers) == 3, f"one gather per step, got {len(src.gathers)}"
@@ -107,14 +107,14 @@ class TestStreaming:
     def test_indices_are_strictly_increasing(self):
         """h5py/zarr fancy indexing REQUIRES increasing indices — the on-device path already sorts."""
         dom, x = _dom()
-        src = Counting(_arr(B, N, D))
+        src = Counting(_arr(B, 1, N, D))
         dom.variable("_f", src)
         _train(dom, x, steps=4, offload_data=True)
         for g in src.gathers:
             assert np.all(np.diff(g) > 0), f"unsorted gather {g}"
 
     def test_loss_matches_the_eager_equivalent(self):
-        a = _arr(B, N, D)
+        a = _arr(B, 1, N, D)
         d1, x1 = _dom()
         d1.variable("_f", a)
         s1 = _train(d1, x1, steps=3, offload_data=True)
@@ -127,22 +127,22 @@ class TestStreaming:
 
     def test_broadcast_row_is_read_as_one_row_not_the_whole_array(self):
         dom, x = _dom()
-        src = Counting(_arr(1, N, D))  # leading dim 1 -> broadcast across the batch
+        src = Counting(_arr(1, 1, N, D))  # leading dim 1 -> broadcast across the batch
         dom.variable("_f", src)
         _train(dom, x, steps=2, offload_data=True)
         assert all(isinstance(k, slice) and k == slice(0, 1) for k in src.reads), src.reads
 
     def test_a_lazy_and_an_eager_tag_coexist(self):
         dom, x = _dom()
-        dom.variable("_f", Counting(_arr(B, N, D)))
-        dom.variable("_g", _arr(B, N, D))
+        dom.variable("_f", Counting(_arr(B, 1, N, D)))
+        dom.variable("_g", _arr(B, 1, N, D))
         _train(dom, x, steps=2, offload_data=True)
 
 
 class TestRefusals:
     def test_on_device_path_refuses_and_names_the_fix(self):
         dom, x = _dom()
-        dom.variable("_f", Counting(_arr(B, N, D)))
+        dom.variable("_f", Counting(_arr(B, 1, N, D)))
         with pytest.raises(ValueError, match="offload_data=True"):
             _train(dom, x, steps=2)  # no offload_data -> would read the whole dataset
 
@@ -154,6 +154,14 @@ class TestRefusals:
         with pytest.raises(ValueError, match="time axis"):
             d.variable("_f", Counting(_arr(B, 6, 5, 1)))
 
+    def test_per_node_rank3_raises_instead_of_being_rewritten(self):
+        """(B, n, 1) is stored as (B, 1, n, 1) when eager; a lazy source cannot be, and read as it is
+        each sample would reach the loss as its first node."""
+        dom, x = _dom()
+        n = int(np.asarray(dom.context["interior"]).shape[-2])
+        with pytest.raises(ValueError, match="time axis"):
+            dom.variable("_f", Counting(_arr(B, n, 1)))
+
     def test_correct_layout_is_accepted(self):
         d = B * jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(5, 4)).domain(compute_mesh_connectivity=True)
         d.variable("interior")
@@ -164,7 +172,7 @@ class TestRefusals:
 class TestExtremes:
     def test_batchsize_equal_to_total(self):
         dom, x = _dom()
-        src = Counting(_arr(B, N, D))
+        src = Counting(_arr(B, 1, N, D))
         dom.variable("_f", src)
         _train(dom, x, steps=2, batchsize=B, offload_data=True)
 
