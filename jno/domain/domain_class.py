@@ -994,6 +994,13 @@ class domain(MeshIOMixin):
             t_ctx = self.context.get("__time__")
             n_t = int(t_ctx.shape[0]) if t_ctx is not None and hasattr(t_ctx, "shape") else 1
         if len(shape) == 3:
+            if self._rank3_axis1_is_steps(shape, n_t):
+                raise ValueError(
+                    f"domain.variable({tag!r}, <lazy {type(handle).__name__}>): the source has shape {shape}, one "
+                    f"value per sample and timestep. The compiler reads that layout as (B, T, 1, k); an eager array "
+                    f"is reshaped for you, a lazy source is not (that would read it). Store it as "
+                    f"{(shape[0], shape[1], 1, shape[2])}, or pass an eager array."
+                )
             if not self._rank3_axis1_is_nodes(tag, shape, n_t):
                 return
         elif shape[1] in (n_t, 1):
@@ -1037,7 +1044,14 @@ class domain(MeshIOMixin):
             n_t = int(t_ctx.shape[0]) if t_ctx is not None and hasattr(t_ctx, "shape") else 1
 
         if tensor.ndim == 3:
-            return tensor[:, None, ...] if self._rank3_axis1_is_nodes(tag, tuple(tensor.shape), n_t) else tensor
+            if self._rank3_axis1_is_nodes(tag, tuple(tensor.shape), n_t):
+                return tensor[:, None, ...]  # (B, 1, n, k): one value per node, shared by every step
+            if self._rank3_axis1_is_steps(tuple(tensor.shape), n_t):
+                # (B, T, k), one value per sample and step. Left as it was, the compiler read it wrong: under
+                # the default window (min_consecutive=1) every drawn step received step 0's value, and with
+                # the full window every step received the whole series. (B, T, 1, k) is read right in both.
+                return tensor[:, :, None, :]
+            return tensor
 
         if tensor.shape[1] in (n_t, 1):
             return tensor  # already carries a time axis (or a broadcast one)
@@ -1092,6 +1106,11 @@ class domain(MeshIOMixin):
             f"Write them out as (B, T, n, k): {(shape[0], 1) + tuple(shape[1:])} (arr[:, None, ...]) for one "
             f"value per node, or any other per-sample array{per_step}."
         )
+
+    def _rank3_axis1_is_steps(self, shape, n_t) -> bool:
+        """Axis 1 of a rank-3 ``(B, a, k)`` is the time axis of a per-step value: a time-dependent domain with
+        ``a == T > 1`` (``a`` also a node count is refused by :meth:`_rank3_axis1_is_nodes` first)."""
+        return bool(getattr(self, "_is_time_dependent", False)) and n_t > 1 and int(shape[1]) == n_t
 
     def _node_counts(self) -> set:
         """Node counts of this domain's point sets -- the ``n`` a per-node ``(B, n, k)`` tensor can carry.
