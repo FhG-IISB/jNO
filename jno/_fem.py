@@ -1338,7 +1338,7 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any:
+def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -1349,10 +1349,23 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any
     parameters into the evaluation, so the result stays **differentiable** in them — the coefficient of a
     parametric natural / surface boundary term (an inverse-design impedance / incident source). When it is
     ``None`` (the default) the parameters keep their stored values (a plain forward pass).
+
+    ``t`` is the time a **temporal** Variable reads (an initial condition passes the start time). A time
+    Variable has its own tag, so without ``t`` it would be handed the spatial points and read the x column;
+    a value that mentions time with no ``t`` given therefore raises instead.
     """
     from .trace_evaluator import TraceEvaluator
 
-    tags = {v.tag for v in _walk(value_node) if isinstance(v, Variable)}
+    variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
+    if temporal and t is None:
+        raise ValueError(
+            "jno.fem: a condition's value references the time coordinate, but it is evaluated here without a "
+            f"time (time tags {sorted(temporal)}). A time-dependent value is supported in a transient Dirichlet "
+            "condition and in an initial condition (read at the start time); anywhere else write it without "
+            "the time variable."
+        )
+    tags = {v.tag for v in variables} - temporal
     pts = jnp.atleast_2d(jnp.asarray(points))
     # Register every ModelCall (parameter / network) so the evaluator resolves it. With ``params`` (the
     # runtime ``args``), substitute a trainable parameter's value OR a trainable network's live module from
@@ -1376,7 +1389,10 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any
                 elif (nn := _neural_coefficient_name(nd)) in params:  # trainable network: its live module
                     mod = params[nn]
             table[m.layer_id] = mod
-    return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context={t: pts for t in tags}), (-1,))
+    context = {tag: pts for tag in tags}
+    for tag in temporal:
+        context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
+    return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context=context), (-1,))
 
 
 def _coord_value_fn(value_node: Any) -> Callable:
@@ -7622,7 +7638,10 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
         if comp is None:
             return jnp.full((n,), float(const))  # scalar broadcast to every dof
         return jnp.zeros((n,)).at[comp::vec].set(float(const))  # one component only
-    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))).reshape(-1)
+    from .utils.solver.time_route import _infer_time_window
+
+    # an initial condition sits at the start time: a value written with the time variable reads it there
+    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), t=_infer_time_window(domain)[0])).reshape(-1)
     if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
         per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
         return jnp.zeros((n,)).at[comp::vec].set(per)

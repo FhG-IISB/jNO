@@ -4384,7 +4384,7 @@ def assemble_fem_native(
             n_real = int(xr.shape[0])
 
             def _at(P):
-                return jnp.reshape(jnp.asarray(_eval_value_node_at(u0_node, P, params=params)), (-1,))
+                return jnp.reshape(jnp.asarray(_eval_value_node_at(u0_node, P, params=params, t=t0)), (-1,))
 
             def _as_nodal(v):
                 if v.size == 1:
@@ -4417,7 +4417,9 @@ def assemble_fem_native(
                     continue
                 pts_ic = pts_f_all[fidx]  # (n_nodes_f[fidx], 2)
                 nn, vv = n_nodes_f[fidx], vecs[fidx]
-                raw = jnp.reshape(jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params)), (-1,))
+                raw = jnp.reshape(
+                    jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params, t=t0)), (-1,)
+                )
                 if comp is not None:
                     # Per-component IC (e.g. ``u(initial)[0] - g0``): set just component ``comp`` at every
                     # node of the field. ``raw`` is the per-node value (or a single constant to broadcast).

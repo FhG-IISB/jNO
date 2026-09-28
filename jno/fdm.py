@@ -1688,7 +1688,7 @@ class _TraceFDM:
             )
         return value
 
-    def _eval_g(self, g_node, idx):
+    def _eval_g(self, g_node, idx, t=None):
         """Value ``g`` at the nodes ``idx`` — a constant, a coordinate expression, or a **known nodal
         field** (a ``jno.np.parameter`` / ``domain.unknown()`` carrying data, e.g. a neighbour's current
         field in a coupled solve), in which case its per-node values are gathered at ``idx``."""
@@ -1702,13 +1702,14 @@ class _TraceFDM:
         if isinstance(inner, ModelCall) and getattr(inner.model, "_is_parameter", False):
             out = jnp.asarray(inner.model.module.value).reshape(-1)[jnp.asarray(idx)]  # nodal data → gather
         else:
-            out = jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+            out = jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx], t=t)).reshape(-1)
         return self._require_real(out, "a condition's value")
 
-    def _condition_value(self, constraint, idx):
+    def _condition_value(self, constraint, idx, t=None):
         """Value ``g`` of an affine condition ``u(region) - g`` (Dirichlet or IC), evaluated at the
-        region's nodes ``idx`` — reused for both boundary conditions and the initial state."""
-        return self._eval_g(self._value_side(constraint), idx)
+        region's nodes ``idx`` — reused for both boundary conditions and the initial state. ``t`` is the
+        time a value written with the time variable reads (the start time, for an initial condition)."""
+        return self._eval_g(self._value_side(constraint), idx, t=t)
 
     def _field_index(self, constraint):
         """Which unknown's DOF block a value-only constraint (Dirichlet) pins — 0 for a single field."""
@@ -2261,7 +2262,7 @@ class _TraceFDM:
             vals = (
                 self._eval_value(self._value_side(c), idx, scope)
                 if self._uses_params(c, scope)
-                else self._condition_value(c, idx)
+                else self._condition_value(c, idx, t=self._start_time())
             )
             k, nodes = self._field_index(c), np.asarray(idx if len(idx) else allnodes)
             for b, vb in zip(self._blocks_of(k), self._split_components(k, vals, len(nodes))):

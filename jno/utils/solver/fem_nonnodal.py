@@ -1249,7 +1249,7 @@ def assemble_fem_nonnodal(
 
                 def _ic_cell(cidx):
                     per, xq, meas = _cell_fields(cidx, _cell_local_sols(cidx, u0_blocks))
-                    u0 = jnp.asarray(_eval_value_node_at(u0_node, xq)).reshape(n_quad)
+                    u0 = jnp.asarray(_eval_value_node_at(u0_node, xq, t=_infer_time_window(domain)[0])).reshape(n_quad)
                     return jnp.einsum("q,qn,q->n", qw * meas, per[0]["shape_vals"], u0)
 
                 loc = (cdofs[0] - offs[0]).reshape(-1)
@@ -1347,7 +1347,7 @@ def assemble_fem_nonnodal(
             def _ic_cell(cidx):
                 per, xq, meas = _cell_fields(cidx, u0_blocks)
                 phi = per[fidx]["shape_vals"]
-                u0 = jnp.asarray(_eval_value_node_at(u0_node, xq))
+                u0 = jnp.asarray(_eval_value_node_at(u0_node, xq, t=_infer_time_window(domain)[0]))
                 if phi.ndim == 3:  # RT/N1E vector basis (n_quad, n_dof, vsize): ∫ u0·Φ
                     u0 = jnp.broadcast_to(
                         u0.reshape(-1) if u0.size == 1 else u0.reshape(n_quad, -1), (n_quad, phi.shape[-1])

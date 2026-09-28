@@ -399,8 +399,9 @@ def test_heat_equation_fdm_march_is_exact_and_the_space_time_pinn_residual_vanis
         return w.t - w.xx - w.yy - f
 
     w = d.unknown()
-    ic = (x0 * x0 + y0 * y0) / 4  # u*(x, y, 0), written without t: see the next test for why
-    traj = np.asarray(jno.fdm([heat(w.bind(x=xi, y=yi, t=ti)), w(xb, yb, tb) - us(xb, yb, tb), w(x0, y0, t0) - ic]).solve())
+    traj = np.asarray(
+        jno.fdm([heat(w.bind(x=xi, y=yi, t=ti)), w(xb, yb, tb) - us(xb, yb, tb), w(x0, y0, t0) - us(x0, y0, t0)]).solve()
+    )
     pts = np.asarray(d.built_mesh.points)[:, :2]
     final = traj.reshape(traj.shape[0], -1)[-1]
     assert np.abs(final - us(pts[:, 0], pts[:, 1], 0.5)).max() < 1e-9
@@ -418,13 +419,13 @@ def test_heat_equation_fdm_march_is_exact_and_the_space_time_pinn_residual_vanis
 
 @pytest.mark.parametrize("path", ["fdm", "fem"])
 def test_an_initial_condition_may_mention_the_time_coordinate(path):
-    """``u(x0, y0, t0) - t0`` must start the march from zero: the initial region sits at the start time.
+    """``u(x0, y0, t0) - t0`` must start the march from the start time, here 0.3 (so neither 0 nor x passes).
 
     Writing a manufactured u*(x, y, t) once and using it for the boundary AND the initial condition is the
-    common pattern. Both paths evaluate the initial value with spatial points only
-    (``jno._fem._eval_value_node_at``), so ``t0`` reads a spatial column and the start state is x, silently."""
+    common pattern. Both paths used to evaluate the initial value with spatial points only
+    (``jno._fem._eval_value_node_at``), so ``t0`` read the x column and the start state was x, silently."""
     r = jno.shape.rect(0, 0, 1, 1, size=1 / 4)
-    d = (r.structured() if path == "fdm" else r).domain(time=(0.0, 0.5, 3))
+    d = (r.structured() if path == "fdm" else r).domain(time=(0.3, 0.8, 3))
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb = d.variable("boundary", split=True)
     x0, y0, t0 = d.variable("initial", split=True)
@@ -438,7 +439,7 @@ def test_an_initial_condition_may_mention_the_time_coordinate(path):
         out = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb, tb) - 0.0, u(x0, y0, t0) - t0]).solve()
         traj = np.asarray(out.fn() if hasattr(out, "fn") else out)
     start = traj.reshape(traj.shape[0], -1)[0]
-    assert np.abs(start).max() < 1e-12, f"the start state is not t0 = 0 everywhere: max {np.abs(start).max():.3g}"
+    assert np.abs(start - 0.3).max() < 1e-12, f"the start state is not t0 = 0.3 everywhere: {start[:4]}"
 
 
 # ==================================================================================================
