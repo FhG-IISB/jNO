@@ -2253,6 +2253,15 @@ class Model(Placeholder):
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
                     or an already-constructed transform.
         """
+        if getattr(self, "_jno_fixed_by_eager_solve", False):
+            # jno.fdm decides what is trainable when `.solve()` runs, and an eager solve already baked this
+            # network into its result at the stored weights: an optimizer attached now would train nothing.
+            raise RuntimeError(
+                "Model.optimizer: this network was already used as a FIXED coefficient by an eager "
+                "`jno.fdm(...).solve()` (it had no optimizer then), so an optimizer attached now cannot reach that "
+                "result and would train nothing. jno.fdm decides what is trainable when `.solve()` runs: attach "
+                "the optimizer before calling `.solve()`."
+            )
         if self._mask_scope_pending and self._param_mask is not None:
             # One-shot masked scope: consume mask on this call.
             group = self._get_or_create_group()

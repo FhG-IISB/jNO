@@ -567,23 +567,15 @@ def test_fdm_net_coefficient_recovered_via_crux():
 
 
 def test_fdm_optimizer_attached_after_the_solve_fails_loudly():
-    """jno.fdm decides what is trainable when ``.solve()`` runs. A network given its optimizer only AFTER the
-    solve was baked in at its stored weights, and the returned array cannot carry it: training on that array
-    must raise, not quietly leave the network alone. Solving again after attaching the optimizer is the fix,
-    and then training runs."""
-    u_obs = _evaluate(_fdm_problem(lambda x, y: 1.0 + 0.5 * x).solve())
+    """jno.fdm decides what is trainable when ``.solve()`` runs. A network given its optimizer only AFTER an
+    eager solve was baked into that result at its stored weights, where no optimizer can reach it: attaching
+    one then must raise, not quietly train nothing. Attaching it before the solve is the working order."""
     net = _affine_net(1.3, 0.0)
-    problem = _fdm_problem(lambda x, y: net(x, y))
-    stale = problem.solve()  # no optimizer yet: an eager solve at the stored weights
+    stale = _fdm_problem(lambda x, y: net(x, y)).solve()  # no optimizer yet: an eager solve at stored weights
     assert not isinstance(stale, Placeholder)
-    net.optimizer(optax.adam(2e-2))  # too late for `stale`
-    # the stale array inside a real loss (next to another trainable), where training would otherwise run and
-    # simply never move the network
-    c = jno.np.parameter((1,), name="late_opt_scale").initialize(lambda *a, **kw: jnp.array([1.0]))
-    c.optimizer(optax.adam(1e-2))
-    with pytest.raises(RuntimeError, match="attach the optimizer first"):
-        jno.core([(c * jnp.asarray(stale) - u_obs).mse], domain=_DUMMY).solve(1)
+    with pytest.raises(RuntimeError, match="attach the optimizer before calling"):
+        net.optimizer(optax.adam(2e-2))
 
-    fresh = problem.solve()  # after attaching: a deferred node that carries the network
-    assert isinstance(fresh, Placeholder)
-    jno.core([(fresh - u_obs).mse], domain=_DUMMY).solve(1)  # trains, no error
+    fresh_net = _affine_net(1.3, 0.0)
+    fresh_net.optimizer(optax.adam(2e-2))  # the working order: optimizer first ...
+    assert isinstance(_fdm_problem(lambda x, y: fresh_net(x, y)).solve(), Placeholder)  # ... then a trainable node

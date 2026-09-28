@@ -2010,19 +2010,6 @@ class core:
                 interface_conditions=getattr(self, "_dd_interfaces", None),
             ).solve(tol=1e-7, max_iter=int(epochs) if epochs and epochs != 1000 else 400)
 
-        from .fdm import _stale_fixed_networks
-
-        _stale = _stale_fixed_networks(set(self._collect_flax_modules()))
-        if _stale:
-            raise RuntimeError(
-                f"jno.core.solve: {len(_stale)} network(s) with an optimizer attached "
-                f"({', '.join(repr(getattr(m, 'name', None) or m.layer_id) for m in _stale)}) were baked into an "
-                "earlier `jno.fdm(...).solve()` at their stored weights, before the optimizer was attached, and "
-                "nothing in this loss depends on them -- training would leave them untouched. jno.fdm decides what "
-                "is trainable when `.solve()` runs: attach the optimizer first, then call `.solve()` again and use "
-                "that result in the loss."
-            )
-
         from contextlib import nullcontext
 
         from jax._src import profiler as _jax_profiler

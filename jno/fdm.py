@@ -834,25 +834,6 @@ def _normal_jacobians(node):
     return [j for c in _iter(n) for j in _normal_jacobians(c)]
 
 
-#: ``{layer_id: weakref(model)}`` of networks an eager ``jno.fdm(...).solve()`` evaluated at their stored
-#: weights -- see :meth:`_TraceFDM._record_fixed_networks`.
-_FIXED_BY_EAGER_SOLVE: dict = {}
-
-
-def _stale_fixed_networks(in_graph) -> list:
-    """Networks that an eager FDM solve baked in as fixed coefficients, that now carry an optimizer, and that
-    nothing in the loss being trained depends on (``in_graph``: the layer ids ``jno.core`` collected). Training
-    would leave them untouched, silently."""
-    out = []
-    for lid, ref in list(_FIXED_BY_EAGER_SOLVE.items()):
-        m = ref()
-        if m is None:
-            _FIXED_BY_EAGER_SOLVE.pop(lid, None)
-        elif getattr(m, "_opt_fn", None) is not None and lid not in in_graph:
-            out.append(m)
-    return out
-
-
 class _TraceFDM:
     """Finite-difference system authored as a fem-style constraint list with ``u = domain.unknown()``:
     ``jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()``. Constraints are classified by the
@@ -1711,13 +1692,11 @@ class _TraceFDM:
         return found
 
     def _record_fixed_networks(self):
-        """Remember every network this solve bakes in at its stored weights (no optimizer yet, not frozen).
+        """Mark every network this solve bakes in at its stored weights (no optimizer yet, not frozen).
 
         Trainability is decided here, at ``.solve()``: an optimizer attached to such a network AFTERWARDS does
-        not reach the array this solve returned, so training would silently leave the network alone.
-        ``jno.core`` checks these records when it trains (:func:`_stale_fixed_networks`) and raises."""
-        import weakref
-
+        not reach the array this solve returned, so training would silently leave the network alone. The mark
+        makes that late ``.optimizer(...)`` raise (see ``Model.optimizer``)."""
         from .trace import ModelCall
 
         def walk(n):
@@ -1730,7 +1709,7 @@ class _TraceFDM:
                 and not getattr(m, "_frozen", False)
                 and getattr(m, "_opt_fn", None) is None
             ):
-                _FIXED_BY_EAGER_SOLVE[m.layer_id] = weakref.ref(m)
+                m._jno_fixed_by_eager_solve = True
             for c in _iter(n):
                 walk(c)
 
