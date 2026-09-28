@@ -960,6 +960,43 @@ def _l2_project_across_meshes(src_pts, src_cells, src_state, src_layout, dst_pts
     return _np.concatenate([o.reshape(-1) for o in out])[:total_dst]
 
 
+def _mass_cg(m_loc, cf, n_nodes: int, b, *, x0=None, tol: float, maxiter: int):
+    """Solve ``M x = b`` for the P{k} mass whose element blocks are ``m_loc`` ``(n_cells, n_dof, n_dof)`` on the
+    connectivity ``cf``: matrix-free Jacobi-CG, the vector mass being ``M (x) I`` so every column of ``b``
+    ``(n_nodes, vec)`` rides one solve. Shared by the conservative transfer and the adaptivity criterion."""
+    import jax
+    import jax.numpy as jnp
+
+    cf = jnp.asarray(cf)
+    m_diag = jax.ops.segment_sum(jnp.einsum("cii->ci", m_loc).reshape(-1), cf.reshape(-1), num_segments=n_nodes)
+    jac = 1.0 / jnp.where(jnp.abs(m_diag) > 1e-30, m_diag, 1.0)
+
+    def mass_apply(z):
+        """The scalar mass applied to every component at once -- the vector mass is M (x) I."""
+        out_c = jnp.einsum("cij,cjv->civ", m_loc, z[cf])
+        return jax.ops.segment_sum(out_c.reshape(-1, z.shape[-1]), cf.reshape(-1), num_segments=n_nodes)
+
+    return jax.scipy.sparse.linalg.cg(
+        mass_apply, b, x0=x0, tol=tol, atol=0.0, maxiter=maxiter, M=lambda z: jac[:, None] * z
+    )[0]
+
+
+def _lagrange_cell_mass(X, cells, dim: int, order: int):
+    """Element mass blocks ``∫_K φ_i φ_j`` of the P{order} nodal-Lagrange basis on the straight-sided simplices
+    ``cells`` of ``X`` -- integrated EXACTLY (degree 2·order), as :func:`_l2_transfer_jax` does."""
+    import jax.numpy as jnp
+    from basix import CellType, make_quadrature
+
+    ct = {1: CellType.interval, 2: CellType.triangle}.get(dim, CellType.tetrahedron)
+    qp, qw = make_quadrature(ct, max(3, 2 * int(order)))
+    X, cells = jnp.asarray(X), jnp.asarray(cells)
+    v = X[cells]
+    J = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=2)
+    detJ = jnp.abs(jnp.linalg.det(J))
+    phi_q = jnp.asarray(_tabulate_lagrange_at(dim, int(order), np.asarray(qp, dtype=np.float64)), dtype=X.dtype)
+    return jnp.einsum("q,c,qi,qj->cij", jnp.asarray(qw, dtype=X.dtype), detJ, phi_q, phi_q)
+
+
 def _l2_transfer_jax(
     X_old, X_new, cells, dim, u, off, *, orders=None, vecs=None, cells_f=None, qdeg=None, tol=None, maxiter: int = 200
 ):
@@ -1118,20 +1155,10 @@ def _l2_transfer_jax(
         # meshes coincide: `b - M u_old` must be exactly zero there. With two routes it was ~1e-7 in
         # float32 and a still mesh drifted instead of transferring untouched.
         m_loc = jnp.einsum("q,c,qi,qj->cij", qw_j, detJ, phi_q, phi_q)
-        m_diag = jax.ops.segment_sum(jnp.einsum("cii->ci", m_loc).reshape(-1), cf.reshape(-1), num_segments=n_nodes)
-        jac = 1.0 / jnp.where(jnp.abs(m_diag) > 1e-30, m_diag, 1.0)
-
-        def mass_apply(z, _m=m_loc, _cf=cf, _n=n_nodes):
-            """The scalar mass applied to every component at once -- the vector mass is M (x) I."""
-            out_c = jnp.einsum("cij,cjv->civ", _m, z[_cf])
-            return jax.ops.segment_sum(out_c.reshape(-1, z.shape[-1]), _cf.reshape(-1), num_segments=_n)
-
         # b_i = sum_c sum_q w_q |det J_c| u_old(xq) phi_i(qp_q)
         b_c = jnp.einsum("q,c,cqv,qi->civ", qw_j, detJ, uq, phi_q)
         b = jax.ops.segment_sum(b_c.reshape(-1, vec), cf.reshape(-1), num_segments=n_nodes)
-        sol = jax.scipy.sparse.linalg.cg(
-            mass_apply, b, x0=blk, tol=tol, atol=0.0, maxiter=maxiter, M=lambda z, _j=jac: _j[:, None] * z
-        )[0]
+        sol = _mass_cg(m_loc, cf, n_nodes, b, x0=blk, tol=tol, maxiter=maxiter)
         outs.append(sol.reshape(-1))
     return jnp.concatenate(outs), esc.reshape(n_cells, -1)
 
@@ -1814,10 +1841,38 @@ def _criterion_nodal(
     offs = list(getattr(fem, "offsets", None) or [0, num.size])
     lo, hi = int(offs[field]), int(offs[field + 1])
     n_nodes, vec = _field_vec(fem, field)
+    order = _criterion_field_order(fem, field)
+    if order >= 2 and stride == 1:
+        # `int g phi_i / int phi_i` is a projection only when every `int phi_i` is positive, which holds for P1
+        # and FAILS from P2 on: a P2 vertex basis function integrates to ZERO on a triangle (negative on a
+        # tetrahedron), so those rows came out as round-off / 1e-30 -- measured 4.6e11 to 2.5e13 for a
+        # criterion 1 + x that lies in [1, 2], and the cells were marked on exactly those rows. Solve with the
+        # CONSISTENT mass instead: the L2 projection the conservative transfer already uses (`_mass_cg`).
+        d = fem.domain
+        dim = int(d.dimension)
+        key = {1: "line", 2: "triangle"}.get(dim, "tetra")
+        X = np.asarray(d.mesh.points)[:, :dim].astype(np.float64)
+        cells = np.asarray(d.mesh.cells_dict[key]).astype(np.int64)
+        cf = np.asarray(_field_layout(fem)["cells_f"][field])
+        rhs = np.asarray(num[lo:hi]).reshape(n_nodes, vec)
+        proj = _mass_cg(
+            _lagrange_cell_mass(X, cells, dim, order), cf, n_nodes, rhs, tol=1e-12, maxiter=max(200, 4 * n_nodes)
+        )
+        return np.linalg.norm(np.asarray(proj), axis=1)
     a = np.linalg.norm(num[lo:hi].reshape(n_nodes, vec), axis=1)
     b = np.linalg.norm(mass[lo:hi].reshape(n_nodes, vec), axis=1)
     g = np.nan_to_num(a / np.maximum(b, 1e-30), nan=0.0, posinf=0.0, neginf=0.0)
     return g[::stride] if stride > 1 else g
+
+
+def _criterion_field_order(fem: Any, field: int) -> int:
+    """Element order of ``field`` in a native nodal-Lagrange assembly, 1 when the problem does not record it
+    (every other route keeps the lumped nodal projection, which is right for P1)."""
+    orders = getattr(fem.domain, "_fem_native_field_orders", None)
+    try:
+        return int(orders[field]) if orders is not None else 1
+    except (IndexError, TypeError, ValueError):
+        return 1
 
 
 def _criterion_margin(fem: Any, constraint: Any, u: np.ndarray, field: int = 0, t: float = 0.0) -> np.ndarray:
