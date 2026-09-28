@@ -4412,6 +4412,268 @@ _ELEM_MAP_CONTENT_MAX = 128
 #: per-type tally of the leaves that defeated content keying (``content_bail``).
 _ELEM_MAP_STATS: Dict[str, Any] = {"id_hits": 0, "content_hits": 0, "misses": 0, "content_bail": {}}
 
+#: Arrays at least this large are LIFTED out of an element function's closure and passed to its
+#: compiled program as arguments instead of being baked in as constants. See :func:`_lift_plan`.
+_LIFT_MIN_BYTES = 1 << 16
+#: ``JNO_ELEM_MAP_LIFT=0`` restores the baked path everywhere (A/B measurement).
+import os as _os
+
+_LIFT_ENABLED = _os.environ.get("JNO_ELEM_MAP_LIFT", "1") != "0"
+#: Compiled lifted programs, keyed by the lifted CONTENT key (big arrays by aval, the rest by value).
+_ELEM_MAP_LIFTED: "OrderedDict[tuple, Any]" = OrderedDict()
+_ELEM_MAP_LIFTED_MAX = 128
+
+
+def _liftable(x):
+    """A value that is lifted to a jit ARGUMENT: a concrete jax array of at least ``_LIFT_MIN_BYTES``.
+
+    numpy arrays stay baked: passing one as an argument converts it to a device array on EVERY call,
+    where a baked constant is converted once. Every array the element closures were measured to
+    capture (connectivity, dof maps, edge signs, coordinates, masks) is already a jax array."""
+    return isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) and x.nbytes >= _LIFT_MIN_BYTES
+
+
+def _computes_at_trace_time(f):
+    """Does ``f`` deliberately compute CONCRETE values while being traced (``ensure_compile_time_eval``)?
+
+    Such a function -- a lazily-filled geometry or pattern memo -- needs its captured arrays concrete:
+    fed tracers, its memo would store a tracer and leak it into the next trace. It is left exactly as
+    it is (original closure, arrays baked), which is what it was written for."""
+    return "ensure_compile_time_eval" in f.__code__.co_names
+
+
+def _graph_has_tracer(fn):
+    """Is there a tracer anywhere in ``fn``'s closure graph (functions, tuples, lists, dicts)?"""
+    import types as _types
+
+    seen, stack = set(), [fn]
+    while stack:
+        x = stack.pop()
+        if id(x) in seen:
+            continue
+        seen.add(id(x))
+        if isinstance(x, jax.core.Tracer):
+            return True
+        if isinstance(x, _types.FunctionType):
+            for c in x.__closure__ or ():
+                try:
+                    stack.append(c.cell_contents)
+                except ValueError:
+                    return True  # unfilled cell: treat as not liftable
+            stack.extend(x.__defaults__ or ())
+        elif type(x) in (tuple, list):
+            stack.extend(x)
+        elif type(x) is dict:
+            stack.extend(x.values())
+    return False
+
+
+def _lift_plan(fn):
+    """Split ``fn``'s closure graph into a static SKELETON and the large arrays it captures.
+
+    **Why.** ``jax.jit`` of a closure bakes every captured array into the program as a constant. For
+    an assembly kernel those are the mesh: connectivity, dof maps, edge signs, coordinates, region
+    masks. Each is then held once by the traced jaxpr, again by the lowered module and again by the
+    compiled executable, and the kernel cache pins the closure itself. Measured on a 1.29M-tet
+    Nedelec problem: 9.5 GB of the 13.9 GB resident after assembly was these copies (live arrays:
+    3.1 GB); on 275k tets, 2.1 of 4.1 GB. Lifted, the program holds none of it, and depends on the
+    arrays' shapes only -- so a same-sized mesh reuses it instead of recompiling.
+
+    **What is rebuilt.** The walk follows what a trace reaches through the closure: nested functions
+    (cells, defaults), tuples, lists and dicts. Only a node that CONTAINS a lifted array is rebuilt;
+    everything else -- including every function, list and dict with nothing to lift -- is kept as the
+    original object, so identity, mutation and bookkeeping behave exactly as before. A function that
+    computes concrete values at trace time (:func:`_computes_at_trace_time`) is always kept as is.
+
+    Returns ``(spec, lifted)``, or ``None`` when there is a tracer anywhere in the graph (an enclosing
+    trace owns it), an unfilled cell, or nothing to lift -- the caller then uses the baked path.
+    """
+    import types as _types
+
+    if _graph_has_tracer(fn):
+        return None
+    lifted, lift_ix, fns, cells, fnode, cnode = [], {}, {}, {}, {}, {}
+
+    def walk(x):
+        if _liftable(x):
+            i = lift_ix.get(id(x))
+            if i is None:
+                i = lift_ix[id(x)] = len(lifted)
+                lifted.append(x)
+            return ("A", i)
+        if isinstance(x, _types.FunctionType):
+            if _computes_at_trace_time(x):
+                return ("S", x)
+            if id(x) in fnode:
+                return fnode[id(x)]  # already walked, or in progress: recursion sees the original
+            fnode[id(x)] = ("S", x)
+            cl = []
+            for c in x.__closure__ or ():
+                if id(c) not in cnode:
+                    cnode[id(c)] = ("S", c.cell_contents)  # provisional, for recursion through cells
+                    cnode[id(c)] = walk(c.cell_contents)
+                cl.append(id(c))
+            dfl = tuple(walk(d) for d in (x.__defaults__ or ()))
+            if any(cnode[cid][0] != "S" for cid in cl) or any(d[0] != "S" for d in dfl):
+                for cid in cl:
+                    cells[cid] = cnode[cid]
+                # the function's ATTRIBUTES, never the function: it holds its original cells, and so
+                # every array this plan exists to stop the cached program from pinning
+                meta = (x.__code__, x.__globals__, x.__name__, x.__qualname__, x.__module__, x.__kwdefaults__)
+                fns[id(x)] = (meta, tuple(cl), dfl)
+                fnode[id(x)] = ("F", id(x))
+            return fnode[id(x)]
+        if type(x) in (tuple, list):
+            ch = tuple(walk(y) for y in x)
+            return ("S", x) if all(n[0] == "S" for n in ch) else ("T", type(x), ch)
+        if type(x) is dict:
+            ch = tuple((k, walk(v)) for k, v in x.items())
+            return ("S", x) if all(n[0] == "S" for _, n in ch) else ("D", ch)
+        return ("S", x)
+
+    root = walk(fn)
+    if not lifted or root[0] != "F":
+        return None
+    return (root, fns, cells), lifted
+
+
+def _lift_rebuild(spec, values):
+    """Rebuild the closure graph of :func:`_lift_plan` with ``values`` in place of the lifted arrays.
+    Cells are rebuilt once each, so rebuilt sibling closures that shared a cell still share it."""
+    import types as _types
+
+    root, fns, cells = spec
+    new_fns, new_cells = {}, {}
+
+    def build(node):
+        kind = node[0]
+        if kind == "A":
+            return values[node[1]]
+        if kind == "S":
+            return node[1]
+        if kind == "T":
+            return node[1](build(y) for y in node[2])
+        if kind == "D":
+            return {k: build(v) for k, v in node[1]}
+        fid = node[1]
+        g = new_fns.get(fid)
+        if g is not None:
+            return g
+        (code, glb, name, qual, mod, kwd), cl, defaults = fns[fid]
+        fresh = [cid for cid in cl if cid not in new_cells]
+        for cid in fresh:
+            new_cells[cid] = _types.CellType()
+        g = _types.FunctionType(code, glb, name, None, tuple(new_cells[cid] for cid in cl) or None)
+        g.__qualname__, g.__module__, g.__kwdefaults__ = qual, mod, kwd
+        new_fns[fid] = g
+        for cid in fresh:
+            new_cells[cid].cell_contents = build(cells[cid])
+        if defaults:
+            g.__defaults__ = tuple(build(d) for d in defaults)
+        return g
+
+    return build(root)
+
+
+class _LiftedAval:
+    """Stand-in for a lifted array in the SHADOW graph a content key is computed from: it tokens as
+    its aval, so exactly the arrays that are arguments -- and no others -- are keyed by shape."""
+
+    __slots__ = ("token",)
+
+    def __init__(self, a):
+        self.token = ("lifted", tuple(a.shape), str(a.dtype), bool(getattr(a, "weak_type", False)))
+
+
+def _elem_run(fn, chunk, scatter):
+    """``(run, extra_arrays, key_chunk)`` -- the vmapped/chunked (and optionally scattering) program of
+    :func:`elem_map` for element function ``fn``."""
+    if scatter is not None:
+        if chunk is None:
+            run = lambda *a: a[-2].at[a[-1].reshape(-1)].add(jax.vmap(fn)(*a[:-2]).reshape(-1).astype(a[-2].dtype))  # noqa: E731
+        else:
+            c = int(chunk)
+            run = lambda *a: _chunked_scatter(fn, a[:-2], c, a[-2], a[-1])  # noqa: E731
+        return run, tuple(scatter), ("scatter", chunk)
+    if chunk is None:
+        return jax.vmap(fn), (), chunk
+    c = int(chunk)
+    return (lambda *a: jax.lax.map(lambda z: fn(*z), a, batch_size=c)), (), chunk
+
+
+def _spec_key(spec, lifted):
+    """Identity key of a lift skeleton: code objects and closure structure canonically numbered (so
+    shared cells and recursion are part of the key), lifted arrays by aval, other leaves by ``id``."""
+    root, fns, cells = spec
+    fnum, cnum = {}, {}
+
+    def tok(node):
+        kind = node[0]
+        if kind == "A":
+            a = lifted[node[1]]
+            return ("A", tuple(a.shape), str(a.dtype), bool(getattr(a, "weak_type", False)))
+        if kind == "S":
+            x = node[1]
+            if isinstance(x, (bool, int, float, complex, str, bytes, type(None))):
+                return ("V", type(x).__name__, x)
+            return ("O", id(x))
+        if kind == "T":
+            return ("T", node[1].__name__, tuple(tok(y) for y in node[2]))
+        if kind == "D":
+            return ("D", tuple((k if isinstance(k, (int, str)) else ("O", id(k)), tok(v)) for k, v in node[1]))
+        fid = node[1]
+        if fid in fnum:
+            return ("Fref", fnum[fid])
+        fnum[fid] = len(fnum)
+        meta, cl, defaults = fns[fid]
+        ctoks = []
+        for cid in cl:
+            if cid in cnum:
+                ctoks.append(("Cref", cnum[cid]))
+            else:
+                cnum[cid] = len(cnum)
+                ctoks.append(("C", tok(cells[cid])))
+        return ("F", id(meta[0]), tuple(ctoks), tuple(tok(d) for d in defaults))
+
+    return tok(root)
+
+
+def _elem_map_lifted(fn, xs, chunk, scatter):
+    """The LIFTED path of :func:`elem_map`, or ``None`` to fall back to the baked one."""
+    plan = _lift_plan(fn)
+    if plan is None:
+        _ELEM_MAP_STATS["lift_fallback"] = _ELEM_MAP_STATS.get("lift_fallback", 0) + 1
+        return None
+    spec, lifted = plan
+    _, extra, kchunk = _elem_run(fn, chunk, scatter)
+    ckey = _fn_content_key(_lift_rebuild(spec, [_LiftedAval(a) for a in lifted]), kchunk)
+    if ckey is None:
+        # The content tokenizer cannot key some leaf (tallied in ``content_bail``). Key on the lift
+        # skeleton instead: lifted arrays by aval, every other leaf by IDENTITY. The compiled program
+        # holds the skeleton, so those leaves cannot be collected and their ids cannot be recycled
+        # while the entry lives. A rebuild of the problem then misses and recompiles, exactly as the
+        # baked path's identity key does -- but still without pinning a single mesh array.
+        _ELEM_MAP_STATS["lift_id_keyed"] = _ELEM_MAP_STATS.get("lift_id_keyed", 0) + 1
+        key = ("lifted-id", _spec_key(spec, lifted), kchunk)
+    else:
+        key = ("lifted",) + ckey
+    jf = _ELEM_MAP_LIFTED.get(key)
+    if jf is None:
+        _ELEM_MAP_STATS["misses"] += 1
+
+        def program(big, *arrays, _spec=spec, _chunk=chunk, _sc=scatter is not None):
+            g = _lift_rebuild(_spec, big)
+            run, _, _ = _elem_run(g, _chunk, (None, None) if _sc else None)
+            return run(*arrays)
+
+        jf = _ELEM_MAP_LIFTED[key] = jax.jit(program)
+        while len(_ELEM_MAP_LIFTED) > _ELEM_MAP_LIFTED_MAX:
+            _ELEM_MAP_LIFTED.popitem(last=False)
+    else:
+        _ELEM_MAP_STATS["content_hits"] += 1
+        _ELEM_MAP_LIFTED.move_to_end(key)
+    return jf(tuple(lifted), *tuple(xs), *extra)
+
 
 def _array_digest(leaf):
     """Content identity of a baked array leaf, memoized by object id (arrays are immutable).
@@ -4553,6 +4815,8 @@ def _leaf_content_token(leaf, seen):
 
     from ...trace import Placeholder as _Ph
 
+    if isinstance(leaf, _LiftedAval):  # an ARGUMENT of the compiled program: only its aval enters it
+        return leaf.token
     if isinstance(leaf, (np.ndarray, jax.Array)):
         return _array_digest(leaf)
     if isinstance(leaf, (bool, int, float, complex, str, bytes, type(None), np.integer, np.floating, np.bool_)):
@@ -4770,7 +5034,22 @@ def elem_map(fn, xs, chunk, *, scatter=None):
 
     The regression the naive ``jax.jit(jax.vmap(fn))`` caused -- repeat solve 522 -> 1233 ms -- does
     not appear; repeats are faster than before the change, not slower.
+
+    **Geometry is now LIFTED, not baked.** Every jax array of at least ``_LIFT_MIN_BYTES`` reachable
+    through ``fn``'s closure graph (nested functions, tuples, lists, dicts) is passed to the compiled
+    program as an argument (:func:`_lift_plan`), and the program is keyed on the arrays' avals, not
+    their values. Baked, those arrays -- connectivity, dof maps, edge signs, coordinates, masks -- were
+    held by the traced jaxpr, the lowered module and the executable, and pinned by this cache:
+    measured on a 1.29M-tet Nedelec problem, the resident memory after assembly fell from 13.9 GB to
+    5.0 GB and the whole run's peak from 22.1 GB to 9.5 GB, bit-identical operator. A same-sized mesh
+    now reuses the compiled program. The baked path remains the fallback for a closure the lift cannot
+    take (a tracer among the captures, an unfilled cell, nothing large to lift);
+    ``JNO_ELEM_MAP_LIFT=0`` forces it everywhere.
     """
+    if _LIFT_ENABLED:
+        out_l = _elem_map_lifted(fn, xs, chunk, scatter)
+        if out_l is not None:
+            return out_l
     if scatter is not None:
         # ``scatter=(out, index)``: return ``out.at[index].add(per_cell)`` instead of the per-cell array.
         # Chunked, the per-cell array is never built: stacking it through ``lax.map`` cost one write of the
