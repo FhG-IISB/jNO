@@ -3330,6 +3330,14 @@ class FEM:
         from . import solve as _solve
         from .utils.solver.solver_api import LinearOperator
 
+        if getattr(self._op, "is_parametric", False):
+            names = sorted(getattr(self._op, "runtime_parameter_exprs", {}) or {})
+            raise NotImplementedError(
+                f"FEM.eigs: this form carries trainable parameter(s) {names}, and an eigensolve here would need "
+                "their values. For eigenvalues differentiable in them, assemble at the values and call the "
+                "solver directly: `K, _ = fem.operator.evaluate({name: value}); M, _ = mass_fem.operator; "
+                "lam, X = jno.solve.eigs(k=...)(K, M)` -- gradients flow through `evaluate` and the eigensolve."
+            )
         K = self.operator[0]
         n_full = int(jnp.shape(K)[0] if getattr(K, "shape", None) is not None else LinearOperator(K).shape[0])
         # Read the constraint sets BEFORE assembling the mass form. `_fem_native_dirichlet_pairs` is
@@ -7212,6 +7220,16 @@ def _fem_impl(
             f"reports dimension {getattr(domain, 'dimension', None)!r}. Use an FEM trial "
             "(`d.fem_symbols()` written against the same weak form), or a collocation PINN."
         )
+    if is_vpinn and int(getattr(domain, "_batch_count", 1) or 1) > 1:
+        # Built without complaint, it then died at evaluation on `Expected shape_vals_flat.ndim == 2`: the
+        # FE tables are per-mesh, and the batch count is read off every context entry (see
+        # `domain._effective_batch_count`), so the table was split row by row as if rows were samples.
+        raise NotImplementedError(
+            f"jno.fem: a VPINN (network trial) on a batched domain ({domain._batch_count} * domain) is not "
+            "supported -- the test-projection tables are per mesh, not per sample. For an operator over a "
+            "family of problems, train on the assembled FE residual instead (`fem.residual(U, args)` "
+            "wrapped with `jno.fn` per sample; see tests/test_hybrid_nn_fem.py), or use one domain per sample."
+        )
     if is_vpinn and periodic_ties:
         raise NotImplementedError(
             "jno.fem: a VPINN (network trial) does not compose with periodic ties -- the tie is imposed "
@@ -7534,6 +7552,14 @@ def _assemble_multifield(
     # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
     _cx_coupled = _is_complex_form(domain, ir)
     _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
+    _par_names = sorted(
+        {
+            str(getattr(n.model, "_parameter_name", None) or "a trainable network")
+            for b in weak_bares
+            for n in _walk(b)
+            if type(n).__name__ == "ModelCall"
+        }
+    )
     if evolution and _cx_coupled:
         raise NotImplementedError(
             "jno.fem: `state.evolves(...)` cannot combine with a complex coupled form — complex forms "
@@ -7565,7 +7591,7 @@ def _assemble_multifield(
     # rather than mis-assemble.
     raise NotImplementedError(
         "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
-        f"parameter ({_par_coupled}) and is linear with no step history, so it would take the coupled "
+        f"parameter ({', '.join(_par_names) or 'unnamed'}) and is linear with no step history, so it would take the coupled "
         "linear assembly, which has no parametric route. Recover the parameter on a single-field "
         "reduced form, on a coupled NONLINEAR form or a load-path march (`domain(tau=...)` + `.i(k)`) "
         "-- both assemble as a residual operator -- or through a coupled first-order transient."

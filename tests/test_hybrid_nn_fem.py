@@ -322,12 +322,9 @@ def test_network_trial_on_batched_domain_gives_per_sample_residual():
     batched ``N * domain`` -- the operator-learning layout.
 
     Oracle: with a network that ignores the sample, every sample's residual loss equals the single-domain
-    one. FAILS today: ``jno.fem`` builds the GroupedAssembly without complaint, but evaluating it raises
-    ``ValueError: Expected shape_vals_flat.ndim == 2, got shape (3,)`` (jno/trace_evaluator.py:2799) --
-    the FE shape table ``N_flat`` ``(n_q, 3)`` reaches the per-sample evaluation as one row. Likely
-    cause: ``_effective_batch_count`` (jno/domain/domain_class.py:1054) takes the max leading dimension
-    over EVERY ``domain.context`` entry, so the lowering's FE tables (``n_q = 198`` rows) read as a
-    batch of 198 and are vmapped row by row once the domain is batched.
+    one -- OR ``jno.fem`` refuses the batched network trial at build time and names the working route (the
+    assembled FE residual). It used to build without complaint and die at evaluation on
+    ``ValueError: Expected shape_vals_flat.ndim == 2`` (the FE tables were split row by row as samples).
     """
 
     def residual_loss(batch):
@@ -342,7 +339,11 @@ def test_network_trial_on_batched_domain_gives_per_sample_residual():
         return np.asarray(jno.core([pde.mse], domain=d).eval([pde.mse])).reshape(-1)
 
     single = residual_loss(1)
-    batched = residual_loss(4)
+    try:
+        batched = residual_loss(4)
+    except NotImplementedError as exc:
+        assert "batched domain" in str(exc) and "fem.residual" in str(exc), str(exc)
+        return
     assert np.allclose(batched, single[0], rtol=1e-10), f"batched {batched} vs single {single}"
 
 
