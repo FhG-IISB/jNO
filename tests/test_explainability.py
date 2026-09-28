@@ -864,10 +864,9 @@ def test_gradient_trackers_run_on_a_trace_containing_a_sparse_solve():
 
     cos = np.asarray(cs.value["cos_sim_matrix"])
     assert cos.shape == (2, 2) and np.all(np.isfinite(cos))
-    # atol=1e-3, not 1e-5: the matrix's two evaluation paths (batched vs single) disagree at GPU
-    # noise level -- measured diag 0.99988 on cuda where cpu gives 1-1e-9. This test pins that the
-    # trackers RUN and COEXIST on a sparse-solve trace, not the self-similarity precision.
-    np.testing.assert_allclose(np.diag(cos), np.ones(2), atol=1e-3)
+    # The self-similarity is 1 to float32 precision on every device. It was 0.99988 / 1.00016 on an Ampere
+    # GPU, where the default float32 matmul is TF32 -- a cosine above 1; the matrix is now HIGHEST precision.
+    np.testing.assert_allclose(np.diag(cos), np.ones(2), atol=1e-5)
     assert np.all(np.abs(cos) <= 1.0 + 1e-5)
 
     align = np.asarray(ga.value["alignment"]).reshape(-1)
