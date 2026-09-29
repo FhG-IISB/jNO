@@ -130,13 +130,16 @@ def test_the_bdf2_march_is_judged_too():
         np.asarray(fem.solve(nonlinear=capped, time=jno.solve.bdf2()).fn())
 
 
-def test_the_bdf2_startup_step_is_covered_by_the_drivers_own_guard():
-    """BDF2's backward-Euler startup step runs OUTSIDE the scan, so its iterate is concrete and the
-    DRIVER's eager check fires on it directly -- the march needs no second guard there. Pinned
-    because it is the reason the startup step is not judged alongside the scan's steps."""
+def test_the_bdf2_startup_step_is_guarded():
+    """BDF2's backward-Euler startup step must not slip through unjudged. It used to run OUTSIDE the scan, so
+    the Newton driver's own eager check fired on it; since the march became one cached, compiled program
+    (#147) the startup step is traced with it and the MARCH's guard judges it instead. Either guard is
+    correct -- what is pinned is that a non-converged startup step raises, and says it was the first step."""
     fem = _heat()
     capped = jno.solve.newton(max_steps=1, rtol=1e-14, atol=1e-14)
-    with pytest.raises(RuntimeError, match=r"newton_krylov did not converge in max_steps=1"):
+    with pytest.raises(
+        RuntimeError, match=r"newton_(krylov|direct) did not converge in max_steps=1|did not converge at step 1 of"
+    ):
         np.asarray(fem.solve(nonlinear=capped, time=jno.solve.bdf2()).fn())
 
 
