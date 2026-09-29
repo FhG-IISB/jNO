@@ -21,6 +21,8 @@ it travels through every path a scheme string does, and a kernel reads its optio
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 _FAMILY = "finite_difference"
@@ -176,11 +178,11 @@ class FDStencil(str):
 def fd(
     *,
     order: int | None = None,
-    points=None,
-    weights=None,
+    points: tuple[int, ...] | None = None,
+    weights: dict[int, float] | None = None,
     boundary: int | None = None,
     average: str | None = None,
-    upwind=None,
+    upwind: Any = None,
     fit: int | None = None,
     rings: int | None = None,
 ) -> FDStencil:
