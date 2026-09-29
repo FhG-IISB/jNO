@@ -130,15 +130,18 @@ for mod, extra, unlocks in OPTIONAL:
     print(f"  {'yes' if have else ' no'}  {mod:<13} {extra:<7} {unlocks}")
 ```
 
+In the repository's default pixi environment (which adds `pymetis`), on a CPU, it prints:
+
 ```text
-jNO 0.3.1 · JAX 0.10.1 · x64=False
+jNO 0.4.0 · JAX 0.10.1 · x64=False
 devices: ['cpu:0']
-  yes  mmgpy         [fem]   adaptive remeshing — fem.solve(adapt=...)
+   no  mmgpy         [fem]   adaptive remeshing — fem.solve(adapt=...)
    no  pypardiso     [fem]   sparse-direct on CPU — jno.solve.lu(backend="pardiso")
    no  nvmath        [fem]   sparse-direct on GPU — jno.solve.lu(backend="cudss")
-  yes  jaxamg        [amg]   GPU algebraic multigrid — jno.solve.amg()
+   no  jaxamg        [amg]   GPU algebraic multigrid — jno.solve.amg()
    no  fmmax         [rcwa]  anisotropic RCWA layers
    no  iree.runtime  [iree]  ahead-of-time export — model.to_iree(...)
+  yes  pymetis       [metis] graph partition — jno.precond.schwarz()  ([fem] and [fdm] pull it in)
   yes  matfree               matrix functions — jno.solve.logdet / applyfun
   yes  pyamg                 CPU algebraic multigrid — jno.precond.amg()
 ```

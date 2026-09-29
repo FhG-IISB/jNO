@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax-numerical-operators"
-version = "0.3.1"
+version = "0.4.0"
 description = "Differentiable numerical methods in JAX (FEM, FDM, spectral) with scientific machine learning"
 readme = "README.md"
 requires-python = ">=3.11, <3.15"
@@ -55,6 +55,7 @@ Homepage = "https://github.com/FhG-IISB/jno"
 Documentation = "https://fhg-iisb.github.io/jNO/"
 Source = "https://github.com/FhG-IISB/jno"
 Issues = "https://github.com/FhG-IISB/jno/issues"
+Changelog = "https://github.com/FhG-IISB/jNO/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # NVIDIA GPU support: swaps in the CUDA-capable JAX build. Same version pin as the core `jax`
