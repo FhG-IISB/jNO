@@ -1,6 +1,6 @@
 name: Nightly (full suite)
 
-# The complete 232-file suite, unfiltered. This is what makes the PR-side path filtering in ci.yml
+# The complete suite, unfiltered. This is what makes the PR-side path filtering in ci.yml
 # safe: if a filter is scoped too narrowly, the miss surfaces here within a day rather than never.
 # Do not add path filters to this workflow -- running everything is its entire purpose.
 #
