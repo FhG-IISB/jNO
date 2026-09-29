@@ -59,11 +59,13 @@ def _spd(n, seed=0, shift=0.0):
 
 @pytest.mark.parametrize("backend,name", [("device", "lu"), ("host", "lu-host"), ("cudss", "lu-cudss")])
 def test_backend_names_are_distinct(backend, name):
-    """Each placement reports its own name, so two specs are never cached as the same solver."""
+    """Each placement reports its own name, so two specs are never cached as the same solver. Every backend has a
+    vmap rule since #147 (the device ``spsolve`` and the factor-once host/cuDSS paths; exercised in
+    ``tests/test_sparse_batching.py``), and the trait says so."""
     spec = jno.solve.lu(backend=backend)
     assert spec.name == name
     assert spec.direct is True
-    assert spec.traits["vmap"] == "no"
+    assert spec.traits["vmap"] == "yes"
 
 
 def test_host_kwarg_still_selects_the_host_backend():
