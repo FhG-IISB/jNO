@@ -101,7 +101,7 @@ and `-e dev` (adds matplotlib and the test tooling).
 
 ## Check what you actually got
 
-Seven optional extras means a missing one usually surfaces much later, as an `ImportError` in the
+Eleven optional extras means a missing one usually surfaces much later, as an `ImportError` in the
 middle of a solve. This reports it up front — devices, precision, and which backends imported:
 
 ```python
@@ -117,7 +117,8 @@ OPTIONAL = [
     ("nvmath",       "[fem]",  'sparse-direct on GPU — jno.solve.lu(backend="cudss")'),
     ("jaxamg",       "[amg]",  "GPU algebraic multigrid — jno.solve.amg()"),
     ("fmmax",        "[rcwa]", "anisotropic RCWA layers"),
-    ("iree.runtime", "[iree]", "ahead-of-time export — model.iree(...)"),
+    ("iree.runtime", "[iree]", "ahead-of-time export — model.to_iree(...)"),
+    ("pymetis",      "[metis]", "graph partition — jno.precond.schwarz()  ([fem] and [fdm] pull it in)"),
     ("matfree",      "",       "matrix functions — jno.solve.logdet / applyfun"),
     ("pyamg",        "",       "CPU algebraic multigrid — jno.precond.amg()"),
 ]
@@ -137,7 +138,7 @@ devices: ['cpu:0']
    no  nvmath        [fem]   sparse-direct on GPU — jno.solve.lu(backend="cudss")
   yes  jaxamg        [amg]   GPU algebraic multigrid — jno.solve.amg()
    no  fmmax         [rcwa]  anisotropic RCWA layers
-   no  iree.runtime  [iree]  ahead-of-time export — model.iree(...)
+   no  iree.runtime  [iree]  ahead-of-time export — model.to_iree(...)
   yes  matfree               matrix functions — jno.solve.logdet / applyfun
   yes  pyamg                 CPU algebraic multigrid — jno.precond.amg()
 ```

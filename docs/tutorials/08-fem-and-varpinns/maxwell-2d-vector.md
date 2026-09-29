@@ -62,7 +62,7 @@ finite-element solution**, nothing painted in.
   and a genuinely complex $k^2 = 30 + 4i$ (so the real and imaginary parts truly couple). At P2 the
   recovered field matches the closed-form $E$ to $L^2$ relative error $\approx 5\times10^{-4}$.
 - **Generality by reuse:** complex lowers onto the coupled-multifield path, so it inherits linear,
-  nonlinear and transient for free — and the *same* trace expression drives a PINN.
+  nonlinear and transient for free.
 - Honest scope: this uses nodal Lagrange elements with grad–div stabilisation (the right tool for a
   smooth field); general Maxwell with reentrant corners wants Nédélec edge elements.
 

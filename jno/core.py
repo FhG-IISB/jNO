@@ -503,30 +503,34 @@ class core:
                 Controls how computation is distributed across multiple GPUs/TPUs.
 
                 - First dimension (batch): Number of devices for data parallelism.
-                Data is split across these devices, each processes different samples.
-                Parameters are replicated on all devices.
+                Data is split across these devices, each takes a share of the samples
+                (or of a single sample's points). Parameters are replicated on all devices.
 
                 - Second dimension (model): Number of devices for model parallelism.
                 Model parameters are sharded across these devices.
                 Use when model is too large to fit on a single device.
 
                 Examples:
-                    - (1, 1): No parallelism, single device (default)
+                    - (1, 1): the default -- expanded to (n_devices, 1), data parallelism
+                      over every device ``jax.devices()`` returns
                     - (2, 1): Pure data parallelism on 2 GPUs - 2x throughput
                     - (1, 2): Pure model parallelism on 2 GPUs - fit 2x larger models
                     - (4, 1): Data parallelism on 4 GPUs - 4x throughput
                     - (2, 2): Hybrid parallelism on 4 GPUs - 2x data, 2x model
                     - (4, 2): Hybrid parallelism on 8 GPUs - 4x data, 2x model
 
-                Note: batch * model must equal the total number of available devices.
+                Note: batch * model must equal the total number of available devices;
+                any other shape logs a warning and falls back to (n_devices, 1). To run on
+                one device, make only that one visible to JAX (e.g. ``CUDA_VISIBLE_DEVICES``).
 
                 Recommendations:
                     - Model fits on 1 GPU: Use (n_devices, 1) for maximum throughput
                     - Model doesn't fit on 1 GPU: Use (1, n_devices) for model sharding
                     - Large model + large data: Use hybrid, e.g., (2, 2) on 4 GPUs
 
-                Default: (1, 1), automatically expanded to (n_devices, 1) for pure
-                data parallelism when multiple devices are available.
+                Default: (1, 1), expanded to (n_devices, 1): pure data parallelism over
+                every visible device. Each training array is split over its samples, else
+                over the points of a single sample, else replicated.
 
             resume_from: Path to a checkpoint directory written by
                 :class:`~jno.utils.callbacks.CheckpointCallback`.  When

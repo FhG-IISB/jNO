@@ -55,7 +55,9 @@ The trained network matches the analytic $x(1-x)y(1-y)$ to rel-$L^2 \approx 7\ti
 - **Same entry as FEM.** A network trial vs an FE trial is the only difference; `jno.fem` routes by
   detecting the `ModelCall`, and the returned `.mse` is an ordinary jNO loss for `jno.core`.
 - **Declare the Dirichlet boundary** (`u(boundary) - g`) so its test functions are masked.
-- Single-field 2-D/3-D for now (1-D and coupled multi-field raise a clear error).
+- Single-field — scalar or vector — on 1-D, 2-D and 3-D meshes, steady only. Two separate
+  `fem_symbols` raise a clear error; a coupled system whose fields share a test space can be written as
+  one vector field instead.
 
 ## Full script
 

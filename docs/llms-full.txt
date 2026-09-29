@@ -292,8 +292,9 @@ passes the value through. Both chain.
 ## 6. Training — `jno.core`
 
 ```python
-crux = jno.core(constraints=[pde.mse, bc.mse], domain=d, rng_seed=42,
-                weights=[1.0, 10.0], mesh=(1, 1))   # mesh = (batch_devices, model_devices)
+crux = jno.core(constraints=[pde.mse, 10.0 * bc.mse], domain=d,   # weight a term by multiplying it
+                mesh=(1, 1))   # mesh = (batch_devices, model_devices); (1, 1) = every device, data-parallel
+# the seed is JNO_SEED (env) or [jno] seed in .jno.toml -- not a jno.core argument
 stats = crux.solve(epochs=10_000, batchsize=32, callbacks=[...], min_consecutive=None)
 stats.plot(f"{run}/training.png")
 ```
@@ -475,20 +476,25 @@ u = fem.solve(x0        = u_guess,                 # warm start
 | iterative preconditioner inside | `fgmres` |
 | symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` |
 | SPD, batched/GPU-heavy | `chebyshev` (inner-product free) |
-| indefinite, single solve | `lu` — **no vmap rule**, use a Krylov inside batched solves |
+| indefinite | `lu` — `vmap`s on every backend; `host`/`cudss`/`pardiso` factor once for a batch against one matrix, `device` factors each system |
 | cuSolver refuses it or is slow | `lu(backend="host")` (SuperLU) |
 | shift-invert eigs, constant-operator transient | `lu(backend="cudss")` |
 | a Newton loop, or no GPU | `lu(backend="pardiso")` |
 | small systems / coarse blocks | `dense` |
 
 `jno.solve.newton(damping=, rtol=1e-8, atol=1e-8, max_steps=100, line_search=, direct=)` —
-note **`rtol`/`atol`, there is no `tol=`**. `direct=True` factorises the assembled tangent each
-step; it is required, not preferred, when the matrix-free Newton-Krylov has no preconditioner to
-lean on (stiff tangents, saddle points) — otherwise it diverges to NaN.
+note **`rtol`/`atol`, there is no `tol=`**. The default (`direct=None`) solves each step on the
+assembled tangent with Jacobi-BiCGStab (verified, re-solved with Jacobi-GMRES when its residual is not
+small), matrix-free where the problem has no assembled tangent; `direct=False` is always matrix-free.
+`direct=True` factorises the assembled tangent each step; it is required, not preferred, when an
+iterative step has no preconditioner to lean on (stiff tangents, saddle points) — the matrix-free
+Newton-Krylov diverges to NaN there.
 
-Preconditioners: `jacobi`, `chebyshev(degree=)`, `nystrom(rank=)` (**SPD only**), `amg(cycles=)`,
-`gmg()`, `ams`, `form([terms], inner=)`, `inner(solver)`, `block_diag`/`triangular` (per-field over
-`fem.blocks`), `cached`.
+Preconditioners: `jacobi`, `chebyshev(degree=)`, `nystrom(rank=)` and `fsai(power=)` (**SPD only**),
+`amg(cycles=)`, `gmg()`, `ams`, `schwarz(parts=, overlap=)` (overlapping Schwarz; needs the `[metis]`
+extra), `form([terms], inner=)`, `inner(solver)`, `block_diag`/`triangular` (per-field over
+`fem.blocks`), `cached`. Every constructor but `cached` takes `float32=True`: the preconditioner is built
+and applied in single precision while the solve stays in double.
 
 **AMG is for repeated solves against the same operator** — build the hierarchy once, or an unbuilt
 spec re-runs pyamg's host-side setup every solve:
@@ -762,7 +768,8 @@ docs use everywhere — is `jno.Path(0,0).line_to(1,0).curve(size=…).domain()`
 - **`fem.points`, not mesh vertices**, for P2 and above.
 - **Hard BC enforcement beats a soft BC loss** whenever the geometry admits a vanishing factor.
 - **A temporal `.integrate(t)` needs `min_consecutive=None` or `>= 2`** in `solve()`.
-- **`jno.solve.lu` has no vmap rule** — use a Krylov solver inside batched/parametric solves.
+- **A batched `jno.solve.lu()` on the default `device` backend factors every system** — for a batch
+  against one matrix (Jacobians, sensitivities) use `lu(backend="host" | "cudss" | "pardiso")`, which factor once.
 - **A trainable `jno.np.parameter` makes the FEM system runtime-parametric**, so `fem.A`/`fem.b`
   are unavailable until you `.freeze()` it.
 - **`jax.config.update("jax_enable_x64", True)` must precede the first JAX array**, and `jno.fdm`

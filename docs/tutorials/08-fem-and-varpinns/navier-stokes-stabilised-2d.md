@@ -84,8 +84,9 @@ for a PSPG-stabilised equal-order pair.
   both errors *worse* at this Reynolds number (velocity 6.14e-02 → 8.36e-02, pressure 1.78e-01 →
   2.06e-01), so its calibration is left open rather than shipped as though it were verified. The term
   is one line if you want it: `tau_c * div(gu) * div(gv)`.
-- **The default solver will not do.** Use `jno.solve.newton(direct=True)`; the matrix-free default
-  goes NaN on a cold start from rest here.
+- **Use the sparse-direct Newton**, `jno.solve.newton(direct=True)`. The matrix-free Newton
+  (`newton(direct=False)`, the default when this tutorial was written) goes NaN on a cold start from
+  rest here.
 - **`dom.cell_metric` is native 2-D/3-D volume terms only** — like `dom.cell_size`. A 1-D form or a
   non-nodal element family refuses by name.
 - This tutorial does **not** claim a turbulence model, a free surface, or a compressible path. jNO's

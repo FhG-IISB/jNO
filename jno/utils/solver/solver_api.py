@@ -1068,13 +1068,16 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
 def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable:
     """Compose the nonlinear-mode slots into the ``(residual_fn, u0) -> u`` ``solve_fn`` contract.
 
-    The inner Newton/Picard linear solve is **matrix-free** -- each outer iteration linearizes
-    the residual into a JVP matvec ``J(u_k) v`` -- so a ``precond=`` spec is materialized *per
-    linearization* against that matvec-only operator (wrapped with the system size, so block
-    slicing and power-iteration bounds work). The same preconditioned solve serves the
+    The default ``newton()`` (``direct=None``) hands the inner linear solve the ASSEMBLED tangent
+    wherever the assembler provides one, so a ``precond=`` spec materializes against an assembled
+    operator (``jacobi`` included). On the **matrix-free** paths -- ``newton(direct=False)``,
+    ``picard()``, or a problem with no assembled tangent -- each outer iteration linearizes the
+    residual into a JVP matvec ``J(u_k) v``, and the spec is materialized *per linearization*
+    against that matvec-only operator (wrapped with the system size, so block slicing and
+    power-iteration bounds work). The same preconditioned solve serves the
     implicit-differentiation tangent/adjoint solve of ``custom_root``.
 
-    What composes here: ``form`` (auxiliary operators assemble independently -- and are cached,
+    What composes on the matrix-free paths: ``form`` (auxiliary operators assemble independently -- and are cached,
     so the assembly happens once even though materialization runs per iteration),
     ``inner(<krylov>)``, ``chebyshev`` (bounds by power iteration on the JVP), a **pre-built**
     ``amg`` (``spec.build(A_representative)``), and ``block_diag``/``triangular`` over those.

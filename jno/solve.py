@@ -12,10 +12,11 @@ Usage::
 
     fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.jacobi())
     fem.solve(linear=jno.solve.lu())                      # differentiable sparse-direct
-    fem.solve(nonlinear=jno.solve.newton(), x0=u_guess)   # warm-started Newton-Krylov
+    fem.solve(nonlinear=jno.solve.newton(), x0=u_guess)   # warm-started Newton
 
-Defaults when a slot is ``None`` are unchanged from the historic behaviour: Jacobi-preconditioned
-BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
+Defaults when a slot is ``None``: Jacobi-preconditioned BiCGStab (steady linear) and :func:`newton` --
+Newton on the assembled tangent with a Jacobi-BiCGStab inner solve, matrix-free Newton-Krylov where the
+problem has no assembled tangent (nonlinear).
 """
 
 from __future__ import annotations
@@ -224,8 +225,7 @@ def dense() -> LinearSolver:
     """Dense LAPACK solve (``jnp.linalg.solve``) on the densified operator.
 
     ``O(N^2)`` memory / ``O(N^3)`` time -- the right answer for small systems and coarse
-    blocks, and the only shipped direct solver with a native vmap batching rule. Direct:
-    ignores ``x0``, rejects a preconditioner.
+    blocks; ``vmap``-native. Direct: ignores ``x0``, rejects a preconditioner.
     """
 
     def _fn(op: LinearOperator, b, *, M, x0):
@@ -2045,13 +2045,14 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
 
     Scope, stated up front:
 
-    * **Either tangent works, and the assembled one is faster here.** The matrix-free default re-pairs
-      for free (its tangent is ``jax.linearize`` of the residual). ``nonlinear=jno.solve.newton(direct=
-      True)`` assembles the tangent instead and rebuilds the contact block's sparsity pattern per
-      round — sound because the block's SIZE is fixed by the declaration, so only the index values
-      move. Measured on a 12:20 gear pair, 11 682 DOF, 5 rounds, median of three::
+    * **Either tangent works, and the assembled one is faster here.** The matrix-free Newton
+      (``newton(direct=False)``) re-pairs for free (its tangent is ``jax.linearize`` of the residual).
+      ``nonlinear=jno.solve.newton(direct=True)`` assembles the tangent instead and rebuilds the contact
+      block's sparsity pattern per round — sound because the block's SIZE is fixed by the declaration,
+      so only the index values move. Measured on a 12:20 gear pair, 11 682 DOF, 5 rounds, median of
+      three, when the matrix-free Newton was still the default::
 
-          matrix-free (default)      44.2 s     1848 MB
+          matrix-free (direct=False) 44.2 s     1848 MB
           newton(direct=True)        14.7 s     1894 MB     <- 3.0x faster, same memory
 
       Peak RSS is comparable at this size rather than a trade: the assembled contact block is small

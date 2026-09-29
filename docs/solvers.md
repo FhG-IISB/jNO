@@ -33,7 +33,7 @@ Pick by structure:
 | symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` | monotone residual, `O(1)` memory — Paige & Saunders, *SINUM* 12(4), 1975 |
 | **complex-symmetric** (`A = Aᵀ`, not `Aᴴ`: time-harmonic eddy-current/A–V, Helmholtz, RCWA) | `cocg` | CG's short recurrence over the **bilinear** form `xᵀy` — `O(n)` memory and one matvec per step where `gmres` needs a `(restart, n)` basis. Only valid when the operator really is complex-symmetric; it can break down where CG cannot — van der Vorst & Melissen, *IEEE Trans. Magn.* 26(2), 1990 |
 | SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961 |
-| indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
+| indefinite | `lu` | sparse-direct; `vmap`s on every backend — `host`/`cudss`/`pardiso` factor once for a batch against one matrix, the default `device` backend factors each system (`jno.setup(lu_stack=k)` stacks `k` per call) |
 | cuSolver refuses it, or is slow | `lu(backend="host")` | SuperLU on the host, driven from the device — same answer, same gradients. Often **faster** than cuSolver, and runs meshes it rejects |
 | **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS. Fastest **per solve** — caches the symbolic plan on the sparsity, so it survives a change of values. Needs the optional stack |
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. Fastest **factorization** — a Newton step reuses the analysis. x86-64 |
@@ -207,6 +207,22 @@ problem repeats**.
     Neither cuDSS nor PARDISO signals singularity through an exception or a NaN — both return a
     finite, plausible-looking vector. jNO checks (the refinement residual for cuDSS, the
     perturbed-pivot count for PARDISO) and **raises** instead.
+
+### Batched solves and operator storage — `jno.setup(lu_stack=, matvec_format=)`
+
+Every `lu` backend has a `vmap` rule, so `jax.jacrev` / `jax.jacfwd` through a solve and a `vmap` over
+solves work on all four. `host`, `cudss` and `pardiso` **factor once** for a batch against one matrix and
+solve the whole block of right-hand sides in one call — the choice for Jacobians and sensitivities. The
+default `device` backend (cuSolver) takes one right-hand side, so it factors every system: one per call
+by default, or `k` per block-diagonal call with `jno.setup(__file__, lu_stack=k)` (or `lu_stack = k`
+under `[jno]` in `.jno.toml`). A larger `k` measured faster, but cuSolver allocates for the fill-in of
+all `k` systems, so the right `k` depends on the problem and the card; too large fails with a cuSolver
+allocation error, never a wrong answer.
+
+The iterative solvers apply a sparse operator as cuSPARSE CSR or as split COO, chosen by timing both on
+the running device, once per operator size class (`matvec_format="auto"`, the default).
+`jno.setup(__file__, matvec_format="csr")` or `"coo"` (or `[jno] matvec_format`) forces one — for reproducible timings, or to
+rule the choice out while debugging.
 
 ## Preconditioners
 
@@ -718,6 +734,29 @@ space).
 
 ## Nonlinear drivers
 
+### The default Newton — `jno.solve.newton()`
+
+A nonlinear `fem.solve()`, and each step of a nonlinear march, runs `jno.solve.newton()` unless told
+otherwise. Its `direct=` argument picks how each linear step is solved:
+
+| `direct=` | tangent | linear step |
+|---|---|---|
+| `None` *(default)* | **assembled** `J(u)` (a BCOO), wherever the assembler provides one | Jacobi-BiCGStab, or the `linear=`/`precond=` slots. The BiCGStab answer is verified (one SpMV) and re-solved with Jacobi-GMRES when its relative residual is not small |
+| `False` | **matrix-free** — `J·v` from a JVP, no tangent stored | BiCGStab, or the `linear=` slot |
+| `True` | **assembled** | a sparse LU each step, or the `linear=` slot's direct solver (see *Sparse-direct Newton* below) |
+
+When each one falls back:
+
+- The default runs matrix-free, as `direct=False` does, when the problem has **no assembled tangent**
+  (a residual-only operator — the matrix-free-only paths listed under the sparse-direct Newton below).
+- With `nonlinear=` unset, a **direct `linear=` slot** (`lu`, `dense`, `amg`) selects `direct=True`.
+- `direct=True` needs the assembled tangent and raises without one; an explicit matrix-free
+  `nonlinear=` beside a direct `linear=` raises too.
+
+Because the default hands its linear step an assembled matrix, a `precond=` that needs one (`jacobi`)
+composes with it; `direct=False` has no matrix and is the choice when the assembled tangent would not fit
+in memory. All three modes are differentiable (implicit differentiation through `lax.custom_root`).
+
 ### Picard / lagged coefficients — `jno.lag`
  When a solution-dependent coefficient's Newton tangent
 destroys the linearized system's structure (the classic case: a shear-thinning viscosity `μ_eff(u)` in
@@ -910,19 +949,20 @@ where Newton is quadratic, so it can need hundreds of sweeps near a propagating 
 `max_sweeps=200` default. It buys robustness, not speed: where Newton converges, Newton is the better
 choice (Farrell & Maurini, CMAME **312**, 2017, compare the two directly). Sweeping is Gauss-Seidel, so
 the **order matters**, and every field block must be listed — an unlisted field's equations would never
-be solved, which is rejected rather than skipped. Each field is solved alone; sweeping a *group* of
-fields together (a Stokes velocity/pressure pair inside one sweep) is not wired.
+be solved, which is rejected rather than skipped. Each field is solved alone unless it is listed in a
+*group*, which is solved together inside one sweep (see "Groups" above).
 
 Differentiable in the ordinary way: at convergence the full residual is zero, so the sweep is just a way
 of *finding* that root and `lax.custom_root` supplies the gradient from the full Jacobian — the
 alternating structure is absent from the derivative by construction.
 
 ### Sparse-direct Newton — `jno.solve.newton(direct=True)`
- The default Newton solves each linear step
-**matrix-free** (BiCGStab on the JVP), which stalls on an **indefinite / ill-conditioned** tangent with no
-good preconditioner — a Taylor–Hood velocity/pressure saddle, a stiff Carman–Kozeny phase-change drag in a
-melt pool. `direct=True` instead **assembles and factorizes** the tangent each step with a sparse LU (the
-transient stepper factorizes the backward-Euler step tangent `M/dt + ∂R/∂u`; the steady path `∂R/∂u`).
+ An iterative linear step — the default's
+Jacobi-BiCGStab on the assembled tangent, or BiCGStab on the JVP with `direct=False` — stalls on an
+**indefinite / ill-conditioned** tangent with no good preconditioner — a Taylor–Hood velocity/pressure
+saddle, a stiff Carman–Kozeny phase-change drag in a melt pool. `direct=True` instead **assembles and
+factorizes** the tangent each step with a sparse LU (the transient stepper factorizes the backward-Euler
+step tangent `M/dt + ∂R/∂u`; the steady path `∂R/∂u`).
 It composes wherever the assembler provides that tangent — `fem.solve(nonlinear=jno.solve.newton(direct=True))`
 on a native nonlinear problem, **steady or the transient march** — and stays differentiable: implicit
 differentiation uses a *direct, transposable* tangent solve on the tangent assembled at the root (the adjoint
@@ -932,8 +972,8 @@ complex) — those fail loud.
 
 The tangent it factorizes is always the **element-scattered sparse** one, in 1-D as in 2-D/3-D. 1-D used
 to build its nonlinear tangent with a global `jax.jacfwd` instead, on the assumption that only the
-matrix-free default would ever ask for it; `direct=True` does ask, from inside the Newton loop, where a
-dense tangent cannot be sparsified at all (`BCOO.fromdense` needs a concrete `nse`). Besides working, the
+then-default matrix-free Newton would ever ask for it; `direct=True` does ask, from inside the Newton
+loop, where a dense tangent cannot be sparsified at all (`BCOO.fromdense` needs a concrete `nse`). Besides working, the
 scattered tangent is `O(nnz)` rather than `O(N²)` — which is what 1-D node counts want.
 
 **A direct `linear=` slot selects it.** `lu`, `dense` and `amg` all need an assembled matrix, so pairing one
@@ -941,16 +981,18 @@ with the *matrix-free* Newton has nothing to factorize. `fem.solve(linear=jno.so
 nonlinear or transient problem therefore routes to the direct Newton, and that slot is the solver that runs on
 the assembled tangent (and on `Jᵀ` in the adjoint); `precond=` materializes against the same assembled
 operator. Which factorization you pick is not cosmetic here: on a 26-step Rayleigh–Bénard march (three fields,
-saddle, nonlinear) the default matrix-free Jacobi-BiCGStab takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and
+saddle, nonlinear) the matrix-free Newton that was the default when this was measured (`direct=False`
+now) takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and
 `linear=jno.solve.lu(backend="host")` **3.1 s**, all to the same 2.8e-07 per-step Newton residual. An *explicit*
 matrix-free `nonlinear=` alongside a direct `linear=` is contradictory and raises rather than picking one
 silently.
 
-> Limits, since they are not obvious. This routing only fires when the *linear* slot is direct — a
-> `precond=` that needs an assembled matrix (`jacobi`, an unbuilt `amg`) raises where it is
-> materialized. `picard()` has no assembled-tangent form: its linearization is the lagged
-> *matrix-free* JVP, so `nonlinear=picard(), linear=lu()` raises — moving to `newton(direct=True)`
-> there changes the algorithm, not just the solver. And the direct Newton needs the assembler to
+> Limits, since they are not obvious. This routing only fires when the *linear* slot is direct. A
+> `precond=` that needs an assembled matrix (`jacobi`, an unbuilt `amg`) gets one from the default
+> Newton; on the matrix-free routes (`newton(direct=False)`, `picard()`, a problem with no assembled
+> tangent) it raises where it is materialized. `picard()` has no assembled-tangent form: its
+> linearization is the lagged *matrix-free* JVP, so `nonlinear=picard(), linear=lu()` raises — moving to
+> `newton(direct=True)` there changes the algorithm, not just the solver. And the direct Newton needs the assembler to
 > supply a tangent, so the matrix-free-only routes (a coupled-residual wrapper) fail loud either way.
 
 **Reusing the factorization — `newton(direct=True, reuse=True)`.** Lagged-Jacobian (chord / Shamanskii)
@@ -1005,9 +1047,11 @@ sparse solver pointless at the sizes where you would want one. Call `.todense()`
 what you need, as above.
 
 If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. On the matrix-free **nonlinear**
-path the `precond` spec is materialized *per Newton/Picard linearization* against the JVP operator — so
-`form`, `inner(...)`, `chebyshev`, a pre-built `amg`, and their `block_diag`/`triangular` compositions
-all work; only specs that need the assembled matrix (`jacobi`, an unbuilt `amg`) raise.
+path (`newton(direct=False)`, `picard()`, or no assembled tangent) the `precond` spec is materialized
+*per Newton/Picard linearization* against the JVP operator — so `form`, `inner(...)`, `chebyshev`, a
+pre-built `amg`, and their `block_diag`/`triangular` compositions all work; only specs that need the
+assembled matrix (`jacobi`, an unbuilt `amg`) raise. The default Newton materializes the spec against
+the assembled tangent instead.
 
 ## Diagnostics — what the solver actually did
 
@@ -1166,7 +1210,8 @@ fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-6, atol=1e-6))
 ```
 
 This is the same check the [load-path march](fem/formulations.md) already applied, on the same
-numbers; only the label and the advice differ. It covers the default θ march and `jno.solve.bdf2()`.
+numbers; only the label and the advice differ. It covers the default θ march, `jno.solve.bdf2()` and
+`jno.solve.sdirk()` (judged per stage: every stage is a Newton solve).
 
 !!! measured "Why a silent transient failure is worse than it sounds"
     Two properties make a capped march genuinely hard to spot, both measured on a coupled melt-pool

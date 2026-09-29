@@ -3954,12 +3954,11 @@ class FemResidualOperator:
         ``fem = jno.fem([...])``.
 
         ``solve_fn`` is **your** solver: any ``(residual_fn, u0) -> u`` callable. The
-        default is a matrix-free Jacobian-free Newton-Krylov (Newton + BiCGStab on the
-        JVP, no external solver dependency); implicit differentiation via
-        ``jax.lax.custom_root`` keeps ``∂u/∂θ`` exact without unrolling Newton. Pass your
-        own to choose another solver/library (e.g. your own Newton). jNO's
-        analytic Jacobian (:attr:`jacobian`) is available; by default ``J @ v`` is a JVP
-        of the residual.
+        default is Newton on this operator's ASSEMBLED tangent (:attr:`jacobian`) with a
+        Jacobi-BiCGStab inner solve, or a matrix-free Newton-Krylov (``J @ v`` a JVP of the
+        residual) when there is no assembled tangent -- no external solver dependency either
+        way; implicit differentiation via ``jax.lax.custom_root`` keeps ``∂u/∂θ`` exact without
+        unrolling Newton. Pass your own to choose another solver/library (e.g. your own Newton).
 
         ``u0`` is the initial guess (default: zeros of the operator size; enable
         x64 — the residual is float64).

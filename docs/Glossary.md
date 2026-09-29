@@ -143,9 +143,10 @@ resampling_strategy=jno.RAD(...))`. See
 
 ### Constraint weighting / loss balancing
 
-Per-constraint scalar weights applied before summing losses. Static
-weights are a list of floats passed to `core(weights=...)`; adaptive
-balancers live under `jno.fn.adaptive.*` (ReLoBRaLo, SoftAdapt, etc.).
+Per-constraint scalar weights applied before summing losses. A static
+weight multiplies its term (`jno.core([pde.mse, 10.0 * bc.mse])`); adaptive
+balancers live under `jno.fn.adaptive.*` (ReLoBRaLo, SoftAdapt, etc.) and
+return weights to multiply in the same way.
 
 ### Foundation model
 

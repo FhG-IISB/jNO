@@ -385,13 +385,13 @@ it, which is what stops a flat stretch from reading as touching itself everywher
 requires `contact=` and is refused without it.
 
 **Either tangent works**, and on this problem the assembled one is simply faster. The matrix-free
-default re-pairs for free; `nonlinear=jno.solve.newton(direct=True)` assembles the tangent and
-rebuilds the contact block's sparsity pattern each round. Measured on a 12:20 gear pair, 11 682 DOF,
-5 rounds, median of three runs:
+Newton (`newton(direct=False)`) re-pairs for free; `nonlinear=jno.solve.newton(direct=True)` assembles
+the tangent and rebuilds the contact block's sparsity pattern each round. Measured on a 12:20 gear pair,
+11 682 DOF, 5 rounds, median of three runs, when the matrix-free Newton was still the default:
 
 | tangent | time | peak RSS |
 |---|---|---|
-| matrix-free (default) | 44.2 s | 1848 MB |
+| matrix-free (`direct=False`; the default then) | 44.2 s | 1848 MB |
 | `newton(direct=True)` | **14.7 s** | 1894 MB |
 
 Peak RSS is *comparable* here, not a trade: the assembled contact block is small next to the ~1.8 GB

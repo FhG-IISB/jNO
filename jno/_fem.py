@@ -21,7 +21,8 @@ Classification rule
 For a plain forward solve you can drive your own solver off the assembled artefacts
 (``jnp.linalg.solve(fem.A, fem.b)``, ``scipy``). :meth:`FEM.solve` additionally provides a
 **differentiable** forward solve as a trace node — the entry point for inverse problems — with
-matrix-free defaults (BiCGStab / Newton–Krylov / backward-Euler) you can override via ``solve_fn``.
+defaults (Jacobi-BiCGStab / Newton on the assembled tangent / backward-Euler) you can override via
+``solve_fn``.
 """
 
 from __future__ import annotations
@@ -1256,8 +1257,8 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
     """One line naming the route a ``solve()`` actually took.
 
     Which solver ran is currently unknowable from the outside, and it is not a detail: the same
-    elasto-plastic march measured 1194 s on the matrix-free default and 14.6 s with a sparse-direct
-    tangent. A user who cannot see which one ran cannot see that difference either.
+    elasto-plastic march measured 1194 s on the matrix-free Newton (then the default) and 14.6 s with a
+    sparse-direct tangent. A user who cannot see which one ran cannot see that difference either.
     """
     _DIRECT = {"lu", "dense", "pardiso", "cudss", "sparse_lu", "direct"}
 
@@ -2235,11 +2236,12 @@ class FEM:
           GiB against 9.4 MiB at ``n=51843``), which would defeat the point at the sizes where you
           would reach for your own solver. A **dense** solver must densify itself:
           ``lambda A, b: jnp.linalg.solve(A.todense(), b)``;
-        * steady nonlinear: ``(residual_fn, u0) -> u`` (default a matrix-free Jacobian-free
-          Newton-Krylov, implicit-diff, no optimistix; pass ``u0=`` for the guess);
+        * steady nonlinear: ``(residual_fn, u0) -> u`` (default :func:`jno.solve.newton`: Newton on
+          the assembled tangent with a Jacobi-BiCGStab inner solve, matrix-free Newton-Krylov where
+          there is no assembled tangent; implicit-diff, no optimistix; pass ``u0=`` for the guess);
         * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
           n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
-          ``dt``, each step solved by the same matrix-free Newton-Krylov; ``save_ts=`` overrides
+          ``dt``, each step solved by the same default Newton; ``save_ts=`` overrides
           the sample times, default the domain's time grid). For a custom integrator build it
           from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``.
 

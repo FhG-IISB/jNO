@@ -76,8 +76,8 @@ DeepONet, FNO, PROSE — wrapped with `jno.nn(...)`.
 
 </details>
 
-**35 worked tutorials** span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic,
-FEM / variational, Bayesian and operator-learning problems — browse the
+**43 worked tutorials** span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic,
+FEM / variational, FDM, RCWA, Bayesian and operator-learning problems — browse the
 [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
 
 ## Install

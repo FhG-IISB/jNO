@@ -499,11 +499,23 @@ iteration count, not from the DOF count.
 and the gather of `x` dominates, so halving precision buys about a quarter of the memory and none of
 the time. Reach for a coarser mesh or a better preconditioner instead.
 
-**Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
-`nystrom` (randomized low-rank — the rung between `jacobi` and multigrid),
-`amg` (algebraic multigrid), `gmg` (geometric multigrid — a structured-grid V-cycle),
-`ams` (H(curl) auxiliary-space Maxwell), `form` (weak-form auxiliary operator),
-`inner` (any solver as `M⁻¹`), `block_diag` / `triangular` (block / Schur), and `cached`.
+**Preconditioners** (`jno.precond`, for the iterative solvers):
+
+| Kind | `jno.precond` |
+| --- | --- |
+| **Diagonal / polynomial** | `jacobi`, `chebyshev` |
+| **Between `jacobi` and multigrid** | `nystrom` (randomized low-rank, SPD); `fsai` (factored sparse approximate inverse, SPD — applied as two sparse products, numeric setup in JAX; see [FSAI](solvers.md#fsai-jnoprecondfsai)) |
+| **Multigrid** | `amg` (algebraic, pyamg), `jaxamg` (GPU AmgX), `gmg` (geometric — a structured-grid V-cycle), `ams` (H(curl) auxiliary-space Maxwell), `hypre` (AMS / BoomerAMG via PETSc) |
+| **Domain decomposition** | `schwarz` (overlapping Schwarz on a METIS partition, two-level by default; needs the `[metis]` extra — see [Overlapping Schwarz](solvers.md#overlapping-schwarz-jnoprecondschwarz)) |
+| **Incomplete factorization** | `ilu` (SuperLU `spilu`, complex-capable) |
+| **Block / saddle point** | `block_diag` / `triangular` (block / Schur), `saddle`, `lsc`, `pcd` |
+| **Composition** | `form` (weak-form auxiliary operator), `inner` (any solver as `M⁻¹`), `real_equivalent` (a complex system through its real block), `cached` |
+| **Precision** | `float32=True` on every constructor but `cached` — built and applied in single precision while the solve stays in double; see [Single precision](solvers.md#single-precision-inside-a-double-solve-float32true) |
+
+**Process-wide solver settings** (`jno.setup`, or the same keys under `[jno]` in `.jno.toml`):
+`lu_stack=k` stacks `k` systems per call when a batched `jno.solve.lu()` runs on the default `device`
+backend (default `1`); `matvec_format="auto" | "csr" | "coo"` fixes the sparse storage the iterative
+solvers apply an operator with (default `"auto"`, timed on the running device per operator size class). See the `jno.setup` docstring.
 
 ::: jno.solve
 

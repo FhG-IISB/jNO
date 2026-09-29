@@ -540,8 +540,9 @@ untouched.
     arrive as `(B, k)`, the first node of each sample, with nothing raised. When axis 1 could be read
     two ways (`n` equals `B` or the timestep count) or matches no point set, the attach raises and
     names the layout to write instead: `(B, 1, n, k)` for one value per node (or any other per-sample
-    array), `(B, T, 1, k)` for one value per timestep. `(B, T, k)` with no point set of `T` nodes is
-    left as it is.
+    array), `(B, T, 1, k)` for one value per timestep. On a time grid, `(B, T, k)` with no point set of
+    `T` nodes is one value per sample and step, and is stored as `(B, T, 1, k)`; a lazy source in that
+    layout is refused (reshaping it would read it) — store it as `(B, T, 1, k)` yourself.
 
 ### Datasets larger than memory
 

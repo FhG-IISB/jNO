@@ -19,11 +19,14 @@ This section covers every aspect of the jNO training pipeline: constructing the 
 
 ```python
 crux = jno.core(
-    constraints=[pde.mse, boc.mse], 
-    rng_seed=42,                       # optional; also set in .jno.toml → [jno] seed
-    mesh=(1, 1),                       # (batch_devices, model_devices)
+    constraints=[pde.mse, 10.0 * boc.mse],   # weight a term by multiplying it
+    mesh=(1, 1),                       # (batch_devices, model_devices); (1, 1) = every device, data-parallel
 )
 ```
+
+The random seed is not a constructor argument: set `JNO_SEED` in the environment or `seed` under
+`[jno]` in `.jno.toml` (default `42`). Adaptive loss weights are covered in
+[Adaptive Loss Weights](../adaptive/schedules.md#adaptive-loss-weights).
 
 ---
 

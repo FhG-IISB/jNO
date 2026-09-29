@@ -611,8 +611,10 @@ problem:
 - **Nonlinear:** Newton with the assembled tangent. A preconditioner that needs a matrix (`amg`, `gmg`) is
   set up once on the tangent at the initial guess.
 
-Left unset, the matrix-free default is unchanged. The assembled operator stays differentiable, so a
-crux-driven inverse runs through the slots too.
+Left unset, the matrix-free default is unchanged, with one exception: a **linear, single-field, steady**
+problem on an **unstructured** mesh goes through the assembled operator by default, with `jno.fem`'s linear
+default (Jacobi-preconditioned BiCGStab). The assembled operator stays differentiable, so a crux-driven
+inverse runs through the slots too.
 
 !!! measured "100 heat steps, unstructured `cotangent`, CPU, repeat solve (machine under load ≈ 5)"
     | nodes | default | `bicgstab` + `jacobi` | `cg` + `amg` | `lu` |
@@ -950,8 +952,7 @@ An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#struc
 A periodic tie `u(left) - u(right)` (opposite faces) wraps that axis on a
 [structured grid](#structured-grid-fast-stencils).
 
-**Planned:** periodic on unstructured meshes and periodic geometric multigrid (a periodic structured solve
-is currently un-preconditioned, so it is slow on fine grids); composite / cut-cell structured geometry
+**Planned:** periodic on unstructured meshes; composite / cut-cell structured geometry
 (axis-aligned rectangles and boxes are supported, above); 1-D meshes. Authoring a `jno.shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann

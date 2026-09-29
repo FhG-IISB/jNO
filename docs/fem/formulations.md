@@ -9,7 +9,7 @@
   one component is `-t * phi_b[i]`.
 * **Finite-strain (hyperelastic) mechanics** — the component spelling is what makes it expressible:
   build `F = I + ∇u` from `u[i].d(x_j)`, then `det F`, `F⁻ᵀ` and `log` are ordinary term algebra, and a
-  form nonlinear in `∇u` routes to the matrix-free Newton automatically (use
+  form nonlinear in `∇u` routes to the default Newton automatically (use
   `nonlinear=jno.solve.newton(line_search=True)` for large steps). Compressible Neo-Hookean
   `P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ` is verified in `tests/test_fem_vector_components.py`: it matches the
   coupled-scalar spelling to machine precision and linear elasticity in the small-load limit. Ramp a hard

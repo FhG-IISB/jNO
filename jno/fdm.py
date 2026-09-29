@@ -303,10 +303,10 @@ def _structured_linear_solve(domain, periodic=False, vcycle=None):
 
 def _integrate_transient(block, ts, time, linear_solve=None, nonlinear_solve=None):
     """March the semidiscrete ``block`` over the save-times ``ts`` with the chosen **time scheme** — a
-    ``jno.solve.theta`` / ``adaptive`` / ``exponential`` slot, via its ``.integrate`` — or the default
-    backward-Euler ``lax.scan`` when ``time is None``. This is the FDM analogue of ``fem.solve(time=…)``:
-    the scheme is the *same* slot object ``jno.fem`` uses, so θ / Crank–Nicolson, adaptive step size, and
-    the exponential integrator all compose onto the strong-form method-of-lines march."""
+    ``jno.solve.theta`` / ``adaptive`` slot, via its ``.integrate`` — or the default backward-Euler
+    ``lax.scan`` when ``time is None``. This is the FDM analogue of ``fem.solve(time=…)``: the scheme is
+    the *same* slot object ``jno.fem`` uses, so θ / Crank–Nicolson and adaptive step size compose onto the
+    strong-form method-of-lines march (the exponential integrator is refused before this is reached)."""
     from .utils.solver.backend_blocks import _default_transient_integrate
 
     if time is None:
@@ -2359,11 +2359,13 @@ class _TraceFDM:
         ``amg``, ``gmg``, …). Setting either assembles the operator as a sparse matrix once — for a linear
         problem the whole system, for a nonlinear one the tangent — so matrix-based solvers and
         preconditioners apply, in steady solves and in every time step. Left unset, the matrix-free
-        default is unchanged.
+        default is unchanged -- except for a linear, single-field, steady problem on an unstructured
+        mesh, which goes through the assembled operator with Jacobi-preconditioned BiCGStab.
 
         ``time=`` selects the time scheme exactly as ``fem.solve(time=…)`` does — ``jno.solve.theta(θ)``
-        (Crank–Nicolson at θ=0.5), ``jno.solve.adaptive(…)`` (step-doubling adaptive step size), or
-        ``jno.solve.exponential(…)`` — defaulting to backward Euler. ``profile=True`` runs the (eager,
+        (Crank–Nicolson at θ=0.5) or ``jno.solve.adaptive(…)`` (step-doubling adaptive step size) —
+        defaulting to backward Euler. ``jno.solve.exponential(…)`` is refused (a strong-form march is a
+        DAE with zero-mass boundary rows). ``profile=True`` runs the (eager,
         non-parametric) solve inside a JAX Perfetto trace and writes it to ``./jno_traces``.
 
         ``save_ts=`` are the times a transient solve returns, exactly as ``fem.solve(save_ts=…)``: the march

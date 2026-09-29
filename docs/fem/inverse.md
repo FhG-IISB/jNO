@@ -57,10 +57,11 @@ recovered = crux.eval([k])                                # the array (do not in
 ```
 
 `fem.solve(solve_fn)` lets you choose the solver, but every problem ships with a differentiable
-default (no external dependency): the linear default is a sparse-direct factorisation
-(`sparse_lu_solve`, JAX `spsolve`), with a Jacobi-preconditioned matrix-free BiCGStab as the iterative
-alternative; the nonlinear default is a matrix-free Newton-Krylov, and the transient default
-backward-Euler over those. All are implicit-diff, so `crux.solve` recovers parameters through them.
+default (no external dependency): the steady linear default is Jacobi-preconditioned BiCGStab on the
+sparse operator, with a sparse-direct factorisation (`jno.solve.lu()`, JAX `spsolve`) one slot away; the
+nonlinear default is Newton on the assembled tangent with Jacobi-BiCGStab inner solves (matrix-free
+Newton-Krylov where there is no assembled tangent), and the transient default backward-Euler over those.
+All are implicit-diff, so `crux.solve` recovers parameters through them.
 
 ### Solving *at* a value — `fem.solve(k=...)`
 
@@ -148,12 +149,13 @@ Every time scheme marches the split operators with its own integrator: `theta` (
 `sdirk()` and `rosenbrock()` (whose stage matrix is applied as `M v + γh A v`, never concatenated), each
 checked the same way on simulated devices.
 
-**A nonlinear solve splits its cells.** A Jacobian-free Newton has no assembled operator to
-partition, so the element axis is split instead: each device evaluates the element kernel on its share of
-the cells into its own partial residual, and one `all-reduce` per evaluation combines them. `J·v` is the
-linearisation of that map and splits the same way, while the Krylov vectors stay replicated -- so neither
-Newton nor its inner solver changes. This covers the default solve, `nonlinear=jno.solve.newton(direct=True)`
-(its residual splits; see the table for its tangent), and a parametric solve given its values
+**A nonlinear solve splits its cells.** A residual has no assembled operator to partition, so the element
+axis is split instead: each device evaluates the element kernel on its share of the cells into its own
+partial residual, and one `all-reduce` per evaluation combines them. On the matrix-free Newton
+(`newton(direct=False)`) `J·v` is the linearisation of that map and splits the same way, while the Krylov
+vectors stay replicated -- so neither Newton nor its inner solver changes. The default Newton and
+`nonlinear=jno.solve.newton(direct=True)` split their residual the same way but assemble their tangent
+without the split (see the table). This covers every Newton mode and a parametric solve given its values
 (`fem.solve(k=2.0)`), which jNO compiles itself. A **nonlinear march** (a Newton solve per time step,
 as in the Rayleigh--Bénard and melt-pool tutorials) splits every step's residual the same way inside
 its scan, when it is evaluated eagerly and has no `adapt=` or moving geometry -- under any time scheme
@@ -193,8 +195,8 @@ placement leaves traced operators alone; an explicit `shard=` is a request you c
 
 | | why |
 |---|---|
-| sparse-direct branches (periodic, 1-D, fused-complex) | route to `spsolve` — single-device, no batching rule |
-| `linear=jno.solve.lu()` | `spsolve` is single-device with no batching rule — a genuine wall, not a wiring gap. Distributing it means a distributed sparse-direct solver (SuperLU_DIST class), which is not a placement change |
+| sparse-direct branches (periodic, 1-D, fused-complex) | route to `spsolve` — single-device |
+| `linear=jno.solve.lu()` | `spsolve` is single-device — a genuine wall, not a wiring gap. Distributing it means a distributed sparse-direct solver (SuperLU_DIST class), which is not a placement change |
 | `linear=jno.solve.dense()` | not wired. Dense LU with partial pivoting shards poorly, but the `N²` matrix itself would split — the win here would be capacity, not speed |
 | `precond=amg()` / `ams()` | the hierarchy is built host-side through scipy/pyamg; distributing the V-cycle is a distributed-AMG project, not a placement change |
 | `precond=chebyshev()` / `form()` | not wired yet, and **not** a hard limit — Chebyshev is matvec-only by construction (spectral bounds by power iteration), so it composes with the sharded matvec directly; `form`'s auxiliary operator is just another assembled BCOO |
@@ -202,7 +204,7 @@ placement leaves traced operators alone; an explicit `shard=` is a request you c
 | parametric / differentiate-through solves | **opt-in only** — needs an explicit `shard=`, see below |
 | a LINEAR march that is parametric (`mass_fn`/`operator_fn`), uses solver slots, or is evaluated inside a trace | not wired yet; the linear, non-parametric march shards (above) |
 | a NONLINEAR march evaluated inside a trace, or with `adapt=` / moving geometry | stays on one device; a plain nonlinear march splits its cells (above) |
-| `newton(direct=True)`'s tangent | assembled and factorised on one device; only its residual splits |
+| the default Newton's and `newton(direct=True)`'s tangent | assembled without the cell split (and factorised on one device, for `direct=True`); only the residual splits |
 | nonlinear surface (boundary-integral) terms | evaluated on every device -- a surface has far fewer cells than the volume |
 | steady nonlinear with `adapt=`, or a deferred nonlinear node that `crux` evaluates | not wired; the node is traced inside `crux`'s `jit`, the conflict described above |
 
@@ -299,7 +301,7 @@ De Lorenzis, *J. Mech. Phys. Solids* 165, 2022) and Tartakovsky et al. (*Water R
 
 **Learned constitutive laws — `net(u)`, `net(∇u)`.** A network may also take the *solution* (or its
 derivatives) as input — then it is a material law, not a spatial map, and the form becomes nonlinear in
-`u` (routed to the matrix-free Newton path automatically). Observe `u`, learn the hidden law
+`u` (routed to the nonlinear Newton path automatically). Observe `u`, learn the hidden law
 unsupervised through the residual:
 
 ```python

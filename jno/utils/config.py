@@ -388,15 +388,15 @@ def setup(
             mixed-order Stokes assembly (9.43 s cold, 2.20 s warm), because jNO's compilation
             cost is fixed per problem *structure* rather than per DOF.
 
-            * ``None`` (default) — read ``[jno] compile_cache`` from the TOML config; off if absent.
+            * ``None`` (default) — read ``[jno] compile_cache`` from the TOML config; on if absent.
             * ``False`` — off. ``True`` — on, at ``~/.cache/jno/xla``.
             * ``str`` — on, at that directory.
 
-            **Off by default, deliberately: a library should not write to a user's disk uninvited.**
-            Worth turning on for anything run more than once — a sweep, an optimisation loop, a test
-            suite, or just re-running a script after an edit. Measured on 3-D Poisson at 27,833 nodes:
-            first build 4.75 s -> 2.22 s, repeat build 2.48 s -> 1.51 s. Set it once per project with
-            ``[jno] compile_cache = true`` in ``.jno.toml`` rather than editing each script.
+            **On by default:** ``import jno`` already enables it (see :func:`_auto_compile_cache`); opt
+            out with ``JNO_COMPILE_CACHE=0``, ``[jno] compile_cache = false`` in ``.jno.toml``, or
+            ``compile_cache=False`` here. It pays for anything run more than once — a sweep, an
+            optimisation loop, a test suite, or just re-running a script after an edit. Measured on 3-D
+            Poisson at 27,833 nodes: first build 4.75 s -> 2.22 s, repeat build 2.48 s -> 1.51 s.
 
         lu_stack: How many systems a ``vmap``-ed ``jno.solve.lu()`` (the default ``"device"`` backend,
             cuSolver's sparse QR) stacks into ONE block-diagonal call -- the batches behind

@@ -1447,8 +1447,8 @@ class TraceEvaluator:
         # ── Scalar target (e.g. loss.mse) → gradient vector (P,) ───────────
         if len(logical_shape) == 0:
             # `jax.grad`, not `jax.jacrev`: for a scalar output the two agree exactly, but
-            # jacrev still vmaps its pullback over a length-1 basis, and a target containing
-            # `fem.solve()` bottoms out in `spsolve`, which has no batching rule.
+            # jacrev still vmaps its pullback over a length-1 basis -- needless work, which for a
+            # target containing `fem.solve()` means a batched `spsolve`.
             grad_pytree = jax.grad(forward_fn)(trainable)
             leaves = jax.tree_util.tree_leaves(grad_pytree)
             cols = [leaf.reshape(-1) for leaf in leaves]

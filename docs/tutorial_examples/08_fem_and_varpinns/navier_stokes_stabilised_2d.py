@@ -103,7 +103,7 @@ fem = jno.fem(
 assert not fem.is_linear, "the convective term keeps this nonlinear"
 print(f"\nStabilised P1/P1 Kovasznay flow (Re={RE:.0f}): dofs={fem.dofs}")
 
-# Assembled-tangent Newton: the matrix-free default goes NaN on this cold start from rest.
+# Sparse-direct Newton: the matrix-free Newton (newton(direct=False)) goes NaN on this cold start from rest.
 sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-8, atol=1e-8)))
 
 off = fem.offsets
