@@ -107,8 +107,8 @@ On a **structured grid**, `(κ * ui.x).x` is the conservative, compact flux diff
     [κ_{i+½}(u_{i+1} − u_i) − κ_{i−½}(u_i − u_{i−1})] / h²
 
 with κ evaluated at the half-points between nodes. Chaining two central differences instead reads every
-second node, a 2h-wide stencil that decouples odd and even nodes. On a layered dielectric (ε = 1 | 10,
-`benchmarks/fdm/electrostatics.py`) that was first order, 0.14 off at h = 0.1, with only the even nodes
+second node, a 2h-wide stencil that decouples odd and even nodes. On a layered dielectric (ε = 1 | 10)
+that was first order, 0.14 off at h = 0.1, with only the even nodes
 wrong. The compact form is exact there. How κ is taken between nodes is `jno.fd(average=...)`:
 
 | `average=` | κ at the half-point | when |

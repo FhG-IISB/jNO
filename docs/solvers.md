@@ -551,7 +551,7 @@ such a menu are things you can write.
     application carries ~11 ms of fixed handle overhead, so it pays only where the iteration savings
     exceed it — for most problems prefer `precond.amg()` (whose V-cycle compiles into the solve) or
     `linear=jno.solve.amg()` (ONE AmgX crossing per solve, with warm structure-keyed re-setup measured
-    ~10x cheaper on repeats). `benchmarks/amg_scaling.py` holds the numbers.
+    ~10x cheaper on repeats).
 
 ??? note "`.cached(refresh=…)`"
     on any spec — reuse an expensive setup across solves: `False` frozen, `True`
@@ -583,7 +583,7 @@ such a menu are things you can write.
     4302 dofs, `tol=1e-10`: `restart=30` → 2.30 s for 3.3e-6; `restart=150` → 0.49 s for 3.3e-9. On
     3-D Stokes this is what makes the recipe overtake a direct factorisation — measured crossover at
     ~15k dofs, and 3.4–3.9× faster (23.2 s → 5.9–6.9 s over repeat runs) at 41k, where LU's fill-in also
-    costs more memory. `benchmarks/saddle_scaling.py` runs that sweep.
+    costs more memory.
 
     On a **reaction-dominated** system — Brinkman/Darcy drag, or a small implicit time step — add the
     Laplacian leg, and the iteration count stops tracking the reaction coefficient:
