@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 from typing import List, Union
 
@@ -1049,8 +1050,10 @@ def laplacian(
     """
     _guard(target, scheme)
     if scheme == "finite_difference" and variables is not None:
-        print(
-            "Variables were selected for the finite difference laplacian which are not used. The finite difference derivatives are computed on the entire spatial grid."
+        warnings.warn(
+            "jno.np.laplacian: the variables passed are not used by the finite-difference laplacian; its "
+            "derivatives are computed on the entire spatial grid.",
+            stacklevel=2,
         )
 
     return Hessian(_u(target), variables, scheme, trace=True)

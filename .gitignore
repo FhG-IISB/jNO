@@ -21,6 +21,7 @@ misc/
 !docs/misc/
 !docs/assets/
 !docs/assets/*
+!assets/*
 runs/
 traces/
 # Talks and decks: kept in the working tree so they survive a scratchpad clear, but NOT in the
