@@ -5599,6 +5599,8 @@ packages:
   - orbax-checkpoint>=0.6.0
   - foundax>=0.2.0
   - pygmsh>=7.0.0
+  - meshio>=5.3
+  - scipy>=1.11
   - cloudpickle>=3.0.0
   - einops>=0.7.0
   - shapely>=2.0

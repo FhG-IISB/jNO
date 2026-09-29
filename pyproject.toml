@@ -39,6 +39,8 @@ dependencies = [
     "foundax>=0.2.0",
 
     "pygmsh>=7.0.0",
+    "meshio>=5.3",  # imported directly (jno.domain); it used to arrive only through pygmsh
+    "scipy>=1.11",  # imported directly (sparse solvers, meshing); it used to arrive only through jax
     "cloudpickle>=3.0.0",
     "einops>=0.7.0",
     "shapely>=2.0",
