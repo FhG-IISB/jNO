@@ -1131,15 +1131,24 @@ class _TraceFDM:
         """While active, every trainable parameter reads a probe value ``(1 + a)·p + b`` near its current
         value ``p`` (``a, b`` drawn from [0.1, 0.2], fixed seed): a generic point that keeps the sign of a
         nonzero value, so a probe does not wander into a regime (a negative diffusivity) the problem never
-        visits, while a zero moves off zero."""
+        visits, while a zero moves off zero. A network's probe moves every weight the same way."""
         import equinox as eqx
+        import jax
 
         rng = np.random.default_rng(11)
-        probe = {}
-        for lid, m in self._current_params().items():
-            p = np.asarray(m.value)
+
+        def moved(x):
+            p = np.asarray(x)
             a, b = rng.uniform(0.1, 0.2, p.shape), rng.uniform(0.1, 0.2, p.shape)
-            probe[lid] = eqx.tree_at(lambda mm: mm.value, m, jnp.asarray((1.0 + a) * p + b, dtype=m.value.dtype))
+            return jnp.asarray((1.0 + a) * p + b, dtype=x.dtype)
+
+        probe = {}
+        for lid, n in self._trainable_params().items():
+            m = n.model.module
+            if not getattr(n.model, "_is_parameter", False):  # a network: every floating-point weight
+                probe[lid] = jax.tree_util.tree_map(lambda x: moved(x) if eqx.is_inexact_array(x) else x, m)
+                continue
+            probe[lid] = eqx.tree_at(lambda mm: mm.value, m, moved(m.value))
         saved = getattr(self, "_perturbation", None)
         self._perturbation = probe
         try:
@@ -1651,12 +1660,17 @@ class _TraceFDM:
         return lambda t=None: probe(0.0, t)
 
     def _trainable_params(self):
-        """**Trainable** ``jno.np.parameter`` fields in the constraints — a parameter with an attached
-        optimizer (``.optimizer(...)``, i.e. ``model._opt_fn is not None``) that is not the unknown: the
-        inverse parameters (a source amplitude, a diffusivity, …). Their presence makes :meth:`solve`
-        return a deferred ``crux``-drivable node. A parameter **without** an optimizer is *data* — a
-        known nodal field (e.g. a neighbour's field in a coupled solve) — so it stays an eager solve and
-        is gathered as a value by :meth:`_eval_g`. Returns ``{layer_id: ModelCall}``."""
+        """**Trainable** models in the constraints — a ``jno.np.parameter`` or a ``jno.nn`` network with an
+        attached optimizer (``.optimizer(...)``, i.e. ``model._opt_fn is not None``) that is not the unknown
+        (and, for a network, not ``.freeze()``d): the inverse parameters (a source amplitude, a diffusivity,
+        a network coefficient ``k(x)``, …). Their presence makes :meth:`solve` return a deferred
+        ``crux``-drivable node. A parameter **without** an optimizer is *data* — a known nodal field (e.g. a
+        neighbour's field in a coupled solve) — so it stays an eager solve and is gathered as a value by
+        :meth:`_eval_g`; a network without one is a known coefficient, evaluated at its stored weights.
+        Returns ``{layer_id: ModelCall}``.
+
+        A network used to be left out: with its optimizer attached, the solve still ran eagerly at the
+        stored weights and returned a constant array, so ``jno.core`` never trained it (no error)."""
         from .trace import ModelCall
 
         found = {}
@@ -1665,9 +1679,9 @@ class _TraceFDM:
             n = _unwrap(n)
             if (
                 isinstance(n, ModelCall)
-                and getattr(n.model, "_is_parameter", False)
                 and all(n.model is not u for u in self.unknowns)
                 and getattr(n.model, "_opt_fn", None) is not None  # trainable ⇔ has an optimizer
+                and (getattr(n.model, "_is_parameter", False) or not getattr(n.model, "_frozen", False))
             ):
                 found[n.model.layer_id] = n
             for c in _iter(n):
@@ -1676,6 +1690,52 @@ class _TraceFDM:
         for c in self._pde + self._dirichlet + self._neumann + self._ic:
             walk(c)
         return found
+
+    def _record_fixed_networks(self):
+        """Mark every network this solve bakes in at its stored weights (no optimizer yet, not frozen).
+
+        Trainability is decided here, at ``.solve()``: an optimizer attached to such a network AFTERWARDS does
+        not reach the array this solve returned, so training would silently leave the network alone. The mark
+        makes that late ``.optimizer(...)`` raise (see ``Model.optimizer``)."""
+        from .trace import ModelCall
+
+        def walk(n):
+            n = _unwrap(n)
+            m = getattr(n, "model", None) if isinstance(n, ModelCall) else None
+            if (
+                m is not None
+                and all(m is not u for u in self.unknowns)
+                and not getattr(m, "_is_parameter", False)
+                and not getattr(m, "_frozen", False)
+                and getattr(m, "_opt_fn", None) is None
+            ):
+                m._jno_fixed_by_eager_solve = True
+            for c in _iter(n):
+                walk(c)
+
+        for c in self._pde + self._dirichlet + self._neumann + self._ic:
+            walk(c)
+
+    @staticmethod
+    def _trainable_arg(node):
+        """What a trainable contributes to the deferred solve node's arguments: a parameter's own
+        ``ModelCall`` (it evaluates to the parameter's current value), a network's ``ModelWeights`` (it
+        evaluates to the network's live module -- a call would evaluate the network instead)."""
+        from .trace import ModelWeights
+
+        return node if getattr(node.model, "_is_parameter", False) else ModelWeights(node.model)
+
+    @staticmethod
+    def _trainable_module(node, value):
+        """The module a trainable resolves to inside the solve, from the value its :meth:`_trainable_arg`
+        evaluated to (possibly traced): the parameter's module holding ``value``, or the network's module
+        itself."""
+        if not getattr(node.model, "_is_parameter", False):
+            return value
+        import equinox as eqx
+
+        module = node.model.module
+        return eqx.tree_at(lambda m: m.value, module, jnp.asarray(value).astype(module.value.dtype))
 
     def _require_real(self, value, what):
         """``value``, unless it is complex while every unknown is real: a real solve would keep only its real
@@ -1688,7 +1748,7 @@ class _TraceFDM:
             )
         return value
 
-    def _eval_g(self, g_node, idx):
+    def _eval_g(self, g_node, idx, t=None):
         """Value ``g`` at the nodes ``idx`` — a constant, a coordinate expression, or a **known nodal
         field** (a ``jno.np.parameter`` / ``domain.unknown()`` carrying data, e.g. a neighbour's current
         field in a coupled solve), in which case its per-node values are gathered at ``idx``."""
@@ -1702,13 +1762,14 @@ class _TraceFDM:
         if isinstance(inner, ModelCall) and getattr(inner.model, "_is_parameter", False):
             out = jnp.asarray(inner.model.module.value).reshape(-1)[jnp.asarray(idx)]  # nodal data → gather
         else:
-            out = jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+            out = jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx], t=t)).reshape(-1)
         return self._require_real(out, "a condition's value")
 
-    def _condition_value(self, constraint, idx):
+    def _condition_value(self, constraint, idx, t=None):
         """Value ``g`` of an affine condition ``u(region) - g`` (Dirichlet or IC), evaluated at the
-        region's nodes ``idx`` — reused for both boundary conditions and the initial state."""
-        return self._eval_g(self._value_side(constraint), idx)
+        region's nodes ``idx`` — reused for both boundary conditions and the initial state. ``t`` is the
+        time a value written with the time variable reads (the start time, for an initial condition)."""
+        return self._eval_g(self._value_side(constraint), idx, t=t)
 
     def _field_index(self, constraint):
         """Which unknown's DOF block a value-only constraint (Dirichlet) pins — 0 for a single field."""
@@ -2261,7 +2322,7 @@ class _TraceFDM:
             vals = (
                 self._eval_value(self._value_side(c), idx, scope)
                 if self._uses_params(c, scope)
-                else self._condition_value(c, idx)
+                else self._condition_value(c, idx, t=self._start_time())
             )
             k, nodes = self._field_index(c), np.asarray(idx if len(idx) else allnodes)
             for b, vb in zip(self._blocks_of(k), self._split_components(k, vals, len(nodes))):
@@ -2313,6 +2374,7 @@ class _TraceFDM:
 
         def _run():
             trainable = self._trainable_params()
+            self._record_fixed_networks()
             if self._transient:
                 if x0 is not None:
                     raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
@@ -3008,18 +3070,16 @@ class _TraceFDM:
         return self.pinned_solver(node_ids, nonlinear=nonlinear)(values)
 
     def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None):
-        """When the constraints carry a trainable ``jno.np.parameter`` (an inverse parameter), return the
-        solve as a **trace node** instead of an array — exactly as ``fem.solve()`` does — so it composes
-        into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with the parameter's
-        attached optimizer recovers it. At each ``crux`` step the parameter node resolves to its current
-        value, the solve re-runs (differentiably, through ``custom_root``), and the gradient flows back."""
-        import equinox as eqx
-
+        """When the constraints carry a trainable ``jno.np.parameter`` or ``jno.nn`` network (an inverse
+        parameter), return the solve as a **trace node** instead of an array — exactly as ``fem.solve()``
+        does — so it composes into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with
+        the trainable's attached optimizer recovers it. At each ``crux`` step the parameter node resolves to
+        its current value (a network's ``ModelWeights`` to its current module, as in ``jno.fem``), the solve
+        re-runs (differentiably, through ``custom_root``), and the gradient flows back."""
         from .trace import FunctionCall
 
         lids = list(trainable)
-        param_nodes = [trainable[lid] for lid in lids]  # the parameter ModelCalls -> FunctionCall args
-        modules = {lid: trainable[lid].model.module for lid in lids}
+        param_nodes = [self._trainable_arg(trainable[lid]) for lid in lids]  # -> FunctionCall args
 
         if self._transient:
             # A warm-up march at the parameters' current values makes every STRUCTURAL decision on concrete
@@ -3029,11 +3089,8 @@ class _TraceFDM:
         elif linear is not None or precond is not None:
             self._prepare_steady_slots(linear, precond)
 
-        def _solve(*values):  # values = the parameters' current (crux-trained) values
-            extra = {
-                lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
-                for lid, v in zip(lids, values)
-            }
+        def _solve(*values):  # values = the parameters' current (crux-trained) values / networks' modules
+            extra = {lid: self._trainable_module(trainable[lid], v) for lid, v in zip(lids, values)}
             if not self._transient:
                 return self._steady_solve(nonlinear=nonlinear, x0=x0, extra_params=extra, linear=linear, precond=precond)
             # A transient solve reads the parameters through `_override`, which every evaluator in the march

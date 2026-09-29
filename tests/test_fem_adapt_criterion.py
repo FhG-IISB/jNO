@@ -268,3 +268,29 @@ def test_the_criterion_reaches_the_public_slot():
     assert jno.solve.remesh().criterion is None
     spec = jno.solve.remesh(criterion=42)
     assert spec.criterion == 42
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_the_nodal_criterion_is_its_projection_on_higher_order_fields(order):
+    """``g = 1 + x`` lies in the P1 and P2 spaces, so its nodal projection must BE ``1 + x`` at every DOF node.
+
+    It was ``int g phi_i / int phi_i``, right for P1 but not from P2 on: a P2 vertex basis function integrates to
+    zero on a triangle, so the vertex rows came out as round-off / 1e-30 (measured 4.6e11 to 2.5e13 where the
+    criterion lies in [1, 2]) and cells were marked on those rows. From P2 on it is the consistent L2
+    projection (the conservative transfer's mass solve); P1 keeps the lumped one."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.fem_symbols(order=order)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    sol = np.asarray(fem.solve()).reshape(-1)
+    g = np.asarray(_criterion_nodal(fem, 1.0 + xi, sol))
+    pts = np.asarray(fem.field_points[0])
+    assert g.shape[0] == pts.shape[0]
+    if order == 1:  # the lumped projection of a linear g is exact only in the interior
+        interior = (pts[:, 0] > 1e-9) & (pts[:, 0] < 1 - 1e-9) & (pts[:, 1] > 1e-9) & (pts[:, 1] < 1 - 1e-9)
+        np.testing.assert_allclose(g[interior], 1.0 + pts[interior, 0], rtol=0.2)
+        assert g.max() < 3.0
+    else:
+        np.testing.assert_allclose(g, 1.0 + pts[:, 0], rtol=1e-8, atol=1e-10)

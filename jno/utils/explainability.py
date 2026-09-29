@@ -410,7 +410,9 @@ def make_per_loss_grad_fn(
 
         norms = jnp.linalg.norm(G, axis=1)  # (N,)
         G_hat = G / (norms[:, None] + 1e-12)
-        cos_matrix = G_hat @ G_hat.T  # (N, N)
+        # HIGHEST precision: the default float32 matmul on an Ampere GPU is TF32 (~3 significant digits), which
+        # made a unit vector's self-similarity 0.99988 or 1.00016 -- a "cosine" above 1. Exact to float32 here.
+        cos_matrix = jnp.matmul(G_hat, G_hat.T, precision=jax.lax.Precision.HIGHEST)  # (N, N)
 
         # Eq. 3.1 of arXiv:2502.00604: average the unit-normalized gradients
         # (rows of G_hat), then map ‖·‖² ∈ [0, 1] to alignment ∈ [-1, 1].

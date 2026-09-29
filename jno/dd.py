@@ -163,12 +163,13 @@ def _fem_param_specs(prob):
 
 
 def _fdm_param_specs(prob):
-    """``(lids, nodes, modules)`` of an FDM subdomain's trainable parameters — empty for a
-    non-parametric FDM. ``lids``/``modules`` feed ``_steady_solve(extra_params=...)`` (the same value
-    injection ``fdm.solve()`` uses for an inverse parameter)."""
+    """``(lids, nodes, calls)`` of an FDM subdomain's trainables (parameters and networks) — empty for a
+    non-parametric FDM. ``nodes`` are the coupled node's args (a network's is its ``ModelWeights``);
+    ``lids``/``calls`` feed ``_steady_solve(extra_params=...)`` through :func:`_fdm_extra_params` (the same
+    value injection ``fdm.solve()`` uses for an inverse parameter)."""
     trainable = prob._trainable_params() if hasattr(prob, "_trainable_params") else {}
     lids = list(trainable)
-    return lids, [trainable[lid] for lid in lids], {lid: trainable[lid].model.module for lid in lids}
+    return lids, [prob._trainable_arg(trainable[lid]) for lid in lids], [trainable[lid] for lid in lids]
 
 
 def _subdomain_param_nodes(prob):
@@ -212,13 +213,7 @@ def _make_pinned_solver(prob, pin_idx, param_values):
         return solve
 
     # FDM
-    import equinox as eqx
-
-    lids, _, modules = _fdm_param_specs(prob)
-    extra = {
-        lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
-        for lid, v in zip(lids, param_values)
-    }
+    extra = _fdm_extra_params(prob, param_values)
 
     def solve(values):
         return jnp.asarray(prob._steady_solve(extra_params=extra or None, extra_pins=(pin, jnp.asarray(values)))).reshape(
@@ -329,14 +324,8 @@ def _fem_ab(prob, theta):
 def _fdm_extra_params(prob, param_values):
     """Build the ``{layer_id: module}`` value injection ``_steady_solve(extra_params=...)`` wants from an
     FDM subdomain's resolved parameter values (the same mechanism ``fdm.solve()`` uses for an inverse)."""
-    import equinox as eqx
-    import jax.numpy as jnp
-
-    lids, _, modules = _fdm_param_specs(prob)
-    return {
-        lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
-        for lid, v in zip(lids, param_values)
-    }
+    lids, _, calls = _fdm_param_specs(prob)
+    return {lid: prob._trainable_module(c, v) for lid, c, v in zip(lids, calls, param_values)}
 
 
 def _line_geometry(probs, geoms):

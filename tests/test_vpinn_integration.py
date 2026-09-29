@@ -652,7 +652,7 @@ class TestVpinnCoupledAsVector:
             jnn.inner(gu, gv, n_contract=2)
             - (lap - 2.0 * s) * vi[0]  # fa
             - (2.0 * lap) * vi[1]  # fb
-            - trial[1] * vi[0]  # the coupling: b enters a's equation
+            - trial[..., 1] * vi[0]  # the coupling: b (component 1) enters a's equation
         ]
 
     def test_the_coupled_system_is_expressible_and_correct_as_a_vector_field(self):

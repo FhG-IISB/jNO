@@ -24,6 +24,7 @@ import time
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 _FORMATS = ("auto", "csr", "coo")
 _FORMAT = "auto"
@@ -81,19 +82,31 @@ def csr_parts(A):
 
     Handles what jNO's operators can contain: duplicates (CSR products sum them, like BCOO), unsorted
     triplets (an uncompressed parametric assembly: stably sorted by row), and out-of-bound padding from
-    ``sum_duplicates`` (turned into explicit zeros in the last row, which keeps a sorted operator sorted
-    without a second sort). Call it OUTSIDE a solver loop -- it is O(nnz), or O(nnz log nnz) unsorted.
+    ``sum_duplicates``. Call it OUTSIDE a solver loop -- it is O(nnz), or O(nnz log nnz) unsorted.
+
+    Padding goes to a GHOST row ``n`` and column ``m`` (``indptr`` then has ``n + 2`` entries), which
+    :func:`csr_matvec` meets with a zero input and drops from the output: exactly BCOO's "padding contributes
+    nothing". It used to be an explicit zero at ``(n - 1, 0)``, which is not nothing against a non-finite
+    input: ``0 * inf`` is NaN, so the transposed product put a NaN in output 0 whenever ``w[n-1]`` was
+    NaN -- and because the format is chosen by timing, only in the runs that picked CSR. A concrete
+    operator without padding gets no ghost.
     """
     n, m = A.shape
     r, c, d = A.indices[:, 0], A.indices[:, 1], A.data
     valid = (r >= 0) & (r < n) & (c >= 0) & (c < m)
+    if isinstance(A.indices, jax.core.Tracer):
+        ghost = True  # traced indices: padding cannot be ruled out
+    else:  # read the concrete pattern with NumPy -- a jnp op here would be staged when called inside a trace
+        idx = np.asarray(A.indices)
+        ghost = not bool(((idx[:, 0] >= 0) & (idx[:, 0] < n) & (idx[:, 1] >= 0) & (idx[:, 1] < m)).all())
     d = jnp.where(valid, d, jnp.zeros((), d.dtype))
-    r = jnp.where(valid, r, n - 1).astype(jnp.int32)
-    c = jnp.where(valid, c, 0).astype(jnp.int32)
+    r = jnp.where(valid, r, n).astype(jnp.int32)  # the ghost row sorts after every real one
+    c = jnp.where(valid, c, m).astype(jnp.int32)
     if not getattr(A, "indices_sorted", False):
         order = jnp.argsort(r, stable=True)
         r, c, d = r[order], c[order], d[order]
-    indptr = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(jnp.bincount(r, length=n)).astype(jnp.int32)])
+    rows = n + 1 if ghost else n
+    indptr = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(jnp.bincount(r, length=rows)).astype(jnp.int32)])
     return d, c, indptr
 
 
@@ -101,12 +114,19 @@ def csr_matvec(parts, shape, transpose=False):
     from jax.experimental.sparse import csr as _csr
 
     d, c, p = parts
+    n, m = shape
+    ghost = int(p.shape[0]) == n + 2  # padding sits in a ghost row/column (see csr_parts)
+    gshape = (n + 1, m + 1) if ghost else (n, m)
 
     def mv(v):
         v = jnp.asarray(v)
+        if ghost:  # the ghost entry of the input is 0, and the ghost entry of the output is dropped
+            v = jnp.concatenate([v, jnp.zeros((1,) + v.shape[1:], v.dtype)])
         if v.ndim == 1:
-            return _csr._csr_matvec(d, c, p, v, shape=shape, transpose=transpose)
-        return _csr._csr_matmat(d, c, p, v, shape=shape, transpose=transpose)
+            out = _csr._csr_matvec(d, c, p, v, shape=gshape, transpose=transpose)
+        else:
+            out = _csr._csr_matmat(d, c, p, v, shape=gshape, transpose=transpose)
+        return out[:-1] if ghost else out
 
     return mv
 

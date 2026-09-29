@@ -1861,6 +1861,7 @@ def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, offs
     seeded at its element midpoints too, not only at the mesh vertices, or the march starts from a
     state that is right on the vertices and zero in between."""
     from ..._fem import _bare, _constant_of, _essential_spec, _eval_value_node_at, _field_key_of
+    from .time_route import _infer_time_window
 
     state0 = jnp.zeros((offs[-1],))
     for ic in ic_residuals:
@@ -1874,7 +1875,7 @@ def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, offs
         if const is not None:
             vals = jnp.full((n_dof,), float(const))
         else:
-            v = jnp.asarray(_eval_value_node_at(node, pts))
+            v = jnp.asarray(_eval_value_node_at(node, pts, t=_infer_time_window(domain)[0]))
             vals = jnp.broadcast_to(v, (n_dof,)) if v.shape[0] == 1 else v
         block = jnp.asarray(vals).reshape(-1)
         if block.shape[0] != offs[fidx + 1] - offs[fidx]:

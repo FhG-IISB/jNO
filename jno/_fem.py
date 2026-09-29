@@ -1338,7 +1338,7 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any:
+def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -1349,10 +1349,23 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any
     parameters into the evaluation, so the result stays **differentiable** in them — the coefficient of a
     parametric natural / surface boundary term (an inverse-design impedance / incident source). When it is
     ``None`` (the default) the parameters keep their stored values (a plain forward pass).
+
+    ``t`` is the time a **temporal** Variable reads (an initial condition passes the start time). A time
+    Variable has its own tag, so without ``t`` it would be handed the spatial points and read the x column;
+    a value that mentions time with no ``t`` given therefore raises instead.
     """
     from .trace_evaluator import TraceEvaluator
 
-    tags = {v.tag for v in _walk(value_node) if isinstance(v, Variable)}
+    variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
+    if temporal and t is None:
+        raise ValueError(
+            "jno.fem: a condition's value references the time coordinate, but it is evaluated here without a "
+            f"time (time tags {sorted(temporal)}). A time-dependent value is supported in a transient Dirichlet "
+            "condition and in an initial condition (read at the start time); anywhere else write it without "
+            "the time variable."
+        )
+    tags = {v.tag for v in variables} - temporal
     pts = jnp.atleast_2d(jnp.asarray(points))
     # Register every ModelCall (parameter / network) so the evaluator resolves it. With ``params`` (the
     # runtime ``args``), substitute a trainable parameter's value OR a trainable network's live module from
@@ -1376,7 +1389,10 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any
                 elif (nn := _neural_coefficient_name(nd)) in params:  # trainable network: its live module
                     mod = params[nn]
             table[m.layer_id] = mod
-    return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context={t: pts for t in tags}), (-1,))
+    context = {tag: pts for tag in tags}
+    for tag in temporal:
+        context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
+    return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context=context), (-1,))
 
 
 def _coord_value_fn(value_node: Any) -> Callable:
@@ -2968,9 +2984,13 @@ class FEM:
             # Runtime-parametric steady linear: solve A(θ)x=b(θ) as a trace node (∂u/∂θ flows through
             # solve_fn). A periodic tie reduces per-call inside FemLinearSystem.solve, after A(θ) is
             # re-formed: u = P · solve(PᵀA(θ)P, Pᵀb(θ)); self._periodic is None for the untied case.
-            _node = self._op.solve(solve_fn, periodic=self._periodic_2n if self._complex_n else self._periodic)
+            _node = self._op.solve(
+                solve_fn, periodic=self._periodic_2n if self._complex_n else self._periodic, values=kwargs.get("values")
+            )
             if self._complex_n is None:
                 return _node
+            if kwargs.get("values"):  # solved at the given values: an array, recombined directly
+                return _complex_recombine(self._complex_n)(_node)
             # Fused complex inverse: the trace node solves the real 2n block, so recombine INSIDE it —
             # the caller must receive a complex field, and ∂u/∂θ still flows through the wrapped fn.
             from .trace import FunctionCall
@@ -3310,6 +3330,14 @@ class FEM:
         from . import solve as _solve
         from .utils.solver.solver_api import LinearOperator
 
+        if getattr(self._op, "is_parametric", False):
+            names = sorted(getattr(self._op, "runtime_parameter_exprs", {}) or {})
+            raise NotImplementedError(
+                f"FEM.eigs: this form carries trainable parameter(s) {names}, and an eigensolve here would need "
+                "their values. For eigenvalues differentiable in them, assemble at the values and call the "
+                "solver directly: `K, _ = fem.operator.evaluate({name: value}); M, _ = mass_fem.operator; "
+                "lam, X = jno.solve.eigs(k=...)(K, M)` -- gradients flow through `evaluate` and the eigensolve."
+            )
         K = self.operator[0]
         n_full = int(jnp.shape(K)[0] if getattr(K, "shape", None) is not None else LinearOperator(K).shape[0])
         # Read the constraint sets BEFORE assembling the mass form. `_fem_native_dirichlet_pairs` is
@@ -5714,6 +5742,29 @@ def _host_assembly_scope():
     return jax.default_device(hosts[0]) if hosts else contextlib.nullcontext()
 
 
+def _refuse_point_indexing(constraints: Any) -> None:
+    """Refuse ``expr[i]`` on a derived FE expression, naming ``expr[..., i]``.
+
+    A subscript indexes the leading axis, as in NumPy. On an expression built from FE symbols (``grad(u, X)``,
+    ``u * k``) that axis is the quadrature points at assembly, so ``grad(u, [x, y])[0]`` is not the x-derivative:
+    it used to reach the assembler and die there on a raw broadcast error. The symbols themselves (``u[i]``,
+    ``v[i]``, ``u(region)[i]``, bound views) read an integer subscript as a component and are not affected."""
+    for c in constraints:
+        for node in _walk(_bare(c)):
+            key = getattr(node, "getitem_key", None)
+            if key is None or getattr(node, "_name", None) != "getitem" or any(k is Ellipsis for k in key):
+                continue
+            base = node.args[0] if getattr(node, "args", None) else None
+            if base is None or isinstance(base, (TrialFunction, TestFunction)):
+                continue
+            if any(isinstance(n, (TrialFunction, TestFunction)) for n in _walk(base)):
+                raise ValueError(
+                    f"jno.fem: `expr[{', '.join(map(repr, key))}]` on an expression built from FE symbols indexes "
+                    "its POINT axis (the quadrature points), not a component. For component i write "
+                    "`expr[..., i]`, e.g. `grad(u, [x, y])[..., 0]` for the x-derivative."
+                )
+
+
 def fem(
     constraints: Any,
     *,
@@ -5828,6 +5879,7 @@ def _fem_impl(
     # remeshed in place -- the constraints reference the domain (not a mesh snapshot),
     # so re-tracing them picks up the refined mesh automatically.
     _orig_constraints = list(constraints)
+    _refuse_point_indexing(constraints)
     _orig_fem_kwargs = {"quad_degree": quad_degree}
 
     # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
@@ -7192,6 +7244,16 @@ def _fem_impl(
             f"reports dimension {getattr(domain, 'dimension', None)!r}. Use an FEM trial "
             "(`d.fem_symbols()` written against the same weak form), or a collocation PINN."
         )
+    if is_vpinn and int(getattr(domain, "_batch_count", 1) or 1) > 1:
+        # Built without complaint, it then died at evaluation on `Expected shape_vals_flat.ndim == 2`: the
+        # FE tables are per-mesh, and the batch count is read off every context entry (see
+        # `domain._effective_batch_count`), so the table was split row by row as if rows were samples.
+        raise NotImplementedError(
+            f"jno.fem: a VPINN (network trial) on a batched domain ({domain._batch_count} * domain) is not "
+            "supported -- the test-projection tables are per mesh, not per sample. For an operator over a "
+            "family of problems, train on the assembled FE residual instead (`fem.residual(U, args)` "
+            "wrapped with `jno.fn` per sample; see tests/test_hybrid_nn_fem.py), or use one domain per sample."
+        )
     if is_vpinn and periodic_ties:
         raise NotImplementedError(
             "jno.fem: a VPINN (network trial) does not compose with periodic ties -- the tie is imposed "
@@ -7514,6 +7576,14 @@ def _assemble_multifield(
     # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
     _cx_coupled = _is_complex_form(domain, ir)
     _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
+    _par_names = sorted(
+        {
+            str(getattr(n.model, "_parameter_name", None) or "a trainable network")
+            for b in weak_bares
+            for n in _walk(b)
+            if type(n).__name__ == "ModelCall"
+        }
+    )
     if evolution and _cx_coupled:
         raise NotImplementedError(
             "jno.fem: `state.evolves(...)` cannot combine with a complex coupled form — complex forms "
@@ -7545,7 +7615,7 @@ def _assemble_multifield(
     # rather than mis-assemble.
     raise NotImplementedError(
         "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
-        f"parameter ({_par_coupled}) and is linear with no step history, so it would take the coupled "
+        f"parameter ({', '.join(_par_names) or 'unnamed'}) and is linear with no step history, so it would take the coupled "
         "linear assembly, which has no parametric route. Recover the parameter on a single-field "
         "reduced form, on a coupled NONLINEAR form or a load-path march (`domain(tau=...)` + `.i(k)`) "
         "-- both assemble as a residual operator -- or through a coupled first-order transient."
@@ -7622,7 +7692,10 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
         if comp is None:
             return jnp.full((n,), float(const))  # scalar broadcast to every dof
         return jnp.zeros((n,)).at[comp::vec].set(float(const))  # one component only
-    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))).reshape(-1)
+    from .utils.solver.time_route import _infer_time_window
+
+    # an initial condition sits at the start time: a value written with the time variable reads it there
+    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), t=_infer_time_window(domain)[0])).reshape(-1)
     if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
         per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
         return jnp.zeros((n,)).at[comp::vec].set(per)

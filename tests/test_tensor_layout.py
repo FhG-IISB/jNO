@@ -112,6 +112,88 @@ class TestTimeDependent:
             dom.variable("_f", _arr(B, H, W, C))
 
 
+class TestPerNode:
+    """Rank 3, ``(B, n, k)``: one value per node per sample, the operator-learning target. The
+    single-window path took axis 1 as time (``arr[0]``), so it arrived as ``(B, k)`` -- node 0 only."""
+
+    def _dom(self, batch=B, n=6):
+        dom = batch * jno.domain.from_array({"nodes": np.random.default_rng(0).random((n, 2))})
+        dom.variable("nodes")
+        return dom
+
+    def test_per_node_data_gets_the_time_axis(self):
+        dom = self._dom()
+        dom.variable("u", _arr(B, 6, 3))
+        assert dom.context["u"].shape == (B, 1, 6, 3)
+
+    def test_attached_before_the_nodes_are_sampled(self):
+        dom = B * jno.domain.from_array({"nodes": np.zeros((6, 2))})
+        dom.variable("u", _arr(B, 6, 1))
+        assert dom.context["u"].shape == (B, 1, 6, 1)
+
+    def test_no_matching_point_set_raises_naming_the_layout(self):
+        dom = self._dom()
+        with pytest.raises(ValueError, match=r"node count.*\(4, 1, 7, 1\)"):
+            dom.variable("u", _arr(B, 7, 1))
+
+    def test_n_equal_to_B_raises(self):
+        dom = self._dom(batch=6)
+        with pytest.raises(ValueError, match="batch count"):
+            dom.variable("u", _arr(6, 6, 1))
+
+    def test_per_step_values_get_a_node_axis(self):
+        """(B, T, k), one value per sample and step, is stored as (B, T, 1, k) -- the layout the compiler reads."""
+        dom = TestTimeDependent()._dom(3)
+        dom.variable("u", _arr(B, 3, 2))
+        assert dom.context["u"].shape == (B, 3, 1, 2)
+
+    @pytest.mark.parametrize("window", [1, None])
+    def test_every_step_receives_its_own_per_step_value(self, window):
+        """data[b, s] = 100 b + s attached as (B, T, 1): sample b at step s must see 100 b + s. Left as (B, T, k),
+        the default one-step window handed every step step 0's value, and the full window handed every step the
+        whole series."""
+        import jax
+
+        nb, nt = 2, 4
+        dom = nb * jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(2, 2)).domain(time=(0.0, 3.0, nt))
+        x, _y, t = dom.variable("interior")
+        data = np.array([[[100.0 * b + s] for s in range(nt)] for b in range(nb)])
+        g = dom.variable("g", data)
+        crux = jno.core([], domain=dom)
+        if window is None:
+            got = np.asarray(crux.eval([g], domain=dom, min_consecutive=None))
+            np.testing.assert_array_equal(got.reshape(nb, nt), data[..., 0])
+            return
+        for seed in (0, 3, 7):
+            tt, gv = crux.eval([t + 0.0 * x, g], domain=dom, min_consecutive=1, key=jax.random.PRNGKey(seed))
+            tt, gv = np.asarray(tt), np.asarray(gv)
+            for b in range(nb):
+                s = int(round(tt[b, 0, 0]))
+                assert gv[b].ravel()[0] == data[b, s, 0], (seed, b, s, gv[b].ravel()[0])
+
+    def test_a_lazy_per_step_source_is_refused_naming_the_layout(self):
+        class Lazy:
+            def __init__(self, a):
+                self._a, self.shape, self.dtype = a, a.shape, a.dtype
+
+            def __getitem__(self, key):
+                return self._a[key]
+
+        dom = TestTimeDependent()._dom(3)
+        with pytest.raises(ValueError, match=r"\(4, 3, 1, 2\)"):
+            dom.variable("u", Lazy(_arr(B, 3, 2)))
+
+    def test_per_node_on_a_time_grid_is_shared_across_steps(self):
+        dom = TestTimeDependent()._dom(3)
+        dom.variable("u", _arr(B, H * W, 2))
+        assert dom.context["u"].shape == (B, 1, H * W, 2)
+
+    def test_timestep_count_equal_to_node_count_raises(self):
+        dom = TestTimeDependent()._dom(H * W)
+        with pytest.raises(ValueError, match="timestep count"):
+            dom.variable("u", _arr(B, H * W, 1))
+
+
 class TestExtremes:
     def test_zero_sized_grid_axis(self):
         dom = _steady()

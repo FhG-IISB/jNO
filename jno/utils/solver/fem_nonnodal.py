@@ -1165,6 +1165,27 @@ def assemble_fem_nonnodal(
 
         return assemble
 
+    # --- the NONLINEAR tangent, assembled per element ------------------------------------------
+    # `_apply_dirichlet_projected` replaces the pinned rows of the residual with `u[d] - g`, so the tangent
+    # of that is the free tangent with those rows set to the identity -- `bcoo_eliminate_dirichlet`,
+    # the same row-replacement `fem_native._dirichlet_jac_rows` performs.
+    #
+    # `surface=False` matches the dense `jacfwd(res_bc)` it replaces EXACTLY: `_make_residual` is
+    # volume-only and the nonlinear path never added `surf_mass` to its tangent. Whether it should is
+    # a separate question about the residual too, not something a storage change may decide quietly.
+    _pin_dofs_j, _, _pin_project = dirichlet_projection(pins) if pins else (None, None, None)
+
+    def _sparse_tangent(asm, u, args=None):
+        # At the PROJECTED state and eliminated on both sides, matching `_apply_dirichlet_projected`.
+        _u = jnp.asarray(u).reshape(-1)
+        _u = _u if _pin_project is None else _pin_project(_u)
+        J = asm(args, surface=False, u_flat=_u)
+        return J if _pin_dofs_j is None else bcoo_eliminate_dirichlet(J, _pin_dofs_j)
+
+    #
+    # Defined BEFORE the transient branch below: that branch returns early, and its Jacobian closures call
+    # `_sparse_tangent` when the march runs -- defined after it, the name was never bound (NameError).
+
     # === transient: M u̇ + A u = c (mirrors fem_1d._assemble_1d_transient) -- split the temporal term
     #     (∫ ∂ₜu·v -> mass M) from the spatial operator, project the IC onto the edge DOFs, time-block it. ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in volume_terms):
@@ -1249,7 +1270,7 @@ def assemble_fem_nonnodal(
 
                 def _ic_cell(cidx):
                     per, xq, meas = _cell_fields(cidx, _cell_local_sols(cidx, u0_blocks))
-                    u0 = jnp.asarray(_eval_value_node_at(u0_node, xq)).reshape(n_quad)
+                    u0 = jnp.asarray(_eval_value_node_at(u0_node, xq, t=_infer_time_window(domain)[0])).reshape(n_quad)
                     return jnp.einsum("q,qn,q->n", qw * meas, per[0]["shape_vals"], u0)
 
                 loc = (cdofs[0] - offs[0]).reshape(-1)
@@ -1347,7 +1368,7 @@ def assemble_fem_nonnodal(
             def _ic_cell(cidx):
                 per, xq, meas = _cell_fields(cidx, u0_blocks)
                 phi = per[fidx]["shape_vals"]
-                u0 = jnp.asarray(_eval_value_node_at(u0_node, xq))
+                u0 = jnp.asarray(_eval_value_node_at(u0_node, xq, t=_infer_time_window(domain)[0]))
                 if phi.ndim == 3:  # RT/N1E vector basis (n_quad, n_dof, vsize): ∫ u0·Φ
                     u0 = jnp.broadcast_to(
                         u0.reshape(-1) if u0.size == 1 else u0.reshape(n_quad, -1), (n_quad, phi.shape[-1])
@@ -1488,22 +1509,6 @@ def assemble_fem_nonnodal(
     # sparsely too (it used to take the dense global jacfwd — a ~10⁴-edge ceiling on 3-D vector inverse design,
     # re-run every optimizer step); ``args=None`` reduces to the non-parametric assembly exactly. Vertex C0/C1
     # families keep the dense path below (their Hessian-shape element assembly is not ported; small 2-D problems).
-    # --- the NONLINEAR tangent, assembled per element ------------------------------------------
-    # `_apply_dirichlet_projected` replaces the pinned rows of the residual with `u[d] - g`, so the tangent
-    # of that is the free tangent with those rows set to the identity -- `bcoo_eliminate_dirichlet`,
-    # the same row-replacement `fem_native._dirichlet_jac_rows` performs.
-    #
-    # `surface=False` matches the dense `jacfwd(res_bc)` it replaces EXACTLY: `_make_residual` is
-    # volume-only and the nonlinear path never added `surf_mass` to its tangent. Whether it should is
-    # a separate question about the residual too, not something a storage change may decide quietly.
-    _pin_dofs_j, _, _pin_project = dirichlet_projection(pins) if pins else (None, None, None)
-
-    def _sparse_tangent(asm, u, args=None):
-        # At the PROJECTED state and eliminated on both sides, matching `_apply_dirichlet_projected`.
-        _u = jnp.asarray(u).reshape(-1)
-        _u = _u if _pin_project is None else _pin_project(_u)
-        J = asm(args, surface=False, u_flat=_u)
-        return J if _pin_dofs_j is None else bcoo_eliminate_dirichlet(J, _pin_dofs_j)
 
     _assemble_sparse_A = _make_sparse_assembler(volume_terms)
 

@@ -61,9 +61,16 @@ def test_duplicate_triplets_are_summed_like_bcoo():
     _close(sparse_matvec(A)(v), [-9.0, -12.0, 25.0])
 
 
-def test_padded_out_of_bound_triplets_contribute_nothing_even_against_nonfinite_input():
+@pytest.mark.parametrize("fmt", ["csr", "coo"])
+def test_padded_out_of_bound_triplets_contribute_nothing_even_against_nonfinite_input(fmt, monkeypatch):
     """``sum_duplicates`` (remove_zeros=True) pads with index (n, m). BCOO ignores those entries; so
-    must we -- including when the clamped neighbour of the pad is inf/NaN (0 * inf would be NaN)."""
+    must we -- including when the clamped neighbour of the pad is inf/NaN (0 * inf would be NaN).
+
+    Both storages, pinned: the format is otherwise chosen by timing, and the CSR one put a NaN in output 0
+    of the transposed product, so this test failed only in the runs that happened to pick CSR."""
+    from jno.utils.solver import matvec_format
+
+    monkeypatch.setattr(matvec_format, "_FORMAT", fmt)
     A = _bcoo(30, seed=3)
     A = A.sum_duplicates(nse=A.nse + 7)  # 7 padding slots at the out-of-bound index
     assert int((np.asarray(A.indices) >= 30).any(axis=1).sum()) == 7

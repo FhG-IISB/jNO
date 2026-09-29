@@ -193,7 +193,17 @@ def main(n_dev: int) -> None:
     # (only with the [metis] extra installed: the partition is METIS)
     import importlib.util
 
-    if importlib.util.find_spec("pymetis") is not None:
+    # Simulated CPU devices share the host's threads. With n_dev devices and too few cores, XLA:CPU deadlocks
+    # the sharded Schwarz solve (its batched dense factorisations inside the sharded program, next to the
+    # all-reduce): measured with 4 devices, it hung intermittently on 2 and 4 cores and never on 6, 8 or 12.
+    # The sharded Jacobi solves above do not hang. Real devices do not share a thread pool this way, so the
+    # section runs where the host can carry it -- on a 4-core CI runner the 2-device case still covers it.
+    import os
+
+    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    if importlib.util.find_spec("pymetis") is not None and cores < n_dev + 2:
+        print(f"SKIP sharded schwarz: {cores} cores for {n_dev} simulated devices (XLA:CPU needs >= {n_dev + 2})")
+    elif importlib.util.find_spec("pymetis") is not None:
         # Its value is placement: each device builds, inverts and applies only its own block of subdomains.
         # Checked on the compiled program (per-device block count, all-reduce) and on answers and gradients,
         # concrete and traced, two-level (hybrid) so the coarse solve rides along.

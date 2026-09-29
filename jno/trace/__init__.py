@@ -433,6 +433,17 @@ class Placeholder:
         if not isinstance(key, tuple):
             key = (key,)
         concrete_key = tuple(None if k is None else k for k in key)
+        if (
+            len(concrete_key) == 2
+            and concrete_key[0] is Ellipsis
+            and isinstance(concrete_key[1], int)
+            and _component_keeps_axis(self)
+        ):
+            # A component of a per-point field is a per-point scalar, (N, 1), like every other one in a trace
+            # (see _component_keeps_axis). ``x[..., i, None]`` also handles a negative ``i``.
+            fc = FunctionCall(lambda x, _i=concrete_key[1]: x[..., _i, None], [self], name="getitem")
+            fc.getitem_key = concrete_key
+            return fc
         fc = FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
         # Record the key so consumers (e.g. the FEM driver) can recover a
         # component index from `u[..., i]` rather than it being hidden in the closure.
@@ -2242,6 +2253,15 @@ class Model(Placeholder):
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
                     or an already-constructed transform.
         """
+        if getattr(self, "_jno_fixed_by_eager_solve", False):
+            # jno.fdm decides what is trainable when `.solve()` runs, and an eager solve already baked this
+            # network into its result at the stored weights: an optimizer attached now would train nothing.
+            raise RuntimeError(
+                "Model.optimizer: this network was already used as a FIXED coefficient by an eager "
+                "`jno.fdm(...).solve()` (it had no optimizer then), so an optimizer attached now cannot reach that "
+                "result and would train nothing. jno.fdm decides what is trainable when `.solve()` runs: attach "
+                "the optimizer before calling `.solve()`."
+            )
         if self._mask_scope_pending and self._param_mask is not None:
             # One-shot masked scope: consume mask on this call.
             group = self._get_or_create_group()
@@ -3371,6 +3391,35 @@ class NormalDerivative(Placeholder):
         return f"NormalDerivative({self.target})"
 
 
+def _component_keeps_axis(expr) -> bool:
+    """Whether the component ``expr[..., i]`` keeps its axis, i.e. is ``(N, 1)`` rather than ``(N,)``.
+
+    A per-point field -- a network, a grid unknown (``domain.unknown()``), data, or any expression built from
+    them -- is ``(N, k)``, and every per-point scalar in a trace is ``(N, 1)``. A bare ``(N,)`` component
+    broadcasts against an ``(N, 1)`` coordinate or source to ``(N, N)``, and the residual's ``.mse`` is then a
+    plausible number of the wrong problem. So such a component keeps its axis, on every path (FDM, PINN, and a
+    network trial inside ``jno.fem``), and the same term means the same thing on each.
+
+    FE symbols (trial and test functions), frozen FE solutions (``FrozenField``) and FE fields stored per cell
+    or per quadrature point are the exception: the weak-form assemblers lower them and read the bare
+    component."""
+    from ..utils.solver.solver_helper import iter_children
+
+    seen, stack = set(), [expr]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if isinstance(n, (TrialFunction, TestFunction, FrozenField)):
+            return False
+        fem_field = getattr(getattr(n, "model", None), "_fem_field", None)
+        if fem_field is not None and fem_field != "node":
+            return False
+        stack.extend(iter_children(n) or ())
+    return True
+
+
 class _FieldComponentIndex:
     """``field[i]`` is the i-th COMPONENT — the mixin that makes one spelling mean one thing.
 
@@ -3728,7 +3777,7 @@ class FemLinearSystem:
         b = self.b if self.rhs_fn is None else self.rhs_fn(args)
         return A, b
 
-    def solve(self, solve_fn=None, *, periodic=None):
+    def solve(self, solve_fn=None, *, periodic=None, values=None):
         """Differentiable forward solve ``u = solve_fn(A(θ), b(θ))`` as a trace node.
 
         Returns a :class:`FunctionCall` field. When it is evaluated (e.g. inside
@@ -3790,7 +3839,24 @@ class FemLinearSystem:
             A = A if hasattr(A, "todense") else jnp.asarray(A)
             return solve_fn(A, b)
 
-        return FunctionCall(_solve, params, name="fem_solve")
+        if values is None:
+            return FunctionCall(_solve, params, name="fem_solve")
+        # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
+        # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
+        # the parameters' STORED values -- a silently wrong answer.)
+        unknown = sorted(set(values) - set(names))
+        if unknown:
+            raise TypeError(
+                f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
+            )
+        missing = sorted(set(names) - set(values))
+        if missing:
+            raise ValueError(
+                f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
+                f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
+                "let `crux` resolve them (the solve is then a trace node, not an array)."
+            )
+        return _solve(*(jnp.asarray(values[n]) for n in names))
 
     def __iter__(self):
         if self.is_parametric:
@@ -5674,6 +5740,11 @@ def collect_tags(expr: Placeholder) -> set:
     def visit(node):
         if isinstance(node, Variable):
             tags.add(node.tag)
+            # a coordinate jno.fem retagged to its quadrature pool also reads the region it was created on
+            # outside FEM assembly (trace_evaluator._context_tag), so that region is in use too
+            region = getattr(node, "_jno_region_tag", None)
+            if region is not None:
+                tags.add(region)
         elif isinstance(node, TensorTag):
             tags.add(node.tag)
         elif isinstance(node, BinaryOp):
