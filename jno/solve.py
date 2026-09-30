@@ -1292,7 +1292,7 @@ def remesh(
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
     toward convergence. On a **transient** problem it remeshes every ``every`` steps and carries the
     state across (basis-aware transfer), so the mesh tracks a moving feature. It holds a *constant*
-    budget -- ``max_dofs`` vertices, else the initial vertex count -- on both paths: the isotropic one
+    budget -- ``max_dofs``, else the initial DOF count -- on both paths: the isotropic one
     refines the marked cells by ``refine_factor`` relative to the rest and then scales the whole size
     field to the budget, so the wake coarsens instead of the mesh ratcheting up::
 
@@ -1307,8 +1307,15 @@ def remesh(
     ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the curvature of the
     solution -- or of the ``criterion``, when one is given) instead of isotropic ZZ marking — far fewer
     DOFs for a layer or a front, and the right choice for an interface. ``hmin``/``hmax`` bound the edge
-    sizes; ``metric_field`` picks which coupled field drives the metric. DOF control is approximate on
-    both paths (the mesher honours a size field loosely), so ``max_dofs`` is a target, not a cap.
+    sizes; ``metric_field`` picks which coupled field drives the metric.
+
+    **``max_dofs`` counts DOFs** -- every unknown of the assembled system, ``fem.dofs``: a vector field
+    counts each component, a Taylor-Hood P2/P1 pair about nine per vertex in 2-D, a complex field its
+    real and imaginary halves. The mesher is steered by a vertex count and honours it only approximately,
+    so every remesh is counted before it is applied and redone with a corrected target if it misses: the
+    DOF count stays within **20 %** of ``max_dofs`` (a march holds it there; a steady round is capped at
+    it), and a remesh that cannot be brought under ``1.2 * max_dofs`` -- an ``hmax`` too small to coarsen
+    that far, say -- raises instead of proceeding over budget.
 
     ``alpha=`` is the **moving-mesh** form, and it is a different operation: instead of meshing the
     geometry afresh it re-triangulates the NODES the motion has carried and keeps the triangles whose
@@ -1328,7 +1335,8 @@ def remesh(
 
     Args:
         anisotropic: Hessian-metric refinement instead of isotropic ZZ + Dörfler marking.
-        max_dofs: Vertex budget. Steady: stop once reached. Transient: the constant target.
+        max_dofs: DOF budget (``fem.dofs``, not vertices), held within 20 %. Steady: stop once
+            reached; no round grows past it. Transient: the constant size every remesh holds.
         every: Transient only — remesh every ``every`` time steps (with ``alpha``, reconnect that often).
         alpha: Moving meshes only — re-triangulate the moved NODES and keep the triangles smaller than
             ``alpha`` × the starting mean edge length. Bodies closer than ~``2·alpha·h`` merge.
@@ -1408,8 +1416,9 @@ def refine(
     refinement level (a 2:1 balance), so no constrained node ever has a constrained parent.
 
     ``theta`` (Dörfler marking), ``criterion``, ``max_iters``, ``max_dofs``, ``tol`` and ``eps`` mean
-    exactly what they do on :func:`remesh`. There is no ``refine_factor``: a split halves the cell by
-    construction. There is no ``anisotropic``: the split is isotropic, so there is no direction to
+    exactly what they do on :func:`remesh`, except that a split has no size to steer, so ``max_dofs`` only
+    stops the loop and the last split may overshoot it. There is no ``refine_factor``: a split halves the
+    cell by construction. There is no ``anisotropic``: the split is isotropic, so there is no direction to
     stretch along -- that needs a simplex mesh and ``remesh(anisotropic=True)``.
 
     **Limitations, measured.** Quadrilateral and hexahedral meshes only; a simplex mesh refuses by name
@@ -1505,7 +1514,7 @@ def relocate(
             fem.solve(adapt=jno.solve.relocate(method="monge_ampere", every=20, escalate=0.5))
 
         Relocation gets first refusal because it costs ~0.4 ms against the 8-15 s a node-set change costs,
-        and escalation then *measures* whether that was enough instead of assuming it. The vertex budget
+        and escalation then *measures* whether that was enough instead of assuming it. The DOF budget
         grows by ``escalate_growth`` each time, capped by ``max_dofs``; the loop is self-limiting, since
         more vertices lower the indicator and the gate stops tripping.
 

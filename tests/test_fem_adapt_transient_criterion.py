@@ -12,7 +12,8 @@ Oracles:
     LIVE state), not its initial one;
   * a criterion that reads ``t`` is read at the remesh time: a marker switched on only around that time
     gives exactly the mesh the always-on marker gives;
-  * an isotropic remesh with ``max_dofs`` holds the vertex count, instead of ratcheting it up;
+  * an isotropic remesh with ``max_dofs`` holds the DOF count (here scalar P1, so the vertex count),
+    instead of ratcheting it up;
   * a condition criterion (``jno.le``) that already holds remeshes nothing, and ``theta`` beside a condition
     is refused, as on the steady loop.
 """
@@ -174,7 +175,7 @@ def test_an_isotropic_remesh_holds_the_budget():
     post = [m[0].shape[0] for m in traj.meshes][4:]  # after the first remesh
     assert max(post) < 1.5 * min(post), f"the vertex count ratcheted instead of holding the budget: {post}"
     assert 0.4 * budget < np.median(post) < 2.5 * budget, (
-        f"the budget was {budget} vertices; the mesh held {np.median(post):.0f}"
+        f"the budget was {budget} DOFs (= vertices, scalar P1); the mesh held {np.median(post):.0f}"
     )
 
 

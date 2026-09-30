@@ -205,8 +205,17 @@ transient problem it is checked on the current mesh every `k` steps, and the mes
 some cell breaks it; `fem.adapt_history` records `remeshed: False` for the rounds it held, so a
 condition that never breaks never remeshes. A ranking criterion (`1 - phi**2`, `|grad u|`) is evaluated
 on the live state at each remesh -- and at that remesh's time, so it may read `t` (a moving source) -- and
-the vertex budget (`max_dofs`, else the starting count) is held on both the isotropic and the anisotropic
+the DOF budget (`max_dofs`, else the starting count) is held on both the isotropic and the anisotropic
 path.
+
+`max_dofs` counts **DOFs** — every unknown of the assembled system (`fem.dofs`), so a vector field counts
+each component, a Taylor–Hood P2/P1 pair about nine per vertex in 2-D, and a complex field its real and
+imaginary halves — not vertices. The mesher is steered by a vertex count and only approximates it, so
+each remesh is counted before it is applied and redone with a corrected target if it misses: the DOF
+count stays within **20 %** of `max_dofs`, and a remesh that cannot be brought under `1.2 × max_dofs`
+(an `hmax` too small to coarsen that far, say) raises. On a steady loop the budget caps each round's
+growth and stops the loop once reached. (It used to be handed to the mesher as a vertex count: a
+Taylor–Hood march asked for `max_dofs=4000` produced 23,793 DOFs.)
 
 Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
 bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
@@ -422,7 +431,7 @@ silently permute the state.
     * **Connectivity-preserving, unless told to remesh**: a move that would invert an element raises. With
       `fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1))` the march
       checks the condition on the moved mesh every `every` steps and, where it breaks, rebuilds the mesh
-      (mmg, at the starting vertex budget), re-assembles and carries the state across. Measured on a top edge
+      (mmg, at the starting DOF budget), re-assembles and carries the state across. Measured on a top edge
       bulging as `y' = 2y sin(πx)`: worst cell aspect 6.27 → 3.19 with one remesh, the surface where the plain
       march puts it, a constant field exact to 4e-16. The laws may read only `boundary` and `interior` (any
       other region is found by a position that does not follow a moved surface), a remesh is not

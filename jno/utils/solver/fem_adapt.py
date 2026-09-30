@@ -176,13 +176,45 @@ def remesh_with_mmg(
     domain geometry is preserved exactly; boundary edges are left splittable so the
     boundary can still be refined along its straight segments.
     """
+    return _mmg_remeshed(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad, hausd=hausd, verbose=verbose).apply(copy)
+
+
+@dataclass
+class _Remeshed:
+    """A mesher's output BEFORE it is put on the domain: ``apply(copy)`` puts it there.
+
+    Split out so a caller holding a DOF budget can count the new mesh's DOFs first and mesh again if it
+    missed (:func:`_remesh_holding_dofs`) -- once applied, the old mesh the size field was defined on is
+    gone. ``cell_type`` is the meshio name (``line`` / ``triangle`` / ``tetra`` / ``quad``).
+    """
+
+    points: np.ndarray
+    cells: np.ndarray
+    cell_type: str
+    _apply: Any
+
+    def apply(self, copy: bool):
+        return self._apply(copy)
+
+
+def _mmg_remeshed(
+    domain: Any,
+    vertex_size: np.ndarray,
+    *,
+    hmin: float | None = None,
+    hmax: float | None = None,
+    hgrad: float = 1.3,
+    hausd: float | None = None,
+    verbose: int = -1,
+) -> _Remeshed:
+    """:func:`remesh_with_mmg` up to, not including, putting the new mesh on ``domain``."""
     dim = int(domain.dimension)
     if dim == 1:
         # mmg has no 1-D mode, and needs none: an interval mesh is a sorted list of vertices, so
         # honouring a size field is subdivision rather than remeshing. Same signature and the same
         # returned domain, so every caller (the steady AFEM loop, the transient re-mesher) is
         # dimension-agnostic above this line.
-        return _remesh_line_1d(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad, copy=copy)
+        return _line_1d_remeshed(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad)
     if dim not in (2, 3):
         raise NotImplementedError(f"remesh_with_mmg supports 1D line and 2D/3D simplicial meshes; got dimension {dim}.")
     _require_simplex(domain, dim, "h-adaptive remeshing (mmg)")
@@ -257,18 +289,22 @@ def remesh_with_mmg(
     else:
         t_out, t_refs = m.get_tetrahedra_with_refs()
         f_out, _ = m.get_triangles_with_refs()
-    return _domain_from_arrays(
-        domain,
+    t_out, f_out = np.asarray(t_out), np.asarray(f_out)
+    cell_refs = None if mat_refs is None else np.asarray(t_refs)
+    return _Remeshed(
         v_out,
-        np.asarray(t_out),
-        np.asarray(f_out),
-        copy=copy,
-        cell_refs=None if mat_refs is None else np.asarray(t_refs),
-        ref_names=ref_names,
+        t_out,
+        "triangle" if dim == 2 else "tetra",
+        lambda copy: _domain_from_arrays(domain, v_out, t_out, f_out, copy=copy, cell_refs=cell_refs, ref_names=ref_names),
     )
 
 
 def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, copy: bool):
+    """:func:`_line_1d_remeshed`, applied to ``domain`` (or a copy)."""
+    return _line_1d_remeshed(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad).apply(copy)
+
+
+def _line_1d_remeshed(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float) -> _Remeshed:
     """Rebuild a 1-D line mesh to honour a per-vertex target size — the 1-D face of
     :func:`remesh_with_mmg`.
 
@@ -318,7 +354,8 @@ def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, 
     new_cells = np.column_stack([np.arange(n), np.arange(1, n + 1)]).astype(np.int64)
     # the boundary of an interval is its two endpoint VERTICES (the block `jno.domain.line` builds)
     bfacets = np.array([[0], [n]], dtype=np.int64)
-    return _domain_from_arrays(domain, new_x.reshape(-1, 1), new_cells, bfacets, copy=copy)
+    pts = new_x.reshape(-1, 1)
+    return _Remeshed(pts, new_cells, "line", lambda copy: _domain_from_arrays(domain, pts, new_cells, bfacets, copy=copy))
 
 
 _RESERVED_CELL_SETS = ("interior", "boundary")
@@ -478,6 +515,11 @@ def _apply_new_mesh(template: Any, new_mesh: Any, *, copy: bool):
 
 
 def _rebuild_to_size(domain: Any, vertex_size: np.ndarray, *, copy: bool = False):
+    """:func:`_rebuilt_remeshed`, applied to ``domain`` (or a copy)."""
+    return _rebuilt_remeshed(domain, vertex_size).apply(copy)
+
+
+def _rebuilt_remeshed(domain: Any, vertex_size: np.ndarray) -> _Remeshed:
     """Remesh a **quadrilateral** domain by rebuilding its ``shape`` plan at a new size field.
 
     There is no mmg for quads: mmg adapts by edge split/collapse/swap, operations defined on
@@ -543,10 +585,20 @@ def _rebuild_to_size(domain: Any, vertex_size: np.ndarray, *, copy: bool = False
             f"{blocks.get('quad', 0)} quadrilaterals, and jNO assembles on one cell type. Coarsen the "
             "refinement (a larger refine_factor) or adapt on a triangular mesh."
         )
-    return _apply_new_mesh(domain, rebuilt.mesh, copy=copy)
+    return _Remeshed(
+        np.asarray(rebuilt.mesh.points)[:, :dim],
+        np.asarray(rebuilt.mesh.cells_dict["quad"]),
+        "quad",
+        lambda copy: _apply_new_mesh(domain, rebuilt.mesh, copy=copy),
+    )
 
 
 def _remesh_to_size(domain: Any, vertex_size, *, copy: bool = False, **mmg_kw):
+    """:func:`_size_remeshed`, applied to ``domain`` (or a copy)."""
+    return _size_remeshed(domain, vertex_size, **mmg_kw).apply(copy)
+
+
+def _size_remeshed(domain: Any, vertex_size, **mmg_kw) -> _Remeshed:
     """Remesh to a per-vertex target size, by whichever mechanism the mesh's cell supports.
 
     Simplices go to mmg, which adapts them locally; quadrilaterals rebuild from the ``shape`` plan
@@ -559,7 +611,7 @@ def _remesh_to_size(domain: Any, vertex_size, *, copy: bool = False, **mmg_kw):
     dim = int(domain.dimension)
     cell_type = mesh_cell_type(domain, dim)
     if cell_type == "quad":
-        return _rebuild_to_size(domain, vertex_size, copy=copy)
+        return _rebuilt_remeshed(domain, vertex_size)
     if cell_type == "hexahedron":
         raise NotImplementedError(
             "h-adaptive remeshing is not supported on a hexahedral mesh, and not for want of plumbing: "
@@ -568,7 +620,7 @@ def _remesh_to_size(domain: Any, vertex_size, *, copy: bool = False, **mmg_kw):
             "octree refinement with hanging-node constraints, which jNO does not have yet. Use a "
             "tetrahedral mesh, or rebuild a structured grid at a finer n."
         )
-    return remesh_with_mmg(domain, vertex_size, copy=copy, **mmg_kw)
+    return _mmg_remeshed(domain, vertex_size, **mmg_kw)
 
 
 def _capture_geometric_boundary_tags(domain: Any) -> None:
@@ -2229,7 +2281,9 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
     return size
 
 
-def _hold_vertex_budget(domain: Any, size: np.ndarray, *, target: float, hmin: float, hmax: float) -> np.ndarray:
+def _hold_vertex_budget(
+    domain: Any, size: np.ndarray, *, target: float, hmin: float, hmax: float, shrink_only: bool = False
+) -> np.ndarray:
     """Scale a per-vertex size field so the mesh it asks for has about ``target`` vertices.
 
     Marking decides WHERE the mesh should be finer than the rest; this decides HOW MANY vertices there
@@ -2245,36 +2299,32 @@ def _hold_vertex_budget(domain: Any, size: np.ndarray, *, target: float, hmin: f
 
     If the clamps make the budget unreachable, the clamped field is returned and a warning says which
     bound bit -- a budget quietly not met is the failure this exists to remove.
+
+    ``shrink_only`` makes ``target`` a ceiling rather than a goal: a field that already asks for no more
+    than ``target`` vertices is returned untouched (unclamped), and only a larger one is coarsened. That
+    is the steady loop's use, where the budget caps a round's growth instead of setting its size.
     """
     import warnings
 
-    dim = int(domain.dimension)
-    pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
-    cells = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64)
-    edges = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim)
-    vol = np.abs(np.linalg.det(edges)) / float(np.prod(np.arange(1, dim + 1)))
     size = np.asarray(size, dtype=np.float64).reshape(-1)
-    h_now = size_field_from_marks(domain, np.empty(0, dtype=np.int64))  # the current local size
-
-    def _density(h):
-        return float(np.sum(vol * np.mean(np.asarray(h)[cells] ** (-dim), axis=1)))
-
-    ref = _density(h_now)
+    predict = _vertex_count_model(domain)
 
     def _predicted(s):
-        return pts.shape[0] * _density(np.clip(s * size, hmin, hmax)) / ref
+        return predict(np.clip(s * size, hmin, hmax))
 
+    if shrink_only and predict(size) <= target:
+        return size
     lo, hi = 1e-6, 1e6  # _predicted is non-increasing in s; bracket, then bisect on log s
     if _predicted(lo) < target:
         warnings.warn(
-            f"adapt: the vertex budget {target:.0f} is out of reach -- even at hmin={hmin:.3g} everywhere the "
+            f"adapt: the vertex target {target:.0f} is out of reach -- even at hmin={hmin:.3g} everywhere the "
             f"mesh would have ~{_predicted(lo):.0f} vertices. Lower hmin to allow a finer mesh.",
             stacklevel=3,
         )
         return np.clip(lo * size, hmin, hmax)
     if _predicted(hi) > target:
         warnings.warn(
-            f"adapt: the vertex budget {target:.0f} is out of reach -- even at hmax={hmax:.3g} everywhere the "
+            f"adapt: the vertex target {target:.0f} is out of reach -- even at hmax={hmax:.3g} everywhere the "
             f"mesh would keep ~{_predicted(hi):.0f} vertices. Raise hmax to allow a coarser mesh.",
             stacklevel=3,
         )
@@ -2283,6 +2333,213 @@ def _hold_vertex_budget(domain: Any, size: np.ndarray, *, target: float, hmin: f
         mid = np.sqrt(lo * hi)
         lo, hi = (mid, hi) if _predicted(mid) > target else (lo, mid)
     return np.clip(np.sqrt(lo * hi) * size, hmin, hmax)
+
+
+def _vertex_count_model(domain: Any):
+    """``predict(size) -> float``: about how many vertices a mesh of ``domain`` at per-vertex size ``size`` has.
+
+    Vertex density goes as ``h^-d``, so ``N(h) ≈ N_now · ∫h^-d / ∫h_now^-d`` over the current cells, with
+    ``h_now`` the current local size (mean incident edge length).
+    """
+    from .fem_native import mesh_cell_type
+
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
+    cell_type = mesh_cell_type(domain, dim)
+    cells = np.asarray(domain.mesh.cells_dict[cell_type]).astype(np.int64)
+    vol = _cell_measures(pts, cells, cell_type, dim)
+
+    def _density(h):
+        return float(np.sum(vol * np.mean(np.asarray(h)[cells] ** (-dim), axis=1)))
+
+    ref = _density(size_field_from_marks(domain, np.empty(0, dtype=np.int64)))
+    return lambda size: pts.shape[0] * _density(np.asarray(size, dtype=np.float64).reshape(-1)) / ref
+
+
+def _cell_measures(pts: np.ndarray, cells: np.ndarray, cell_type: str, dim: int) -> np.ndarray:
+    """Per-cell length / area / volume of a simplex mesh, or of a (planar) quadrilateral mesh."""
+    if cell_type == "quad":
+        x, y = pts[cells, 0], pts[cells, 1]  # (C, 4), vertices in cyclic (meshio) order
+        return 0.5 * np.abs(np.sum(x * np.roll(y, -1, axis=1) - np.roll(x, -1, axis=1) * y, axis=1))
+    edges = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim)
+    return np.abs(np.linalg.det(edges)) / float(np.prod(np.arange(1, dim + 1)))
+
+
+# ---------------------------------------------------------------------------
+# The DOF budget -- `max_dofs` counts unknowns, the mesher is steered by vertices
+# ---------------------------------------------------------------------------
+# How closely a remesh holds `max_dofs`. The mesher honours a size field or a metric only approximately
+# (measured on a 2-D heat march: an anisotropic metric asking for N vertices got 0.66 N, an isotropic
+# size field 1.05 N-1.3 N), so the count cannot be dialled in exactly. A remesh is repeated with a
+# corrected target until its DOF count lands within this fraction of the budget, and never proceeds
+# above ``(1 + _DOF_BUDGET_TOL) * max_dofs``.
+_DOF_BUDGET_TOL = 0.2
+_DOF_BUDGET_ATTEMPTS = 4
+
+# Sub-entities of the tensor-product cells, in meshio/VTK vertex order (the order jNO's meshes store).
+_QUAD_EDGES = ((0, 1), (1, 2), (2, 3), (3, 0))
+_HEX_EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7))
+_HEX_FACES = ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))
+
+
+def _mesh_entity_counts(n_points: int, cells: np.ndarray, cell_type: str, dim: int) -> tuple[int, int, int, int]:
+    """``(vertices, edges, 2-faces, 3-cells)`` of a conforming mesh -- what a Lagrange node count needs."""
+    cells = np.asarray(cells, dtype=np.int64)
+    n_cells = int(cells.shape[0])
+
+    def _unique(local: Any) -> int:
+        keys = np.sort(np.concatenate([cells[:, list(ent)] for ent in local], axis=0), axis=1)
+        return int(np.unique(keys, axis=0).shape[0]) if keys.size else 0
+
+    if cell_type == "line":
+        return n_points, n_cells, 0, 0
+    if cell_type == "quad":
+        return n_points, _unique(_QUAD_EDGES), n_cells, 0
+    if cell_type == "hexahedron":
+        return n_points, _unique(_HEX_EDGES), _unique(_HEX_FACES), n_cells
+    n_local = cells.shape[1]
+    edges = _unique(itertools.combinations(range(n_local), 2))
+    if dim == 2:
+        return n_points, edges, n_cells, 0
+    return n_points, edges, _unique(itertools.combinations(range(n_local), 3)), n_cells
+
+
+def _lagrange_node_count(entities: tuple[int, int, int, int], order: int, cell_type: str) -> int:
+    """Nodes of a continuous order-``order`` Lagrange space on a mesh with these entity counts.
+
+    Each entity carries the nodes interior to it: ``p - 1`` per edge, ``(p-1)(p-2)/2`` per triangle and
+    ``(p-1)(p-2)(p-3)/6`` per tetrahedron on simplices; ``(p-1)^2`` per quadrilateral and ``(p-1)^3`` per
+    hexahedron on tensor-product cells. The same partition ``_promote_to_degree`` builds by deduplication.
+    """
+    from math import comb
+
+    v, e, f, c = entities
+    k = int(order) - 1
+    if cell_type in ("quad", "hexahedron"):
+        return v + k * e + k * k * f + k**3 * c
+    return v + k * e + comb(k, 2) * f + comb(k, 3) * c
+
+
+def _dof_counter(fem: Any):
+    """``count(points, cells, cell_type) -> int``: the DOFs ``fem``'s problem would have on another mesh.
+
+    The count is ``fem.dofs`` -- every unknown of the system jNO assembles, so a vector field counts each
+    component and a complex one its real and imaginary halves. Per field, the Lagrange order is recovered
+    from the field's node count on the CURRENT mesh (the one order whose node count matches) and its
+    multiplicity from the block size, so the count on a new mesh is exact for nodal-Lagrange fields.
+    A field that no Lagrange order explains (a non-nodal family) raises: the DOF budget cannot be counted.
+    """
+    from .fem_native import mesh_cell_type
+
+    d = fem.domain
+    dim = int(d.dimension)
+    cell_type = mesh_cell_type(d, dim)
+    n_points = int(np.asarray(d.mesh.points).shape[0])
+    entities = _mesh_entity_counts(n_points, np.asarray(d.mesh.cells_dict[cell_type]), cell_type, dim)
+    total = int(fem.dofs)
+    node_counts = [int(np.asarray(p).shape[0]) for p in (fem.field_points or [])]
+    offsets = fem.offsets if fem.offsets is not None else [0, total]
+    blocks = np.diff(np.asarray([int(o) for o in offsets]))
+
+    def _refuse(why: str):
+        return NotImplementedError(
+            f"adapt(max_dofs=...): the budget counts DOFs, and this problem's could not be counted on a new "
+            f"mesh -- {why}. The count needs nodal-Lagrange fields. Drop max_dofs (a march then holds its "
+            "starting size, a steady loop runs to max_iters / tol)."
+        )
+
+    if not node_counts or len(node_counts) != len(blocks):
+        raise _refuse(f"{len(blocks)} field block(s) but {len(node_counts)} node set(s)")
+    orders, mults = [], []
+    for i, (nn, blk) in enumerate(zip(node_counts, blocks)):
+        order = next((p for p in range(1, 9) if _lagrange_node_count(entities, p, cell_type) == nn), None)
+        if order is None or nn == 0 or blk % nn:
+            raise _refuse(f"field {i} has {nn} nodes and {blk} DOFs, which no Lagrange order on this mesh gives")
+        orders.append(order)
+        mults.append(int(blk // nn))
+    per_layout = int(np.sum(blocks))
+    if per_layout == 0 or total % per_layout:
+        raise _refuse(f"fem.dofs = {total} is not a multiple of the {per_layout} DOFs its field blocks hold")
+    factor = total // per_layout  # 2 for a complex problem assembled as a real [Re; Im] system
+
+    def count(points: np.ndarray, cells: np.ndarray, new_cell_type: str) -> int:
+        ent = _mesh_entity_counts(int(np.asarray(points).shape[0]), cells, new_cell_type, dim)
+        return factor * sum(m * _lagrange_node_count(ent, p, new_cell_type) for m, p in zip(mults, orders))
+
+    return count
+
+
+def _remesh_holding_dofs(
+    domain: Any,
+    field_for: Any,
+    *,
+    count: Any,
+    n_dofs: int,
+    budget: float,
+    hold: bool,
+    first_vertices: float | None = None,
+    **mesher_kw: Any,
+) -> tuple[int, bool]:
+    """Remesh ``domain`` in place so its problem has at most ``(1 + _DOF_BUDGET_TOL) * budget`` DOFs.
+
+    ``max_dofs`` counts DOFs -- every unknown of the assembled system, so a Taylor-Hood P2/P1 pair carries
+    about nine per vertex in 2-D -- while the mesher is steered by a vertex count (a metric's complexity,
+    a size field's predicted count). ``field_for(n_vertices)`` returns the size field / metric asking for
+    ``n_vertices``; the first request converts the budget at the current DOFs per vertex
+    (``n_dofs / n_vertices``). The mesher's output is then COUNTED (``count``, see :func:`_dof_counter`)
+    before it is applied, because the mesher only approximates the request and the DOFs per vertex drift
+    with the boundary fraction. A miss is corrected by rescaling the request and meshing again, up to
+    ``_DOF_BUDGET_ATTEMPTS`` times.
+
+    ``hold=True`` (a march): the budget is the size to hold, so a mesh is accepted once it is within the
+    tolerance on either side; if none gets there, the closest one under the ceiling is kept.
+    ``hold=False`` (the steady loop): the budget only caps the round's growth. The first request is
+    ``first_vertices`` (the round's own growth target), and any mesh under the ceiling is accepted --
+    unless that asks for more than the budget: then the budget sets the size, exactly as on a march, and
+    the loop stops after this round, so the mesh has to land near it rather than anywhere below.
+
+    Raises ``RuntimeError`` naming the budget and every attempt when no mesh fits under the ceiling --
+    proceeding on a mesh several times over budget is the failure this exists to remove.
+
+    Returns ``(dofs, capped)``: the applied mesh's DOF count, and whether the budget (rather than
+    ``first_vertices``) decided its size.
+    """
+    n_verts = int(np.asarray(domain.mesh.points).shape[0])
+    per_vertex = float(n_dofs) / float(max(n_verts, 1))
+    ceiling = (1.0 + _DOF_BUDGET_TOL) * float(budget)
+    budget_vertices = float(budget) / per_vertex
+    if first_vertices is None or float(first_vertices) >= budget_vertices:
+        request, capped = budget_vertices, True
+    else:
+        request, capped = float(first_vertices), False
+    tried: list[tuple[float, int]] = []
+    best = None  # (miss, dofs, remeshed, capped)
+    for _ in range(_DOF_BUDGET_ATTEMPTS):
+        cand = _size_remeshed(domain, field_for(request), **mesher_kw)
+        got = int(count(cand.points, cand.cells, cand.cell_type))
+        tried.append((request, got))
+        if got <= ceiling:
+            miss = abs(np.log(max(got, 1) / float(budget))) if (hold or capped) else 0.0
+            if best is None or miss < best[0]:
+                best = (miss, got, cand, capped)
+            # Once the budget sets the size (always on a march; on a steady round when the growth would
+            # pass it) the mesh must land NEAR it too -- the steady loop stops after such a round.
+            if not (hold or capped) or got >= (1.0 - _DOF_BUDGET_TOL) * float(budget):
+                break
+        # Aim the correction at the budget itself, not at the ceiling, so the next try has headroom.
+        request, capped = request * float(budget) / float(max(got, 1)), True
+    if best is None:
+        attempts = ", ".join(f"{g}" for _r, g in tried)
+        raise RuntimeError(
+            f"adapt(max_dofs={budget:.0f}): the remesh could not be held under the DOF budget -- "
+            f"{len(tried)} attempts gave {attempts} DOFs, against a ceiling of {ceiling:.0f} "
+            f"(max_dofs + {_DOF_BUDGET_TOL:.0%}, the tolerance the mesher can be steered to). The edge-size "
+            "window is the usual cause: `hmax` stops the mesh coarsening far enough (raise it), or the "
+            "geometry needs more elements than the budget allows (raise max_dofs)."
+        )
+    _miss, got, cand, capped = best
+    cand.apply(False)
+    return got, capped
 
 
 def _per_node_edge_length(domain: Any) -> np.ndarray:
@@ -2676,7 +2933,13 @@ class AdaptSpec:
     tol
         Stop early once the global error estimate falls below this (optional).
     max_dofs
-        Stop once the mesh vertex count reaches this budget (optional).
+        The DOF budget (optional): every unknown of the assembled system (``fem.dofs``), so a vector
+        field counts each component, a Taylor-Hood P2/P1 pair about nine per vertex in 2-D, and a complex
+        field its real and imaginary halves. Held within ``_DOF_BUDGET_TOL`` (20 %): the mesher cannot hit
+        a count exactly, so each remesh is counted before it is applied and redone with a corrected
+        target if it misses, and one that cannot be brought under ``1.2 * max_dofs`` raises. Steady: the
+        loop stops once a mesh reaches the budget, and no round grows past it. Transient: the constant
+        size every remesh holds (default: the starting DOF count).
     eps
         Relative-change convergence tolerance: stop once the round's figure of merit
         stops changing by more than ``eps`` between successive rounds (optional). The
@@ -2691,8 +2954,7 @@ class AdaptSpec:
         elements aligned to the solution's curvature) grown by ``refine_factor``× vertices
         per round, instead of isotropic ZZ + Dörfler marking. Far fewer DOFs for directional
         features (layers, fronts); 2D and 3D scalar. ``hmin`` / ``hmax`` bound the edge sizes.
-        Metric-based DOF control is approximate, so ``max_dofs`` is honored only loosely here
-        (a round may overshoot it by up to ~1.5x, especially in 3D).
+        Metric-based DOF control is approximate, so ``max_dofs`` is held within 20 % (see there).
     hmin, hmax
         Edge-size window for the anisotropic metric (defaults derive from the mesh).
     every
@@ -2990,6 +3252,11 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
 
     Requires ``fem`` to have been built by :func:`jno.fem` (so its constraint recipe was
     retained); a hand-constructed ``FEM`` has no recipe to re-assemble.
+
+    ``n_dofs`` and ``max_dofs`` count DOFs (``fem.dofs``), not vertices. With a budget, a round's growth is
+    capped so its mesh stays within 20 % of ``max_dofs`` (:func:`_remesh_holding_dofs`), and the loop stops
+    after the round the budget sized. ``split`` (hanging-node refinement) has no size to steer, so there
+    the budget only stops the loop, and the last split may overshoot it.
     """
     import jno
 
@@ -3016,6 +3283,7 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     u = None
     prev_est = None
     n_converged = 0
+    budget_bound = False  # did the DOF budget, rather than the round's growth, size the last remesh?
     for it in range(spec.max_iters):
         _full = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
         # LAZY: a user `criterion=` replaces the recovery estimator entirely and reads the FULL vector,
@@ -3051,7 +3319,10 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             eta, est = _criterion_indicators(cur, _crit, _full, int(spec.metric_field))
         else:
             eta, est = zz_error_indicators(d, u)
-        n_dofs = int(np.asarray(d.mesh.points).shape[0])
+        n_verts = int(np.asarray(d.mesh.points).shape[0])
+        # DOFs, not vertices: `max_dofs` used to be compared with the vertex count, which a vector, P2 or
+        # multifield problem exceeds several times over (a Taylor-Hood pair has ~9 DOFs per vertex).
+        n_dofs = int(cur.dofs)
         if _is_constraint:
             marked = None if spec.anisotropic else np.flatnonzero(_margin > 0.0).astype(np.int64)
         else:
@@ -3080,7 +3351,10 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
 
         last = it == spec.max_iters - 1
         below_tol = spec.tol is not None and est < spec.tol
-        over_budget = spec.max_dofs is not None and n_dofs >= spec.max_dofs
+        # The budget is reached once the mesh has max_dofs DOFs -- or once the budget, rather than the
+        # round's own growth, sized the mesh just solved on (the mesher lands within _DOF_BUDGET_TOL of it,
+        # possibly just under, and another round would only re-mesh at the same size).
+        over_budget = spec.max_dofs is not None and (n_dofs >= spec.max_dofs or budget_bound)
         plateaued = spec.eps is not None and n_converged >= _EPS_PATIENCE
         nothing_marked = marked is not None and marked.size == 0
         if last or below_tol or over_budget or plateaued or nothing_marked:
@@ -3101,7 +3375,7 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
                         "has no nodal field to build a Hessian metric from. Use the isotropic path "
                         "(anisotropic=False), or state it as a condition (jno.le/jno.ge)."
                     )
-                u = _criterion_nodal(cur, _crit, _full, int(spec.metric_field))[:n_dofs]
+                u = _criterion_nodal(cur, _crit, _full, int(spec.metric_field))[:n_verts]
             if np.iscomplexobj(u):
                 # The metric is a SCALAR estimator, so a complex solution is reduced to |u| here --
                 # the same modulus the isotropic ZZ indicator and the transient driver already use.
@@ -3116,18 +3390,46 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             h_typ = _mean_edge_length(d)
             hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
             hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0
-            # target the vertex count directly (hessian_metric is calibrated per dimension) and
-            # cap it at the DOF budget so a single round cannot blow far past max_dofs
-            target = n_dofs * spec.refine_factor
-            if spec.max_dofs is not None:
-                target = min(target, float(spec.max_dofs))
-            metric = hessian_metric(d, u, target_complexity=target, hmin=hmin, hmax=hmax)
+            # target the vertex count directly (hessian_metric is calibrated per dimension); with a
+            # budget, the round's growth is capped so its DOFs stay within tolerance of max_dofs
+            target = n_verts * spec.refine_factor
             # a loose size gradation lets adjacent elements change size fast, which is what
             # permits the high aspect ratios that make anisotropic adaptation pay off
-            _remesh_to_size(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
+            if spec.max_dofs is not None:
+                _, budget_bound = _remesh_holding_dofs(
+                    d,
+                    lambda nv, _u=u: hessian_metric(d, _u, target_complexity=nv, hmin=hmin, hmax=hmax),
+                    count=_dof_counter(cur),
+                    n_dofs=n_dofs,
+                    budget=float(spec.max_dofs),
+                    hold=False,
+                    first_vertices=target,
+                    hmin=hmin,
+                    hmax=hmax,
+                    hgrad=3.0,
+                )
+            else:
+                metric = hessian_metric(d, u, target_complexity=target, hmin=hmin, hmax=hmax)
+                _remesh_to_size(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
         else:
             size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
-            _remesh_to_size(d, size, copy=False)  # mutate the domain in place
+            if spec.max_dofs is not None:
+                # The marked field as it stands, unless it asks for more than the budget: then it is
+                # coarsened as a whole (the marked pattern kept) until it fits. The window is the one the
+                # mesher would derive from the field itself, unless the spec sets one.
+                _lo = spec.hmin if spec.hmin is not None else 0.5 * float(size.min())
+                _hi = spec.hmax if spec.hmax is not None else 2.0 * float(size.max())
+                _, budget_bound = _remesh_holding_dofs(
+                    d,
+                    lambda nv, _s=size: _hold_vertex_budget(d, _s, target=nv, hmin=_lo, hmax=_hi, shrink_only=True),
+                    count=_dof_counter(cur),
+                    n_dofs=n_dofs,
+                    budget=float(spec.max_dofs),
+                    hold=False,
+                    first_vertices=_vertex_count_model(d)(size),
+                )
+            else:
+                _remesh_to_size(d, size, copy=False)  # mutate the domain in place
         # Re-materialize custom coordinate-predicate tags on the refreshed mesh so that
         # surface-integral terms -- Neumann / Robin / absorbing boundary conditions -- re-derive on
         # the new boundary facets. (Dirichlet already re-resolves geometrically via its location
@@ -4010,6 +4312,20 @@ def _remesh_between_rounds(fem: Any, rspec: Any, coord_specs: list, margin: np.n
         from .fem_refine import refine_domain
 
         refine_domain(dom, marked, copy=False)
+    elif rspec.max_dofs is not None:
+        # the budget caps the round, exactly as on the steady loop (see `_remesh_holding_dofs`)
+        size = size_field_from_marks(dom, marked, refine_factor=rspec.refine_factor)
+        _lo = rspec.hmin if rspec.hmin is not None else 0.5 * float(size.min())
+        _hi = rspec.hmax if rspec.hmax is not None else 2.0 * float(size.max())
+        _remesh_holding_dofs(
+            dom,
+            lambda nv: _hold_vertex_budget(dom, size, target=nv, hmin=_lo, hmax=_hi, shrink_only=True),
+            count=_dof_counter(fem),
+            n_dofs=int(fem.dofs),
+            budget=float(rspec.max_dofs),
+            hold=False,
+            first_vertices=_vertex_count_model(dom)(size),
+        )
     else:
         _remesh_to_size(dom, size_field_from_marks(dom, marked, refine_factor=rspec.refine_factor), copy=False)
     for _name, _pred in list(getattr(dom, "_tag_predicates", {}).items()):
@@ -4382,7 +4698,7 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
 
     if int(_rspec.max_iters) <= 0 or _blocking is None:
         return _give_up("the remesh budget is spent")
-    if _rspec.max_dofs is not None and int(np.asarray(fem.domain.mesh.points).shape[0]) >= int(_rspec.max_dofs):
+    if _rspec.max_dofs is not None and int(fem.dofs) >= int(_rspec.max_dofs):
         return _give_up("max_dofs is reached")
     if _remaining <= 0:
         return _give_up("the relocation rounds are spent")
@@ -4713,9 +5029,10 @@ def run_adaptive_transient(
     Hessian is the metric (anisotropic); a ``jno.le``/``jno.ge`` **condition** is a trigger, rebuilding the
     mesh only when some cell breaks it (``adapt_history`` records ``remeshed: False`` for the rounds that
     held). Without a criterion, the recovery estimate / Hessian of ``spec.metric_field``. Both paths hold
-    the vertex budget -- ``spec.max_dofs``, else the initial count: the anisotropic metric is normalised to
-    it, and the isotropic marked size field is scaled to it (:func:`_hold_vertex_budget`), so the wake
-    coarsens instead of the mesh ratcheting up by ``refine_factor`` each round.
+    the DOF budget -- ``spec.max_dofs``, else the initial DOF count -- within 20 %: the anisotropic metric
+    is normalised to it, the isotropic marked size field is scaled to it (:func:`_hold_vertex_budget`), so
+    the wake coarsens instead of the mesh ratcheting up by ``refine_factor`` each round, and every remesh
+    is counted and redone until it lands (:func:`_remesh_holding_dofs`).
 
     **Fields**: one or several coupled native-Lagrange fields — scalar or **vector**, **P1 or higher
     order (P2)**, and **mixed spaces** (e.g. Taylor-Hood P2 velocity + P1 pressure). State is carried
@@ -4812,14 +5129,16 @@ def run_adaptive_transient(
             "modulus of `metric_field`."
         )
 
-    # Transient budget: a CONSTANT target complexity + a FIXED edge-size window (from the initial mesh), so
-    # each remesh REDISTRIBUTES ~the same number of DOFs to follow the moving feature — the mesh tracks it
-    # and coarsens the wake, instead of ratcheting up by refine_factor every remesh like the steady loop
-    # (which grows the mesh toward convergence). Budget = max_dofs if given, else the initial vertex count.
+    # Transient budget: a CONSTANT DOF count + a FIXED edge-size window (from the initial mesh), so each
+    # remesh REDISTRIBUTES ~the same number of DOFs to follow the moving feature — the mesh tracks it and
+    # coarsens the wake, instead of ratcheting up by refine_factor every remesh like the steady loop (which
+    # grows the mesh toward convergence). Budget = max_dofs if given, else the initial DOF count. It is
+    # counted in DOFs, not vertices: it used to be handed to the mesher as a vertex count, so a Taylor-Hood
+    # march (~9 DOFs per vertex) asked for max_dofs=4000 came back with 23,793 DOFs.
     h_typ0 = _mean_edge_length(d)
     hmin = spec.hmin if spec.hmin is not None else h_typ0 / 50.0
     hmax = spec.hmax if spec.hmax is not None else h_typ0 * 2.0
-    target = float(spec.max_dofs) if spec.max_dofs is not None else float(n_verts)
+    budget = float(spec.max_dofs) if spec.max_dofs is not None else float(fem.dofs)
 
     def _snapshot():
         return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
@@ -4893,8 +5212,17 @@ def run_adaptive_transient(
                 u_v = np.sqrt(_re**2 + _im**2)
             else:
                 u_v = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
-            metric = hessian_metric(d, u_v, target_complexity=target, hmin=hmin, hmax=hmax)
-            remesh_with_mmg(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
+            _remesh_holding_dofs(
+                d,
+                lambda nv, _u=u_v: hessian_metric(d, _u, target_complexity=nv, hmin=hmin, hmax=hmax),
+                count=_dof_counter(cur),
+                n_dofs=int(cur.dofs),
+                budget=budget,
+                hold=True,
+                hmin=hmin,
+                hmax=hmax,
+                hgrad=3.0,
+            )
         else:
             if marked is None:
                 if crit is not None:
@@ -4909,7 +5237,14 @@ def run_adaptive_transient(
             # Refine the marked cells by refine_factor RELATIVE to the rest, then scale the whole field to
             # the budget -- so the wake coarsens as the feature moves on, instead of the mesh ratcheting up.
             size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
-            remesh_with_mmg(d, _hold_vertex_budget(d, size, target=target, hmin=hmin, hmax=hmax), copy=False)
+            _remesh_holding_dofs(
+                d,
+                lambda nv, _s=size: _hold_vertex_budget(d, _s, target=nv, hmin=hmin, hmax=hmax),
+                count=_dof_counter(cur),
+                n_dofs=int(cur.dofs),
+                budget=budget,
+                hold=True,
+            )
         for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):  # flux tags re-derive on the new facets
             d.tag(_name, _pred)
         # Drop the cached p.pin() gauge nodes so `_lower_gauge_pin` re-creates the single-vertex pin region
@@ -5987,7 +6322,7 @@ def run_mesh_motion(
     n_steps = len(ts) - 1
     if _cond is not None:
         # The remesh budget is fixed ONCE, from the mesh the march started on, exactly as the transient
-        # remesher fixes it: each remesh redistributes the same vertex count inside the same edge window.
+        # remesher fixes it: each remesh redistributes the same DOF count inside the same edge window.
         if _resume is None:
             # Two different length scales, deliberately. The mmg CLAMPS are global bounds on what the
             # mesher may produce, so they stay scalars; the ALPHA FILTER's threshold is per-cell and on
@@ -5996,7 +6331,7 @@ def run_mesh_motion(
             _budget = (
                 _cond.hmin if _cond.hmin is not None else float(np.min(_h0)) / 50.0,
                 _cond.hmax if _cond.hmax is not None else 2.0 * float(np.max(_h0)),
-                float(_cond.max_dofs) if _cond.max_dofs is not None else float(n_verts),
+                float(_cond.max_dofs) if _cond.max_dofs is not None else float(cur.dofs),  # DOFs, not vertices
                 _h0,  # the STARTING length scale: the alpha filter's threshold must not drift as cells stretch
             )
         else:
@@ -6537,14 +6872,17 @@ def run_mesh_motion(
                             # nodes that get added are stretched along the feature. The budget growth is
                             # self-limiting: more vertices lower the indicator, so the gate stops tripping.
                             try:
-                                _met = hessian_metric(
+                                _uv_esc = np.asarray(_u_r)[:n_verts].astype(float)
+                                _remesh_holding_dofs(
                                     d,
-                                    np.asarray(_u_r)[:n_verts].astype(float),
-                                    target_complexity=_tgt,
-                                    hmin=float(_budget[0]),
-                                    hmax=float(_budget[1]),
+                                    lambda nv, _u=_uv_esc: hessian_metric(
+                                        d, _u, target_complexity=nv, hmin=float(_budget[0]), hmax=float(_budget[1])
+                                    ),
+                                    count=_dof_counter(cur),
+                                    n_dofs=int(cur.dofs),
+                                    budget=_tgt,
+                                    hold=True,
                                 )
-                                remesh_with_mmg(d, _met, copy=False)
                             except (RuntimeError, ValueError) as _exc:
                                 # mmg can refuse a metric it cannot mesh. Escalation optimises the
                                 # DISCRETISATION, never the physics, so declining it leaves a mesh that is
@@ -6582,18 +6920,18 @@ def run_mesh_motion(
                     # feature IS directional; what r-adaptivity cannot do is BOUND the aspect ratio, and
                     # a metric does exactly that through hmin/hmax.
                     _uv = np.asarray(carry[0])[:n_verts].astype(float)
-                    _met = hessian_metric(
-                        d, _uv, target_complexity=float(_budget[2]), hmin=float(_budget[0]), hmax=float(_budget[1])
+                    _field_for = lambda nv, _u=_uv: hessian_metric(  # noqa: E731
+                        d, _u, target_complexity=nv, hmin=float(_budget[0]), hmax=float(_budget[1])
                     )
-                    remesh_with_mmg(d, _met, copy=False)
                 else:
                     marked = np.flatnonzero(margin > 0.0).astype(np.int64)
                     size = size_field_from_marks(d, marked, refine_factor=_cond.refine_factor)
-                    remesh_with_mmg(
-                        d,
-                        _hold_vertex_budget(d, size, target=_budget[2], hmin=_budget[0], hmax=_budget[1]),
-                        copy=False,
+                    _field_for = lambda nv, _s=size: _hold_vertex_budget(  # noqa: E731
+                        d, _s, target=nv, hmin=_budget[0], hmax=_budget[1]
                     )
+                _remesh_holding_dofs(
+                    d, _field_for, count=_dof_counter(cur), n_dofs=int(cur.dofs), budget=float(_budget[2]), hold=True
+                )
                 _carry = "interpolate"
             for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
                 d.tag(_name, _pred)

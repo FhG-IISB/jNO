@@ -88,7 +88,7 @@ print(f"CHNS droplet merger: {fem.dofs} DOFs on {n0} vertices")
 
 phi_now = c.bind(x=xi, y=yi)
 traj = fem.solve(
-    adapt=jno.solve.remesh(criterion=1.0 - phi_now * phi_now, every=3, max_dofs=n0),  # follow the interface
+    adapt=jno.solve.remesh(criterion=1.0 - phi_now * phi_now, every=3, max_dofs=fem.dofs),  # follow the interface
     nonlinear=jno.solve.newton(direct=True),  # a sparse-direct Newton per step: the saddle needs it
 )
 ic = fem.block_index(c)  # which block of the state is phi
