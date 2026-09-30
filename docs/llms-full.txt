@@ -400,7 +400,7 @@ call — `jno.fem` classifies each term by the region its symbols are bound to.
 | Neumann flux `∂u/∂n = g` | `-g * phi.bind(x=xb, y=yb)` |
 | Robin `∂u/∂n + a u = g` | `(a * u.bind(x=xb, y=yb) - g) * phi.bind(x=xb, y=yb)` |
 | Vector traction `t` | `-jno.np.inner(t, phi.bind(x=xb, y=yb), n_contract=1)` |
-| Periodic / tie | `u("left") - u("right")` (no test function ⇒ a tie) |
+| Periodic / tie | `u(xl, yl) - u(xr, yr)`, the faces' coordinates from `d.variable("left", split=True)` (no test function ⇒ a tie) |
 | Bloch | `u(A) - c * u(B)` |
 
 `g` may be a constant or a coordinate expression. **Zero Neumann is the natural default and needs

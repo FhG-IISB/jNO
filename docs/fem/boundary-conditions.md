@@ -253,9 +253,14 @@ reuse the same `P`.
 ```python
 d.tag("left",  lambda x, y: x < 1e-9)      # a tag predicate includes the corner nodes,
 d.tag("right", lambda x, y: x > 1 - 1e-9)  # which matters — see below
+xl, yl = d.variable("left", split=True)[:2]
+xr, yr = d.variable("right", split=True)[:2]
 
-fem = jno.fem([weak_form, u("left") - u("right")])
+fem = jno.fem([weak_form, u(xl, yl) - u(xr, yr)])
 ```
+
+The faces enter through their coordinates, like every other boundary term: `u("left")` with a bare tag
+name is not a tie and raises.
 
 A tie works on a **scalar or a vector** field. On a vector field the mortar rows are unchanged — they
 are node-pair weights — and the prolongation is expanded componentwise, `kron(P_node, I_vec)`. That is

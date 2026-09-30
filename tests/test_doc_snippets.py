@@ -1,11 +1,12 @@
 """Guards against the docs' code rotting away from the library.
 
-Two of them, and they catch different things:
+Three of them, and they catch different things:
 
 * :func:`test_fem_index_intro_snippet_runs` EXECUTES the self-contained intro on the FEM landing
   page. (The per-tutorial *full scripts* are already run by the subprocess tutorial tests via their
   ``--8<--`` includes; the inline excerpts elsewhere are fragments that reference setup variables and
-  are intentionally not executed.)
+  are intentionally not executed -- except where one is run inside a namespace that supplies its
+  setup, as :func:`test_the_tie_snippet_in_boundary_conditions_runs_and_is_periodic` does for the tie.)
 * :func:`test_every_jno_reference_in_the_docs_resolves` cannot execute a fragment, but it can still
   check the thing that actually rots: whether the ``jno.*`` names a snippet uses still EXIST. It
   parses every Python block in ``docs/`` and resolves each dotted chain rooted at ``jno``.
@@ -101,3 +102,31 @@ def test_every_jno_reference_in_the_docs_resolves():
     assert not missing, "docs reference jno attributes that do not exist: " + "; ".join(
         f"{name} ({', '.join(sorted(where))})" for name, where in sorted(missing.items())
     )
+
+
+def test_the_tie_snippet_in_boundary_conditions_runs_and_is_periodic():
+    """The tie example on ``fem/boundary-conditions.md`` is a fragment (it needs ``d``, ``u`` and a weak
+    form), so it is run here inside one: ``u - Δu = cos(2πx)`` on the unit square, periodic in x and
+    natural in y, whose solution is ``cos(2πx) / (1 + 4π²)``. The snippet used to spell the tie
+    ``u("left") - u("right")``, which is not a tie and raised a ValueError."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        import numpy as np
+
+        block = next(b for b in _python_blocks(DOCS / "fem" / "boundary-conditions.md") if "u(xl, yl) - u(xr, yr)" in b)
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=24).domain()
+        u, phi = d.fem_symbols(order=2)
+        xi, yi = d.variable("interior", split=True)[:2]
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        weak_form = ui * vi + ui.x * vi.x + ui.y * vi.y - jno.np.cos(2 * np.pi * xi) * vi
+        ns = {"jno": jno, "d": d, "u": u, "weak_form": weak_form}
+        exec(compile(block, "<fem/boundary-conditions.md tie>", "exec"), ns)
+        fem = ns["fem"]
+        sol = np.asarray(fem.solve()).reshape(-1)
+        x = np.asarray(fem.points)[:, 0]
+        exact = np.cos(2 * np.pi * x) / (1 + 4 * np.pi**2)
+        err = np.abs(sol - exact).max() / np.abs(exact).max()
+        assert err < 1e-3, f"the snippet's periodic solve is {err:.2e} off the analytic solution"
+    finally:
+        jax.config.update("jax_enable_x64", prev)
