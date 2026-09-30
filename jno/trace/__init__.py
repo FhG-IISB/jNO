@@ -4125,10 +4125,12 @@ class GaugePin:
     additive constant, so its discrete operator has a one-dimensional (constant) null space and
     the saddle system is singular. ``p.pin(value)`` removes it by fixing a single, *arbitrary*
     degree of freedom to ``value``: this is **gauge-fixing**, not a boundary condition. ``jno.fem``
-    lowers each pin to a single-node Dirichlet ``p(node) - value`` at a deterministic vertex
-    (nearest the mesh min-corner) -- the same essential path the explicit ``p(xpn, ypn) - value``
-    form takes -- so assembly is unchanged. The location is intentionally not user-specified;
-    any single DOF removes the null space.
+    lowers each pin to a single-node Dirichlet ``p(node) - value`` at a deterministic vertex -- the
+    same essential path the explicit ``p(xpn, ypn) - value`` form takes -- so assembly is unchanged.
+    The vertex is the one nearest the mesh min-corner; with periodic ties ``u(A) - u(B)`` in the
+    problem, the one nearest the min-corner that lies on **no** tied face (the min-corner of a
+    periodic box is exactly the node the ties eliminate). The location is intentionally not
+    user-specified; any single DOF removes the null space.
 
     ``mean=True`` picks a *different gauge*: the field is normalised after the solve so that
     ``int p dx == 0``. The node pin still runs (it is what makes the system non-singular); only the
@@ -4374,9 +4376,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
             fem = jno.fem([momentum, -q * div(u), p.pin(), *wall_bcs])
 
-        ``jno.fem`` pins a deterministic vertex (nearest the mesh min-corner), so the gauge is
-        reproducible; the location is intentionally not user-specified -- any single DOF removes
-        the null space.
+        ``jno.fem`` pins a deterministic vertex, so the gauge is reproducible: the one nearest the
+        mesh min-corner, or -- when the problem has periodic ties ``u(A) - u(B)`` -- the one nearest
+        the min-corner that lies on no tied face, so the tie reduction never eliminates it or sums
+        another row into it. Pinning works the same under full or partial periodicity, steady or
+        transient, single-field or coupled. The location is intentionally not user-specified -- any
+        single DOF removes the null space.
 
         ``mean=True`` swaps the gauge for the **zero-mean** one, ``int p dx == 0``::
 

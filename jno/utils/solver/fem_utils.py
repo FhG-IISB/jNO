@@ -3800,6 +3800,53 @@ def _prolongation_dof_level(n_nodes, vec, secondary_set, raw, exclude, *, is_blo
     }
 
 
+def _prescribed_dofs_kept_out(prescribed, raw, secondary_interp, secondary_set, vec):
+    """The prescribed DOFs to keep out of the tie elimination; the rest are left to the tie.
+
+    **Kept out** — a prescribed DOF on the eliminated side whose tie partner is prescribed as well: where
+    a tied face meets a constrained boundary (the corner of a periodic channel with no-slip walls, the rim
+    of a mortar interface). Each side holds its own data, the tie adds nothing there, and non-periodic
+    data could not satisfy it anyway, so the DOF keeps a row of its own for its value.
+
+    **Left to the tie** — a prescribed DOF whose *exact* (weight-1) partner is FREE: a single node pinned
+    on a tied face, such as ``p(corner) - 0`` on a periodic corner. The tie says the node and its images
+    are ONE unknown, so the value has to hold at all of them. Keeping it out instead tore the tie at that
+    node, silently: the node held its value, its images did not, and the field was no longer periodic
+    there (measured: a 0.037 jump between a pinned corner and its three images on a doubly periodic
+    Poisson problem, u ~ 1). The DOF is eliminated like any other secondary, and
+    :func:`reduced_dirichlet_pairs` imposes its value on the reduced DOF it resolves to.
+
+    A lone prescribed DOF on a *weighted* tie (mortar / collocated / Bloch phase) is refused: its value
+    would be a multipoint constraint ``sum_j w_j x_j = g`` on the main side, which has no unit row to
+    impose it into, and tearing the tie would be wrong without saying so.
+    """
+    if not prescribed:
+        return prescribed
+    out = set(prescribed)
+    for d in prescribed:
+        s, c = divmod(int(d), vec)
+        if s not in secondary_set:
+            continue
+        partners = raw[s]
+        if any((int(m) * vec + c) in prescribed for m, _w in partners):
+            continue  # both sides prescribed: keep this DOF's own row
+        exact = s not in secondary_interp and len(partners) == 1
+        w = complex(partners[0][1]) if exact else None
+        if exact and abs(w - 1.0) <= 1e-12:
+            out.discard(d)  # left to the tie: the value is carried to the DOF this one resolves to
+            continue
+        kind = "Bloch-phase" if exact else "non-matching (mortar/collocated)"
+        raise NotImplementedError(
+            f"jno.fem: a value is prescribed on DOF {int(d)} (node {s}), which a {kind} tie eliminates, and "
+            "none of the nodes it is tied to is prescribed. The tie makes its value a weighted combination of "
+            "those nodes, so the prescription would be a multipoint constraint -- there is no row to impose "
+            "it into, and keeping the node out of the tie would break the tie there without saying so. "
+            "Prescribe the value on a node the tie keeps (the `B` side of `u(A) - u(B)`) or off the tied face; "
+            "for a gauge, `p.pin()` already picks such a node."
+        )
+    return out
+
+
 def prolongation_from_ties(
     n_nodes: int,
     secondary_to_main: Dict[int, int],
@@ -3862,7 +3909,10 @@ def prolongation_from_ties(
     #
     # Done BEFORE the transitive resolution, not by post-processing P: a chain s1 -> s2 -> k bakes
     # `w(s1,s2)*w(s2,k)` into s1's row, and promoting s2 afterwards cannot un-bake it.
-    _excl = {int(d) for d in (exclude_dofs or ())}
+    #
+    # Not every prescribed secondary is kept out, though: one whose exact tie partner is FREE is left to
+    # the tie, so its value holds at every periodic image (see `_prescribed_dofs_kept_out`).
+    _excl = _prescribed_dofs_kept_out({int(d) for d in (exclude_dofs or ())}, raw, secondary_interp, secondary_set, vec)
     if _excl and any((d // vec) in secondary_set for d in _excl):
         return _prolongation_dof_level(
             n_nodes, vec, secondary_set, raw, _excl, is_bloch=is_bloch, coupling=coupling, tie_counts=tie_counts
@@ -5532,6 +5582,48 @@ def wrap_reduced_dirichlet(periodic, residual_fn=None, jacobian_fn=None):
     return r_bc, _jac_bc
 
 
+def wrap_reduced_dirichlet_transient(periodic, mass_fn, residual_fn, jacobian_fn=None):
+    """``(mass, residual, jacobian)`` of a reduced NONLINEAR time block, carrying the reduced-space Dirichlet rows.
+
+    The time-block companion of :func:`wrap_reduced_dirichlet`, with the block's signatures:
+    ``mass(t, args)``, ``residual(u, t, args)``, ``jacobian(u, t, args)``. Handing the residual to
+    :func:`wrap_reduced_dirichlet` directly failed on the first step (its projected residual takes the
+    state alone), so a nonlinear transient with a prescribed value on a tie target -- a pressure pinned on
+    the retained corner of a periodic box -- could not march at all. The mass gets the treatment the linear
+    march gives it (:func:`impose_reduced_dirichlet` with ``mass=``): ``P^T M P`` refills the prescribed
+    row, and it has to be empty again, or the step equation ``M(u+ - u)/dt + r(u+) = 0`` no longer reduces
+    to ``u+[d] = g`` on that row.
+    """
+    pairs = (periodic or {}).get("dirichlet_reduced")
+    if not pairs:
+        return mass_fn, residual_fn, jacobian_fn
+    from .fem_1d import _apply_dirichlet_projected
+
+    dofs = jnp.asarray([int(d) for d, _v in pairs], dtype=jnp.int32)
+
+    def _zero_rows_cols(M):
+        if hasattr(M, "indices"):
+            return bcoo_zero_rows_cols(M, dofs)
+        return jnp.asarray(M).at[dofs, :].set(0.0).at[:, dofs].set(0.0)
+
+    def mass_bc(t, args=None):
+        return _zero_rows_cols(mass_fn(t, args))
+
+    def residual_bc(u, t, args=None):
+        return _apply_dirichlet_projected(lambda uu: residual_fn(uu, t, args), pairs)(u)
+
+    jac_bc = None
+    if jacobian_fn is not None:
+
+        def jac_bc(u, t, args=None):
+            J = jacobian_fn(u, t, args)
+            if hasattr(J, "indices"):
+                return bcoo_eliminate_dirichlet(J, dofs)
+            return jnp.asarray(J).at[dofs, :].set(0.0).at[:, dofs].set(0.0).at[dofs, dofs].set(1.0)
+
+    return mass_bc, residual_bc, jac_bc
+
+
 def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False):
     """``[(reduced_dof, value)]`` for the prescribed DOFs whose reduced row the congruence pollutes.
 
@@ -5545,9 +5637,12 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
     only genuinely polluted rows are returned (a reduced column carrying more than its own identity
     entry), so a tie with no Dirichlet overlap yields ``[]``.
 
-    Requires every prescribed DOF to be KEPT, which ``prolongation_from_ties(exclude_dofs=...)``
-    guarantees; a prescribed DOF that was eliminated has no reduced row to write into and is skipped
-    here rather than silently mapped to the wrong one.
+    A prescribed DOF is normally KEPT (``prolongation_from_ties(exclude_dofs=...)``). The exception is one
+    the tie was left to carry -- a single prescribed node whose exact partner is free, see
+    :func:`_prescribed_dofs_kept_out`. Its ``P`` row is a single weight-1 entry, and its value is imposed
+    on that reduced DOF, i.e. at the node and every periodic image of it. Two different values landing on
+    one reduced DOF that way are refused, as is an eliminated DOF with a weighted row: there is no single
+    row to impose either into, and picking one would lose a boundary condition in silence.
     """
     if not dirichlet_pairs:
         return []
@@ -5556,6 +5651,7 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
     # reduced columns carrying more than their own identity entry == the rows P^T pollutes
     polluted = set()
     full_to_red = {}
+    entries = []  # per block: (P row ids, P col ids, P weights), to resolve an eliminated DOF
     for bi, blk in enumerate(blocks):
         P = blk["P"]
         vec = int(blk.get("vec", 1) or 1)
@@ -5566,6 +5662,7 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
         idx = np.asarray(P.indices) if hasattr(P, "indices") else None
         if idx is None:
             return []
+        entries.append((idx[:, 0], idx[:, 1], np.asarray(P.data)))
         counts = np.bincount(idx[:, 1], minlength=int(P.shape[1]))
         for r in np.flatnonzero(counts > 1):
             polluted.add(int(off_red[bi]) + int(r))
@@ -5574,18 +5671,50 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
             for c in range(vec):
                 full_to_red[int(off_full[bi]) + n * vec + c] = int(off_red[bi]) + r * vec + c
 
-    out = []
+    def _carried(d):
+        """The reduced DOF an eliminated ``d`` resolves to with weight 1, or ``None``."""
+        bi = int(np.searchsorted(off_full, d, side="right")) - 1
+        if not 0 <= bi < len(entries):
+            return None
+        rows, cols, data = entries[bi]
+        sel = np.flatnonzero(rows == d - int(off_full[bi]))
+        if sel.size != 1 or abs(complex(data[sel[0]]) - 1.0) > 1e-12:
+            return None
+        return int(off_red[bi]) + int(cols[sel[0]])
+
+    def _concrete(g):
+        try:
+            return complex(np.asarray(g).reshape(()))
+        except Exception:  # noqa: BLE001 - a traced / array-valued value: nothing to compare eagerly
+            return None
+
+    out, held = [], {}
     for d, g in dirichlet_pairs:
         r = full_to_red.get(int(d))
         if r is None:
-            raise RuntimeError(
-                f"jno.fem: prescribed DOF {int(d)} was eliminated by a tie, so it has no reduced row to "
-                "impose its value into. It should have been excluded from the elimination "
-                "(`prolongation_from_ties(exclude_dofs=...)`); dropping it here would lose a boundary "
-                "condition in silence."
-            )
-        if all_rows or r in polluted:
-            out.append((r, g))
+            r = _carried(int(d))
+            if r is None:
+                raise RuntimeError(
+                    f"jno.fem: prescribed DOF {int(d)} was eliminated by a weighted tie, so it has no reduced "
+                    "row to impose its value into. It should have been excluded from the elimination "
+                    "(`prolongation_from_ties(exclude_dofs=...)`); dropping it here would lose a boundary "
+                    "condition in silence."
+                )
+        if not (all_rows or r in polluted):
+            continue
+        if r in held and held[r][0] != int(d):
+            # Two prescribed NODES the tie identifies: one unknown, so one value -- or a contradiction.
+            a, b = _concrete(held[r][1]), _concrete(g)
+            if a is not None and b is not None and abs(a - b) > 1e-12 * max(1.0, abs(a), abs(b)):
+                raise ValueError(
+                    f"jno.fem: two different values ({a.real if a.imag == 0 else a} and "
+                    f"{b.real if b.imag == 0 else b}) are prescribed on DOFs {held[r][0]} and {int(d)}, which a "
+                    "tie identifies as one unknown. Prescribe one value there, or prescribe both sides of the "
+                    "tie so each keeps its own row."
+                )
+            continue
+        held.setdefault(r, (int(d), g))
+        out.append((r, g))
     return out
 
 

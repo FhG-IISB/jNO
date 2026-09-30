@@ -522,16 +522,24 @@ def _discover_domain(constraints: List[Any]):
     )
 
 
-def _lower_gauge_pin(pin: GaugePin) -> Any:
+def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
     """Lower a ``p.pin()`` marker to a single-node Dirichlet residual ``field(node) - value``.
 
-    Picks a deterministic vertex (nearest the mesh min-corner) and reuses
-    ``domain.point_region`` + ``domain.variable``, so the synthesized residual is identical to a
-    hand-written ``p(xpn, ypn) - value`` -- the value side is the literal constant, so the
-    transient route treats it as a plain (time-independent) Dirichlet at every step. The pin's
-    coordinate Variables are cached per (domain, field) so a second ``jno.fem(...)`` on the same
-    domain neither re-registers the region nor re-samples (the cached vars are Dirichlet-only and
-    never retagged, so reuse is safe).
+    Picks a deterministic vertex and reuses ``domain.point_region`` + ``domain.variable``, so the
+    synthesized residual is identical to a hand-written ``p(xpn, ypn) - value`` -- the value side is
+    the literal constant, so the transient route treats it as a plain (time-independent) Dirichlet at
+    every step. The pin's coordinate Variables are cached per (domain, field, vertex) so a second
+    ``jno.fem(...)`` on the same domain neither re-registers the region nor re-samples (the cached vars
+    are Dirichlet-only and never retagged, so reuse is safe).
+
+    **Which vertex.** With no ties, the one nearest the mesh min-corner. With periodic / tied faces
+    (``ties``, the ``(main, secondary, ...)`` specs), the vertex nearest the min-corner that lies on NO
+    tied face. The min-corner of a periodic box is exactly the node the ties eliminate, and a gauge only
+    needs some DOF of the field's constant null space: a node off every tied face is never eliminated,
+    never merged with an image, and never has another row summed into it, so the pin is the same plain
+    one-node Dirichlet it is without ties, on every route (steady or transient, single-field or coupled,
+    conforming or mortar ties). Only a mesh with no vertex off the tied faces (one cell across) falls back
+    to the min-corner; the reduction then carries the value to all of its periodic images.
     """
     import numpy as _np
 
@@ -542,6 +550,21 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
             "jno.fem: p.pin() needs a field from domain.fem_symbols(...); the pinned symbol carries no domain."
         )
     dim = int(domain.dimension)
+    pts = _np.asarray(domain.mesh.points)[:, :dim]
+    corner = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex...
+    d2 = ((pts - corner) ** 2).sum(axis=1)
+    nid = int(d2.argmin())
+    if ties:
+        # ...or, with ties, the vertex nearest it that no tie touches (either side of any tie: the
+        # eliminated side loses its row, the retained side has the eliminated rows summed into it).
+        on_tie = _np.zeros(len(pts), dtype=bool)
+        every = _np.arange(len(pts))
+        for tag in {t for (m, s, *_r) in ties for t in (m, s)}:
+            ids = _face_nodes(domain, pts, every, tag)
+            if ids is not None:
+                on_tie[_np.asarray(ids, dtype=int).reshape(-1)] = True
+        if not on_tie.all():
+            nid = int(_np.where(on_tie, _np.inf, d2).argmin())
     # Single leading underscore (not "__...__"): the pin node is a genuine single-vertex boundary
     # region that `_region_and_support` must SEE, so its tag must not match the reserved
     # double-underscore filter that hides internal/temporal tags from region detection.
@@ -552,12 +575,15 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
     # keys on content). The name is deterministic, and just as unique where uniqueness matters:
     # trial names are distinct within a problem, and the per-domain cache WANTS two problems pinning
     # the same-named field on the same domain to share the pin region.
+    #
+    # A vertex other than the min-corner is named in the tag too: the same field pinned with and without
+    # ties on one domain must not share a region that sits at the wrong node for one of them.
     tag = f"_gauge_pin_{getattr(field, 'name', None) or field.field_key}"
+    if nid != int(d2.argmin()):
+        tag = f"{tag}_v{nid}"
     cache = domain.__dict__.setdefault("_gauge_pin_coords", {})
     if tag not in cache:
-        pts = _np.asarray(domain.mesh.points)[:, :dim]
-        target = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex
-        domain.point_region(tag, target)
+        domain.point_region(tag, pts[nid])
         cache[tag] = domain.variable(tag, split=True)
     spatial = cache[tag][:dim]
     return field(*spatial) - pin.value
@@ -4938,17 +4964,24 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
 
 
 def _build_periodic_reduction_multifield(
-    domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any
+    domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any, exclude_dofs: Any = None
 ) -> dict:
     """Periodic reduction for a coupled (multi-field) problem: one block per field. Each field's
     ``P_i`` is built from its own DOF nodes / element order / vec and its own ties (matched by
     ``field_key``), so heterogeneous-order couplings (e.g. Taylor-Hood: P2 velocity + P1 pressure)
     are supported. The Galerkin reduction stays block-wise (``P_i^T M[i,j] P_j``) via the
     ``fem_utils`` helpers — no block-diagonal ``P`` is materialised — and when all fields share a
-    mesh + order a single node-``P`` is built once and shared (the common case)."""
+    mesh + order a single node-``P`` is built once and shared (the common case).
+
+    ``exclude_dofs`` are the prescribed DOFs in the COUPLED numbering; each field's builder gets its own
+    slice, shifted to that field's local numbering, so a prescribed DOF on a tied face keeps its own row
+    exactly as on the single-field path. Without it every coupled problem with a Dirichlet value on a
+    tied face -- a periodic channel with no-slip walls -- failed to build."""
     offs = [int(o) for o in offsets]
     n_fields = len(offs) - 1
     sizes = [offs[i + 1] - offs[i] for i in range(n_fields)]
+    _ex = sorted({int(d) for d in (exclude_dofs or ())})
+    excl = [[d - offs[i] for d in _ex if offs[i] <= d < offs[i + 1]] for i in range(n_fields)]
 
     pts_all = getattr(domain, "_fem_native_dof_points_all", None) or [points] * n_fields
     cells_all = getattr(domain, "_fem_native_assembly_cells_all", None) or [cells] * n_fields
@@ -4968,11 +5001,22 @@ def _build_periodic_reduction_multifield(
         seen: set = set()
         uniq = [t for t in ties if (t[0], t[1]) not in seen and not seen.add((t[0], t[1]))]
         red = _build_periodic_reduction(domain, uniq, pts_all[0], cells_all[0], int(orders[0]), int(vec))
-        P, kept, v = red["P"], red["kept_nodes"], red["vec"]
-        nrf = int(P.shape[1])
-        blocks = [{"P": P, "kept": kept, "vec": v, "is_selection": red["is_selection"]} for _ in range(n_fields)]
-        off_full = [i * sizes[0] for i in range(n_fields + 1)]
-        off_red = [i * nrf for i in range(n_fields + 1)]
+        blocks, off_full, off_red = [], [0], [0]
+        for i in range(n_fields):
+            # the shared P serves every field with nothing prescribed on it; one that has prescribed
+            # DOFs gets its own, which differs only if one of them sits on a tied face
+            red_i = (
+                _build_periodic_reduction(
+                    domain, uniq, pts_all[0], cells_all[0], int(orders[0]), int(vec), exclude_dofs=excl[i]
+                )
+                if excl[i]
+                else red
+            )
+            blocks.append(
+                {"P": red_i["P"], "kept": red_i["kept_nodes"], "vec": red_i["vec"], "is_selection": red_i["is_selection"]}
+            )
+            off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
+            off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
         return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
 
     # Heterogeneous: a distinct P_i per field, from its own nodes/order/vec and its own ties.
@@ -4982,7 +5026,9 @@ def _build_periodic_reduction_multifield(
         vec_i = max(1, sizes[i] // int(pts_i.shape[0]))
         ties_i = [t for t in ties if _tie_field_index(t) in (i, None)]
         if ties_i:
-            red_i = _build_periodic_reduction(domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i))
+            red_i = _build_periodic_reduction(
+                domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i), exclude_dofs=excl[i]
+            )
             P_i, kept_i, v_i, sel_i = red_i["P"], red_i["kept_nodes"], red_i["vec"], red_i["is_selection"]
         else:  # a field with no periodic tie -> sparse identity (a selection: one main per row)
             import jax.experimental.sparse as jsparse
@@ -5127,11 +5173,12 @@ def _annotate_reduced_dirichlet(periodic: Any, pairs: list, tv: list) -> Any:
     # constant to put back. Refuse rather than march a condition that stopped being imposed.
     if tv and reduced_dirichlet_pairs(periodic, [(d, 0.0) for d in tv]):
         raise NotImplementedError(
-            "jno.fem: a node carrying a TIME-VARYING essential value sits on a non-matching tied/periodic "
-            "interface, where the tie reduction destroys the row that holds it. The constant-value "
-            "restoration cannot be used, because the held value changes every step. Either make the "
-            "interface conforming (`jno.shape.regions(..., conforming=True)`), or move the time-varying "
-            "condition off the tied face."
+            "jno.fem: a node carrying a TIME-VARYING essential value sits on a tied/periodic interface where "
+            "the tie reduction destroys the row that holds it (a non-matching interface, or a single node "
+            "whose tie partner is free, so the value is carried to its periodic image). The constant-value "
+            "restoration cannot be used, because the held value changes every step. Make the interface "
+            "conforming (`jno.shape.regions(..., conforming=True)`) and prescribe both sides of the tie, or "
+            "move the time-varying condition off the tied face."
         )
     return periodic
 
@@ -5296,7 +5343,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         reduce_matrix_periodic,
         reduce_vector_periodic,
         restrict_state_periodic,
-        wrap_reduced_dirichlet,
+        wrap_reduced_dirichlet_transient,
     )
 
     # A block whose state is TWO stacked copies of the field reduces by P on each half; see
@@ -5356,8 +5403,9 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
 
         # `Pᵀ` sums an eliminated DOF's equation into the rows it ties to, so a prescribed DOF that is a
         # tie target loses the row holding its value -- in the reduced residual exactly as in the reduced
-        # matrix. Same pairs, same helper as every other reduced path.
-        residual_red, jac_red = wrap_reduced_dirichlet(periodic, residual_red, jac_red)
+        # matrix, and `PᵀMP` refills its (zeroed) mass row. Same pairs as every other reduced path; the
+        # time-block helper exists because these callables take `(u, t, args)`, not the state alone.
+        mass_red, residual_red, jac_red = wrap_reduced_dirichlet_transient(periodic, mass_red, residual_red, jac_red)
 
         return dataclasses.replace(
             block,
@@ -5886,17 +5934,18 @@ def _fem_impl(
     _refuse_point_indexing(constraints)
     _orig_fem_kwargs = {"quad_degree": quad_degree}
 
-    # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
-    # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
-    # bare marker, not a walkable expression, so it must not reach `_discover_domain` (which walks
-    # coordinate Variables) or the `_region_and_support` classifier.
+    # Gauge pins (`p.pin()`) remove a field's constant null space. Each lowers to a single-node
+    # Dirichlet `p(node) - value`. A GaugePin is a bare marker, not a walkable expression, so it must
+    # not reach `_discover_domain` (which walks coordinate Variables) or the `_region_and_support`
+    # classifier: the markers are set aside here and lowered right after the periodic ties are split
+    # off (below), still before classification -- which vertex a pin may use depends on the ties.
     _mean_gauge_fields: List[Any] = []
-    if any(isinstance(c, GaugePin) for c in constraints):
-        pins = [c for c in constraints if isinstance(c, GaugePin)]
+    _gauge_pins = [c for c in constraints if isinstance(c, GaugePin)]
+    if _gauge_pins:
         # `mean=True` keeps the node pin (it is what makes the system non-singular) and additionally
         # re-levels the field after the solve; only the constant the pin leaves behind is replaced.
-        _mean_gauge_fields = [pin.field for pin in pins if getattr(pin, "mean", False)]
-        constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
+        _mean_gauge_fields = [pin.field for pin in _gauge_pins if getattr(pin, "mean", False)]
+        constraints = [c for c in constraints if not isinstance(c, GaugePin)]
 
     # Nonlocal coupling terms (radiation, integral/non-reflecting BCs, ...) are not local weak forms and
     # not walkable trace expressions: a plain pure-JAX residual function ``f(u) -> (n_dofs,)``. A bare
@@ -5953,6 +6002,8 @@ def _fem_impl(
     constraints = core_constraints
     if periodic_ties and not constraints:
         raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
+    # Gauge pins lower to a one-node Dirichlet at a vertex off every tied face (see `_lower_gauge_pin`).
+    constraints = constraints + [_lower_gauge_pin(p, periodic_ties) for p in _gauge_pins]
 
     # Essential normal-flux BCs `u·n - g` (H(div) RT) pin boundary-edge DOFs at assembly; like periodic
     # ties they must be separated before classification (the Cartesian Dirichlet parser would reject them).
@@ -6263,7 +6314,13 @@ def _fem_impl(
             periodic = _build_periodic_reduction_nonnodal(domain, periodic_ties, fem_obj.offsets)
         elif multifield:
             periodic = _build_periodic_reduction_multifield(
-                domain, periodic_ties, fem_obj.points, cells, ele_order, fem_obj.offsets
+                domain,
+                periodic_ties,
+                fem_obj.points,
+                cells,
+                ele_order,
+                fem_obj.offsets,
+                exclude_dofs=[int(d) for d, _g in _dpairs] + _tvdofs,
             )
         else:
             # A prescribed DOF must not be eliminated by the tie, and a prescribed DOF that the tie

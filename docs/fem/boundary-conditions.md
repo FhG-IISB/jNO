@@ -216,6 +216,25 @@ fem = jno.fem([mech,
                maximum(0.0, -c * u.gap(seam2_a, seam2_b, domain=d)) * inner(n, phi_s, 1)])  # contact
 ```
 
+**A value on one node of a tied face, and `p.pin()`.** The tie says a node and its periodic images are
+**one** unknown, so a value written at one of them holds at all of them: `u(corner) - 0` on the corner of a
+doubly periodic box fixes all four corners. `p.pin()` needs no such care. It pins the vertex nearest the
+min-corner that lies on **no** tied face (with no ties, the min-corner itself). A gauge only needs some DOF
+of the field's constant null space, and a node off every tied face is never eliminated and never has
+another row summed into it. So the pin is the same one-node condition with or without periodicity, steady
+or transient, single-field or coupled. `p.pin(mean=True)` re-levels afterwards to `∫p dx = 0` exactly as
+without ties. Two different values on nodes a tie identifies are refused by name. So is a value on a
+single node of a *weighted* (mortar / collocated / Bloch) tie, whose image is a weighted sum of other
+nodes: prescribe it on the kept side of the tie (the `B` in `u(A) - u(B)`) instead.
+
+```python
+at = lambda tag: d.variable(tag, split=True)[:2]                          # (x, y) on a face
+fem = jno.fem([momentum, continuity,
+               u(*at("left")) - u(*at("right")), u(*at("bottom")) - u(*at("top")),   # fully periodic
+               p(*at("left")) - p(*at("right")), p(*at("bottom")) - p(*at("top")),
+               p.pin()])                                                  # a vertex off the tied faces
+```
+
 !!! warning "Scope"
     A **transient** tie is still scalar-only (that route pre-builds its own reduction), and refuses by
     name. A tie combined with `u.gap` assembles but solves to a **deferred trace node** rather than an
@@ -262,6 +281,16 @@ fem = jno.fem([mech,
     not per node, so a roller keeps the tie on its free components), and the rows the congruence pollutes
     are re-imposed in the reduced space — symmetrically, because restoring the row alone leaves the
     reduced column populated and silently downgrades LDL^T to general LU.
+
+    The exclusion applies where the tie partner is prescribed as well, e.g. the corner of a periodic
+    channel with no-slip walls. A prescribed DOF whose exact partner is **free** is left to the tie instead,
+    and its value is imposed on the reduced DOF it resolves to. Excluding it tore the tie at that node,
+    silently: a pinned corner of a doubly periodic Poisson problem held 0 while its three images held
+    -0.037, for a solution of order 1. The coupled (multi-field) reduction did not apply the exclusion at
+    all, so every coupled problem with a value on a tied face failed to build, a pressure pin on a
+    periodic box among them. A nonlinear **transient** with a restored row failed on its first step, and
+    its reduced mass row is now emptied as the linear march empties it. All of this is pinned in
+    `tests/test_fem_pin_periodic.py` against Poisson, Poiseuille and Taylor–Green solutions.
 
     Every reduced-space path goes through one helper for this (`impose_reduced_dirichlet`, or
     `wrap_reduced_dirichlet` for the residual-form paths). That matters: the steady real path was fixed
