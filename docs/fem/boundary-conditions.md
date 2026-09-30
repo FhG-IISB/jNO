@@ -149,7 +149,16 @@ rather than a box, and is rejected.
 
 **Scope.** Bounds are wired on the steady residual path (real, 2D/3D native Lagrange, single-field or
 coupled), including inside a `tau=` load-path march; a transient or complex assembly is rejected with
-a clear error. One box per field. Note that a bound is not a cure for an ill-posed operator: in a
+a clear error. One box per field. A box composes with a **periodic tie**, steady or on a `tau=` march:
+the tied solve runs on the kept unknowns `u = P ũ`, and the box is imposed there — the full box restricted
+to the kept DOFs, which is exact because an eliminated DOF *is* the DOF it is tied to. So the bound must be
+the same on both tied faces (a periodic `lo`/`hi`, or `u.i(-1)`, which satisfies the tie by construction);
+a bound that differs across the tie is refused by name, and so is a box beside a *weighted* elimination
+(a non-matching mortar interface, hanging nodes, a slip condition), whose eliminated values a box on the
+kept ones would not bound. Measured: the periodic obstacle problem matches its analytic free boundary, and
+a tied ratchet `u.bounds(u.i(-1), None)` holds the unit-load linear solve to 1e-8
+(`tests/test_fem_bounds_periodic.py`, `tests/test_fem_history_march_periodic.py`). Note that a bound is
+not a cure for an ill-posed operator: in a
 phase-field form `dm.bounds(0, 1)` keeps the damage in range but does **not** remove the need for a
 floor on `(1-dm)²`, which at `dm = 1` would otherwise make the displacement block singular. And on a
 non-convex energy a monolithic Newton is not expected to converge whether or not a bound is present —
@@ -387,8 +396,8 @@ fem = jno.fem([momentum, continuity,
     `.evolves` update are computed from a field that satisfies the tie. The same hand-written step matches
     the `u.t` march with `time=jno.solve.theta(1.0)` to ~1e-10 relative, single-field and coupled, with the
     seam values equal exactly. Pinned in `tests/test_fem_history_march_periodic.py`.
-    `tau=jno.solve.arclength(...)` and `.bounds(...)` do not solve in the reduced space and refuse such a
-    form by name.
+    `tau=jno.solve.arclength(...)` does not solve in the reduced space and refuses such a form by name. A
+    `.bounds(...)` box is imposed on the reduced unknowns (see [inequalities](#inequalities-uboundslo-hi)).
 
 ### The tangential companion — `u.slide`
 

@@ -254,7 +254,9 @@ A constraint that `jno.fem` eliminates rather than assembles — a periodic tie 
 condition `n·u = 0`, the hanging nodes of a locally refined mesh — is applied at every step: the step solves
 `Pᵀ r(P ũ) = 0` for the reduced unknowns and the march carries the prolonged `u = P ũ`, so the history
 buffers and `.evolves` updates see a field that satisfies it. Refused by name with such a constraint:
-`tau=jno.solve.arclength(...)` and a `.bounds(...)` box.
+`tau=jno.solve.arclength(...)`. A `.bounds(...)` box is imposed on the reduced unknowns; with a periodic
+tie it needs the same bound on both tied faces, and beside a weighted elimination (mortar, hanging nodes,
+slip) it is refused by name.
 
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
 a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and a nonlocal `jno.Coupling` term.

@@ -16,7 +16,9 @@ Oracles:
 * **slip / hanging nodes** — the constraint holds to round-off at every step, measured on the solution's
   own nodal values.
 * **differentiability** — ``∂/∂θ`` through the reduced march, against central finite differences.
-* **refusals** — the two legs that do not reduce (arc-length, a ``.bounds`` box) refuse by name.
+* **a ``.bounds`` box** — ``u >= u.i(-1)`` on a tied march ratchets onto the unit-load LINEAR steady solve of
+  the same tied problem, scaled by the peak load factor (every free DOF active on the way down).
+* **refusals** — arc-length, the leg that does not reduce, refuses by name.
 
 Step alignment: the march solves at every ``tau`` point, starting from the virgin buffer ``u.i(-1) = 0``,
 so march step ``k`` is ``k + 1`` backward-Euler steps from zero — the ``u.t`` trajectory's frame ``k + 1``
@@ -313,20 +315,45 @@ def test_arclength_with_a_tie_is_refused_by_name():
         _heat("tau").solve(tau=jno.solve.arclength())
 
 
-def test_bounds_with_a_tie_on_a_march_is_refused_by_name():
-    d = _square(**_grid("tau"))
+def _ratchet(*, bounded, steady=False):
+    """``-Δu = s(τ) f(x)``, ``f = 10 (1 + 0.5 sin 2πx) > 0``, u = 0 on y = 0, 1, periodic in x, with the load
+    factor ``s`` rising 0 -> 1 and falling back. ``bounded`` adds ``u.bounds(u.i(-1), None)``: u may never
+    decrease. ``steady`` builds the unit-load (s = 1) linear solve instead, on its own domain."""
+    d = _square() if steady else _square(tau=(0.0, 1.0, 9))
     u, v = d.fem_symbols(names=("u", "v"))
     V = d.variable("interior", split=True)
-    ub, vb = u.bind(x=V[0], y=V[1], t=V[2]), v.bind(x=V[0], y=V[1], t=V[2])
+    ub, vb = u.bind(x=V[0], y=V[1]), v.bind(x=V[0], y=V[1])
     on = lambda r: d.variable(r, split=True)[:2]  # noqa: E731
-    fem = jno.fem(
-        [
-            (ub - u.i(-1)) / DT * vb + ub.x * vb.x + ub.y * vb.y - 10.0 * vb,
-            u(*on("b")) - 0.0,
-            u(*on("t")) - 0.0,
-            u(*on("l")) - u(*on("r")),
-            u.bounds(0.0, 0.05),
-        ]
-    )
-    with pytest.raises(NotImplementedError, match="bounds.*periodic tie"):
-        fem.solve()
+    f = 10.0 * (1.0 + 0.5 * jno.np.sin(2 * PI * V[0]))
+    load = 1.0 if steady else 1.0 - jno.np.abs(2 * V[-1] - 1.0)  # 0 -> 1 -> 0 over tau
+    terms = [ub.x * vb.x + ub.y * vb.y - load * f * vb, u(*on("b")) - 0.0, u(*on("t")) - 0.0]
+    terms.append(u(*on("l")) - u(*on("r")))
+    if not steady:
+        s_, _ = d.fem_symbols(value_shape=(), names=("s", "sv"))
+        terms[0] = terms[0] + 0.0 * s_.i(-1) * vb  # an inert state: its only job is to trigger the march
+        terms.append(s_.evolves(s_.i(-1)))
+    if bounded:
+        terms.append(u.bounds(u.i(-1), None))
+    fem = jno.fem(terms)
+    return np.asarray(fem.solve()), fem
+
+
+def test_bounds_with_a_tie_on_a_march_ratchet_at_the_peak():
+    """A box used to be refused on a tied march. Now: the load rises and falls; with ``u >= u.i(-1)`` the
+    tied field follows ``s(τ) u₁`` up -- ``u₁`` the unit-load solve of the same tied problem through the
+    LINEAR steady path, an independent route -- and then holds ``u₁`` exactly while the load falls,
+    because ``f > 0`` makes every free DOF want to decrease (the whole field is active). The unbounded
+    control unloads to zero, so the bound is what holds it."""
+    u1, _fem1 = _ratchet(bounded=False, steady=True)
+    ratchet, fem = _ratchet(bounded=True)
+    control, _fem = _ratchet(bounded=False)
+    s = 1.0 - np.abs(2 * np.linspace(0.0, 1.0, 9) - 1.0)
+    held = np.maximum.accumulate(s)  # the load factor the ratchet remembers
+    scale = np.abs(u1).max()
+    assert scale > 0.1
+    for k in range(9):
+        err = np.abs(ratchet[k] - held[k] * u1).max() / scale
+        assert err < 1e-8, f"step {k}: the tied ratchet is {err:.2e} off {held[k]:.2f} u1"
+    assert np.abs(control[-1]).max() / scale < 1e-8, "the unbounded control did not unload"
+    lo, hi = _seam(fem)
+    assert np.array_equal(ratchet[:, lo], ratchet[:, hi]), "the tie is not exact under the box"

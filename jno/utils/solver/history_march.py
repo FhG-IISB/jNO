@@ -173,11 +173,15 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
 
         A reduced system (``fem._periodic``) is different in the same way: the driver zeroes ``Pᵀ r``,
         and the full ``r`` keeps the tie's reaction on the eliminated rows however well the step
-        converged. ``root_fn`` still takes a FULL state (the march's carry), restricting it first."""
-        if periodic is not None:
-            r_red, _j, restrict, _p = _reduced(res, None, pargs or {})
-            return (lambda u: r_red(restrict(u))), u_prev
+        converged. ``root_fn`` still takes a FULL state (the march's carry), restricting it first. The
+        two compose: a box on a tied form is the min-map of ``Pᵀ r``, over the reduced unknowns."""
         prep = getattr(solve_fn, "prepare_residual", None)
+        if periodic is not None:
+            r_red, _j, restrict, prolong = _reduced(res, None, pargs or {})
+            if prep is not None:
+                phi, start = prep(r_red, restrict(u_prev))
+                return (lambda u: phi(restrict(u))), prolong(start)
+            return (lambda u: r_red(restrict(u))), u_prev
         return prep(res, u_prev) if prep is not None else (res, u_prev)
 
     def _roll(buf, nv):
@@ -515,8 +519,11 @@ def _refuse_unreduced_routes(fem, path):
     """Refuse the load-path legs that do not (yet) solve in a constraint's reduced space.
 
     The fixed-grid march, an explicit ``tau=<schedule>``, the adaptive pilot and the per-step contact
-    loop all take their steps through ``_step_once``, which reduces. These two do not, and running them
-    on the full residual would drop the tie / slip / hanging-node constraint in silence."""
+    loop all take their steps through ``_step_once``, which reduces. Arc-length does not, and running it
+    on the full residual would drop the tie / slip / hanging-node constraint in silence. (A ``.bounds``
+    box used to be refused here too; it is now stated on the reduced unknowns -- see
+    ``FEM._resolve_bounds_in`` -- and a reduction it cannot be stated on is refused when the form is
+    built, by ``_check_bounds_under_reduction``.)"""
     kind = "slip condition `n·u = 0`" if (fem._periodic or {}).get("coupling") == "slip" else "periodic tie"
     if getattr(fem.domain, "_fem_hanging_nodes", None):
         kind = "hanging-node constraint"
@@ -526,13 +533,6 @@ def _refuse_unreduced_routes(fem, path):
             "bordered system for (u, load factor) that is not wired to the constraint's reduced space "
             "u = P ũ, so the constraint would be dropped. March the declared `domain(tau=...)` grid "
             "(or tau=jno.solve.adaptive(limit=...)), which does apply it."
-        )
-    if getattr(fem, "_bound_specs", None):
-        raise NotImplementedError(
-            f"jno.fem: `.bounds(lo, hi)` together with a {kind} on a `domain(tau=...)` march is not "
-            "supported. The box is stated on the full DOF vector, while the constrained march solves for "
-            "the reduced unknowns u = P ũ; the min-map would have to be restricted to the kept DOFs, "
-            "which is not implemented. Drop one of the two."
         )
 
 

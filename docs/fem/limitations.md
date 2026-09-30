@@ -143,8 +143,9 @@ path is unaffected.
     load-path march** both run. The march assembles on the real, steady native-Lagrange path,
     **single-field or coupled** — not transient / complex / 1-D / non-nodal, each rejected with a
     clear error. Periodic ties, exact slip conditions and hanging-node constraints compose (each step
-    solves in the reduced space `u = P ũ`); with one of them, `tau=jno.solve.arclength(...)` and
-    `.bounds(...)` refuse by name.
+    solves in the reduced space `u = P ũ`); with one of them, `tau=jno.solve.arclength(...)` refuses by
+    name. A `.bounds(...)` box composes with a periodic tie whose bound is the same on both faces, and
+    refuses beside a weighted elimination (mortar, hanging nodes, slip).
 
     An internal state advances on every cell by default; `state.evolves(formula, region="strip")`
     restricts it to one region, and outside it the state is **frozen** at the value it already has —

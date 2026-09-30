@@ -3922,7 +3922,7 @@ class FEM:
             box-constrained solve against ``residual_fn`` reads a correct answer as a failure. Only
             ``Phi`` vanishes at the solution."""
             u0 = jnp.asarray(u0).reshape(-1)
-            resolved = self._resolve_bounds(u0)
+            resolved = self._resolve_bounds_in(u0)
             if resolved is None:
                 return residual_fn, u0
             lo, hi = resolved
@@ -3953,7 +3953,7 @@ class FEM:
             wrong operator for the constrained problem — so the same selection is applied to the matrix
             here. The active set is a function of the iterate, hence a traced mask rather than a DOF
             list, which is what :func:`bcoo_identity_rows` exists for."""
-            resolved = self._resolve_bounds(u0)
+            resolved = self._resolve_bounds_in(u0)
             if resolved is None:
                 return jacobian_fn
             from .utils.solver.fem_utils import bcoo_identity_rows
@@ -3979,7 +3979,7 @@ class FEM:
 
             Handed to a driver that extrapolates past its own sub-solve (``staggered(over_relax>1)``):
             the sub-solve's answer is feasible by construction, a step BEYOND it need not be."""
-            resolved = self._resolve_bounds(u0)
+            resolved = self._resolve_bounds_in(u0)
             if resolved is None:
                 return None
             lo, hi = resolved
@@ -4006,6 +4006,33 @@ class FEM:
         if solve_fn is None:
             _bounded.wants_jacobian = True  # the default Newton runs on the assembled tangent when offered
         return _bounded
+
+    def _resolve_bounds_in(self, u):
+        """``(lo, hi)`` in the space ``u`` lives in, or ``None`` if there are no boxes.
+
+        Usually the full DOF vector. A form with a periodic tie root-finds on the REDUCED unknowns
+        ``u = P ũ``, so its box must be stated on ``ũ``: it is the full box restricted to the kept DOFs.
+        That is exact, not an approximation — a tie that reaches here is a weight-1 selection and every
+        eliminated DOF's bound equals the bound of the DOF it resolves to, both checked when the form is
+        built (:func:`_check_bounds_under_reduction`). The full box is resolved at ``P ũ``, so a
+        ``u.i(-1)`` bound still reads the previous step's full field."""
+        u = jnp.asarray(u).reshape(-1)
+        per = getattr(self, "_periodic", None)
+        if per is None or u.shape[0] == int(self.dofs):
+            return self._resolve_bounds(u)
+        from .utils.solver.fem_utils import _periodic_blocks, prolong_periodic, restrict_state_periodic
+
+        n_red = int(_periodic_blocks(per)[2][-1])
+        if u.shape[0] != n_red:
+            raise ValueError(
+                f"jno.fem internal: a box-constrained solve was handed a state of size {u.shape[0]}, which "
+                f"is neither the full DOF count {int(self.dofs)} nor the tie's reduced count {n_red}."
+            )
+        resolved = self._resolve_bounds(jnp.asarray(prolong_periodic(per, u)).reshape(-1))
+        if resolved is None:
+            return None
+        lo, hi = resolved
+        return restrict_state_periodic(per, lo), restrict_state_periodic(per, hi)
 
     def _resolve_bounds(self, u_warm):
         """``(lo, hi)`` over the whole DOF vector for the declared boxes, or ``None`` if there are none.
@@ -5565,6 +5592,62 @@ def _galerkin_reduction(basis: Any, n_dofs: int, *, ortho_tol: float = 1e-8) -> 
     return {"P": U, "kept_nodes": None, "vec": 1, "is_selection": False}
 
 
+def _check_bounds_under_reduction(fem_obj: Any, periodic: Any, kind: str) -> None:
+    """Refuse a box ``u.bounds(lo, hi)`` that cannot be stated on a reduction's kept unknowns.
+
+    A reduced solve root-finds on ``ũ`` with ``u = P ũ``, and the box is imposed there as the full box
+    restricted to the kept DOFs (:meth:`FEM._resolve_bounds_in`). That bounds every eliminated DOF too
+    exactly when ``P`` is a weight-1 selection -- each eliminated DOF IS one kept DOF -- and the bound
+    is the same on both. Otherwise the restricted box would silently leave eliminated DOFs unbounded:
+
+    * a weighted ``P`` (a non-matching mortar / collocated interface, a hanging node, a slip condition,
+      an antiperiodic or Bloch phase): an eliminated value is a combination of kept ones, which a box
+      on the kept ones does not bound (mortar weights can even be negative);
+    * a box that differs across the tie: the tie makes the two DOFs one unknown, so it cannot hold
+      both bounds, and which one wins would be an accident of which side is kept.
+
+    A ``u.i(-1)`` bound is the previous step's field, which lies in the range of ``P`` and so is
+    periodic by construction; it is resolved here at zero, which passes.
+    """
+    if periodic is None or not getattr(fem_obj, "_bound_specs", None):
+        return
+    from .utils.solver.fem_utils import _is_selection, _periodic_blocks, restrict_state_periodic
+
+    blocks, off_f, off_r = _periodic_blocks(periodic)
+    main = np.zeros(int(off_f[-1]), dtype=np.int64)
+    for i, b in enumerate(blocks):
+        P = b.get("P")
+        weight_one = (
+            P is not None
+            and hasattr(P, "indices")
+            and b.get("kept") is not None
+            and _is_selection(P)
+            and bool(np.all(np.asarray(P.data) == 1.0))
+        )
+        if not weight_one:
+            raise NotImplementedError(
+                f"jno.fem: `.bounds(lo, hi)` together with a {kind} whose elimination is WEIGHTED (a "
+                "non-matching mortar or collocated interface, a hanging node, a slip condition, or an "
+                "antiperiodic / Bloch phase). The box is imposed on the kept unknowns, and there it does "
+                "not bound an eliminated value that is a combination of them. Make the tied interface "
+                "conforming (`jno.shape.regions(..., conforming=True)`), or drop one of the two."
+            )
+        idx = np.asarray(P.indices)
+        main[int(off_f[i]) + idx[:, 0]] = int(off_r[i]) + idx[:, 1]
+    lo, hi = fem_obj._resolve_bounds(jnp.zeros((int(fem_obj.dofs),)))
+    for side, full in (("lower", np.asarray(lo)), ("upper", np.asarray(hi))):
+        kept = np.asarray(restrict_state_periodic(periodic, jnp.asarray(full)))
+        bad = np.flatnonzero(~np.isclose(full, kept[main], rtol=1e-12, atol=1e-12))
+        if bad.size:
+            d = int(bad[0])
+            raise ValueError(
+                f"jno.fem: the {side} bound of `.bounds(lo, hi)` differs across the {kind}: DOF {d} has "
+                f"{full[d]:.6g}, but the DOF it is tied to has {kept[main[d]]:.6g} ({bad.size} DOF(s) "
+                "disagree). The tie makes them ONE unknown, which cannot hold two bounds. Make the bound "
+                "periodic too (the same value on both tied faces), or drop the tie."
+            )
+
+
 def reduce_op_periodic(op: Any, mode: str, periodic: dict) -> Any:
     """Apply the periodic Galerkin reduction ``P`` to a FEM operator, recursing into composite ops.
 
@@ -6284,6 +6367,7 @@ def _fem_impl(
             # returned a centre value of 0.0194 against 0.0737, with the constraint reported as built.
             fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, _hp)
             fem_obj._periodic = _hp
+            _check_bounds_under_reduction(fem_obj, _hp, "hanging-node constraint")
             return _fuse_complex_steady(fem_obj)
         if not periodic_ties and not slip_bcs:
             return _fuse_complex_steady(fem_obj)
@@ -6394,6 +6478,9 @@ def _fem_impl(
         # ops are returned unchanged and reduce lazily in FEM.solve.
         fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
         fem_obj._periodic = periodic
+        _check_bounds_under_reduction(
+            fem_obj, periodic, "slip condition `n·u = 0`" if periodic.get("coupling") == "slip" else "periodic tie"
+        )
         return _fuse_complex_steady(fem_obj)
 
     def _finalize(fem_obj: "FEM") -> "FEM":
