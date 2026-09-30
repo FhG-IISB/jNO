@@ -110,7 +110,7 @@ already expressible with the slots on this page.
 
 **1. Solve in the subspace** rather than regressing into it. The A-orthogonal projection
 `U(UᵀAU)⁻¹Uᵀb` is the *provably best* starting point from `span(U)` — and it is exactly what
-[`fem.solve(basis=U)`](fem/inverse.md#reduced-order-solves-fembasisu) computes, certificate included.
+[`fem.solve(basis=U)`](fem/inverse.md#reduced-order-solves-femsolvebasisu) computes, certificate included.
 
 **2. Put the subspace in the preconditioner**, as a coarse-space correction
 `M⁻¹ = diag⁻¹ + U(UᵀAU)⁻¹Uᵀ` (Nicolaides, *SINUM* **24**(2), 1987, 355; Frank & Vuik, *SISC*
@@ -853,7 +853,7 @@ fem.solve(nonlinear=jno.solve.staggered([[v, p], [T]], direct=True), linear=jno.
 ```
 
 This is not a convenience. A velocity/pressure pair **cannot be swept apart**: the pressure block is the
-constraint block, with no diagonal of its own — the block [`jno.precond.saddle`](#saddle) locates
+constraint block, with no diagonal of its own — the block [`jno.precond.saddle`](#preconditioners) locates
 structurally — so "solve `p` with `v` frozen" is not a well-posed sub-problem. Any flow staggered
 against a solid or a temperature therefore has to group its Stokes pair. Measured on a three-field
 Stokes/temperature problem (`tests/test_fem_staggered_groups.py`): the grouped sweep lands on the
