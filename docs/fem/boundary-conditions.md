@@ -39,7 +39,9 @@ interior equations see the boundary's rate through the mass matrix, whose column
 kept. This holds on linear and **nonlinear** forms, single-field or **coupled** — so a ramped or
 pulsatile inflow, a moving lid, or a manufactured solution with exact time-dependent boundary values on
 Navier–Stokes is written the same way — and the march stays differentiable in the form's runtime
-parameters. Measured on the Taylor–Green vortex with the exact velocity imposed on all four walls
+parameters, a `jno.np.parameter` or a trainable net coefficient, single-field or coupled (a P2
+manufactured solution with `k` set at runtime is reproduced to 1e-8, identical to `k` written as a
+number). Measured on the Taylor–Green vortex with the exact velocity imposed on all four walls
 (`tests/test_fem_coupled_time_dirichlet.py`): BDF2 stays second order in time (2.3; with the data one
 step late it drops to 1.05, and at 16 steps is ~900× less accurate).
 
@@ -62,8 +64,7 @@ interior functional matches central differences to 1e-6.
 
 *Scope, all loud:* a trainable **net** inside a time-varying value, or a net/parameter-valued Dirichlet
 **beside** one on a transient form; a parameter inside the value on a second-order (`u_tt`) form or on
-the τ load path; a runtime parameter on a single-field form with such data; a nonlinear second-order
-(`u_tt`) form; a time-varying value on a non-matching tied interface (see
+the τ load path; a nonlinear second-order (`u_tt`) form; a time-varying value on a non-matching tied interface (see
 below). **Accuracy:** a time-varying boundary value costs Runge–Kutta-type schemes order — the classical
 *order reduction* from their low stage order (Ostermann & Roche, *Math. Comp.* 59 (1992) 403–420). See
 [the measured orders](limitations.md#the-detail).

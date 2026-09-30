@@ -23,6 +23,7 @@ Oracles:
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -456,6 +457,106 @@ def test_boundary_amplitude_is_recovered_through_jno_core():
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# single field: a runtime parameter (or trainable net) in the FORM beside g(x, t)
+# ---------------------------------------------------------------------------------------------------------------
+
+K0 = 2.5
+
+
+class _ConstNet(eqx.Module):
+    """A 'network' with one weight that outputs it at every point -- a trainable net coefficient whose value is
+    known, so the hard-coded form is its oracle."""
+
+    c: jnp.ndarray
+
+    def __call__(self, *args):
+        return jnp.broadcast_to(self.c.reshape(1, 1), (jnp.asarray(args[0]).shape[0], 1))
+
+
+def _parametric_single_field(k, nonlinear, net=False):
+    """``u = x^2 + y^2 + t`` solves ``u_t - k lap u (+ u^3) = f`` with ``f`` written for ``k = K0``. P2 represents
+    it exactly and every scheme integrates a linear-in-time solution exactly, so at ``k = K0`` the march is exact
+    to round-off -- with the wall value ``g = x^2 + y^2 + t`` imposed at the right time."""
+    d = jno.shape.rect(0, 0, 1, 1).structured(n=3).domain(time=(0.0, 0.2, 5))
+    u, v = d.fem_symbols(names=("u", "v"), order=2)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ue = xi * xi + yi * yi + ti
+    f = 1.0 - 4.0 * K0 + (ue**3 if nonlinear else 0.0)
+    kk = k(xi, yi) if net else k
+    form = ui.t * vi + kk * (ui.x * vi.x + ui.y * vi.y) + (ui**3 * vi if nonlinear else 0.0) - f * vi
+    return jno.fem([form, u(xb, yb) - (xb * xb + yb * yb + tb), u(ci[0], ci[1]) - (ci[0] ** 2 + ci[1] ** 2)])
+
+
+@pytest.mark.parametrize("coef", ["parameter", "net"])
+@pytest.mark.parametrize("nonlinear", [False, True], ids=["linear", "nonlinear"])
+def test_single_field_parametric_form_with_time_varying_dirichlet(nonlinear, coef):
+    """A single-field transient with a runtime parameter (or a trainable net) in the form AND g(x, t) data used to
+    refuse at build, although the coupled route already threaded it. Now: the runtime run equals the hard-coded
+    one, both equal the manufactured solution, and the coefficient really enters (k = 1 is visibly wrong)."""
+    if coef == "net":
+        k = jno.nn.wrap(_ConstNet(c=jnp.asarray(K0)))
+        k.dtype(jnp.float64)
+    else:
+        k = jno.np.reshape(jno.np.parameter((1,), name="k"), ())
+    fp = _parametric_single_field(k, nonlinear, net=coef == "net")
+    fh = _parametric_single_field(K0, nonlinear)
+    bp, bh = fp.operator, fh.operator
+    assert len(fp.offsets) == 2 and bp.is_nonlinear() == nonlinear
+    (name,) = bp.runtime_parameter_exprs
+    at = (lambda kv: {name: _ConstNet(c=jnp.asarray(kv))}) if coef == "net" else (lambda kv: {name: jnp.asarray([kv])})
+    save = jnp.linspace(bp.t0, bp.t1, 5)
+    pts = np.asarray(fp.points)
+    exact = (pts[:, 0] ** 2 + pts[:, 1] ** 2)[None, :] + np.asarray(save)[:, None]
+    for scheme in ("theta1", "bdf2", "sdirk3"):
+        yp = np.asarray(_march(bp, scheme, at(K0), save))
+        yh = np.asarray(_march(bh, scheme, {}, save))
+        assert np.abs(yp - yh).max() < 1e-9, f"{scheme}: runtime vs hard-coded {np.abs(yp - yh).max():.2e}"
+        assert np.abs(yp - exact).max() < 1e-8, f"{scheme}: vs exact {np.abs(yp - exact).max():.2e}"
+    off = np.abs(np.asarray(_march(bp, "bdf2", at(1.0), save)) - exact).max()
+    assert off > 0.1, f"k = 1 should miss the solution written for k = {K0}; off by only {off:.2e}"
+
+
+def test_single_field_nodal_field_parameter_with_time_varying_dirichlet():
+    """The third runtime coefficient kind, a nodal FIELD parameter ``k(x)``: set to a P1-representable field it
+    must march exactly what the same coordinate function written into the form does."""
+    save = None
+    out = []
+    for field in (True, False):
+        d = jno.shape.rect(0, 0, 1, 1).structured(n=4).domain(time=(0.0, 0.2, 5))
+        u, v = d.fem_symbols(names=("u", "v"))
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, tb = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        k = jno.np.parameter(v, name="kf") if field else 0.6 + 0.8 * xi + 0.5 * yi
+        fem = jno.fem(
+            [ui.t * vi + k * (ui.x * vi.x + ui.y * vi.y) - vi, u(xb, yb) - xb * sin(3.0 * tb), u(ci[0], ci[1]) - 0.0]
+        )
+        pts = np.asarray(fem.points)
+        args = {"kf": jnp.asarray(0.6 + 0.8 * pts[:, 0] + 0.5 * pts[:, 1])} if field else {}
+        save = jnp.linspace(fem.operator.t0, fem.operator.t1, 3)
+        out.append(np.asarray(_march(fem.operator, "bdf2", args, save)))
+    assert np.abs(out[1]).max() > 0.1 and np.abs(out[0] - out[1]).max() < 1e-12
+
+
+def test_single_field_parametric_gradient_with_time_varying_dirichlet():
+    """Reverse mode w.r.t. the form's parameter through a single-field nonlinear march with g(x, t) data."""
+    k = jno.np.reshape(jno.np.parameter((1,), name="k"), ())
+    bp = _parametric_single_field(k, True).operator
+    save = jnp.linspace(bp.t0, bp.t1, 3)
+
+    def loss(kv):
+        return jnp.sum(_march(bp, "bdf2", {"k": jnp.reshape(kv, (1,))}, save)[-1] ** 2)
+
+    gr, fd = float(jax.grad(loss)(1.3)), float((loss(1.3 + 1e-6) - loss(1.3 - 1e-6)) / 2e-6)
+    assert abs(gr) > 1e-3
+    np.testing.assert_allclose(gr, fd, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # what still refuses
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -485,9 +586,9 @@ def test_refusals_name_the_combination():
     fem = jno.fem(weak + [u(xb, yb) - tb, w(xb, yb) - 0.0] + ics)
     assert fem.is_transient and not fem.is_linear
 
-    # single field: nonlinear + time-varying Dirichlet builds; a runtime parameter in the form still refuses
+    # single field: nonlinear + time-varying Dirichlet builds, and so does a runtime parameter in the form
     k = jno.np.reshape(jno.np.parameter((1,), name="kk"), ())
     base = [u(xb, yb) - tb, u(ci[0], ci[1]) - 0.0]
     assert not jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y + ui**3 * vi] + base).is_linear
-    with pytest.raises(NotImplementedError, match="without a runtime parameter"):
-        jno.fem([ui.t * vi + k * (ui.x * vi.x + ui.y * vi.y) + ui**3 * vi] + base)
+    fk = jno.fem([ui.t * vi + k * (ui.x * vi.x + ui.y * vi.y) + ui**3 * vi] + base)
+    assert "kk" in fk.operator.runtime_parameter_exprs

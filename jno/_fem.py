@@ -6982,10 +6982,9 @@ def _fem_impl(
         )
 
     # ---- native Lagrange (single field): the standard fast path. Covers 2D triangle and 3D tet (incl.
-    # Neumann/Robin surfaces), steady (incl. runtime-scalar-parametric) and transient (constant
-    # Dirichlet + a time-dependent source). complex / VPINN / field-param / time-varying-Dirichlet /
-    # transient-parametric / vector-or-parametric-periodic fall through to the specialized branches
-    # below. ----
+    # Neumann/Robin surfaces), steady and transient, runtime-parametric or not, with constant or
+    # time-varying g(x, t) Dirichlet data and a time-dependent source. complex / VPINN / transient-periodic
+    # fall through to the specialized branches below. ----
     from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
 
     # Native periodic is wired for the STEADY single-field case that ``_finalize`` reduces -- scalar or
@@ -7001,36 +7000,26 @@ def _fem_impl(
         and not _is_complex_form(domain, ir)
         and _native_periodic_ok
     ):
-        _native_now = True
-        if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-            # native transient covers a runtime SCALAR parameter and a single-field nodal FIELD
-            # parameter k(x). A time-varying Dirichlet g(x,t) routes native for the non-parametric
-            # transient, linear (row replacement + the per-step Dirichlet lift in the forcing) or nonlinear
-            # (the same row replacement in the residual, read at the step's time); combined with a runtime
-            # parameter it is rejected below.
-            from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs as _cnce
+        # A time-varying Dirichlet g(x, t) routes native on every first-order transient, parametric or not:
+        # the row replacement (linear: the per-step Dirichlet lift in the forcing; nonlinear: u[d] - g(x_d, t)
+        # in the residual) is the same code the coupled route runs, re-assembled branch included. It used
+        # to be refused here with a runtime parameter or a trainable net in the form, after the coupled route
+        # had already been taught to thread it.
+        from .utils.solver.fem_native import assemble_fem_native
 
-            _native_now = (
-                not any(_crp(b) for b in weak_bares)
-                # tv-Dirichlet g(x,t) + a TRAINABLE net: rejected below (frozen nets stay native)
-                and not any(_cnce(b) for b in weak_bares)
-            )
-        if _native_now:
-            from .utils.solver.fem_native import assemble_fem_native
-
-            domain._fem_problem = None  # native owns this domain's FE state
-            op, mode, offs = assemble_fem_native(
-                domain,
-                volume_terms,
-                boundary_terms,
-                dirichlet_raw,
-                ic_residuals,
-                vec=vec or 1,
-                quad_degree=quad_degree,
-                evolution=_evolution,
-                bounded=bool(_bounds),
-            )
-            return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+        domain._fem_problem = None  # native owns this domain's FE state
+        op, mode, offs = assemble_fem_native(
+            domain,
+            volume_terms,
+            boundary_terms,
+            dirichlet_raw,
+            ic_residuals,
+            vec=vec or 1,
+            quad_degree=quad_degree,
+            evolution=_evolution,
+            bounded=bool(_bounds),
+        )
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 
     # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively.
     # ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so wrapping each term in ``.real`` /
@@ -7429,12 +7418,6 @@ def _fem_impl(
             f"nonlinear={_nonlinear}, parametric+steady={_parametric and not is_transient}. A STEADY "
             "vector tie is supported — drop the time derivative, write the field as a scalar, or drop "
             "the periodic tie."
-        )
-    if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-        raise NotImplementedError(
-            "jno.fem: a time-varying Dirichlet g(x, t) on a single-field transient form is supported natively "
-            f"only without a runtime parameter or trainable network (got nonlinear={_nonlinear}, "
-            f"parametric={_parametric}). Remove the runtime parameter, or fix the Dirichlet value in time."
         )
     raise NotImplementedError(
         "jno.fem: this single-field weak form is not handled by the native assembler. Please report the "

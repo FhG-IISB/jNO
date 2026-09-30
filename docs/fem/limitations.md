@@ -30,7 +30,7 @@ path is unaffected.
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
-| Time-varying Dirichlet `g(x, t)` | first-order transients, linear or nonlinear, single-field or coupled, a trainable **parameter** inside the value included (differentiable); not a trainable net inside the value, nor a net/parameter-valued Dirichlet beside it, not a parameter inside it on a `u_tt` form or the τ load path, not a runtime parameter on a single-field form, not a nonlinear `u_tt` form. `sdirk(3)` and `ros2` lose some order to it, and `ros2` holds the wall value only to its order (measured below) | raises |
+| Time-varying Dirichlet `g(x, t)` | first-order transients, linear or nonlinear, single-field or coupled, a trainable **parameter** inside the value included (differentiable); not a trainable net inside the value, nor a net/parameter-valued Dirichlet beside it, not a parameter inside it on a `u_tt` form or the τ load path, not a nonlinear `u_tt` form. `sdirk(3)` and `ros2` lose some order to it, and `ros2` holds the wall value only to its order (measured below) | raises |
 | Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
