@@ -107,8 +107,10 @@ path is unaffected.
 ??? note "Plasticity — what runs today"
     Deformation theory (monotonic / proportional) and the path-dependent flow-theory **`tau=`
     load-path march** both run. The march assembles on the real, steady native-Lagrange path,
-    **single-field or coupled** — not transient / complex / 1-D / non-nodal / periodic, each rejected
-    with a clear error.
+    **single-field or coupled** — not transient / complex / 1-D / non-nodal, each rejected with a
+    clear error. Periodic ties, exact slip conditions and hanging-node constraints compose (each step
+    solves in the reduced space `u = P ũ`); with one of them, `tau=jno.solve.arclength(...)` and
+    `.bounds(...)` refuse by name.
 
     An internal state advances on every cell by default; `state.evolves(formula, region="strip")`
     restricts it to one region, and outside it the state is **frozen** at the value it already has —

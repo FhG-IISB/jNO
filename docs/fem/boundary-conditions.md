@@ -194,7 +194,8 @@ partition of unity, so summing the weak term `F·φ` over every DOF is the same 
 A term that names two boundary regions and carries no test function is a **tie**: it identifies the
 DOFs on region `A` with those on region `B`. It is enforced by algebraic reduction (a prolongation
 `P` that eliminates the `A` DOFs), not by assembly, so it composes with everything downstream —
-complex, transient, Bloch (`u(A) - c*u(B)`), and `basis=` all reuse the same `P`.
+complex, transient, Bloch (`u(A) - c*u(B)`), `basis=`, and the `domain(tau=...)` load-path march all
+reuse the same `P`.
 
 ```python
 d.tag("left",  lambda x, y: x < 1e-9)      # a tag predicate includes the corner nodes,
@@ -271,6 +272,21 @@ fem = jno.fem([mech,
 
     A **time-varying** essential value on a polluted interface row is refused by name: its held value is
     written into the full row every step and there is no constant to put back.
+
+!!! measured "A tie on a load-path march — applied at every step"
+    A form that reads step history (`u.i(-1)`, or a `state.evolves(...)` update) marches over a
+    `domain(tau=...)` grid, and that march used to hand Newton the **full** residual: the tie was dropped
+    without a word. A backward-Euler heat step written by hand, periodic in x, came back bit-identical to
+    the same form with *no* condition on the tied faces (natural Neumann) — 30% of max|u| off the `u.t`
+    reference. The exact slip condition `n·u = 0` and the hanging-node constraint ride the same `P` and
+    were dropped the same way (a wall velocity of full magnitude; 29% of max|u| on a hanging node).
+
+    Each step now solves `Pᵀ r(P ũ) = 0` and the march carries `u = P ũ`, so the history buffers and every
+    `.evolves` update are computed from a field that satisfies the tie. The same hand-written step matches
+    the `u.t` march with `time=jno.solve.theta(1.0)` to ~1e-10 relative, single-field and coupled, with the
+    seam values equal exactly. Pinned in `tests/test_fem_history_march_periodic.py`.
+    `tau=jno.solve.arclength(...)` and `.bounds(...)` do not solve in the reduced space and refuse such a
+    form by name.
 
 ### The tangential companion — `u.slide`
 

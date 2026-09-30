@@ -2863,7 +2863,9 @@ class FEM:
         # history buffers (``.i(k)`` in the form) and the domain a ``tau=`` pseudo-time grid. March the
         # grid, threading τ as the load coordinate and the per-QP internal state on ``args["__history__"]``;
         # each step solves equilibrium then advances the states via their ``.evolves`` readout. Triggered
-        # with NOTHING passed — exactly as ``u.t`` triggers the transient stepper. ----
+        # with NOTHING passed — exactly as ``u.t`` triggers the transient stepper. A reduction on
+        # ``self._periodic`` (periodic tie / slip / hanging nodes) is applied per step INSIDE the march,
+        # which is why this dispatch sits above the reduced steady-nonlinear branch below. ----
         if getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None):
             if not getattr(self.domain, "_is_pseudo_time", False):
                 raise ValueError(
@@ -6094,16 +6096,15 @@ def _fem_impl(
     # displacement field's energy history is the same march as one-field plasticity. Reject the
     # structurally-incompatible routes up front — fail loud, never a silently dropped update.
     # (transient / complex are rejected below, once the IR reveals them.)
+    # A periodic tie composes: the march solves each step in the tie's reduced space and the readout
+    # evaluates the evolution formula on the prolonged (tie-satisfying) solution.
     if _evolution and (
-        is_vpinn
-        or getattr(domain, "dimension", None) == 1
-        or (_trial_spaces(constraints) - _NATIVE_SPACES)
-        or periodic_ties
+        is_vpinn or getattr(domain, "dimension", None) == 1 or (_trial_spaces(constraints) - _NATIVE_SPACES)
     ):
         raise NotImplementedError(
             "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, "
             "native-Lagrange path only (the load-path march over `domain(tau=...)`), single-field or "
-            "coupled. Not yet: VPINN, 1D, non-nodal (Argyris/Morley/edge) elements, or periodic ties."
+            "coupled. Not yet: VPINN, 1D, or non-nodal (Argyris/Morley/edge) elements."
         )
 
     # The transient route reduces M/A from the assembly context at *assembly* time, so its P must be

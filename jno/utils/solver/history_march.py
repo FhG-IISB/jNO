@@ -19,6 +19,11 @@ block vector and the buffers are indexed by cell, so a state written by one fiel
 phase-field history coupling damage to displacement) marches identically. A state advances on every cell
 unless its update names a region -- ``state.evolves(formula, region=...)`` masks the readout, freezing the
 state outside that region at the value it already has.
+
+A constraint that ``jno.fem`` eliminates rather than assembles -- a periodic tie ``u(A) - u(B)``, an exact
+slip condition ``n·u = 0``, a hanging-node constraint -- is applied here the way the steady nonlinear solve
+applies it: each step root-finds ``Pᵀ r(P ũ) = 0`` for the reduced unknowns and prolongs ``u = P ũ``. The
+arc-length leg and a ``.bounds(...)`` box do not reduce, and refuse such a form by name.
 """
 
 import functools
@@ -89,6 +94,62 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             )
         path_frames[_fid] = _fr
 
+    # ---- the constraint REDUCTION ``u = P ũ`` (periodic ties, exact slip ``n·u = 0``, hanging nodes) ----
+    # None of these is assembled: ``jno.fem`` records them as a prolongation on ``fem._periodic``, and a
+    # solve that does not apply it solves the UNCONSTRAINED problem. This march used to hand Newton the
+    # full residual, so a periodic tie was dropped without a word -- a periodic backward-Euler heat march
+    # came back bit-identical to the same form with a natural (Neumann) condition on the tied faces
+    # (max error 30% of max|u| against the `u.t` reference). Each step now solves ``Pᵀ r(P ũ) = 0`` for
+    # ``ũ`` and prolongs, exactly as the steady nonlinear solve does. The carry, the history buffers and
+    # the returned trajectory stay in the FULL space: the readout interpolates ``u`` at every cell's
+    # quadrature points, and ``P ũ`` satisfies the constraint there by construction.
+    periodic = getattr(fem, "_periodic", None)
+    if periodic is not None:
+        _refuse_unreduced_routes(fem, path)
+
+    def _identity(x):
+        return x
+
+    def _reduced(res, jac, pargs):
+        """``(res, jac, restrict, prolong)`` for ONE step's root-find, in the space the solve runs in.
+
+        Unconstrained: the step's own closures and two identities, so the march is unchanged. Reduced:
+        ``Pᵀ r(P ũ)`` and ``Pᵀ J P``, with the prescribed rows that ``Pᵀ`` sums into a tie target put
+        back (the helper every reduced solve path shares), and ``P`` rebuilt for this solve's runtime
+        coordinates when a slip surface moves with them."""
+        if periodic is None:
+            return res, jac, _identity, _identity
+        from .fem_utils import (
+            prolong_periodic,
+            reduce_matrix_periodic,
+            reduce_vector_periodic,
+            restrict_state_periodic,
+            wrap_reduced_dirichlet,
+        )
+        from .slip_runtime import bind_periodic
+
+        pb = bind_periodic(periodic, pargs)
+
+        def _prolong(ur):
+            return jnp.asarray(prolong_periodic(pb, ur)).reshape(-1)
+
+        def _restrict(u):
+            # A gather of the kept DOFs: exact on the range of P (every P here has identity kept rows),
+            # which is where every state this march carries lives.
+            return jnp.asarray(restrict_state_periodic(pb, u)).reshape(-1)
+
+        def r_free(ur):
+            return reduce_vector_periodic(pb, jnp.asarray(res(_prolong(ur))).reshape(-1))
+
+        j_free = None
+        if jac is not None:
+
+            def j_free(ur):
+                return reduce_matrix_periodic(pb, jac(_prolong(ur)))
+
+        r_red, j_red = wrap_reduced_dirichlet(pb, r_free, j_free)
+        return r_red, j_red, _restrict, _prolong
+
     def _newton(res, u_prev, jac=None):
         if solve_fn is not None:
             # A sparse-direct driver (``newton(direct=True)`` / ``staggered(direct=True)``) flags
@@ -102,13 +163,20 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
 
         return newton_default(res, u_prev, jacobian=jac)
 
-    def _root_of(res, u_prev):
+    def _root_of(res, u_prev, pargs=None):
         """``(root_fn, start)`` — the function ``_newton`` above actually drives to zero, and from where.
 
         Usually just ``(res, u_prev)``. A box-constrained form (``field.bounds(lo, hi)``) is different:
         its driver root-finds the **min-map** ``Phi``, not ``res``, and on an active bound ``res`` is
         non-zero *by construction*. Asking the wrapper for its own root function is what lets the
-        convergence check below score the step against the right thing."""
+        convergence check below score the step against the right thing.
+
+        A reduced system (``fem._periodic``) is different in the same way: the driver zeroes ``Pᵀ r``,
+        and the full ``r`` keeps the tie's reaction on the eliminated rows however well the step
+        converged. ``root_fn`` still takes a FULL state (the march's carry), restricting it first."""
+        if periodic is not None:
+            r_red, _j, restrict, _p = _reduced(res, None, pargs or {})
+            return (lambda u: r_red(restrict(u))), u_prev
         prep = getattr(solve_fn, "prepare_residual", None)
         return prep(res, u_prev) if prep is not None else (res, u_prev)
 
@@ -130,7 +198,9 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             if getattr(op, "jacobian", None) is not None and not matrix_free
             else None
         )
-        u = _newton(lambda u: op.residual(u, args, tau_k), u_prev, _jac)
+        # On a reduced system the root-find runs on ũ and returns u = P ũ (identities otherwise).
+        _r, _j, _restrict, _prolong = _reduced(lambda u: op.residual(u, args, tau_k), _jac, param_args)
+        u = _prolong(_newton(_r, _restrict(u_prev), _j))
         # Advance every buffered state: volume states via their `.evolves` formula / a primary-unknown
         # history; surface states (a friction slip) via the surface readout on the region's faces.
         new_states = readout(u, tau_k, args)
@@ -162,7 +232,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             # against a whole Newton solve: measured at 2.4% (30.30 s -> 31.03 s, median of 3) on an
             # 8-step, 576-DOF Yeoh phase-field march.
             args = {"__history__": buffers, "__surface_history__": sbuffers, "__loadpath__": path_k, **param_args}
-            root_fn, u_ref = _root_of(lambda uu: op.residual(uu, args, tau_k), u_prev)
+            root_fn, u_ref = _root_of(lambda uu: op.residual(uu, args, tau_k), u_prev, param_args)
             r_end = jnp.linalg.norm(jnp.asarray(root_fn(u)))
             r_start = jnp.linalg.norm(jnp.asarray(root_fn(u_ref)))
             return (u, new_buffers, new_sbuffers), (u, r_end, r_start)
@@ -441,6 +511,31 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
     return FunctionCall(lambda *values: _march(dict(zip(names, values))), params, name="fem_history_march")
 
 
+def _refuse_unreduced_routes(fem, path):
+    """Refuse the load-path legs that do not (yet) solve in a constraint's reduced space.
+
+    The fixed-grid march, an explicit ``tau=<schedule>``, the adaptive pilot and the per-step contact
+    loop all take their steps through ``_step_once``, which reduces. These two do not, and running them
+    on the full residual would drop the tie / slip / hanging-node constraint in silence."""
+    kind = "slip condition `n·u = 0`" if (fem._periodic or {}).get("coupling") == "slip" else "periodic tie"
+    if getattr(fem.domain, "_fem_hanging_nodes", None):
+        kind = "hanging-node constraint"
+    if _is_arclength(path):
+        raise NotImplementedError(
+            f"fem.solve(tau=jno.solve.arclength(...)) on a form with a {kind}: arc-length solves a "
+            "bordered system for (u, load factor) that is not wired to the constraint's reduced space "
+            "u = P ũ, so the constraint would be dropped. March the declared `domain(tau=...)` grid "
+            "(or tau=jno.solve.adaptive(limit=...)), which does apply it."
+        )
+    if getattr(fem, "_bound_specs", None):
+        raise NotImplementedError(
+            f"jno.fem: `.bounds(lo, hi)` together with a {kind} on a `domain(tau=...)` march is not "
+            "supported. The box is stated on the full DOF vector, while the constrained march solves for "
+            "the reduced unknowns u = P ũ; the min-map would have to be restricted to the kept DOFs, "
+            "which is not implemented. Drop one of the two."
+        )
+
+
 def _is_arclength(path):
     """Is ``tau=`` an arc-length spec? Checked BEFORE :func:`_is_explicit_schedule`, which keys on the
     absence of ``.limit`` and would otherwise try to read the spec as an array of tau values."""
@@ -705,7 +800,7 @@ def _pilot_schedule(
         died at τ=0 with the limit satisfied (overshoot ×0)."""
         args = {"__history__": bufs, "__surface_history__": sbufs, "__loadpath__": {}, **pargs}
         _res = lambda uu: op.residual(uu, args, tau_k)  # noqa: E731
-        root_fn, u_ref = root_of(_res, u_prev)
+        root_fn, u_ref = root_of(_res, u_prev, pargs)
         r_before = jnp.linalg.norm(jnp.asarray(root_fn(u_ref)))
         u, nb, nsb = step_once(u_prev, bufs, sbufs, tau_k, {}, pargs)
         r_after = jnp.linalg.norm(jnp.asarray(root_fn(u)))
@@ -718,7 +813,7 @@ def _pilot_schedule(
     max_steps = int(path.max_steps)
 
     _rtol_a, _atol_a = getattr(solve_fn, "tolerances", None) or _MARCH_FALLBACK_TOL
-    root_of = root_of if root_of is not None else (lambda res, up: (res, up))
+    root_of = root_of if root_of is not None else (lambda res, up, pargs=None: (res, up))
 
     def _accept_bound(r_before):
         """How small ``||r_after||`` must be for a trial step to count as solved.
