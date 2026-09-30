@@ -4821,6 +4821,9 @@ def assemble_fem_native(
                     metadata={
                         **({"prev_state_slices": prev_state_slices} if _nonlinear_mass else {}),
                         **({"derived_specs": derived_specs} if derived_specs else {}),
+                        # The tangent's sparsity pattern can change during the march (a reconnection, a contact
+                        # re-pairing): no host-side merge plan may be built on it (`_plan_step_tangent_merge`).
+                        "pattern_moves": bool(dynamic_topology or _gap_tables),
                     },
                     **common,
                 ),

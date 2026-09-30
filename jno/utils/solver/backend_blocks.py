@@ -300,6 +300,9 @@ class SemidiscreteTimeBlock:
 
     # optional hints
     forcing_mode: str = "none"
+    #: Host-side merge plan for the step tangent ``J + M/dt`` (see ``solver_api._plan_step_tangent_merge``):
+    #: set once, eagerly, before a march is traced; ``None`` keeps the unplanned (concatenated) operator.
+    step_merge_plan: Any = None
 
     def is_linear(self) -> bool:
         """
@@ -399,6 +402,10 @@ class SemidiscreteTimeBlock:
         if self.is_nonlinear():
             from .newton_krylov import newton_default, newton_krylov
 
+            # The step tangent's host merge plan, unless this evaluation hands the assembler a runtime
+            # topology (a reconnecting march): its pattern is then not the one the plan was built on.
+            _merge_plan = None if (args and "__topology__" in args) else self.step_merge_plan
+
             # θ-method: M(y⁺−y)/dt + θ R(y⁺) + (1−θ) R(y) = 0. θ=1 (default) is backward Euler — the
             # existing first-order behaviour; a second-order (u_tt) block sets θ=½ (trapezoidal /
             # Newmark average-acceleration) so an undamped nonlinear wave is not spuriously damped.
@@ -440,7 +447,10 @@ class SemidiscreteTimeBlock:
                         def jac_step(wn):
                             # J = J_spatial(wn) + (1/dt)·J_mass(wn); both assembled BCOO (exact ∂M/∂u).
                             return _add_step_operator(
-                                self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
+                                self.jacobian(wn, t_next, args),
+                                self.mass_residual_jac(wn, t_next, _ap),
+                                1.0 / dt,
+                                plan=_merge_plan,
                             )
 
                         return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
@@ -451,7 +461,10 @@ class SemidiscreteTimeBlock:
 
                     def jac_default(wn):
                         return _add_step_operator(
-                            self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
+                            self.jacobian(wn, t_next, args),
+                            self.mass_residual_jac(wn, t_next, _ap),
+                            1.0 / dt,
+                            plan=_merge_plan,
                         )
 
                     return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
@@ -479,7 +492,7 @@ class SemidiscreteTimeBlock:
 
                     def jac_step(wn):  # ∂G/∂wn = M/dt + diag(w)·J_R; it used to drop the θ, a wrong tangent for θ < 1
                         J = self.jacobian(wn, t_next, args)
-                        return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt)
+                        return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
                     return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
                 return _verdict(G, u, nonlinear_solve(G, u), report)
@@ -489,7 +502,7 @@ class SemidiscreteTimeBlock:
 
                 def jac_default(wn):  # the same ∂G/∂wn = M/dt + diag(w)·J_R as `jac_step`
                     J = self.jacobian(wn, t_next, args)
-                    return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt)
+                    return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
                 return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
             return _verdict(G, u, newton_krylov(G, u), report)

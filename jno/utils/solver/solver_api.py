@@ -1660,7 +1660,7 @@ def _refuse_a_useless_applier(applier, A, name, *, single_leaf, where="march"):
     )
 
 
-def _add_step_operator(M, A, scale):
+def _add_step_operator(M, A, scale, plan=None):
     """Form the theta-step operator ``M + scale * A`` once, eagerly.
 
     Both BCOO: concatenate triplets (duplicates are legal COO — every consumer sums them:
@@ -1676,13 +1676,97 @@ def _add_step_operator(M, A, scale):
     if hasattr(M, "todense") and hasattr(A, "todense"):
         import jax.experimental.sparse as jsp
 
-        from .fem_utils import sum_duplicate_triplets
+        from .fem_utils import compress_plan, sum_duplicate_triplets
 
         data = jnp.concatenate([M.data, scale * A.data])
+        if plan is not None and (int(M.nse), int(A.nse), tuple(M.shape)) == plan[1]:
+            # Planned, host-side, before the march was traced (`_plan_step_tangent_merge`): an O(nnz) scatter
+            # into the sorted, duplicate-free union pattern, flagged as such so the CSR conversion does not
+            # sort it again. The flags are static pytree data, so they survive the closure conversion a
+            # Newton driver applies to the tangent -- where the indices themselves become tracers.
+            (idx, inverse, nse), _sig = plan
+            return jsp.BCOO(
+                (jax.ops.segment_sum(data, inverse, num_segments=nse), idx),
+                shape=M.shape,
+                indices_sorted=True,
+                unique_indices=True,
+            )
+        if not isinstance(M.indices, jax.core.Tracer) and not isinstance(A.indices, jax.core.Tracer):
+            # The PATTERN is concrete even when the values are traced (a march builds its step tangent under
+            # `backend_blocks._concrete_pattern`), so the merge is decided once, host-side -- `compress_plan`,
+            # content-cached -- and applied as an O(nnz) scatter into a sorted, duplicate-free pattern. Without
+            # it the step operator kept every triplet of both operands (M and A overlap almost entirely) and
+            # the CSR conversion argsorted them on every Newton iteration: 6.15M triplets and ~300 MiB of
+            # sort scratch on a 24^3 P1/P1 Navier-Stokes march.
+            plan = compress_plan(np.concatenate([np.asarray(M.indices), np.asarray(A.indices)], axis=0))
+            if plan is not None:
+                idx, inverse, nse = plan
+                return jsp.BCOO(
+                    (jax.ops.segment_sum(data, inverse, num_segments=nse), idx),
+                    shape=M.shape,
+                    indices_sorted=True,
+                    unique_indices=True,
+                )
         indices = jnp.concatenate([M.indices, A.indices], axis=0)
         return sum_duplicate_triplets(jsp.BCOO((data, indices), shape=M.shape))
     dense = lambda x: x.todense() if hasattr(x, "todense") else jnp.asarray(x)
     return dense(M) + scale * dense(A)
+
+
+def _plan_step_tangent_merge(block, state=None):
+    """Plan, host-side and once, how a nonlinear march merges its step tangent ``J + M/dt``.
+
+    ``SemidiscreteTimeBlock.step`` forms the tangent as ``_add_step_operator(J, M, 1/dt)`` inside the march's
+    trace, where every index array is a tracer: the merge could not be planned, so the operator reached the
+    linear solve as a raw concatenation of both operands (they overlap almost entirely) and the CSR
+    conversion ARGSORTED it on every Newton iteration. Measured on a 24^3 periodic P1/P1 Navier-Stokes
+    march: 6.15M raw triplets and ~300 MiB of sort scratch, the largest buffer of the compiled step.
+
+    The pattern is fixed by mesh and constraints, so it is read here from ONE eager evaluation of the same
+    two operands at the initial state, compressed once (``compress_plan``, content-cached), and stored on
+    the block. ``_add_step_operator`` applies it only when both operands arrive with the planned sizes.
+
+    Not planned -- the unplanned path stays, correct and as before -- when the pattern can move during the
+    march: a runtime topology (``metadata["pattern_moves"]``: reconnection, contact re-pairing), or when the
+    operands cannot be evaluated eagerly here.
+    """
+    from .fem_utils import compress_plan
+
+    meta = block.metadata or {}
+    if meta.get("pattern_moves") or block.jacobian is None or block.dt is None:
+        return None
+    at = block.state0 if state is None else state
+    if at is None:
+        return None
+    t0 = float(meta.get("t0", 0.0))
+    try:
+        J = block.jacobian(at, t0, None)
+        if block.mass is None:
+            if block.mass_residual_jac is None:
+                return None
+            _lp: dict = {}
+            _u0 = jnp.asarray(at).reshape(-1)
+            for _fid, _s0, _s1, _vec in meta.get("prev_state_slices", []):
+                _sl = _u0[_s0:_s1]
+                _lp[_fid] = _sl if _vec == 1 else _sl.reshape(-1, _vec)
+            S = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
+        else:
+            S = block.mass(t0, None)
+    except Exception:  # noqa: BLE001 -- an operand that needs runtime args: leave the march unplanned
+        return None
+    if not (hasattr(J, "indices") and hasattr(S, "indices")):
+        return None
+    if isinstance(J.indices, jax.core.Tracer) or isinstance(S.indices, jax.core.Tracer):
+        return None
+    plan = compress_plan(np.concatenate([np.asarray(J.indices), np.asarray(S.indices)], axis=0))
+    if plan is None:
+        return None
+    idx, inverse, nse = plan
+    # DEVICE arrays, made once: every consumer of the merged operator slices its indices
+    # (`A.indices[:, 0]`, validity masks), and on a NumPy array each slice is a fresh host array the trace
+    # captures as its own constant -- measured 6 copies of the pattern and 6 masks in one compiled march.
+    # A single device constant is sliced by staged ops instead, and captured once.
+    return (jnp.asarray(idx), jnp.asarray(inverse), int(nse)), (int(J.nse), int(S.nse), tuple(J.shape))
 
 
 def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None, state=None):
@@ -1713,6 +1797,8 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # BDF2 steps (the last of `step_scales`, which every step but the first uses).
         scales = tuple(scheme.step_scales(block)) if scheme is not None and hasattr(scheme, "step_scales") else ()
         precond = _freeze_precond_for_march(precond, fem, block, state, scale=scales[-1] if scales else None)
+        if block.step_merge_plan is None:
+            block.step_merge_plan = _plan_step_tangent_merge(block, state)
         if not linear_step:
             return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
         # A LINEARLY implicit scheme (Rosenbrock) solves linear systems with the stage matrix even on a
