@@ -4580,7 +4580,20 @@ def assemble_fem_native(
         else:
             row_dofs = tv_dofs if d_dofs is None else jnp.concatenate([d_dofs, tv_dofs])
 
-        def _zero_mass_rows(Mx, _d=d_dofs, _t=tv_dofs):
+        # The rows whose held value is re-formed from the runtime args -- a net- or parameter-valued Dirichlet
+        # `u(wall) - net(x)` / `u(wall) - g` -- are NOT in `d_dofs`: `_build_dirichlet_pairs` skips them so their
+        # value is never frozen. Anything that clears "the Dirichlet rows" from `d_dofs` alone therefore leaves
+        # theirs standing. The per-step parametric mass did exactly that: next to a trainable density
+        # `rho(x) u_t`, the wall row kept its mass and read `M_dd (u⁺ - u)/dt + u⁺ = g`, a condition softened into
+        # a relaxation (~0.1 off g after the first step, decaying), with nothing to flag it. This is the full
+        # set -- constant and args-dependent -- the branches below build for their own rows.
+        const_dofs = (
+            jnp.asarray([p[0] for p in _dirichlet_pairs_at(_dir_static_args())], dtype=jnp.int32)
+            if _dir_args_dependent
+            else d_dofs
+        )
+
+        def _zero_mass_rows(Mx, _d=const_dofs, _t=tv_dofs):
             """The mass with no time derivative on a constrained DOF.
 
             A constant condition zeroes its row AND column, as it always has. A time-varying one zeroes only
@@ -4640,8 +4653,9 @@ def assemble_fem_native(
                 return J if _d is None else bcoo_zero_rows(J, _d)
 
         # Parametric mass ``mass_fn(t, args)`` (unknown density net(x)*u_t): re-assemble M from args each
-        # step with the Dirichlet rows zeroed (a constrained DOF carries no time derivative; see
-        # `_zero_mass_rows` for the columns). ``None`` keeps the static ``M_bc`` for a non-parametric mass.
+        # step with EVERY Dirichlet row zeroed, args-dependent ones included (a constrained DOF carries no time
+        # derivative; see `const_dofs`, and `_zero_mass_rows` for the columns). ``None`` keeps the static
+        # ``M_bc`` for a non-parametric mass.
         def _mass_cb(t, args=None):
             return _zero_mass_rows(_mass_jac(zeros, t, args))
 
