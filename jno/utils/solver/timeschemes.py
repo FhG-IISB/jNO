@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 class _TimeScheme:
@@ -836,6 +837,57 @@ def adaptive_march(
     return out * poison
 
 
+def _refuse_what_the_mask_would_zero(Aop, mask, s0, forcings):
+    """Raise where holding every zero-mass DOF at 0 would be WRONG, instead of returning it.
+
+    The exponential integrator treats a zero-mass row as a homogeneous Dirichlet row and masks the DOF to
+    0. That is exact for ``u = 0`` on the wall and silently wrong for anything else. Measured on a 2-D heat
+    block before this guard: with ``u = 1`` on the wall the boundary came back 0, and with ``u = t`` the
+    whole field stayed 0 -- plausible numbers, no warning. The same mask would zero any other algebraic
+    unknown (a pressure row), whose value is not 0 either.
+
+    Two checks, both on concrete values (under ``jit``/``grad`` the values are tracers and cannot be
+    inspected, so a traced call relies on the eager call that precedes it):
+
+    * no zero-mass row may reference an unconstrained DOF -- a Dirichlet row, or the real/imaginary pair of
+      a fused complex one, qualifies; a pressure or flux row does not;
+    * the data on those rows -- the forcing, sampled at both ends of the window for a time-varying one --
+      must be zero. (An initial state that is non-zero on the wall is not refused: it is inconsistent with a
+      zero wall value, and every scheme overwrites it at the first step.)
+    """
+    arrays = [mask, s0, *forcings]
+    if any(isinstance(a, jax.core.Tracer) for a in arrays):
+        return
+    bnd = np.asarray(mask) < 0.5
+    if not bnd.any():
+        return
+    data = getattr(Aop, "data", None)
+    idx = getattr(Aop, "indices", None)
+    if data is not None and idx is not None and not isinstance(data, jax.core.Tracer):
+        rows, cols, vals = np.asarray(idx)[:, 0], np.asarray(idx)[:, 1], np.asarray(data)
+        # A zero-mass row may couple to other ZERO-MASS DOFs -- a fused complex Dirichlet row ties the real
+        # and imaginary halves of the same DOF -- because with zero data that subsystem is solved by 0.
+        # It must not reach an unconstrained DOF: that is an algebraic equation (a pressure row) whose
+        # solution is not 0.
+        coupled = bnd[rows] & ~bnd[cols] & (np.abs(vals) > 0)
+        if coupled.any():
+            raise NotImplementedError(
+                "jno.solve.exponential: this block has zero-mass rows that couple to other unknowns (an "
+                "algebraic constraint -- a pressure or a flux row -- not a plain Dirichlet row). The "
+                "exponential integrator holds every zero-mass DOF at 0, which would be wrong for them. Use "
+                "jno.solve.theta(...), bdf2() or sdirk(), which impose algebraic rows exactly."
+            )
+    for v in forcings:
+        v = np.asarray(v).reshape(-1)
+        scale = max(1.0, float(np.max(np.abs(v)))) if v.size else 1.0
+        if v.size and float(np.max(np.abs(v[bnd]))) > 1e-12 * scale:
+            raise NotImplementedError(
+                "jno.solve.exponential: a Dirichlet value on this block is NOT zero. The exponential "
+                "integrator holds every zero-mass DOF at 0, so it would silently return u = 0 there. Use jno.solve.theta(...), bdf2() or sdirk(), or write "
+                "the problem for w = u - g with a lifting g of the boundary data so the wall value is 0."
+            )
+
+
 def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     """Advance ``M u̇ + A u = f(t)`` per step via ``exp(-dt·M⁻¹A)``: exact for the homogeneous decay, with a
     ``φ₁`` weight for a constant source and a ``φ₂`` ramp weight (ETD2) for a time-varying one.
@@ -902,6 +954,7 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
 
     d = lumped_diagonal(Mop)  # Dirichlet DOFs carry NO mass (d=0) — algebraic (u=0), not ODEs
     mask = (d > 1e-12 * jnp.max(d)).astype(dtype)  # 1 interior / 0 boundary — a *multiply* (trace-safe)
+    _refuse_what_the_mask_would_zero(Aop, mask, s0, [c_aff] + ([_f_of(grid[0]), _f_of(grid[-1])] if _time_varying else []))
 
     def _consistent_m_solve():
         """A masked, Jacobi-preconditioned CG solve for ``M⁻¹·(mask·rhs)`` — used by the consistent-mass

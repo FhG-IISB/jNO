@@ -1851,7 +1851,13 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     exponential, with forcing carried exactly through an augmented generator (a ramp row for ETD2) — still
     matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable; time-varying
     **coefficients** ``M(t)``/``A(t)`` (a moving/parametric operator) or a nonlinear form → use
-    :func:`theta`."""
+    :func:`theta`.
+
+    **Walls must be homogeneous.** Every zero-mass DOF is held at 0, which is a Dirichlet row with
+    ``g = 0`` and nothing else. A non-zero or time-varying wall value, or an algebraic row that reaches an
+    unconstrained DOF (a pressure row), raises ``NotImplementedError`` rather than silently returning 0 there
+    (checked eagerly; a traced call relies on the eager one before it). Lift the boundary data
+    (``w = u - g``) or use :func:`theta`, :func:`bdf2` or :func:`sdirk`."""
     from .utils.solver.timeschemes import _ExponentialScheme
 
     return _ExponentialScheme(order, mass, symmetric)
