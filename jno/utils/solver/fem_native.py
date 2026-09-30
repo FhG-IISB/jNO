@@ -4650,7 +4650,7 @@ def assemble_fem_native(
         # X and ``du/dX`` is exactly ZERO. That is a wrong gradient with no symptom, not a missing feature.
         if runtime_parameter_tags or neural_param_names or _dir_args_dependent or _ic_net_models or _coord_specs:
             if _dir_args_dependent:
-                if getattr(domain, "_fem_native_dirichlet_tv", None):
+                if tv_dofs is not None:
                     raise NotImplementedError(
                         "jno.fem: a net-valued Dirichlet combined with a time-varying g(x, t) Dirichlet on a "
                         "transient form is not supported yet (the net value rides the forcing; the g(x, t) lift "
@@ -4664,9 +4664,14 @@ def assemble_fem_native(
 
                 def _dhold(args):  # held value on every Dirichlet dof (net entries live in the weights)
                     return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
+
+                M_bc = M if _dd is None else bcoo_zero_rows_cols(M, _dd)
             else:
-                _dd = d_dofs
-            M_bc = M if _dd is None else bcoo_zero_rows_cols(M, _dd)
+                # Constant AND time-varying rows. The time-varying ones used to be left out here -- `d_dofs`
+                # holds only the constant pairs -- so a runtime-parametric coupled transient marched its
+                # driven boundary as a free one: a plausible trajectory with the condition simply gone.
+                _dd = row_dofs
+                M_bc = _zero_mass_rows(M)  # time-varying rows keep their columns, as on every other path
             free_mask = jnp.ones((total,), dtype=zeros.dtype)
             if _dd is not None:
                 free_mask = free_mask.at[_dd].set(0.0)
@@ -4684,8 +4689,10 @@ def assemble_fem_native(
             else:
                 c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
 
-                def forcing_vector_fn(t, args=None, _mask=free_mask):
-                    return _mask * (-spatial_res(zeros, t, args))
+                def forcing_vector_fn(t, args=None, _mask=free_mask, _t=tv_dofs):
+                    f = _mask * (-spatial_res(zeros, t, args))
+                    # the time-varying held value, written onto its identity rows (the per-step Dirichlet lift)
+                    return f if _t is None else f.at[_t].set(_tv_hold(t).astype(f.dtype))
 
             return (
                 SemidiscreteTimeBlock(
