@@ -89,6 +89,12 @@ class _Spec:
     traceable = False
     key = None
     complex_ok = False  # conservative: a consumer reformulates unless the spec says it takes complex
+    #: Does :meth:`materialize` run a HOST-side setup that needs a CONCRETE matrix (pyamg, scipy, PETSc)?
+    #: Narrower than ``not traceable``: a ``form``/``lsc``/``chebyshev`` is not traceable, yet materializes
+    #: inside a traced Newton loop from what it assembled eagerly. A spec that says True cannot, and a steady
+    #: nonlinear solve builds it once, eagerly, from the tangent at the initial guess
+    #: (``solver_api._freeze_precond_for_newton``). Containers answer for their children.
+    host_setup = False
     #: Build and apply in single precision (see :func:`_materialize_in_float32`). Set by every constructor's
     #: ``float32=`` flag; part of the spec's value identity, so a float32 and a float64 spec never share a
     #: compiled program.
@@ -190,6 +196,10 @@ class _Combination(_Spec):
                 raise TypeError(f"jno.precond: cannot combine a preconditioner spec with {type(side).__name__}.")
         self.left, self.right = left, right
 
+    @property
+    def host_setup(self):
+        return bool(getattr(self.left, "host_setup", False) or getattr(self.right, "host_setup", False))
+
     def prepare(self, fem):
         for side in (self.left, self.right):
             if hasattr(side, "prepare"):
@@ -286,6 +296,10 @@ class _RealEquivalent(_Spec):
 
     def __init__(self, inner):
         self.inner = inner
+
+    @property
+    def host_setup(self):
+        return bool(getattr(self.inner, "host_setup", False))
 
     def prepare(self, fem):
         # Deliberately does NOT forward to the inner spec. `prepare` is where a spec may eagerly
@@ -467,6 +481,7 @@ class _Hypre(_Spec):
     """Spec for a hypre preconditioner reached through PETSc; see :func:`hypre`."""
 
     traceable = False  # PETSc assembles on the host from a concrete matrix
+    host_setup = True
     complex_ok = False  # hypre's AMS/BoomerAMG are real-only
 
     def __init__(self, kind, options):
@@ -597,6 +612,7 @@ class _ILU(_Spec):
     """Spec for an incomplete-LU preconditioner; see :func:`ilu`."""
 
     traceable = False  # scipy factorises on the host from a concrete matrix
+    host_setup = True
     complex_ok = True  # SuperLU's ILU is complex-capable
     # ...and it must see the COMPLEX operator, not the fused real 2n block. In [[K,-M],[M,K]] the
     # diagonal is K's, and for the standard (symmetrised) A-V system K's scalar-potential rows are
@@ -1153,6 +1169,10 @@ class _BlockDiag(_Spec):
         self.pairs = pairs
 
     @property
+    def host_setup(self):
+        return any(getattr(spec, "host_setup", False) for _f, spec in self.pairs)
+
+    @property
     def complex_native(self):
         """A block composition is complex-native iff any child is (i.e. contains AMS).
 
@@ -1198,6 +1218,10 @@ class _BlockDiag(_Spec):
 class _Triangular(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
+
+    @property
+    def host_setup(self):
+        return any(getattr(spec, "host_setup", False) for _f, spec in self.pairs)
 
     @property
     def complex_native(self):
@@ -1941,6 +1965,10 @@ class _Saddle(_Spec):
         self.schur = schur
         self._resolved = None
 
+    @property
+    def host_setup(self):  # its momentum blocks are amg(); unresolved, that is all it can say
+        return True if self._resolved is None else self._resolved.host_setup
+
     def _compose(self, fem):
         """The ``triangular`` composition this spec stands for, built once against ``fem``."""
         if self._resolved is not None:
@@ -2152,6 +2180,10 @@ class _AMG(_Spec):
         return self._levels is not None
 
     @property
+    def host_setup(self):  # unbuilt, `materialize` runs pyamg on the operator it is handed
+        return self._levels is None
+
+    @property
     def key(self):
         """Value identity for the compiled slot path. The hierarchy is the compilation: two specs
         share a program only if they apply the *same* levels the same number of times. ``self``
@@ -2227,7 +2259,9 @@ def amg(
     over a sweep / Newton loop / inverse solve, say so: ``jno.precond.amg().cached()``. Inside a
     **traced** context (jit, vmap, a parametric inverse) pyamg cannot run under the trace, so build
     once eagerly first — ``spec.build(fem.A)`` — and the frozen hierarchy is reused (a legitimate
-    preconditioner while values drift: speed degrades gracefully, correctness never). pyamg is
+    preconditioner while values drift: speed degrades gracefully, correctness never). A nonlinear
+    ``fem.solve`` does that itself: a steady Newton builds the hierarchy once from the tangent at the
+    initial guess, a march from the step tangent at the initial state. pyamg is
     imported lazily — without it a clear ``ImportError`` explains the install. On a matvec-only
     sub-block the matrix is recovered via the (dense) block view.
 
@@ -2865,6 +2899,10 @@ class _Cached(_Spec):
         return self.refresh is False and self._applier is not None
 
     @property
+    def host_setup(self):  # a frozen cache that has built does no setup; otherwise the inner spec decides
+        return not self.traceable and bool(getattr(self.spec, "host_setup", False))
+
+    @property
     def key(self):
         """The stored applier IS the compilation, so its identity is the key. ``self`` holds it, so the
         ``id`` cannot be recycled while this spec is alive."""
@@ -2947,6 +2985,10 @@ class _FSAI(_Spec):
     @property
     def traceable(self):  # once the pattern exists, the numeric phase is pure JAX
         return self._pattern is not None
+
+    @property
+    def host_setup(self):  # the symbolic phase reads a concrete operator's pattern on the host
+        return self._pattern is None
 
     @property
     def key(self):
@@ -3065,6 +3107,10 @@ class _Schwarz(_Spec):
     @property
     def traceable(self):
         return self._pattern is not None
+
+    @property
+    def host_setup(self):  # the partition reads a concrete operator's graph on the host
+        return self._pattern is None
 
     @property
     def key(self):

@@ -381,6 +381,24 @@ the march themselves and are not chunked, so a cadence beside one raises rather 
 A frozen preconditioner is probed once and refused if it makes a random residual worse — but only when it
 stands alone, since a block preconditioner need not reduce a full residual in one application.
 
+A **steady** nonlinear solve has the same problem one level down: Newton runs as a `lax.while_loop`, so the
+tangent is traced there too. An unbuilt `amg()` (or `ilu()`, or a block holding one) is therefore
+built **once**, before the loop, from the assembled tangent at the initial guess `x0` (zero by default; a
+periodic, slip or hanging-node system uses its reduced tangent). It does not follow the tangent as Newton
+moves: the root is unchanged and only the Krylov speed depends on how far the tangent drifts from `x0`.
+Specs that already materialize inside the loop (`jacobi`, `form`, `lsc`, `pcd`) are left as they were.
+
+```python
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())                  # nonlinear: built at x0
+fem.solve(linear=jno.solve.fgmres(),
+          precond=jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([pb * qb / mu]))))
+```
+
+For Navier–Stokes, lag the convecting velocity (`jno.lag`, [above](#the-momentum-block-picard-not-newton))
+so the velocity block AMG is built on is the Oseen operator. `cached(spec, refresh=k)` is **refused**
+here rather than ignored: a rebuild every `k` Newton iterations would need the loop cut into chunks,
+which the steady solve does not do. To rebuild at a better state, solve again from that state (`x0=`).
+
 ### When the pressure mass is not enough
 
 `saddle()`'s pressure-mass Schur approximation stands in for the Schur complement of a **viscous**

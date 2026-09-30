@@ -193,8 +193,8 @@ def test_block_preconditioner_on_the_reduced_newton_tangent(periodic):
     """Steady Navier-Stokes: the direct Newton hands the preconditioner the REDUCED tangent PᵀJP (the
     `_reduced` wrapper), and a solution-dependent Schur factor is refreshed from the REDUCED iterate --
     LSC and PCD prolong it before re-slicing the tangent / re-reading the velocity. (Jacobi on the
-    velocity block: an unbuilt amg() cannot be set up inside the traced steady Newton loop at all, with
-    or without a tie.)"""
+    velocity block keeps these per-linearization; an unbuilt amg() there is built once, before the
+    Newton loop -- tests/test_precond_amg_steady_newton.py.)"""
     fem, u, p, pb, qb, _ref = _channel(periodic, nonlinear=True)
     newton = jno.solve.newton(direct=True, rtol=1e-11, atol=1e-12)
     ref = _arr(fem.solve(nonlinear=newton, linear=jno.solve.lu(backend="host")))

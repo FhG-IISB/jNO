@@ -1268,12 +1268,14 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     ``inner(<krylov>)``, ``chebyshev`` (bounds by power iteration on the JVP), a **pre-built**
     ``amg`` (``spec.build(A_representative)``), and ``block_diag``/``triangular`` over those.
     What cannot: specs that need the assembled matrix -- ``jacobi`` (no diagonal on a matvec),
-    an unbuilt ``amg``, ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own
-    targeted errors when materialized.
+    ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own targeted errors when
+    materialized.
 
-    On a **transient march** an unbuilt ``amg`` composes anyway: the march's own driver freezes it
-    first (:func:`_freeze_precond_for_march`), building the hierarchy from the step tangent at the
-    initial state, outside the scan. That is the one place the representative operator is known.
+    An unbuilt ``amg`` (any leaf whose setup cannot run under a trace) composes anyway: it is frozen
+    ONCE, eagerly, from the assembled tangent at the entry iterate ``x0``, outside the Newton
+    ``while_loop`` (:func:`_freeze_precond_for_newton`) -- on a **transient march** from the step tangent
+    at the initial state, outside the scan (:func:`_freeze_precond_for_march`). A frozen preconditioner
+    changes how fast each Krylov solve converges, never what Newton converges to.
 
     **A DIRECT ``linear=`` slot picks the direct Newton.** ``lu``/``dense``/``amg`` need an assembled
     matrix, and a matrix-free tangent has none to give them, so pairing one with the matrix-free
@@ -1308,12 +1310,13 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     if _prep is not None and fem is not None:
         _prep(fem)
 
-    inner = None
+    solver = None
     if linear is not None or precond is not None:
         solver = linear if linear is not None else _solve_ns.bicgstab()  # historic matrix-free default
         if precond is not None:
             prepare_precond(precond, fem)  # aux assembly now, NOT inside the traced Newton loop
 
+    def _inner_with(pc):
         def inner(operator, rhs):
             # The direct Newton hands us the ASSEMBLED tangent, the matrix-free one a JVP callable.
             # ``LinearOperator`` is the uniform handle over both, so the same composed inner serves
@@ -1325,8 +1328,12 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
                 if callable(operator) and not hasattr(operator, "shape")
                 else LinearOperator(operator)
             )
-            M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+            M = materialize_precond(pc, PrecondContext(op, fem)) if pc is not None else None
             return solver(op, rhs, M=M)
+
+        return inner
+
+    inner = None if solver is None else _inner_with(precond)
 
     def _composed(residual_fn, u0, *, jacobian=None, project=None):
         # Solution-dependent preconditioner refresh -- the Picard lag. Every Newton driver's loop is
@@ -1335,12 +1342,18 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
         # solution-dependent auxiliary form can be assembled from, and it is refreshed here, once
         # per composed invocation. A fully traced caller passes a tracer and skips the refresh --
         # the spec then raises its own loud error at materialization if it was never assembled.
+        lin = inner
         if precond is not None and fem is not None and not isinstance(u0, jax.core.Tracer):
             for s in _iter_specs(precond):
                 hook = getattr(s, "refresh_from", None)
                 if hook is not None:
                     hook(u0, fem)
-        return nonlinear(residual_fn, u0, linear_solve=inner, jacobian=jacobian, project=project)
+            # A spec whose setup needs a CONCRETE matrix (an unbuilt amg: pyamg; ilu: scipy) cannot set up
+            # inside the loop; it is built ONCE, eagerly, from the tangent at the entry iterate. Everything
+            # else keeps materializing per linearization, exactly as before.
+            if getattr(precond, "host_setup", False):
+                lin = _inner_with(_freeze_precond_for_newton(precond, fem, u0, jacobian))
+        return nonlinear(residual_fn, u0, linear_solve=lin, jacobian=jacobian, project=project)
 
     # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller
     # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
@@ -1419,12 +1432,23 @@ class _FrozenMarchPrecond:
     accepts), so nothing downstream needs to know a march is what it came from.
     """
 
-    __slots__ = ("_apply", "_of")
+    __slots__ = ("_apply", "_of", "_n")
 
-    def __init__(self, apply, of):
-        self._apply, self._of = apply, of
+    def __init__(self, apply, of, n=None):
+        self._apply, self._of, self._n = apply, of, n
 
-    def __call__(self, _ctx):
+    def __call__(self, ctx):
+        m = getattr(ctx, "_n", lambda: None)()
+        if self._n is not None and m is not None and m != self._n:
+            # A driver that solves SUB-systems (jno.solve.staggered sweeps one field group at a time) hands the
+            # inner solve a smaller operator than the tangent this was built from; applying it would fail
+            # deep inside the Krylov loop with a broadcasting error.
+            raise ValueError(
+                f"fem.solve(precond={self._of!r}): this preconditioner was built once, from the {self._n} x "
+                f"{self._n} tangent, but is being applied to a {m} x {m} system (a driver that solves "
+                "sub-systems, e.g. jno.solve.staggered). Use a traceable preconditioner there "
+                "(jno.precond.jacobi()), or staggered(direct=True) with a linear= slot."
+            )
         return self._apply
 
     def __repr__(self):
@@ -1463,8 +1487,8 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
     # of its wrapper took a configuration that worked (measured 0.18 s/step on the melt pool's T+w) and
     # refused it at the probe, since a block-triangular applier is not required to reduce a full
     # residual in one application the way a V-cycle is.
-    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
-    if all(bool(getattr(s, "traceable", True)) for s in leaves):
+    leaves, untraceable = _untraceable_leaves(precond)
+    if not untraceable:
         return precond  # nothing here needs a concrete matrix -- leave the per-linearization path alone
 
     name = getattr(precond, "name", type(precond).__name__)
@@ -1500,21 +1524,99 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
             _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
         J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
         A_rep = _add_step_operator(J, J_mass, 1.0 / scale)  # ∝ J_mass + scale·J; scale = dt for backward Euler
-        op = LinearOperator(A_rep)
-        prepare_precond(precond, fem)
-        applier = materialize_precond(precond, PrecondContext(op, fem))
-        _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
-        return _FrozenMarchPrecond(applier, precond)
+        return _frozen_at(precond, fem, A_rep, name, leaves)
     M = block.mass(t0, None)
     A_rep = _add_step_operator(M, J, scale)
+    return _frozen_at(precond, fem, A_rep, name, leaves)
+
+
+def _untraceable_leaves(precond):
+    """``(leaves, any_untraceable)`` of a preconditioner tree. Only a LEAF decides whether a tree needs a
+    concrete matrix: a block container (``triangular``, ``block_diag``) assembles nothing itself."""
+    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
+    return leaves, not all(bool(getattr(s, "traceable", True)) for s in leaves)
+
+
+def _frozen_at(precond, fem, A_rep, name, leaves, *, where="march"):
+    """Materialize ``precond`` once against the concrete ``A_rep`` and wrap it as a frozen spec (probed once:
+    a lone leaf that amplifies a residual is refused rather than left to stall the Krylov solve)."""
     op = LinearOperator(A_rep)
     prepare_precond(precond, fem)
     applier = materialize_precond(precond, PrecondContext(op, fem))
-    _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
-    return _FrozenMarchPrecond(applier, precond)
+    single = len(leaves) == 1 and leaves[0] is precond
+    _refuse_a_useless_applier(applier, A_rep, name, single_leaf=single, where=where)
+    return _FrozenMarchPrecond(applier, precond, n=int(A_rep.shape[0]))
 
 
-def _refuse_a_useless_applier(applier, A, name, *, single_leaf):
+def _assembled_tangent_at(fem, u):
+    """The problem's ASSEMBLED tangent at ``u``, on the space ``u`` lives in, or ``None`` if it has none.
+
+    For a driver that is not handed one (``newton(direct=False)``, ``picard()``): the full-space
+    ``fem._op.jacobian`` at the prolonged iterate, carried onto the reduced space (``P^T J P``, reduced
+    Dirichlet rows eliminated) when a periodic tie / slip / hanging nodes reduce the solve."""
+    op = getattr(fem, "_op", None)
+    jac, size = getattr(op, "jacobian", None), getattr(op, "size", None)
+    if not callable(jac) or size is None:
+        return None
+    u = jnp.asarray(u).reshape(-1)
+    if int(u.shape[0]) == int(size):
+        J = jac(u, {})
+        return J if hasattr(J, "shape") else None
+    per = _matching_reduction(fem, int(u.shape[0]))
+    if per is None:
+        return None
+    from ...precond import _on_solved_space
+    from .fem_utils import prolong_periodic
+
+    J = jac(prolong_periodic(per, u), {})
+    return _on_solved_space(fem, J) if hasattr(J, "todense") else None
+
+
+def _freeze_precond_for_newton(precond, fem, u0, jacobian=None):
+    """Materialize a preconditioner with a NON-traceable leaf once, from the tangent at the entry iterate.
+
+    Only a spec whose ``host_setup`` says so (an unbuilt ``amg``, ``ilu``, ``hypre``, an unbuilt
+    ``schwarz``/``fsai``, or a block / sum / ``cached`` holding one) -- a ``form``, ``lsc`` or ``jacobi``
+    tree keeps materializing per linearization inside the loop, as it always did.
+
+    A steady nonlinear solve runs Newton as a ``lax.while_loop``, so the tangent it hands the inner
+    linear solve is traced, and a host-side setup (``amg``: pyamg; ``ilu``: scipy) died inside it with
+    "AMG setup needs a concrete matrix but got a traced one" -- on the ordinary
+    ``fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())`` over a nonlinear problem. The
+    march solved this before its scan (:func:`_freeze_precond_for_march`); this is the same move before
+    the Newton loop: the tangent at ``x0`` (the default guess is zero) is assembled eagerly -- the one the
+    Newton driver itself uses when it is handed one (``jacobian``), else the problem's own assembled
+    tangent on the solve's space -- and the whole tree is materialized against it once.
+
+    The frozen setup does not follow the tangent as Newton moves. That is always CORRECT (a preconditioner
+    changes the Krylov convergence speed, never the root Newton converges to); how much speed it costs
+    depends on how far the tangent drifts from ``x0``. A ``cached(spec, refresh=k)`` cadence cannot be
+    honoured inside the single ``while_loop`` (rebuilding every k Newton iterations would need the loop cut
+    into chunks), so it is refused rather than silently ignored.
+    """
+    leaves, _ = _untraceable_leaves(precond)
+    name = getattr(precond, "name", type(precond).__name__)
+    cadence = _refresh_cadence(precond)
+    if cadence is not None:
+        raise NotImplementedError(
+            f"fem.solve(precond=jno.precond.cached(..., refresh={cadence})): a steady nonlinear solve builds "
+            "this preconditioner ONCE, from the tangent at the initial guess, because the Newton loop is a "
+            f"single lax.while_loop -- a rebuild every {cadence} iterations cannot happen inside it, and would "
+            "silently never fire. Drop the cadence (the frozen setup is always correct, only slower as the "
+            "tangent drifts), or re-solve from a better x0= to rebuild it there."
+        )
+    A_rep = jacobian(u0) if jacobian is not None else _assembled_tangent_at(fem, u0)
+    if A_rep is None or not hasattr(A_rep, "shape") or isinstance(getattr(A_rep, "data", A_rep), jax.core.Tracer):
+        raise TypeError(
+            f"fem.solve(precond={name}): this preconditioner is set up on the host from a CONCRETE matrix, and "
+            "this nonlinear solve offers no assembled tangent to build it from. Use the default "
+            "jno.solve.newton() (it assembles the tangent), a traceable preconditioner (jno.precond.jacobi()), "
+            "or pre-build this one yourself with spec.build(A)."
+        )
+    return _frozen_at(precond, fem, A_rep, name, leaves, where="newton")
+
+
+def _refuse_a_useless_applier(applier, A, name, *, single_leaf, where="march"):
     """One probe: does ``M^-1`` actually reduce a residual on the operator it was built from?
 
     A preconditioner is free to be mediocre, but one that AMPLIFIES is worse than none, and inside a
@@ -1548,9 +1650,10 @@ def _refuse_a_useless_applier(applier, A, name, *, single_leaf):
     if not (left == left) or left <= 1.0:
         return
     raise ValueError(
-        f"fem.solve(precond={name}): on this march the preconditioner makes a random residual "
+        f"fem.solve(precond={name}): {'on this march' if where == 'march' else 'in this nonlinear solve'} the "
+        "preconditioner makes a random residual "
         f"{left:.1f}x WORSE, so the Krylov solve cannot converge with it -- it would stall inside the "
-        "time loop instead of failing here. This is what an algebraic-multigrid hierarchy does on a "
+        f"{'time' if where == 'march' else 'Newton'} loop instead of failing here. This is what an algebraic-multigrid hierarchy does on a "
         "tangent that is not Laplacian-like (a strongly nonlinear coefficient contributes a term that "
         "breaks its strength-of-connection assumption). Use jno.precond.jacobi(), which reads the "
         "diagonal off the tangent itself, or precondition a problem whose step operator is definite."
