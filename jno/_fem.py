@@ -6726,6 +6726,16 @@ def _fem_impl(
                 "u_tt mass term. Use a jno.fn indicator coefficient instead, e.g. (1 + k*ind)*(u.x*v.x + "
                 "u.y*v.y), which gives the same piecewise-material dynamics."
             )
+        if couplings:
+            # This route returns its augmented block without passing through `_finalize`, where a
+            # Coupling is folded in -- so the coupling was DROPPED, silently: a `1e6 * u` coupling left
+            # the trajectory bit-identical to the uncoupled one.
+            raise NotImplementedError(
+                "jno.fem: a nonlocal `jno.Coupling` on a second-order-in-time (u_tt) form is not wired -- "
+                "the augmented [u; v] block has no slot for it, and it would be dropped. Write the problem "
+                "first order in time with an explicit velocity field (a first-order transient takes a "
+                "Coupling), or express the term locally in the weak form."
+            )
         # Coupled second-order-in-time is the SAME augmented formula with the coupled M2/C/K blocks —
         # one assembler serves both, so damping, a nonlinear spatial operator and driven boundaries
         # apply to the coupled case with no second copy of the path.
@@ -7354,6 +7364,14 @@ def _fem_impl(
     ):
         from .utils.solver.fem_native import assemble_fem_native
 
+        if couplings:
+            # Refused on the coupled route too (`_finalize`); this branch returns without it, so the
+            # coupling used to be dropped in silence (a `1e6 * u` coupling changed nothing).
+            raise NotImplementedError(
+                "jno.fem: periodic ties combined with a *transient* nonlocal Coupling are not yet supported "
+                "-- the transient march runs on the tie's reduced unknowns, which the coupling's full-space "
+                "residual cannot address. Drop the tie, or express the term locally in the weak form."
+            )
         domain._fem_problem = None
         op, mode, offs = assemble_fem_native(
             domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree

@@ -63,7 +63,8 @@ path is unaffected.
     - periodic ties.
 
     Time-varying Dirichlet is refused on nonlinear `u_tt` forms (a first-order nonlinear transient
-    takes it). A **complex coefficient** on any `u_tt` form is refused by name — it used to be
+    takes it). A nonlocal `jno.Coupling` is refused on any `u_tt` form, and on a single-field transient
+    with a periodic tie; both routes used to drop it silently. A **complex coefficient** on any `u_tt` form is refused by name — it used to be
     silently cast to real. Write the problem first-order in time instead; the complex transient is
     supported.
 
