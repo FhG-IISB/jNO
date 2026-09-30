@@ -182,6 +182,16 @@ components, and the message points at `u.d(x)`.
 it died inside the assembler with a broadcast error naming nothing — while `u(region)[0]` and
 `u.vector[0]`, built by the views as `u[..., 0]`, selected the component correctly.)
 
+A **vector wall value** clamps every component at once: `u(xb, yb) - (1.0, -0.5)`, or a varying one
+`u(xb, yb) - jno.np.stack([gx, gy], axis=-1)` (`gx`, `gy` may read `t` for a driven wall). A scalar value
+on a vector field is the same number on every component, and `u(xb, yb)[i] - g` clamps one component
+and wants a scalar `g`; a vector there raises. Pinned in `tests/test_fem_vector_dirichlet_values.py`.
+
+!!! warning "Fixed: a vector wall value used to keep only its first component"
+    Until this was fixed, `u(xb, yb) - (1.0, -0.5)` imposed `(1.0, 1.0)` — silently, steady and
+    transient alike — and a vector `g(x, t)` wrote the wrong values. Examples that only used `(0, 0)`
+    could not show it.
+
 ### Reading the reaction off a constrained region — `fem.eval`
 
 The quantity conjugate to an essential condition is the **reaction**: force in mechanics, total heat

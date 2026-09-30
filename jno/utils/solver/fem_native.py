@@ -782,6 +782,52 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
+def _dirichlet_value_columns(gs, vt, comp, region):
+    """A Dirichlet value table ``(n_nodes, n_values)`` checked against the clamped components.
+
+    ``n_values`` must be 1 (a scalar, the same on every clamped component) or, for an all-component clamp
+    ``u(region) - g`` on a ``vt``-vector field, exactly ``vt`` (one column per component). Anything else is
+    a shape the user did not mean, so it is refused rather than truncated: a vector value used to be cut
+    to its first component and broadcast, which imposed ``(1.0, 1.0)`` for ``(1.0, -0.5)``."""
+    n_values = gs.shape[1] if gs.ndim == 2 else 1
+    if n_values == 1:
+        return gs.reshape(-1)
+    if comp is None and n_values == vt:
+        return gs
+    what = f"component {int(comp)} (`u(...)[{int(comp)}] - g`)" if comp is not None else f"a {vt}-component field"
+    raise ValueError(
+        f"jno.fem: the Dirichlet value on {region!r} has {n_values} components per point, but it clamps {what}. "
+        "Give a scalar, or one value per component for an all-component clamp `u(region) - (g0, g1, ...)`."
+    )
+
+
+def _time_value_components(value_node, coords, vt, comp, region):
+    """How many values per point a time-varying ``g(x, t)`` has -- 1 or ``vt`` -- read from one evaluation
+    at ``t = 0`` with the stored parameter values. A value that does not scale with the number of points
+    (constant in space) and has several components cannot be laid out per node here: refused with the
+    per-component spelling that works."""
+    from ..._fem import _eval_value_node_at_time
+
+    n = int(coords.shape[0])
+    if n == 0:
+        return 1
+    k = min(2, n)
+    r = np.asarray(_eval_value_node_at_time(value_node, coords[:k], 0.0))
+    r1 = np.asarray(_eval_value_node_at_time(value_node, coords[:1], 0.0))
+    if k == 2 and r.size == r1.size:  # constant in space
+        if r1.size == 1:
+            return 1
+        raise NotImplementedError(
+            f"jno.fem: the time-varying Dirichlet value on {region!r} is a {r1.size}-vector that does not depend "
+            "on position. Write it per component, `u(region)[i] - g_i(t)`, which is supported."
+        )
+    per = r.size // k
+    if per == 1:
+        return 1
+    _dirichlet_value_columns(np.zeros((1, per)), vt, comp, region)  # raises unless per == vt, all-component
+    return per
+
+
 class _FusedVolumeTerms(tuple):
     """Additive volume sub-terms that share ONE test field and ONE region mask, assembled as one kernel.
 
@@ -4124,9 +4170,17 @@ def assemble_fem_native(
                 pts_all = np.asarray(pts_f_all[fidx])
                 nids = list(_boundary_node_ids(fidx, region))
                 coords = jnp.asarray(pts_all[np.asarray(nids, dtype=int)]) if nids else jnp.zeros((0, dim))
-                for c in range(vt) if comp is None else [int(comp)]:
-                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
+                per = _time_value_components(value_node, coords, vt, comp, region)
+                if per == vt and vt > 1:
+                    # g(x, t) evaluates to (n_nodes, vt): ONE entry whose DOFs are node-major, so every
+                    # consumer's `g.reshape(-1)` lands component c of node k on DOF k*vt + c. Stashing it once
+                    # per component with the whole flattened g wrote the wrong values (or the wrong count).
+                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids for c in range(vt)], dtype=jnp.int32)
                     tv_stash.append((dofs, value_node, coords))
+                else:  # a scalar g(x, t): the same value on each clamped component
+                    for c in range(vt) if comp is None else [int(comp)]:
+                        dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
+                        tv_stash.append((dofs, value_node, coords))
                 continue
             _vn = _bare_node(value_node) if value_node is not None else None
             # A nodal DATA-field value (a `jno.np.parameter` carrying a field with NO optimizer — e.g. a
@@ -4161,16 +4215,22 @@ def assemble_fem_native(
                 # single-point evaluation settles it and costs nothing.
                 one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
                 if raw.shape == one.shape or len(nids) == 0:
-                    gs = np.full(len(nids), float(np.real(one).reshape(-1)[0]))  # constant over the region
+                    const = np.real(one).reshape(-1).astype(float)  # constant over the region: (n_values,)
+                    gs = np.broadcast_to(const, (len(nids), const.size))
                 else:
-                    gs = np.real(raw).reshape(len(nids), -1)[:, 0].astype(float)  # first component per node
+                    gs = np.real(raw).reshape(len(nids), -1).astype(float)  # (n_nodes, n_values)
+                # EVERY component, not the first one broadcast to all: `u(wall) - (1.0, -0.5)` on a vector
+                # field used to impose (1.0, 1.0) -- silently, steady and transient alike.
+                gs = _dirichlet_value_columns(gs, vt, comp, region)
             elif callable(value):
                 gs = np.array([float(_real_dirichlet_values(value(p), region)) for p in pts], dtype=float)
             else:
                 gs = np.full(len(nids), float(_real_dirichlet_values(value, region)))
             comps_range = range(vt) if comp is None else [int(comp)]
-            for nid, g in zip(nids, gs):
+            gs = np.asarray(gs, dtype=float)
+            for k, nid in enumerate(nids):
                 for c in comps_range:
+                    g = gs[k] if gs.ndim == 1 else gs[k, c if gs.shape[1] > 1 else 0]
                     pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g)))
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
@@ -4366,6 +4426,11 @@ def assemble_fem_native(
             comps_range = range(vt) if comp is None else [int(comp)]
             if value_node is not None and _is_temporal_value_node(value_node):
                 coords = jnp.asarray(pts_all[np.asarray(nids, dtype=int)]) if nids else jnp.zeros((0, dim))
+                if _time_value_components(value_node, coords, vt, comp, region) == vt and vt > 1:
+                    # One node-major entry for a vector g(x, t): see `_build_dirichlet_pairs`.
+                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids for c in range(vt)], dtype=jnp.int32)
+                    tv_entries.append((dofs, value_node, coords))
+                    continue
                 for c in comps_range:
                     dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
                     tv_entries.append((dofs, value_node, coords))
@@ -4373,12 +4438,14 @@ def assemble_fem_native(
             for nid in nids:
                 p = pts_all[nid]
                 if value_node is not None:
-                    g = float(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None])).reshape(-1)[0])
+                    gv = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None]))).reshape(1, -1)
+                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region)).reshape(-1)
                 elif callable(value):
-                    g = float(value(p))
+                    gv = np.array([float(value(p))])
                 else:
-                    g = float(value)
+                    gv = np.array([float(value)])
                 for c in comps_range:
+                    g = float(gv[c] if gv.size > 1 else gv[0])  # every component, not the first one broadcast
                     const_pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g)))
         return const_pairs, tv_entries
 
