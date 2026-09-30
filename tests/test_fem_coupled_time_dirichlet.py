@@ -16,6 +16,9 @@ Oracles:
 * **Differential** -- a linear Stokes form built twice, once as it is (the linear block, whose time-varying
   Dirichlet lift is the established path) and once with a negligible convective term that routes it through the
   nonlinear residual path. The two trajectories agree to round-off in every scheme.
+* **Runtime vs hard-coded** -- a trainable parameter inside the value (``u(wall) - a*x*sin(3t)``) set at runtime
+  marches bit-identically to the same number written into the form; ``jax.grad`` w.r.t. it matches central
+  differences; and ``jno.core`` recovers it from the trajectory it produced.
 """
 
 from __future__ import annotations
@@ -350,12 +353,114 @@ def test_nonlinear_path_reproduces_the_linear_block(scheme):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# a trainable parameter inside the time-varying value: identify boundary data
+# ---------------------------------------------------------------------------------------------------------------
+
+A_TRUE = 1.7
+
+
+def _driven_wall(a, nonlinear, coupled=True):
+    """``u = a x sin(3t)`` on every wall, zero IC; the second field (coupled) is held at zero on the walls and
+    driven through the coupling. ``a`` is a number (hard-coded) or a ``jno.np.parameter`` (set at runtime)."""
+    d = jno.shape.rect(0, 0, 1, 1).structured(n=4).domain(time=(0.0, 0.2, 5))
+    u, v = d.fem_symbols(names=("u", "v"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    lap = lambda p, q: p.x * q.x + p.y * q.y  # noqa: E731
+    wall = u(xb, yb) - a * xb * sin(3.0 * tb)
+    if not coupled:
+        return jno.fem([ui.t * vi + lap(ui, vi) + (ui**3 * vi if nonlinear else 0.0), wall, u(ci[0], ci[1]) - 0.0]), u
+    w, q = d.fem_symbols(names=("w", "q"))
+    wi, qi = w.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    cpl = (ui * wi * vi + (wi**3 - ui) * qi) if nonlinear else (ui * qi - wi * vi)
+    form = ui.t * vi + lap(ui, vi) + wi.t * qi + lap(wi, qi) + cpl
+    return jno.fem([form, wall, w(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0, w(ci[0], ci[1]) - 0.0]), u
+
+
+def _amp():
+    return jno.np.reshape(jno.np.parameter((1,), name="a"), ())
+
+
+def _march(blk, scheme, args, save):
+    return SCHEMES[scheme][0]().integrate(blk, args, save, linear_solve=None, nonlinear_solve=None)
+
+
+@pytest.mark.parametrize("coupled", [True, False], ids=["coupled", "single"])
+@pytest.mark.parametrize("nonlinear", [False, True], ids=["linear", "nonlinear"])
+def test_parameter_in_time_varying_value_equals_the_hard_coded_march(nonlinear, coupled):
+    """``u(wall) - a*x*sin(3t)`` with ``a`` a runtime parameter used to refuse at build on every path. Set at
+    runtime it must march exactly the trajectory the hard-coded ``a`` does, in every scheme, and the wall must
+    carry ``a*x*sin(3t)`` itself (a stiffly accurate scheme holds it to round-off)."""
+    fp, u = _driven_wall(_amp(), nonlinear, coupled)
+    fh, _ = _driven_wall(A_TRUE, nonlinear, coupled)
+    bp, bh = fp.operator, fh.operator
+    assert "a" in bp.runtime_parameter_exprs and bp.is_nonlinear() == nonlinear
+    save = jnp.linspace(bp.t0, bp.t1, 3)
+    blk = fp.blocks[fp.block_index(u)] if coupled else slice(None)
+    pts = np.asarray(fp.field_points[fp.block_index(u)] if coupled else fp.points)
+    wall = np.isclose(pts[:, 0], 0) | np.isclose(pts[:, 0], 1) | np.isclose(pts[:, 1], 0) | np.isclose(pts[:, 1], 1)
+    g = A_TRUE * pts[wall, 0][None, :] * np.sin(3.0 * np.asarray(save))[:, None]
+    for scheme in ("theta1", "bdf2", "sdirk3", "ros2"):
+        yp = np.asarray(_march(bp, scheme, {"a": jnp.asarray([A_TRUE])}, save))
+        yh = np.asarray(_march(bh, scheme, {}, save))
+        assert np.abs(yp - yh).max() < 1e-12, f"{scheme}: runtime a vs hard-coded a: {np.abs(yp - yh).max():.2e}"
+        if scheme != "ros2":  # ros2 is not stiffly accurate -- see the wall-value test below
+            err = np.abs(yp[:, blk][:, wall] - g).max()
+            assert err < 1e-10, f"{scheme}: wall value off by {err:.2e}"
+    # and the parameter does move the answer (a wrong key would fall back to the stored value silently)
+    y2 = np.asarray(_march(bp, "bdf2", {"a": jnp.asarray([2.0 * A_TRUE])}, save))
+    assert np.abs(y2 - np.asarray(_march(bh, "bdf2", {}, save))).max() > 0.5
+
+
+@pytest.mark.parametrize("nonlinear", [False, True], ids=["linear", "nonlinear"])
+def test_gradient_wrt_boundary_amplitude_matches_finite_differences(nonlinear):
+    """Reverse mode through the march w.r.t. the boundary amplitude, the loss read on the INTERIOR nodes only
+    (so the derivative has to travel through the PDE, not just the wall rows): central differences to 1e-6."""
+    fp, u = _driven_wall(_amp(), nonlinear)
+    bp = fp.operator
+    save = jnp.linspace(bp.t0, bp.t1, 3)
+    pts = np.asarray(fp.field_points[fp.block_index(u)])
+    inner_ = ~(np.isclose(pts[:, 0], 0) | np.isclose(pts[:, 0], 1) | np.isclose(pts[:, 1], 0) | np.isclose(pts[:, 1], 1))
+    idx = np.arange(fp.dofs)[fp.blocks[fp.block_index(u)]][inner_]
+    for scheme in ("bdf2", "sdirk3"):
+
+        def loss(av, scheme=scheme):
+            return jnp.sum(_march(bp, scheme, {"a": jnp.reshape(av, (1,))}, save)[-1, idx] ** 2)
+
+        gr = float(jax.grad(loss)(A_TRUE))
+        fd = float((loss(A_TRUE + 1e-6) - loss(A_TRUE - 1e-6)) / 2e-6)
+        assert abs(gr) > 1e-3, "the amplitude must actually move the interior"
+        np.testing.assert_allclose(gr, fd, rtol=1e-6, err_msg=f"{scheme}")
+
+
+def test_boundary_amplitude_is_recovered_through_jno_core():
+    """The inverse problem this enables, end to end: the amplitude of a driven wall recovered from the
+    trajectory it produced, through ``jno.core`` (0.5 -> 1.7)."""
+    import optax
+
+    fh, _ = _driven_wall(A_TRUE, False, coupled=False)
+    u_traj = np.asarray(fh.solve(time=jno.solve.bdf2()).fn())
+    a = jno.np.parameter((1,), name="a")
+    a.dtype(jnp.float64)
+    a.initialize(jax.nn.initializers.constant(0.5))
+    a.optimizer(optax.adam(5e-2))
+    fem, _ = _driven_wall(jno.np.reshape(a, ()), False, coupled=False)
+    crux = jno.core(
+        [(fem.solve(time=jno.solve.bdf2()) - u_traj).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))})
+    )
+    crux.solve(300)
+    got = float(np.asarray(crux.eval([a])).reshape(-1)[0])
+    assert abs(got - A_TRUE) < 1e-5, f"recovered amplitude {got} (true {A_TRUE})"
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # what still refuses
 # ---------------------------------------------------------------------------------------------------------------
 
 
 def test_refusals_name_the_combination():
-    # a trainable parameter INSIDE a time-varying value: the two held-value mechanisms do not compose (yet)
     d = jno.shape.rect(0, 0, 1, 1).structured(n=3).domain(time=(0.0, 0.1, 3))
     u, v = d.fem_symbols(names=("u", "v"))
     w, q = d.fem_symbols(names=("w", "q"))
@@ -367,8 +472,12 @@ def test_refusals_name_the_combination():
     weak = [ui.t * vi + ui.x * vi.x + ui.y * vi.y + ui * wi * vi, wi.t * qi + wi.x * qi.x + wi.y * qi.y]
     ics = [u(ci[0], ci[1]) - 0.0, w(ci[0], ci[1]) - 0.0]
     g = jno.np.reshape(jno.np.parameter((1,), name="g"), ())
+    # a trainable parameter inside a time-varying value builds on a first-order transient ...
+    assert "g" in jno.fem(weak + [u(xb, yb) - g * tb, w(xb, yb) - 0.0] + ics).operator.runtime_parameter_exprs
+    # ... but not on a u_tt form, whose block evaluates g(x, t) and its rate without the runtime args
+    ci0 = u.bind(x=ci[0], y=ci[1], t=ci[2])
     with pytest.raises(NotImplementedError, match="BOTH runtime-parametric"):
-        jno.fem(weak + [u(xb, yb) - g * tb, w(xb, yb) - 0.0] + ics)
+        jno.fem([ui.tt * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - g * tb, u(ci[0], ci[1]) - 0.0, ci0.t - 0.0])
     # a parameter-valued Dirichlet on one field next to a time-varying one on another
     with pytest.raises(NotImplementedError, match="parameter-valued Dirichlet combined with a time-varying"):
         jno.fem(weak + [u(xb, yb) - g, w(xb, yb) - tb] + ics)

@@ -43,9 +43,27 @@ parameters. Measured on the Taylor–Green vortex with the exact velocity impose
 (`tests/test_fem_coupled_time_dirichlet.py`): BDF2 stays second order in time (2.3; with the data one
 step late it drops to 1.05, and at 16 steps is ~900× less accurate).
 
-*Scope, all loud:* a trainable parameter or net **inside** a time-varying value, or a net/parameter-valued
-Dirichlet **beside** one on a transient form; a runtime parameter on a single-field form with such data;
-a nonlinear second-order (`u_tt`) form; a time-varying value on a non-matching tied interface (see
+**Boundary data you want to identify.** A trainable parameter may sit inside the value — an inflow
+amplitude, a ramp rate. The held value is re-evaluated at each step's time with the runtime value of the
+parameter, so the march is differentiable in it (reverse mode through every scheme):
+
+```python
+a = jno.np.parameter((1,), name="a")                                  # unknown amplitude
+a.dtype(jnp.float64); a.initialize(jax.nn.initializers.constant(0.5)); a.optimizer(optax.adam(5e-2))
+fem = jno.fem([form, u(xb, yb) - a * xb * jno.np.sin(3 * tb), u(ci[0], ci[1]) - 0.0])
+crux = jno.core([(fem.solve(time=jno.solve.bdf2()) - u_traj).mse], domain=obs)
+crux.solve(300)                                                       # a: 0.5 -> 1.7
+```
+
+Measured (`tests/test_fem_coupled_time_dirichlet.py`): the recovery above lands on 1.70000007. With `a`
+set at runtime the march is bit-identical to the one with `a` written as a number — linear and nonlinear,
+coupled and single-field, in `theta`, `bdf2`, `sdirk` and `ros2` — and `jax.grad` w.r.t. `a` of an
+interior functional matches central differences to 1e-6.
+
+*Scope, all loud:* a trainable **net** inside a time-varying value, or a net/parameter-valued Dirichlet
+**beside** one on a transient form; a parameter inside the value on a second-order (`u_tt`) form or on
+the τ load path; a runtime parameter on a single-field form with such data; a nonlinear second-order
+(`u_tt`) form; a time-varying value on a non-matching tied interface (see
 below). **Accuracy:** a time-varying boundary value costs Runge–Kutta-type schemes order — the classical
 *order reduction* from their low stage order (Ostermann & Roche, *Math. Comp.* 59 (1992) 403–420). See
 [the measured orders](limitations.md#the-detail).

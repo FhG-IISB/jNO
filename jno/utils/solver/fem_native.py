@@ -1446,6 +1446,24 @@ def assemble_fem_native(
     # (IndexError gathering a length-1 value by node id) rather than meaning anything.
     _dir_param_exprs: Dict[str, Any] = {}
     _dir_param_rows: set = set()
+    # A trainable parameter inside a TIME-varying value (`u(wall) - a*sin(t)`, an inflow amplitude to
+    # identify). Not an args-dependent row of the kind above -- its held value changes every step -- so it
+    # stays in the time-varying stash, whose held value `_tv_hold(t, args)` is evaluated at the time the
+    # step's residual/forcing is called at WITH the runtime args. Its exprs only have to reach
+    # `runtime_parameter_exprs` so the solve node hands them over. That is the first-order transient;
+    # the τ load-path march and the second-order (u_tt) block evaluate g(x, t) without args and refuse.
+    _tv_param_exprs: Dict[str, Any] = {}
+    _first_order_transient = (
+        not tv_dirichlet_external
+        and not _is_march
+        and (
+            bool(ic_residuals)
+            or any(
+                _contains_temporal_derivative(t)
+                for t in list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
+            )
+        )
+    )
     for _i, (_fk, _rg, _comp, _val, _vnode) in enumerate(dirichlet_raw):
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is None or _is_neural_coefficient(_vn):
@@ -1463,20 +1481,23 @@ def assemble_fem_native(
             from ..._fem import _is_temporal_value_node as _is_tv
 
             if _is_tv(_vnode):
-                # `u(top) - g * tau`: the value is BOTH parametric and time/τ-dependent. The parametric
-                # branch would hold it constant in τ (silently un-ramping the load); the temporal branch
-                # would freeze the parameter at its stored value (silently un-training it). Neither is
-                # right, so refuse until the two held-value mechanisms compose.
+                if _first_order_transient:
+                    _tv_param_exprs.update(_found)  # held value re-formed per (t, args); see above
+                    continue
+                # `u(top) - g * tau` on the load path, or g(x, t) on a u_tt block: those consumers evaluate
+                # the value at the step's τ/t only. The parametric branch would hold it constant in τ
+                # (silently un-ramping the load); the temporal one would freeze the parameter at its
+                # stored value (silently un-training it). Neither is right, so refuse.
                 raise NotImplementedError(
                     f"jno.fem: the essential value on {_rg!r} is BOTH runtime-parametric "
-                    f"({sorted(_found)}) and time/τ-dependent. A trainable parameter in a t/τ-varying "
-                    "essential value is not supported yet -- train the amplitude through a Neumann/body "
-                    "term written as a function of τ, or fix one of the two."
+                    f"({sorted(_found)}) and time/τ-dependent. That is supported on a first-order transient "
+                    "(`u.t`), not on a τ load-path march or a second-order (`u.tt`) form. There, train the "
+                    "amplitude through a Neumann/body term written as a function of τ/t, or fix one of the two."
                 )
             _dir_param_exprs.update(_found)
             _dir_param_rows.add(_i)
-    if _dir_param_exprs:
-        _param_and_neural_exprs = {**_param_and_neural_exprs, **_dir_param_exprs}
+    if _dir_param_exprs or _tv_param_exprs:
+        _param_and_neural_exprs = {**_param_and_neural_exprs, **_dir_param_exprs, **_tv_param_exprs}
 
     def _dir_static_args() -> Dict[str, Any]:
         """Stored-value args for every args-dependent Dirichlet slot (net modules + parameter values) --
@@ -4545,9 +4566,13 @@ def assemble_fem_native(
         _tv_entries_t = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])
         tv_dofs = jnp.concatenate([jnp.asarray(e[0], dtype=jnp.int32) for e in _tv_entries_t]) if _tv_entries_t else None
 
-        def _tv_hold(t, _tv=_tv_entries_t):
-            """``g(x_d, t)`` on every time-varying Dirichlet DOF, in ``tv_dofs`` order."""
-            return jnp.concatenate([jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,)) for _d, n, c in _tv])
+        def _tv_hold(t, args=None, _tv=_tv_entries_t):
+            """``g(x_d, t)`` on every time-varying Dirichlet DOF, in ``tv_dofs`` order. ``args`` carries a
+            trainable parameter of the value (``u(wall) - a*sin(t)``), so the held value is differentiable in
+            it; ``None`` reads the stored values."""
+            return jnp.concatenate(
+                [jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t, params=args)), (-1,)) for _d, n, c in _tv]
+            )
 
         # Every row that carries a condition instead of an equation: constant and time-varying alike.
         if tv_dofs is None:
@@ -4678,7 +4703,7 @@ def assemble_fem_native(
                     R = spatial_res(u, t, args)
                     if _d is not None:
                         R = R.at[_d].set(u[_d] - _g)
-                    return R.at[_t].set(u[_t] - _tv_hold(t).astype(R.dtype))
+                    return R.at[_t].set(u[_t] - _tv_hold(t, args).astype(R.dtype))
 
                 def jac_bc(u, t, args=None, _d=row_dofs):
                     # identity rows, columns kept: the exact Jacobian of the row-replaced residual
@@ -4776,7 +4801,7 @@ def assemble_fem_native(
                 def forcing_vector_fn(t, args=None, _mask=free_mask, _t=tv_dofs):
                     f = _mask * (-spatial_res(zeros, t, args))
                     # the time-varying held value, written onto its identity rows (the per-step Dirichlet lift)
-                    return f if _t is None else f.at[_t].set(_tv_hold(t).astype(f.dtype))
+                    return f if _t is None else f.at[_t].set(_tv_hold(t, args).astype(f.dtype))
 
             return (
                 SemidiscreteTimeBlock(
@@ -4826,11 +4851,20 @@ def assemble_fem_native(
             def forcing_vector_fn(t, args=None, _mask=free_tv, _tv=_tv_entries):
                 f = _mask * (-spatial_res(zeros, t))  # source load on the free rows
                 for dofs, vnode, coords in _tv:
-                    f = f.at[dofs].set(jnp.asarray(_eval_value_node_at_time(vnode, coords, t)).reshape(-1))
+                    # `args` reaches a trainable parameter in the value (`u(wall) - a*sin(t)`); the operator
+                    # does not depend on it, so it stays assembled once.
+                    f = f.at[dofs].set(jnp.asarray(_eval_value_node_at_time(vnode, coords, t, params=args)).reshape(-1))
                 return f
 
             return (
-                SemidiscreteTimeBlock(M=M_tv, A=A_tv, affine_bias=c_tv, forcing_vector_fn=forcing_vector_fn, **common),
+                SemidiscreteTimeBlock(
+                    M=M_tv,
+                    A=A_tv,
+                    affine_bias=c_tv,
+                    forcing_vector_fn=forcing_vector_fn,
+                    runtime_parameter_exprs=dict(_tv_param_exprs),
+                    **common,
+                ),
                 "transient",
                 offs,
             )

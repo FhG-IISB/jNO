@@ -1702,22 +1702,18 @@ def _is_temporal_value_node(node: Any) -> bool:
     return any(isinstance(v, Variable) and getattr(v, "axis", None) == "temporal" for v in _walk(node))
 
 
-def _eval_value_node_at_time(value_node: Any, points: Any, t: Any) -> Any:
+def _eval_value_node_at_time(value_node: Any, points: Any, t: Any, params: Any = None) -> Any:
     """Evaluate a time-dependent coordinate value ``g(x, t)`` at ``points`` and time ``t``.
 
-    Like :func:`_eval_value_node_at`, but the **temporal** Variable carries its own tag
-    (``'__time__'``, separate from the spatial coordinate tag), so its context entry is a
-    ``(n, 1)`` array filled with ``t`` while each spatial tag maps to the points. (Mapping
-    every tag to the points, as the steady evaluator does, makes the time variable read a
-    spatial column.) Reuses the existing ``TraceEvaluator``."""
-    from .trace_evaluator import TraceEvaluator
+    The **temporal** Variable carries its own tag (``'__time__'``, separate from the spatial coordinate
+    tag), so its context entry is a ``(n, 1)`` array filled with ``t`` while each spatial tag maps to the
+    points. (Mapping every tag to the points makes the time variable read a spatial column.)
 
-    pts = jnp.atleast_2d(jnp.asarray(points))
-    ctx: dict = {}
-    for v in _walk(value_node):
-        if isinstance(v, Variable):
-            ctx[v.tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype) if getattr(v, "axis", None) == "temporal" else pts
-    return jnp.reshape(TraceEvaluator({}).evaluate(value_node, context=ctx), (-1,))
+    ``params`` (the runtime ``args``) substitutes the value's trainable parameters -- ``u(wall) -
+    a*sin(t)`` with ``a = jno.np.parameter(...)`` -- so the held value, and every step built on it, stays
+    differentiable in them. ``None`` keeps their stored values. This is :func:`_eval_value_node_at` with a
+    time; one evaluator, so the two cannot drift."""
+    return _eval_value_node_at(value_node, points, params=params, t=t)
 
 
 def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any, Any]:
