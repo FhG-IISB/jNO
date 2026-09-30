@@ -296,7 +296,10 @@ reduced field by field. The block preconditioners split *that* operator: the sli
 (`ctx.blocks`) are each field's reduced DOFs, while `fem.blocks` keeps slicing the full solution that
 `fem.solve` returns. An auxiliary `form([...])` is written on the full space as usual (no ties in it) and
 reduced with the same field's `P`. So `block_diag`, `triangular`, `saddle` (mass, Cahouet–Chabard,
-`lsc`), `pcd` and `jno.solve.staggered` are written exactly as on the untied problem. One case is refused
+`lsc`), `pcd` and `jno.solve.staggered` are written exactly as on the untied problem. The preconditioners
+that build a pattern once (`fsai`, `schwarz`) build it from the reduced operator, and
+`schwarz(nullspace="rigid")` builds its rigid-body modes on the full mesh and restricts them to the kept
+DOFs (a translation along a periodic direction restricts exactly). One case is refused
 by name: a complex form solved as its fused real-equivalent `[Re; Im]` block. There a field is not one
 contiguous slice, so use a complex-native composition (a child such as `ams()`) or a whole-system
 preconditioner.

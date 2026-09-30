@@ -2998,8 +2998,10 @@ class _FSAI(_Spec):
 
 
 def _representative_operator(fem):
-    """A concrete assembled matrix with the problem's sparsity pattern, or None: the steady linear operator,
-    a transient block's step pattern (M and A together), or the Newton tangent at zero."""
+    """A concrete assembled matrix with the sparsity pattern of the operator the solve RUNS ON, or None: the
+    steady linear operator, a transient block's step pattern (M and A together), or the Newton tangent at
+    zero -- carried onto the reduced space ``P^T A P`` when a periodic tie, slip elimination or hanging-node
+    constraint reduces the problem (:func:`_on_solved_space`)."""
     import jax.experimental.sparse as jsp
 
     hook = getattr(fem, "_representative_operator", None)  # a problem that says it itself (jno.fdm)
@@ -3007,18 +3009,46 @@ def _representative_operator(fem):
         return hook()
     op = getattr(fem, "_op", None)
     if isinstance(op, tuple) and hasattr(op[0], "todense"):
-        return op[0]
+        return _on_solved_space(fem, op[0])
     M, A = getattr(op, "M", None), getattr(op, "A", None)
     if hasattr(M, "todense") and hasattr(A, "todense"):
-        return jsp.BCOO((jnp.concatenate([M.data, A.data]), jnp.concatenate([M.indices, A.indices])), shape=M.shape)
+        both = jsp.BCOO((jnp.concatenate([M.data, A.data]), jnp.concatenate([M.indices, A.indices])), shape=M.shape)
+        return _on_solved_space(fem, both)
     jac, size = getattr(op, "jacobian", None), getattr(op, "size", None)
     if callable(jac) and size is not None:
         try:
             J = jac(jnp.zeros((int(size),)), {})
         except TypeError:
             return None  # a parametric / transient signature this probe does not know; build on first use
-        return J if hasattr(J, "todense") else None
+        return _on_solved_space(fem, J) if hasattr(J, "todense") else None
     return None
+
+
+def _on_solved_space(fem, A):
+    """``A``, assembled on the full finite-element space, carried onto the space the solve works in.
+
+    A periodic tie, the exact slip elimination and hanging-node constraints make every solve path run on
+    ``P^T A P`` (with the prescribed rows the congruence destroyed eliminated again). A pattern built from the
+    FULL operator -- Schwarz's partition, FSAI's -- described a different matrix: every such solve failed with
+    a shape error ("incompatible shapes (162, 1), (144, 1)"). Only the PATTERN is read from the result (which
+    unknowns couple, which rows are eliminated), so the reduced Dirichlet rows are eliminated with the
+    Newton tangent's masking; the linear path scales those rows differently, on the same pattern."""
+    from .utils.solver.fem_utils import _periodic_blocks, bcoo_eliminate_dirichlet, reduce_matrix_periodic
+    from .utils.solver.solver_api import _fem_reductions
+
+    n = int(A.shape[0])
+    for per in _fem_reductions(fem):
+        _b, off_f, off_r = _periodic_blocks(per)
+        if int(off_f[-1]) != n or int(off_r[-1]) == n:
+            continue
+        # Concrete even when prepared from inside a trace: the pattern is host data.
+        with jax.ensure_compile_time_eval():
+            A = reduce_matrix_periodic(per, A)
+            pairs = per.get("dirichlet_reduced")
+            if pairs and hasattr(A, "indices"):
+                A = bcoo_eliminate_dirichlet(A, jnp.asarray([int(d) for d, _v in pairs], dtype=jnp.int32))
+        return A
+    return A
 
 
 class _Schwarz(_Spec):
@@ -3065,6 +3095,14 @@ class _Schwarz(_Spec):
                     "pass it through fem.solve(precond=...), or call spec.build(A, fem=fem)."
                 )
             null = _near_null_space(fem, n)
+        elif null is not None and int(np.shape(null)[0]) != n:
+            # Reshaped to (n, -1) below, a full-space (n_full, k) array on a reduced system could silently come
+            # out as (n, k') garbage whenever n_full * k happens to divide by n.
+            raise ValueError(
+                f"jno.precond.schwarz(nullspace=...): the array has {int(np.shape(null)[0])} rows, but the operator "
+                f"being preconditioned has {n} (a periodic tie / slip / hanging nodes solve on the REDUCED system "
+                "P^T A P). Give the near-null space on that space, or use nullspace='rigid'."
+            )
         # Host-side, and CONCRETE even when asked from inside a trace (a jno.core step preparing the solve): a
         # dtype conversion there would be staged, and the cached index tables would be that trace's tracers.
         with jax.ensure_compile_time_eval():
@@ -3149,11 +3187,24 @@ def _near_null_space(fem, n):
     """Per field: RIGID-BODY modes for a field with as many components as the space has dimensions (a
     displacement: translations and infinitesimal rotations), else one constant per component. The kernel of the
     unconstrained operator for elasticity, and of any diffusion-type block -- what a coarse space must represent
-    for the iteration count to stay independent of the number of parts."""
+    for the iteration count to stay independent of the number of parts.
+
+    ``n`` is the size of the operator being preconditioned. On a REDUCED system (periodic tie, slip, hanging
+    nodes: the solve runs on ``P^T A P``) the modes are built on the full space, where the DOF coordinates
+    are, and restricted field by field with the kept-DOF gather ``G`` (``G P = I``: the rows of ``P`` at the
+    kept DOFs are the identity) -- exact for a mode the reduced space contains (``z = P r`` gives ``G z = r``;
+    a translation along a periodic direction), a best-effort coarse vector for one it does not (a rotation
+    under a periodic tie). The layout comes from :func:`~jno.utils.solver.solver_api._field_layout`, which
+    refuses a size no reduction explains."""
     import numpy as np
 
+    from .utils.solver.fem_utils import restrict_state
+    from .utils.solver.solver_api import _field_layout
+
+    slices, red = _field_layout(fem, n)
+    n_full = int(n) if red is None else int(fem.blocks[-1].stop)
     cols = []
-    for pts, idx in _dof_layout(fem, n):
+    for pts, idx in _dof_layout(fem, n_full):
         vec, dim = idx.shape[1], pts.shape[1]
         modes = []
         for c in range(vec):  # translations / constants
@@ -3167,10 +3218,18 @@ def _near_null_space(fem, n):
                 m[:, i], m[:, j] = -x[:, j], x[:, i]
                 modes.append(m)
         for m in modes:
-            col = np.zeros(n)
+            col = np.zeros(n_full)
             col[idx.reshape(-1)] = m.reshape(-1)
             cols.append(col)
-    return np.stack(cols, axis=1)
+    Z = np.stack(cols, axis=1)
+    if red is None:
+        return Z
+    out = np.zeros((int(n), Z.shape[1]))
+    with jax.ensure_compile_time_eval():
+        for full, sl, b in zip(fem.blocks, slices, red):
+            for k in range(Z.shape[1]):
+                out[sl, k] = np.asarray(restrict_state(b["P"], Z[full, k], b.get("kept"), b.get("vec", 1)))
+    return out
 
 
 def schwarz(
@@ -3199,7 +3258,11 @@ def schwarz(
     ``nullspace`` sets what the coarse space carries per part: ``None`` one constant (Nicolaides); ``"rigid"``
     the near-null space built from the problem -- rigid-body modes for a displacement-like field (as many
     components as dimensions), one constant per component otherwise -- which is what elasticity needs; or an
-    explicit ``(n, k)`` array.
+    explicit ``(n, k)`` array. On a REDUCED system (a periodic tie, slip ``n·u = 0``, hanging nodes: the solve
+    runs on ``P^T A P``) the partition is of that reduced operator, and ``"rigid"`` builds the modes on the full
+    mesh and restricts them to the kept DOFs -- exact for a mode the reduced space contains (a translation
+    along a periodic direction), a coarse vector like any other for one it does not (a rotation under a
+    periodic tie). An explicit array must be given on the reduced space.
 
     Works best for elliptic, positive-definite problems (diffusion, elasticity, implicit time steps); indefinite
     problems (Helmholtz, saddle points as a whole) are outside what Schwarz handles robustly.
