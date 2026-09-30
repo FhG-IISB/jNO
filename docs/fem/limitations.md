@@ -123,7 +123,7 @@ path is unaffected.
     | `sdirk(2)` | 2.01, 2.00 | 2.01, 2.00 | yes |
     | `sdirk(3)` | **2.63, 2.60** | 2.95, 2.98 | yes |
     | `rosenbrock()` (ros34pw2) | 2.87, 2.93 | 2.95, 2.98 | yes |
-    | `rosenbrock("ros2")` | **1.48, 1.68** | 1.77, 1.87 | **no** — 5e-3 off at 16 steps |
+    | `rosenbrock("ros2")` | **1.48, 1.68** | 1.77, 1.87 | **no** — 5.3e-4 off at 16 steps |
 
     The losses in bold are the classical *order reduction* of one-step methods with low stage order
     under time-dependent boundary data (Ostermann & Roche, *Math. Comp.* 59 (1992) 403–420), not a
@@ -132,7 +132,11 @@ path is unaffected.
     (1.05) at ~900× the error. "Wall rows exact" means the nodal wall value equals `g(x, tⁿ)` to
     round-off at every step: a stiffly accurate scheme's last stage *is* the step, so it lands on
     `g(tₙ₊₁)`; `ros2` is not stiffly accurate, so its step is a combination of stages and holds the wall
-    value only to its order. Use the default `ros34pw2` when a time-varying wall value must hold exactly.
+    value only to its order (1.4e-3 off after the first step, 5.3e-4 at `T`, falling as `dt²`). Re-imposing
+    `g(tₙ₊₁)` on the wall rows after each step was tried and not adopted: the wall becomes exact, but the
+    change it makes to the interior decays only as O(dt) — on the walled Taylor–Green box the ros2 rate over
+    32 → 64 → 128 → 256 steps fell from 1.81, 1.89, 1.94 to 1.77, 1.83, 1.82, with 19 % more interior error
+    at 256 steps. Use the default `ros34pw2` when a time-varying wall value must hold exactly.
 
 ??? note "Plasticity — what runs today"
     Deformation theory (monotonic / proportional) and the path-dependent flow-theory **`tau=`

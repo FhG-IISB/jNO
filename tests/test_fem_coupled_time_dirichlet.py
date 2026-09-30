@@ -353,6 +353,36 @@ def test_nonlinear_path_reproduces_the_linear_block(scheme):
     assert np.abs(a - b).max() < 1e-10, f"{scheme}: {np.abs(a - b).max():.2e}"
 
 
+def _ros_wall_error(nst, method):
+    """Largest wall error of a heat march whose walls are driven by ``g = e^{-2t}``, at ``T`` and over the march.
+    A Dirichlet row is decoupled from the rest of the stage equations, so this is ``g``'s own error -- the same on
+    any mesh or form with this ``g`` (measured identical on the Taylor-Green walls at h = pi/4, pi/6, pi/8)."""
+    d = jno.shape.rect(0, 0, 1, 1).structured(n=2).domain(time=(0.0, 0.5, nst + 1))
+    u, v = d.fem_symbols(names=("u", "v"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - exp(-2.0 * tb), u(ci[0], ci[1]) - 1.0])
+    y = np.asarray(fem.solve(time=jno.solve.rosenbrock(method)).fn())
+    pts = np.asarray(fem.points)
+    wall = np.isclose(pts[:, 0], 0) | np.isclose(pts[:, 0], 1) | np.isclose(pts[:, 1], 0) | np.isclose(pts[:, 1], 1)
+    err = np.abs(y[:, wall] - np.exp(-2.0 * np.linspace(0.0, 0.5, nst + 1))[:, None]).max(axis=1)
+    return err[-1], err.max()
+
+
+def test_ros2_holds_a_driven_wall_to_second_order_only():
+    """What the docs state about ``ros2``: it is not stiffly accurate, so a driven wall is off g by O(dt^2) --
+    5.3e-4 at T after 16 steps, 1.35e-3 at the first step -- where the stiffly accurate ``ros34pw2`` lands on g.
+    (Re-imposing g after each step was measured and NOT adopted: it makes the wall exact but leaves an O(dt) term
+    in the interior -- on the Taylor-Green walls the rate stalls at 1.8 where the plain ros2 reaches 1.94.)"""
+    e16, m16 = _ros_wall_error(16, "ros2")
+    e32, _ = _ros_wall_error(32, "ros2")
+    assert 4e-4 < e16 < 7e-4 and 1e-3 < m16 < 2e-3, f"ros2 wall error {e16:.2e} at T, {m16:.2e} max"
+    assert 1.8 < np.log2(e16 / e32) < 2.2, f"ros2 wall error rate {np.log2(e16 / e32):.2f}"
+    assert max(_ros_wall_error(16, "ros34pw2")) < 1e-12
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # a trainable parameter inside the time-varying value: identify boundary data
 # ---------------------------------------------------------------------------------------------------------------
