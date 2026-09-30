@@ -782,6 +782,29 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
+class _FusedVolumeTerms(tuple):
+    """Additive volume sub-terms that share ONE test field and ONE region mask, assembled as one kernel.
+
+    ``_split_additive_terms`` lowers a weak form to its additive pieces, and each piece used to become its
+    own element kernel: its own ``lax.map`` over the cells, its own per-cell ``jacfwd`` in the tangent,
+    and -- the expensive part -- its own copy of the tangent's triplet pattern. Pieces with the same test
+    field and mask have the IDENTICAL pattern (same cells, same test DOFs, same local DOFs), so the
+    compressed-scatter plan held one int32 per raw triplet for every piece: ``n_pieces x n_cells x
+    n_test x n_local``. A stabilised 3-D Navier-Stokes momentum equation splits into 16 pieces, and on a
+    16^3 P1/P1 cube those 16 identical index copies were 288 MiB of the march's 0.56 GiB peak -- more
+    than the element blocks, the operator (16 MiB) and the Krylov vectors together. That, not the
+    physics, is what made the device memory grow at ~35 kB per DOF.
+
+    ``sum_i int f_i v = int (sum_i f_i) v``, so fusing them changes the answer only by the order of the
+    floating-point summation: each cell sums its pieces before the one scatter, where the global
+    scatter used to sum them. The pieces still evaluate one by one against the SAME per-cell field
+    data (``_vol_elem_res`` builds it once), so the fused kernel is also one ``jacfwd`` per cell
+    instead of one per piece.
+    """
+
+    __slots__ = ()
+
+
 class _CellFieldData(dict):
     """One field's per-cell data, with ``shape_hess`` built only if a term actually reads it.
 
@@ -2527,6 +2550,14 @@ def assemble_fem_native(
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
+        if isinstance(coeff, _FusedVolumeTerms):
+            # One test field, one mask: every piece integrates against this same `loc` and has the same
+            # (n_test,) layout, so their sum is the fused group's element residual.
+            w = qw_shared * meas
+            out = _integrate_term(domain, coeff[0], loc, w)
+            for piece in coeff[1:]:
+                out = out + _integrate_term(domain, piece, loc, w)
+            return out
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _vol_readout_loc(c, local_all, t=0.0, args=None, pts=None, rnames=()):
@@ -3072,6 +3103,15 @@ def assemble_fem_native(
                 coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
                 typed.extend(_classify_one(coeff, "volume"))
         typed_with_masks = [(coeff, tfi, tuple(sorted(_collect_region_mask_names(coeff)))) for coeff, tfi in typed]
+        # Fuse the pieces that share (test field, region mask): one kernel, one tangent pattern per group
+        # rather than per piece (see `_FusedVolumeTerms`). Grouped in first-appearance order, so the
+        # block order every consumer below iterates is deterministic.
+        _groups: Dict[Tuple[int, Tuple[str, ...]], List[Any]] = {}
+        for coeff, tfi, rn in typed_with_masks:
+            _groups.setdefault((tfi, rn), []).append(coeff)
+        typed_with_masks = [
+            (cs[0] if len(cs) == 1 else _FusedVolumeTerms(cs), tfi, rn) for (tfi, rn), cs in _groups.items()
+        ]
 
         surface_work: List[Tuple[str, np.ndarray, List[Tuple[Any, int]]]] = []
         if bterms and conn.n_bfaces > 0:
@@ -3547,6 +3587,29 @@ def assemble_fem_native(
         if dynamic_topology:
             _plan_builders.append(_host_plan)
 
+        _inv_blocks_cache: Dict[Tuple[int, int], Any] = {}
+
+        def _inv_block(plan, i, off, k, shape=None):
+            """Block ``i`` of the plan's ``inverse`` -- the SAME object on every call for a host plan.
+
+            Slicing the NumPy inverse afresh per call hands the trace a NEW array object each time, and
+            a trace keys its captured constants on object identity: a march that evaluates this tangent
+            in several places (the start-up step, the stepped body, the convergence check) baked one
+            full copy of the per-raw-triplet map per evaluation. Measured on a 16^3 P1/P1 Navier-Stokes
+            march: 4 copies, 72 MiB of index constants where one copy is 18 MiB. A traced plan (a
+            runtime-connectivity bundle) is sliced in the trace and never cached."""
+            inv = plan[1]
+            if isinstance(inv, jax.core.Tracer):
+                blk = inv[off : off + k]
+                return blk if shape is None else blk.reshape(shape)
+            key = (id(inv), i, shape)
+            hit = _inv_blocks_cache.get(key)
+            if hit is None or hit[0] is not inv:
+                blk = inv[off : off + k]
+                hit = (inv, blk if shape is None else blk.reshape(shape))
+                _inv_blocks_cache[key] = hit
+            return hit[1]
+
         def jacobian(u_flat, t=0.0, args=None):
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
@@ -3578,9 +3641,9 @@ def assemble_fem_native(
                     rows_l.append(rows_fn())
                     cols_l.append(cols_fn())
                     return
-                _inv, _nse = _plan[1], _plan[2]
+                _nse = _plan[2]
                 k = _blk_sizes[_nblk[0]]
-                part = jax.ops.segment_sum(flat, _inv[_off[0] : _off[0] + k], num_segments=_nse)
+                part = jax.ops.segment_sum(flat, _inv_block(_plan, _nblk[0], _off[0], k), num_segments=_nse)
                 _acc[0] = part if _acc[0] is None else _acc[0] + part
                 _off[0] += k
                 _nblk[0] += 1
@@ -3590,10 +3653,31 @@ def assemble_fem_native(
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
                     return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d))(la)
 
+                _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
+                if _plan is not None:
+                    # Scatter each CHUNK's element blocks straight into the compressed slots (the residual's
+                    # own `scatter=` path), so the (n_cell, n_test, n_local) stack of every cell's block is
+                    # never built. That stack -- and the copy XLA made of it -- was the largest mesh-sized
+                    # buffer left in a march once the per-term patterns were fused: 2 x 36 MiB of the
+                    # 16^3 P1/P1 Navier-Stokes tangent, growing with the cell count where the chunked
+                    # scratch does not.
+                    k = _blk_sizes[_nblk[0]]
+                    n_t, n_l = int(cd_d[tfi].shape[1]), int(cad_d.shape[1])
+                    inv_b = _inv_block(_plan, _nblk[0], _off[0], k, shape=(n_cells, n_t * n_l))
+                    acc = _acc[0] if _acc[0] is not None else jnp.zeros((_plan[2],), dtype=local_all.dtype)
+                    _acc[0] = _elem_map(
+                        lambda c, la, _k=_ke: _k(c, la).reshape(-1),
+                        (jnp.arange(n_cells), local_all),
+                        _chunk_v,
+                        scatter=(acc, inv_b),
+                    )
+                    _off[0] += k
+                    _nblk[0] += 1
+                    continue
                 Ke = _elem_map(  # (n_cell, n_test_tfi, n_local_all)
                     _ke,
                     (jnp.arange(n_cells), local_all),
-                    _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
+                    _chunk_v,
                 )
                 _emit(
                     Ke.reshape(-1),
