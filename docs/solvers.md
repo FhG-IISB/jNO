@@ -1313,8 +1313,11 @@ non-conservative form.
 `jno.solve.rosenbrock()` is linearly implicit: every stage is **one linear solve** with the same matrix
 `W = M + γh·J`, `J` the tangent at the step's start — no Newton loop on a nonlinear block. The default
 `"ros34pw2"` (Rang & Angermann, BIT 45, 2005) is order 3, stiffly accurate and consistent for index-1
-DAEs; `"ros2"` (Verwer et al., SIAM J. Sci. Comput. 20(4), 1999) is order 2. Time-varying Dirichlet data
-is exact. It refuses a time-, parameter- or state-dependent mass (use `sdirk` or `bdf2`).
+DAEs; `"ros2"` (Verwer et al., SIAM J. Sci. Comput. 20(4), 1999) is order 2. A time-varying Dirichlet
+row lands exactly on `g(tₙ₊₁)` under the default, which is stiffly accurate; `"ros2"` is not, and holds it
+only to its order (5e-3 off on a Taylor–Green wall at 16 steps — see
+[the measured orders](fem/limitations.md#the-detail)). It refuses a time-, parameter- or state-dependent
+mass (use `sdirk` or `bdf2`).
 
 ```python
 sol = fem.solve(time=jno.solve.sdirk(order=3))

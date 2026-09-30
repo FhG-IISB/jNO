@@ -16,6 +16,40 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+#### Time-varying Dirichlet data — `g(x, t)`
+
+On a transient form `g` may depend on time too: write it with the boundary variable's `t`. Nothing is
+passed to `fem.solve()`:
+
+```python
+xin, yin, tin = d.variable("inlet", split=True)
+ramp = 1.0 - jno.np.exp(-tin / 0.1)                              # smooth start-up
+fem = jno.fem([
+    momentum, continuity,
+    u(xin, yin)[0] - ramp * 4 * U * yin * (H - yin) / H**2,      # ramped (or pulsatile) inflow
+    u(xin, yin)[1] - 0.0,
+    ...                                                          # walls, initial condition
+])
+```
+
+The constrained row reads `u = g(x, t)` at the time the step lands on, in every time scheme: `t_{n+1}`
+for `theta` (a Dirichlet row carries no time derivative, so every θ imposes it at the new time) and
+`bdf2`, each stage time for `sdirk`, and each stage time plus the `∂g/∂t` term for `rosenbrock`. The
+interior equations see the boundary's rate through the mass matrix, whose columns on those rows are
+kept. This holds on linear and **nonlinear** forms, single-field or **coupled** — so a ramped or
+pulsatile inflow, a moving lid, or a manufactured solution with exact time-dependent boundary values on
+Navier–Stokes is written the same way — and the march stays differentiable in the form's runtime
+parameters. Measured on the Taylor–Green vortex with the exact velocity imposed on all four walls
+(`tests/test_fem_coupled_time_dirichlet.py`): BDF2 stays second order in time (2.3; with the data one
+step late it drops to 1.05, and at 16 steps is ~900× less accurate).
+
+*Scope, all loud:* a trainable parameter or net **inside** a time-varying value, or a net/parameter-valued
+Dirichlet **beside** one on a transient form; a runtime parameter on a single-field form with such data;
+a nonlinear second-order (`u_tt`) form; a time-varying value on a non-matching tied interface (see
+below). **Accuracy:** a time-varying boundary value costs Runge–Kutta-type schemes order — the classical
+*order reduction* from their low stage order (Ostermann & Roche, *Math. Comp.* 59 (1992) 403–420). See
+[the measured orders](limitations.md#the-detail).
+
 #### Per-tag surface coefficients — `d.attach(tag, h=...)`
 
 A boundary term is normally written per tag, on that tag's coordinates. When the *same* condition

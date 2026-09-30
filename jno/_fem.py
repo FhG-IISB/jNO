@@ -7008,15 +7008,14 @@ def _fem_impl(
         _native_now = True
         if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
             # native transient covers a runtime SCALAR parameter and a single-field nodal FIELD
-            # parameter k(x). A time-varying Dirichlet g(x,t) routes native only for the LINEAR,
-            # non-parametric transient (the row-replacement + per-step Dirichlet-lift forcing path);
-            # combined with a runtime parameter or a nonlinear residual it is rejected below.
+            # parameter k(x). A time-varying Dirichlet g(x,t) routes native for the non-parametric
+            # transient, linear (row replacement + the per-step Dirichlet lift in the forcing) or nonlinear
+            # (the same row replacement in the residual, read at the step's time); combined with a runtime
+            # parameter it is rejected below.
             from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs as _cnce
-            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin
 
             _native_now = (
                 not any(_crp(b) for b in weak_bares)
-                and not any(_nlin(domain, b) for b in weak_bares)
                 # tv-Dirichlet g(x,t) + a TRAINABLE net: rejected below (frozen nets stay native)
                 and not any(_cnce(b) for b in weak_bares)
             )
@@ -7437,9 +7436,9 @@ def _fem_impl(
         )
     if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
         raise NotImplementedError(
-            "jno.fem: a time-varying Dirichlet g(x, t) on a transient form is supported natively only for a "
-            f"LINEAR, non-parametric problem (got nonlinear={_nonlinear}, parametric={_parametric}). "
-            "Linearize the form, or remove the runtime parameter."
+            "jno.fem: a time-varying Dirichlet g(x, t) on a single-field transient form is supported natively "
+            f"only without a runtime parameter or trainable network (got nonlinear={_nonlinear}, "
+            f"parametric={_parametric}). Remove the runtime parameter, or fix the Dirichlet value in time."
         )
     raise NotImplementedError(
         "jno.fem: this single-field weak form is not handled by the native assembler. Please report the "
@@ -7531,7 +7530,6 @@ def _assemble_multifield(
     # uses — so the Dirichlet field indices match the kernel's field order.
     fields, field_index = _infer_fields(ir.volume_expr)
     by_field: dict[int, dict[str, Any]] = {}
-    dirichlet_tv: List[Any] = []  # (field_idx, region, comp, value_node) for time-varying g(x,t)
     for field_key, region, comp, value, value_node in dirichlet_raw:
         fidx = field_index.get(field_key)
         if fidx is None:
@@ -7544,8 +7542,6 @@ def _assemble_multifield(
             current = dict(current) if isinstance(current, dict) else {}
             current[_COMPONENT_NAMES[comp]] = value
             region_values[region] = current
-        if _is_temporal_value_node(value_node):
-            dirichlet_tv.append((fidx, region, comp, value_node))
     domain._fem_dirichlet_by_field = by_field
 
     # Native 2D Lagrange coverage gate (expressed over the inferred fields -- no `constraints` here):
@@ -7571,8 +7567,8 @@ def _assemble_multifield(
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
     # constant (incl. non-homogeneous) Dirichlet + a time-dependent source, and a time-varying Dirichlet
-    # g(x,t) for the LINEAR block (row-replacement + per-step Dirichlet-lift forcing); a nonlinear block
-    # with a time-varying Dirichlet is rejected below (the native branch carries only constant Dirichlet).
+    # g(x,t) on a linear block (row replacement + the per-step Dirichlet lift in the forcing) and on a
+    # nonlinear one (the same row replacement in the residual, its held value read at the step's time).
     if is_transient:
         if evolution:
             # Same rejection the single-field path makes once its IR reveals the transient — restated here
@@ -7583,7 +7579,6 @@ def _assemble_multifield(
                 "coupled (multi-field) form — the load path is the *pseudo-time* march over "
                 "`domain(tau=...)`, not a `u.t` transient. Drop `u.t`, or drive time through the `tau` grid."
             )
-        _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
         # The native coupled-transient assembler threads runtime SCALAR parameters through ``args``
         # (``fem_native._runtime_vals`` packs each parameter per cell, re-evaluated every step), so a
         # *parametric* coupled transient -- e.g. trainable rate constants recovered through the
@@ -7596,7 +7591,7 @@ def _assemble_multifield(
             and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
             and not _is_complex_form(domain, ir)
         )
-        if _native_transient_ok and _tv_native:
+        if _native_transient_ok:
             from .utils.solver.fem_native import assemble_fem_native
 
             domain._fem_problem = None
@@ -7604,15 +7599,15 @@ def _assemble_multifield(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
             )
             return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
-        # Coupled transient that the native block does not cover (a complex coefficient, or a time-varying
-        # Dirichlet on a nonlinear block) -- reject explicitly rather than mis-assemble.
+        # Coupled transient that the native block does not cover (a complex coefficient, a non-Lagrange
+        # field, or a mesh that is not 2-D/3-D) -- reject explicitly rather than mis-assemble.
         raise NotImplementedError(
             "jno.fem: this coupled (multi-field) transient is not supported natively. The native coupled "
-            "transient covers constant / time-dependent / runtime-parametric coefficients (incl. nonlinear) "
-            "and a time-varying Dirichlet on a LINEAR block "
-            f"(got nonlinear={any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)}, "
-            f"complex={_is_complex_form(domain, ir)}, "
-            f"time_varying_dirichlet={bool(dirichlet_tv)})."
+            "transient covers REAL, 2-D/3-D, Lagrange fields -- constant / time-dependent / runtime-parametric "
+            "coefficients (incl. nonlinear), with constant or time-varying g(x, t) Dirichlet data "
+            f"(got dimension={getattr(domain, 'dimension', None)}, "
+            f"spaces={sorted({str(f.get('space', 'Lagrange')) for f in fields})}, "
+            f"complex={_is_complex_form(domain, ir)})."
         )
 
     if _native_ok:

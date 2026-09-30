@@ -4452,6 +4452,37 @@ def assemble_fem_native(
         d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
+        # Time-varying essential values g(x, t). `_build_dirichlet_pairs` keeps them OUT of the constant pairs
+        # and stashes (dofs, value node, coords) instead, so every branch below must either thread them or
+        # refuse: a branch that only reads `d_dofs` drops the condition, and the boundary then marches as if
+        # it were free -- a plausible trajectory with nothing to flag it.
+        from ..._fem import _eval_value_node_at_time
+
+        _tv_entries_t = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])
+        tv_dofs = jnp.concatenate([jnp.asarray(e[0], dtype=jnp.int32) for e in _tv_entries_t]) if _tv_entries_t else None
+
+        def _tv_hold(t, _tv=_tv_entries_t):
+            """``g(x_d, t)`` on every time-varying Dirichlet DOF, in ``tv_dofs`` order."""
+            return jnp.concatenate([jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,)) for _d, n, c in _tv])
+
+        # Every row that carries a condition instead of an equation: constant and time-varying alike.
+        if tv_dofs is None:
+            row_dofs = d_dofs
+        else:
+            row_dofs = tv_dofs if d_dofs is None else jnp.concatenate([d_dofs, tv_dofs])
+
+        def _zero_mass_rows(Mx, _d=d_dofs, _t=tv_dofs):
+            """The mass with no time derivative on a constrained DOF.
+
+            A constant condition zeroes its row AND column, as it always has. A time-varying one zeroes only
+            its ROW: its column is what gives each free row its share of the boundary's rate, ``M_fd·ġ``,
+            through ``M (u⁺ - u)/dt`` -- the boundary value moves from ``g(tⁿ)`` to ``g(tⁿ⁺¹)`` inside the
+            step. Zeroing it would drop that term from every interior equation next to a moving boundary.
+            (The linear block keeps the columns for the same reason.)"""
+            if _d is not None:
+                Mx = bcoo_zero_rows_cols(Mx, _d)
+            return Mx if _t is None else bcoo_zero_rows(Mx, _t)
+
         # ---- STATE-DEPENDENT (nonlinear) MASS: ``c(u)·u_t`` with a coefficient depending on the unknown.
         # The fixed ``M = _mass_jac(zeros)`` freezes ``c`` at ``u=0`` (silently wrong; see jno-fem-hard-limits).
         # Reformulate each temporal term to backward-Euler *residual* form ``c(u)·(u − u_prev)·v`` — with
@@ -4489,20 +4520,21 @@ def assemble_fem_native(
             _mass_res_raw = _make_residual(temporal_be)  # ∫ c(u)·(u − u_prev)·v  (volume only; mass has no boundary)
             _mass_jac_raw = _make_jacobian(temporal_be)
 
-            def mass_res_bc(u, t, args=None, _d=d_dofs, _f=_mass_res_raw):
+            # Rows only, constant and time-varying alike: the mass ACTION `c(u)(u - u_prev)` on a free row keeps
+            # its boundary columns either way, which is what carries a moving boundary's rate into it.
+            def mass_res_bc(u, t, args=None, _d=row_dofs, _f=_mass_res_raw):
                 R = jnp.asarray(_f(jnp.asarray(u), t, args)).reshape(-1)
                 return R if _d is None else R.at[_d].set(0.0)  # a constrained DOF carries no mass equation
 
-            def mass_jac_bc(u, t, args=None, _d=d_dofs, _f=_mass_jac_raw):
+            def mass_jac_bc(u, t, args=None, _d=row_dofs, _f=_mass_jac_raw):
                 J = _f(jnp.asarray(u), t, args)
                 return J if _d is None else bcoo_zero_rows(J, _d)
 
         # Parametric mass ``mass_fn(t, args)`` (unknown density net(x)*u_t): re-assemble M from args each
-        # step with the Dirichlet rows/cols zeroed (a constrained DOF carries no time derivative). ``None``
-        # keeps the static ``M_bc`` for a non-parametric mass.
-        def _mass_cb(t, args=None, _d=d_dofs):
-            Mt = _mass_jac(zeros, t, args)
-            return Mt if _d is None else bcoo_zero_rows_cols(Mt, _d)
+        # step with the Dirichlet rows zeroed (a constrained DOF carries no time derivative; see
+        # `_zero_mass_rows` for the columns). ``None`` keeps the static ``M_bc`` for a non-parametric mass.
+        def _mass_cb(t, args=None):
+            return _zero_mass_rows(_mass_jac(zeros, t, args))
 
         # A mass-only nonlinearity (state-dependent mass) also requires the nonlinear step path, even when
         # every spatial term is linear — the mass action lives in the residual there (``mass_residual``).
@@ -4519,6 +4551,13 @@ def assemble_fem_native(
                     "jno.fem: a net-valued Dirichlet with a state-dependent (nonlinear) mass c(u)·u_t on a "
                     "transient form is not supported (the mass residual holds a static Dirichlet dof set). "
                     "Use a linear/parametric mass."
+                )
+            if _dir_args_dependent and tv_dofs is not None:
+                raise NotImplementedError(
+                    "jno.fem: a net- or parameter-valued Dirichlet combined with a time-varying g(x, t) "
+                    "Dirichlet on a transient form is not supported yet (the first re-forms its held values "
+                    "from the runtime args, the second from the step time, and the two row sets are not "
+                    "merged). Use one or the other."
                 )
 
             if _dir_args_dependent:
@@ -4541,6 +4580,27 @@ def assemble_fem_native(
                     return bcoo_set_dirichlet_rows(spatial_jac(jnp.asarray(u), t, args), _d)
 
                 _mdofs = _tnpd
+            elif tv_dofs is not None:
+                # Time-varying Dirichlet g(x, t): the same row replacement as a constant g (below), with the
+                # held value re-evaluated at the time the RESIDUAL is called at. Every scheme calls it at the
+                # time its step or stage lands on -- t_{n+1} for θ (whose zero-mass rows take θ = 1, see
+                # `_theta_row_weights`) and BDF2, each stage time t_n + c_i·dt for SDIRK, and
+                # t_n + α_i·h for a Rosenbrock stage, whose ∂R/∂t term then carries -ġ -- so the row reads
+                # u[d] = g(x_d, t) at the right time without the scheme knowing the condition exists. It is
+                # the linear block's per-step Dirichlet lift (`forcing_vector_fn` writes g(x_d, t) onto the
+                # same rows) and the load-path march's displacement control, applied on the residual path.
+                def res_bc(u, t, args=None, _d=d_dofs, _g=d_vals, _t=tv_dofs):
+                    u = jnp.asarray(u)
+                    R = spatial_res(u, t, args)
+                    if _d is not None:
+                        R = R.at[_d].set(u[_d] - _g)
+                    return R.at[_t].set(u[_t] - _tv_hold(t).astype(R.dtype))
+
+                def jac_bc(u, t, args=None, _d=row_dofs):
+                    # identity rows, columns kept: the exact Jacobian of the row-replaced residual
+                    return bcoo_set_dirichlet_rows(spatial_jac(jnp.asarray(u), t, args), _d)
+
+                _mdofs = d_dofs  # the time-varying rows are zeroed below, their columns kept
             else:
                 # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
                 # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
@@ -4555,6 +4615,8 @@ def assemble_fem_native(
                 _mdofs = d_dofs
 
             M_bc = M if _mdofs is None else bcoo_zero_rows_cols(M, _mdofs)
+            if tv_dofs is not None:
+                M_bc = bcoo_zero_rows(M_bc, tv_dofs)  # rows only -- see `_zero_mass_rows`
             return (
                 SemidiscreteTimeBlock(
                     # A state-dependent mass carries no fixed matrix; the mass action is in mass_residual.

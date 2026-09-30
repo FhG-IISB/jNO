@@ -307,7 +307,9 @@ coupled blocks — damping `u_t` terms, a nonlinear spatial operator (Newton on 
 residual) and a driven boundary `g(x, t)` all apply to the coupled case exactly as to a single
 field. *Scope: nodal Lagrange, 2D/3D (1D has its own narrower path). Fail-loud: a coupled field
 with no `u_tt` term (write a first-order field as an explicit first-order system), runtime
-parameters on a coupled form, a trainable Dirichlet value, and `g(x, t)` on a nonlinear form.*
+parameters on a coupled form, a trainable Dirichlet value, and `g(x, t)` on a nonlinear second-order
+form (a first-order nonlinear transient takes it — see
+[time-varying Dirichlet data](boundary-conditions.md#time-varying-dirichlet-data-gx-t)).*
 ---
 
 ## The rest of this guide
