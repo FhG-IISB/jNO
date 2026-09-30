@@ -966,7 +966,9 @@ Over-relaxation also acts on the **free** DOFs only. Farrell & Maurini's `ũ` li
 space `C_ū`, where a prescribed DOF has `δ = 0`; jNO imposes essential conditions as residual rows, so
 without the mask the sub-solve's exact hit on the prescribed value gets extrapolated past — measured on
 one row with `g = 2`, ω = 1.7 gave 3.40 → 1.02 → 2.69, an oscillation decaying only as `|1−ω|ᵏ`, worst
-on a *ramped* condition where `g` moves every load step.
+on a *ramped* condition where `g` moves every load step. The mask covers every nonlinear problem — plain
+or parametric, 2-D/3-D or 1-D (non-nodal families excepted) — and on a periodic, slip or hanging-node
+system the prescribed DOFs are mapped into the reduced space the sweep runs in.
 
 Cost when ω ≠ 1: one extra full residual evaluation per block per sweep.
 

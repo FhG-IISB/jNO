@@ -258,6 +258,16 @@ def _essential_node_ids(domain: Any, region: str) -> List[int]:
     return nids
 
 
+def _essential_dofs(dirichlet_pairs):
+    """The DOFs carrying an essential condition, as a nonlinear operator declares them (``op.dirichlet_dofs``,
+    ``None`` when there are none). ``jno.solve.staggered(over_relax != 1)`` reads it to leave them alone:
+    without it, one over-relaxed sweep put a prescribed ``g = 2`` at ``3.0`` (omega = 1.5), and every other
+    field was solved against that wrong boundary value until the overshoot decayed as ``|1 - omega|^k``."""
+    if not dirichlet_pairs:
+        return None
+    return np.asarray([int(d) for d, _g in dirichlet_pairs], dtype=np.int64)
+
+
 def _dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], vec: int) -> List[Tuple[int, float]]:
     """Resolve ``{region: value}`` into a list of ``(global_dof, value)`` pairs."""
     pts = np.asarray(domain.mesh.points)
@@ -938,6 +948,7 @@ def assemble_fem_1d(
             size=ndof,
             runtime_parameter_exprs=_param_and_neural_exprs,
         )
+        op.dirichlet_dofs = _essential_dofs(dirichlet_pairs)  # left alone by an extrapolating driver
         return op, "nonlinear"
 
     # linear: R(u) = A u - b  ->  A = dR/du, b = -R(0), then symmetric Dirichlet.
@@ -1681,6 +1692,7 @@ def assemble_fem_1d_multifield(
             size=total,
             runtime_parameter_exprs=_c_exprs,
         )
+        op.dirichlet_dofs = _essential_dofs(dirichlet_pairs)  # left alone by an extrapolating driver
         return op, "nonlinear", offsets
 
     zeros = jnp.zeros(total)

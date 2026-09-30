@@ -5080,6 +5080,11 @@ def assemble_fem_native(
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating
+        # driver (``staggered(over_relax != 1)``) must leave them alone. Missing here, every NON-parametric
+        # problem over-relaxed its prescribed values -- measured g = 2 held at 3.0 after one sweep with
+        # omega = 1.5, the rest of the field solved against that wrong boundary value until it decayed.
+        _op_np.dirichlet_dofs = s_d_dofs
         _op_np.derived_specs = derived_specs  # {fid: {fn, in_slices, every, ...}} — jno.derived rules
         _op_np.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
         _op_np.contact_pairs = dict(_contact_pairs)
