@@ -350,7 +350,14 @@ fem = jno.fem([momentum, continuity,
     first and the others stayed wrong for exactly as long as they had their own copy of the logic —
     5.8e-04 on the fused-complex path, whose `blkdiag(P, P)` transform dropped the record entirely, and
     4.2e-04 on the transient, which built its reduction through a second construction site that never
-    annotated it. Both are now at round-off and are measured against their conforming controls.
+    annotated it. Both are now at round-off and are measured against their conforming controls. The
+    second-order (`u_tt`) route was a third construction site, with neither the exclusion nor the
+    record: on a membrane periodic in x with held walls, a non-periodic wall value (`u = x` on y = 0)
+    moved a tied corner by the whole value, 1.0, and a value held on one side of the tie only was 0.5 off
+    at its image. It now goes through the same helpers, and since a `u_tt` block starts from a
+    wall-consistent state (`u = g`, `u_t = 0`), the image starts at the held value too. Pinned in
+    `tests/test_fem_second_order_time.py` against the analytic standing wave and the same data written
+    without the corner conflict.
 
     A **time-varying** essential value on a polluted interface row is refused by name: its held value is
     written into the full row every step and there is no constant to put back.

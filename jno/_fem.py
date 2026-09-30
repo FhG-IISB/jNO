@@ -5381,6 +5381,19 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
 
     blocks, off_f, off_r = _periodic_blocks(periodic)
     n_full, n_red = int(off_f[-1]), int(off_r[-1])
+    # The initial state takes each reduced DOF's value from its MAIN node. A second-order block starts
+    # from a wall-consistent state (``u[d] = g``, ``v[d] = 0``, set by its assembler); where a prescribed
+    # value was carried onto a free main DOF (a node held on the eliminated side of a tie), the main node
+    # holds the initial condition instead, and the t=0 frame showed the held node off its value (measured:
+    # 0 against a held 0.5) until the first step re-imposed it. Start from the value, as the untied block
+    # does. A FIRST-order block keeps its own convention -- its t=0 frame is the initial condition itself,
+    # on an untied wall too -- so it is left alone.
+    state0_red = restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1))
+    if _meta_in.get("second_order") and periodic.get("dirichlet_reduced"):
+        _dr = periodic["dirichlet_reduced"]
+        state0_red = state0_red.at[jnp.asarray([int(r) for r, _g in _dr], dtype=jnp.int32)].set(
+            jnp.asarray([float(np.real(g)) for _r, g in _dr], dtype=state0_red.dtype)
+        )
     meta = dict(getattr(block, "metadata", None) or {})
     meta.update(periodic=True, full_state_size=n_full, reduced_state_size=n_red)
     prol = blocks[0]["P"] if len(blocks) == 1 else periodic
@@ -5411,7 +5424,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
             mass=mass_red,
             residual=residual_red,
             jacobian=jac_red,
-            state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
+            state0=state0_red,
             prolongation=prol,
             metadata=meta,
         )
@@ -5468,7 +5481,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         operator_fn=op_red,
         affine_bias=c_red,
         forcing_vector_fn=f_red,
-        state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
+        state0=state0_red,
         prolongation=prol,
         metadata=meta,
     )
@@ -6631,9 +6644,26 @@ def _fem_impl(
         if periodic_ties:
             # Bloch / phononic in the time domain: reduce the augmented [u, v] block by the field
             # prolongation P (duplicated per block inside _reduce_transient_block_periodic).
+            #
+            # Prescribed DOFs go through the SAME exclude/restore the first-order routes use. Without it a
+            # wall value on a tied face was lost silently wherever the two sides of the tie disagree about
+            # it: `PᵀAP` sums the eliminated DOF's row into its partner's, so a value held on one side only
+            # (or a non-periodic one, g = x on a wall meeting the tie) was averaged or overwritten --
+            # measured 0.5 and 1.0 off the prescribed value on a u_tt membrane, while the same data written
+            # without the corner conflict held it exactly.
+            _tdp, _ttv = _prescribed_dofs(domain)
             _cells = getattr(domain, "_fem_native_assembly_cells", None)
             _eo = int(getattr(domain, "_fem_native_assembly_order", 1))
-            _periodic = _build_periodic_reduction(domain, periodic_ties, _so.points, _cells, _eo, vec or 1)
+            _periodic = _build_periodic_reduction(
+                domain,
+                periodic_ties,
+                _so.points,
+                _cells,
+                _eo,
+                vec or 1,
+                exclude_dofs=[int(d) for d, _g in _tdp] + _ttv,
+            )
+            _periodic = _annotate_reduced_dirichlet(_periodic, _tdp, _ttv)
             _so._op = reduce_op_periodic(_so._op, "transient", _periodic)
             _so._periodic = _periodic
         return _so
@@ -8096,6 +8126,10 @@ def _assemble_second_order_time(
         sop, _sm, _soffs = assemble_fem_native(
             domain, stiff_raw, boundary_terms, [], [], vec=_vec_asm, quad_degree=quad_degree
         )
+        # That Dirichlet-free assembly overwrote the SHARED prescribed-DOF stash with nothing. Put this
+        # problem's back: a periodic tie reads it to keep prescribed DOFs out of the elimination and to
+        # restore the rows the congruence destroys, and a nonlocal Coupling reads it to zero pinned rows.
+        domain._fem_native_dirichlet_pairs, domain._fem_native_dirichlet_tv = pairs, tv
         if multifield and list(_soffs) != gm["offs"]:
             raise NotImplementedError(
                 f"jno.fem: coupled second-order-in-time requires one consistent block layout; the "
