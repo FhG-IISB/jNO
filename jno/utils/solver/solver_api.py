@@ -610,21 +610,113 @@ class NonlinearSolver:
         return f"jno.solve.{self.name}({', '.join(f'{k}={v!r}' for k, v in self.config.items())})"
 
 
+def _fem_reductions(fem):
+    """The DOF reductions ``u = P u_red`` a solve on ``fem`` may run on, as periodic-format dicts.
+
+    One slot serves every elimination jNO performs -- periodic/Bloch ties, the exact slip ``n·u = 0``
+    elimination and hanging-node constraints all build a dict of the same shape onto ``fem._periodic``.
+    A complex form solved as its fused real-equivalent ``2n`` block reduces by ``fem._periodic_2n``
+    (``blkdiag(P, P)``) instead, so that is a candidate too.
+    """
+    return [p for p in (getattr(fem, "_periodic", None), getattr(fem, "_periodic_2n", None)) if p is not None]
+
+
+def _matching_reduction(fem, n):
+    """The reduction (a periodic-format dict) whose REDUCED space has ``n`` DOFs and whose per-field full
+    offsets are ``fem.blocks``' -- i.e. the one a length-``n`` vector on ``fem``'s system lives in -- or
+    ``None``."""
+    full = getattr(fem, "blocks", None)
+    if full is None or n is None:
+        return None
+    from .fem_utils import _periodic_blocks
+
+    starts = [int(s.start) for s in full] + [int(full[-1].stop)]
+    for per in _fem_reductions(fem):
+        _b, off_f, off_r = _periodic_blocks(per)
+        if int(off_r[-1]) == int(n) and len(off_f) == len(starts) and [int(o) for o in off_f] == starts:
+            return per
+    return None
+
+
+def _field_layout(fem, n):
+    """``(slices, red_blocks)``: the per-field slices of a length-``n`` vector on ``fem``'s system.
+
+    ``fem.blocks`` slice the FULL solution -- the layout ``fem.solve`` returns. A reduction (periodic tie,
+    slip elimination, hanging nodes) makes the solver work on ``P^T A P`` instead, and it reduces BLOCK-WISE:
+    the reduced vector is each field's reduced DOFs concatenated in block order (``off_red``). A
+    preconditioner is handed that reduced operator, so slicing it with the full offsets cut it in the wrong
+    places -- the last field's slice ran past the end and came back EMPTY (a 3-D periodic Navier-Stokes
+    ``triangular`` preconditioner failed with "incompatible shapes (729,), (0,)"), or, where it happened to
+    fit, a "block" straddled two fields.
+
+    So the layout is read off the operator's SIZE: ``n`` equal to the full size gives ``fem.blocks``
+    (``red_blocks`` is ``None``); equal to a reduction's size gives that reduction's per-field slices, and
+    ``red_blocks`` its per-field ``P_i`` dicts (what an auxiliary form on one field's full space is reduced
+    with). A size that matches neither is refused by name -- there is no correct way to guess.
+    """
+    full = getattr(fem, "blocks", None)
+    if full is None:
+        return None, None
+    n_full = int(full[-1].stop)
+    if n is None or int(n) == n_full:
+        return list(full), None
+    n = int(n)
+    from .fem_utils import _periodic_blocks
+
+    per = _matching_reduction(fem, n)
+    if per is not None:
+        blocks, _off_f, off_r = _periodic_blocks(per)
+        return [slice(int(off_r[i]), int(off_r[i + 1])) for i in range(len(full))], list(blocks)
+    sizes = [int(_periodic_blocks(p)[2][-1]) for p in _fem_reductions(fem)]
+    reduced = f" (reduced: {', '.join(str(s) for s in sizes)})" if sizes else ""
+    fused = (
+        " A complex form is solved as its fused real-equivalent [Re; Im] block, where a field's DOFs are "
+        "not one contiguous slice: precondition it with a complex-native block composition (a child such as "
+        "jno.precond.ams(), which routes the solve onto the complex operator), or with a whole-system "
+        "preconditioner."
+        if getattr(fem, "_complex_n", None) is not None
+        else ""
+    )
+    raise ValueError(
+        f"jno.precond: the operator being preconditioned has {n} rows, but this system's field blocks cover "
+        f"{n_full} DOFs{reduced}, so it cannot be split by field -- a per-field slice would cut it in the "
+        f"wrong places.{fused}"
+    )
+
+
+def _field_reduction(block: dict) -> dict:
+    """One field's block of a multifield reduction (``{"P", "kept", "vec", "is_selection"}``) as a
+    single-field reduction dict -- what ``reduce_matrix_periodic`` takes to form ``P_i^T M P_i``."""
+    return {
+        "P": block["P"],
+        "kept_nodes": block.get("kept"),
+        "vec": block.get("vec", 1),
+        "is_selection": block.get("is_selection"),
+    }
+
+
+_UNRESOLVED = object()
+
+
 class PrecondContext:
     """What a preconditioner spec sees at materialization time.
 
     ``ctx.A`` is the assembled :class:`LinearOperator` (matvec-only on the Jacobian-free
     nonlinear path), ``ctx.fem`` the owning :class:`jno.FEM` (``None`` outside ``fem.solve``),
     ``ctx.diag()`` the operator diagonal. For multifield systems ``ctx.blocks`` are the
-    per-field DOF slices (from ``fem.offsets``), ``ctx.block_slice(field)`` resolves a trial
-    symbol (or integer index) to its slice, and ``ctx.sub(i, j=None)`` is the ``(i, j)``
+    per-field DOF slices **of** ``ctx.A`` (from ``fem.offsets``, or — when a periodic tie, slip
+    elimination or hanging-node constraint reduced the system to ``P^T A P`` — the per-field
+    slices of that reduced system), ``ctx.block_slice(field)`` resolves a trial symbol (or
+    integer index) to its slice, and ``ctx.sub(i, j=None)`` is the ``(i, j)``
     sub-operator as a :class:`LinearOperator` — applied through the *full* operator's matvec
     (embed into block ``j``, extract block ``i``), so it stays sparse/matrix-free; ``diag`` and
     ``dense`` are exact views for ``i == j`` direct/diagonal inner solvers.
 
     ``ctx.assemble(terms, quad_degree=...)`` assembles an **auxiliary weak form** with the
     ordinary ``jno.fem`` machinery and returns its operator — the "preconditioners are weak
-    forms" primitive (weighted mass matrices, low-order proxies, shifted operators).
+    forms" primitive (weighted mass matrices, low-order proxies, shifted operators). On a
+    reduced system the form (assembled on the full finite-element space) is reduced with the
+    same ``P`` as ``ctx.A``, so the two act on the same space.
     """
 
     def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None, mesh: Any = None):
@@ -634,6 +726,94 @@ class PrecondContext:
         # The device mesh of a SHARDED solve (``None`` otherwise): a spec that distributes itself partitions
         # its own data over it (see ``sharding.sharded_solve``).
         self.mesh = mesh
+        # The reduction ``u = P u_red`` from the full finite-element space onto the space ``A`` acts on (a
+        # periodic-format dict; ``None``: ``A`` is on the full space). Resolved from the FEM for a
+        # whole-system context; a per-field child context (``_block_context``) carries its own field's P.
+        self._space = _UNRESOLVED
+        # The field block this context IS, for a per-field child of a block preconditioner (``None`` for a
+        # whole-system context). A child applies what it builds to exactly that block's vector, so an
+        # auxiliary form of any other size is an error there -- not so on the whole system, where a user's
+        # own block scheme may legitimately build a one-field form and apply it to that field's slice.
+        self._field = None
+
+    def _n(self):
+        shape = getattr(self.A, "shape", None) if self.A is not None else None
+        return None if shape is None else int(shape[0])
+
+    def _space_reduction(self):
+        """The reduction mapping the full FE space onto ``A``'s space, or ``None`` (see ``_space``)."""
+        if self._space is not _UNRESOLVED:
+            return self._space
+        n = self._n()
+        if n is None:
+            return None
+        from .fem_utils import _periodic_blocks
+
+        for per in _fem_reductions(self.fem):
+            _b, off_f, off_r = _periodic_blocks(per)
+            if n == int(off_r[-1]) and n != int(off_f[-1]):
+                return per
+        return None
+
+    def _on(self, A, grid: Any = None) -> "PrecondContext":
+        """A context for another operator on the SAME space as this one (a precision cast, the inner
+        solve's own operator), keeping what that space is -- its reduction."""
+        ctx = PrecondContext(A, self.fem, grid)
+        ctx._space = self._space_reduction()
+        ctx._field = self._field
+        return ctx
+
+    def _block_context(self, field) -> "PrecondContext":
+        """The context a per-field child of a block preconditioner is materialized against: ``sub(field)``,
+        on that field's own space -- the field's REDUCED space on a reduced system, so an auxiliary form
+        the child assembles on the full field space is reduced with that field's ``P_i``."""
+        idx = field if isinstance(field, int) else self.fem.block_index(field)
+        ctx = PrecondContext(self.sub(idx), self.fem)
+        _slices, red = _field_layout(self.fem, self._n())
+        ctx._space = None if red is None else _field_reduction(red[idx])
+        ctx._field = idx
+        return ctx
+
+    def _to_space(self, op: LinearOperator, *, what: str = "the auxiliary operator") -> LinearOperator:
+        """``op``, assembled on the full finite-element space, carried onto the space ``A`` acts on.
+
+        On a reduced system that is the Galerkin reduction ``P^T op P`` with the same ``P`` as ``A`` -- the
+        preconditioner then approximates the operator actually being solved. On a whole reduced system a
+        form over ONE field's full space (a user's own block scheme, applied to that field's slice) is
+        reduced with that field's ``P_i`` when the field is unambiguous. A per-field child context refuses a
+        size nothing explains; a whole-system one returns such an operator unchanged, as it always did.
+        """
+        n = self._n()
+        m = None if op.shape is None else int(op.shape[0])
+        if n is None or m is None or m == n:
+            return op
+        red = self._space_reduction()
+        if red is not None:
+            from .fem_utils import _periodic_blocks, reduce_matrix_periodic
+
+            blocks, off_f, off_r = _periodic_blocks(red)
+            target = None
+            if m == int(off_f[-1]) and n == int(off_r[-1]):
+                target = red
+            elif self._field is None and len(blocks) > 1:
+                hits = [i for i in range(len(blocks)) if int(off_f[i + 1] - off_f[i]) == m]
+                if hits and len({id(blocks[i]["P"]) for i in hits}) == 1:  # one field space: unambiguous
+                    target = _field_reduction(blocks[hits[0]])
+            if target is not None:
+                # CONCRETE even when materialized inside a trace (the matrix-free Newton materializes in its
+                # loop body): the form and P are both concrete, and a host-side consumer -- the default
+                # factor-once LU, an AMG setup -- needs the reduced matrix as data, not as a tracer.
+                with jax.ensure_compile_time_eval():
+                    mat = reduce_matrix_periodic(target, op.bcoo if op.bcoo is not None else op.dense())
+                return LinearOperator(mat)
+        if self._field is not None:
+            raise ValueError(
+                f"jno.precond: {what} is {m} x {m}, but the operator it preconditions is {n} x {n}"
+                + (" (a reduced system: periodic ties / slip / hanging nodes)" if red is not None else "")
+                + ". A form must be written on the same space as the (sub-)system it preconditions -- over "
+                "one field's symbols inside block_diag/triangular, over every field for the whole system."
+            )
+        return op
 
     def diag(self):
         return self.A.diag()
@@ -652,7 +832,9 @@ class PrecondContext:
 
     @property
     def blocks(self):
-        blocks = getattr(self.fem, "blocks", None)
+        """Per-field ``slice``s of ``A`` -- of the REDUCED system when the solve runs on one (see
+        :func:`_field_layout`); ``fem.blocks`` itself always slices the full solution."""
+        blocks, _red = _field_layout(self.fem, self._n())
         if blocks is None:
             raise TypeError("PrecondContext.blocks: no per-field block structure (single field, or no FEM attached).")
         return blocks
@@ -723,8 +905,12 @@ class PrecondContext:
                     "PrecondContext.assemble: a complex auxiliary form with periodic ties is not supported "
                     "(the outer P-reduction is not mirrored onto the preconditioner block)."
                 )
+        # On a reduced system (periodic ties, slip, hanging nodes) `ctx.A` is `P^T A P`, while the form was
+        # assembled on the full finite-element space; `_to_space` reduces it with the same P so the two act
+        # on the same space (a form of any other size -- one field's, inside a user's own block scheme --
+        # is returned as assembled).
         if aux.is_complex:
-            return LinearOperator(_bcoo(aux.A))  # the fused 2n real-equivalent block IS `.A`
+            return self._to_space(LinearOperator(_bcoo(aux.A)))  # the fused 2n block IS `.A`
         # `.A` is DOCUMENTED dense ("use fem.operator for the raw sparse form on large problems"), so
         # reaching for it here cost n^2 on every auxiliary -- 1.74 GB for a velocity-space mass at
         # 14,739 dofs, which is a preconditioner running out of memory doing the one thing it exists
@@ -733,8 +919,8 @@ class PrecondContext:
         if raw is not None:
             A_raw = raw.evaluate(None)[0] if hasattr(raw, "evaluate") else (raw[0] if isinstance(raw, tuple) else raw)
             if hasattr(A_raw, "indices"):  # already a BCOO -- keep it sparse end to end
-                return LinearOperator(A_raw)
-        return LinearOperator(_bcoo(aux.A))
+                return self._to_space(LinearOperator(A_raw))
+        return self._to_space(LinearOperator(_bcoo(aux.A)))
 
 
 def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:

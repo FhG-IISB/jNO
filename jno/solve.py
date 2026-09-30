@@ -803,7 +803,9 @@ def staggered(
     free upgrade, and it is not the default.
 
     Scope: composes through ``fem.solve(nonlinear=...)`` on a multifield problem, which is where the
-    block layout comes from; it has no meaning on a single field and says so.
+    block layout comes from; it has no meaning on a single field and says so. On a system reduced by
+    periodic ties, a slip elimination or hanging nodes the driver is handed the reduced iterate and sweeps
+    each field's REDUCED DOFs (the layout is read off the iterate's size).
 
     **Groups.** An entry of ``fields`` may be a LIST of trial symbols, which are then solved *together*
     inside one sweep rather than alternated against each other::
@@ -867,9 +869,37 @@ def staggered(
             for g in gidx
         ]
         resolved["names"] = gidx
+        resolved["fem"] = fem
+        resolved["n_full"] = int(blocks[-1].stop)
         # Essential-condition dofs, so over-relaxation can leave them alone (see staggered_newton).
         _dd = getattr(getattr(fem, "_op", None), "dirichlet_dofs", None)
         resolved["constrained"] = None if _dd is None else _np.asarray(_dd, dtype=_np.int64)
+
+    def _layout_for(n):
+        """``(group index arrays, constrained dofs)`` for an iterate of length ``n``.
+
+        On a system a periodic tie, slip ``n·u = 0`` or hanging-node constraint reduced to ``P^T A P``
+        the driver is handed the REDUCED iterate, whose fields sit at the reduced offsets -- sweeping it
+        with ``fem.blocks`` (the full layout) would solve "fields" that straddle the real ones, and clamp
+        the last one's out-of-range indices. The layout is therefore read off the iterate's size (one
+        source of truth: :func:`~jno.utils.solver.solver_api._field_layout`), and the essential-condition
+        dofs are mapped into the reduced space with it."""
+        if n == resolved["n_full"]:
+            return resolved["blocks"], resolved["constrained"]
+        from .utils.solver.fem_utils import reduced_dirichlet_pairs
+        from .utils.solver.solver_api import _field_layout, _matching_reduction
+
+        fem = resolved["fem"]
+        slices, _red = _field_layout(fem, n)  # raises by name when no reduction explains n
+        groups = [
+            _np.concatenate([_np.arange(int(slices[i].start), int(slices[i].stop), dtype=_np.int32) for i in g])
+            for g in resolved["names"]
+        ]
+        con = resolved["constrained"]
+        if con is not None and len(con) and float(over_relax) != 1.0:  # only over-relaxation reads them
+            pairs = reduced_dirichlet_pairs(_matching_reduction(fem, n), [(int(d), 0.0) for d in con], all_rows=True)
+            con = _np.asarray(sorted(r for r, _g in pairs), dtype=_np.int64)
+        return groups, con
 
     if line_search not in (True, False, "backtrack"):
         raise ValueError(
@@ -894,6 +924,7 @@ def staggered(
             )
         from .utils.solver.newton_krylov import staggered_newton
 
+        groups, layout_constrained = _layout_for(int(_np.size(u0)))
         if direct and jacobian is None:
             raise ValueError(
                 "jno.solve.staggered(direct=True) factorizes each field's ASSEMBLED diagonal block, and "
@@ -905,7 +936,7 @@ def staggered(
         return staggered_newton(
             residual_fn,
             u0,
-            resolved["blocks"],
+            groups,
             rtol=rtol,
             atol=atol,
             max_sweeps=max_sweeps,
@@ -916,7 +947,7 @@ def staggered(
             jacobian=jacobian if direct else None,
             over_relax=float(over_relax),
             project=project,
-            constrained=constrained if constrained is not None else resolved["constrained"],
+            constrained=constrained if constrained is not None else layout_constrained,
             damping=damping,
             line_search=line_search,
             ls_max=ls_max,

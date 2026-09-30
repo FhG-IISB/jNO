@@ -17,7 +17,8 @@ with differentiable solves. A user spec is any object with ``materialize(ctx)`` 
     fem.solve(linear=jno.solve.cg(), precond=my_precond)
 
 Composition: :func:`block_diag` / :func:`triangular` build block preconditioners over the
-per-field DOF blocks (``fem.blocks``); :func:`form` assembles auxiliary weak-form operators
+per-field DOF blocks (``fem.blocks`` -- or, on a system reduced by periodic ties / slip / hanging nodes,
+the per-field blocks of the reduced ``P^T A P`` the solve runs on); :func:`form` assembles auxiliary weak-form operators
 ("preconditioners as weak forms"); :func:`inner` turns any ``jno.solve`` solver into an
 (inexact) ``M^{-1}`` application.
 """
@@ -157,7 +158,7 @@ def _materialize_in_float32(spec, materialize, ctx):
     op = ctx.A
     hi = getattr(op.bcoo, "dtype", None)
     lo = _low_precision(hi) if hi is not None else jnp.float32
-    lo_ctx = PrecondContext(op.astype(lo), ctx.fem, getattr(ctx, "_grid", None))
+    lo_ctx = ctx._on(op.astype(lo), getattr(ctx, "_grid", None))  # same space (and reduction) as `op`
     M = materialize(spec, lo_ctx)
 
     def cast(f):
@@ -904,9 +905,14 @@ class _Form(_Spec):
                 "traced context (jit/vmap over the whole solve, a lax.scan march) never has one. "
                 "Run the solve eagerly, or use a static form([...]) with a frozen coefficient."
             )
-        if self._op is None:
-            self._op = ctx.assemble(self.terms, quad_degree=self.quad_degree)
-        op = self._op
+        if self._op is None:  # cached on the FULL space (no operator attached), like `prepare` does
+            self._op = PrecondContext(None, ctx.fem).assemble(self.terms, quad_degree=self.quad_degree)
+        # The form is assembled (and cached) on the full finite-element space. On a system reduced by a
+        # periodic tie / slip elimination / hanging nodes the operator it preconditions is `P^T A P` --
+        # inside a block composition, one field's `P_i^T A_ii P_i` -- so reduce the form with that same P.
+        # Without this a pressure-mass Schur block was sized for the full pressure space while the Krylov
+        # vector it was applied to carried only the reduced one.
+        op = ctx._to_space(self._op, what="the jno.precond.form auxiliary operator")
         if self.inner is False:
             # APPLY, don't invert: `M v = A v`. This is the middle factor of a product like PCD,
             # where `F_p` is applied between two inverses. It is a preconditioner FACTOR, not a
@@ -956,7 +962,7 @@ class _Form(_Spec):
             # system. `ctx.fem` is carried through so an inner AMS can read the edge topology.
             from .utils.solver.solver_api import materialize_precond
 
-            ap = materialize_precond(self.inner, PrecondContext(op, ctx.fem))
+            ap = materialize_precond(self.inner, ctx._on(op))
             # some specs materialize to a bare callable (no .T); a symmetric applier is its own T
             return PrecondApplier(ap, ap.T if hasattr(ap, "T") else ap)
 
@@ -1007,7 +1013,10 @@ def form(terms, *, inner=None, quad_degree: int = 2, float32: bool = False) -> _
     the spec — it is parameter-independent) and must be steady linear. Its size must match the
     (sub-)operator this spec preconditions: a form over one field's symbols preconditions that
     field's diagonal block inside :func:`block_diag`/:func:`triangular`; a form over all fields
-    preconditions the full system. With an *iterative* ``inner``, drive the outer solve with
+    preconditions the full system. A size that does not match is refused by name. On a system reduced
+    by a periodic tie, a slip ``n·u = 0`` elimination or hanging-node constraints, write the form on the
+    full space as usual (no ties in it): it is reduced with the same field's ``P`` as the operator,
+    ``P_i^T Â P_i``, when it is materialized. With an *iterative* ``inner``, drive the outer solve with
     ``jno.solve.fgmres()`` (flexible preconditioning).
 
     ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
@@ -1032,7 +1041,7 @@ class _InnerSolve(_Spec):
         # inner AMS reads the edge topology off it and cannot be built from the matrix alone.
         M = Mt = None
         if self.precond is not None:
-            ap = materialize_precond(self.precond, PrecondContext(op, ctx.fem))
+            ap = materialize_precond(self.precond, ctx._on(op))
             M, Mt = ap, ap.T  # PrecondApplier is callable; .T is its transpose applier
         # transpose applier solves the transposed (sub-)operator, so a non-symmetric block gets a
         # correctly-preconditioned adjoint solve (else reverse-mode stalls -- see PrecondApplier).
@@ -1116,7 +1125,10 @@ def _pairs_to_appliers(pairs, ctx: PrecondContext):
         )
     appliers = []
     for idx in range(len(blocks)):
-        sub_ctx = PrecondContext(ctx.sub(idx), ctx.fem)
+        # `ctx.blocks` / the child context are those of the operator actually being solved: on a system
+        # reduced by periodic ties, slip or hanging nodes, the per-field slices of `P^T A P`, not
+        # `fem.blocks` (which slice the full solution) -- see `solver_api._field_layout`.
+        sub_ctx = ctx._block_context(idx)
         m = materialize_precond(resolved[idx], sub_ctx)
         # Normalize to a PrecondApplier so the block transpose paths (apply_T) always have `.T`.
         # A bare-callable block precond (e.g. amg) has no structural transpose, so `.T` reuses M
@@ -1245,6 +1257,9 @@ def block_diag(*pairs, float32: bool = False) -> _BlockDiag:
     than :func:`triangular` but ignores the coupling blocks — prefer :func:`triangular` for
     saddle systems.
 
+    On a system reduced by periodic ties, a slip elimination or hanging nodes the blocks are those of
+    the reduced ``P^T A P`` the solve runs on (each field's reduced DOFs), so it composes unchanged.
+
     ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
     double -- see :func:`_materialize_in_float32`.
     """
@@ -1266,6 +1281,10 @@ def triangular(*pairs, float32: bool = False) -> _Triangular:
     ``form([(1/mu) * pi * qi])`` as the Schur-complement approximation; Elman, Silvester & Wathen,
     *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, §9.2). With inexact
     (iterative) block solves the outer Krylov must be flexible: ``jno.solve.fgmres()``.
+
+    Periodic ties, the slip ``n·u = 0`` elimination and hanging nodes reduce the system block-wise to
+    ``P^T A P``; the blocks, the couplings and any auxiliary :func:`form` are then those of the reduced
+    system, so the composition is written exactly as without them.
 
     ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
     double -- see :func:`_materialize_in_float32`.
@@ -1354,6 +1373,12 @@ class _CahouetChabard(_Spec):
         return f"jno.precond._CahouetChabard(mass_weight={self.mass_weight}, laplace_weight={self.laplace_weight})"
 
 
+def _solve_reduction(fem):
+    """The reduction ``u = P u_red`` (periodic tie, slip ``n·u = 0`` elimination, hanging nodes) a solve on
+    ``fem`` runs in, or ``None``. Every one of them lives in the same periodic-format dict on ``fem._periodic``."""
+    return getattr(fem, "_periodic", None)
+
+
 class _LSC(_Spec):
     """Least-squares commutator Schur approximation; see :func:`lsc`.
 
@@ -1382,12 +1407,16 @@ class _LSC(_Spec):
         self._dead = None
 
     # -- setup ------------------------------------------------------------------------------------
-    def _velocity_mass_lump(self, fem, iu, n_u):
+    def _velocity_mass_lump(self, fem, iu, n_u, reduction=None):
         """Row-sum lump of the velocity mass matrix, as a ``(n_u,)`` vector.
 
         The velocity element ORDER is not recorded on the FEM, so it is recovered by assembling the
         mass on each candidate order and keeping the one whose size matches the block. That costs one
         or two throwaway mass assemblies, once, and keeps ``lsc()`` argument-free.
+
+        ``reduction`` (the velocity field's own ``P``, as a periodic-format dict) is given when the solve
+        runs on a reduced system: the mass is then lumped as ``P^T M P``, the velocity mass of the space
+        the commutator's blocks live on. ``n_u`` is always the FULL block size the assembly is matched to.
         """
         import numpy as _np
 
@@ -1409,11 +1438,16 @@ class _LSC(_Spec):
             except Exception:  # noqa: BLE001 -- a mismatched order can fail in several ways
                 continue
             if op.shape is not None and int(op.shape[0]) == int(n_u):
+                if reduction is not None:
+                    from .utils.solver.fem_utils import reduce_matrix_periodic
+                    from .utils.solver.solver_api import LinearOperator
+
+                    op = LinearOperator(reduce_matrix_periodic(reduction, op.bcoo if op.bcoo is not None else op.dense()))
                 # The lump is a ROW SUM, so take it as a matvec against ones. The obvious
                 # `lumped_diagonal(op.dense())` fallback densifies an n_u x n_u operator -- 1.74 GB at
                 # 14,739 velocity dofs, which is what made this the memory wall of the whole iterative
                 # path while every other stage stayed sparse.
-                d = _np.asarray(op @ jnp.ones((int(n_u),), dtype=jnp.float64))
+                d = _np.asarray(op @ jnp.ones((int(op.shape[0]),), dtype=jnp.float64))
                 return _np.where(_np.abs(d) > 1e-30, d, 1.0)
         raise NotImplementedError(
             f"jno.precond.lsc(): could not build a velocity mass matching the {n_u}-dof momentum block "
@@ -1429,16 +1463,36 @@ class _LSC(_Spec):
         from . import solve as _s
         from .utils.solver.solver_api import LinearOperator, _slice_bcoo
 
-        s_u, s_p, iu, _ip = self._blocks
+        s_u, s_p, iu, ip = self._blocks
+        # A periodic tie / slip elimination / hanging-node constraint makes the solve run on `P^T A P`, and
+        # the Krylov vectors this is applied to carry the REDUCED pressure DOFs. Capture the blocks of that
+        # reduced operator (with the reduced-space Dirichlet rows the solve re-imposes), sliced by the
+        # reduced per-field layout; the full operator's blocks are sized for a space the solve never sees.
+        per = _solve_reduction(fem)
         if fem.is_linear:
             A = _fem_concrete_operator(fem)
         else:
             # `fem.jacobian` DENSIFIES. On a saddle system that is n^2 -- exactly the cost this
             # preconditioner exists to avoid -- so take the raw BCOO off the operator instead.
             u0 = _np.zeros(fem.dofs) if at is None else _np.asarray(at).reshape(-1)
+            if per is not None and u0.shape[0] != int(fem.dofs):
+                from .utils.solver.fem_utils import prolong_periodic
+
+                u0 = _np.asarray(prolong_periodic(per, jnp.asarray(u0))).reshape(-1)  # the refresh's reduced iterate
             raw = getattr(getattr(fem, "_op", None), "jacobian", None)
             A = raw(u0) if raw is not None else fem.jacobian(u0)
         A = A.bcoo if getattr(A, "bcoo", None) is not None else A
+        red_u = None
+        if per is not None:
+            from .utils.solver.fem_utils import reduce_matrix_periodic, wrap_reduced_dirichlet
+            from .utils.solver.solver_api import _field_layout, _field_reduction
+
+            A = reduce_matrix_periodic(per, A)
+            _r, bc = wrap_reduced_dirichlet(per, None, lambda: A)
+            A = bc() if bc is not None else A
+            slices, red_blocks = _field_layout(fem, int(A.shape[0]))
+            s_u, s_p = slices[iu], slices[ip]
+            red_u = _field_reduction(red_blocks[iu])
         B = _slice_bcoo(A, s_p, s_u)
         Bt = _slice_bcoo(A, s_u, s_p)
         F = _slice_bcoo(A, s_u, s_u)
@@ -1454,7 +1508,8 @@ class _LSC(_Spec):
             return  # B and M do not depend on the solution, so P is built exactly once
 
         n_u = int(s_u.stop - s_u.start)
-        self._minv = 1.0 / self._velocity_mass_lump(fem, iu, n_u) if self.scaled else _np.ones(n_u)
+        n_u_full = int(fem.blocks[iu].stop - fem.blocks[iu].start)
+        self._minv = 1.0 / self._velocity_mass_lump(fem, iu, n_u_full, red_u) if self.scaled else _np.ones(n_u)
 
         def _csr(blk):
             idx = _np.asarray(blk.indices)
@@ -1758,7 +1813,16 @@ class _PCD(_Spec):
         if sol is not None:
             blocks = fem.blocks
             s_u = blocks[c["iu"]]
-            uv = _np.asarray(sol).reshape(-1)[s_u.start : s_u.stop].reshape(-1, dim)
+            sol = _np.asarray(sol).reshape(-1)
+            per = _solve_reduction(fem)
+            if per is not None and sol.shape[0] != int(blocks[-1].stop):
+                # On a reduced system (periodic ties / slip / hanging nodes) the refresh hands over the
+                # REDUCED iterate; `fem.blocks` slice the full one, so prolong first. F_p is assembled on
+                # the full pressure space and reduced with the pressure P when it is materialized.
+                from .utils.solver.fem_utils import prolong_periodic
+
+                sol = _np.asarray(prolong_periodic(per, jnp.asarray(sol))).reshape(-1)
+            uv = sol[s_u.start : s_u.stop].reshape(-1, dim)
             # Sample the velocity on the CONSTRAINT field's nodes. For Taylor-Hood the pressure nodes
             # are a subset of the velocity nodes, so this is exact; the guard below is what makes that
             # a checked fact rather than an assumption.

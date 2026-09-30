@@ -1971,7 +1971,10 @@ class FEM:
         """Per-field DOF ``slice``s into the flat solution (``None`` without block structure).
 
         The structural handle block preconditioners build on: ``jno.precond.block_diag`` /
-        ``triangular`` resolve their field arguments to these slices (see ``docs/solvers.md``)."""
+        ``triangular`` resolve their field arguments to these slices (see ``docs/solvers.md``).
+        These always slice the FULL solution. When a periodic tie, slip ``n·u = 0`` or hanging-node
+        constraint makes the solve run on the reduced ``P^T A P``, a preconditioner is handed the
+        per-field slices of that reduced system instead (``PrecondContext.blocks``)."""
         off = self.offsets
         if off is None:
             return None

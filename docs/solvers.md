@@ -291,6 +291,16 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
           ))
 ```
 
+**Periodic ties, slip and hanging nodes.** These make the solve run on the reduced system `PᵀAP`,
+reduced field by field. The block preconditioners split *that* operator: the slices they are handed
+(`ctx.blocks`) are each field's reduced DOFs, while `fem.blocks` keeps slicing the full solution that
+`fem.solve` returns. An auxiliary `form([...])` is written on the full space as usual (no ties in it) and
+reduced with the same field's `P`. So `block_diag`, `triangular`, `saddle` (mass, Cahouet–Chabard,
+`lsc`), `pcd` and `jno.solve.staggered` are written exactly as on the untied problem. One case is refused
+by name: a complex form solved as its fused real-equivalent `[Re; Im]` block. There a field is not one
+contiguous slice, so use a complex-native composition (a child such as `ams()`) or a whole-system
+preconditioner.
+
 ??? note "`jno.precond.chebyshev(degree=…)`"
     fixed-degree Chebyshev **polynomial** preconditioner: matvecs and
     AXPYs only, the GPU-era substitute for Gauss-Seidel/ILU smoothing, and a fixed *linear* map so it
