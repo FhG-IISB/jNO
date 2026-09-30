@@ -4761,26 +4761,35 @@ def _bake_fingerprint(fn, chunk):
 
 def _chunked_scatter(fn, xs, c, out, index):
     """``out.at[index].add(vmap(fn)(*xs))`` in chunks of ``c`` cells, WITHOUT materialising the per-cell
-    result: each chunk scatter-adds straight into ``out``. Padding rows repeat the last cell and scatter to
-    an out-of-range index, which ``mode="drop"`` discards."""
+    result: each chunk scatter-adds straight into ``out``.
+
+    When ``c`` does not divide the cell count the LAST chunk is slid back to end at the last cell, and the
+    cells it shares with the previous chunk scatter to an out-of-range index that ``mode="drop"`` discards.
+    Nothing is padded. Padding used to concatenate a filler tail onto every input -- a full copy of each,
+    the index block included: on a 24^3 P1/P1 Navier-Stokes tangent that was 81 MiB of index copies (the
+    one-int32-per-raw-triplet scatter map) in the compiled march, for 7 filler cells. The overlap costs at
+    most one chunk of element work, which the filler tail cost too."""
     n = xs[0].shape[0]
     nb = -(-n // c)
-    pad = nb * c - n
+    if nb * c == n:
+        blocks = tuple(x.reshape((nb, c) + x.shape[1:]) for x in xs) + (index.reshape((nb, c) + index.shape[1:]),)
 
-    def padded(x, fill):
-        if not pad:
-            return x
-        return jnp.concatenate([x, jnp.broadcast_to(fill, (pad,) + x.shape[1:]).astype(x.dtype)])
+        def body(acc, blk):
+            r = jax.vmap(fn)(*blk[:-1])
+            return acc.at[blk[-1].reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
-    xs_p = [padded(x, x[-1]) for x in xs]
-    idx_p = padded(index, out.shape[0])
-    blocks = tuple(x.reshape((nb, c) + x.shape[1:]) for x in xs_p) + (idx_p.reshape((nb, c) + index.shape[1:]),)
+        return jax.lax.scan(body, out, blocks)[0]
 
-    def body(acc, blk):
-        r = jax.vmap(fn)(*blk[:-1])
-        return acc.at[blk[-1].reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
+    def body_slid(acc, i):
+        start = jnp.minimum(i * c, n - c)  # the last chunk ends at the last cell instead of running past it
+        blk = [jax.lax.dynamic_slice_in_dim(x, start, c) for x in xs]
+        idx = jax.lax.dynamic_slice_in_dim(index, start, c)
+        fresh = (start + jnp.arange(c)) >= i * c  # cells the previous chunk has not already added
+        idx = jnp.where(fresh.reshape((c,) + (1,) * (idx.ndim - 1)), idx, out.shape[0])
+        r = jax.vmap(fn)(*blk)
+        return acc.at[idx.reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
-    return jax.lax.scan(body, out, blocks)[0]
+    return jax.lax.scan(body_slid, out, jnp.arange(nb))[0]
 
 
 def elem_map(fn, xs, chunk, *, scatter=None):
