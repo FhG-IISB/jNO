@@ -289,8 +289,16 @@ fem = jno.fem([momentum, continuity,
 ```
 
 !!! warning "Scope"
-    A **transient** tie is still scalar-only (that route pre-builds its own reduction), and refuses by
-    name. A tie combined with `u.gap` assembles but solves to a **deferred trace node** rather than an
+    A tie works on a **transient** form as on a steady one: a single field, scalar or vector, first or
+    second order in time (`u.t`, `u.tt`), linear or nonlinear, with constant or time-varying wall data
+    `g(x, t)`; and a coupled first-order system. Measured: a vector march equals two scalar marches of
+    the same equation to 1e-10 with the seam equal node for node, and the mortar patch test marched in
+    time stays on the linear field to 1e-17 (`tests/test_fem_periodic_transient_vector.py`,
+    `tests/test_fem_vector_tie.py`). Refused by name: a tie on a **coupled** `u_tt` form; a **complex**
+    transient with a time-varying Dirichlet value (not wired with or without a tie); a Bloch tie on a
+    real transient (see [solvers](../solvers.md)).
+
+    A tie combined with `u.gap` assembles but solves to a **deferred trace node** rather than an
     array, because the gap marks the form structurally nonlinear and a reduced nonlinear system stays
     lazy so its node can flow into `jno.core` for an inverse problem. Evaluate it the way
     `tests/test_fem_periodic_unstructured.py::test_periodic_nonlinear_reaction_diffusion` does, via a

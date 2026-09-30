@@ -747,10 +747,9 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     Note: a runtime-*scalar* parameter AND a single-field nodal FIELD parameter k(x) are allowed here
     (this gate only runs on single-field problems -- multifield returns earlier). The transient call
     sites add their own runtime-parameter exclusion (native transient-parametric is not wired yet).
-    Periodic ties are allowed here for the steady scalar single-field case (the caller scopes out the
-    transient / vector / parametric periodic sub-cases, which build the reduction in their own
-    branches); the reduction (``_build_periodic_reduction``) is fed the native assembly cells in
-    ``_finalize``.
+    Periodic ties are allowed here. A steady tie is reduced in ``_finalize`` (``_build_periodic_reduction``
+    fed the native assembly cells); a single-field TRANSIENT tie, scalar or vector, builds its reduction in
+    its own branch of :func:`fem`, and a coupled one goes through ``_finalize`` block by block.
     """
     if getattr(domain, "dimension", None) not in (2, 3):
         return False
@@ -7235,26 +7234,26 @@ def _fem_impl(
             )
         return _finalize(FEM(domain=domain, op=block, classification=classification, mode="transient"))
 
-    # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble
-    # the full native transient block, build the prolongation P from the native assembly mesh, then
-    # reduce the block (P^T M P, P^T·operator_fn·P, ...). The reduced block carries P, so its trajectory
-    # prolongs back with u = P u_red. This is the optimized scalar single-field fast path; vector and
-    # coupled multi-field fall through to the general assembly + `_finalize` block-wise reduction. ----
+    # ---- native periodic transient (single field, scalar or vector; linear or nonlinear, incl.
+    # runtime-parametric): assemble the full native transient block, build the prolongation P from the
+    # native assembly mesh, then reduce the block (P^T M P, P^T·operator_fn·P, ...). The reduced block
+    # carries P, so its trajectory prolongs back with u = P u_red. A vector field needs nothing extra:
+    # the tie's node-pair weights expand componentwise, `kron(P_node, I_vec)`, exactly as on the steady
+    # path and the coupled transient (whose per-field blocks are this same call with each field's vec).
+    # Coupled multi-field falls through to the general assembly + `_finalize` block-wise reduction. ----
     if (
         not is_vpinn
         and periodic_ties
         and is_transient
         and not multifield
-        and (vec or 1) == 1
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not _is_complex_form(domain, ir)
-        and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
     ):
         from .utils.solver.fem_native import assemble_fem_native
 
         domain._fem_problem = None
         op, mode, offs = assemble_fem_native(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
         )
         if mode != "transient":
             # fail loud rather than silently mis-reduce a steady/nonlinear op as a time block
@@ -7268,7 +7267,7 @@ def _fem_impl(
             domain._fem_native_dof_points,
             domain._fem_native_assembly_cells,
             int(getattr(domain, "_fem_native_assembly_order", 1)),
-            1,
+            vec or 1,
             exclude_dofs=[int(d) for d, _g in _tdp] + _ttv,
         )
         reduced = _reduce_transient_block_periodic(op, _annotate_reduced_dirichlet(periodic, _tdp, _ttv))
@@ -7442,12 +7441,18 @@ def _fem_impl(
     _parametric = any(_crp(b) for b in weak_bares)
     _nonlinear = any(_nlin(domain, b) for b in weak_bares)
     if periodic_ties:
+        # Every standard single-field tie has returned above: steady or transient (first or second order
+        # in time), scalar or vector, linear or nonlinear, with constant or time-varying Dirichlet data,
+        # real or complex. What reaches here is a combination no route assembles; say which.
+        _tv_dir = any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
         raise NotImplementedError(
-            "jno.fem: a periodic tie on a TRANSIENT form is supported on a scalar single field only "
-            f"(the transient route pre-builds its own reduction). This form has vec={vec or 1}, "
-            f"nonlinear={_nonlinear}, parametric+steady={_parametric and not is_transient}. A STEADY "
-            "vector tie is supported — drop the time derivative, write the field as a scalar, or drop "
-            "the periodic tie."
+            "jno.fem: this single-field form with a periodic tie matched no assembly route. The form is "
+            f"transient={bool(is_transient)}, complex={bool(_is_complex_form(domain, ir))}, "
+            f"time-varying Dirichlet={_tv_dir}, vec={vec or 1}, nonlinear={_nonlinear}, "
+            f"parametric={_parametric}, dimension={getattr(domain, 'dimension', None)}. A tie is supported "
+            "on steady and transient single-field Lagrange forms, scalar or vector, linear or nonlinear, "
+            "real or complex; a COMPLEX transient with a time-varying Dirichlet value is not wired (with or "
+            "without a tie). Hold the Dirichlet value constant in time, or drop the tie."
         )
     raise NotImplementedError(
         "jno.fem: this single-field weak form is not handled by the native assembler. Please report the "

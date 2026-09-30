@@ -254,25 +254,46 @@ def test_one_interface_tied_and_another_in_contact_on_the_same_field():
     assert fem._periodic is not None and fem._periodic.get("n_red") < fem._periodic.get("n_full")
 
 
-def test_a_transient_vector_tie_still_refuses_and_names_the_steady_case():
-    """Scope preserved and stated: the transient route pre-builds its own reduction, which is still
-    scalar. The message must point at what DOES work rather than repeating the old blanket refusal."""
-    d = _split_box(0.5).domain_like() if False else _split_box(0.5)
+def _transient_patch(tie):
+    """The patch test marched in time: ``u_t = ∇·ε(u)`` on the tied stack, the linear field ``L`` held on
+    the outer boundary and taken as the initial state. ``L`` is an equilibrium of the TIED body, so the
+    march must stay on it; it is not one of two untied bodies (``L`` carries a constant stress, whose
+    traction on a free interface is not zero). Returns ``max |u - L|`` over the trajectory, and ``|L|``."""
     d = (
         jno.shape.regions(lower=jno.shape.box(0, 0, 0, 1, 1, 1), upper=jno.shape.box(0, 0, 1, 1, 1, 2), conforming=False)
         .sized(0.5)
-        .domain(time=(0.0, 1.0, 4))
+        .domain(time=(0.0, 0.2, 4))
     )
     u, phi = d.fem_symbols(value_shape=(3,))
     co = d.variable("interior", split=True)
-    ui, vi = u.bind(x=co[0], y=co[1], z=co[2], t=co[-1]), phi.bind(x=co[0], y=co[1], z=co[2], t=co[-1])
     X = [co[0], co[1], co[2]]
-    sec, main = _sides(d)
-    sv, mv = d.variable(sec, split=True), d.variable(main, split=True)
-    with pytest.raises(NotImplementedError, match="TRANSIENT"):
-        jno.fem(
-            [
-                n.inner(ui.t, vi, 1) + n.inner(n.symgrad(ui, X), n.symgrad(vi, X), 2),
-                u(sv[0], sv[1], sv[2]) - u(mv[0], mv[1], mv[2]),
-            ]
-        )
+    ui, vi = u.bind(x=co[0], y=co[1], z=co[2], t=co[-1]), phi.bind(x=co[0], y=co[1], z=co[2], t=co[-1])
+    ob = d.variable(
+        "outer",
+        where=lambda x, y, z: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9) | (z < 1e-9) | (z > 2 - 1e-9),
+        split=True,
+    )
+    c0 = d.variable("initial", split=True)
+    L = lambda P, k: _A[k, 0] * P[0] + _A[k, 1] * P[1] + _A[k, 2] * P[2] + _C[k]  # noqa: E731
+    terms = [n.inner(ui.t, vi, 1) + n.inner(n.symgrad(ui, X), n.symgrad(vi, X), 2)]
+    terms += [u(ob[0], ob[1], ob[2])[k] - L(ob, k) for k in range(3)]
+    terms += [u(c0[0], c0[1], c0[2])[k] - L(c0, k) for k in range(3)]
+    if tie:
+        sec, main = _sides(d)
+        sv, mv = d.variable(sec, split=True), d.variable(main, split=True)
+        terms.append(u(sv[0], sv[1], sv[2]) - u(mv[0], mv[1], mv[2]))
+    s = jno.fem(terms).solve()
+    Y = np.asarray(s.fn() if hasattr(s, "fn") else s)
+    lin = _linear_field(np.asarray(d.built_mesh.points))
+    return float(np.abs(Y.reshape(Y.shape[0], -1, 3) - lin[None]).max()), float(np.abs(lin).max())
+
+
+def test_a_transient_vector_tie_holds_the_patch_field():
+    """A tie on a single-field VECTOR transient used to be refused ("scalar single field only"), although
+    the reduction is the steady one, ``kron(P_node, I_vec)``. The transient patch test pins it: the tied
+    march stays on the linear field to round-off, while the same march without the tie drifts off it --
+    so the tie is what holds it there, not the boundary data alone."""
+    tied, scale = _transient_patch(tie=True)
+    free, _scale = _transient_patch(tie=False)
+    assert tied < 1e-12 * max(scale, 1.0), f"tied transient patch test off by {tied:.3e}"
+    assert free > 1e-4 * scale, f"the untied control should leave the linear field (off by {free:.3e})"
