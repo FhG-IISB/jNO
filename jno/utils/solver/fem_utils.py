@@ -1484,7 +1484,7 @@ def _eval_integrand(domain, node, local):
                 "steady, native-Lagrange path (2D/3D, single-field or coupled), marched over a "
                 "`domain(tau=(start, end, n))` pseudo-time grid by a plain `fem.solve()` — nothing is "
                 "passed to it. Not carried by: 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, "
-                "a nonlocal `jno.Coupling` term, a `u.t` transient, or a complex form."
+                "a `u.t` transient, or a complex form."
             )
         buf_c = table[node.history_key]  # (n_quad, depth, *value_shape) for this cell
         return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)

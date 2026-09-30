@@ -5747,7 +5747,10 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     ``field_key`` acts on that field's DOF sub-block (multifield, e.g. radiation on T in a heat+flow system);
     without one it acts on the whole vector (single field). For a **transient** form the coupling enters each
     implicit step: a nonlinear time block gains the term in its residual, a linear one is promoted to a
-    nonlinear (backward-Euler) block -- so e.g. enclosure radiation over a heating cycle solves in-residual."""
+    nonlinear (backward-Euler) block -- so e.g. enclosure radiation over a heating cycle solves in-residual.
+    On a step-history form (``.i(k)`` / ``.evolves`` over ``domain(tau=...)``) the coupling enters every
+    load step's residual: the wrapped operator keeps the history layout and state readout that make
+    ``fem.solve()`` march, and passes the step's load-path time through to the local residual."""
     if fem_obj._mode not in ("linear", "nonlinear", "transient"):
         raise NotImplementedError(f"jno.fem: nonlocal Coupling terms are not supported for mode {fem_obj._mode!r}.")
     n = int(fem_obj.dofs)
@@ -5850,12 +5853,25 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     else:  # already a nonlinear residual operator -> add the coupling
         base_residual = op.residual
 
-        def residual(u, args=None, _base=base_residual):
-            return jnp.asarray(_base(u, args)).reshape(-1) + coupling_residual(u, args)
+        # `*rest` carries the load-path time: a step-history form's residual is `R(u, args, tau)`, called
+        # so by the `domain(tau=...)` march. A keyword default here swallowed it -- tau landed in `_base`.
+        def residual(u, args=None, *rest, _base=base_residual):
+            return jnp.asarray(_base(u, args, *rest)).reshape(-1) + coupling_residual(u, args)
 
-        fem_obj._op = FemResidualOperator(
+        wrapped = FemResidualOperator(
             residual, jacobian_fn=None, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
         )
+        # Everything else the assembler hung on the operator describes the SAME problem and must survive
+        # the wrap: the step-history layout and state readout that make `fem.solve()` march a
+        # `domain(tau=...)` grid (dropped, the march never started and the first residual raised on an
+        # unbuffered `u.i(-1)`), the load-path fields, the derived-field rules, the contact search and
+        # the Dirichlet DOF set. Only what the wrap changes is not copied: the residual; the tangent,
+        # which cannot see the opaque coupling (the solve goes matrix-free, as for every Coupling); and
+        # the runtime parameters, now merged with the coupling's.
+        for _k, _v in vars(op).items():
+            if _k not in ("residual", "jacobian", "runtime_parameter_exprs"):
+                setattr(wrapped, _k, _v)
+        fem_obj._op = wrapped
     return fem_obj
 
 
