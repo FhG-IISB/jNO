@@ -397,7 +397,9 @@ def test_the_default_save_grid_returns_the_trajectory_without_resampling(monkeyp
     workspace, which is what made a 6000-step x 18k-DOF case fail to allocate 5.72 GiB on an 8 GB card.
 
     Pinned because the check is inside a broad `except`: when this was refactored, a NameError in the
-    comparison silently sent every march down the slow path with nothing said."""
+    comparison silently sent every march down the slow path with nothing said.
+
+    An EAGER march now goes further: it gathers its on-grid frames and never blends at all."""
     import jno.utils.solver.backend_blocks as bb
 
     orig, fired = bb._resample_trajectory, []
@@ -411,7 +413,7 @@ def test_the_default_save_grid_returns_the_trajectory_without_resampling(monkeyp
     for scheme in (jno.solve.theta(1.0), jno.solve.bdf2()):
         fired.clear()
         _heat(6).solve(time=scheme).fn()
-        assert fired == [True], f"{scheme!r}: the identity fast path did not fire ({fired})"
+        assert fired == [], f"{scheme!r}: an eager march blended frames that sit on the grid ({fired})"
 
 
 def _on_boundary(fem):

@@ -2267,7 +2267,9 @@ class FEM:
           n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
           ``dt``, each step solved by the same default Newton; ``save_ts=`` overrides
           the sample times, default the domain's time grid). For a custom integrator build it
-          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``.
+          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``. Evaluated eagerly,
+          the built-in schemes keep only the states the ``save_ts`` frames read and return a HOST NumPy
+          array; under ``jit``/``grad`` the march stays one scan (docs: solvers, "What a march keeps").
 
         Enable x64 — the assembly is float64.
 

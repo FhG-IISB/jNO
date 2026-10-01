@@ -586,6 +586,10 @@ class SemidiscreteTimeBlock:
         ``values`` (what ``fem.solve(k=2.0)`` passes) marches at those parameter values NOW and returns the
         trajectory array, as the steady solves do; every runtime parameter must be named.
 
+        Evaluated eagerly, the built-in schemes keep only the states the ``save_ts`` frames read -- no past on
+        the device -- and the trajectory comes back as a HOST NumPy array (see :func:`_march_to_host`). Under
+        ``jit``/``grad`` the march stays one ``lax.scan``, and the result a traced array.
+
         Enable x64 (``jax_enable_x64``); the assembly is float64.
         """
         from ...trace import FunctionCall  # lazy: avoid an import cycle with jno.trace
@@ -631,6 +635,9 @@ class SemidiscreteTimeBlock:
                         "not timed: .fn() returns asynchronously, and timing it would force a device "
                         "sync — wrap it in jax.block_until_ready yourself to time it"
                     )
+            import numpy as _np
+
+            on_host = isinstance(ys, _np.ndarray)  # an eager march handed its frames to the host
             if self.prolongation is not None:
                 # Periodic tie: the block integrates in the reduced main-DOF space. Prolong each saved
                 # step ``u = P·u_red`` back to the full nodal layout, so the returned trajectory lives on the
@@ -639,7 +646,7 @@ class SemidiscreteTimeBlock:
                 # periodic transient hands back reduced DOFs a caller then mis-slices with full offsets.
                 import jax
 
-                ys = jax.vmap(self.prolong)(ys)
+                ys = _prolong_on_host(self, ys) if on_host else jax.vmap(self.prolong)(ys)
             if (self.metadata or {}).get("complex"):
                 # A complex transient integrates as the real-equivalent 2n block over y=[u_r; u_i].
                 # Recombine ONCE, here, after any periodic prolongation -- P is real and linear, so
@@ -659,6 +666,25 @@ class SemidiscreteTimeBlock:
             check_runtime_values(names, values)
             return _solve(*(jnp.asarray(values[n]) for n in names))
         return FunctionCall(_solve, params, name="fem_transient_solve")
+
+
+def _prolong_on_host(block, ys):
+    """``P u_red`` for every frame of a HOST trajectory, the full layout back on the host.
+
+    The frames go through the device in batches no larger than a march chunk (:func:`_offload_chunk`):
+    prolonging them all at once would rebuild the whole (now full-size) trajectory on the device, which
+    is what handing the frames to the host avoided."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    n_full = int(jnp.shape(block.prolong(jnp.zeros((ys.shape[1],), ys.dtype)))[0])
+    k = _offload_chunk(ys.shape[0], n_full, ys.dtype)
+    run = jax.jit(jax.vmap(block.prolong))
+    out = np.empty((ys.shape[0], n_full), dtype=ys.dtype)
+    for a in range(0, ys.shape[0], k):
+        out[a : a + k] = np.asarray(run(jnp.asarray(ys[a : a + k])))
+    return out
 
 
 def _block_time_grid(block):
@@ -717,7 +743,8 @@ def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, t
             out.append(ys[_np.flatnonzero(keep)])
         done += k
         lo = hi
-    return jnp.concatenate(out, axis=0)
+    # An eager chunk hands back HOST frames: join them there, not on the device.
+    return _np.concatenate(out, axis=0) if all(isinstance(o, _np.ndarray) for o in out) else jnp.concatenate(out, axis=0)
 
 
 def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None, theta=None):
@@ -769,8 +796,9 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # step is a linear solve with its own guard and is not judged here.
     _judge = bool(block.is_nonlinear())
 
-    def march(s0, grid_ts, args):
-        blk = hoist_time_invariant(block, args, grid_ts[0])  # static loads/operators: once, not per step
+    def make_step(args, t_start):
+        """One implicit step, the block's static loads/operators hoisted once at ``t_start``."""
+        blk = hoist_time_invariant(block, args, t_start)  # static loads/operators: once, not per step
 
         def step(w, t_next):
             out = blk.step(
@@ -788,7 +816,47 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
             wn, r_end, r_start = out
             return wn, (wn, r_end, r_start)
 
-        return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+        return step
+
+    def march(s0, grid_ts, args):
+        return jax.lax.scan(jax.checkpoint(make_step(args, grid_ts[0])), s0, grid_ts[1:])[1]
+
+    if _march_eagerly(args, save_ts):
+        # Evaluated eagerly: march in chunks and hand each chunk's frames to the host as it goes, so the
+        # device never holds the past (see `_march_to_host`). Returns a host array.
+        import numpy as np
+
+        from .history_march import _TRANSIENT_ADVICE, _check_march_converged
+
+        grid_np = np.asarray(grid_ts, dtype=float)
+
+        def _verdict(r_end, r_start, n_done, final, unchanged):
+            _check_march_converged(
+                r_end,
+                r_start,
+                grid_np[1 : n_done + 1],
+                nonlinear_solve,
+                what="transient march",
+                coord="t",
+                advice=_TRANSIENT_ADVICE,
+                unchanged=unchanged,
+            )
+
+        return _march_to_host(
+            block,
+            args,
+            (linear_solve, nonlinear_solve, theta, dt),
+            make_step,
+            s0,
+            grid_np,
+            dtype,
+            save_ts,
+            state_of=lambda c: c,
+            prefix_ts=grid_np[:1],
+            prefix_states=[s0],
+            judge=_verdict if _judge else None,
+            skip_first_compare=True,  # the one-scan guard compared the produced states, not s0
+        )
 
     # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
     # residuals (the rhs, the θ-combination, the Krylov solve's saved primals — measured ~32 vectors
@@ -1107,6 +1175,242 @@ def _sharded_transient(block, args, save_ts, linear_solve, nonlinear_solve, thet
         return _default_transient_integrate(local, args, save_ts, theta=theta)
 
     return jax.jit(march, in_shardings=(split, split, split, split), out_shardings=repl)(Md, Mi, Ad, Ai)
+
+
+#: An eager march keeps at most this fraction of the solving device's memory in stacked states at once
+#: (``bytes_limit // _OFFLOAD_BUDGET_DIVISOR``): the chunk in flight. A policy relative to the device the
+#: march runs on, not a number tuned on one card.
+_OFFLOAD_BUDGET_DIVISOR = 16
+
+
+def _offload_chunk(n_steps, n_dofs, dtype):
+    """Steps per chunk for an eager march that hands its frames to the host as it goes.
+
+    Sized from the solving device's own memory limit. A device that reports none (the CPU) IS the host
+    memory, so there is nothing to protect and the march runs as one chunk."""
+    import numpy as np
+
+    from .placement import solve_device
+
+    try:
+        stats = solve_device().memory_stats() or {}
+    except Exception:  # noqa: BLE001 - a backend without memory stats: treat as host memory
+        stats = {}
+    limit = stats.get("bytes_limit")
+    if not limit:
+        return int(n_steps)
+    per_step = max(1, int(n_dofs) * np.dtype(dtype).itemsize)
+    return int(max(1, min(n_steps, (int(limit) // _OFFLOAD_BUDGET_DIVISOR) // per_step)))
+
+
+def _chunk_bounds(n_steps, k):
+    """``[(a, b), ...]`` step ranges of at most ``k`` steps covering ``0..n_steps``. Equal lengths when a
+    divisor of ``n_steps`` lies in ``[k/2, k]`` -- every chunk then runs ONE compiled program; otherwise
+    full chunks and a shorter tail (one more compile)."""
+    k = max(1, min(int(k), int(n_steps)))
+    for d in range(k, (k + 1) // 2 - 1, -1):
+        if d > 0 and n_steps % d == 0:
+            k = d
+            break
+    return [(a, min(a + k, n_steps)) for a in range(0, n_steps, k)]
+
+
+def _march_eagerly(args, save_ts):
+    """True when the march runs on concrete values: no trace is active and nothing handed in is traced.
+    Then it can hand its frames to the host as it goes. Under ``jit``/``grad``/``vmap`` -- even of a form
+    with no parameter, whose inputs are all concrete -- it stays one ``lax.scan`` (the adjoint needs the
+    states anyway)."""
+    import jax
+    from jax._src import core as _core
+
+    if not _core.trace_state_clean():
+        return False
+    return not any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves((args, save_ts)))
+
+
+def _needed_steps(grid_np, save):
+    """The steps of a march over ``grid_np`` whose states the frames at ``save`` read.
+
+    Index 0 is the march's start state, ``j >= 1`` the state after step ``j``. A save time on a grid point
+    reads that point; one between two reads both (the blend of :func:`_resample_trajectory`); one past the
+    end reads the last state. Save times at or before ``grid_np[0]`` belong to whatever came before."""
+    import numpy as np
+
+    n = int(grid_np.size) - 1
+    s = save[save > grid_np[0]]
+    hi = np.clip(np.searchsorted(grid_np, s, side="right"), 1, n)
+    lo = hi - 1
+    on_grid = grid_np[lo] == s
+    past_end = s >= grid_np[n]
+    need = np.concatenate([lo[on_grid & ~past_end], hi[~on_grid | past_end], lo[~on_grid & ~past_end]])
+    return np.unique(need[need >= 1])
+
+
+def _frame_chunks(n_steps, needed, budget_frames):
+    """Chunk bounds ``[(a, b)]`` over ``0..n_steps`` and the most needed states any chunk holds.
+
+    The device holds a chunk's needed states (its save slots) and nothing else of the march, so the bound is
+    on NEEDED states per chunk, not on steps: a march that saves 10 frames of 10^4 steps is one chunk."""
+    import numpy as np
+
+    budget = max(1, int(budget_frames))
+    if needed.size <= budget:
+        return [(0, n_steps)], max(1, int(needed.size))
+    k = max(1, (n_steps * budget) // max(1, int(needed.size)))
+    while True:
+        bounds = _chunk_bounds(n_steps, k)
+        per = [int(((needed > a) & (needed <= b)).sum()) for a, b in bounds]
+        if max(per) <= budget or k == 1:
+            return bounds, max(1, max(per))
+        k = max(1, (k * budget) // max(per))
+
+
+def _march_to_host(
+    block,
+    args,
+    config,
+    make_step,
+    carry0,
+    grid_np,
+    dtype,
+    save_ts,
+    *,
+    state_of,
+    prefix_ts,
+    prefix_states,
+    judge=None,
+    skip_first_compare=False,
+    cache=True,
+):
+    """Run a march and return its frames at ``save_ts`` as a HOST array; the device keeps no past steps.
+
+    ``make_step(args, t_start)`` returns the scheme's ``step(carry, t_next) -> (carry, out)``, with ``out``
+    the new state, or ``(state, *residuals)`` when ``judge`` is given; ``state_of(carry)`` is the state in a
+    carry. ``prefix_ts`` / ``prefix_states`` are the states the scheme already has at and before
+    ``grid_np[0]`` (the initial state; BDF2's start-up step).
+
+    **No past on the device.** Each step writes its state into a slot of a small buffer when a frame will
+    read it -- a save time's grid point, or the two points either side of an off-grid one -- and into one
+    scratch row otherwise. The device holds the save slots and the current state, never the steps between.
+    The march runs in chunks only when the save slots would outgrow ``1/_OFFLOAD_BUDGET_DIVISOR`` of the
+    device (:func:`_frame_chunks`); each chunk's frames are then sampled on the device -- gathered on the
+    grid, blended by :func:`_resample_trajectory` off it, the arithmetic of the one-scan path -- their copy
+    to the host started, and the next chunk queued before they are collected. Nothing runs inside the
+    compiled step: no callback, no sync.
+
+    ``judge(r_end, r_start, n_steps_done, final, unchanged)`` sees every step's residuals so far as host
+    arrays, one chunk behind the march, so a diverged step raises before the rest is returned.
+    ``unchanged`` (final call) is whether no step changed the state -- carried through the scan as one flag
+    (``skip_first_compare`` leaves the first step out, for a march whose start state is not a state the
+    one-scan guard compared).
+
+    ``cache=False`` compiles the chunk afresh for this call instead of through :func:`_cached_march`, for a
+    ``make_step`` that closes over values derived from ``args`` (the cache would replay the first call's)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    save = np.asarray(save_ts, dtype=float).reshape(-1)
+    n = int(grid_np.size) - 1
+    n_dofs = int(jnp.shape(state_of(carry0))[-1])
+    needed = _needed_steps(grid_np, save)
+    # The device's budget in states (`_offload_chunk`: all of them where the device is the host memory).
+    chunks, n_slots = _frame_chunks(n, needed, _offload_chunk(n, n_dofs, dtype))
+    judged = judge is not None
+
+    def chunk_march(ext, grid, slots, compare, args):
+        step = make_step(args, grid[0])
+
+        def body(c, x):
+            carry, buf, same = c
+            t_next, slot, cmp = x
+            carry, out = step(carry, t_next)
+            st = out[0] if judged else out
+            buf = jax.lax.dynamic_update_slice(buf, st[None, :].astype(buf.dtype), (slot, jnp.zeros_like(slot)))
+            if judged:
+                same = same & (~cmp | jnp.all(st == state_of(c[0])))
+            return (carry, buf, same), (tuple(out[1:]) if judged else None)
+
+        return jax.lax.scan(jax.checkpoint(body), ext, (grid[1:], slots, compare))
+
+    out = np.empty((save.size, n_dofs), dtype=np.dtype(dtype))
+    landed = []  # (rows, device frames) whose host copy is under way
+
+    def _ship(rows, fr):
+        fr.copy_to_host_async()
+        landed.append((rows, fr))
+
+    def _land():
+        for rows, fr in landed:
+            out[rows] = np.asarray(fr)
+        landed.clear()
+
+    def _sample(states, ts_local, rows):
+        """Frames at ``save[rows]`` from ``states`` (rows of a trajectory on the grid points ``ts_local``)."""
+        ts = save[rows]
+        hit = np.searchsorted(ts_local, ts)
+        if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
+            return states[jnp.asarray(hit)]
+        return _resample_trajectory(states, jnp.asarray(ts_local, dtype), ts, dtype)
+
+    t_prev = float(grid_np[0])
+    rows = np.flatnonzero(save <= t_prev)
+    if rows.size:
+        pts = jnp.stack([jnp.asarray(p, dtype) for p in prefix_states])
+        _ship(rows, _sample(pts, np.asarray(prefix_ts, dtype=float), rows))
+    prev = jnp.asarray(prefix_states[-1], dtype)
+    carry = carry0
+    run = None if cache else jax.jit(lambda e, g, sl, cm: chunk_march(e, g, sl, cm, args))
+    res, res_dev, flags = [], None, []
+    for ci, (a, b) in enumerate(chunks):
+        mine = needed[(needed > a) & (needed <= b)]  # global step indices this chunk keeps
+        slots = np.full((b - a,), n_slots, dtype=np.int32)  # the scratch row
+        slots[mine - a - 1] = np.arange(mine.size, dtype=np.int32)
+        compare = np.ones((b - a,), dtype=bool)
+        if skip_first_compare and a == 0:
+            compare[0] = False
+        ext = (carry, jnp.zeros((n_slots + 1, n_dofs), dtype), jnp.asarray(True))
+        g = jnp.asarray(grid_np[a : b + 1], dtype)
+        if cache:
+            (carry, buf, same), r = _split_cached_march(
+                block, args, (*config, "to_host"), chunk_march, ext, g, jnp.asarray(slots), jnp.asarray(compare), args
+            )
+        else:
+            (carry, buf, same), r = run(ext, g, jnp.asarray(slots), jnp.asarray(compare))
+        last = ci == len(chunks) - 1
+        rows = np.flatnonzero((save > t_prev) & ((save <= grid_np[b]) | last))
+        frames = None
+        if rows.size:
+            states = jnp.concatenate([prev[None, :], buf[: mine.size]], axis=0)
+            frames = _sample(states, np.concatenate([[t_prev], grid_np[mine]]), rows)
+        if judged:
+            for x in (*r, same):
+                x.copy_to_host_async()
+        # This chunk is queued: collect the PREVIOUS one's frames and verdict while it runs.
+        _land()
+        if judged:
+            if res_dev is not None:
+                res.append(tuple(np.asarray(x) for x in res_dev))
+                judge(*_stack_residuals(res), int(a), False, None)
+            res_dev = r
+            flags.append(same)
+        if frames is not None:
+            _ship(rows, frames)
+        prev = state_of(carry)
+        t_prev = float(grid_np[b])
+        del buf, frames
+    _land()
+    if judged:
+        res.append(tuple(np.asarray(x) for x in res_dev))
+        judge(*_stack_residuals(res), n, True, bool(all(bool(np.asarray(f)) for f in flags)))
+    return out
+
+
+def _stack_residuals(res):
+    """Concatenate per-chunk host residual tuples along the step axis."""
+    import numpy as np
+
+    return tuple(np.concatenate([r[i] for r in res], axis=0) for i in range(len(res[0])))
 
 
 def _resample_trajectory(traj, grid_ts, save_ts, dtype):

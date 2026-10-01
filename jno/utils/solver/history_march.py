@@ -680,7 +680,7 @@ _TRANSIENT_ADVICE = (
 
 
 def _check_march_converged(
-    r_end, r_start, grid, solve_fn=None, *, states=None, what="load-path march", coord="τ", advice=None
+    r_end, r_start, grid, solve_fn=None, *, states=None, what="load-path march", coord="τ", advice=None, unchanged=None
 ):
     """Raise if any step of a ``lax.scan`` march returned a non-root.
 
@@ -701,6 +701,9 @@ def _check_march_converged(
     No-op on tracers: under ``jax.grad`` of a runtime-parametric march the norms are themselves traced,
     and the same trade applies as everywhere else in jNO — under a transform the solver's iteration cap
     is all there is.
+
+    ``unchanged`` stands in for ``states`` when the march never held its trajectory (a march that handed
+    its frames to the host chunk by chunk): whether every state equals the first one.
     """
     if any(isinstance(v, jax.core.Tracer) for v in (r_end, r_start)):
         LAST_MARCH_STATS.clear()
@@ -716,7 +719,7 @@ def _check_march_converged(
     _record_march(what=what, coord=coord, grid=grid, residual=r_end, bound=bound)
     bad = ~np.isfinite(r_end) | (r_end > bound)
     if not bad.any():
-        _check_march_moved(r_end, r_start, bound, rtol, atol, states=states, what=what)
+        _check_march_moved(r_end, r_start, bound, rtol, atol, states=states, what=what, unchanged=unchanged)
         return
     k = int(np.argmax(bad))
     tau_k = float(np.asarray(grid)[k]) if np.asarray(grid).size > k else float("nan")
@@ -728,7 +731,7 @@ def _check_march_converged(
     )
 
 
-def _check_march_moved(r_end, r_start, bound, rtol, atol, *, states=None, what="load-path march"):
+def _check_march_moved(r_end, r_start, bound, rtol, atol, *, states=None, what="load-path march", unchanged=None):
     """Raise if no step of the march took a single Newton update — the trajectory IS its initial state.
 
     ``atol`` is an ABSOLUTE floor, and a weak form carries whatever residual scale its units give it. A
@@ -761,11 +764,15 @@ def _check_march_moved(r_end, r_start, bound, rtol, atol, *, states=None, what="
     # and r_end == r_start at machine precision (measured 1.07e-12 .. 2.68e-12 over four steps). What
     # distinguishes that from the pathology is the TRAJECTORY -- the claim being made here is that it is
     # the initial state. So the states decide, and without them there is no evidence to raise on.
-    if states is None:
+    if unchanged is not None:
+        if not unchanged:
+            return
+    elif states is None:
         return
-    s = np.asarray(states)
-    if isinstance(states, jax.core.Tracer) or s.size == 0 or not np.all(s == s[0]):
-        return
+    else:
+        s = np.asarray(states)
+        if isinstance(states, jax.core.Tracer) or s.size == 0 or not np.all(s == s[0]):
+            return
     raise RuntimeError(
         f"fem.solve: the {what} returned its INITIAL STATE unchanged — no step took a single Newton "
         f"update. Every step's residual passed the convergence test at the incoming iterate "

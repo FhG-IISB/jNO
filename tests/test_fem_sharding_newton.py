@@ -158,9 +158,10 @@ def test_the_split_solve_matches_one_device(one, n_dev):
     assert many["param_devices"] == n_dev and many["param_opt_out_devices"] == 1
     assert many["param_diff"] < 1e-11
     assert abs(many["grad"] - one["grad"]) < 1e-10 * abs(one["grad"]), (many["grad"], one["grad"])
-    # the march split its residual inside the scan, and opting out did not
-    assert many["march_devices"] == n_dev and many["march_split"] > 0
-    assert many["march_opt_out_devices"] == 1 and many["march_opt_out_split"] == 0
+    # the march split its residual inside the scan, and opting out did not. (Its frames come back on the
+    # HOST -- an eager march keeps no trajectory on the devices -- so the split is read off the residual.)
+    assert many["march_devices"] == 0 and many["march_split"] > 0
+    assert many["march_opt_out_devices"] == 0 and many["march_opt_out_split"] == 0
     # BDF2, SDIRK and Rosenbrock take the same split (Rosenbrock: its residuals; the stage matrix is one device's)
     for name in ("bdf2", "sdirk", "rosenbrock"):
         assert one[f"march_{name}_split"] == 0 and many[f"march_{name}_split"] > 0, name

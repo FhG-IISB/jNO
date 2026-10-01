@@ -1293,6 +1293,24 @@ The same flag exists on `jno.core(...).solve(profile=True)` (see
 
 ## Transient problems
 
+### What a march keeps — only the frames you ask for
+
+Evaluated eagerly (`fem.solve(...).fn()`, `fem.solve(k=2.0)`), a march keeps **no past on the device**.
+Each step writes its state into a save slot when a frame at `save_ts` will read it (a save time on the
+grid, or the two grid points either side of one off it) and into a scratch row otherwise, and the frames
+come back as a **host NumPy array**. Saving every step of a march whose frames would outgrow 1/16 of the
+device runs it in chunks: each chunk's frames are copied out while the next chunk is already queued, with
+nothing inside the compiled step (no callback, no sync). The answer is bit-identical to the one-scan march
+on CPU, under every scheme below; on a GPU it moves only by the run-to-run noise the old march had
+(measured 4–7e-11, scatter-add order).
+
+Measured (RTX 3070, 2-D linear heat, 22,801 DOFs, 5 frames saved): peak device memory 186 → 59 MiB at
+500 steps and 708 → 59 MiB at 2,000 steps; wall time unchanged.
+
+**Pass `save_ts=` for a long march.** The default saves every grid point, which keeps the whole trajectory
+— on the host now, not the device. **Under `jit`/`grad`** (`jno.core`, an inverse problem) the march stays
+one `lax.scan` holding every step: the adjoint needs the states.
+
 ### Time schemes — `fem.solve(time=…)`
 
 | Scheme | Order | Stability | Use |

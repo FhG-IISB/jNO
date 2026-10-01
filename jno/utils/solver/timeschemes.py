@@ -245,6 +245,72 @@ class _BDF2Scheme(_TimeScheme):
             _, ys = jax.lax.scan(jax.checkpoint(step), (first, s0), grid[2:])
             return s1, ys
 
+        from .backend_blocks import _march_eagerly, _march_to_host
+
+        if _march_eagerly(args, save_ts):
+            # Eager: the start-up step, then the BDF2 steps in chunks whose frames go to the host as they
+            # are made -- the carry is the two-level state (u^n, u^{n-1}), so a chunk boundary changes
+            # nothing about the scheme (see `_march_to_host`).
+            def startup(s0, grid2, args):
+                blk = hoist_time_invariant(block, args, grid2[0])
+                return blk.step(
+                    s0, grid2[1] - dt, dt, args=args, theta=1.0,
+                    linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=_judge,
+                )  # fmt: skip
+
+            def make_step(args, t_start):
+                blk = hoist_time_invariant(block, args, t_start)
+
+                def step(carry, t_next):
+                    u_n, u_nm1 = carry
+                    u_star = (4.0 * u_n - u_nm1) / 3.0
+                    out = blk.step(
+                        u_star, t_next - dt_eff, dt_eff, args=args, theta=1.0,
+                        linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=_judge,
+                    )  # fmt: skip
+                    if not _judge:
+                        return (out, u_n), out
+                    wn, r_end, r_start = out
+                    return (wn, u_n), (wn, r_end, r_start)
+
+                return step
+
+            cfg = (linear_solve, nonlinear_solve, "bdf2", dt)
+            first = _split_cached_march(block, args, (*cfg, "startup"), startup, s0, jnp.asarray(grid_ts[:2], dtype), args)
+            s1 = first[0] if _judge else first
+
+            def _verdict(r_end, r_start, n_done, final, unchanged):
+                _check_march_converged(
+                    np.concatenate([np.reshape(np.asarray(first[1]), (1,)), r_end]),
+                    np.concatenate([np.reshape(np.asarray(first[2]), (1,)), r_start]),
+                    grid_ts[1 : n_done + 2],
+                    nonlinear_solve,
+                    what="transient march (BDF2)",
+                    coord="t",
+                    advice=_TRANSIENT_ADVICE,
+                    unchanged=unchanged,
+                )
+
+            if grid_ts.size < 3:  # one step: the start-up step is the whole march
+                if _judge:
+                    _verdict(np.zeros((0,)), np.zeros((0,)), 0, True, None)
+                traj = jnp.concatenate([s0[None, :], s1[None, :]], axis=0)
+                return np.asarray(_resample_trajectory(traj, grid_ts, save_ts, dtype))
+            return _march_to_host(
+                block,
+                args,
+                cfg,
+                make_step,
+                (s1, s0),
+                grid_ts[1:],
+                dtype,
+                save_ts,
+                state_of=lambda c: c[0],
+                prefix_ts=grid_ts[:2],
+                prefix_states=[s0, s1],
+                judge=_verdict if _judge else None,
+            )
+
         # Traced ONCE per block and configuration (see `_cached_march`): an eager BDF2 march used to re-trace
         # its scan on every call -- measured ~0.3 s per warm call of a 12k-DOF heat march.
         s1, ys = _split_cached_march(
@@ -390,8 +456,8 @@ class _SDIRKScheme(_TimeScheme):
         grid_ts = jnp.asarray(grid_np, dtype)
         judge = bool(block.is_nonlinear())
 
-        def march(s0, grid_ts, args):
-            blk = hoist_time_invariant(block, args, grid_ts[0])
+        def make_step(args, t_start):
+            blk = hoist_time_invariant(block, args, t_start)
 
             def step(u, t_next):
                 un, reps = self._one_step(blk, u, t_next - dt, dt, args, linear_solve, nonlinear_solve, judge)
@@ -399,9 +465,35 @@ class _SDIRKScheme(_TimeScheme):
                     return un, un
                 return un, (un, jnp.stack([r[0] for r in reps]), jnp.stack([r[1] for r in reps]))
 
-            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+            return step
 
-        ys = _split_cached_march(block, args, (linear_solve, nonlinear_solve, repr(self), dt), march, s0, grid_ts, args)
+        def march(s0, grid_ts, args):
+            return jax.lax.scan(jax.checkpoint(make_step(args, grid_ts[0])), s0, grid_ts[1:])
+
+        from .backend_blocks import _march_eagerly, _march_to_host
+
+        cfg = (linear_solve, nonlinear_solve, repr(self), dt)
+        if _march_eagerly(args, save_ts):  # chunks, frames to the host as they are made (`_march_to_host`)
+            from .history_march import _TRANSIENT_ADVICE, _check_march_converged
+
+            n_stage = self.A.shape[0]
+
+            def _verdict(r_end, r_start, n_done, final, unchanged):
+                _check_march_converged(
+                    r_end.reshape(-1),  # one entry per STAGE: every stage is a Newton solve that must converge
+                    r_start.reshape(-1),
+                    np.repeat(grid_np[1 : n_done + 1], n_stage),
+                    nonlinear_solve,
+                    what=f"transient march ({self!r}, per stage)",
+                    coord="t",
+                    advice=_TRANSIENT_ADVICE,
+                )
+
+            return _march_to_host(
+                block, args, cfg, make_step, s0, grid_np, dtype, save_ts,
+                state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0], judge=_verdict if judge else None,
+            )  # fmt: skip
+        ys = _split_cached_march(block, args, cfg, lambda *a: march(*a)[1], s0, grid_ts, args)
         if judge:
             from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -610,8 +702,8 @@ class _RosenbrockScheme(_TimeScheme):
         t0, t1 = float(block.t0), float(block.t1)
         grid_ts = jnp.asarray(np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1), dtype)
 
-        def march(s0, grid_ts, args):
-            blk = hoist_time_invariant(block, args, grid_ts[0])
+        def make_step(args, t_start):
+            blk = hoist_time_invariant(block, args, t_start)
             if block.is_nonlinear():
                 if block.mass is not None and blk.mass is block.mass:
                     raise NotImplementedError(
@@ -628,9 +720,21 @@ class _RosenbrockScheme(_TimeScheme):
                 un = self._one_step(blk, u, t_next - dt, dt, args, linear_solve)
                 return un, un
 
-            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+            return step
 
-        ys = _split_cached_march(block, args, (linear_solve, repr(self), dt), march, s0, grid_ts, args)
+        def march(s0, grid_ts, args):
+            return jax.lax.scan(jax.checkpoint(make_step(args, grid_ts[0])), s0, grid_ts[1:])
+
+        from .backend_blocks import _march_eagerly, _march_to_host
+
+        cfg = (linear_solve, repr(self), dt)
+        if _march_eagerly(args, save_ts):  # chunks, frames to the host as they are made (`_march_to_host`)
+            grid_np = np.asarray(grid_ts, dtype=float)
+            return _march_to_host(
+                block, args, cfg, make_step, s0, grid_np, dtype, save_ts,
+                state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0],
+            )  # fmt: skip
+        ys = _split_cached_march(block, args, cfg, lambda *a: march(*a)[1], s0, grid_ts, args)
         traj = jnp.concatenate([s0[None, :], ys], axis=0)
         return _resample_trajectory(traj, grid_ts, save_ts, dtype)
 
@@ -1041,6 +1145,25 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
                     wn = wn + dt * apply_f(g, _phi1)
             return wn, wn
 
+    from .backend_blocks import _march_eagerly, _march_to_host
+
+    if _march_eagerly(args, save_ts):
+        # Eager: chunks whose frames go to the host as they are made (`_march_to_host`). Each step emits its
+        # full field `to_field(w)` -- a fixed diagonal map, so this is the same per-row value as mapping the
+        # stacked trajectory afterwards; frames between grid points blend with the shared resampler.
+        def make_step(_args, _t_start):
+            def step_u(wc, t_target):
+                wn, _ = step(wc, t_target)
+                return wn, to_field(wn)
+
+            return step_u
+
+        grid_np = np.asarray(grid, dtype=float)
+        return _march_to_host(
+            block, args, ("exponential", order, mass, symmetric, dt), make_step, w0, grid_np, dtype, save_ts,
+            state_of=to_field, prefix_ts=grid_np[:1], prefix_states=[to_field(w0)],
+            cache=False,  # the step closes over the source evaluated at THIS call's args
+        )  # fmt: skip
     _, ws = jax.lax.scan(step, w0, grid[1:])
     traj_u = jax.vmap(to_field)(jnp.concatenate([w0[None, :], ws], axis=0))  # each row → the full field u
     save_ts = jnp.asarray(save_ts, dtype)
