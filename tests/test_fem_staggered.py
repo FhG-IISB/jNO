@@ -528,6 +528,33 @@ def test_retreat_bottoms_out_at_the_fallback():
     assert abs(got - 1.0) < 1e-6, got
 
 
+@pytest.mark.parametrize("cliff", [0.2, 0.3, 0.6])
+def test_the_exact_line_search_never_returns_a_non_finite_step(cliff):
+    """The energy along the step keeps falling (``phi'(t) = t - 0.8 < 0``) until the residual is NaN at
+    ``t >= cliff`` -- a stand-in for ``det F <= 0``. The minimum the bisection would find is past the
+    cliff, so the right answer is a step just short of it: finite, and not zero. The search used to stop
+    at the first NaN trial and return the midpoint of ``[0, 0.5]``, 0.25 -- itself past a cliff at 0.2,
+    which put a 3-D Yeoh phase-field march on a NaN step."""
+    from jno.utils.solver.newton_krylov import _bisect_slope
+
+    def f(y):
+        return jnp.where(y >= cliff, jnp.nan, y - 0.8)
+
+    x, d = jnp.zeros(1), jnp.ones(1)
+    lam = float(_bisect_slope(f, x, d, atol=1e-10, rtol=1e-4, max_iters=40, dtype=jnp.float64))
+    assert np.isfinite(float(f(x + lam * d)[0])), f"the step lam={lam} lands past the cliff at {cliff}"
+    assert cliff - 1e-6 < lam + 1e-6 and lam > 0.9 * cliff, f"lam={lam}: a usable step up to {cliff} existed"
+
+
+def test_the_exact_line_search_is_unchanged_where_everything_is_finite():
+    """A convex quadratic along the step, minimum at 0.37: found to the slope tolerance, as before."""
+    from jno.utils.solver.newton_krylov import _bisect_slope
+
+    lam = float(_bisect_slope(lambda y: y - 0.37, jnp.zeros(1), jnp.ones(1), atol=1e-12, rtol=1e-10,
+                              max_iters=60, dtype=jnp.float64))  # fmt: skip
+    assert abs(lam - 0.37) < 1e-9, lam
+
+
 def test_there_is_exactly_one_armijo_implementation():
     """Anti-drift. Three byte-identical Armijo loops existed before the retreat helper, and a fourth
     step-taker (over-relaxation) had none at all — which is precisely how the finite-strain NaN got in.

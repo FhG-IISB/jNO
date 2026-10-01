@@ -297,24 +297,33 @@ def _bisect_slope(f, x, delta, *, atol, rtol, max_iters, dtype):
     linear solve grows. In jNO it matters even less: a residual is ~14.6 ms against a ~613 ms tangent
     assembly on the problem this was profiled on.
 
-    NaN-safe by the same construction as everything else in this module: a non-finite ``phi'`` fails its
-    sign comparison, so the bracket shrinks rather than the NaN propagating."""
+    **A non-finite trial is not the minimum.** Past an inverted element (``det F <= 0`` makes
+    ``J**(-2/3)`` NaN) ``phi'`` is NaN. Such a trial fails its sign comparison, so the bracket shrinks
+    toward ``lo``; and the bisection KEEPS GOING, because a NaN slope is not a slope under tolerance. The
+    answer is the bracket's midpoint only while its upper end is a finite point; otherwise it is ``lo``,
+    which only ever moves to a trial with a finite, still-descending slope. Before, ``|NaN| > tol`` read
+    as converged: the search stopped at the first non-finite trial and returned the midpoint of
+    ``[lo, NaN point]`` -- never evaluated, and on a 3-D Yeoh phase-field march itself inside the inverted
+    region, so the sub-solve took a NaN step and stopped there (its own ``||r|| > atol`` is also False
+    for NaN). Which runs hit it was round-off luck: reordering a 3x3 contraction's sum flipped it."""
     slope = lambda lam: jnp.dot(jnp.asarray(f(x + lam * delta)).reshape(-1), delta)  # noqa: E731
     s0, s1 = slope(jnp.zeros((), dtype)), slope(jnp.ones((), dtype))
     # Scaled by ||delta|| so `atol` is a slope in physical units rather than a raw dot product.
     tol = atol * jnp.linalg.norm(delta) + rtol * jnp.abs(s0)
 
     def cond(st):
-        lo, hi, sl, it = st
-        return (jnp.abs(sl) > tol) & ((hi - lo) > 1e-12) & (it < max_iters)
+        lo, hi, sl, it, _hi_ok = st
+        # `not (|sl| <= tol)`: a NaN slope is NOT converged (see the docstring), so the bisection goes on.
+        return jnp.logical_not(jnp.abs(sl) <= tol) & ((hi - lo) > 1e-12) & (it < max_iters)
 
     def body(st):
-        lo, hi, _sl, it = st
+        lo, hi, _sl, it, hi_ok = st
         mid = 0.5 * (lo + hi)
         sm = slope(mid)
         # `sm * s0 > 0` -> the root is to the RIGHT of mid (same sign as the left end), else to the left.
         right = sm * s0 > 0.0
-        return jnp.where(right, mid, lo), jnp.where(right, hi, mid), sm, it + 1
+        return (jnp.where(right, mid, lo), jnp.where(right, hi, mid), sm, it + 1,
+                jnp.where(right, hi_ok, jnp.isfinite(sm)))  # fmt: skip
 
     # The carried slope starts at INFINITY, not at ``s0``. Seeding it with ``s0`` lets the loop exit
     # before bisecting even once whenever ``|phi'(0)|`` is already under tolerance -- and it then returns
@@ -323,10 +332,10 @@ def _bisect_slope(f, x, delta, *, atol, rtol, max_iters, dtype):
     # step of every sub-solve. Measured before the fix: an exact line search needing MORE staggered
     # sweeps than the backtracking it replaced (22 vs 21), and a probe whose minimum lay at ``lam = 0``
     # returning ``lam = 0.5`` with ``phi' = +1.0``. The convergence test belongs on midpoints only.
-    lo, hi, _sl, _it = jax.lax.while_loop(
-        cond, body, (jnp.zeros((), dtype), jnp.ones((), dtype), jnp.asarray(jnp.inf, dtype), 0)
+    lo, hi, _sl, _it, hi_ok = jax.lax.while_loop(
+        cond, body, (jnp.zeros((), dtype), jnp.ones((), dtype), jnp.asarray(jnp.inf, dtype), 0, jnp.isfinite(s1))
     )
-    lam = 0.5 * (lo + hi)
+    lam = jnp.where(hi_ok, 0.5 * (lo + hi), lo)  # never the midpoint of a bracket ending in a non-finite trial
     # No sign change over [0, 1]: phi' never crosses zero, so the energy is still decreasing at the full
     # step and there is nothing to find inside it (their Fig. 2a).
     return jnp.where(s0 * s1 > 0.0, jnp.ones((), dtype), lam)
