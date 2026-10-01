@@ -327,6 +327,23 @@ class SemidiscreteTimeBlock:
 
         return _prolong(self.prolongation, reduced)
 
+    def prev_state_loadpath(self, u):
+        """The previous state ``u`` as a state-dependent mass reads it: each prev-field's nodal slice, keyed
+        by its frozen id, for the assembler's load-path channel (a vector field node-major, ``(n, vec)``).
+
+        The slices index the FULL nodal layout. On a reduced block (periodic tie, slip, hanging nodes) the
+        march carries the REDUCED state, so it is prolonged first -- slicing the reduced vector with full
+        offsets read the wrong DOFs, and raised outright when the length was not a multiple of the field's
+        components (a periodic Navier-Stokes march with u_t in its stabilisation)."""
+        import jax.numpy as jnp
+
+        full = jnp.asarray(self.prolong(u) if self.prolongation is not None else u).reshape(-1)
+        lp = {}
+        for fid, s0, s1, vec in (self.metadata or {}).get("prev_state_slices", []):
+            sl = full[s0:s1]
+            lp[fid] = sl if vec == 1 else sl.reshape(-1, vec)
+        return lp
+
     def is_nonlinear(self) -> bool:
         """
         Return True if this block contains a nonlinear semidiscrete payload.
@@ -429,11 +446,7 @@ class SemidiscreteTimeBlock:
                 # Deliver the previous state y as each prev-field's nodal slice on the load-path channel.
                 # A vector field's DOFs are node-major interleaved (node·vec + comp), so reshape its slice to
                 # (n_nodes, vec); a scalar field stays 1-D. The assembler's load-path gather handles either.
-                _lp = dict((args or {}).get("__loadpath__", {}) or {})
-                _uprev = jnp.asarray(u, dtype).reshape(-1)
-                for _fid, _s0, _s1, _vec in self.metadata.get("prev_state_slices", []):
-                    _slice = _uprev[_s0:_s1]
-                    _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
+                _lp = {**dict((args or {}).get("__loadpath__", {}) or {}), **self.prev_state_loadpath(u)}
                 _ap = {**(args or {}), "__loadpath__": _lp}
 
                 def G(wn):

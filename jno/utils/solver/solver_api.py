@@ -1517,12 +1517,7 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
         # tangent is ``J_spatial + J_mass/dt`` -- the same combination `SemidiscreteTimeBlock.step` forms.
         # ``mass_residual_jac`` reads the previous state off the load-path channel, so it is delivered
         # here exactly as the stepper delivers it, from the initial state.
-        _lp: dict = {}
-        _u0 = jnp.asarray(at).reshape(-1)
-        for _fid, _s0, _s1, _vec in (block.metadata or {}).get("prev_state_slices", []):
-            _slice = _u0[_s0:_s1]
-            _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
-        J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
+        J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": block.prev_state_loadpath(at)})
         A_rep = _add_step_operator(J, J_mass, 1.0 / scale)  # ∝ J_mass + scale·J; scale = dt for backward Euler
         return _frozen_at(precond, fem, A_rep, name, leaves)
     M = block.mass(t0, None)
@@ -1744,12 +1739,7 @@ def _plan_step_tangent_merge(block, state=None):
         if block.mass is None:
             if block.mass_residual_jac is None:
                 return None
-            _lp: dict = {}
-            _u0 = jnp.asarray(at).reshape(-1)
-            for _fid, _s0, _s1, _vec in meta.get("prev_state_slices", []):
-                _sl = _u0[_s0:_s1]
-                _lp[_fid] = _sl if _vec == 1 else _sl.reshape(-1, _vec)
-            S = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
+            S = block.mass_residual_jac(at, t0, {"__loadpath__": block.prev_state_loadpath(at)})
         else:
             S = block.mass(t0, None)
     except Exception:  # noqa: BLE001 -- an operand that needs runtime args: leave the march unplanned

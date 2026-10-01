@@ -5616,8 +5616,12 @@ def wrap_reduced_dirichlet(periodic, residual_fn=None, jacobian_fn=None):
     return r_bc, _jac_bc
 
 
-def wrap_reduced_dirichlet_transient(periodic, mass_fn, residual_fn, jacobian_fn=None):
-    """``(mass, residual, jacobian)`` of a reduced NONLINEAR time block, carrying the reduced-space Dirichlet rows.
+def wrap_reduced_dirichlet_transient(
+    periodic, mass_fn, residual_fn, jacobian_fn=None, mass_residual_fn=None, mass_residual_jac_fn=None
+):
+    """``(mass, residual, jacobian, mass_residual, mass_residual_jac)`` of a reduced NONLINEAR time block,
+    carrying the reduced-space Dirichlet rows. ``mass`` is ``None`` for a state-dependent mass, whose action
+    is ``mass_residual(u, t, args)`` instead; its prescribed rows are emptied the same way.
 
     The time-block companion of :func:`wrap_reduced_dirichlet`, with the block's signatures:
     ``mass(t, args)``, ``residual(u, t, args)``, ``jacobian(u, t, args)``. Handing the residual to
@@ -5630,7 +5634,7 @@ def wrap_reduced_dirichlet_transient(periodic, mass_fn, residual_fn, jacobian_fn
     """
     pairs = (periodic or {}).get("dirichlet_reduced")
     if not pairs:
-        return mass_fn, residual_fn, jacobian_fn
+        return mass_fn, residual_fn, jacobian_fn, mass_residual_fn, mass_residual_jac_fn
     from .fem_1d import _apply_dirichlet_projected
 
     dofs = jnp.asarray([int(d) for d, _v in pairs], dtype=jnp.int32)
@@ -5640,8 +5644,23 @@ def wrap_reduced_dirichlet_transient(periodic, mass_fn, residual_fn, jacobian_fn
             return bcoo_zero_rows_cols(M, dofs)
         return jnp.asarray(M).at[dofs, :].set(0.0).at[:, dofs].set(0.0)
 
-    def mass_bc(t, args=None):
-        return _zero_rows_cols(mass_fn(t, args))
+    mass_bc = None
+    if mass_fn is not None:
+
+        def mass_bc(t, args=None):
+            return _zero_rows_cols(mass_fn(t, args))
+
+    mres_bc = None
+    if mass_residual_fn is not None:
+
+        def mres_bc(u, t, args=None):
+            return jnp.asarray(mass_residual_fn(u, t, args)).reshape(-1).at[dofs].set(0.0)
+
+    mjac_bc = None
+    if mass_residual_jac_fn is not None:
+
+        def mjac_bc(u, t, args=None):
+            return _zero_rows_cols(mass_residual_jac_fn(u, t, args))
 
     def residual_bc(u, t, args=None):
         return _apply_dirichlet_projected(lambda uu: residual_fn(uu, t, args), pairs)(u)
@@ -5655,7 +5674,7 @@ def wrap_reduced_dirichlet_transient(periodic, mass_fn, residual_fn, jacobian_fn
                 return bcoo_eliminate_dirichlet(J, dofs)
             return jnp.asarray(J).at[dofs, :].set(0.0).at[:, dofs].set(0.0).at[dofs, dofs].set(1.0)
 
-    return mass_bc, residual_bc, jac_bc
+    return mass_bc, residual_bc, jac_bc, mres_bc, mjac_bc
 
 
 def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False):

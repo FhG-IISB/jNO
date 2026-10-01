@@ -5453,9 +5453,29 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
 
     if block.is_nonlinear():
         _mass, _res, _jac = block.mass, block.residual, block.jacobian
+        _mres, _mjac = getattr(block, "mass_residual", None), getattr(block, "mass_residual_jac", None)
 
-        def mass_red(t, args=None, _p=periodic, _m=_mass):
-            return reduce_matrix_periodic(_p, _m(t, args))
+        # A STATE-DEPENDENT mass (`c(u) u_t`, e.g. `u_t` inside a stabilised residual) has no mass matrix --
+        # its action is the `mass_residual` -- so there is none to reduce, and wrapping None in a reducer
+        # made the block look as if it had one.
+        mass_red = None
+        if _mass is not None:
+
+            def mass_red(t, args=None, _p=periodic, _m=_mass):
+                return reduce_matrix_periodic(_p, _m(t, args))
+
+        # ...and the mass action itself is reduced like the residual (prolong in, Pᵀ out). It was left in the
+        # FULL layout, so the step residual added a full-size mass action to a reduced spatial residual.
+        mres_red = mjac_red = None
+        if _mres is not None:
+
+            def mres_red(u_red, t, args=None, _p=periodic, _m=_mres):
+                return reduce_vector_periodic(_p, jnp.asarray(_m(prolong_periodic(_p, u_red), t, args)).reshape(-1))
+
+        if _mjac is not None:
+
+            def mjac_red(u_red, t, args=None, _p=periodic, _m=_mjac):
+                return reduce_matrix_periodic(_p, _m(prolong_periodic(_p, u_red), t, args))
 
         def residual_red(u_red, t, args=None, _p=periodic, _r=_res):
             return reduce_vector_periodic(_p, jnp.asarray(_r(prolong_periodic(_p, u_red), t, args)).reshape(-1))
@@ -5470,13 +5490,17 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         # tie target loses the row holding its value -- in the reduced residual exactly as in the reduced
         # matrix, and `PᵀMP` refills its (zeroed) mass row. Same pairs as every other reduced path; the
         # time-block helper exists because these callables take `(u, t, args)`, not the state alone.
-        mass_red, residual_red, jac_red = wrap_reduced_dirichlet_transient(periodic, mass_red, residual_red, jac_red)
+        mass_red, residual_red, jac_red, mres_red, mjac_red = wrap_reduced_dirichlet_transient(
+            periodic, mass_red, residual_red, jac_red, mres_red, mjac_red
+        )
 
         return dataclasses.replace(
             block,
             mass=mass_red,
             residual=residual_red,
             jacobian=jac_red,
+            mass_residual=mres_red,
+            mass_residual_jac=mjac_red,
             state0=state0_red,
             prolongation=prol,
             metadata=meta,
