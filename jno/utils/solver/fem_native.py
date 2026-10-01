@@ -5039,64 +5039,68 @@ def assemble_fem_native(
             # ``t`` carries the pseudo-time (load) coordinate τ for the history march — the load written
             # as a function of τ in the weak form varies through it. Defaults to 0.0, so the ordinary
             # (non-marching) parametric/inverse call sites are unchanged.
-            if _dir_args_dependent:
-                # net- or parameter-valued Dirichlet: the held value is a differentiable function of the
-                # args (net weights or a trainable boundary value), so the row-replacement value is
-                # re-evaluated from args each residual call (mirrors the linear parametric path's
-                # ``_dirichlet_pairs_at``). The dof set is static; only the held values ride the args.
-                _npd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
-                    dtype=jnp.int32,
-                )
+            if _dir_args_dependent or _tv_dirichlet:
+                # Held values that are not constants. Two kinds, and one form can carry both -- a trainable
+                # grip on one face beside a ramped one on another -- so they are written TOGETHER. (An
+                # `if/elif` between them dropped the τ rows whenever a parameter-valued row was present:
+                # the ramped face was left free, measured at 0.25 where 0.5 -> 1.0 -> 1.5 was prescribed.)
+                #
+                # * net- or parameter-valued (`u(top) - g`, `u(top) - net(x)`): the held value is a
+                #   differentiable function of the args, re-evaluated from them each residual call (mirrors
+                #   the linear parametric path's ``_dirichlet_pairs_at``, which also returns the constant
+                #   pairs);
+                # * τ-DEPENDENT (`u(top)[1] - delta*tau`, i.e. DISPLACEMENT CONTROL, which is how a softening
+                #   test is driven at all -- under load control the specimen snaps at the peak and there is
+                #   no branch to follow): re-evaluated at this step's τ.
+                #
+                # Either way the dof set is static; only the held VALUES ride the args / τ.
+                if _dir_args_dependent:
+                    _bd = jnp.asarray([p[0] for p in _dirichlet_pairs_at(_dir_static_args())], dtype=jnp.int32)
 
-                def _np_hold(args):  # held value on every Dirichlet dof (const + net), net entries live
-                    return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
+                    def _base_hold(args):  # const + net + parameter entries; the latter two live in args
+                        return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
 
-                def _np_project(u, args, _d=_npd):
-                    return jnp.asarray(u).at[_d].set(_np_hold(args))
+                else:
+                    _bd = s_d_dofs
 
-                def res_p(u, args=None, t=0.0, _d=_npd):
+                    def _base_hold(args, _g=s_d_vals):
+                        return _g
+
+                _tvd = None
+                if _tv_dirichlet:
+                    from ..._fem import _eval_value_node_at_time
+
+                    _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
+
+                    def _tv_hold(t):
+                        return jnp.concatenate(
+                            [
+                                jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,))
+                                for _d, n, c in _tv_dirichlet
+                            ]
+                        )
+
+                _all_d = jnp.concatenate([d for d in (_bd, _tvd) if d is not None])
+
+                def _hold_project(u, args, t, _b=_bd, _t=_tvd):
                     u = jnp.asarray(u)
-                    R = residual(_np_project(u, args), t, args)
-                    return R.at[_d].set(u[_d] - _np_hold(args))
+                    if _b is not None:
+                        u = u.at[_b].set(jnp.asarray(_base_hold(args)).astype(u.dtype))
+                    if _t is not None:
+                        u = u.at[_t].set(_tv_hold(t).astype(u.dtype))
+                    return u
 
-                def jac_p(u, args=None, t=0.0, _d=_npd):
-                    return bcoo_eliminate_dirichlet(jacobian(_np_project(u, args), t, args), _d)
-
-                _constrained = _npd  # the dof set is static here; only the HELD VALUES ride the weights
-            elif _tv_dirichlet:
-                # A τ-DEPENDENT essential value on the load path -- `u(top)[1] - delta*tau`, i.e.
-                # DISPLACEMENT CONTROL, which is how a softening test is driven at all (under load
-                # control the specimen snaps at the peak and there is no branch to follow). The value is
-                # not a constant pair, so it is re-evaluated at this step's τ and written into the same
-                # row-replacement the constant pairs use. Before this it was collected and then dropped:
-                # the constraint simply vanished and the solve returned u = 0, which looks entirely
-                # plausible. The dof set is static, so only the held VALUES ride τ.
-                from ..._fem import _eval_value_node_at_time
-
-                _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
-                _all_d = _tvd if s_d_dofs is None else jnp.concatenate([s_d_dofs, _tvd])
-
-                def _tv_hold(t):
-                    return jnp.concatenate(
-                        [jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,)) for _d, n, c in _tv_dirichlet]
-                    )
-
-                def _tv_project(u, t, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
+                def res_p(u, args=None, t=0.0, _b=_bd, _t=_tvd):
                     u = jnp.asarray(u)
-                    if _d is not None:
-                        u = u.at[_d].set(_g.astype(u.dtype))
-                    return u.at[_t].set(_tv_hold(t).astype(u.dtype))
-
-                def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
-                    u = jnp.asarray(u)
-                    R = residual(_tv_project(u, t), t, args)
-                    if _d is not None:
-                        R = R.at[_d].set(u[_d] - _g)
-                    return R.at[_t].set(u[_t] - _tv_hold(t))
+                    R = residual(_hold_project(u, args, t), t, args)
+                    if _b is not None:
+                        R = R.at[_b].set(u[_b] - _base_hold(args))
+                    if _t is not None:
+                        R = R.at[_t].set(u[_t] - _tv_hold(t))
+                    return R
 
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
-                    return bcoo_eliminate_dirichlet(jacobian(_tv_project(u, t), t, args), _d)
+                    return bcoo_eliminate_dirichlet(jacobian(_hold_project(u, args, t), t, args), _d)
 
                 _constrained = _all_d
             else:

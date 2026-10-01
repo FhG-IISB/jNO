@@ -104,7 +104,8 @@ path is unaffected.
     through the solve's / each step's `custom_root` (nonlinear / transient).
 
     Refused loudly: a value that is **both** parametric and t/τ-dependent (`u(top) - g*tau`). Train
-    the amplitude through a Neumann / body term instead. A FIELD-sized optimizer-less parameter stays
+    the amplitude through a Neumann / body term instead. A parametric wall **beside** a τ-ramped one
+    (`u(left) - g` with `u(right) - delta*tau`) is fine on the load path: both are held at every step. A FIELD-sized optimizer-less parameter stays
     the nodal data-field value (a neighbour's field in a DD solve), gathered per node.
 
 ??? measured "Time-varying Dirichlet `g(x, t)` — the orders each scheme keeps"
