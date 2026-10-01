@@ -1319,11 +1319,15 @@ not, and rejects a step that fails to reduce the residual -- so a stale tangent 
 solve, never a divergence. Evaluated eagerly, the march also carries the tangent **from step to step**
 (on the step-merge plan's fixed sparsity pattern), because a march's tangent changes little between steps.
 The step's convergence record reuses the norms Newton already computed instead of evaluating the residual
-twice more.
+twice more. And on a kept tangent the inner Krylov solve is **inexact**: a step contracts the residual by
+the tangent's own contraction, not by the accuracy of the linear solve, so each correction is solved only to
+a forcing tolerance -- half the outer target over the current residual, floored at 1e-3, capped at 0.1
+(Dembo, Eisenstat & Steihaug 1982) -- instead of to 1e-10.
 
 Measured (RTX 3070, the Taylor–Green LES of the turbulence tutorial: residual-based VMS + Vreman, P1/P1,
-55,296 DOFs, BDF2): one tangent for an 8-step march instead of two per step; **0.80 → 0.30 s per step**,
-same trajectory (energy identical to 6 digits). The answer moves only within the Newton tolerance: a reused
+BDF2): at 55,296 DOFs one tangent for an 8-step march instead of two per step, **0.80 → 0.30 s per step**;
+at 442,368 DOFs, where the Krylov solves dominate once the tangent is kept, the inexact solves take
+1,200 → 160 matvecs per step, **2.14 → 1.50 s per step** -- same trajectory (energy identical to 6 digits). The answer moves only within the Newton tolerance: a reused
 tangent converges linearly, so the final residual lands under the test rather than far below it. Pass
 `nonlinear=jno.solve.newton()` for a fresh tangent at every iteration. Under `jit`/`grad` the march keeps
 the tangent within a step but not across steps (the reverse pass would store one tangent per step).

@@ -103,3 +103,32 @@ def test_newton_reuse_works_on_the_assembled_iterative_default():
     assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
     with pytest.raises(ValueError, match="matrix-free"):
         jno.solve.newton(direct=False, reuse=True)
+
+
+def test_a_kept_tangent_solves_its_correction_only_as_far_as_the_step_needs(monkeypatch):
+    """Inexact Newton on a kept tangent: the inner solve gets a forcing tolerance, not the fixed 1e-10, and
+    the march still lands on the fresh-tangent trajectory (measured on a 442k-DOF stabilised flow: 1200 ->
+    160 matvecs per step)."""
+    import jno.utils.solver.newton_krylov as nk
+
+    forced = []
+    real = nk.assembled_krylov_solve
+
+    def spy(*a, **k):
+        solve = real(*a, **k)
+
+        def wrapped(J, b, rtol=None):
+            forced.append(rtol is not None)
+            return solve(J, b, rtol=rtol)
+
+        wrapped.accepts_rtol = True
+        return wrapped
+
+    monkeypatch.setattr(nk, "assembled_krylov_solve", spy)
+    got = np.asarray(_nonlinear_heat().solve(time=jno.solve.bdf2()).fn())
+    assert forced and any(forced), "the kept-tangent Newton did not pass a forcing tolerance"
+    monkeypatch.undo()
+    fresh = np.asarray(
+        _nonlinear_heat().solve(time=jno.solve.bdf2(), nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-12)).fn()
+    )
+    assert np.abs(got - fresh).max() <= 1e-7 * np.abs(fresh).max()

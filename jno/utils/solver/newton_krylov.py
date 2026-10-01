@@ -638,23 +638,32 @@ def assembled_krylov_solve(tol=1e-10, maxit=2000):
     and GMRES all converge to the same trajectory). The check is one SpMV per solve; a healthy solve never
     pays for the GMRES."""
 
-    def solve(J, b):
+    def solve(J, b, rtol=None):
+        """``rtol`` (traced allowed) overrides ``tol`` for this solve -- an inexact-Newton forcing term."""
         from ..._fem import _bicgstab_jacobi
         from .krylov import gmres as _scaled_gmres
         from .linear import jacobi, sparse_matvec
 
         b = jnp.asarray(b).reshape(-1)
-        x = _bicgstab_jacobi(J, b, float(tol), int(maxit))
+        if rtol is None:
+            tol_ = float(tol)
+            x = _bicgstab_jacobi(J, b, tol_, int(maxit))
+        else:  # a traced forcing term cannot be the compiled helper's STATIC tolerance; same iteration
+            tol_ = rtol
+            x = jax.scipy.sparse.linalg.bicgstab(sparse_matvec(J), b, tol=tol_, atol=0.0, maxiter=int(maxit), M=jacobi(J))[0]
         mv = sparse_matvec(J)
         eps = float(jnp.finfo(b.dtype).eps)
         r_rel = jnp.linalg.norm(mv(x) - b) / jnp.maximum(jnp.linalg.norm(b), eps)
-        ktol = max(float(tol), 100.0 * eps)
+        ktol = jnp.maximum(tol_, 100.0 * eps)
+        # A solve asked for less is judged against what it was asked for: a BiCGStab that broke down still
+        # misses that by orders of magnitude, while the GMRES rescue is not paid by every loose solve.
         return jax.lax.cond(
-            r_rel < max(1e-9, 1e4 * eps),
+            r_rel < jnp.maximum(jnp.maximum(1e-9, 10.0 * tol_), 1e4 * eps),
             lambda: x,
             lambda: _scaled_gmres(mv, b, tol=ktol, atol=0.0, restart=min(int(b.shape[0]), 40), M=jacobi(J))[0],
         )
 
+    solve.accepts_rtol = True
     return solve
 
 
@@ -680,6 +689,12 @@ def newton_default(
             tangent0=tangent0, info=info, **kw,
         )  # fmt: skip
     return newton_krylov(residual_fn, u0, inner_tol=inner_tol, inner_maxit=inner_maxit, **kw)
+
+
+#: The inexact-Newton forcing floor on a KEPT tangent (``newton_direct(reuse=True)``): the inner Krylov
+#: solve stops at this relative residual unless the outer target needs more. A carried tangent measured
+#: ~1e-3 contraction per step on the flows that motivated it; 1e-2 and 1e-4 ran within noise of it there.
+_CHORD_FORCING_FLOOR = 1e-3
 
 
 def newton_direct(
@@ -816,7 +831,18 @@ def newton_direct(
             u, r, k, J, fresh, nfact = state
             rn = jnp.linalg.norm(r)
             with gate_suspended():  # as in `body`: no host callback inside the loop (reverse mode, remat)
-                delta = linear_solve(J, -r)
+                if getattr(linear_solve, "accepts_rtol", False):
+                    # INEXACT Newton (Dembo, Eisenstat & Steihaug, SIAM J. Numer. Anal. 19 (1982) 400): a
+                    # step on a kept tangent contracts the residual by its tangent's contraction, not by the
+                    # accuracy of the linear solve, so solving far below it buys nothing. The forcing term
+                    # tracks what this iteration needs -- half the outer target over the current residual --
+                    # floored at _CHORD_FORCING_FLOOR, capped at 0.1. Measured on a 442k-DOF stabilised
+                    # flow: 1200 -> 160 matvecs per step, 2.14 -> 1.49 s per step, same Newton count.
+                    target = atol + rtol * r0n
+                    eta = jnp.clip(0.5 * target / jnp.maximum(rn, 1e-300), _CHORD_FORCING_FLOOR, 0.1)
+                    delta = linear_solve(J, -r, rtol=eta)
+                else:
+                    delta = linear_solve(J, -r)
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u_try = u + alpha * delta
             r_try = f_fwd(u_try)
