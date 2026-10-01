@@ -93,7 +93,7 @@ from .sharding import element_mesh as _element_mesh
 from .sharding import element_partials as _element_partials
 from .sharding import reduce_partials as _reduce_partials
 from .sharding import sharded_element_add as _sharded_element_add
-from .small_linalg import small_det, small_inv
+from .small_linalg import small_det, small_inv, small_matmul
 from .weak_form import (
     _apply_sign,
     _contains_temporal_derivative,
@@ -2152,7 +2152,8 @@ def assemble_fem_native(
         n_q = qw_shared.shape[0]
         h_qp = jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (n_q, 1))
         K = small_inv(J)  # dxi/dx: (dim, dim) affine, (n_q, dim, dim) curved
-        G_qp = jnp.broadcast_to(jnp.swapaxes(K, -1, -2) @ K, (n_q, dim, dim))
+        # K^T K as a multiply-sum: `@` on a batch of 3x3s is a padded batched GEMM on a GPU (small_einsum).
+        G_qp = jnp.broadcast_to(small_matmul(jnp.swapaxes(K, -1, -2), K), (n_q, dim, dim))
         return h_qp, G_qp
 
     # Cell-local DOF bookkeeping for per-cell element-Jacobian assembly. ``cell_all_dofs[c]`` lists

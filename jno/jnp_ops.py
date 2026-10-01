@@ -975,11 +975,22 @@ def double_dot(x, y) -> FunctionCall:
     return inner(x, y, n_contract=2)
 
 
+def _small_einsum(subscripts, *args):
+    from .utils.solver.small_linalg import small_einsum  # lazy: jno.utils.solver imports this module's users
+
+    return small_einsum(subscripts, *args)
+
+
 def einsum(subscripts: str, *operands) -> FunctionCall:
-    """Traced jnp.einsum wrapper for compact tensor/vector contractions."""
+    """Traced jnp.einsum wrapper for compact tensor/vector contractions.
+
+    A contraction of small per-point tensors (``M·N·K`` at most 8x8x8 per pairwise step) is evaluated as a
+    broadcast multiply and a sum instead of a ``dot_general``, which a GPU runs as a padded batched GEMM
+    once the points are batched (see :func:`jno.utils.solver.small_linalg.small_einsum`); larger ones are
+    plain ``jnp.einsum``. Same values up to summation order."""
     return _attach_coords(
         FunctionCall(
-            lambda *args, _subs=subscripts: jnp.einsum(_subs, *args),
+            lambda *args, _subs=subscripts: _small_einsum(_subs, *args),
             [_u(o) for o in operands],
             name="einsum",
         ),
