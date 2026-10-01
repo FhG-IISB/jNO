@@ -559,7 +559,7 @@ class SemidiscreteTimeBlock:
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
         return _default_step_solve(step_op, rhs, u, d, krylov=(self.metadata or {}).get("krylov"))
 
-    def solve(self, solve_fn=None, *, save_ts=None):
+    def solve(self, solve_fn=None, *, save_ts=None, values=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
         trace node (mirrors :meth:`FemLinearSystem.solve` for the steady case).
 
@@ -582,6 +582,9 @@ class SemidiscreteTimeBlock:
         ``block.operator_fn(t, args)``) and ``block.state0`` -- and form ``u_dot = M^-1(c - A u)``.
         Note a Dirichlet problem zeroes M's Dirichlet rows (a DAE), so the implicit
         ``(M + dt A)`` default is preferred there; an explicit field must hold those rows.
+
+        ``values`` (what ``fem.solve(k=2.0)`` passes) marches at those parameter values NOW and returns the
+        trajectory array, as the steady solves do; every runtime parameter must be named.
 
         Enable x64 (``jax_enable_x64``); the assembly is float64.
         """
@@ -646,6 +649,15 @@ class SemidiscreteTimeBlock:
                 ys = ys[..., :h] + 1j * ys[..., h:]
             return ys
 
+        if values is not None:
+            # `fem.solve(k=2.0)` on a parametric transient: the caller named the parameters, so march at them
+            # now. (This used to raise a TypeError -- the keyword had no way in.)
+            import jax.numpy as jnp
+
+            from ...trace import check_runtime_values
+
+            check_runtime_values(names, values)
+            return _solve(*(jnp.asarray(values[n]) for n in names))
         return FunctionCall(_solve, params, name="fem_transient_solve")
 
 

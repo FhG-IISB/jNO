@@ -5017,6 +5017,7 @@ def run_adaptive_transient(
     nonlinear: Any = None,
     linear: Any = None,
     precond: Any = None,
+    values: Any = None,
     **kwargs: Any,
 ) -> "AdaptiveTrajectory":
     """Drive ``FEM.solve(adapt=spec)`` for a **transient** problem: march the semidiscrete block and,
@@ -5048,7 +5049,11 @@ def run_adaptive_transient(
     :func:`_field_layout`); the driver owns the march (no whole-march ``solve_fn``, and ``x0=``/``time=``
     do not compose with a remesh — the DOF layout changes). The forward march is differentiable within
     each fixed-mesh chunk and through the transfers, but the *remesh decisions* are not (the AFEM-inverse
-    pattern — freeze the mesh sequence, differentiate the chunks — applies)."""
+    pattern — freeze the mesh sequence, differentiate the chunks — applies).
+
+    **Runtime parameters** are marched at the values named in the call, ``fem.solve(adapt=..., k=2.0)``
+    (``values``); a parametric form without them is refused rather than marched at the parameters' stored
+    values (0.0 for a fresh ``jno.np.parameter``) -- which is what happened, silently, before."""
     import jax
     import jax.numpy as jnp
 
@@ -5056,8 +5061,27 @@ def run_adaptive_transient(
 
     from .backend_blocks import _block_time_grid
 
+    if kwargs:
+        raise TypeError(
+            f"fem.solve(adapt=...) on a transient problem got unexpected keyword(s) {sorted(kwargs)!r}; "
+            "a runtime parameter is passed by its name, the solver slots as nonlinear=/linear=/precond=."
+        )
     if fem._constraints is None:
         raise ValueError("FEM.solve(adapt=...) requires a FEM built by jno.fem(...) (its constraint list is retained).")
+    _pnames = list(getattr(fem._op, "runtime_parameter_exprs", None) or {})
+    if _pnames and values is None:
+        raise NotImplementedError(
+            f"fem.solve(adapt=...) on a transient problem carrying runtime parameters {sorted(_pnames)!r}: the "
+            "remeshing march is a host loop, so it returns frames, not a trace node `crux` could resolve, and "
+            "marching at the parameters' stored values would silently answer a different problem. Name the "
+            "values: " + ", ".join(f"{n}=..." for n in _pnames) + " in the same call."
+        )
+    step_args = None
+    if values is not None:
+        from ...trace import check_runtime_values
+
+        check_runtime_values(_pnames, values)
+        step_args = {n: jnp.asarray(v) for n, v in values.items()}
     if solve_fn is not None:
         raise NotImplementedError(
             "fem.solve(adapt=..., solve_fn=...) is not supported on a transient problem: the adaptive driver "
@@ -5163,7 +5187,7 @@ def run_adaptive_transient(
             lin_s, nonlin_s = None, None
 
         def _body(u, t, _blk=blk, _l=lin_s, _n=nonlin_s):
-            un = _blk.step(u, t, dt, theta=theta, linear_solve=_l, nonlinear_solve=_n)
+            un = _blk.step(u, t, dt, step_args, theta=theta, linear_solve=_l, nonlinear_solve=_n)
             return un, un
 
         state, traj = jax.lax.scan(_body, state, jnp.asarray(ts[i : i + chunk], dtype=state.dtype))

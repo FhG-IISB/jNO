@@ -45,7 +45,7 @@ def _roll_buffer(buf, nv):
     return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
 
 
-def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
+def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
     """March ``fem`` over its domain's pseudo-time grid and return the ``(n_steps, n_dofs)`` trajectory.
 
     ``solve_fn`` (if given) is a nonlinear solver ``(residual_fn, u0) -> u`` — e.g. the one composed from
@@ -59,8 +59,18 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
     **every load step** — see :func:`_march_eager_contact`. That march is a host loop rather than a
     ``lax.scan``, which costs the load path its reverse-mode differentiability; the alternative would
     be to march with one frozen pairing, which is the wrong answer rather than a slower one.
+
+    ``values`` (what ``fem.solve(k=2.0)`` passes on a runtime-parametric form) marches at those values NOW
+    and returns the trajectory array; every runtime parameter must be named. Without them a parametric form
+    returns the differentiable trace node that ``crux`` resolves. (The values used to be dropped, and the
+    march ran at the parameters' STORED values -- a silently wrong answer.)
     """
     op = fem._op
+    if values is not None:
+        from ...trace import check_runtime_values
+
+        check_runtime_values(list(getattr(op, "runtime_parameter_exprs", {}) or {}), values)
+        values = {k: jnp.asarray(v) for k, v in values.items()}
     domain = fem.domain
     specs: Dict[Any, Any] = op.history_specs
     readout = op.state_readout
@@ -393,11 +403,14 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
                 "fem.solve(tau=<schedule>, contact=...) is not wired yet: the contact march walks the "
                 "domain's declared `domain(tau=...)` grid. Declare the grid you want and march it."
             )
+        if values is not None:
+            return _march_eager_contact(contact, values)  # concrete values: the search can run
         if getattr(op, "runtime_parameter_exprs", {}):
             raise NotImplementedError(
                 "fem.solve(tau=..., contact=...) on a form carrying a runtime parameter is not wired: "
                 "the search needs a concrete displacement to project, and a differentiable solve hands "
-                "it tracers. Run the march forward at the values you want."
+                "it tracers. Run the march forward at the values you want: `fem.solve(contact=..., "
+                "<name>=<value>)`."
             )
         return _march_eager_contact(contact, {})
 
@@ -451,6 +464,8 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             exprs = getattr(op, "runtime_parameter_exprs", {}) or {}
             if not exprs:
                 return _driver({})
+            if values is not None:
+                return _driver(values)
             from ...trace import FunctionCall
 
             _names = list(exprs)
@@ -491,6 +506,10 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
         # Non-parametric: the answer is an array, nothing will differentiate it, so the adaptive path
         # keeps the states its pilot already solved rather than marching them a second time.
         return _driver({}, replay=False) if _is_adaptive else _driver({})
+    if values is not None:
+        # Named values are concrete, so the adaptive pilot can accept or reject steps with them -- this is
+        # the forward run the refusal below asks for -- and nothing will differentiate the array returned.
+        return _driver(values, replay=False) if _is_adaptive else _driver(values)
     from ...trace import FunctionCall
 
     names = list(exprs)
@@ -508,7 +527,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             "step, and a differentiable solve hands it tracers; piloting at the stored values instead "
             "would silently adapt to whatever they happen to be (0.0 for a fresh jno.np.parameter). Run "
             "the study forward first and replay the schedule it found:\n"
-            "    fem.solve(tau=jno.solve.adaptive(limit=...))   # forward, at the values you want\n"
+            f"    fem.solve(tau=jno.solve.adaptive(limit=...), {names[0]}=...)   # forward, at the values you want\n"
             "    fem.solve(tau=fem.tau_schedule)                # differentiable replay of that schedule\n"
             "`tau=<array>` also accepts any non-uniform grid you choose."
         )

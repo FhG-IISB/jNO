@@ -2905,7 +2905,9 @@ class FEM:
                 )
             from .utils.solver.history_march import run_history_march
 
-            return run_history_march(self, solve_fn if from_slots else solve_fn, path=tau, contact=contact)
+            return run_history_march(
+                self, solve_fn if from_slots else solve_fn, path=tau, contact=contact, values=kwargs.get("values")
+            )
         if tau is not None:
             raise ValueError(
                 "fem.solve(tau=...) sizes the steps of a pseudo-time LOAD-PATH march, but this form does "
@@ -2916,6 +2918,12 @@ class FEM:
             # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
             # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
             # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
+            if kwargs.get("values"):
+                raise NotImplementedError(
+                    "fem.solve(precond=<complex-native>, <parameter>=...): the complex-native solve works on the "
+                    "assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
+                    "Use a real-equivalent preconditioner, or build the form with the value fixed."
+                )
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
             # Non-parametric steady linear. Default: matrix-free Jacobi-preconditioned BiCGStab on the

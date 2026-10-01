@@ -3744,6 +3744,25 @@ class Noise(Placeholder):
         return f"Noise({self.distribution}, {params_str})"
 
 
+def check_runtime_values(names, values):
+    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter or leaves one out.
+
+    Every solve that accepts the values (steady linear and nonlinear, transient, load-path march) checks
+    them here, so the same call fails the same way whichever path the form takes."""
+    unknown = sorted(set(values) - set(names))
+    if unknown:
+        raise TypeError(
+            f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
+        )
+    missing = sorted(set(names) - set(values))
+    if missing:
+        raise ValueError(
+            f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
+            f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
+            "let `crux` resolve them (the solve is then a trace node, not an array)."
+        )
+
+
 class FemLinearSystem:
     """Container for a steady linear FEM system ``A(args) x = b(args)``."""
 
@@ -3844,18 +3863,7 @@ class FemLinearSystem:
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
-        unknown = sorted(set(values) - set(names))
-        if unknown:
-            raise TypeError(
-                f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
-            )
-        missing = sorted(set(names) - set(values))
-        if missing:
-            raise ValueError(
-                f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
-                f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
-                "let `crux` resolve them (the solve is then a trace node, not an array)."
-            )
+        check_runtime_values(names, values)
         return _solve(*(jnp.asarray(values[n]) for n in names))
 
     def __iter__(self):
@@ -4003,18 +4011,7 @@ class FemResidualOperator:
         if values is None:
             return FunctionCall(_solve, params, name="fem_solve")
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
-        unknown = sorted(set(values) - set(names))
-        if unknown:
-            raise TypeError(
-                f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
-            )
-        missing = sorted(set(names) - set(values))
-        if missing:
-            raise ValueError(
-                f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
-                f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
-                "let `crux` resolve them (the solve is then a trace node, not an array)."
-            )
+        check_runtime_values(names, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
         # jit, every call re-stages the solver -- `lax.while_loop` / `custom_root` / `linearize` trace
         # their bodies on each Python call -- so an 8-value sweep cost 48 tracings and the whole point,
