@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -416,7 +417,23 @@ def identity_pushforward_hess(ref_hess: jnp.ndarray, J: jnp.ndarray) -> jnp.ndar
     Returns
     -------
     hess_phys : ``(n_quad, n_dof, tdim, tdim)``  physical Hessian ``∂²φ/∂x∂x`` (symmetric).
+
+    A P1 basis has an identically zero reference Hessian, and it is tabulated anyway. The push-forward
+    of a zero table is returned as a zero CONSTANT, not an einsum: the einsum was the most expensive
+    kernel of a 3-D stabilised Navier-Stokes residual (``lap(u)`` in the strong residual, ~9 of 26 ms
+    at 55k DOFs), and a constant lets XLA drop every contraction against it. The zero terms stay
+    exactly zero; the sums around them may fuse in a different order (round-off, 1e-16 relative).
     """
     _refuse_curved_hessian(J)
+    if _is_zero_table(ref_hess):
+        n = jnp.shape(J)[-2]
+        return jnp.zeros((*jnp.shape(ref_hess)[:2], n, n), jnp.result_type(ref_hess, J))
     K = small_inv(J)  # J⁻¹
     return jnp.einsum("qnij,ia,jb->qnab", ref_hess[..., 0, :, :], K, K)
+
+
+def _is_zero_table(a) -> bool:
+    """Whether ``a`` is a CONCRETE all-zero table (a tracer -- a table being differentiated -- is not)."""
+    if isinstance(a, jax.core.Tracer):
+        return False
+    return not np.any(np.asarray(a))
