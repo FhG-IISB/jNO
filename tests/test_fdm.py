@@ -2095,9 +2095,9 @@ def test_a_frozen_march_preconditioner_is_built_for_the_scheme(monkeypatch):
     scales = []
     real = solver_api._add_step_operator
 
-    def spy(M, A, scale):
+    def spy(M, A, scale, **kw):  # **kw: the step-tangent merge plan (`plan=`) rides along
         scales.append(float(scale))
-        return real(M, A, scale)
+        return real(M, A, scale, **kw)
 
     monkeypatch.setattr(solver_api, "_add_step_operator", spy)
     d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=1 / 16).structured(), time=(0.0, 0.2, 21))
