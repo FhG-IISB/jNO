@@ -3265,7 +3265,7 @@ def assemble_fem_native(
             "test field (it determines the equation block)."
         )
 
-    _preprocess_cache: Dict[Tuple[int, int], Tuple[Any, Any]] = {}
+    _preprocess_cache: Dict[Tuple[int, int], Tuple[Any, Any, Any, Any]] = {}
 
     def _preprocess_terms(terms, bterms):
         """``(typed_with_masks, surface_work)``: lower each additive sub-term to
@@ -3280,11 +3280,18 @@ def assemble_fem_native(
         it is thrown away with the closure. Keyed on the identity of the term containers, which is
         what "the same list, twice" means; a caller that mutated ``terms`` between the two calls would
         defeat it, but that would be a bug in its own right (the residual and the Jacobian must come
-        from one form)."""
+        from one form).
+
+        Each entry PINS the containers it was keyed on, and a hit must be the SAME objects: an id is only
+        unique while its object lives, and a build passes short-lived lists here. Without the pin, a list
+        freed after its pass handed its id to a later, different one, which then got the first list's
+        lowered terms -- a wrong operator with nothing to flag it. Measured on a 3-D enrichment loop
+        (``adapt=jno.solve.enrich``): the p-adaptive solution's energy came out 0.119 against a correct
+        1.763, and which runs hit it depended on allocation history (prior builds, import order)."""
         _ck = (id(terms), id(bterms))
         _hit = _preprocess_cache.get(_ck)
-        if _hit is not None:
-            return _hit
+        if _hit is not None and _hit[0] is terms and _hit[1] is bterms:
+            return _hit[2], _hit[3]
         typed: List[Tuple[Any, int]] = []
         for bare in terms:
             for sign, sub in _split_additive_terms(domain, bare):
@@ -3318,7 +3325,7 @@ def assemble_fem_native(
                         bcoeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
                         btyped.extend(_classify_one(bcoeff, f"boundary ({region!r})"))
                 surface_work.append((region, np.asarray(face_ids, dtype=np.int32), btyped))
-        _preprocess_cache[_ck] = (typed_with_masks, surface_work)
+        _preprocess_cache[_ck] = (terms, bterms, typed_with_masks, surface_work)
         return typed_with_masks, surface_work
 
     # --- element-loop chunking -----------------------------------------------------------------
