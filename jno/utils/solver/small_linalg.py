@@ -86,11 +86,12 @@ def small_einsum(subscripts: str, *operands, limit: int | None = None):
     for ~1 MFLOP of work per chunk. Written as a multiply and a reduction it fuses into the element loop.
 
     The operands are contracted pairwise, left to right. If EVERY pairwise contraction is at most
-    ``limit`` (default :data:`SMALL_CONTRACTION`) multiply-adds per instance (its ``M·N·K``; axes shared by both operands and kept in the
-    result are batch, and do not count), the multiply-sum form is used; otherwise the whole call is
-    ``jnp.einsum``, which keeps its optimised contraction order and its GEMM for real matrices. A form
-    this does not parse (no ``->``, a repeated index within one operand) is passed to ``jnp.einsum``
-    unchanged. Same values up to summation order; differentiable like any jnp expression.
+    ``limit`` (default :data:`SMALL_CONTRACTION`) multiply-adds per instance (its ``M·N·K``; axes shared by
+    both operands and kept in the result are batch, and do not count), the multiply-sum form is used;
+    otherwise the whole call is ``jnp.einsum``, which keeps its optimised contraction order and its GEMM
+    for real matrices. A form this does not parse (no ``->``, a repeated index within one operand) is
+    passed to ``jnp.einsum`` unchanged. Same values up to summation order; differentiable like any jnp
+    expression.
     """
     plan = _small_einsum_plan(subscripts, operands, SMALL_CONTRACTION if limit is None else limit)
     if plan is None:
