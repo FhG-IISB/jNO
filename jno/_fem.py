@@ -2776,6 +2776,23 @@ class FEM:
                     "that bodies which come within about 2*alpha*h merge. This problem has no geometry "
                     "term, so nothing moves the nodes: add one (`coord.d(t) - velocity`), or drop alpha=."
                 )
+            if getattr(adapt, "relocate", False) or getattr(adapt, "enrich", False):
+                # These two drivers take the solver slots only as keywords they forward to the solves they
+                # hand back (relocate: the solve on the final mesh; enrich: each round's solve). The slots
+                # never reached them -- so `linear=jno.solve.lu()`, the very advice the saddle-point warning
+                # gives, was dropped without a word and the default iterative solve ran anyway. They are
+                # forwarded now. The relocation DESCENT keeps its own differentiable solves (sparse-direct,
+                # Newton, or the default march), which these slots do not configure.
+                if (x0 is not None) or (time is not None):
+                    raise NotImplementedError(
+                        "fem.solve(adapt=jno.solve.relocate(...) / enrich(...)) does not take x0= or time=: a "
+                        "warm start and a time scheme do not survive the change of mesh or space. The "
+                        "nonlinear=/linear=/precond= slots configure the solve it hands back."
+                    )
+                kwargs = {
+                    **kwargs,
+                    **{k: v for k, v in (("nonlinear", nonlinear), ("linear", linear), ("precond", precond)) if v is not None},
+                }
             if getattr(adapt, "enrich", False):
                 # p-adaptivity: raise the local order by switching interpolation covers on at the marked
                 # NODES. The mesh -- points, cells, connectivity -- is untouched, so the DOF *nodes* are

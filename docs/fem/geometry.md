@@ -148,6 +148,10 @@ u = fem.solve(adapt=jno.solve.relocate(max_iters=60))
     solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
     not wired yet.
 
+    The `nonlinear=`/`linear=`/`precond=` slots configure the solve on the **final** mesh, the one returned
+    (`linear=jno.solve.lu()` on a saddle problem, say); the descent itself keeps its own differentiable
+    solves. `x0=` and `time=` are refused: a warm start and a time scheme do not survive the change of mesh.
+
 ### A mesh objective that names the physics — `objective=<expression>`
 
 The three built-in objectives (`"equidistribution"`, `"energy"`, `"huang"`) are mesh-*quality* measures:
