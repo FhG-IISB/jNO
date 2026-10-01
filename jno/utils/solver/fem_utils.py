@@ -3424,6 +3424,34 @@ def _periodic_facet_weights(
     return None
 
 
+def _nearest_in_interface(s_loc, m_loc):
+    """``(index, distance)`` of the nearest ``m_loc`` row for every ``s_loc`` row (in-interface coordinates).
+
+    A k-d tree; with no main nodes the indices are 0 and the distances 0, as the caller expects. Equal
+    distances are broken by the LOWEST main index, as the dense ``argmin`` this replaces did."""
+    n_s = len(s_loc)
+    if not len(m_loc) or not n_s:
+        return np.zeros(n_s, dtype=int), np.zeros(n_s)
+    if np.shape(s_loc)[1] == 0:  # a point interface (1-D): every node is at the origin of its frame
+        return np.zeros(n_s, dtype=int), np.zeros(n_s)
+    from scipy.spatial import cKDTree
+
+    s_loc, m_loc = np.asarray(s_loc, dtype=float), np.asarray(m_loc, dtype=float)
+    tree = cKDTree(m_loc)
+    d0, _ = tree.query(s_loc, k=1)
+    # Every main node within a hair of the nearest distance is a candidate; the dense formula then decides
+    # among them, so the pick -- and its lowest-index tie break -- is exactly the dense argmin's.
+    cands = tree.query_ball_point(s_loc, r=d0 * (1.0 + 1e-9) + 1e-300)
+    idx = np.empty(n_s, dtype=int)
+    dist = np.empty(n_s)
+    for i, c in enumerate(cands):
+        c = np.sort(np.asarray(c, dtype=int))
+        d2 = np.sum((s_loc[i] - m_loc[c]) ** 2, axis=-1)
+        j = int(np.argmin(d2))
+        idx[i], dist[i] = c[j], np.sqrt(d2[j])
+    return idx, dist
+
+
 def build_periodic_prolongation(
     points: np.ndarray,
     pairs: Sequence[Tuple[str, str]],
@@ -3598,10 +3626,13 @@ def build_periodic_prolongation(
                 loc = _s_all[:, None]
         m_loc, s_loc = loc[m_ids], loc[s_ids]
 
-        # Nearest in-interface main node for every secondary node.
-        d2 = np.sum((s_loc[:, None, :] - m_loc[None, :, :]) ** 2, axis=-1)
-        nn = np.argmin(d2, axis=1) if m_ids.size else np.zeros(len(s_ids), dtype=int)
-        dist = np.sqrt(d2[np.arange(len(s_ids)), nn]) if m_ids.size and len(s_ids) else np.zeros(len(s_ids))
+        # Nearest in-interface main node for every secondary node -- by a k-d tree: the dense (n_s, n_m)
+        # distance table grew with the SQUARE of the face (a 128^2-node face: 268M entries, 2 GB).
+        nn, dist = _nearest_in_interface(s_loc, m_loc)
+        # A conforming interface needs nothing else: every secondary has its main node, the tie is a 0/1
+        # map, and the integrated mortar rows below would be computed only to be discarded (see `_mode`).
+        # They cost 14 of a 34 s build on a 32^3 periodic box -- pure-Python polygon clipping per face.
+        _all_match = bool(m_ids.size) and len(s_ids) > 0 and bool(np.all(dist <= tol))
 
         # Rim nodes carry no multiplier under the boundary-modified space, so they get no row and stay
         # KEPT. Computed once, here, and handed to the row builder so the two cannot drift.
@@ -3628,7 +3659,7 @@ def build_periodic_prolongation(
         # nothing to integrate over, so those nodes keep the collocated node-to-segment weights. Which
         # one each tie used is reported back in ``coupling`` rather than left to guesswork.
         mortar: Dict[int, List[Tuple[int, float]]] = {}
-        if s_fc is not None and m_fc is not None and loc.shape[1] in (1, 2):
+        if s_fc is not None and m_fc is not None and loc.shape[1] in (1, 2) and not _all_match:
             span = float(np.ptp(loc)) if loc.size else 1.0
             if loc.shape[1] == 1:  # 2-D interface: edge facets, clipping is an interval intersection
                 if _faces_span_the_same_extent(s_fc, m_fc, loc, span=span):
@@ -3676,7 +3707,7 @@ def build_periodic_prolongation(
         # tie mechanism for a 1-D interface (the frame has zero columns, so there is nothing to
         # integrate over), for Morley's value block (delegated with no facets at all), for quad/hex
         # facets, and for 3-D P2 tets -- the last two have no dual basis of this form at all.
-        _exact_ok = bool(m_ids.size) and len(s_ids) > 0 and bool(np.all(dist <= tol))
+        _exact_ok = _all_match
         # Mortar only if every NON-RIM secondary has a row; a tag selecting nodes but not whole facets
         # leaves some without one, and filling those from collocation is the mixing this removes.
         _mortar_ok = bool(mortar) and all(int(sid) in mortar for sid in s_ids if int(sid) not in _rim)
