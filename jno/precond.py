@@ -2933,12 +2933,22 @@ class _Cached(_Spec):
         raise TypeError(f"cached(refresh=...): expected bool, int, or callable, got {type(self.refresh).__name__}")
 
     def materialize(self, ctx: PrecondContext):
+        from jax._src import core as _core
+
         key = self._key_of(ctx)
         self._count += 1
-        if self._applier is None or key != self._key:
-            self._applier = materialize_precond(self.spec, ctx)  # build the wrapped preconditioner once
-            self._key = key
-        return self._applier  # same applier object (and its .T) reused on later solves
+        if self._applier is not None and key == self._key:
+            return self._applier  # same applier object (and its .T) reused on later solves
+        applier = materialize_precond(self.spec, ctx)
+        if _core.trace_state_clean():
+            # Built from CONCRETE values: its arrays are constants to any later trace, so it is kept.
+            self._applier, self._key = applier, key
+        # Built INSIDE a trace -- the Newton step of a nonlinear march (a scan body), a jitted or
+        # differentiated solve -- the applier closes over that trace's tracers. Keeping it handed them to
+        # the next trace: UnexpectedTracerError on the FIRST solve of a nonlinear march, on the second
+        # steady `newton(direct=True)` solve, and on a second jit trace or a `grad`. It is returned and not
+        # kept; inside a trace the build is part of the compiled program anyway.
+        return applier
 
     def __repr__(self):
         return f"jno.precond.cached({self.spec!r}, refresh={self.refresh}, built={self._applier is not None})"
@@ -2959,6 +2969,11 @@ def cached(spec, *, refresh=False):
     cadence policy for a Newton loop or transient march whose operator values drift step by step;
     pass a callable ``ctx -> hashable`` for a custom invalidation key. The wrapped spec's eager ``prepare(fem)`` hook (if any) is forwarded, so it composes with the
     ``jit``/``vmap``/parametric-inverse build-eagerly requirement unchanged.
+
+    Only a setup built from **concrete** values is kept. One built inside a trace -- the per-step Newton
+    solve of a nonlinear march, a solve under ``jax.jit``/``jax.grad`` -- closes over that trace's
+    intermediate values, so it is used for that trace and not kept: there the cache builds once per
+    trace (once per compiled program), not once per run.
 
     Reuse the SAME ``cached(...)`` object across the solves you want to share the setup::
 
