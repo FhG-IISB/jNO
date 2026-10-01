@@ -510,16 +510,22 @@ def _root_driver(
     name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False,
     reuse=False, anderson=0,
 ) -> NonlinearSolver:  # fmt: skip
-    if reuse and direct is not True:
+    if reuse and direct is False:
         raise ValueError(
-            f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED, factorized tangent between steps, and only "
-            f"the sparse-direct driver has one: pass direct=True as well. The default iterative and the "
-            f"matrix-free modes never factorize the tangent, so there is nothing to reuse."
+            f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED tangent between steps (and, for the sparse-direct "
+            f"driver, its factorization). The matrix-free mode (direct=False) never assembles one, so there is "
+            f"nothing to reuse: use the default direct=None (assembled tangent, iterative solve) or direct=True."
         )
 
     # direct: True = assembled tangent + sparse LU; None = assembled tangent + iterative inner solve when the
     # assembler provides one, matrix-free otherwise (newton's default); False = always matrix-free.
-    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
+    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None, tangent0=None, info=None):
+        # `tangent0`: a tangent the caller carries between calls (a time march, step to step) -- honoured only
+        # with reuse=True and an assembled tangent. `info` (a dict) receives the solve's own residual norms
+        # and, with reuse, its last tangent; see newton_direct.
+        carry = {"info": info} if jacobian is not None and direct is not False else {}
+        if reuse and jacobian is not None and direct is not False:
+            carry["tangent0"] = tangent0
         if direct is None and jacobian is not None:
             # The default: Newton on the ASSEMBLED tangent, solved iteratively -- the composed
             # ``linear=``/``precond=`` slots if given, else Jacobi-BiCGStab (see newton_default).
@@ -537,6 +543,8 @@ def _root_driver(
                 ls_max=ls_max,
                 ls_c=ls_c,
                 linear_solve=linear_solve if linear_solve is not None else assembled_krylov_solve(inner_tol, inner_maxit),
+                reuse=reuse,
+                **carry,
             )
         if direct:
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
@@ -567,6 +575,7 @@ def _root_driver(
                 # the historic sparse-LU default
                 linear_solve=linear_solve,
                 reuse=reuse,
+                **carry,
             )
         from .utils.solver.newton_krylov import newton_krylov
 
@@ -597,7 +606,10 @@ def _root_driver(
         config["anderson"] = anderson
     if reuse:
         config["reuse"] = reuse
-    return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol}, config=config)
+    return NonlinearSolver(
+        _fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol, "carries_tangent": bool(reuse), "reports_info": direct is not False},
+        config=config,
+    )
 
 
 def newton(
@@ -636,13 +648,20 @@ def newton(
     ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
     to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning.
 
-    ``reuse=True`` (with ``direct=True``) is **lagged-Jacobian Newton**: step against the last factorized
-    tangent until its contraction drops below 1/2, then refresh -- fewer factorizations for more,
-    cheaper steps. A step on a stale tangent that does not reduce the residual is rejected, so it
-    cannot diverge where the fresh Newton would not. Pays off with a backend that keeps its
-    factorization (``lu(backend="cudss" | "pardiso")``); ``backend="device"`` refactorizes anyway.
-    ``fem.stats["nonlinear"]["factorizations"]`` reports the count. See
-    :func:`jno.utils.solver.newton_krylov.newton_direct` for the rule and its source."""
+    ``reuse=True`` is **lagged-Jacobian Newton**: step against the last ASSEMBLED tangent until its
+    contraction drops below 1/2, then refresh -- fewer assemblies (and, with ``direct=True``,
+    factorizations) for more, cheaper steps. A step on a stale tangent that does not reduce the residual is
+    rejected, so it cannot diverge where the fresh Newton would not. It pays wherever assembling the tangent
+    costs more than a solve -- a long element integrand (a stabilised flow), or a backend that keeps its
+    factorization (``lu(backend="cudss" | "pardiso")``; ``backend="device"`` refactorizes anyway). Refused
+    with ``direct=False``, which never assembles a tangent. ``fem.stats["nonlinear"]["factorizations"]``
+    reports the count. See :func:`jno.utils.solver.newton_krylov.newton_direct` for the rule and its source.
+
+    **A transient march's own default Newton is** ``newton(reuse=True)``, and an eager march carries the
+    tangent from step to step as well: the tangent of a march changes little between steps, so it is
+    assembled a handful of times per march rather than at every Newton iteration (measured on a stabilised
+    3-D flow: once for 8 steps, 0.80 -> 0.30 s per step). An explicit ``nonlinear=newton()`` keeps a fresh
+    tangent per iteration."""
     return _root_driver(
         "newton",
         damping=damping,

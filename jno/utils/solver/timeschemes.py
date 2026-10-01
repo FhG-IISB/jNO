@@ -258,20 +258,27 @@ class _BDF2Scheme(_TimeScheme):
                     linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=_judge,
                 )  # fmt: skip
 
+            from .backend_blocks import _carried_tangent0
+
+            # The step tangent rides the carry (`SemidiscreteTimeBlock.step`, `tangent=`). It starts empty
+            # rather than from the start-up step's: that one is scaled by 1/dt, the BDF2 steps by 3/(2dt).
+            tang0 = _carried_tangent0(block, s0, nonlinear_solve, dtype)
+
             def make_step(args, t_start):
                 blk = hoist_time_invariant(block, args, t_start)
 
                 def step(carry, t_next):
-                    u_n, u_nm1 = carry
+                    (u_n, u_nm1), tang = carry if tang0 is not None else (carry, None)
                     u_star = (4.0 * u_n - u_nm1) / 3.0
                     out = blk.step(
                         u_star, t_next - dt_eff, dt_eff, args=args, theta=1.0,
-                        linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=_judge,
+                        linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=_judge, tangent=tang,
                     )  # fmt: skip
-                    if not _judge:
-                        return (out, u_n), out
-                    wn, r_end, r_start = out
-                    return (wn, u_n), (wn, r_end, r_start)
+                    if tang is not None:
+                        out, tang = out
+                    wn = out[0] if _judge else out
+                    nxt = (wn, u_n) if tang is None else ((wn, u_n), tang)
+                    return nxt, out
 
                 return step
 
@@ -299,13 +306,13 @@ class _BDF2Scheme(_TimeScheme):
             return _march_to_host(
                 block,
                 args,
-                cfg,
+                (*cfg, tang0 is not None),
                 make_step,
-                (s1, s0),
+                (s1, s0) if tang0 is None else ((s1, s0), tang0),
                 grid_ts[1:],
                 dtype,
                 save_ts,
-                state_of=lambda c: c[0],
+                state_of=(lambda c: c[0]) if tang0 is None else (lambda c: c[0][0]),
                 prefix_ts=grid_ts[:2],
                 prefix_states=[s0, s1],
                 judge=_verdict if _judge else None,

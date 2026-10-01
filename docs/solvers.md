@@ -1311,6 +1311,23 @@ Measured (RTX 3070, 2-D linear heat, 22,801 DOFs, 5 frames saved): peak device m
 — on the host now, not the device. **Under `jit`/`grad`** (`jno.core`, an inverse problem) the march stays
 one `lax.scan` holding every step: the adjoint needs the states.
 
+### What a march's Newton keeps — its tangent
+
+A nonlinear march's default per-step Newton is `jno.solve.newton(reuse=True)`: it keeps the assembled step
+tangent while that still contracts the residual (`‖r_new‖ < ‖r_old‖/2`), refreshes it the moment it does
+not, and rejects a step that fails to reduce the residual -- so a stale tangent costs at most one wasted
+solve, never a divergence. Evaluated eagerly, the march also carries the tangent **from step to step**
+(on the step-merge plan's fixed sparsity pattern), because a march's tangent changes little between steps.
+The step's convergence record reuses the norms Newton already computed instead of evaluating the residual
+twice more.
+
+Measured (RTX 3070, the Taylor–Green LES of the turbulence tutorial: residual-based VMS + Vreman, P1/P1,
+55,296 DOFs, BDF2): one tangent for an 8-step march instead of two per step; **0.80 → 0.30 s per step**,
+same trajectory (energy identical to 6 digits). The answer moves only within the Newton tolerance: a reused
+tangent converges linearly, so the final residual lands under the test rather than far below it. Pass
+`nonlinear=jno.solve.newton()` for a fresh tangent at every iteration. Under `jit`/`grad` the march keeps
+the tangent within a step but not across steps (the reverse pass would store one tangent per step).
+
 ### Time schemes — `fem.solve(time=…)`
 
 | Scheme | Order | Stability | Use |

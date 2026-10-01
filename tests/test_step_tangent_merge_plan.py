@@ -45,7 +45,10 @@ def _nonlinear_heat(n=6, steps=4):
 
 
 def _march(fem):
-    return np.asarray(fem.solve(time=jno.solve.bdf2()).fn())
+    # An explicit Newton with a fresh tangent per iteration: the plan must not change the answer, and the
+    # default driver's tangent carry -- which needs the plan -- would make the two marches stop at different
+    # points under the same tolerance, hiding what this compares.
+    return np.asarray(fem.solve(time=jno.solve.bdf2(), nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-14)).fn())
 
 
 def test_the_planned_march_equals_the_unplanned_one(monkeypatch):

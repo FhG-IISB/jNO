@@ -8,19 +8,24 @@ from typing import Any, Callable, Dict, Optional
 # ---------------------------------------------------------------------
 
 
-def _verdict(G, u_prev, wn, report):
+def _verdict(G, u_prev, wn, report, norms=None):
     """The step's own residual norms, for a march that wants to judge its steps afterwards.
 
     ``G`` is the function the driver actually root-finds, so both norms are for the SAME equation --
     one at the incoming iterate and one at the solved state. That is what lets the caller apply the
     driver's own ``atol + rtol*||r(u_prev)||`` test outside the trace, where it can concretise.
 
-    Costs two residual evaluations per step, and only when asked. Same arrangement, for the same
+    Costs two residual evaluations per step, and only when asked -- none when the Newton solve hands back
+    the norms it already took (``norms = (||G(wn)||, ||G(u_prev)||)``, the same two numbers: measured as
+    ~20% of a step of a stabilised 3-D flow whose tangent is carried). Same arrangement, for the same
     reason, as the load-path march in ``history_march.py``.
     """
     if not report:
         return wn
     import jax.numpy as jnp
+
+    if norms is not None:
+        return wn, jnp.asarray(norms[0]), jnp.asarray(norms[1])
 
     return (
         wn,
@@ -360,7 +365,9 @@ class SemidiscreteTimeBlock:
             self.mass_residual is not None and self.residual is not None
         )
 
-    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False):
+    def step(
+        self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None
+    ):
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
 
         The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
@@ -389,7 +396,80 @@ class SemidiscreteTimeBlock:
         * ``report=True`` additionally returns ``(u, ||G(u)||, ||G(u_prev)||)`` on a NONLINEAR
           step, so a marcher can judge the step outside the trace -- see :func:`_verdict`. A
           linear step is a linear solve with its own guard and ignores the flag.
-        """
+
+        ``tangent`` (``(data, valid)``) is a step tangent CARRIED from the previous step: with it the call
+        returns ``(result, tangent_next)``. jNO's default Newton then starts from it and keeps it while it
+        still contracts the residual (see :func:`~jno.utils.solver.newton_krylov.newton_direct`,
+        ``reuse``), instead of assembling a fresh tangent at every step -- the dominant cost of a march
+        whose element integrand is long (a stabilised flow: 220 of ~300 ms per Newton iteration). The data
+        rides the step-merge plan's fixed pattern (``step_merge_plan``); a path that has no such tangent (a
+        user ``nonlinear=`` slot, a matrix-free residual, a linear block) hands ``tangent`` back unchanged.
+        Without ``tangent`` the default Newton still keeps its tangent WITHIN the step."""
+        box = {}
+        out = self._step(
+            u, t, dt, args, theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=report,
+            tangent=tangent, _box=box,
+        )  # fmt: skip
+        if tangent is None:
+            return out
+        return out, box.get("tangent", tangent)
+
+    @staticmethod
+    def _carried_bcoo(tangent, plan, dtype):
+        """The carried tangent's data on the step-merge plan's fixed pattern, with its validity flag."""
+        import jax.experimental.sparse as jsp
+        import jax.numpy as jnp
+
+        (idx, _inv, _nse), (_n_j, _n_m, shape) = plan
+        data, valid = tangent
+        J0 = jsp.BCOO((jnp.asarray(data, dtype), idx), shape=tuple(shape), indices_sorted=True, unique_indices=True)
+        return J0, valid
+
+    @classmethod
+    def _slot_newton(cls, nonlinear_solve, G, u, jac, tangent, plan, dtype, box):
+        """A composed ``nonlinear=`` driver on the assembled step tangent, given the carried tangent when it
+        keeps tangents (``reuse=True``, the march default)."""
+        import jax.numpy as jnp
+
+        info = {}
+        if tangent is not None and plan is not None and getattr(nonlinear_solve, "carries_tangent", False):
+            wn = nonlinear_solve(G, u, jacobian=jac, tangent0=cls._carried_bcoo(tangent, plan, dtype), info=info)
+        elif getattr(nonlinear_solve, "reports_info", False):
+            wn = nonlinear_solve(G, u, jacobian=jac, info=info)
+        else:
+            return nonlinear_solve(G, u, jacobian=jac)
+        cls._collect(info, box)
+        return wn
+
+    @staticmethod
+    def _collect(info, box):
+        """The Newton solve's carried tangent and residual norms, for :meth:`step` to hand back / report."""
+        import jax.numpy as jnp
+
+        # Only a SPARSE tangent rides the carry (on the merge plan's pattern); a dense one -- a march reduced
+        # to a Galerkin basis, whose tangent is the projected UᵀJU -- is kept within the step only.
+        if "tangent" in info and hasattr(info["tangent"], "indices"):
+            box["tangent"] = (info["tangent"].data, jnp.asarray(True))
+        if "norms" in info:
+            box["norms"] = info["norms"]
+
+    @staticmethod
+    def _default_newton(G, u, jac, tangent, plan, dtype, box):
+        """jNO's per-step Newton on the assembled step tangent ``jac``, keeping that tangent while it
+        contracts -- within the step always, and across steps when a ``tangent`` is carried in."""
+        import jax.numpy as jnp
+
+        from .newton_krylov import newton_default
+
+        info = {}
+        tangent0 = SemidiscreteTimeBlock._carried_bcoo(tangent, plan, dtype) if (tangent is not None and plan is not None) else None
+        wn = newton_default(G, u, jacobian=jac, reuse=True, tangent0=tangent0, info=info)
+        SemidiscreteTimeBlock._collect(info, box)
+        return wn
+
+    def _step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False,
+              tangent=None, _box=None):  # fmt: skip
+        """The body of :meth:`step`; see there."""
         import jax.numpy as jnp
 
         args = args or {}
@@ -466,7 +546,8 @@ class SemidiscreteTimeBlock:
                                 plan=_merge_plan,
                             )
 
-                        return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
+                        wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                        return _verdict(G, u, wn, report, _box.get("norms"))
                     return _verdict(G, u, nonlinear_solve(G, u), report)
                 # default Newton: on the assembled step tangent when both Jacobians exist
                 if self.jacobian is not None and self.mass_residual_jac is not None:
@@ -480,7 +561,8 @@ class SemidiscreteTimeBlock:
                             plan=_merge_plan,
                         )
 
-                    return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
+                    wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                    return _verdict(G, u, wn, report, _box.get("norms"))
                 return _verdict(G, u, newton_krylov(G, u), report)
 
             M_t = _operand(self.mass(t_next, args))
@@ -507,7 +589,8 @@ class SemidiscreteTimeBlock:
                         J = self.jacobian(wn, t_next, args)
                         return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
-                    return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
+                    wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                    return _verdict(G, u, wn, report, _box.get("norms"))
                 return _verdict(G, u, nonlinear_solve(G, u), report)
             # default Newton: on the assembled step tangent M/dt + J when the assembler provides J
             if self.jacobian is not None:
@@ -517,7 +600,8 @@ class SemidiscreteTimeBlock:
                     J = self.jacobian(wn, t_next, args)
                     return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
-                return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
+                wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                return _verdict(G, u, wn, report, _box.get("norms"))
             return _verdict(G, u, newton_krylov(G, u), report)
 
         from .linear import matrix_diagonal, sparse_matvec
@@ -855,16 +939,37 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
                 unchanged=unchanged,
             )
 
+        # The step tangent rides the carry from step to step (see `SemidiscreteTimeBlock.step`, `tangent=`):
+        # assembled once and kept while it still contracts, instead of once per step.
+        tang0 = _carried_tangent0(block, s0, nonlinear_solve, dtype)
+        if tang0 is None:
+            carry0, state_of, stepper = s0, (lambda c: c), make_step
+        else:
+
+            def stepper(args, t_start):
+                blk = hoist_time_invariant(block, args, t_start)
+
+                def step(c, t_next):
+                    w, tang = c
+                    out, tang = blk.step(
+                        w, t_next - dt, dt, args=args, theta=theta, linear_solve=linear_solve,
+                        nonlinear_solve=nonlinear_solve, report=_judge, tangent=tang,
+                    )  # fmt: skip
+                    return (out[0] if _judge else out, tang), out
+
+                return step
+
+            carry0, state_of = (s0, tang0), (lambda c: c[0])
         return _march_to_host(
             block,
             args,
-            (linear_solve, nonlinear_solve, theta, dt),
-            make_step,
-            s0,
+            (linear_solve, nonlinear_solve, theta, dt, tang0 is not None),
+            stepper,
+            carry0,
             grid_np,
             dtype,
             save_ts,
-            state_of=lambda c: c,
+            state_of=state_of,
             prefix_ts=grid_np[:1],
             prefix_states=[s0],
             judge=_verdict if _judge else None,
@@ -1226,6 +1331,31 @@ def _chunk_bounds(n_steps, k):
             k = d
             break
     return [(a, min(a + k, n_steps)) for a in range(0, n_steps, k)]
+
+
+def _carried_tangent0(block, state, nonlinear_solve, dtype):
+    """The empty carried step tangent ``(zeros(nse), False)`` for a march whose per-step Newton keeps its
+    tangent (jNO's default; a ``newton(reuse=True)`` slot) on an assembled tangent, or ``None`` where
+    nothing can be carried: a linear block, a driver that does not keep tangents, no assembled tangent, or
+    no fixed tangent pattern to carry it on (no step-merge plan -- a pattern that moves during the march).
+    Builds the plan if no slot did."""
+    import jax.numpy as jnp
+
+    if not block.is_nonlinear() or block.jacobian is None:
+        return None
+    if nonlinear_solve is not None and not (
+        getattr(nonlinear_solve, "carries_tangent", False) and getattr(nonlinear_solve, "wants_jacobian", False)
+    ):
+        return None
+    if getattr(block, "mass_residual", None) is not None and getattr(block, "mass_residual_jac", None) is None:
+        return None
+    if block.step_merge_plan is None:
+        from .solver_api import _plan_step_tangent_merge
+
+        block.step_merge_plan = _plan_step_tangent_merge(block, state)
+    if block.step_merge_plan is None:
+        return None
+    return (jnp.zeros((int(block.step_merge_plan[0][2]),), dtype), jnp.asarray(False))
 
 
 def _march_eagerly(args, save_ts):

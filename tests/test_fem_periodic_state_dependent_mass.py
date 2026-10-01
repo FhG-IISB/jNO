@@ -36,6 +36,9 @@ def _x64():
 
 E = 1e-9
 DT, NST = 0.1, 5
+# The oracles are exact recursions, so Newton is asked to converge well below them (the march's default
+# stops just under rtol=1e-8, which is the solver's contract but not this test's subject).
+TIGHT = jno.solve.newton(rtol=1e-13, atol=1e-15)
 A0, B0, KA, KB = 0.3, -0.5, 1.0, 2.0
 
 
@@ -89,7 +92,7 @@ def test_two_fields_with_their_own_state_dependent_mass_march_on_a_periodic_squa
     ]  # fmt: skip
     fem = jno.fem(terms)
     kw = {"time": jno.solve.bdf2()} if scheme == "bdf2" else {}
-    traj = np.asarray(fem.solve(**kw).fn())
+    traj = np.asarray(fem.solve(nonlinear=TIGHT, **kw).fn())
     ga, gb = traj[:, fem.blocks[0]], traj[:, fem.blocks[1]]
     want_a, want_b = _recursion(A0, KA, scheme), _recursion(B0, KB, scheme)
     assert np.abs(want_a[-1] - A0) > 0.05 and np.abs(want_b[-1] - B0) > 0.05  # both actually decay
@@ -114,7 +117,7 @@ def test_a_vector_field_with_a_state_dependent_mass_marches_on_a_periodic_square
             u(*c)[0] - u0[0], u(*c)[1] - u0[1],
         ]
     )  # fmt: skip
-    traj = np.asarray(fem.solve().fn()).reshape(NST + 1, -1, 2)
+    traj = np.asarray(fem.solve(nonlinear=TIGHT).fn()).reshape(NST + 1, -1, 2)
     # the uniform state stays parallel to u0: w = s u0, (1 + s²|u0|²)(s - s_prev)/dt + s = 0
     want = [1.0]
     for _ in range(NST):

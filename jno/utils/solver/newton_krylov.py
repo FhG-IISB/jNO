@@ -658,7 +658,9 @@ def assembled_krylov_solve(tol=1e-10, maxit=2000):
     return solve
 
 
-def newton_default(residual_fn, u0, *, jacobian=None, inner_tol=1e-10, inner_maxit=2000, **kw):
+def newton_default(
+    residual_fn, u0, *, jacobian=None, inner_tol=1e-10, inner_maxit=2000, reuse=False, tangent0=None, info=None, **kw
+):  # fmt: skip
     """jNO's default Newton: on the ASSEMBLED tangent whenever the assembler provides one, else matrix-free.
 
     With ``jacobian`` (a callable ``u -> BCOO``, the assembler's tangent): each step assembles ``J(u)`` and
@@ -667,9 +669,16 @@ def newton_default(residual_fn, u0, *, jacobian=None, inner_tol=1e-10, inner_max
     ``-div((1+u^2) grad u)`` problem (RTX 3070, 4 Newton steps, same root to 2e-16): 516 -> 206 ms at
     10k DOF, 1133 -> 428 ms at 29k, 4025 -> 1181 ms at 87k (2.3-3.4x). Without one (a residual-only
     problem) it is :func:`newton_krylov`, the previous default. Differentiable either way (implicit
-    diff through ``custom_root``)."""
+    diff through ``custom_root``).
+
+    ``reuse`` / ``tangent0`` / ``info`` are :func:`newton_direct`'s (lagged tangent, carried across calls;
+    the solve's own residual norms); without an assembled tangent there is none to keep and ``info`` stays
+    empty."""
     if jacobian is not None:
-        return newton_direct(residual_fn, jacobian, u0, linear_solve=assembled_krylov_solve(inner_tol, inner_maxit), **kw)
+        return newton_direct(
+            residual_fn, jacobian, u0, linear_solve=assembled_krylov_solve(inner_tol, inner_maxit), reuse=reuse,
+            tangent0=tangent0, info=info, **kw,
+        )  # fmt: skip
     return newton_krylov(residual_fn, u0, inner_tol=inner_tol, inner_maxit=inner_maxit, **kw)
 
 
@@ -687,6 +696,8 @@ def newton_direct(
     ls_c=1e-4,
     linear_solve=None,
     reuse=False,
+    tangent0=None,
+    info=None,
 ):
     """Root-find ``residual_fn(u) = 0`` with a **sparse-direct** Newton: each step solves against the
     ASSEMBLED Jacobian ``jacobian_fn(u)`` (a ``jax.experimental.sparse.BCOO``) instead of the
@@ -739,7 +750,15 @@ def newton_direct(
     many residual evaluations, i.e. a large 3-D saddle; on a small problem it can be slower. The
     count is reported as ``fem.stats["nonlinear"]["factorizations"]``. Convergence and the gradient
     are unaffected: the loop still stops on the true residual, and the implicit gradient uses a fresh
-    tangent at the root."""
+    tangent at the root.
+
+    ``tangent0 = (J, valid)`` (with ``reuse=True``) starts from a tangent the CALLER kept -- a time march
+    carrying the last step's tangent into the next -- treated as a reused one: the contraction rule above
+    decides whether it still serves. ``valid=False`` (a traced flag) assembles a fresh one instead.
+    ``info`` (a dict) receives ``"norms"`` -- ``(||r(root)||, ||r(u0)||)``, which a time march reports per
+    step instead of evaluating the residual twice more -- and, with ``reuse=True``, ``"tangent"``: the last
+    tangent, gradient-free, for the caller to carry. A carried tangent is never part of the answer or of
+    its gradient (the implicit gradient re-assembles at the root)."""
     if linear_solve is None:
         from .linear import sparse_lu_solve
 
@@ -789,7 +808,7 @@ def newton_direct(
 
         if not reuse:
             u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
-            return u, k, k, jnp.linalg.norm(r), r0n  # a fresh tangent (one factorization) every step
+            return u, k, k, jnp.linalg.norm(r), r0n, None  # a fresh tangent (one factorization) every step
 
         def body_reuse(state):
             # Lagged-Jacobian step: see the docstring for the rule. `J` is the tangent carried from
@@ -811,11 +830,23 @@ def newton_direct(
             J_new = jax.lax.cond(refresh, lambda: J_fwd(u_new), lambda: J)
             return u_new, r_new, k + 1, J_new, refresh, nfact + refresh.astype(jnp.int32)
 
-        state0 = (x0, r_start, 0, J_fwd(x0), jnp.asarray(True), jnp.asarray(1, jnp.int32))
-        u, r, k, _J, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
-        return u, k, nfact, jnp.linalg.norm(r), r0n
+        if tangent0 is None:
+            J0, fresh0 = J_fwd(x0), jnp.asarray(True)
+        else:
+            # A tangent the caller carried (the last time step's): taken as a REUSED one, so the first
+            # step on it is judged by the contraction rule; an invalid one (the march's first step) is
+            # replaced by a fresh assembly, here, in one place.
+            J_carried, valid = tangent0
+            valid = jnp.asarray(valid)
+            J0 = jax.lax.cond(valid, lambda: J_carried, lambda: J_fwd(x0))
+            fresh0 = jnp.logical_not(valid)
+        state0 = (x0, r_start, 0, J0, fresh0, fresh0.astype(jnp.int32))
+        u, r, k, J_last, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
+        return u, k, nfact, jnp.linalg.norm(r), r0n, J_last
 
-    root, _steps, _nfact, _rn, _r0n = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
+    if tangent0 is not None and not reuse:
+        raise ValueError("newton_direct(tangent0=...) starts from a kept tangent, which only reuse=True does.")
+    root, _steps, _nfact, _rn, _r0n, _J = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
     _convergence_check(
         f0,
         u0,
@@ -838,6 +869,10 @@ def newton_direct(
         tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, linear_solve, "the newton_direct tangent", "transpose")  # noqa: E731
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
+    if info is not None:
+        info["norms"] = (_rn, _r0n)
+        if _J is not None:
+            info["tangent"] = jax.lax.stop_gradient(_J)
     return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
 
 

@@ -602,9 +602,9 @@ class NonlinearSolver:
         # differently or the second silently reuses the first's compiled solve.
         self.config = dict(config or {})
 
-    def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None, project=None):
+    def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None, project=None, **carry):
         kw = {"project": project} if project is not None else {}
-        return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian, **kw)
+        return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian, **kw, **carry)
 
     def __repr__(self):
         return f"jno.solve.{self.name}({', '.join(f'{k}={v!r}' for k, v in self.config.items())})"
@@ -1335,7 +1335,7 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
 
     inner = None if solver is None else _inner_with(precond)
 
-    def _composed(residual_fn, u0, *, jacobian=None, project=None):
+    def _composed(residual_fn, u0, *, jacobian=None, project=None, **carry):
         # Solution-dependent preconditioner refresh -- the Picard lag. Every Newton driver's loop is
         # a ``lax.while_loop``, so the per-step iterate is a tracer no host assembly can see; the
         # solve's ENTRY iterate (warm start / previous march step) is the one concrete solution a
@@ -1353,8 +1353,13 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             # else keeps materializing per linearization, exactly as before.
             if getattr(precond, "host_setup", False):
                 lin = _inner_with(_freeze_precond_for_newton(precond, fem, u0, jacobian))
-        return nonlinear(residual_fn, u0, linear_solve=lin, jacobian=jacobian, project=project)
+        return nonlinear(residual_fn, u0, linear_solve=lin, jacobian=jacobian, project=project, **carry)
 
+    # A carried tangent (a march, step to step) is honoured by a driver that keeps its tangent (reuse=True).
+    _traits_nl = getattr(nonlinear, "traits", None) or {}
+    _composed.carries_tangent = bool(_traits_nl.get("carries_tangent", False))
+    # ...and hands back its own residual norms (a march reports them per step instead of re-evaluating).
+    _composed.reports_info = bool(_traits_nl.get("reports_info", False))
     # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller
     # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
     # ``direct=None`` (newton's default) assembles the tangent whenever one is offered, so it wants it too.
@@ -1790,6 +1795,16 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         if block.step_merge_plan is None:
             block.step_merge_plan = _plan_step_tangent_merge(block, state)
         if not linear_step:
+            if nonlinear is None:
+                # The march's own default Newton KEEPS its tangent while it contracts (reuse=True): within a
+                # step, and -- carried by the marcher -- from step to step. A march's tangent changes little
+                # from one step to the next, and assembling it is the dominant cost of a long integrand
+                # (measured, a stabilised 3-D flow at 55k DOFs: 220 of ~300 ms per Newton iteration); the
+                # contraction rule refreshes it the moment it stops paying, so it never costs more than one
+                # wasted solve. An explicit `nonlinear=` keeps exactly what it asked for.
+                from ... import solve as _solve_ns
+
+                nonlinear = _solve_ns.newton(direct=True if getattr(linear, "direct", False) else None, reuse=True)
             return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
         # A LINEARLY implicit scheme (Rosenbrock) solves linear systems with the stage matrix even on a
         # nonlinear block: it takes the linear step solve composed below, not a Newton driver.

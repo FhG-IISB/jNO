@@ -122,7 +122,10 @@ def test_a_periodic_march_prolongs_its_host_frames(chunks_of):
 @pytest.mark.parametrize("scheme", ["theta", "bdf2"])
 def test_the_eager_march_equals_the_traced_one(scheme, chunks_of):
     chunks_of(4)
-    node = _heat(nonlinear=True, param=True).solve(**SCHEMES[scheme]())
+    # An explicit Newton: the eager march also carries its tangent across steps, which a traced one does
+    # not, and the two would then differ by the Newton tolerance -- not what this compares.
+    nl = jno.solve.newton(rtol=1e-12, atol=1e-14)
+    node = _heat(nonlinear=True, param=True).solve(nonlinear=nl, **SCHEMES[scheme]())
     k = jnp.array([1.3])
     eager = node.fn(k)
     traced = jax.jit(lambda kk: node.fn(kk))(k)  # one scan, every step on the device: the adjoint's path
