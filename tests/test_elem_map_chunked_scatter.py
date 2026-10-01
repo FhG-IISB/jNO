@@ -45,3 +45,29 @@ def test_the_chunked_scatter_needs_no_padding(n, c):
     g1 = jax.grad(lambda xx: (chunked(xx) ** 2).sum())(x)
     g2 = jax.grad(lambda xx: (full(xx) ** 2).sum())(x)
     assert float(jnp.abs(g1 - g2).max()) < 1e-12
+
+
+@pytest.mark.parametrize("chunk", [None, 4], ids=["one_vmap", "chunked"])
+def test_a_wrapped_kernel_whose_parameter_buffer_was_donated_is_recompiled(chunk):
+    """The chunked tangent passes its element kernel as ``lambda c, la, _k=kernel: ...``, so the runtime
+    parameter the kernel closes over sits one closure level down. ``elem_map``'s cache shares a compiled
+    program between equal-content builds, and checks that the program's own baked buffers are still alive
+    (an optimizer step donates the old parameter buffer). The check read only the top-level leaves -- one
+    function -- so the second of two crux recoveries of one form ran a compilation whose parameter buffer
+    was gone: "Array has been deleted with shape=float64[1]". Oracle: the second build runs, and agrees."""
+    from jno.utils.solver.fem_utils import elem_map
+
+    def build(p):
+        def kernel(c, x):
+            return x * p[0] + c
+
+        return lambda c, x, _k=kernel: _k(c, x).reshape(-1)
+
+    def run(p, n):  # n cells: a new size makes the shared program RETRACE, through its original closure
+        xs = (jnp.arange(float(n)), jnp.ones((n, 1)))
+        return np.asarray(elem_map(build(p), xs, chunk, scatter=(jnp.zeros((n,)), jnp.arange(n).reshape(n, 1))))
+
+    p1 = jnp.array([2.0])
+    assert np.array_equal(run(p1, 6), np.arange(6.0) + 2.0)
+    p1.delete()  # what a donating optimizer step does to the old parameter buffer
+    assert np.array_equal(run(jnp.array([2.0]), 8), np.arange(8.0) + 2.0)

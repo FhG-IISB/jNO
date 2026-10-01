@@ -4733,6 +4733,31 @@ def _fn_content_key(fn, chunk, seen=None, renumber=None):
     return (fn.__code__, tok, chunk)
 
 
+def _baked_arrays(obj, seen=None):
+    """Every leaf a compilation bakes from ``obj``, NESTED functions included: a function leaf contributes
+    the leaves of its own closure cells and defaults, recursively -- as :func:`_fn_content_key` walks them.
+
+    The donated-buffer check in :func:`elem_map` needs this depth. An element function passed as
+    ``lambda c, la, _k=kernel: ...`` (the chunked tangent scatter does) has ONE top-level leaf, the
+    ``kernel`` function; the runtime ``args`` it closes over sit one level down. The check saw no array,
+    so a content-hit alias ran a compilation whose parameter buffer an optimizer step had donated:
+    "Array has been deleted with shape=float64[1]" in the second of two crux recoveries of one form."""
+    if seen is None:
+        seen = set()
+    out = []
+    for leaf in jax.tree_util.tree_leaves(obj):
+        if hasattr(leaf, "__code__") and id(leaf) not in seen:
+            seen.add(id(leaf))
+            try:
+                cells = tuple(c.cell_contents for c in (leaf.__closure__ or ()))
+            except ValueError:  # an unfilled cell: nothing baked through it yet
+                cells = ()
+            out.extend(_baked_arrays((cells, leaf.__defaults__ or ()), seen))
+        else:
+            out.append(leaf)
+    return out
+
+
 def _bake_fingerprint(fn, chunk):
     """Identity of everything a ``jit`` of ``fn`` would BAKE IN: its code object, and the *leaves* of
     its closure cells and default arguments.
@@ -4861,7 +4886,7 @@ def elem_map(fn, xs, chunk, *, scatter=None):
     # is what makes the donated-buffer check below possible.
     def _baked_dead(entry):
         return entry[2] is not entry[1] and any(
-            isinstance(_l, jax.Array) and _l.is_deleted() for _l in jax.tree_util.tree_leaves(entry[2])
+            isinstance(_l, jax.Array) and _l.is_deleted() for _l in _baked_arrays(entry[2])
         )
 
     hit = _ELEM_MAP_CACHE.get(key)
@@ -4884,7 +4909,7 @@ def elem_map(fn, xs, chunk, *, scatter=None):
         if ckey is not None:
             chit = _ELEM_MAP_CONTENT.get(ckey)
             if chit is not None and any(
-                isinstance(_l, jax.Array) and _l.is_deleted() for _l in jax.tree_util.tree_leaves(chit[2])
+                isinstance(_l, jax.Array) and _l.is_deleted() for _l in _baked_arrays(chit[2])
             ):
                 # Same corpse check for the content table (its entries keep the ORIGINAL build's
                 # leaves as ``baked``, which are exactly the compiled closure's buffers).
