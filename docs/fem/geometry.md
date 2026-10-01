@@ -890,6 +890,10 @@ also how you reach the options below:
   `T` in a heat+flow / thermo-mechanical solve).
 - **Transient.** The coupling enters each implicit step, so enclosure radiation over a heating cycle
   solves in-residual. (Not combined with periodic ties.)
+- **Essential rows.** The contribution is zeroed on every Dirichlet row -- constant, time- or
+  τ-dependent, or parameter/net-valued -- so it never moves a prescribed value. A coupling on a linear
+  form promotes it to a residual operator that still declares those rows, so
+  `jno.solve.staggered(over_relax>1)` leaves them alone.
 
 All four (bare function, `params`, `field_key`, transient) are covered in
 `tests/test_fem_enclosure_radiation.py`. Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed.,

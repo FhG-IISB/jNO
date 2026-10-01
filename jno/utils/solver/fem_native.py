@@ -4157,12 +4157,24 @@ def assemble_fem_native(
 
         pairs: List[Tuple[int, float]] = []
         tv_stash: List[Tuple[Any, Any, Any]] = []  # (dofs, value_node, coords) for time-varying g(x,t)
+        # The DOFs of the rows whose held value rides the runtime args (a parameter or a net in the value).
+        # They get no constant pair either, and a consumer that zeroes "the constrained rows" -- a nonlocal
+        # `Coupling` -- must see them, or it adds its contribution onto the row's `u - g` and shifts the wall.
+        args_dofs: List[int] = []
+
+        def _row_dofs(fidx, region, comp):
+            vt = vecs[fidx]
+            comps = range(vt) if comp is None else [int(comp)]
+            return [int(offs[fidx] + nid * vt + c) for nid in _boundary_node_ids(fidx, region) for c in comps]
+
         for _row_i, (field_key, region, comp, value, value_node) in enumerate(dirichlet_raw):
             fidx = field_index.get(field_key)
             if fidx is None:
                 continue
             if _row_i in _dir_param_rows:
-                continue  # args-dependent value: (re-)formed per args in _dirichlet_pairs_at, never frozen here
+                # args-dependent value: (re-)formed per args in _dirichlet_pairs_at, never frozen here
+                args_dofs.extend(_row_dofs(fidx, region, comp))
+                continue
             # Time-varying Dirichlet g(x,t): no constant pair — stash (dofs, value_node, coords) so a
             # transient caller (e.g. the second-order augmented block) writes g(x_d, t) each step.
             if value_node is not None and _is_temporal_value_node(value_node):
@@ -4195,6 +4207,7 @@ def assemble_fem_native(
             ):
                 _field_vals = np.asarray(_vn.model.module.value).reshape(-1)
             elif _vn is not None and _is_neural_coefficient(_vn):
+                args_dofs.extend(_row_dofs(fidx, region, comp))
                 continue  # a net-valued Dirichlet is (re-)built per args in _dirichlet_pairs_at
             vt = vecs[fidx]
             pts_all = pts_f_all[fidx]
@@ -4238,6 +4251,7 @@ def assemble_fem_native(
         # second-order block, the velocity ġ) per step.
         domain._fem_native_dirichlet_pairs = pairs
         domain._fem_native_dirichlet_tv = tv_stash
+        domain._fem_native_dirichlet_args_dofs = args_dofs
         _mask_cover_pins(pairs)
         _gauge_cover_modes(pairs)
         return pairs

@@ -5754,8 +5754,19 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     if fem_obj._mode not in ("linear", "nonlinear", "transient"):
         raise NotImplementedError(f"jno.fem: nonlocal Coupling terms are not supported for mode {fem_obj._mode!r}.")
     n = int(fem_obj.dofs)
-    pairs = getattr(domain, "_fem_native_dirichlet_pairs", None) or []
-    d_dofs = jnp.asarray([int(p[0]) for p in pairs], dtype=jnp.int32) if pairs else None
+    # EVERY constrained row, not only the constant-valued ones: a row whose held value moves with τ / t
+    # (`u(right) - (0.5 + tau)`) or rides the runtime args (`u(left) - g`, a net profile) has no constant
+    # pair either, and a contribution left on it is added to its `u - g` -- measured: a coupling of 0.1
+    # held such a wall at 0.4 where 0.5 was prescribed. The operator's own declaration joins in for the
+    # paths that do not stash on the domain (1-D).
+    _d = [int(p[0]) for p in (getattr(domain, "_fem_native_dirichlet_pairs", None) or [])]
+    for _dofs, _node, _coords in getattr(domain, "_fem_native_dirichlet_tv", None) or []:
+        _d.extend(int(i) for i in np.asarray(_dofs).reshape(-1))
+    _d.extend(int(i) for i in getattr(domain, "_fem_native_dirichlet_args_dofs", None) or [])
+    _op_d = getattr(fem_obj._op, "dirichlet_dofs", None)
+    if _op_d is not None:
+        _d.extend(int(i) for i in np.asarray(_op_d).reshape(-1))
+    d_dofs = jnp.asarray(np.unique(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
 
     # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
     # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
@@ -5848,6 +5859,9 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
             return (A @ u) - jnp.asarray(b).reshape(-1) + coupling_residual(u, args)
 
         fem_obj._op = FemResidualOperator(residual, size=n, runtime_parameter_exprs=rpe)
+        # The promoted operator states its essential rows like every other residual operator does, so an
+        # extrapolating driver (`staggered(over_relax>1)`) leaves them on their prescribed values.
+        fem_obj._op.dirichlet_dofs = d_dofs
         fem_obj._mode = "nonlinear"
         fem_obj._A = fem_obj._b = None
     else:  # already a nonlinear residual operator -> add the coupling
@@ -5871,6 +5885,8 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
         for _k, _v in vars(op).items():
             if _k not in ("residual", "jacobian", "runtime_parameter_exprs"):
                 setattr(wrapped, _k, _v)
+        if d_dofs is not None:
+            wrapped.dirichlet_dofs = d_dofs  # the full set the coupling is zeroed on (see above)
         fem_obj._op = wrapped
     return fem_obj
 
