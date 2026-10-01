@@ -851,6 +851,20 @@ class _FusedVolumeTerms(tuple):
     __slots__ = ()
 
 
+def _content_keyable(coeff) -> bool:
+    """Can ``elem_map``'s cache key a kernel baking ``coeff`` by content? The same allow-list walk the
+    cache runs (:func:`~jno.utils.solver.fem_utils._expr_digest`), with its bail tally put back: this is a
+    grouping question asked at build time, not a cache miss, and the tally is what measures the misses."""
+    from .fem_utils import _ELEM_MAP_STATS, _expr_digest
+
+    saved = dict(_ELEM_MAP_STATS["content_bail"])
+    try:
+        return _expr_digest(coeff) is not None
+    finally:
+        _ELEM_MAP_STATS["content_bail"].clear()
+        _ELEM_MAP_STATS["content_bail"].update(saved)
+
+
 class _CellFieldData(dict):
     """One field's per-cell data, with ``shape_hess`` built only if a term actually reads it.
 
@@ -3173,11 +3187,16 @@ def assemble_fem_native(
         # Fuse the pieces that share (test field, region mask): one kernel, one tangent pattern per group
         # rather than per piece (see `_FusedVolumeTerms`). Grouped in first-appearance order, so the
         # block order every consumer below iterates is deterministic.
-        _groups: Dict[Tuple[int, Tuple[str, ...]], List[Any]] = {}
+        #
+        # ...and by whether the compiled-kernel cache can key the piece by CONTENT (`_content_keyable`).
+        # A piece it cannot (a trainable parameter or a net in the coefficient) would make the whole fused
+        # kernel unkeyable, so a rebuild of a parametric form shared NO kernel -- measured 0 content hits
+        # where the unfused pieces got 6, i.e. the plain load term recompiled on every rebuild.
+        _groups: Dict[Tuple[int, Tuple[str, ...], bool], List[Any]] = {}
         for coeff, tfi, rn in typed_with_masks:
-            _groups.setdefault((tfi, rn), []).append(coeff)
+            _groups.setdefault((tfi, rn, _content_keyable(coeff)), []).append(coeff)
         typed_with_masks = [
-            (cs[0] if len(cs) == 1 else _FusedVolumeTerms(cs), tfi, rn) for (tfi, rn), cs in _groups.items()
+            (cs[0] if len(cs) == 1 else _FusedVolumeTerms(cs), tfi, rn) for (tfi, rn, _k), cs in _groups.items()
         ]
 
         surface_work: List[Tuple[str, np.ndarray, List[Tuple[Any, int]]]] = []
