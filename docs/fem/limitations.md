@@ -105,7 +105,10 @@ path is unaffected.
 
     Refused loudly: a value that is **both** parametric and t/τ-dependent (`u(top) - g*tau`). Train
     the amplitude through a Neumann / body term instead. A parametric wall **beside** a τ-ramped one
-    (`u(left) - g` with `u(right) - delta*tau`) is fine on the load path: both are held at every step. A FIELD-sized optimizer-less parameter stays
+    (`u(left) - g` with `u(right) - delta*tau`) is fine on the load path: both are held at every step.
+    A t/τ-dependent essential value needs steps to be held at: on a steady form that reads no step
+    history (`.i(k)`), and so does not march its `domain(tau=...)` grid, it is refused, with or without
+    a parameter in the form. A FIELD-sized optimizer-less parameter stays
     the nodal data-field value (a neighbour's field in a DD solve), gathered per node.
 
 ??? measured "Time-varying Dirichlet `g(x, t)` — the orders each scheme keeps"

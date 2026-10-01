@@ -5021,6 +5021,23 @@ def assemble_fem_native(
     s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
     s_d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
+    # A τ/t-dependent essential value is held at a STEP's τ (the load-path march) or t (the transient
+    # steppers, which returned above). A steady form that marches nothing has no τ to hold it at, so it is
+    # refused here -- AHEAD of the runtime-parametric branch. Placed after it, the guard never saw a
+    # parametric form: the linear one dropped the wall outright (u = 0 everywhere, where u = g x was
+    # prescribed) and the nonlinear one held it at τ = 0, while the same forms without a parameter raised.
+    # EXCEPT when the caller declared it consumes the tv stash itself (`tv_dirichlet_external=True`): the
+    # second-order u_tt block calls this assembler for the spatial operator and the Dirichlet stashes,
+    # then writes g(x_d, t) and the compatible ġ(x_d, t) onto its augmented [u, v] system per step.
+    if _tv_dirichlet and not tv_dirichlet_external and not (history_specs or surface_history_specs):
+        raise NotImplementedError(
+            "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is held at each step's "
+            "τ or t, and this form has no steps: it reads no step history (`.i(k)`), so `fem.solve()` does "
+            "not march its `domain(tau=...)` grid, and it has no `u.t`. Add the history read that makes it "
+            "a load-path march, use a constant essential value, or drive the load through a Neumann/body "
+            "term written as a function of τ."
+        )
+
     # ---- runtime-parametric (inverse): the operator/residual is re-evaluated at the runtime args
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
@@ -5166,21 +5183,6 @@ def assemble_fem_native(
             metadata={"nonaffine_operator": True},
         )
         return op, "linear", offs
-
-    # A τ/t-dependent essential value that no branch above threaded would be silently DROPPED here --
-    # the constraint disappears and the solve returns a plausible-looking wrong answer. Fail instead.
-    # EXCEPT when the caller declared it consumes the tv stash itself (`tv_dirichlet_external=True`):
-    # the second-order u_tt block calls this assembler for the spatial operator and the Dirichlet
-    # stashes, then writes g(x_d, t) and the compatible ġ(x_d, t) onto its augmented [u, v] system per
-    # step -- a legitimate consumer this guard was firing on (found by the pre-push suite: two wave
-    # oracles that pass on origin/main NotImplementedError'd from the guard's own commit onward).
-    if _tv_dirichlet and not tv_dirichlet_external:
-        raise NotImplementedError(
-            "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is threaded on the "
-            "steady residual path -- the load-path march and the runtime-parametric solve -- and by the "
-            "linear transient stepper. This form assembled through neither. Use a constant essential "
-            "value, or drive the load through a Neumann/body term written as a function of τ."
-        )
 
     # nonlinear (non-parametric)
     if nonlinear:

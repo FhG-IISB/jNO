@@ -859,6 +859,24 @@ def test_tau_dependent_dirichlet_off_the_march_fails_loud():
         )
 
 
+@pytest.mark.parametrize("nonlinear", [False, True], ids=["linear", "nonlinear"])
+def test_tau_dependent_dirichlet_off_the_march_fails_loud_with_a_parameter_too(nonlinear):
+    """A runtime parameter routes the form through the parametric branch, which returned before the guard
+    above: the linear form dropped the ramped wall (u = 0 everywhere) and the nonlinear one held it at
+    τ = 0, while the parameter-free twins raised."""
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 4))
+    d.tag("bot", lambda x, y: y < 1e-9)
+    d.tag("top", lambda x, y: y > 1 - 1e-9)
+    co, cb, ct = (d.variable(r, split=True) for r in ("interior", "bot", "top"))
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    k = jno.np.parameter((1,), name="k")
+    reaction = 0.1 * u * u * phi if nonlinear else 0.1 * u * phi
+    with pytest.raises(NotImplementedError, match="this form has no steps"):
+        jno.fem([k * inner(grad(u, X), grad(phi, X), 1) + reaction, u(*cb) - 0.0, u(*ct) - (0.5 + ct[-1])])
+
+
 # --------------------------------------------------------------------------------------------------
 # The march runs its per-step Newton inside `lax.scan`, where the driver's own convergence check
 # self-disables (it needs a concrete residual). Without a check OUTSIDE the scan a diverged step is
