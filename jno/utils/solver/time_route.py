@@ -121,6 +121,76 @@ def _strip_temporal_trial_derivative(node: Any) -> Any:
     return node
 
 
+#: Operations LINEAR in each argument: a rate inside one of them keeps the term linear in the rate (the degree
+#: adds up across the arguments, as in a product). Anything else that wraps a rate -- sqrt, sin, abs, where, a
+#: power -- is treated as nonlinear in it.
+_RATE_LINEAR_CALLS = {"inner", "einsum", "trace", "transpose", "sym", "antisym", "matmul", "dot", "sum", "mean",
+                      "reshape", "squeeze", "expand_dims", "getitem", "negative", "multiply", "symgrad"}  # fmt: skip
+_RATE_STACKING_CALLS = {"stack", "concat", "concatenate"}  # the degree of the stack is the largest part's
+
+
+def _rate_degree(node: Any):
+    """How many time-derivative factors ``u_t`` the product ``node`` carries -- ``None`` when ``u_t`` sits
+    inside an operation that is not linear in it (``sqrt(u_t)``, ``u_t**2``, ``where(..., u_t, ...)``)."""
+    if _is_temporal_jacobian_of_trial(node):
+        return 1
+    if isinstance(node, BinaryOp):
+        a, b = _rate_degree(node.left), _rate_degree(node.right)
+        if a is None or b is None:
+            return None
+        if node.op in ("*", "@"):
+            return a + b
+        if node.op in ("+", "-"):
+            return max(a, b)
+        if node.op == "/":
+            return a if b == 0 else None
+        return None if (a or b) else 0  # a power, a comparison, ... of a rate
+    if isinstance(node, FunctionCall):
+        degs = [_rate_degree(x) if isinstance(x, Placeholder) else 0 for x in node.args]
+        if not any(d is None or d > 0 for d in degs):
+            return 0
+        if any(d is None for d in degs):
+            return None
+        name = getattr(node, "_name", None) or getattr(getattr(node, "fn", None), "__name__", "")
+        if name in _RATE_LINEAR_CALLS:
+            return sum(degs)
+        if name in _RATE_STACKING_CALLS:
+            return max(degs)
+        return None
+    if isinstance(node, (Jacobian, Hessian)):
+        return _rate_degree(node.target)
+    from .solver_helper import iter_children
+
+    degs = [_rate_degree(c) for c in (iter_children(node) or ())]
+    if any(d is None for d in degs):
+        return None
+    return max(degs, default=0)
+
+
+def refuse_nonlinear_in_rate(node: Any, where: str = "jno.fem") -> None:
+    """Raise unless the transient term ``node`` is LINEAR in the time derivative ``u_t``.
+
+    A first-order march writes every term as a mass action ``M(u) u_t``: the constant-mass path reads ``M``
+    off the derivative of the term at ``u_t = 0``, and the state-dependent path replaces ``u_t`` by
+    ``u - u_prev`` and divides the whole action by the step once. Both are exact only for a term linear in
+    ``u_t``. A quadratic one came out scaled by ``dt`` instead of ``dt**2`` -- measured on ``u_t + a u_t**2 +
+    u = 0``: the march matched the mis-scaled recursion to every digit, not backward Euler -- and the
+    constant-mass path would drop it outright (its derivative at ``u_t = 0`` is zero). Refused by name."""
+    deg = _rate_degree(node)
+    if deg is not None and deg <= 1:
+        return
+    what = "quadratic (or higher)" if deg is not None else "not linear"
+    shown = repr(node)
+    shown = shown if len(shown) <= 240 else shown[:240] + " ..."
+    raise NotImplementedError(
+        f"{where}: the transient term {shown} is {what} in the time derivative u_t. A first-order march "
+        "treats every u_t as a mass action M(u)·u_t, which is exact only for a term linear in u_t -- this "
+        "one would be marched wrongly (a u_t·u_t piece scaled by dt instead of dt², silently). Write the term "
+        "with u_t entering linearly; for a residual-based VMS Reynolds stress -(∇v, u'⊗u'), drop the "
+        "u_t⊗u_t piece of u'⊗u' (or evaluate u' quasi-statically there)."
+    )
+
+
 def _replace_temporal_with_backward_euler(node: Any, prev_for) -> Any:
     """Replace ``d/dt(TrialFunction)`` with ``(TrialFunction − u_prev)`` — the backward-Euler
     discretization of a transient term used when the mass coefficient depends on the unknown

@@ -1338,9 +1338,15 @@ where the pressure has no time derivative at all, that ringing is exactly what y
 The first BDF2 step is plain backward Euler — a multistep method has no second level to start from.
 A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
 `c(uⁿ⁺¹)(3uⁿ⁺¹ − 4uⁿ + uⁿ⁻¹)/(2Δt)`, second order in time (measured on a manufactured `c(u) = 1 + u²`);
-it is not the conservative form an enthalpy mass `H(u)_t` would want. Refused loudly rather than
-mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not damped),
-and `.adaptive()` (step doubling sizes a one-step method).
+it is not the conservative form an enthalpy mass `H(u)_t` would want. It composes with periodic ties
+(the march carries the reduced state; the mass action is reduced like the residual). Refused loudly
+rather than mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not
+damped), and `.adaptive()` (step doubling sizes a one-step method).
+
+Every scheme needs each transient term **linear in `u_t`** — `c(u)·u_t`, or `u_t` inside a contraction such
+as `τ (u·∇v)·u_t` (the time derivative inside a residual-based stabilisation). A term quadratic in `u_t`, or
+`u_t` inside a nonlinear function, is refused: it used to be marched with `(u − u_prev)²/Δt` where `/Δt²`
+belonged. The `u_t⊗u_t` piece of a residual-based VMS Reynolds stress is such a term — drop that piece.
 
 ### Higher order — `sdirk` and `rosenbrock`
 

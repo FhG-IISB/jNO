@@ -4527,6 +4527,10 @@ def assemble_fem_native(
             refuse_mixed_temporal_group(_t, where="jno.fem")
         temporal = [t for t in sub_signed if _contains_temporal_derivative(t)]
         spatial = [t for t in sub_signed if not _contains_temporal_derivative(t)]
+        from .time_route import refuse_nonlinear_in_rate
+
+        for _t in temporal:
+            refuse_nonlinear_in_rate(_t)
         if not temporal:
             raise ValueError(
                 "jno.fem (native): an initial condition was provided but no temporal term "
