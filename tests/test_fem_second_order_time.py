@@ -65,12 +65,12 @@ def _wave_fem(mesh_size=0.1, n_periods=4, n_steps=240, damping=0.0, u0_fn=_mode1
     return jno.fem([weak, u(xb, yb) - float(dirichlet), u_ic, vel_ic])
 
 
-def _trajectory(fem, theta=None):
+def _trajectory(fem, theta=None, nonlinear_solve=None):
     block = fem.operator
     if theta is not None:
         block.metadata["theta"] = theta
     ts = np.asarray(_block_time_grid(block))
-    ys = np.asarray(_default_transient_integrate(block, {}, ts))
+    ys = np.asarray(_default_transient_integrate(block, {}, ts, nonlinear_solve=nonlinear_solve))
     # The augmented state is [displacements | velocities], so the split is the MIDPOINT — the same
     # thing as offsets[1] for a single field, but not for a coupled system, whose displacement half
     # already spans several field blocks.
@@ -417,7 +417,10 @@ def test_second_order_1d_nonlinear_reduces_to_the_linear_path():
         if eps:
             weak = weak + eps * ((u * u * u) * vi)
         fem = jno.fem([weak, u(xb) - 0.0, u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]), ui0.t - 0.0])
-        _ts, U, _ = _trajectory(fem)
+        # The routes are compared below the march Newton's own tolerance (it stops just under atol=1e-8 and
+        # solves each correction only as far as that needs), so the nonlinear one is solved tightly.
+        tight = jno.solve.newton(rtol=1e-13, atol=1e-15) if eps else None
+        _ts, U, _ = _trajectory(fem, nonlinear_solve=tight)
         return U
 
     lin, nl = wave(0.0), wave(1e-9)

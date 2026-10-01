@@ -69,10 +69,12 @@ def _eager(out):
 
 @pytest.mark.parametrize("refresh", [False, True], ids=["frozen", "on_pattern_change"])
 def test_a_nonlinear_march_with_a_cached_preconditioner(refresh):
-    ref = _eager(_heat_march().solve())
+    # Compared at 1e-12, below the march Newton's own tolerance: both marches solve tightly.
+    tight = jno.solve.newton(rtol=1e-13, atol=1e-15)
+    ref = _eager(_heat_march().solve(nonlinear=tight))
     spec = jno.precond.cached(jno.precond.jacobi(), refresh=refresh)
     for _ in range(2):  # the second march must not meet the first one's tracers either
-        got = _eager(_heat_march().solve(precond=spec))
+        got = _eager(_heat_march().solve(precond=spec, nonlinear=tight))
         assert np.abs(got - ref).max() <= 1e-12 * np.abs(ref).max()
     assert spec._applier is None, "a setup built inside the march's trace must not be kept"
 

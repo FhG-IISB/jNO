@@ -414,8 +414,14 @@ def _amp():
     return jno.np.reshape(jno.np.parameter((1,), name="a"), ())
 
 
+#: The wall-value checks below are tighter than the march Newton's own tolerance (atol=1e-8, with each
+#: correction solved only as far as that needs), so a nonlinear march is solved with a tight explicit Newton.
+_TIGHT = jno.solve.newton(rtol=1e-13, atol=1e-15)
+
+
 def _march(blk, scheme, args, save):
-    return SCHEMES[scheme][0]().integrate(blk, args, save, linear_solve=None, nonlinear_solve=None)
+    nl = _TIGHT if blk.is_nonlinear() and scheme != "ros2" else None  # Rosenbrock has no Newton solve
+    return SCHEMES[scheme][0]().integrate(blk, args, save, linear_solve=None, nonlinear_solve=nl)
 
 
 @pytest.mark.parametrize("coupled", [True, False], ids=["coupled", "single"])
