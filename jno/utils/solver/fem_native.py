@@ -38,6 +38,7 @@ linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary con
 
 from __future__ import annotations
 
+import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 import jax
@@ -826,6 +827,64 @@ def _time_value_components(value_node, coords, vt, comp, region):
         return 1
     _dirichlet_value_columns(np.zeros((1, per)), vt, comp, region)  # raises unless per == vt, all-component
     return per
+
+
+#: The field key of a test function evaluated as a seeded trial field (see ``_seeded_element_residual``).
+_SEED_KEY = ("__test_seed__",)
+#: Internal A/B switch (tests): ``[False]`` evaluates every term per test DOF, as before. Read at build time.
+_SEEDED_TEST = [True]
+
+
+class _NotSeedable(Exception):
+    """A seeded test-function piece did not reduce to a real scalar per quadrature point."""
+
+
+#: ``piece -> (rewritten, test_nodes) | None``. Module-level and weak-keyed ON PURPOSE: the element kernels'
+#: closures are walked by the compile cache's content fingerprint and its baked-array liveness check, and
+#: a mutable cache inside them is neither -- it made that walk fail outright. A piece's rewrite depends on
+#: the piece alone, so sharing it across builds is exact.
+_SEED_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _seeded_piece(piece):
+    """``(rewritten, test_nodes)`` -- ``piece`` with its test function as a trial field keyed ``_SEED_KEY``
+    -- or ``None`` when ``piece`` is not provably linear in it (see ``_seeded_element_residual``)."""
+    if not _SEEDED_TEST[0]:
+        return None
+    try:
+        return _SEED_CACHE[piece]
+    except (KeyError, TypeError):
+        pass
+    from ...trace import TestFunction as _Test
+    from ...trace import TrialFunction as _Trial
+    from ...trace import substitute as _substitute
+    from .solver_helper import iter_children
+    from .time_route import linear_degree
+
+    res = None
+    if linear_degree(piece, lambda n: isinstance(n, _Test), strict=True) == 1:
+        tests: Dict[int, Any] = {}
+
+        def _walk(n):
+            if isinstance(n, _Test):
+                tests[id(n)] = n
+                return
+            for ch in iter_children(n) or ():
+                _walk(ch)
+
+        _walk(piece)
+        proxies = {}
+        for n in tests.values():
+            pr = _Trial(name="seed", value_shape=getattr(n, "value_shape", ()), order=getattr(n, "order", 1),
+                        space=getattr(n, "space", "Lagrange"))  # fmt: skip
+            pr.field_key = _SEED_KEY
+            proxies[n] = pr
+        res = (_substitute(piece, proxies), tuple(tests.values()))
+    try:
+        _SEED_CACHE[piece] = res
+    except TypeError:  # not weak-referenceable: recompute next time, it is a trace-time cost only
+        pass
+    return res
 
 
 class _FusedVolumeTerms(tuple):
@@ -2586,7 +2645,8 @@ def assemble_fem_native(
         un = jax.lax.dynamic_slice(u_flat, (offs[fidx],), (n_geom * vt,)).reshape(n_geom, vt)
         return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
 
-    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None):
+    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None,
+                      seeded=True):  # fmt: skip
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
@@ -2632,15 +2692,61 @@ def assemble_fem_native(
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
-        if isinstance(coeff, _FusedVolumeTerms):
-            # One test field, one mask: every piece integrates against this same `loc` and has the same
-            # (n_test,) layout, so their sum is the fused group's element residual.
-            w = qw_shared * meas
-            out = _integrate_term(domain, coeff[0], loc, w)
-            for piece in coeff[1:]:
-                out = out + _integrate_term(domain, piece, loc, w)
-            return out
-        return _integrate_term(domain, coeff, loc, qw_shared * meas)
+        # One test field, one mask: every piece integrates against this same `loc` and has the same
+        # (n_test,) layout, so their sum is the group's element residual.
+        w = qw_shared * meas
+        pieces = tuple(coeff) if isinstance(coeff, _FusedVolumeTerms) else (coeff,)
+        # The TANGENT keeps the per-DOF evaluation (``seeded=False``): its element matrix of a symmetric form
+        # is then bitwise symmetric, which is what admits LDLᵀ and keeps the eigs symmetry guard quiet; the
+        # seeded one is forward-over-reverse and symmetric only to round-off (3e-17 measured).
+        seeds = [p for p in (_seeded_piece(pc) for pc in pieces) if p is not None] if seeded else []
+        out = _seeded_element_residual(seeds, tfi, per, loc, w) if seeds else None
+        plain = pieces if out is None else [pc for pc in pieces if _seeded_piece(pc) is None]
+        for piece in plain:
+            r = _integrate_term(domain, piece, loc, w)
+            out = r if out is None else out + r
+        return out
+
+    # ---- the test function as a seeded trial field ---------------------------------------------------
+    # A weak term is LINEAR in its test function: per quadrature point it is ``f·v + F:∇v (+ ...)``. The
+    # evaluator used to carry the test basis through every product as an extra axis -- n_local x n_comp
+    # one-hot columns for a vector field -- so each term was evaluated once per test DOF, mostly on
+    # zeros. Evaluating the test function instead as a field with coefficients ``s``, ``v = Σ_a φ_a s_a``,
+    # gives the integrand as a scalar per point, linear in ``s``, and the element residual is exactly its
+    # gradient: ``r_a = ∂/∂s_a Σ_q w_q I(s)``. One reverse pass does the basis contraction for every
+    # derivative of ``v`` the term reads. Measured on a 3-D residual-based VMS residual (P1/P1, 442k
+    # DOFs, RTX 3070): 71.7 -> 53.6 ms, and 48.9 -> 34.6 ms for its mass residual.
+    #
+    # Only where linearity is PROVEN (``linear_degree(..., strict=True) == 1``): a test function under
+    # ``stop_gradient``, a network, or a call the walk does not know keeps the per-DOF evaluation, which
+    # is the same number for every linear term and the old number for anything else.
+    def _seeded_element_residual(seeded, tfi, per, loc, w):
+        """``r = ∂/∂s Σ_q w_q I(s)`` for the seeded pieces, or ``None`` if one of them does not reduce to a
+        real scalar per quadrature point (the per-DOF path then takes every piece, and raises as before)."""
+        from .fem_utils import _field_slot_or_none
+
+        base = per[tfi]
+        if any(_field_slot_or_none(loc, t) != tfi for _rw, tests in seeded for t in tests):
+            return None  # a test basis other than this group's field: not this kernel's layout
+        slot = len(per)
+        index = {**loc["field_index"], _SEED_KEY: slot}
+
+        def total(s):
+            fd = _CellFieldData({**base, "cell_sol": s}, getattr(base, "_hess_fn", None))
+            loc2 = {**loc, "fields": list(per) + [fd], "field_index": index}
+            acc = 0.0
+            for rewritten, _tests in seeded:
+                val = _eval_integrand(domain, rewritten, loc2)
+                if jnp.iscomplexobj(val) or jnp.ndim(val) == 0 or val.shape[0] != w.shape[0] or val.size != w.shape[0]:
+                    raise _NotSeedable
+                acc = acc + jnp.sum(val.reshape(-1) * w)
+            return acc
+
+        s0 = jnp.zeros(jnp.shape(base["cell_sol"]), jnp.result_type(base["cell_sol"], w))
+        try:
+            return jax.grad(total)(s0).reshape(-1)
+        except _NotSeedable:
+            return None
 
     def _vol_readout_loc(c, local_all, t=0.0, args=None, pts=None, rnames=()):
         """The per-cell ``loc`` a TEST-FREE volume expression is evaluated in, plus the geometric measure
@@ -3738,7 +3844,7 @@ def assemble_fem_native(
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d))(la)
+                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=False))(la)
 
                 _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
                 if _plan is not None:
