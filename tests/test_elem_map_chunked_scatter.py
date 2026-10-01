@@ -41,7 +41,8 @@ def test_the_chunked_scatter_needs_no_padding(n, c):
     def chunked(xx):
         return _chunked_scatter(fn, [xx], c, jnp.zeros(20), idx)
 
-    assert float(jnp.abs(chunked(x) - full(x)).max()) < 1e-14
+    # Relative: a scatter-add sums in an unspecified order (atomics on a GPU), so the last bits move.
+    assert float(jnp.abs(chunked(x) - full(x)).max()) <= 1e-14 * float(jnp.abs(full(x)).max())
     g1 = jax.grad(lambda xx: (chunked(xx) ** 2).sum())(x)
     g2 = jax.grad(lambda xx: (full(xx) ** 2).sum())(x)
     assert float(jnp.abs(g1 - g2).max()) < 1e-12
