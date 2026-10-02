@@ -1477,15 +1477,30 @@ def _march_to_host(
         return jax.lax.scan(jax.checkpoint(body), ext, (grid[1:], slots, compare))
 
     out = np.empty((save.size, n_dofs), dtype=np.dtype(dtype))
-    landed = []  # (rows, device frames) whose host copy is under way
+    landed = []  # (rows, device arrays, how to make the frames on the host) whose host copy is under way
 
     def _ship(rows, fr):
         fr.copy_to_host_async()
-        landed.append((rows, fr))
+        landed.append((rows, (fr,), None))
+
+    def _ship_states(rows, prev, buf, k, ts_local):
+        """A chunk's frames, made on the HOST from its raw slot buffer: the device keeps no copy of them.
+
+        Sampling them on the device -- the start state concatenated before the slots, then gathered or
+        blended -- held THREE copies of the frames there next to the march's own memory, and a 442k-DOF
+        stabilised flow saving 81 frames ran the 8 GB card out of memory landing them."""
+        prev.copy_to_host_async()
+        buf.copy_to_host_async()
+        landed.append((rows, (prev, buf), (k, ts_local)))
 
     def _land():
-        for rows, fr in landed:
-            out[rows] = np.asarray(fr)
+        for rows, arrs, how in landed:
+            if how is None:
+                out[rows] = np.asarray(arrs[0])
+                continue
+            k, ts_local = how
+            states = np.concatenate([np.asarray(arrs[0])[None, :], np.asarray(arrs[1])[:k]], axis=0)
+            out[rows] = _sample_host(states, ts_local, save[rows])
         landed.clear()
 
     def _sample(states, ts_local, rows):
@@ -1522,10 +1537,8 @@ def _march_to_host(
             (carry, buf, same), r = run(ext, g, jnp.asarray(slots), jnp.asarray(compare))
         last = ci == len(chunks) - 1
         rows = np.flatnonzero((save > t_prev) & ((save <= grid_np[b]) | last))
-        frames = None
         if rows.size:
-            states = jnp.concatenate([prev[None, :], buf[: mine.size]], axis=0)
-            frames = _sample(states, np.concatenate([[t_prev], grid_np[mine]]), rows)
+            _ship_states(rows, prev, buf, int(mine.size), np.concatenate([[t_prev], grid_np[mine]]))
         if judged:
             for x in (*r, same):
                 x.copy_to_host_async()
@@ -1537,16 +1550,30 @@ def _march_to_host(
                 judge(*_stack_residuals(res), int(a), False, None)
             res_dev = r
             flags.append(same)
-        if frames is not None:
-            _ship(rows, frames)
         prev = state_of(carry)
         t_prev = float(grid_np[b])
-        del buf, frames
+        del buf
     _land()
     if judged:
         res.append(tuple(np.asarray(x) for x in res_dev))
         judge(*_stack_residuals(res), n, True, bool(all(bool(np.asarray(f)) for f in flags)))
     return out
+
+
+def _sample_host(states, ts_local, ts):
+    """Rows of ``states`` (a trajectory on the grid times ``ts_local``) at the times ``ts``, on the host:
+    picked where a time is a grid point, else the linear blend of the two bracketing states with
+    :func:`_resample_trajectory`'s clamping."""
+    import numpy as np
+
+    hit = np.searchsorted(ts_local, ts)
+    if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
+        return states[hit]
+    hi = np.clip(np.searchsorted(ts_local, ts, side="right"), 1, ts_local.size - 1)
+    lo = hi - 1
+    span = ts_local[hi] - ts_local[lo]
+    w = np.clip(np.where(span > 0, (ts - ts_local[lo]) / np.where(span > 0, span, 1.0), 0.0), 0.0, 1.0)
+    return states[lo] * (1.0 - w[:, None]) + states[hi] * w[:, None]
 
 
 def _stack_residuals(res):

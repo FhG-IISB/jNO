@@ -197,3 +197,19 @@ def test_a_march_that_never_moves_is_still_refused(chunks_of):
     )
     with pytest.raises(RuntimeError, match="returned its INITIAL STATE unchanged"):
         fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-6, atol=1e-2), linear=jno.solve.lu(backend="host")).fn()
+
+
+def test_host_sampling_is_the_device_resample():
+    """Chunk frames are now picked or blended on the HOST from the raw slot buffer (sampling them on the
+    device held three copies there: a 442k-DOF flow saving 81 frames ran an 8 GB card out of memory). The
+    host sampler must be the device one: exact picks on grid points, the same blend and clamping off them."""
+    from jno.utils.solver.backend_blocks import _resample_trajectory, _sample_host
+
+    rng = np.random.default_rng(0)
+    grid = np.array([0.0, 0.1, 0.25, 0.4, 0.7])
+    states = rng.standard_normal((grid.size, 6))
+    on = grid[[1, 3, 4]]
+    assert np.array_equal(_sample_host(states, grid, on), states[[1, 3, 4]])
+    off = np.array([-0.05, 0.05, 0.25, 0.33, 0.7, 0.9])  # below, inside, on, inside, on, above the grid
+    want = np.asarray(_resample_trajectory(jnp.asarray(states), jnp.asarray(grid), off, jnp.float64))
+    assert np.allclose(_sample_host(states, grid, off), want, rtol=1e-14, atol=1e-14)
