@@ -2,7 +2,7 @@
 
 `jno.peec` solves for the **current distribution in a conductor network** — resistance, loop
 inductance, current sharing between parallel paths, and the ohmic loss that feeds a thermal model. It
-is the method of choice for a busbar, a power-module layout, a planar transformer winding or a bond-wire
+is the method of choice for a busbar, a power-module layout, a transformer winding or a bond-wire
 loop: geometry that is *mostly metal in mostly air*, where meshing the surrounding space would be the
 whole cost.
 
