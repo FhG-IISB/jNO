@@ -2693,6 +2693,10 @@ class domain(MeshIOMixin):
                 )
             # The explicit targets already won: `default` only fills what they left, so the two
             # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
+            if not resolved and has_default:
+                # Only a default was declared: the coefficient is that value everywhere -- there is no
+                # region to mask, and `_by_region` of an empty mapping is (rightly) an error.
+                return self._resolve_attached(default)
             return self._by_region(resolved, default=self._resolve_attached(default) if has_default else None)
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 

@@ -232,8 +232,9 @@ def resolve_sigma(value, xyz, what: str, tangent=None):
             )
         return out
     arr = jnp.asarray(value)
-    if arr.ndim == 0:
-        return jnp.broadcast_to(arr, (n,))
+    if arr.ndim == 0 or (arr.size == 1 and n != 1):
+        # a scalar, or a one-element array such as a `jno.np.parameter((1,))`: one value for the whole conductor
+        return jnp.broadcast_to(arr.reshape(()), (n,))
     if arr.shape != (n,):
         raise ValueError(
             f"peec: {arr.size} conductivities were attached to {what}, which discretises into {n} "
