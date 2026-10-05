@@ -126,7 +126,10 @@ class Dissipation(dict):
     The mapping itself is the total, so the thermal side is unchanged and a region that dissipates
     two ways never contributes half of itself by accident::
 
-        q = d.by_region(emag.dissipation(), default=0.0)
+        for region, value in emag.dissipation().items():
+            d.attach(region, q=value)
+        d.attach(q=0.0)          # every other region
+        q = d.q
 
     ``.sigma`` is the ohmic loss and ``.mu_r`` the core loss, each named after what the region
     attached -- the same spelling in and out, as with ``.attach(k=...)`` and ``d.k``, so no channel
@@ -313,11 +316,13 @@ class PEECSolution:
     def dissipation(self):
         """``{region: W/m^3}`` — the ohmic loss of each conductor, per unit of its own volume.
 
-        Shaped for :meth:`jno.domain.by_region`, which is how a per-region quantity enters a weak
+        Shaped for :meth:`jno.domain.attach`, which is how a per-region quantity enters a weak
         form, so the thermal side reads::
 
-            q = d.by_region(emag.dissipation(), default=0.0)
-            heat = d.k * grad(T) . grad(s) - q * s
+            for region, value in emag.dissipation().items():
+                d.attach(region, q=value)
+            d.attach(q=0.0)
+            heat = d.k * grad(T) . grad(s) - d.q * s
 
         Volumetric rather than total because that is what a source term is. The volume is the
         DISCRETISATION's -- the summed filament volumes -- so it is consistent with the currents that
@@ -623,11 +628,11 @@ class ParametricSolution:
                     raise ValueError(
                         f"jno.peec: the readout was handed {nm!r} with shape {got} where the "
                         f"parameter is {shapes[nm]}, which means it is being evaluated per point -- "
-                        "typically `d.by_region({region: sol.dissipation()[region]})`. A PEEC "
+                        "typically `d.attach(region, q=sol.dissipation()[region])`. A PEEC "
                         "readout is ONE value per region, not a field, so evaluate it once and pass "
                         "the number:\n\n"
                         "    q = sol.dissipation()['bar']            # a trace node\n"
-                        "    loss = jno.fn(lambda qb: <fem solve using d.by_region({'bar': qb})>, [q])\n\n"
+                        "    loss = jno.fn(lambda qb: <fem solve using d.attach('bar', q=qb)>, [q])\n\n"
                         "The FEM takes a traced scalar there and stays differentiable through it."
                     )
             at = dict(zip(names, values))

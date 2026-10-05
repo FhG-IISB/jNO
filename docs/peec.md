@@ -377,7 +377,7 @@ alone, so a grid is only refined where there is something to resolve.
 | `sol.Z` / `sol.R` | terminal impedance of the source port, ohm |
 | `sol.L` | loop inductance from the **field energy**, `Iᴴ Lp I / \|I_port\|²`, henry |
 | `sol.joule` | ohmic dissipation at the solved excitation, `Σ R_k \|I_k\|²`, watt |
-| `sol.dissipation()` | `{region: W/m³}` — total loss, shaped for `d.by_region`; `.sigma` / `.mu_r` split it |
+| `sol.dissipation()` | `{region: W/m³}` — total loss, shaped for `d.attach`; `.sigma` / `.mu_r` split it |
 | `sol.current(t)` | net current injected at terminal `t`, amp |
 | `sol.voltage(a, b=None)` | potential at terminal `a`, or the difference `a - b`, volt |
 | `sol.i` | the filament currents themselves |
@@ -458,12 +458,14 @@ the property that caused them — the same spelling in and out, as with `.attach
 
 ### Feeding a thermal solve
 
-`dissipation()` is shaped for `jno.domain.by_region`, which is how a per-region quantity enters a weak
+`dissipation()` is shaped for `d.attach`, which is how a per-region quantity enters a weak
 form — and it is **jittable**, so an electro-thermal objective reaches `jno.core`:
 
 ```python
-q = d.by_region(emag.solve().dissipation(), default=0.0)
-heat = kappa * dot(grad(T, coords), grad(s, coords)) - q * s
+for region, value in emag.solve().dissipation().items():
+    d.attach(region, q=value)
+d.attach(q=0.0)                                   # every other region
+heat = kappa * dot(grad(T, coords), grad(s, coords)) - d.q * s
 ```
 
 ## Solver controls
