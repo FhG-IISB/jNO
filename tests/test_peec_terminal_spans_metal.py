@@ -28,8 +28,8 @@ T = 0.5 * mm
 
 def _stack():
     """A bar with an ISOLATED plane one cell below it -- the shape of a DBC stack."""
-    bar = jno.Shape.box(0, 0, 2 * T, 20 * mm, 4 * mm, 3 * T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("bar")
-    plane = jno.Shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("plane")
+    bar = jno.shape.box(0, 0, 2 * T, 20 * mm, 4 * mm, 3 * T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("bar")
+    plane = jno.shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("plane")
     return bar + plane
 
 
@@ -50,8 +50,8 @@ def _solve(term_where, _caplog=None):
     P._PITCH_WARNED.clear()  # the warning is deduped per process, so each case starts clean
     f = bar_filaments(
         [
-            jno.Shape.box(0, 0, 2 * T, 20 * mm, 4 * mm, 3 * T, size=(2 * mm, 2 * mm, T)),
-            jno.Shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)),
+            jno.shape.box(0, 0, 2 * T, 20 * mm, 4 * mm, 3 * T, size=(2 * mm, 2 * mm, T)),
+            jno.shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)),
         ],
         sigma=[SIG, SIG],
     )

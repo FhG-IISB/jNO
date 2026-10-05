@@ -18,7 +18,7 @@ import jno
 
 @pytest.fixture
 def dom():
-    d = jno.Shape.rect(0, 0, 1, 1).domain(size=0.4)
+    d = jno.shape.rect(0, 0, 1, 1).domain(size=0.4)
     d.tag("A", lambda x, y: np.isclose(x, 0))
     d.tag("B", lambda x, y: np.isclose(x, 1))
     d.tag("C", lambda x, y: np.isclose(y, 1))

@@ -23,7 +23,7 @@ loss_frac = jno.np.parameter((1,), name="loss_frac")
 loss_frac.initialize(jax.nn.initializers.constant(0.2))    # a deliberately poor first guess
 loss_frac.optimizer(optax.adam(0.03))
 
-bar  = jno.Shape.box(...).attach(sigma=CU * (1.0 - loss_frac * corroded))
+bar  = jno.shape.box(...).attach(sigma=CU * (1.0 - loss_frac * corroded))
 emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0)
 ```
 

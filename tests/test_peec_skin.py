@@ -42,7 +42,7 @@ def test_a_round_wire_approaches_its_thin_skin_asymptote():
 
 def test_one_cell_through_the_thickness_still_shows_the_skin_effect():
     """The point of the surface impedance: no splitting across the section, and sqrt(f) still appears."""
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.004, 0.002))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.004, 0.002))
     assert f.lattice["n"][2] == 1  # ONE cell through the 2 mm thickness
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
@@ -71,7 +71,7 @@ def test_a_wire_and_a_bar_take_different_coefficients():
 
 def test_the_impedance_is_differentiable_through_the_surface_form():
     """The sqrt in gamma is zero at DC, and differentiating a masked branch through it gives NaN."""
-    f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, 0.03)], r=3e-4, size=0.005))
+    f = line_filaments(jno.shape.line([(0, 0, 0), (0, 0, 0.03)], r=3e-4, size=0.005))
     for hz in (0.0, 1e6):
         loss = lambda s, hz=hz: jax.numpy.real(
             jax.numpy.sum(internal_impedance(f.length, f.area, f.skin, f.round_, 2 * np.pi * hz, s))
@@ -91,7 +91,7 @@ def test_the_impedance_is_differentiable_through_the_surface_form():
 def _bar(n, hz_pitch=None):
     """A 40 x 4 x 2 mm bar cut into ``n`` cells through its 2 mm thickness."""
     t = 0.002
-    return bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, t), size=(0.002, 0.004, hz_pitch or t / n))
+    return bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, t), size=(0.002, 0.004, hz_pitch or t / n))
 
 
 def _port(f, hz):
@@ -108,7 +108,7 @@ def test_the_thickness_is_measured_by_extent_not_by_pitch():
     Picking the thinner PITCH would call the 0.5 mm cell width the thickness and hand the skin
     formula the wrong dimension entirely.
     """
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.020, 0.00057), size=(0.0005, 0.0005, 0.00057))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.020, 0.00057), size=(0.0005, 0.0005, 0.00057))
     assert np.allclose(np.asarray(f.skin), 0.00057)  # the thickness, not the 0.5 mm pitch
     assert np.all(np.asarray(f.span) == 1)
 
@@ -199,8 +199,8 @@ def test_a_run_breaks_where_the_MATERIAL_changes():
     Stacked pieces of the SAME material stay one run, which matters just as much: a terminal post
     standing on a trace really is one column of copper, and that case is a genuine warning.
     """
-    lo = jno.Shape.box(0, 0, 0, 0.020, 0.008, 0.001)
-    hi = jno.Shape.box(0, 0, 0.001, 0.020, 0.008, 0.002)
+    lo = jno.shape.box(0, 0, 0, 0.020, 0.008, 0.001)
+    hi = jno.shape.box(0, 0, 0.001, 0.020, 0.008, 0.002)
     grid = dict(size=(0.002, 0.002, 0.001))
 
     same = bar_filaments([lo, hi], sigma=[SIG, SIG], **grid)
@@ -213,8 +213,8 @@ def test_a_run_breaks_where_the_MATERIAL_changes():
 
 def test_the_material_break_does_not_silence_the_stacked_copper_warning():
     """The post-on-a-trace case must still be caught: same metal, so still one conductor."""
-    trace = jno.Shape.box(0, 0, 0, 0.040, 0.010, 0.00057)
-    post = jno.Shape.box(0.018, 0.003, 0.00057, 0.022, 0.007, 0.00157)
+    trace = jno.shape.box(0, 0, 0, 0.040, 0.010, 0.00057)
+    post = jno.shape.box(0.018, 0.003, 0.00057, 0.022, 0.007, 0.00157)
     f = bar_filaments([trace, post], size=(0.002, 0.002, 0.00057), sigma=[SIG, SIG])
     assert (np.asarray(f.span) > 1).any()  # the column under the post is more than one element
 
@@ -234,8 +234,8 @@ def test_the_thickness_guard_runs_at_build_and_does_not_block_a_jit(caplog):
     # it -- a terminal post on a 0.57 mm trace is exactly this. A minority is unresolved, so the
     # guard warns rather than refusing the package, which is the case worth keeping alive.
     h = 0.0005
-    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, h, size=(0.001, 0.001, h)).attach(sigma=SIG).name("trace")
-    post = jno.Shape.box(0.009, 0.001, h, 0.011, 0.003, h + 0.0015).attach(sigma=SIG).name("post")
+    trace = jno.shape.box(0, 0, 0, 0.02, 0.004, h, size=(0.001, 0.001, h)).attach(sigma=SIG).name("trace")
+    post = jno.shape.box(0.009, 0.001, h, 0.011, 0.003, h + 0.0015).attach(sigma=SIG).name("post")
     d = (trace + post).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)

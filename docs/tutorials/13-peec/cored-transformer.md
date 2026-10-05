@@ -13,8 +13,8 @@ into the circuit.
 Nothing is switched on. **What a region carries decides what it is:**
 
 ```python
-core = jno.Shape.box(...).attach(mu_r=2000 - 200j).name("core")   # complex ⇒ lossy
-turn = jno.Shape.box(...).attach(sigma=CU).name("pri")            # metal
+core = jno.shape.box(...).attach(mu_r=2000 - 200j).name("core")   # complex ⇒ lossy
+turn = jno.shape.box(...).attach(sigma=CU).name("pri")            # metal
 ```
 
 ## An open terminal has a voltage

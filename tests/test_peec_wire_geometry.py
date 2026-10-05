@@ -27,7 +27,7 @@ ARC = [(0, 0, 0), (5 * MM, 0, 2 * MM), (10 * MM, 0, 0)]
 
 
 def _shape():
-    return jno.Shape.line(ARC, r=RW, size=1 * MM)
+    return jno.shape.line(ARC, r=RW, size=1 * MM)
 
 
 def _loop(points):
@@ -118,11 +118,11 @@ def _welded_case():
     from jno.peec import _weld
     from jno.utils.solver.peec import bar_filaments
 
-    plate = jno.Shape.box(0, 0, 0, 20 * MM, 6 * MM, 1 * MM)
+    plate = jno.shape.box(0, 0, 0, 20 * MM, 6 * MM, 1 * MM)
     fb = bar_filaments(plate, size=(2 * MM, 2 * MM, 1 * MM), sigma=[SIG])
     nb = len(np.asarray(fb.length))
     arc = [(3 * MM, 3 * MM, 0.6 * MM), (10 * MM, 3 * MM, 4 * MM), (17 * MM, 3 * MM, 0.6 * MM)]
-    sh = jno.Shape.line(arc, r=RW, size=2 * MM)
+    sh = jno.shape.line(arc, r=RW, size=2 * MM)
     # A welded network shares one near-field block, vectorised over a single sub-point count: a bar
     # samples its VOLUME (quad x quad_t^2), so the wire asks for that many along its length. This is
     # what `jno.peec._discretise` does; here the network is assembled by hand, so it does it here.

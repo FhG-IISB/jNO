@@ -26,7 +26,7 @@ SIG = 5.8e7
 
 def _straight(ell=2.0, n=400, a=1e-3):
     """A long straight wire carrying 1 A, so the infinite-wire law applies near its middle."""
-    sh = jno.Shape.line([(0, 0, -ell / 2), (0, 0, ell / 2)], r=a, size=ell / n)
+    sh = jno.shape.line([(0, 0, -ell / 2), (0, 0, ell / 2)], r=a, size=ell / n)
     f = line_filaments(sh)
     p = np.asarray(f.nodes)
     term = {
@@ -81,7 +81,7 @@ def test_an_arc_on_its_axis_matches_the_closed_form():
     th = np.linspace(0, 2 * np.pi * (1 - 1.0 / n), n)  # one segment short: the gap the port sits in
     frac = 1.0 - 1.0 / n
     pts = [(R * np.cos(t), R * np.sin(t), 0.0) for t in th]
-    sh = jno.Shape.line(pts, r=5e-4, size=2 * np.pi * R / n)
+    sh = jno.shape.line(pts, r=5e-4, size=2 * np.pi * R / n)
     f = line_filaments(sh)
     nd = np.asarray(f.nodes)
     term = {

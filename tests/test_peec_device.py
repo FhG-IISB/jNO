@@ -24,13 +24,13 @@ R_WIRE = ELL / (SIG * np.pi * RAD**2)
 
 def two_wires(gap=0.004):
     """Two collinear wires with a gap: nothing conducts across it but a device."""
-    lo = jno.Shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("lo")
-    hi = jno.Shape.line([(0, 0, ELL + gap), (0, 0, 2 * ELL + gap)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("hi")
+    lo = jno.shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("lo")
+    hi = jno.shape.line([(0, 0, ELL + gap), (0, 0, 2 * ELL + gap)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("hi")
     pads = (
-        jno.Shape.sphere(0, 0, 0.0, 2 * RAD).name("A")
-        + jno.Shape.sphere(0, 0, ELL, 2 * RAD).name("M")
-        + jno.Shape.sphere(0, 0, ELL + gap, 2 * RAD).name("N")
-        + jno.Shape.sphere(0, 0, 2 * ELL + gap, 2 * RAD).name("B")
+        jno.shape.sphere(0, 0, 0.0, 2 * RAD).name("A")
+        + jno.shape.sphere(0, 0, ELL, 2 * RAD).name("M")
+        + jno.shape.sphere(0, 0, ELL + gap, 2 * RAD).name("N")
+        + jno.shape.sphere(0, 0, 2 * ELL + gap, 2 * RAD).name("B")
     )
     d = (lo + hi + pads).domain()
     i, v = d.peec_symbols()
@@ -78,10 +78,10 @@ def test_a_device_carries_no_partial_inductance():
 
 def test_no_device_means_no_current_at_all():
     """The gap is the point: without the device the two wires are separate metal, and it says so."""
-    lo = jno.Shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("lo")
-    hi = jno.Shape.line([(0, 0, ELL + 0.004), (0, 0, 2 * ELL + 0.004)], r=RAD, size=ELL / 10)
+    lo = jno.shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("lo")
+    hi = jno.shape.line([(0, 0, ELL + 0.004), (0, 0, 2 * ELL + 0.004)], r=RAD, size=ELL / 10)
     hi = hi.attach(sigma=SIG).name("hi")
-    pads = jno.Shape.sphere(0, 0, 0.0, 2 * RAD).name("A") + jno.Shape.sphere(0, 0, 2 * ELL + 0.004, 2 * RAD).name("B")
+    pads = jno.shape.sphere(0, 0, 0.0, 2 * RAD).name("A") + jno.shape.sphere(0, 0, 2 * ELL + 0.004, 2 * RAD).name("B")
     d = (lo + hi + pads).domain()
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
@@ -127,10 +127,10 @@ def _bridged(hz, rdev, as_metal):
     """
     from jno.utils.solver.peec import bar_filaments, solve_network, terminal_nodes
 
-    bars = [jno.Shape.box(0, 0, 0, 10 * MM, W, T_BAR), jno.Shape.box(12 * MM, 0, 0, 22 * MM, W, T_BAR)]
+    bars = [jno.shape.box(0, 0, 0, 10 * MM, W, T_BAR), jno.shape.box(12 * MM, 0, 0, 22 * MM, W, T_BAR)]
     sig = [SIG, SIG]
     if as_metal:  # R = rho L / A, and A is the CELL's, so the grid sets the on-resistance
-        bars.append(jno.Shape.box(10 * MM, 0, 0, 12 * MM, W, T_BRIDGE))
+        bars.append(jno.shape.box(10 * MM, 0, 0, 12 * MM, W, T_BRIDGE))
         sig.append((2 * MM) / (rdev * W * T_BRIDGE))
     f = bar_filaments(bars, size=(1 * MM, W, hz), sigma=sig)
     p = np.asarray(f.nodes)

@@ -40,7 +40,7 @@ def _pair_energy(f, x):
 
 
 def _built(pitch, freq=0.0):
-    bar = jno.Shape.box(0, 0, 0, LX, WY, TZ, size=pitch).attach(sigma=SIG).name("bar")
+    bar = jno.shape.box(0, 0, 0, LX, WY, TZ, size=pitch).attach(sigma=SIG).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < pitch[0] if isinstance(pitch, tuple) else x < pitch)
     d.tag("B", lambda x, y, z: x > LX - (pitch[0] if isinstance(pitch, tuple) else pitch))
@@ -52,7 +52,7 @@ def _built(pitch, freq=0.0):
 @pytest.mark.parametrize("pitch", [0.002, 0.001])
 def test_the_fft_energy_is_the_pair_sum(pitch):
     """Same quadratic form, two evaluations -- they must agree to round-off, not merely closely."""
-    f = bar_filaments(jno.Shape.box(0, 0, 0, LX, WY, TZ), size=pitch)
+    f = bar_filaments(jno.shape.box(0, 0, 0, LX, WY, TZ), size=pitch)
     rng = np.random.default_rng(0)
     x = jnp.asarray(rng.normal(size=int(np.asarray(f.length).shape[0])))
 
@@ -75,7 +75,7 @@ def test_L_is_unchanged_by_the_faster_evaluation():
 def test_a_wire_has_no_lattice_and_keeps_the_pair_sum():
     """A polyline is not Toeplitz, so the fallback has to stay -- and still give the right number."""
     arc = [(0, 0, 0), (5e-3, 0, 2e-3), (10e-3, 0, 0)]
-    f = line_filaments(jno.Shape.line(arc, r=1.9e-4, size=1e-3))
+    f = line_filaments(jno.shape.line(arc, r=1.9e-4, size=1e-3))
     term = {
         "A": terminal_nodes(f, lambda q: np.linalg.norm(q - np.array(arc[0]), axis=1) < 1e-9),
         "B": terminal_nodes(f, lambda q: np.linalg.norm(q - np.array(arc[-1]), axis=1) < 1e-9),

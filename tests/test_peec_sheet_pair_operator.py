@@ -25,7 +25,7 @@ def _bar(ny=4):
     guard has nothing to say -- this file is about the operator, not about which conductors deserve
     a pair.
     """
-    return bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.004 / ny, 0.002))
+    return bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.004 / ny, 0.002))
 
 
 def _centres(fil):

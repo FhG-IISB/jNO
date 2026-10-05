@@ -43,7 +43,7 @@ def bar_ends(f):
 
 @pytest.mark.parametrize("pitch", [0.002, 0.001])
 def test_the_fft_apply_is_the_dense_operator(pitch):
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=pitch)
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=pitch)
     k = np.asarray(pair_matrix(f.pos, f.mom, INV_R, f.self_g, group=f.group))
     x = np.random.default_rng(0).normal(size=k.shape[0])
     assert np.linalg.norm(np.asarray(lattice_apply(f, INV_R)(x)) - k @ x) / np.linalg.norm(k @ x) < 1e-13
@@ -55,7 +55,7 @@ def test_the_quadrature_goes_into_the_generator():
     Every bar of a family has the same offsets, so the double sum still depends only on the cell
     separation and the block stays Toeplitz -- which is why this can be exact rather than a coarser rule.
     """
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=0.002, quad=3)
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=0.002, quad=3)
     k = np.asarray(pair_matrix(f.pos, f.mom, INV_R, f.self_g, group=f.group))
     x = np.ones(k.shape[0])
     matched = np.asarray(lattice_apply(f, INV_R, quad=3)(x))
@@ -70,7 +70,7 @@ def test_a_hole_in_the_conductor_keeps_the_fft_exact():
     That is what lets an L-shape keep translation invariance: the lattice ignores the geometry, and
     the absent cells simply carry no current.
     """
-    ell = jno.Shape.box(0, 0, 0, 0.030, 0.008, 0.002) | jno.Shape.box(0.022, 0.0, 0, 0.030, 0.030, 0.002)
+    ell = jno.shape.box(0, 0, 0, 0.030, 0.008, 0.002) | jno.shape.box(0.022, 0.0, 0, 0.030, 0.030, 0.002)
     f = bar_filaments(ell, size=0.002)
     kept, total = np.asarray(f.nodes).shape[0], int(np.prod(f.lattice["n"]))
     assert kept < total  # there really is a hole in the grid
@@ -83,7 +83,7 @@ def test_a_hole_in_the_conductor_keeps_the_fft_exact():
 def test_the_matrix_free_solve_agrees_with_the_dense_one(pitch):
     # the IN-PLANE pitch is what varies: one cell through the thickness at both, which is the
     # discretisation the element's surface impedance is valid for
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(pitch, pitch, 0.002))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(pitch, pitch, 0.002))
     a, b = bar_ends(f)
     got = {}
     for mf in (False, True):
@@ -97,7 +97,7 @@ def test_the_matrix_free_solve_agrees_with_the_dense_one(pitch):
 
 def test_filaments_off_a_lattice_refuse_the_fft():
     """A polyline's filaments are not Toeplitz, and saying so beats applying the wrong operator."""
-    f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, 0.05)], r=5e-4, size=0.005))
+    f = line_filaments(jno.shape.line([(0, 0, 0), (0, 0, 0.05)], r=5e-4, size=0.005))
     with pytest.raises(ValueError, match="do not sit on a lattice"):
         lattice_apply(f, INV_R)
     with pytest.raises(ValueError, match="needs a lattice somewhere in the network"):
@@ -113,7 +113,7 @@ def test_mutual_inductance_is_what_makes_the_ac_solution_differ_from_dc():
     only the edge/middle current density is 1.0000 and the profile matches DC to 1.7e-14; with the
     mutuals it is 2.2497, current crowding to the edges.
     """
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.020, 0.002), size=0.002)
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.020, 0.002), size=0.002)
     lp = np.asarray(pair_matrix(f.pos, f.mom, INV_R, f.self_g, group=f.group)) * 4e-7 * np.pi / (4 * np.pi)
     assert np.count_nonzero(lp - np.diag(np.diag(lp))) > 0  # there ARE mutual terms
     off = np.abs(lp - np.diag(np.diag(lp))).sum()
@@ -124,9 +124,9 @@ SIGCU = 5.8e7
 
 
 def _trace_and_wire():
-    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=(0.001, 0.001, 0.001)).attach(sigma=SIGCU).name("trace")
+    trace = jno.shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=(0.001, 0.001, 0.001)).attach(sigma=SIGCU).name("trace")
     wire = (
-        jno.Shape.line([(0.019, 0.002, 0.00075), (0.019, 0.002, 0.006), (0.030, 0.002, 0.00075)], r=1.9e-4, size=0.001)
+        jno.shape.line([(0.019, 0.002, 0.00075), (0.019, 0.002, 0.006), (0.030, 0.002, 0.00075)], r=1.9e-4, size=0.001)
         .attach(sigma=SIGCU)
         .name("wire")
     )
@@ -138,8 +138,8 @@ def _trace_and_wire():
 
 def test_several_solids_share_one_grid():
     """Separate lattices couple through a block that is not Toeplitz; one grid stays a single FFT."""
-    a = jno.Shape.box(0, 0, 0, 0.020, 0.006, 0.001)
-    b = jno.Shape.box(0.024, 0, 0, 0.044, 0.006, 0.001)
+    a = jno.shape.box(0, 0, 0, 0.020, 0.006, 0.001)
+    b = jno.shape.box(0.024, 0, 0, 0.044, 0.006, 0.001)
     f = bar_filaments([a, b], size=(0.002, 0.002, 0.001))
     assert set(np.unique(np.asarray(f.part)).tolist()) == {0, 1}  # two conductors...
     assert np.asarray(f.nodes).shape[0] < int(np.prod(f.lattice["n"]))  # ...with the gap masked out
@@ -154,8 +154,8 @@ def test_a_bar_straddling_two_conductors_takes_them_in_series():
     Half the bar lies in each, so its conductivity is the series (harmonic) mean: for one material
     that degenerates to the material, and only a genuine mismatch changes anything.
     """
-    a = jno.Shape.box(0, 0, 0, 0.010, 0.006, 0.001)
-    b = jno.Shape.box(0.010, 0, 0, 0.020, 0.006, 0.001)  # touching, so a bar straddles them
+    a = jno.shape.box(0, 0, 0, 0.010, 0.006, 0.001)
+    b = jno.shape.box(0.010, 0, 0, 0.020, 0.006, 0.001)  # touching, so a bar straddles them
     with pytest.raises(ValueError, match="its conductivity depends on both"):
         bar_filaments([a, b], size=(0.002, 0.002, 0.001))  # ambiguous without conductivities
 
@@ -223,8 +223,8 @@ def test_one_compiled_solve_is_reused_without_leaking_between_networks():
         )
         return complex(1.0 / inj["A"])
 
-    small = jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002)
-    large = jno.Shape.box(0, 0, 0, 0.060, 0.006, 0.002)
+    small = jno.shape.box(0, 0, 0, 0.040, 0.004, 0.002)
+    large = jno.shape.box(0, 0, 0, 0.060, 0.006, 0.002)
     first = run(small)
     other = run(large)
     again = run(small)
@@ -240,7 +240,7 @@ def test_a_frequency_sweep_reuses_the_compilation():
     # the cache is module-level and bounded, so other tests both fill and evict it; this test is
     # about how many entries THIS network adds, so it starts from a known state
     _KRYLOV_CACHE.clear()
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.002))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.002))
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
@@ -274,7 +274,7 @@ def test_the_matrix_free_gradient_is_exact_at_the_default_restart():
 
     The 592-element case is the one that matters: it is where the old path was silently wrong.
     """
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.008, 0.002), size=(0.001, 0.001, 0.002))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.008, 0.002), size=(0.001, 0.001, 0.002))
     p = np.asarray(f.nodes)
     assert len(np.asarray(f.length)) > 500  # big enough that the old path returned the wrong sign
     term = {
@@ -295,7 +295,7 @@ def test_the_matrix_free_gradient_is_exact_at_the_default_restart():
 
 def test_the_dense_and_matrix_free_gradients_agree():
     """The dense path is exact by construction, so it is the oracle for the iterative one."""
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.008, 0.002), size=(0.002, 0.002, 0.002))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.008, 0.002), size=(0.002, 0.002, 0.002))
     p = np.asarray(f.nodes)
     term = {
         "A": terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9),
@@ -336,7 +336,7 @@ def test_a_welded_network_converges_in_a_mesh_independent_number_of_steps():
     """
     import time
 
-    box = jno.Shape.box(0, 0, 0, 0.096, 0.059, 0.00057)
+    box = jno.shape.box(0, 0, 0, 0.096, 0.059, 0.00057)
     # ONE cell through the 0.57 mm thickness, and the in-plane pitch chosen to keep the element
     # count where it was when this was two cells -- the comparison is welded-against-plain on the
     # SAME lattice, so shrinking the baseline would inflate the ratio without anything being slower.
@@ -354,7 +354,7 @@ def test_a_welded_network_converges_in_a_mesh_independent_number_of_steps():
         return time.perf_counter() - t
 
     plain = timed(fb, jnp.full(nb, SIGCU))
-    wires = [jno.Shape.line([(0.01, 0.02, 0.0003), (0.01, 0.02, 0.004), (0.02, 0.03, 0.0003)], r=1.9e-4, size=0.001)]
+    wires = [jno.shape.line([(0.01, 0.02, 0.0003), (0.01, 0.02, 0.004), (0.02, 0.03, 0.0003)], r=1.9e-4, size=0.001)]
     # welded to a bar lattice, so the wire must carry the SAME sub-point count (jno.peec
     # ._QUAD * _QUAD_T**2); near_block needs one count across the whole system.
     fl = line_filaments(wires, quad=3 * 2**2)

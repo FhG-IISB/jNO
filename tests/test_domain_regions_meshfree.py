@@ -16,13 +16,13 @@ import jno
 
 
 def two_lines():
-    mk = lambda o: jno.Shape.line([(o, 0, 0), (o, 0, 0.01), (o + 0.02, 0, 0.01), (o + 0.02, 0, 0)], r=2e-4)
+    mk = lambda o: jno.shape.line([(o, 0, 0), (o, 0, 0.01), (o + 0.02, 0, 0.01), (o + 0.02, 0, 0)], r=2e-4)
     return mk(0.0).name("W1") + mk(0.03).name("W2"), mk(0.0), mk(0.03)
 
 
 def two_boxes(size=0.5):
-    a = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).name("A")
-    b = jno.Shape.box(1, 0, 0, 2, 1, 1, size=size).name("B")
+    a = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).name("A")
+    b = jno.shape.box(1, 0, 0, 2, 1, 1, size=size).name("B")
     return a + b
 
 
@@ -74,8 +74,8 @@ def test_a_singly_named_plan_defers_too():
     Its `_shape_regions` entry is recorded either way -- that is what carries an `.attach`ed property
     -- and its tag vocabulary is the same deferred or not, so nothing downstream can tell.
     """
-    named = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).name("solo").domain()
-    plain = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    named = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).name("solo").domain()
+    plain = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     assert named.__dict__.get("_lazy_plan") is not None
     assert named.__dict__.get("_mesh") is None
     assert sorted(named._shape_regions) == ["solo"]
@@ -85,5 +85,5 @@ def test_a_singly_named_plan_defers_too():
 def test_a_structured_plan_still_meshes_eagerly():
     """By the time the domain sees it, a structured plan has been swapped for its lattice closure,
     which is not a Shape and carries no closed-form membership."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.3).structured().domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).structured().domain()
     assert d.__dict__.get("_lazy_plan") is None

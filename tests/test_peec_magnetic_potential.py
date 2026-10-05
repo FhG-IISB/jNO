@@ -27,7 +27,7 @@ SIG = 5.8e7
 
 
 def _lattice(nx=4, ny=3, nz=2, p=0.002):
-    return bar_filaments(jno.Shape.box(0, 0, 0, nx * p, ny * p, nz * p, size=(p, p, p)), size=(p, p, p), sigma=SIG)
+    return bar_filaments(jno.shape.box(0, 0, 0, nx * p, ny * p, nz * p, size=(p, p, p)), size=(p, p, p), sigma=SIG)
 
 
 def _dense_P(fil, quad=2):
@@ -87,9 +87,9 @@ def test_it_is_the_dual_of_the_partial_inductance_coefficient():
 def test_a_hole_in_the_core_is_not_charged():
     """Cells that carry no material must not appear: the operator is over occupancy, not the box."""
     p = 0.002
-    solid = bar_filaments(jno.Shape.box(0, 0, 0, 6 * p, 4 * p, p, size=(p, p, p)), sigma=SIG)
+    solid = bar_filaments(jno.shape.box(0, 0, 0, 6 * p, 4 * p, p, size=(p, p, p)), sigma=SIG)
     holed = bar_filaments(
-        jno.Shape.box(0, 0, 0, 6 * p, 4 * p, p, size=(p, p, p)) - jno.Shape.box(2 * p, p, -p, 4 * p, 3 * p, 2 * p),
+        jno.shape.box(0, 0, 0, 6 * p, 4 * p, p, size=(p, p, p)) - jno.shape.box(2 * p, p, -p, 4 * p, 3 * p, 2 * p),
         size=(p, p, p),
         sigma=SIG,
     )
@@ -104,6 +104,6 @@ def test_a_polyline_has_no_cells_and_says_so():
     """Flux divides between cells; a filament has none, so the refusal names the reason."""
     from jno.utils.solver.peec import line_filaments
 
-    fil = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, 0.01)], r=2e-4, size=0.002))
+    fil = line_filaments(jno.shape.line([(0, 0, 0), (0, 0, 0.01)], r=2e-4, size=0.002))
     with pytest.raises(ValueError, match="no cells for flux to divide between"):
         magnetic_potential_apply(fil)

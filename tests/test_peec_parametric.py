@@ -30,7 +30,7 @@ CU, mm = 5.8e7, 1e-3
 
 
 def _net(sigma):
-    bar = jno.Shape.box(0, 0, 0, 16 * mm, 4 * mm, 0.8 * mm, size=(0.8 * mm,) * 3).attach(sigma=sigma).name("bar")
+    bar = jno.shape.box(0, 0, 0, 16 * mm, 4 * mm, 0.8 * mm, size=(0.8 * mm,) * 3).attach(sigma=sigma).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < 0.9 * mm)
     d.tag("B", lambda x, y, z: x > 15.1 * mm)

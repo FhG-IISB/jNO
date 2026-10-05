@@ -22,8 +22,8 @@ ELL, RAD = 0.050, 5e-4
 
 
 def one_wire():
-    wire = jno.Shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("wire")
-    pads = jno.Shape.sphere(0, 0, 0.0, 2 * RAD).name("A") + jno.Shape.sphere(0, 0, ELL, 2 * RAD).name("B")
+    wire = jno.shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name("wire")
+    pads = jno.shape.sphere(0, 0, 0.0, 2 * RAD).name("A") + jno.shape.sphere(0, 0, ELL, 2 * RAD).name("B")
     return wire, (wire + pads).domain()
 
 
@@ -88,15 +88,15 @@ def test_a_frequency_array_sweeps():
 
 def test_current_leaves_the_low_resistance_path_at_high_frequency():
     """The reason to run PEEC: with two paths the DC answer is the wrong answer at switching speeds."""
-    direct = jno.Shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4, size=0.004).attach(sigma=SIG).name("direct")
+    direct = jno.shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4, size=0.004).attach(sigma=SIG).name("direct")
     detour = (
-        jno.Shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4, size=0.004)
+        jno.shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4, size=0.004)
         .attach(sigma=SIG)
         .name("detour")
     )
     # pads FIRST: a terminal sits ON a conductor, and regions resolve by declaration order, so a pad
     # declared after the conductor it marks is subtracted away to nothing.
-    pads = jno.Shape.sphere(0, 0, 0, 3e-4).name("P") + jno.Shape.sphere(0.05, 0, 0, 3e-4).name("N")
+    pads = jno.shape.sphere(0, 0, 0, 3e-4).name("P") + jno.shape.sphere(0.05, 0, 0, 3e-4).name("N")
     d = (pads + direct + detour).domain()
     _i, v, at = ports(d)
     sol = jno.peec([v(*at("P")) - v(*at("N")) - 1.0], freq=np.array([0.0, 1e8])).solve()
@@ -114,8 +114,8 @@ def test_a_region_with_no_material_at_all_is_named():
     The behaviour is unchanged -- a region drawn into a solve with no material is refused rather than
     quietly excluded -- but a message naming only `sigma` would now be wrong half the time.
     """
-    wire = jno.Shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 5).name("wire")  # no .attach
-    d = (wire + jno.Shape.sphere(0, 0, 0.0, 2 * RAD).name("A") + jno.Shape.sphere(0, 0, ELL, 2 * RAD).name("B")).domain()
+    wire = jno.shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 5).name("wire")  # no .attach
+    d = (wire + jno.shape.sphere(0, 0, 0.0, 2 * RAD).name("A") + jno.shape.sphere(0, 0, ELL, 2 * RAD).name("B")).domain()
     _i, v, at = ports(d)
     with pytest.raises(ValueError, match=r"'wire' declares neither a conductivity nor a permeability"):
         jno.peec([v(*at("A")) - v(*at("B")) - 1.0]).solve()
@@ -134,9 +134,9 @@ def test_an_empty_constraint_list_is_refused():
 
 
 def _two_paths():
-    direct = jno.Shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4, size=0.004).attach(sigma=SIG).name("direct")
+    direct = jno.shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4, size=0.004).attach(sigma=SIG).name("direct")
     detour = (
-        jno.Shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4, size=0.004)
+        jno.shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4, size=0.004)
         .attach(sigma=SIG)
         .name("detour")
     )
@@ -164,7 +164,7 @@ def test_a_terminal_can_be_a_tag_and_then_declaration_order_stops_mattering():
 def test_the_two_terminal_spellings_agree():
     """A pad written as a region (declared first) and as a tag must give the same circuit."""
     direct, detour = _two_paths()
-    pads = jno.Shape.sphere(0, 0, 0, 3e-4).name("P") + jno.Shape.sphere(0.05, 0, 0, 3e-4).name("N")
+    pads = jno.shape.sphere(0, 0, 0, 3e-4).name("P") + jno.shape.sphere(0.05, 0, 0, 3e-4).name("N")
 
     as_region = (pads + direct + detour).domain()
     _i, v, at = ports(as_region)

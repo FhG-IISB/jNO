@@ -38,7 +38,7 @@ def _counted():
 
 
 def _built(pitch=0.002, freq=0.0):
-    bar = jno.Shape.box(0, 0, 0, LX, WY, TZ, size=pitch).attach(sigma=SIG).name("bar")
+    bar = jno.shape.box(0, 0, 0, LX, WY, TZ, size=pitch).attach(sigma=SIG).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < pitch)
     d.tag("B", lambda x, y, z: x > LX - pitch)

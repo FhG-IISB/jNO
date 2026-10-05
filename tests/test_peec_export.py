@@ -19,7 +19,7 @@ SIG = 5.8e7
 
 
 def _solved(freq=0.0):
-    bar = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("bar")
+    bar = jno.shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.02 - 0.0011)
@@ -68,7 +68,7 @@ def test_a_complex_solve_exports_magnitude_and_phase(tmp_path):
 
 def test_a_swept_solution_says_which_frequency_rather_than_guessing(tmp_path):
     """With an array freq there is no single current field, so it has to be asked for."""
-    bar = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("bar")
+    bar = jno.shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.02 - 0.0011)

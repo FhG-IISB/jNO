@@ -85,7 +85,7 @@ def _plate(pitch):
     import jno
     from jno.utils.solver.peec import bar_filaments
 
-    return bar_filaments(jno.Shape.box(0, 0, 0, 0.060, 0.030, 0.001), size=(pitch, pitch, 0.001), sigma=5.8e7)
+    return bar_filaments(jno.shape.box(0, 0, 0, 0.060, 0.030, 0.001), size=(pitch, pitch, 0.001), sigma=5.8e7)
 
 
 def _near_pairs(fil):

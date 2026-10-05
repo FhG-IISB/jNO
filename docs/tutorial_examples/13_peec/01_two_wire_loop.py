@@ -44,8 +44,8 @@ ELL, SEP, RAD = 0.100, 0.005, 5e-4  # leg length, wire spacing, wire radius (m)
 
 # --- the conductor: a hairpin of round wire, and a pad at each open end ---------------------------
 route = [(0, 0, 0), (ELL, 0, 0), (ELL, SEP, 0), (0, SEP, 0)]
-loop = jno.Shape.line(route, r=RAD, size=2e-3).attach(sigma=CU).name("loop")
-pads = jno.Shape.sphere(0, 0, 0, 2 * RAD).name("A") + jno.Shape.sphere(0, SEP, 0, 2 * RAD).name("B")
+loop = jno.shape.line(route, r=RAD, size=2e-3).attach(sigma=CU).name("loop")
+pads = jno.shape.sphere(0, 0, 0, 2 * RAD).name("A") + jno.shape.sphere(0, SEP, 0, 2 * RAD).name("B")
 
 d = (loop + pads).domain()
 i, v = d.peec_symbols()  # terminal current, nodal potential

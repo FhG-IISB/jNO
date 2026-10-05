@@ -31,12 +31,12 @@ import jno
 CU, MU_R = 5.8e7, 2400.0                      # copper; N87 ferrite at 100 kHz
 GAP = 0.5e-3
 
-core = (jno.Shape.box(0, 0, 0, 0.020, 0.020, 0.010, size=(0.5e-3,) * 3)
-        - jno.Shape.box(0.005, 0.005, -1e-3, 0.015, 0.015, 0.011)      # the window
-        - jno.Shape.box(0.008, -1e-3, 0.004, 0.012, 0.021, 0.004 + GAP))  # the gap
+core = (jno.shape.box(0, 0, 0, 0.020, 0.020, 0.010, size=(0.5e-3,) * 3)
+        - jno.shape.box(0.005, 0.005, -1e-3, 0.015, 0.015, 0.011)      # the window
+        - jno.shape.box(0.008, -1e-3, 0.004, 0.012, 0.021, 0.004 + GAP))  # the gap
 core = core.attach(mu_r=MU_R).name("core")     # no sigma: a ferrite does not conduct
 
-turn = (jno.Shape.line([(0.010, 0.002, 0.002), (0.010, 0.002, 0.008),
+turn = (jno.shape.line([(0.010, 0.002, 0.002), (0.010, 0.002, 0.008),
                         (0.010, 0.018, 0.008), (0.010, 0.018, 0.002)], r=0.4e-3, size=1e-3)
         .attach(sigma=CU).name("turn"))
 

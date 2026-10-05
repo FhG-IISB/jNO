@@ -30,7 +30,7 @@ PITCH = 0.002  # a one-cell-wide chain: 20 cells along x, one across y and z
 
 def chain(sigma):
     """The 1-D bar chain, with whatever conductivity spelling is under test."""
-    return bar_filaments(jno.Shape.box(0, 0, 0, LX, WY, TZ), size=PITCH, sigma=sigma)
+    return bar_filaments(jno.shape.box(0, 0, 0, LX, WY, TZ), size=PITCH, sigma=sigma)
 
 
 def dc_resistance(f):
@@ -114,8 +114,8 @@ def test_a_void_cell_is_nearly_an_open_circuit():
 
 def test_a_field_on_one_conductor_leaves_its_neighbour_alone():
     """Two conductors share one grid; a field is resolved over its OWN cells, not the whole lattice."""
-    left = jno.Shape.box(0, 0, 0, 0.02, WY, TZ).name("left")
-    right = jno.Shape.box(0.02, 0, 0, 0.04, WY, TZ).name("right")
+    left = jno.shape.box(0, 0, 0, 0.02, WY, TZ).name("left")
+    right = jno.shape.box(0.02, 0, 0, 0.04, WY, TZ).name("right")
     f = bar_filaments([left, right], size=PITCH, sigma=[lambda x, y, z: SIG * jnp.ones_like(x), SIG])
     assert np.allclose(np.asarray(f.lattice["sigma"]), SIG)
     graded = bar_filaments([left, right], size=PITCH, sigma=[lambda x, y, z: SIG * (0.1 + 0 * x), SIG])
@@ -127,7 +127,7 @@ def test_a_field_on_one_conductor_leaves_its_neighbour_alone():
 
 
 def test_element_centres_are_the_midpoints():
-    f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, 0.05)], r=5e-4, size=0.005))
+    f = line_filaments(jno.shape.line([(0, 0, 0), (0, 0, 0.05)], r=5e-4, size=0.005))
     c = np.asarray(element_centres(f))
     inc = np.asarray(f.incidence.toarray())
     ia, ib = np.argmax(inc == 1, axis=0), np.argmax(inc == -1, axis=0)
@@ -138,13 +138,13 @@ def test_element_centres_are_the_midpoints():
 def test_a_graded_wire_is_the_series_sum():
     ell = 0.05
     fld = lambda x, y, z: SIG * (0.3 + z / ell)  # noqa: E731  -- POSITIONAL: the third arg is z
-    wire = jno.Shape.line([(0, 0, 0), (0, 0, ell)], r=5e-4, size=ell / 10).attach(sigma=fld)
-    pads = jno.Shape.sphere(0, 0, 0.0, 1e-3).name("A") + jno.Shape.sphere(0, 0, ell, 1e-3).name("B")
+    wire = jno.shape.line([(0, 0, 0), (0, 0, ell)], r=5e-4, size=ell / 10).attach(sigma=fld)
+    pads = jno.shape.sphere(0, 0, 0.0, 1e-3).name("A") + jno.shape.sphere(0, 0, ell, 1e-3).name("B")
     d = (wire.name("wire") + pads).domain()
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]  # noqa: E731
     got = float(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0).solve().R)
-    f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, ell)], r=5e-4, size=ell / 10))
+    f = line_filaments(jno.shape.line([(0, 0, 0), (0, 0, ell)], r=5e-4, size=ell / 10))
     z = np.asarray(element_centres(f))[:, 2]
     # a wire is one series path: every filament's own resistance, added up
     exact = float((np.asarray(f.length) / ((SIG * (0.3 + z / ell)) * np.asarray(f.area))).sum())
@@ -168,8 +168,8 @@ def test_a_short_field_takes_the_FIRST_coordinates():
 
 def test_the_front_door_takes_a_flat_field_unchanged():
     ell = 0.05
-    line = lambda: jno.Shape.line([(0, 0, 0), (0, 0, ell)], r=5e-4, size=ell / 10)  # noqa: E731
-    pads = jno.Shape.sphere(0, 0, 0.0, 1e-3).name("A") + jno.Shape.sphere(0, 0, ell, 1e-3).name("B")
+    line = lambda: jno.shape.line([(0, 0, 0), (0, 0, ell)], r=5e-4, size=ell / 10)  # noqa: E731
+    pads = jno.shape.sphere(0, 0, 0.0, 1e-3).name("A") + jno.shape.sphere(0, 0, ell, 1e-3).name("B")
 
     def solve(sig):
         d = (line().attach(sigma=sig).name("wire") + pads).domain()
@@ -231,6 +231,6 @@ def test_a_field_that_does_not_broadcast_is_refused():
 
 
 def test_the_wrong_number_of_conductors_is_still_refused():
-    box = jno.Shape.box(0, 0, 0, LX, WY, TZ)
+    box = jno.shape.box(0, 0, 0, LX, WY, TZ)
     with pytest.raises(ValueError, match="2 conductivities for 1 conductors"):
         bar_filaments(box, size=PITCH, sigma=[SIG, SIG])

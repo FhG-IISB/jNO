@@ -24,9 +24,9 @@ HOST = 2.5 * RAD  # a thin solid needs a host within ~2.5 r; see Line.build
 
 
 def bridged_traces():
-    tr = lambda x0, x1, nm: jno.Shape.box(x0, 0, 0.001, x1, 0.004, 0.0015, size=HOST).attach(sigma=SIG, k=K_CU).name(nm)
+    tr = lambda x0, x1, nm: jno.shape.box(x0, 0, 0.001, x1, 0.004, 0.0015, size=HOST).attach(sigma=SIG, k=K_CU).name(nm)
     wire = (
-        jno.Shape.line([(0.007, 0.002, 0.0015), (0.010, 0.002, 0.004), (0.013, 0.002, 0.0015)], r=RAD, size=HOST)
+        jno.shape.line([(0.007, 0.002, 0.0015), (0.010, 0.002, 0.004), (0.013, 0.002, 0.0015)], r=RAD, size=HOST)
         .attach(sigma=SIG, k=K_CU)
         .name("W")
     )
@@ -94,9 +94,9 @@ def _sigma_of(T, sig0=SIG, t0=293.15, alpha=0.00393):
 
 def _solve_at(sig):
     """One pass of the loop: EM at the given conductivities, then the thermal solve it drives."""
-    tr = lambda x0, x1, nm: jno.Shape.box(x0, 0, 0.001, x1, 0.004, 0.0015, size=HOST).attach(sigma=sig[nm], k=K_CU).name(nm)
+    tr = lambda x0, x1, nm: jno.shape.box(x0, 0, 0.001, x1, 0.004, 0.0015, size=HOST).attach(sigma=sig[nm], k=K_CU).name(nm)
     wire = (
-        jno.Shape.line([(0.007, 0.002, 0.0015), (0.010, 0.002, 0.004), (0.013, 0.002, 0.0015)], r=RAD, size=HOST)
+        jno.shape.line([(0.007, 0.002, 0.0015), (0.010, 0.002, 0.004), (0.013, 0.002, 0.0015)], r=RAD, size=HOST)
         .attach(sigma=sig["W"], k=K_CU)
         .name("W")
     )

@@ -13,7 +13,7 @@ from jno.utils.solver.peec import port_spec
 
 @pytest.fixture
 def sym():
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     for name, f in [
         ("P", lambda x, y: np.isclose(x, 0)),
         ("N", lambda x, y: np.isclose(x, 1)),
@@ -68,7 +68,7 @@ def test_a_constraint_mixing_both_fields_must_be_a_whole_device(sym):
 
 def test_an_unknown_field_is_named_in_the_error(sym):
     i, v, at = sym
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
     d.tag("P", lambda x, y: np.isclose(x, 0))
     w = d.trial_function(name="w")
     with pytest.raises(ValueError, match=r"unknown field 'w'"):

@@ -81,7 +81,7 @@ def test_a_solve_does_not_construct_arrays_per_NODE(pitch):
     real = jnp.asarray
 
     for p in (pitch, pitch / 2):
-        bar = jno.Shape.box(0, 0, 0, LX, WY, TZ, size=p).attach(sigma=SIG).name("bar")
+        bar = jno.shape.box(0, 0, 0, LX, WY, TZ, size=p).attach(sigma=SIG).name("bar")
         d = bar.domain()
         d.tag("A", lambda x, y, z: x < p)
         d.tag("B", lambda x, y, z: x > LX - p)

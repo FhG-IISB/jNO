@@ -24,7 +24,7 @@ L, H = 1.0, 0.25
 
 
 def domain():
-    d = jno.Shape.rect(0, 0, L, H, size=0.1).domain()
+    d = jno.shape.rect(0, 0, L, H, size=0.1).domain()
     _ = d.mesh
     return d
 

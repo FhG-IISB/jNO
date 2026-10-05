@@ -33,8 +33,8 @@ CU, MU_R = 5.8e7, 2000.0
 
 def _meshes():
     """A conductor plate and a core plate stacked in z, on ONE grid -- both carry x and y families."""
-    plate = jno.Shape.box(0, 0, 0, 3 * P, 3 * P, P, size=(P,) * 3).attach(sigma=CU).name("plate")
-    core = jno.Shape.box(0, 0, 2 * P, 3 * P, 3 * P, 3 * P, size=(P,) * 3).attach(mu_r=MU_R).name("core")
+    plate = jno.shape.box(0, 0, 0, 3 * P, 3 * P, P, size=(P,) * 3).attach(sigma=CU).name("plate")
+    core = jno.shape.box(0, 0, 2 * P, 3 * P, 3 * P, 3 * P, size=(P,) * 3).attach(mu_r=MU_R).name("core")
     fil = bar_filaments(plate, sigma=CU, grid_shapes=[core])
     mag = bar_filaments(core, sigma=MU_R - 1.0, grid_shapes=[plate])
     assert fil.lattice["n"] == mag.lattice["n"] and fil.lattice["d"] == mag.lattice["d"]
@@ -131,8 +131,8 @@ def test_two_meshes_on_different_grids_are_refused():
     It is not hypothetical: built independently the two meshes came out different SIZES and offset
     from each other, and every number downstream would have been wrong with nothing to show for it.
     """
-    plate = jno.Shape.box(0, 0, 0, 3 * P, 3 * P, P, size=(P,) * 3).attach(sigma=CU).name("plate")
-    core = jno.Shape.box(0, 0, 2 * P, 3 * P, 3 * P, 3 * P, size=(P,) * 3).attach(mu_r=MU_R).name("core")
+    plate = jno.shape.box(0, 0, 0, 3 * P, 3 * P, P, size=(P,) * 3).attach(sigma=CU).name("plate")
+    core = jno.shape.box(0, 0, 2 * P, 3 * P, 3 * P, 3 * P, size=(P,) * 3).attach(mu_r=MU_R).name("core")
     with pytest.raises(ValueError, match="COMMON grid"):
         magnetic_coupling_apply(bar_filaments(plate, sigma=CU), bar_filaments(core, sigma=MU_R - 1.0))
 

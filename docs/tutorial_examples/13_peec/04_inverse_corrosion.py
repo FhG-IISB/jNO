@@ -13,7 +13,7 @@ the same solve that produced it -- no finite differences, no second model, no ad
 The parameter lives in the PROBLEM STATEMENT, exactly as a conductivity always has::
 
     loss_frac = jno.np.parameter((1,), name="loss_frac")
-    bar = jno.Shape.box(...).attach(sigma=CU * (1.0 - loss_frac * corroded))
+    bar = jno.shape.box(...).attach(sigma=CU * (1.0 - loss_frac * corroded))
 
 and because the material now carries a trainable parameter, ``emag.solve().R`` is a **trace node**
 rather than a number. So the objective is written the way every other jNO objective is written, and
@@ -41,7 +41,7 @@ LOSS_TRUE = 0.65  # the answer we are pretending not to know: 65 % of the copper
 
 def busbar(sigma):
     """A 24 mm bar, driven end to end at DC."""
-    bar = jno.Shape.box(0, 0, 0, 24 * mm, 4 * mm, P, size=(P,) * 3).attach(sigma=sigma).name("bar")
+    bar = jno.shape.box(0, 0, 0, 24 * mm, 4 * mm, P, size=(P,) * 3).attach(sigma=sigma).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < 0.9 * mm)
     d.tag("B", lambda x, y, z: x > 23.1 * mm)

@@ -39,12 +39,12 @@ class _Catch(logging.Handler):
 
 def _module(wire, ground, freq=1e6):
     """A bar over an isolated plane. ``wire`` makes it a WELDED network, which is the hard case."""
-    bar = jno.Shape.box(0, 0, 2 * T, 20 * mm, 4 * mm, 3 * T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("bar")
-    plane = jno.Shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("plane")
+    bar = jno.shape.box(0, 0, 2 * T, 20 * mm, 4 * mm, 3 * T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("bar")
+    plane = jno.shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("plane")
     sh = bar + plane
     if wire:
         p = [(6 * mm, 2 * mm, 3 * T), (10 * mm, 2 * mm, 3 * T + 1.5 * mm), (14 * mm, 2 * mm, 3 * T)]
-        sh = sh + jno.Shape.line(p, r=1.9e-4, size=1 * mm).attach(sigma=SIG).name("w")
+        sh = sh + jno.shape.line(p, r=1.9e-4, size=1 * mm).attach(sigma=SIG).name("w")
     d = sh.domain()
     d.tag("A", lambda x, y, z: (x < 2.1 * mm) & (z > 1.9 * T))
     d.tag("B", lambda x, y, z: (x > 17.9 * mm) & (z > 1.9 * T))
@@ -97,7 +97,7 @@ def test_it_says_which_conductor_it_pinned():
 
 def test_a_fully_connected_network_is_left_alone():
     """No floating piece -> nothing to pin, and nothing said."""
-    bar = jno.Shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("bar")
+    bar = jno.shape.box(0, 0, 0, 20 * mm, 4 * mm, T, size=(2 * mm, 2 * mm, T)).attach(sigma=SIG).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < 2.1 * mm)
     d.tag("B", lambda x, y, z: x > 17.9 * mm)
