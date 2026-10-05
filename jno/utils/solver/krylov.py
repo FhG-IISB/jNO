@@ -447,8 +447,13 @@ def lanczos_spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None):
 
 
 def _usable_interval(lo, hi):
-    """A Ritz interval a Chebyshev recurrence can be fitted to: finite, positive, of positive width."""
-    return jnp.isfinite(lo) & jnp.isfinite(hi) & (hi > 0.0) & (hi - lo > 0.0)
+    """A Ritz interval a Chebyshev recurrence can be fitted to: finite, positive, of positive width.
+
+    ``lo > 0`` matters under ``jit``: a breakdown (a Krylov space that closes after one step, as on
+    a multiple of the identity) gives NaN Ritz values eagerly but finite, sign-mixed ones once XLA
+    has compiled the recurrence. An SPD operator has no negative Ritz value, so a negative one is the
+    breakdown showing through."""
+    return jnp.isfinite(lo) & jnp.isfinite(hi) & (lo > 0.0) & (hi > 0.0) & (hi - lo > 0.0)
 
 
 def nystrom_sketch(matvec, n, *, rank, key, dtype=None):
