@@ -107,7 +107,8 @@ def test_chunking_changes_nothing(scheme, save, chunks_of):
     assert isinstance(one, np.ndarray) and isinstance(chunked, np.ndarray), "an eager march returns host frames"
     assert one.shape == chunked.shape == ((11 if save is None else save.size), 64)
     assert np.abs(one).max() > 0.1
-    assert np.array_equal(one, chunked)
+    # two separate marches: bit-identical on CPU, but a GPU reassociates its sparse reductions run to run
+    assert np.allclose(one, chunked, rtol=1e-10, atol=1e-12 * np.abs(one).max())
 
 
 def test_a_periodic_march_prolongs_its_host_frames(chunks_of):
@@ -116,7 +117,8 @@ def test_a_periodic_march_prolongs_its_host_frames(chunks_of):
     chunks_of(3)
     chunked = _run("bdf2", nonlinear=True, periodic=True)
     assert isinstance(chunked, np.ndarray) and chunked.shape == (11, 64)  # the full nodal layout
-    assert np.array_equal(one, chunked)
+    # two separate marches: bit-identical on CPU, but a GPU reassociates its sparse reductions run to run
+    assert np.allclose(one, chunked, rtol=1e-10, atol=1e-12 * np.abs(one).max())
 
 
 @pytest.mark.parametrize("scheme", ["theta", "bdf2"])
