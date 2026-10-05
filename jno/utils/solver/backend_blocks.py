@@ -365,9 +365,7 @@ class SemidiscreteTimeBlock:
             self.mass_residual is not None and self.residual is not None
         )
 
-    def step(
-        self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None
-    ):
+    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None):
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
 
         The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
@@ -429,7 +427,6 @@ class SemidiscreteTimeBlock:
     def _slot_newton(cls, nonlinear_solve, G, u, jac, tangent, plan, dtype, box):
         """A composed ``nonlinear=`` driver on the assembled step tangent, given the carried tangent when it
         keeps tangents (``reuse=True``, the march default)."""
-        import jax.numpy as jnp
 
         info = {}
         if tangent is not None and plan is not None and getattr(nonlinear_solve, "carries_tangent", False):
@@ -457,12 +454,15 @@ class SemidiscreteTimeBlock:
     def _default_newton(G, u, jac, tangent, plan, dtype, box):
         """jNO's per-step Newton on the assembled step tangent ``jac``, keeping that tangent while it
         contracts -- within the step always, and across steps when a ``tangent`` is carried in."""
-        import jax.numpy as jnp
 
         from .newton_krylov import newton_default
 
         info = {}
-        tangent0 = SemidiscreteTimeBlock._carried_bcoo(tangent, plan, dtype) if (tangent is not None and plan is not None) else None
+        tangent0 = (
+            SemidiscreteTimeBlock._carried_bcoo(tangent, plan, dtype)
+            if (tangent is not None and plan is not None)
+            else None
+        )
         wn = newton_default(G, u, jacobian=jac, reuse=True, tangent0=tangent0, info=info)
         SemidiscreteTimeBlock._collect(info, box)
         return wn
@@ -497,7 +497,7 @@ class SemidiscreteTimeBlock:
             return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
 
         if self.is_nonlinear():
-            from .newton_krylov import newton_default, newton_krylov
+            from .newton_krylov import newton_krylov
 
             # The step tangent's host merge plan, unless this evaluation hands the assembler a runtime
             # topology (a reconnecting march): its pattern is then not the one the plan was built on.
@@ -1394,7 +1394,6 @@ def _frame_chunks(n_steps, needed, budget_frames):
 
     The device holds a chunk's needed states (its save slots) and nothing else of the march, so the bound is
     on NEEDED states per chunk, not on steps: a march that saves 10 frames of 10^4 steps is one chunk."""
-    import numpy as np
 
     budget = max(1, int(budget_frames))
     if needed.size <= budget:

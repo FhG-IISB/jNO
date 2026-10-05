@@ -607,7 +607,10 @@ def _root_driver(
     if reuse:
         config["reuse"] = reuse
     return NonlinearSolver(
-        _fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol, "carries_tangent": bool(reuse), "reports_info": direct is not False},
+        _fn,
+        name=name,
+        direct=direct,
+        traits={"rtol": rtol, "atol": atol, "carries_tangent": bool(reuse), "reports_info": direct is not False},
         config=config,
     )
 

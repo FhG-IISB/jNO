@@ -2793,7 +2793,11 @@ class FEM:
                     )
                 kwargs = {
                     **kwargs,
-                    **{k: v for k, v in (("nonlinear", nonlinear), ("linear", linear), ("precond", precond)) if v is not None},
+                    **{
+                        k: v
+                        for k, v in (("nonlinear", nonlinear), ("linear", linear), ("precond", precond))
+                        if v is not None
+                    },
                 }
             if getattr(adapt, "enrich", False):
                 # p-adaptivity: raise the local order by switching interpolation covers on at the marked

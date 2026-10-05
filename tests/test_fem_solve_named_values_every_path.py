@@ -165,4 +165,3 @@ def test_a_remeshing_transient_refuses_a_parametric_form_without_values():
     pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     with pytest.raises(NotImplementedError, match="Name the values"):
         _heat(_param("k"), False, size=0.2).solve(adapt=jno.solve.remesh(every=2, max_dofs=200))
-

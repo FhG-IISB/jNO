@@ -3751,9 +3751,7 @@ def check_runtime_values(names, values):
     them here, so the same call fails the same way whichever path the form takes."""
     unknown = sorted(set(values) - set(names))
     if unknown:
-        raise TypeError(
-            f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
-        )
+        raise TypeError(f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}.")
     missing = sorted(set(names) - set(values))
     if missing:
         raise ValueError(

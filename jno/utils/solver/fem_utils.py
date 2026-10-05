@@ -4939,9 +4939,7 @@ def elem_map(fn, xs, chunk, *, scatter=None):
         chit = None
         if ckey is not None:
             chit = _ELEM_MAP_CONTENT.get(ckey)
-            if chit is not None and any(
-                isinstance(_l, jax.Array) and _l.is_deleted() for _l in _baked_arrays(chit[2])
-            ):
+            if chit is not None and any(isinstance(_l, jax.Array) and _l.is_deleted() for _l in _baked_arrays(chit[2])):
                 # Same corpse check for the content table (its entries keep the ORIGINAL build's
                 # leaves as ``baked``, which are exactly the compiled closure's buffers).
                 del _ELEM_MAP_CONTENT[ckey]

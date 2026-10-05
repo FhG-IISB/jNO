@@ -659,7 +659,9 @@ def assembled_krylov_solve(tol=1e-10, maxit=2000):
             x = _bicgstab_jacobi(J, b, tol_, int(maxit))
         else:  # a traced forcing term cannot be the compiled helper's STATIC tolerance; same iteration
             tol_ = rtol
-            x = jax.scipy.sparse.linalg.bicgstab(sparse_matvec(J), b, tol=tol_, atol=0.0, maxiter=int(maxit), M=jacobi(J))[0]
+            x = jax.scipy.sparse.linalg.bicgstab(sparse_matvec(J), b, tol=tol_, atol=0.0, maxiter=int(maxit), M=jacobi(J))[
+                0
+            ]
         mv = sparse_matvec(J)
         eps = float(jnp.finfo(b.dtype).eps)
         r_rel = jnp.linalg.norm(mv(x) - b) / jnp.maximum(jnp.linalg.norm(b), eps)
