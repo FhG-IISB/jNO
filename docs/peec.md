@@ -456,17 +456,37 @@ the property that caused them — the same spelling in and out, as with `.attach
     core loss and nothing else. That is the oracle the core-loss channel is tested against, so it
     carries no convention of its own.
 
-### Feeding a thermal solve
+### Electro-thermal coupling
 
-`dissipation()` is shaped for `d.attach`, which is how a per-region quantity enters a weak
-form — and it is **jittable**, so an electro-thermal objective reaches `jno.core`:
+The loss heats the conductor, and a hotter conductor is more resistive -- copper by about 0.39 %/K. The
+two problems are written as two term lists and solved together by `jno.core`:
 
 ```python
-for region, value in emag.solve().dissipation().items():
-    d.attach(region, q=value)
-d.attach(q=0.0)                                   # every other region
-heat = kappa * dot(grad(T, coords), grad(s, coords)) - d.q * s
+T, s = d.fem_symbols()
+d.attach(sigma=SIG20 / (1 + ALPHA * (T - 293.15)), k=400.0)   # sigma depends on the FEM field T
+
+i, v = d.peec_symbols()
+em = jno.peec([v(*at("P")) - v(*at("N")) - 1.0], freq=1e6)
+
+heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(*at("N")) - 300.0])
+
+sol = jno.core([em, heat]).solve()          # a fixed point: sigma(T) <-> T
+sol.field, sol.em.R, sol.iterations
 ```
+
+`em.loss` is the loss density of each conductor [W/m^3], a coefficient the weak form uses like any
+other; the coupled solve fills it in. The temperature reaches each PEEC element by linear interpolation
+of the FEM field at the element centre. With a trainable `jno.np.parameter` in either problem,
+`solve()` returns the converged field as a trace node over the parameters, and the gradient goes through
+the fixed point by `jax.lax.custom_root` -- implicit differentiation, not unrolled iterations.
+
+!!! warning "Scope"
+    The heat problem must be **linear** in its field (a constant or region-wise `k`), the field a scalar
+    P1 field on the same domain, and the network solved at **one** frequency. The geometry is frozen at
+    the first solve, as for `build()`. A conductivity written in a FEM field cannot be solved without its
+    FEM problem: `em.solve()` refuses and names `jno.core([em, heat])`.
+
+`sol.em.dissipation()` still returns the `{region: W/m^3}` mapping, for a thermal model outside jNO.
 
 ## Solver controls
 
