@@ -7,7 +7,8 @@ broadcast over the whole mesh.
 
 That is the worst kind of wrong. On a 2789-cell electro-thermal source spanning nine orders of
 magnitude it returned 361.19 K where the same 2789 values, declared on P0, give 355.72 K -- a
-plausible temperature, five kelvin out, with nothing said.
+plausible temperature, five kelvin out, with nothing said. It is now refused when the fem is
+built, before anything is packed.
 """
 
 import jax
@@ -46,17 +47,15 @@ def peak(fem, vals):
 def test_an_array_on_no_space_is_refused_by_name_and_count():
     d = domain()
     n = int(d._cells_p1().shape[0])
-    fem = poisson(d, jno.np.parameter((n,), name="q"))
-    with pytest.raises(ValueError, match=rf"parameter 'q', which carries {n} values.*no FE space"):
-        peak(fem, np.linspace(1.0, 2.0, n))
+    with pytest.raises(NotImplementedError, match=rf"parameter 'q' was declared with {n} components"):
+        poisson(d, jno.np.parameter((n,), name="q"))
 
 
 def test_the_message_names_the_spelling_that_works():
     d = domain()
     n = int(d._cells_p1().shape[0])
-    fem = poisson(d, jno.np.parameter((n,), name="q"))
-    with pytest.raises(ValueError, match=r"space='P0'"):
-        peak(fem, np.ones(n))
+    with pytest.raises(NotImplementedError, match=r"FIELD parameter"):
+        poisson(d, jno.np.parameter((n,), name="q"))
 
 
 def test_a_genuine_scalar_parameter_still_works():
