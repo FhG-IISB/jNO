@@ -532,6 +532,54 @@ def _parameters_in(values):
     return out
 
 
+def _field_symbols(node):
+    """The FEM trial-function symbols inside an attached value -- a conductivity written in terms of a
+    field another solver computes (``sigma(T)`` with ``T`` from ``d.fem_symbols()``)."""
+    from jno.trace import Placeholder, TrialFunction
+
+    if not isinstance(node, Placeholder):
+        return []
+    from jno._fem import _walk
+
+    out, seen = [], set()
+    for n in _walk(node):
+        if isinstance(n, TrialFunction) and id(n) not in seen:
+            seen.add(id(n))
+            out.append(n)
+    return out
+
+
+def _eval_field_material(expr, field_values, params=None):
+    """An attached material that depends on a FEM field, at given values of that field.
+
+    ``field_values`` maps each :class:`~jno.trace.TrialFunction` in ``expr`` to an array (one value per
+    PEEC element, or a scalar). The field is swapped for a tensor tag carrying those values and the
+    expression is evaluated by the trace evaluator, so a gradient reaches both the field values and any
+    trainable parameter in the expression.
+    """
+    import equinox as eqx
+
+    from jno.trace import TensorTag, substitute
+    from jno.trace_evaluator import TraceEvaluator
+
+    tags = {f: TensorTag(f"__peec_field_{i}") for i, f in enumerate(field_values)}
+    sub = substitute(expr, tags)
+    table = {}
+    for mc in _model_calls(sub):
+        mod = mc.model.module
+        name = getattr(mc.model, "_parameter_name", None)
+        val = (params or {}).get(name) if name is not None else None
+        if val is None:
+            val = _initial_value(mc)
+        if val is not None:
+            mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(val))
+        table[mc.model.layer_id] = mod
+    ctx = {t.tag: jnp.asarray(field_values[f]) for f, t in tags.items()}
+    size = int(jnp.size(next(iter(ctx.values()))))
+    out = jnp.asarray(TraceEvaluator(table).evaluate(sub, context=ctx))
+    return out.reshape(-1) if out.size == size else jnp.broadcast_to(out.reshape(()), (size,))
+
+
 def _eval_material(expr, params):
     """An attached material expression at concrete parameter values -- a JAX array, differentiable.
 
@@ -734,6 +782,42 @@ class PEEC:
                 "exactly one `v(A) - v(B) - volts`, and express the rest as fixed potentials or currents."
             )
 
+    def _terminal_names(self):
+        return (
+            {t for s in self.sources for t in s[:2]}
+            | {t for t, _ in self.currents}
+            | {t for t, _ in self.grounds}
+            | {t for dv in self.devices for t in dv[:2]}
+        )
+
+    @property
+    def loss(self):
+        """The ohmic loss density of each conductor [W/m^3], as a coefficient a weak form can use.
+
+        It is the heat source of a thermal problem on the same geometry::
+
+            heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(sink) - 300.0])
+            jno.core([em, heat]).solve()
+
+        The value of a conductor's loss is only known once this network is solved, so ``em.loss`` is a
+        placeholder that the coupled solve fills in -- region by region, one value per conductor, the
+        same mapping :meth:`PEECSolution.dissipation` returns. Solving the FEM problem on its own, without
+        this network, leaves it unfilled and the FEM refuses to solve.
+        """
+        if getattr(self, "_loss", None) is None:
+            from .architectures.models import parameter
+
+            named = self._terminal_names()
+            regions = [n for n in (getattr(self.domain, "_shape_regions", {}) or {}) if n not in named]
+            if not regions:
+                raise ValueError(
+                    "jno.peec: em.loss needs named conductor regions to put the loss on. Name the "
+                    "conductors -- `shape.name('trace')` -- so each one's loss can be a heat source."
+                )
+            self._loss_params = {n: parameter((1,), name=f"__peec_loss_{n}") for n in regions}
+            self._loss = self.domain._by_region(self._loss_params, default=0.0)
+        return self._loss
+
     def _discretise(self):
         regions = dict(getattr(self.domain, "_shape_regions", {}) or {})
         named = (
@@ -777,7 +861,17 @@ class PEEC:
         # `sigma` alone is a conductor; `mu_r` alone is a core that does not conduct, a ferrite or a
         # powder; both together is a conducting magnetic material, a lamination or a lossy core.
         sig, mur = _attached("sigma"), _attached("mu_r")
+        # `d.attach(sigma=...)` with no target is the default for every region that declares neither
+        # a conductivity nor a permeability -- the same rule `d.<name>` applies to a FEM coefficient.
+        _default = type(self.domain)._DEFAULT_TARGET
+        default_sig = sig.pop(_default, None)
+        mur.pop(_default, None)
+        if default_sig is not None:
+            for n in conductors:
+                if n not in sig and n not in mur:
+                    sig[n] = default_sig
         param_exprs: dict = {}  # region -> attached expression, for the ones carrying a parameter
+        field_exprs: dict = {}  # region -> attached expression in terms of a FEM field (sigma(T))
         lines, line_sig, solids = [], [], []
         line_names, solid_names = [], []
         magnetic, magnetic_names = [], []
@@ -827,9 +921,33 @@ class PEEC:
             # NOT coerced to float: a conductivity may be a traced value, which is what closes the
             # electro-thermal loop — sigma(T) falls as the conductor heats, and copper is about 31 %
             # more resistive at 100 C than at 20 C.
+            if _field_symbols(sig[n]):
+                # A conductivity written in a FEM field -- `sigma0 / (1 + alpha (T - T0))` -- has no value
+                # until that field is solved, so this network can only be solved TOGETHER with the FEM
+                # problem that owns the field. The coupled driver sets a reference field value for the
+                # structural build (the lattice and the skin-depth guard need a number) and hands the
+                # field-dependent values in at every solve.
+                ref = getattr(self, "_field_reference", None)
+                if ref is None:
+                    names = sorted({f.name for f in _field_symbols(sig[n])})
+                    raise ValueError(
+                        f"jno.peec: the conductivity of {n!r} depends on the FEM field {names}, which only a "
+                        "FEM solve produces. Solve the two problems together -- "
+                        "`jno.core([em, heat]).solve()` -- where `heat` is the `jno.fem` problem of that field."
+                    )
+                field_exprs[n] = sig[n]
+                sig[n] = jnp.reshape(
+                    _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])}), (-1,)
+                )[0]
             if kind == "Line":
+                val = sig[n]
+                if _model_calls(val):
+                    # A trainable parameter on a wire is recorded and evaluated at its CURRENT value for
+                    # the build, exactly as on a solid below; only the values are traced later.
+                    param_exprs[n] = val
+                    val = _eval_material(val, {})
                 lines.append(sh)
-                line_sig.append(sig[n])
+                line_sig.append(val)
                 line_names.append(n)
             else:
                 # ANY closed-form solid, not just a box: the lattice covers its bounding box and a
@@ -969,6 +1087,7 @@ class PEEC:
                 sigma=[jnp.asarray(m) - 1.0 for _, m in magnetic],
                 grid_shapes=[s for s, _ in solids],
             )
+        self._field_exprs = field_exprs
         return fil, terms, line_names + solid_names, resolve_all, mag, tuple(magnetic_names), param_exprs
 
     def build(self) -> "BuiltPEEC":
