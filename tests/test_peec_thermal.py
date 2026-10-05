@@ -1,10 +1,13 @@
 """The coupling quantity: ohmic loss as a per-region source a weak form can consume.
 
 ``joule`` is a total, and a heat source is not a total — it is watts per cubic metre, per conductor.
-``dissipation()`` returns exactly the ``{region: value}`` mapping ``domain.by_region`` takes, so the
+``dissipation()`` returns exactly the ``{region: value}`` mapping ``domain.attach`` takes, one region at a time, so the
 thermal side needs no new concept:
 
-    q = d.by_region(emag.dissipation(), default=0.0)
+    for region, value in emag.dissipation().items():
+        d.attach(region, q=value)
+    d.attach(q=0.0)
+    q = d.q
     heat = d.k * grad(T) . grad(s) - q * s
 """
 
@@ -72,7 +75,10 @@ def test_the_dissipation_drives_a_thermal_solve_on_the_same_geometry():
     Ti, si = T.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
     xn, yn, zn = d.variable("N", split=True)[:3]
     grad2 = lambda u, w: u.x * w.x + u.y * w.y + u.z * w.z
-    Q = d.by_region({k: float(x) for k, x in emag.dissipation().items()}, default=0.0)
+    for name, q in emag.dissipation().items():
+        d.attach(name, Q=float(q))
+    d.attach(Q=0.0)
+    Q = d.Q
     Th = np.asarray(jno.fem([d.k * grad2(Ti, si) - Q * si, T(xn, yn, zn) - 300.0]).solve()).reshape(-1)
 
     assert Th.min() >= 300.0 - 1e-6  # nothing colder than the sink
@@ -111,7 +117,10 @@ def _solve_at(sig):
     Ti, si = T.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
     xn, yn, zn = d.variable("N", split=True)[:3]
     g2 = lambda u, w: u.x * w.x + u.y * w.y + u.z * w.z
-    Q = d.by_region({k: float(x) for k, x in emag.dissipation().items()}, default=0.0)
+    for name, q in emag.dissipation().items():
+        d.attach(name, Q=float(q))
+    d.attach(Q=0.0)
+    Q = d.Q
     fem = jno.fem([d.k * g2(Ti, si) - Q * si, T(xn, yn, zn) - 300.0])
     Th = np.asarray(fem.solve()).reshape(-1)
     pts = np.asarray(fem.points)

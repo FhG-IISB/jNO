@@ -97,7 +97,7 @@ assert ratios[-1] > 0.99, "at mu_r = 20000 the core should couple almost all of 
 # permeability, and dominant for a lossy one.
 #
 # (`dissipation()` is deliberately VOLUMETRIC, per unit of the discretisation's own summed element
-# volume, because a heat source is a density -- it is shaped for `d.by_region`, not for totalling.
+# volume, because a heat source is a density -- it is shaped for `d.attach`, not for totalling.
 # `joule` is the total that pairs with it on the copper side; the core channel has no such total.)
 print("\n  a complex mu_r dissipates, and the power balance says how much\n")
 for mu in (2000.0, 2000.0 - 200.0j):

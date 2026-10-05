@@ -60,7 +60,7 @@ two orders of magnitude here.
 
 !!! note "`dissipation()` is a density, on purpose"
     It returns W/m³ per unit of the discretisation's own summed element volume, because a heat
-    source is a density — it is shaped for `d.by_region`, not for totalling. `joule` is the total
+    source is a density — it is shaped for `d.attach`, not for totalling. `joule` is the total
     that pairs with it on the copper side; the core channel has no such total today, which is why
     the balance above is written with `joule` and `Re(1/Z)`.
 

@@ -181,7 +181,7 @@ def test_an_explicit_sigma_override_still_solves_concretely():
 def test_a_readout_evaluated_per_point_says_so_instead_of_going_singular():
     """A FEM region coefficient is evaluated PER QUADRATURE POINT, and hands each point a scalar.
 
-    A PEEC readout is one value for the whole region, not a field, so `d.by_region({r: node})` runs
+    A PEEC readout is one value for the whole region, not a field, so `d.attach(r, q=node)` runs
     a network solve per point -- and what it actually produced was `Factor is exactly singular` from
     inside a preconditioner callback, with nothing naming the material or the composition. The wrong
     SHAPE is the reliable signal that this has happened, and it is worth catching precisely because
