@@ -79,6 +79,61 @@ not a detail: a plain `log(max(P* - P, eps))` is **constant** above the bound, s
 is exactly zero and the barrier silently stops doing anything — the failure mode is a satisfied-looking
 run whose perimeter sits far above target.
 
+### Perimeter is a *global* budget, and converged designs exploit that
+
+A design can meet $P^\*$ exactly and still be locally serrated, paying for a spike here with
+flatness elsewhere. Measured on a converged 3-D bracket with the barrier active and satisfied, the
+angle between adjacent surface facets had a **median of $33.5^\circ$, a 99th percentile of
+$88.9^\circ$, and $27\%$ of adjacent pairs above $60^\circ$** — a surface nobody would machine,
+scoring as well on eq. (38) as a smooth one would. Neither cheap lever fixes it: un-throttling node
+migration un-pinned the nodes ($27.3\% \to 6.2\%$ sitting at their move bound) and moved the
+roughness only $33.5^\circ \to 32.0^\circ$, while tightening $P^\*$ from 44 to 31 bought $26.9^\circ$
+at $91\%$ worse compliance. Both also collapsed the volume constraint, to $V=0.705$ and $0.635$
+against the baseline's $0.998$.
+
+`rho.curvature(zeta=0.1)` is the local measure the perimeter is not — the discrete bending energy
+of a triangle mesh (Grinspun, Hirani, Desbrun & Schröder, *Discrete Shells*, SCA 2003, §3), summed
+over pairs of interior facets sharing a **ridge** (a mesh vertex in 2-D, a mesh edge in 3-D). Each
+pair costs $|\Delta_i||\Delta_j|(1-\cos\theta_{ij})$ in the sharp limit, so it is zero unless *both*
+facets carry boundary and then grows with the angle between them. It is orientation-free (facet
+normal and density jump flip signs together), non-negative by construction, and exactly zero both on
+a flat boundary and where there is no boundary at all.
+
+Add it as a penalty rather than a constraint — MMA already has the volume and the geometric bounds
+to trade against, and that trade is where the volume collapses:
+
+```python
+S = rho.curvature(zeta=0.1)
+terms.append(WEIGHT * S)          # weight in compliance units; see the scale note below
+```
+
+A weight needs a scale and the *design* cannot supply one, because at iteration 0 the density is
+uniform and the bending is exactly zero. Take it from the **mesh** instead — what a single flat cut
+already costs, purely from its own faceting. That floor is real (an unstructured interface zig-zags
+between tetrahedra rather than lying in the plane it approximates, the same reason a straight bar's
+perimeter measures above its length) but it does **not** track refinement: measured $50.7$ at
+$h=0.5$ against $52.4$ at $h=0.35$, across a $2.6\times$ change in tet count. So `WEIGHT = w / S_ref`
+keeps $w$ comparable across meshes.
+
+The comparison that shows the two functionals are genuinely different: under a monotone staircase
+boundary the perimeter *telescopes* to one horizontal unit per column plus the total rise, whatever
+route the staircase takes. Three designs of identical volume and identical perimeter — $14.0000$ to
+every decimal place — score $S = 2$, $10$, $12$, exactly their right-angle counts.
+
+| | one big step | five small ones | a staircase |
+|---|---|---|---|
+| perimeter $P$ | $14.0000$ | $14.0000$ | $14.0000$ |
+| bending $S$ | $2$ | $10$ | $12$ |
+
+In 3-D the separation is milder and the honest number is the ratio *between* the functionals: a
+square corrugation at fixed volume raises $P$ by $1.59\times$ and $S$ by $1.90\times$; scrambling
+the same material raises $P$ by $14.6\times$ and $S$ by $48.2\times$. So bending is about
+$1.2\times$ sharper on a fold and $3.3\times$ sharper on noise — worth its own term, and **not** a
+replacement for perimeter control.
+
+Under a deformable mesh the term is also differentiable in the node coordinates, which is half the
+point: it gives node migration a reason to *align* the boundary rather than merely shorten it.
+
 ### The patch filter has a size limit, and it is lower than it looks
 
 Eq. (18) is a **geometric mean** over $N-2$ factors, and a mean dilutes a single outlier by $1/N$.

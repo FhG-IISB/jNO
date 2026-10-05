@@ -316,3 +316,63 @@ class TestStallFallback:
         for e, loss in enumerate(self._falling(40)):
             _step(cont, g, t, lid, loss, e)
         assert cont.penal == 5.0
+
+
+def test_the_patch_filter_alone_floors_the_grey_indicator():
+    """``M_nd`` cannot reach the paper's 1e-4 target while the patch filter is applied, because the
+    filter puts intermediate values into a design that is already perfectly binary.
+
+    eq. (19) maps ``rho_bar_k = rho_k (f^I + f^J + f^K) / P_k``, and eq. (17)'s last factor,
+    ``1 - rho_k (1 - (rho_{k,1} + rho_{k,N-1}) / 2)``, reads only the two elements SHARING AN EDGE
+    with ``k``. It is described as catching a patch that contains a single dense element, and it
+    does -- both edge-neighbours void gives ``1 - 1*(1-0) = 0``. But an element on an ordinary
+    straight material boundary has ONE dense and ONE void edge-neighbour, which gives
+    ``1 - 1*(1-0.5) = 0.5``, and after the geometric mean ``f = 0.5^(1/(N-2))``.
+
+    Measured on a straight-sided bar in a 60x30 mesh of 4,226 triangles: the input has
+    ``M_nd = 0.000000`` exactly, the filtered output has **0.0124**, and every element the filter
+    moves was SOLID on input, landing at 0.894 or 0.947 -- which are ``(0.841+1+1)/3`` and
+    ``(0.841+0.841+1)/3``, i.e. one or two of the element's three patches firing the factor.
+
+    So a design cannot be driven to ``M_nd < 1e-4`` by raising ``penal``: the floor is the filter's
+    output, not the design's greyness. Confirmed end to end -- with the filter the indicator
+    plateaus at 0.068 as ``penal`` goes 3 -> 8, and with it off the same run reaches 0.0027.
+
+    The implementation is faithful: ``_f_patch_reference`` in ``test_topology_optimisation.py`` is a
+    literal transcription of eq. (18) and the vectorised kernel is asserted against it, so 0.841 is
+    what the equation says and not a transcription slip.
+
+    The last factor is also defensible on its own terms. ``rho_{k,1}`` and ``rho_{k,N-1}`` are k's
+    two EDGE-neighbours in the walk; if both are void while other patch elements are dense, k
+    touches the structure only through the node, which is a one-node connection. Returning 0.5 when
+    one of the two is void is the smooth partial response a relaxation should give.
+
+    What does not follow is the pairing with the convergence criterion. ``M_nd`` (eq. 20) is
+    measured on the PHYSICAL density, ``rho_tilde = rho_k (f^I+f^J+f^K)/P_k <= rho_k <= 1``, so a
+    boundary element can never reach 1 and the indicator has a hard floor. Pinned as a MEASUREMENT,
+    not a contract -- the open question for the authors is how 1e-4 is reached: whether ``M_nd`` is
+    evaluated on the design density instead, or whether the final factor is suppressed near the
+    material boundary the way it already is for boundary-NODE patches (Fig. 2c-d), which the paper
+    justifies on exactly the grounds that would apply here.
+    """
+    import jax.numpy as jnp
+
+    d = jno.Shape.rect(0, 0, 60, 30, size=1.0).domain()
+    cells = np.asarray(d._cells_p1())
+    cen = np.asarray(d.mesh.points)[:, :2][cells].mean(axis=1)
+    rho = np.where(np.abs(cen[:, 1] - 15.0) < 6.0, 1.0, 0.0)
+    assert 4 * np.mean(rho * (1 - rho)) == 0.0, "the input must be exactly binary or this proves nothing"
+
+    out = np.asarray(d.patch_filter()(jnp.asarray(rho)))
+    m_nd = float(4 * np.mean(out * (1 - out)))
+    moved = (out > 0.02) & (out < 0.98)
+    assert moved.any(), "the filter left a binary design untouched; the floor would not exist"
+    assert (rho[moved] > 0.5).all(), "the filter should only pull SOLID elements down, never lift void ones"
+    assert m_nd > 1e-3, f"expected a floor around 1.2e-2, got {m_nd:.2e}"
+    assert m_nd > 100 * 1e-4, (
+        f"M_nd = {m_nd:.4f} against the paper's 1e-4 target (Sec. 3.1): raising penal cannot close "
+        "this, because the intermediate values come from the filter and not from the design"
+    )
+    assert 0.85 < float(np.median(out[moved])) < 0.96, (
+        f"the pulled-down values should sit at (0.841+1+1)/3 or (0.841+0.841+1)/3; got {np.median(out[moved]):.4f}"
+    )
