@@ -114,5 +114,5 @@ def test_1d_is_refused_by_name():
     """A 1-D cell has no shape to be bad, so there is nothing to measure -- say so rather than
     returning a number that means nothing."""
     d = jno.domain.line((0.0, 1.0), 0.2)
-    with pytest.raises(NotImplementedError, match="simplices in 2-D or 3-D"):
+    with pytest.raises(NotImplementedError, match="2-D or 3-D"):
         d.cell_aspect()

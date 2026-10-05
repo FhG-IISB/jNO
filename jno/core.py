@@ -5598,6 +5598,8 @@ class core:
         # eqx.filter_jit wrappers are not picklable; drop the cache.
         # It will be rebuilt lazily on the next eval() call.
         state["_eval_cache"] = None
+        # Compiled step and hook programs hold device handles; they are rebuilt on the next solve().
+        state.pop("_jit_program_cache", None)
 
         return state
 
