@@ -577,7 +577,10 @@ def _eval_field_material(expr, field_values, params=None):
     ctx = {t.tag: jnp.asarray(field_values[f]) for f, t in tags.items()}
     size = int(jnp.size(next(iter(ctx.values()))))
     out = jnp.asarray(TraceEvaluator(table).evaluate(sub, context=ctx))
-    return out.reshape(-1) if out.size == size else jnp.broadcast_to(out.reshape(()), (size,))
+    if out.size == size or size == 1:
+        # one value per element -- or a scalar field value combined with a per-element parameter
+        return out.reshape(-1)
+    return jnp.broadcast_to(out.reshape(()), (size,))
 
 
 def _eval_material(expr, params):
@@ -936,9 +939,8 @@ class PEEC:
                         "`jno.core([em, heat]).solve()` -- where `heat` is the `jno.fem` problem of that field."
                     )
                 field_exprs[n] = sig[n]
-                sig[n] = jnp.reshape(
-                    _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])}), (-1,)
-                )[0]
+                _ref = _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])})
+                sig[n] = _ref[0] if _ref.size == 1 else _ref
             if kind == "Line":
                 val = sig[n]
                 if _model_calls(val):
