@@ -442,7 +442,9 @@ def test_parameter_in_time_varying_value_equals_the_hard_coded_march(nonlinear, 
     for scheme in ("theta1", "bdf2", "sdirk3", "ros2"):
         yp = np.asarray(_march(bp, scheme, {"a": jnp.asarray([A_TRUE])}, save))
         yh = np.asarray(_march(bh, scheme, {}, save))
-        assert np.abs(yp - yh).max() < 1e-12, f"{scheme}: runtime a vs hard-coded a: {np.abs(yp - yh).max():.2e}"
+        # Same arithmetic, but a GPU reassociates the sparse reductions run to run (3e-12 seen on a
+        # 0.02-sized field), so the bound is round-off, not bitwise.
+        assert np.abs(yp - yh).max() < 1e-10, f"{scheme}: runtime a vs hard-coded a: {np.abs(yp - yh).max():.2e}"
         if scheme != "ros2":  # ros2 is not stiffly accurate -- see the wall-value test below
             err = np.abs(yp[:, blk][:, wall] - g).max()
             assert err < 1e-10, f"{scheme}: wall value off by {err:.2e}"
