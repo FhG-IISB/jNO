@@ -77,7 +77,7 @@ def _f_at(n: int, design) -> float:
     With a single patch slot the filter reduces to ``rho_k * f``, so dividing by ``rho_k`` recovers
     the criterion itself.
     """
-    d = jno.Shape.rect(0, 0, 2, 1, size=1.0).domain()  # tiny; its own topology is replaced below
+    d = jno.shape.rect(0, 0, 2, 1, size=1.0).domain()  # tiny; its own topology is replaced below
     d._patch_topology = lambda: _ring_topology(n)
     r = np.asarray(design(n), dtype=float)
     assert r.shape == (n,), f"the probe must supply one density per patch element, got {r.shape}"
@@ -197,7 +197,7 @@ class TestTheHarnessIsFaithful:
         makes it the one configuration where a real mesh and a single synthetic ring must agree to
         machine precision -- which is what pins the substitution.
         """
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.2).domain()
         topo = d._patch_topology()
         n_cells = int(d._cells_p1().shape[0])
         k = int(np.where(~topo["boundary"].any(axis=1))[0][0])  # all three patches interior
@@ -217,5 +217,5 @@ class TestTheHarnessIsFaithful:
         """Why the topology has to be synthesised at all -- and why N=27 is a 3-D-only regime."""
         biggest = 0
         for size in (0.5, 0.25, 0.12):
-            biggest = max(biggest, int(jno.Shape.rect(0, 0, 2, 1, size=size).domain()._patch_topology()["size"].max()))
+            biggest = max(biggest, int(jno.shape.rect(0, 0, 2, 1, size=size).domain()._patch_topology()["size"].max()))
         assert biggest < 15, f"a 2-D triangulation reached a patch of {biggest}; the framing needs revisiting"

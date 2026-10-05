@@ -25,7 +25,7 @@ PI = np.pi
 
 def _lattice(nx=4, ny=2, lx=4.0, ly=2.0):
     """A lattice of ``nx * ny`` unit squares -- every quantity below is exact on it."""
-    return jno.Shape.rect(0, 0, lx, ly, size=1.0).structured(n=(nx, ny)).quad().domain()
+    return jno.shape.rect(0, 0, lx, ly, size=1.0).structured(n=(nx, ny)).quad().domain()
 
 
 class TestQuadCellGeometry:
@@ -100,7 +100,7 @@ class TestQuadCellGeometry:
         A hexahedron's volume is not ``|det J| / 6`` and its faces need not be planar, so both the
         volume and the dihedral would be silently wrong if the simplex path were reused.
         """
-        d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=1.0).structured(n=(2, 1, 1)).quad().domain()
+        d = jno.shape.box(0, 0, 0, 2, 1, 1, size=1.0).structured(n=(2, 1, 1)).quad().domain()
         assert d._cells_topo()[1] == "hexahedron"
         for call in (d.cell_volume, d.cell_angles, d.cell_aspect):
             with pytest.raises(NotImplementedError, match="hexahedral"):

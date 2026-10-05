@@ -277,11 +277,20 @@ def geometric_decay(param: Any, gamma: float, *, start: float = 1.0, minimum: fl
     """
     return GeometricDecay(param, gamma, start=start, minimum=minimum)
 
+
 class HeavisideContinuation(_Callback):
     """Ramp a projection sharpness from ``start`` to ``maximum``. See :func:`heaviside_continuation`."""
 
-    def __init__(self, param: Any, *, start: float = 1.0, maximum: float = 16.0, over: int,
-                 hold: int = 0, schedule: str = "geometric"):
+    def __init__(
+        self,
+        param: Any,
+        *,
+        start: float = 1.0,
+        maximum: float = 16.0,
+        over: int,
+        hold: int = 0,
+        schedule: str = "geometric",
+    ):
         if int(over) <= 0:
             raise ValueError(
                 f"heaviside_continuation: over= must be a positive number of iterations, got {over!r}. "
@@ -345,8 +354,9 @@ class HeavisideContinuation(_Callback):
         return grads
 
 
-def heaviside_continuation(param: Any, *, start: float = 1.0, maximum: float = 16.0, over: int,
-                           hold: int = 0, schedule: str = "geometric") -> HeavisideContinuation:
+def heaviside_continuation(
+    param: Any, *, start: float = 1.0, maximum: float = 16.0, over: int, hold: int = 0, schedule: str = "geometric"
+) -> HeavisideContinuation:
     """Sharpen a density projection over a declared number of iterations.
 
     A smoothed-Heaviside projection (see :func:`jno.np.heaviside`) is only useful if its sharpness

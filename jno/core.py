@@ -164,6 +164,7 @@ def _reparam_scalar_constants(models):
     meant to depend on still enters the key, so mutating it costs a recompile it did not need. That
     is a wasted compile, not a wrong answer, and it is the right side to err on.
     """
+
     def _scalars(v, out):
         if isinstance(v, (bool, int, float)):
             out.append(float(v))
@@ -190,6 +191,7 @@ def _reparam_scalar_constants(models):
             if name in g:
                 _scalars(g[name], out)
     return tuple(out)
+
 
 def _optimizer_states_match(a, b) -> bool:
     """Whether two optax states have the same tree, leaf shapes and dtypes.

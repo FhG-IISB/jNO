@@ -85,9 +85,7 @@ class TestTheMap:
             got = float(heaviside(jnp.asarray(eta), beta, eta))
             want = math.tanh(beta * eta) / (math.tanh(beta * eta) + math.tanh(beta * (1.0 - eta)))
             assert abs(got - want) < 1e-14, f"eta={eta}, beta={beta}: {got} vs {want}"
-            assert abs(got - eta) > 1e-6, (
-                f"eta={eta} came back as its own image, which only eta=0.5 should do"
-            )
+            assert abs(got - eta) > 1e-6, f"eta={eta} came back as its own image, which only eta=0.5 should do"
 
     @pytest.mark.parametrize("beta", [1.0, 4.0, 16.0])
     def test_it_is_monotone_and_stays_in_the_unit_interval(self, beta):
@@ -99,8 +97,10 @@ class TestTheMap:
     def test_it_sharpens_with_beta(self):
         """The whole reason for the ramp: more beta, less grey."""
         r = np.linspace(0.0, 1.0, 201)
-        m_nd = [float(np.mean(4.0 * (v := np.asarray(heaviside(jnp.asarray(r), b))) * (1.0 - v)))
-                for b in (1.0, 2.0, 4.0, 8.0, 16.0)]
+        m_nd = [
+            float(np.mean(4.0 * (v := np.asarray(heaviside(jnp.asarray(r), b))) * (1.0 - v)))
+            for b in (1.0, 2.0, 4.0, 8.0, 16.0)
+        ]
         assert all(a > b for a, b in zip(m_nd, m_nd[1:])), (
             f"the grey-level indicator must fall monotonically in beta; got {m_nd}"
         )
@@ -111,7 +111,7 @@ class TestTheMap:
         assert math.isfinite(g) and g > 0.0, f"d/drho must be finite and positive, got {g}"
 
     def test_a_threshold_outside_the_unit_interval_is_refused(self):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(s, name="rho")
         with pytest.raises(ValueError, match="eta"):
@@ -122,7 +122,7 @@ class TestItComposes:
     """The composition rule: non-local maps reparameterise, pointwise maps compose."""
 
     def test_it_chains_after_the_filter(self):
-        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(s, name="rho")
         rho.dtype(jnp.float64)
@@ -139,7 +139,7 @@ class TestItComposes:
         must change what a solve computes. A `constrain()` transform reading a Python float cannot
         do this -- that is the whole reason `project` is a node.
         """
-        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(s, name="rho")
         rho.dtype(jnp.float64)

@@ -109,8 +109,7 @@ class TestMutatedReparamConstant:
         assert len(keys) >= 2, "the key must be built on every solve, or reuse cannot be decided"
         assert keys[0] is not None, "a describable configuration must produce a key, not None"
         assert keys[0] == keys[1], (
-            "nothing changed between these two solves, so the key must be identical and the "
-            "compiled program reused"
+            "nothing changed between these two solves, so the key must be identical and the compiled program reused"
         )
 
     def test_the_key_moves_when_the_constant_moves(self):
@@ -127,6 +126,4 @@ class TestMutatedReparamConstant:
             f"the reparameterization constants must differ once the cell is mutated; got {before} "
             f"both times, so the key cannot tell the two programs apart"
         )
-        assert 1.0 in before and 10.0 in after, (
-            f"the mutated value itself must appear: before={before}, after={after}"
-        )
+        assert 1.0 in before and 10.0 in after, f"the mutated value itself must appear: before={before}, after={after}"

@@ -654,7 +654,7 @@ def test_a_surface_traction_carries_the_same_force_on_an_enriched_space():
     lam, mu = 1.0 * 0.3 / (1 - 0.3**2), 1.0 / (2 * 1.3)
 
     def build(space):
-        d = jno.Shape.rect(0, 0, L, H, size=0.5).domain()
+        d = jno.shape.rect(0, 0, L, H, size=0.5).domain()
         kw = {"value_shape": (2,)} | ({"space": "cover"} if space == "cover" else {})
         u, phi = d.fem_symbols(**kw)
         xi, yi, _ = d.variable("interior", split=True)

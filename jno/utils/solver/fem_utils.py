@@ -4545,11 +4545,7 @@ def _expr_digest(node, seen=None):
                 pos.append(_v)
         if fn_tok is None or kw is None or pos is None:
             fn_tok = None
-        head = (
-            None
-            if fn_tok is None
-            else ("call", node._name, fn_tok, getattr(node, "reduces_axis", None), kw, tuple(pos))
-        )
+        head = None if fn_tok is None else ("call", node._name, fn_tok, getattr(node, "reduces_axis", None), kw, tuple(pos))
     else:
         head = None
     if head is None:

@@ -51,11 +51,7 @@ def _loaded_bar(space, *, dim=3, size=0.5):
     lam, mu = E0 * nu / ((1 + nu) * (1 - 2 * nu)), E0 / (2 * (1 + nu))
     tol = 1e-9
 
-    shp = (
-        jno.Shape.box(0, 0, 0, L, 1.0, 1.0, size=size)
-        if dim == 3
-        else jno.Shape.rect(0.0, 0.0, L, 1.0, size=size)
-    )
+    shp = jno.shape.box(0, 0, 0, L, 1.0, 1.0, size=size) if dim == 3 else jno.shape.rect(0.0, 0.0, L, 1.0, size=size)
     d = shp.domain()
     u, phi = d.fem_symbols(value_shape=(dim,), **({"space": "cover"} if space == "cover" else {}))
     co = d.variable("interior", split=True)[:dim]
@@ -83,9 +79,7 @@ def _solve_dense(fem):
     import jax.numpy as jnp
 
     dense = lambda a: jnp.asarray(a.todense() if hasattr(a, "todense") else a)  # noqa: E731
-    return np.asarray(
-        fem.solve(lambda a, b: jnp.linalg.solve(dense(a), jnp.asarray(b).reshape(-1)))
-    ).reshape(-1)
+    return np.asarray(fem.solve(lambda a, b: jnp.linalg.solve(dense(a), jnp.asarray(b).reshape(-1)))).reshape(-1)
 
 
 class TestCoverUnderTraction:
@@ -97,9 +91,7 @@ class TestCoverUnderTraction:
         _d, fem, _u, _eps, _a = _loaded_bar("cover", dim=dim, size=0.6 if dim == 3 else 0.4)
         sol = _solve_dense(fem)
         assert np.all(np.isfinite(sol)), "the enriched solve returned non-finite values"
-        assert np.abs(sol).max() > 0.0, (
-            "a loaded bar must deflect; an all-zero solution means the traction never assembled"
-        )
+        assert np.abs(sol).max() > 0.0, "a loaded bar must deflect; an all-zero solution means the traction never assembled"
 
     def test_the_enriched_bar_deflects_like_the_p1_one(self):
         """Sanity, not accuracy: the two formulations must agree on the sign and the order.

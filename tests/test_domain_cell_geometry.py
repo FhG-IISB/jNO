@@ -333,7 +333,7 @@ class TestDihedralAngles:
         inside ``(2 pi, 3 pi)`` — 2.35 pi for the regular tet — so that argument does not carry over
         and a minimum-angle bound alone permits a cap.
         """
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
         s = np.asarray(d.cell_angles().eval()).sum(axis=1) / PI
         assert s.min() > 2.0 and s.max() < 3.0, f"sums must lie in (2pi, 3pi), got [{s.min()}, {s.max()}]"
         assert s.max() - s.min() > 0.02, (
@@ -382,7 +382,7 @@ class TestDihedralAngles:
 
     def test_the_gradient_matches_finite_differences(self):
         """Differentiable in the vertex positions, or it cannot constrain a mesh an optimiser moves."""
-        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+        d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
         xm, ym, zm, _ = d.variable("mv3", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
         xm.trainable(name="mx3"), ym.trainable(name="my3"), zm.trainable(name="mz3")
         args, rebuild = d._moving_points()
@@ -422,7 +422,7 @@ class TestDihedralAngles:
 
     def test_the_constraint_form_is_expressible_and_feasible(self):
         """The paper's eq. (24) shape, written on dihedrals: a sound mesh must satisfy g <= 1."""
-        d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
+        d = jno.shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
         theta_min = np.radians(10.0)
         g = ((PI - d.cell_angles()) / (PI - theta_min)).pnorm(50, normalize=True)
         val = float(np.asarray(g.eval()))

@@ -14,7 +14,6 @@ solve of the same mesh and density.
 """
 
 import jax
-import numpy as np
 import pytest
 
 import jno
@@ -45,7 +44,7 @@ class _CollectLog:
 
 def _build(trainable_where, *, allow=False):
     """Poisson on the unit square, Dirichlet on the LEFT edge, some region promoted to trainable."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
     xm, _ym, _t = d.variable("mv", where=trainable_where, split=True)
     xm.trainable(name="mesh_x")
     if allow:

@@ -357,7 +357,7 @@ def test_the_patch_filter_alone_floors_the_grey_indicator():
     """
     import jax.numpy as jnp
 
-    d = jno.Shape.rect(0, 0, 60, 30, size=1.0).domain()
+    d = jno.shape.rect(0, 0, 60, 30, size=1.0).domain()
     cells = np.asarray(d._cells_p1())
     cen = np.asarray(d.mesh.points)[:, :2][cells].mean(axis=1)
     rho = np.where(np.abs(cen[:, 1] - 15.0) < 6.0, 1.0, 0.0)

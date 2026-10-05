@@ -71,7 +71,7 @@ def _x64():
 
 def _assemble(magnitude, *, region, size=0.5):
     """|resultant| of the load vector for a traction of `magnitude` on the y = 1 face."""
-    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     u, phi = d.fem_symbols(value_shape=(3,))
     xi, yi, zi = d.variable("interior", split=True)[:3]
     eps = lambda w: symgrad(w, [xi, yi, zi])  # noqa: E731

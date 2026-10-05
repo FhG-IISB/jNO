@@ -451,7 +451,7 @@ class TestPerimeter:
 
     @staticmethod
     def _setup_3d(size=0.5, lx=4.0, ly=2.0, lz=4.0):
-        d = jno.Shape.box(0, 0, 0, lx, ly, lz, size=size).domain()
+        d = jno.shape.box(0, 0, 0, lx, ly, lz, size=size).domain()
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(s, name="rho_perim_3d")
         cells = np.asarray(d._cells_p1())
@@ -521,7 +521,7 @@ class TestCurvature:
 
     @staticmethod
     def _grid(n=8, size=1.0):
-        d = jno.Shape.rect(0, 0, n, n, size=size).structured().domain(cell="quad")
+        d = jno.shape.rect(0, 0, n, n, size=size).structured().domain(cell="quad")
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(s, name=f"rho_curv_{n}_{size}")
         cells = np.asarray(d._cells_topo()[0])
@@ -600,7 +600,7 @@ class TestCurvature:
         bug hide in both sides.
         """
         z = 0.1
-        d = jno.Shape.box(0, 0, 0, 2, 1, 2, size=0.5).domain()
+        d = jno.shape.box(0, 0, 0, 2, 1, 2, size=0.5).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
         fast = _summed(jno.np.parameter(sym, name="rho_pairs").curvature(zeta=z).fn)
         topo = d._facet_ridges()
@@ -637,7 +637,7 @@ class TestCurvature:
         with ``|v| <= 1`` — and gray is where a formulation that merely looks non-negative on
         black-and-white designs would give itself away, since that is where the smoothed magnitude
         and the true one disagree most."""
-        d = jno.Shape.box(0, 0, 0, 2, 1, 2, size=0.6).domain()
+        d = jno.shape.box(0, 0, 0, 2, 1, 2, size=0.6).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
         s = _summed(jno.np.parameter(sym, name="rho_nonneg").curvature(zeta=0.1).fn)
         n = np.asarray(d._cells_p1()).shape[0]
@@ -655,7 +655,7 @@ class TestCurvature:
         So bending is roughly 1.2x sharper on a fold and 3.3x sharper on noise — worth a term, and
         not a replacement for the perimeter.
         """
-        d = jno.Shape.box(0, 0, 0, 4, 2, 4, size=0.5).domain()
+        d = jno.shape.box(0, 0, 0, 4, 2, 4, size=0.5).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(sym, name="rho_fold")
         s, p = _summed(rho.curvature(zeta=0.1).fn), rho.perimeter(zeta=0.1).fn
@@ -679,7 +679,7 @@ class TestCurvature:
         """
         floors = []
         for h in (0.5, 0.35):
-            d = jno.Shape.box(0, 0, 0, 4, 2, 4, size=h).domain()
+            d = jno.shape.box(0, 0, 0, 4, 2, 4, size=h).domain()
             _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
             s = _summed(jno.np.parameter(sym, name=f"rho_floor_{h}").curvature(zeta=0.1).fn)
             cells = np.asarray(d._cells_p1())
@@ -692,7 +692,7 @@ class TestCurvature:
         """Under a deformable mesh this is the term that gives node migration a reason to ALIGN the
         boundary rather than merely shorten it, so the mesh gradient is not an incidental extra —
         it is half the point. Only the nodes near the boundary may feel it."""
-        d = jno.Shape.rect(0, 0, 8, 4, size=0.6).domain()
+        d = jno.shape.rect(0, 0, 8, 4, size=0.6).domain()
         xs, ys, _ = d.variable("mv", where=lambda x, y: (x > 0.1) & (x < 7.9), split=True)
         for c, name in ((xs, "curv_cx"), (ys, "curv_cy")):
             c.trainable(name=name)
@@ -724,7 +724,7 @@ class TestCurvature:
         is not free -- the O(N) identity is exact but its evaluation cancels, so a ridge carrying no
         boundary lands a few ulp below zero and a p-norm over it would raise a negative to a power.
         """
-        d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5).domain()
+        d = jno.shape.box(0, 0, 0, 2, 1, 1, size=0.5).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
         node = jno.np.parameter(sym, name="rho_perridge").curvature(zeta=0.1)
         n_ridges = d._facet_ridges()["ridge_nodes"].shape[0]
@@ -743,7 +743,7 @@ class TestCurvature:
         Measured on this mesh: max/median over the ridges that carry any boundary is 2.8 for a flat
         cut and 23.9 for a scrambled design (5.1 and 17.7 at half the mesh size).
         """
-        d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5).domain()
+        d = jno.shape.box(0, 0, 0, 2, 1, 1, size=0.5).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
         node = jno.np.parameter(sym, name="rho_tail").curvature(zeta=0.1)
         cells = np.asarray(d._cells_p1())
@@ -766,7 +766,7 @@ class TestCurvature:
         )
 
     def test_a_nodal_density_is_refused(self):
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+        d = jno.shape.rect(0, 0, 2, 1, size=0.4).domain()
         _r, s = d.fem_symbols(names=("r", "s"))
         with pytest.raises(TypeError, match="P0"):
             jno.np.parameter(s, name="rho_nodal_c").curvature()
@@ -777,7 +777,7 @@ class TestInteriorFacets:
 
     @pytest.mark.parametrize(
         "shape, n_face_nodes",
-        [(jno.Shape.rect(0, 0, 2, 1, size=0.4), 2), (jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5), 3)],
+        [(jno.shape.rect(0, 0, 2, 1, size=0.4), 2), (jno.shape.box(0, 0, 0, 2, 1, 1, size=0.5), 3)],
         ids=["triangles", "tets"],
     )
     def test_every_facet_is_shared_by_exactly_two_distinct_cells(self, shape, n_face_nodes):
@@ -800,8 +800,8 @@ class TestInteriorFacets:
         from jno.utils.solver.fem_facets import build_facet_connectivity
 
         for shape, key, n_local in (
-            (jno.Shape.rect(0, 0, 2, 1, size=0.4), "triangle", 3),
-            (jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5), "tetrahedron", 4),
+            (jno.shape.rect(0, 0, 2, 1, size=0.4), "triangle", 3),
+            (jno.shape.box(0, 0, 0, 2, 1, 1, size=0.5), "tetrahedron", 4),
         ):
             d = shape.domain()
             cells = np.asarray(d._cells_p1())
@@ -824,7 +824,7 @@ class TestInteriorFacets:
 
     @pytest.mark.parametrize(
         "shape, n_local, n_ridge_nodes",
-        [(jno.Shape.rect(0, 0, 2, 1, size=0.4), 2, 1), (jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5), 3, 2)],
+        [(jno.shape.rect(0, 0, 2, 1, size=0.4), 2, 1), (jno.shape.box(0, 0, 0, 2, 1, 1, size=0.5), 3, 2)],
         ids=["triangles", "tets"],
     )
     def test_every_facet_reports_its_own_facets(self, shape, n_local, n_ridge_nodes):
@@ -849,7 +849,7 @@ class TestInteriorFacets:
         runs through is a property of the density, not of the mesh. Measured ~6 on a tet mesh
         against exactly 2 for the 2-D case, where a ridge is a point on a boundary curve.
         """
-        d3 = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
+        d3 = jno.shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
         t3 = d3._facet_ridges()
         counts = np.bincount(t3["facet_ridge"].reshape(-1), minlength=t3["ridge_nodes"].shape[0])
         assert counts.max() > 2, "a tet mesh edge carries a fan of faces, not a pair"
@@ -859,7 +859,7 @@ class TestInteriorFacets:
         """``_facet_ridges`` must extend ``_interior_facets`` rather than recompute it — a second
         traversal that disagreed about which facets are interior would silently bend the wrong
         boundary."""
-        for shape in (jno.Shape.rect(0, 0, 2, 1, size=0.4), jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5)):
+        for shape in (jno.shape.rect(0, 0, 2, 1, size=0.4), jno.shape.box(0, 0, 0, 2, 1, 1, size=0.5)):
             d = shape.domain()
             base, ext = d._interior_facets(), d._facet_ridges()
             assert np.array_equal(base["cells"], ext["cells"])
@@ -940,8 +940,8 @@ class TestCrossMeshTransfer:
         looks at ranks 0-31. A tet is pointier than a triangle, so its centroid sits further from
         parts of it and the ranking is looser than the 2-D default assumes.
         """
-        coarse = jno.Shape.box(0, 0, 0, 4, 2, 2, size=1.0).domain()
-        fine = jno.Shape.box(0, 0, 0, 4, 2, 2, size=0.5).domain()
+        coarse = jno.shape.box(0, 0, 0, 4, 2, 2, size=1.0).domain()
+        fine = jno.shape.box(0, 0, 0, 4, 2, 2, size=0.5).domain()
         n_c, n_f = int(coarse._cells_p1().shape[0]), int(fine._cells_p1().shape[0])
         assert coarse._cells_p1().shape[1] == 4, "this must be a tetrahedral mesh"
         assert n_f > 2 * n_c, f"the target must be genuinely finer ({n_c} -> {n_f})"
@@ -959,8 +959,8 @@ class TestCrossMeshTransfer:
         mesh resolves the plane exactly, which it does not.
         """
         h = 0.5
-        coarse = jno.Shape.box(0, 0, 0, 4, 2, 6, size=h).domain()
-        fine = jno.Shape.box(0, 0, 0, 4, 2, 6, size=h / 2).domain()
+        coarse = jno.shape.box(0, 0, 0, 4, 2, 6, size=h).domain()
+        fine = jno.shape.box(0, 0, 0, 4, 2, 6, size=h / 2).domain()
         c_cen = np.asarray(coarse.mesh.points)[:, :3][coarse._cells_p1()].mean(axis=1)
         slab = np.where(np.abs(c_cen[:, 2] - 3.0) < 1.5, 1.0, 0.0)
         assert 0.1 < slab.mean() < 0.9, "the slab must be a real subset for this to test anything"
@@ -977,8 +977,8 @@ class TestCrossMeshTransfer:
     def test_deformed_source_coordinates_are_honoured_on_tets(self):
         """The 3-D half of the reanalysis contract: a mesh moved by `.trainable()` must be read on
         its DEFORMED coordinates, or the density is sampled off the geometry it was never on."""
-        coarse = jno.Shape.box(0, 0, 0, 4, 2, 2, size=0.8).domain()
-        fine = jno.Shape.box(0, 0, 0, 4, 2, 2, size=0.4).domain()
+        coarse = jno.shape.box(0, 0, 0, 4, 2, 2, size=0.8).domain()
+        fine = jno.shape.box(0, 0, 0, 4, 2, 2, size=0.4).domain()
         pts = np.asarray(coarse.mesh.points)[:, :3]
         slab = np.where(np.abs(pts[coarse._cells_p1()].mean(axis=1)[:, 2] - 1.0) < 0.4, 1.0, 0.0)
 
@@ -994,8 +994,8 @@ class TestCrossMeshTransfer:
     def test_a_target_of_a_different_dimension_is_refused(self):
         """Both meshes carry `(n_cells,)` fields, so a dimension mismatch would otherwise reach the
         point locator as a shape error from three frames down."""
-        box = jno.Shape.box(0, 0, 0, 2, 2, 2, size=1.0).domain()
-        rect = jno.Shape.rect(0, 0, 2, 2, size=1.0).domain()
+        box = jno.shape.box(0, 0, 0, 2, 2, 2, size=1.0).domain()
+        rect = jno.shape.rect(0, 0, 2, 2, size=1.0).domain()
         with pytest.raises(ValueError, match="cannot cross dimensions"):
             box.transfer_cell_field(np.ones(int(box._cells_p1().shape[0])), rect)
 
@@ -1065,7 +1065,7 @@ class TestPatchFilterOnTets:
 
     @staticmethod
     def _box(size=0.5):
-        d = jno.Shape.box(0, 0, 0, 3, 2, 2, size=size).domain()
+        d = jno.shape.box(0, 0, 0, 3, 2, 2, size=size).domain()
         return d, np.asarray(d._cells_p1()), d._patch_topology()
 
     def test_a_tet_belongs_to_six_edge_fans(self):

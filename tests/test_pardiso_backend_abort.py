@@ -45,7 +45,7 @@ REPRO = textwrap.dedent(
     LAM, MU = E0*NU/((1+NU)*(1-2*NU)), E0/(2*(1+NU))
     USE_FILTER = __import__("os").environ["FILTER"] == "1"
 
-    d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.25).domain()
+    d = jno.shape.box(0, 0, 0, 2, 1, 1, size=0.25).domain()
     u, phi = d.fem_symbols(value_shape=(3,))
     _r, s = d.fem_symbols(space="P0", names=("r", "s"))
     xi, yi, zi = d.variable("interior", split=True)[:3]
@@ -74,8 +74,7 @@ REPRO = textwrap.dedent(
 
 
 def _run(filter_on: bool):
-    env = dict(os.environ, FILTER="1" if filter_on else "0",
-               CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu")
+    env = dict(os.environ, FILTER="1" if filter_on else "0", CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu")
     return subprocess.run([sys.executable, "-c", REPRO], env=env, capture_output=True, text=True, timeout=900)
 
 
@@ -96,8 +95,7 @@ class TestTheBackendDoesNotKillTheProcess:
             f"handed a non-finite system again:\n{r.stderr[-600:]}"
         )
         assert "non-finite" in r.stderr, (
-            f"expected the guard's FloatingPointError naming the non-finite entries, got:\n"
-            f"{r.stderr[-800:]}"
+            f"expected the guard's FloatingPointError naming the non-finite entries, got:\n{r.stderr[-800:]}"
         )
 
     def test_an_unfiltered_density_survives_repeated_adjoints(self):

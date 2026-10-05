@@ -17,7 +17,6 @@ asserted here, so the limit is pinned rather than assumed.
 
 import jax
 import numpy as np
-import optax
 import pytest
 
 import jno
@@ -95,7 +94,5 @@ class TestOrdinaryConstraintsPass:
         v.dtype(jax.numpy.float64)
         v.initialize(lambda k, sh, dtype=None: jax.numpy.full(sh, 0.5))
         v.optimizer(jno.optimizers.mma(move=0.2, lower=0.0, upper=1.0))
-        crux = jno.core(
-            [((v[0] - 1.0) ** 2).name("f"), jno.le((4.0 * v[1]).name("g_other"), 1.0)], domain=d
-        )
+        crux = jno.core([((v[0] - 1.0) ** 2).name("f"), jno.le((4.0 * v[1]).name("g_other"), 1.0)], domain=d)
         crux.solve(1)  # must not raise: g starts at 2.0 > 1 but its gradient w.r.t. v is non-zero

@@ -438,7 +438,7 @@ class TestFunctionalSolver:
 
     def test_a_collocation_integral_refuses_a_solver(self):
         """There is no linear solve in a collocation or temporal integral for a backend to select."""
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
         xi, yi, _ = d.variable("interior", split=True)
         with pytest.raises(TypeError, match="only to a FEM functional"):
             (xi * yi).integrate(solver=jno.solve.lu(backend="host"))
