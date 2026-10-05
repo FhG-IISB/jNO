@@ -1,4 +1,4 @@
-"""Guards for :meth:`jno.Shape.line` — a tube along a polyline.
+"""Guards for :meth:`jno.shape.line` — a tube along a polyline.
 
 The primitive exists for one reason, and ``test_line_can_be_a_named_region_with_its_own_size``
 is that reason: a swept solid has no closed-form membership, so it cannot carry its own ``size=``
@@ -29,7 +29,7 @@ def _distance_to_polyline(x, pts):
 
 def test_contains_is_the_distance_to_the_polyline():
     """The closed form, against a reference written from the definition."""
-    line = jno.Shape.line(PTS, d=0.75)
+    line = jno.shape.line(PTS, d=0.75)
     rng = np.random.default_rng(0)
     x = rng.uniform(-2.0, 11.0, (4000, 3))
     got = np.asarray(line.contains(x))
@@ -47,8 +47,8 @@ def test_line_can_be_a_named_region_with_its_own_size():
     The host is sized at 0.8 rather than something coarser on purpose; see
     :func:`test_a_coarse_host_cannot_mesh_around_a_thin_inclusion` for why.
     """
-    wire = jno.Shape.line(PTS, d=0.75, size=0.30).name("wire")
-    host = (jno.Shape.box(-2, -2, -2, 2, 12, 4, size=0.8) - wire).name("air")
+    wire = jno.shape.line(PTS, d=0.75, size=0.30).name("wire")
+    host = (jno.shape.box(-2, -2, -2, 2, 12, 4, size=0.8) - wire).name("air")
     d = (wire + host).domain()
     sets = d.mesh.cell_sets
     assert "wire" in sets and "air" in sets
@@ -71,8 +71,8 @@ def test_a_coarse_host_cannot_mesh_around_a_thin_inclusion():
     present but empty, and without a guard that object behaves like a domain until some later
     reduction over an empty set fails far from the geometry that caused it.
     """
-    wire = jno.Shape.line(PTS, d=0.75, size=0.30).name("wire")
-    coarse = (jno.Shape.box(-2, -2, -2, 2, 12, 4, size=1.6) - wire).name("air")
+    wire = jno.shape.line(PTS, d=0.75, size=0.30).name("wire")
+    coarse = (jno.shape.box(-2, -2, -2, 2, 12, 4, size=1.6) - wire).name("air")
     with pytest.raises(RuntimeError, match="EMPTY 3-D mesh"):
         (wire + coarse).domain().points
 
@@ -81,7 +81,7 @@ def test_meshes_to_roughly_the_analytic_volume():
     """A faceted cylinder is an INSCRIBED polygon, so the mesh must be under the true volume -- and
     not by more than the faceting at this resolution. Bounds it on both sides rather than asserting
     a single number that would move with the mesher."""
-    line = jno.Shape.line(PTS, d=0.75, size=0.30)
+    line = jno.shape.line(PTS, d=0.75, size=0.30)
     d = line.domain()
     P, C = np.asarray(d.points), np.asarray(d._cells_p1())
     e = np.stack([P[C[:, i + 1]] - P[C[:, 0]] for i in range(3)], -1)
@@ -92,14 +92,14 @@ def test_meshes_to_roughly_the_analytic_volume():
 
 
 def test_bounds_enclose_the_tube():
-    lo, hi = jno.Shape.line(PTS, d=0.75)._node[1].bounds()
+    lo, hi = jno.shape.line(PTS, d=0.75)._node[1].bounds()
     assert np.allclose(lo, (-0.375, -0.375, -0.375))
     assert np.allclose(hi, (0.375, 10.375, 2.375))
 
 
 def test_two_dimensional_points_are_padded():
     """A planar polyline is written in 2-D and lifted, like every other primitive."""
-    a = jno.Shape.line([(0, 0), (3, 4)], d=0.5)._node[1].points
+    a = jno.shape.line([(0, 0), (3, 4)], d=0.5)._node[1].points
     assert a == ((0.0, 0.0, 0.0), (3.0, 4.0, 0.0))
 
 
@@ -113,12 +113,12 @@ def test_two_dimensional_points_are_padded():
 )
 def test_refuses_an_ambiguous_or_impossible_cross_section(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        jno.Shape.line(PTS, **kwargs)
+        jno.shape.line(PTS, **kwargs)
 
 
 def test_refuses_a_degenerate_polyline():
     with pytest.raises(ValueError, match="at least two points"):
-        jno.Shape.line([(0.0, 0.0, 0.0)], d=0.5)
+        jno.shape.line([(0.0, 0.0, 0.0)], d=0.5)
 
 
 def test_the_built_solid_and_the_membership_test_agree_at_a_bend():
@@ -132,7 +132,7 @@ def test_the_built_solid_and_the_membership_test_agree_at_a_bend():
     """
     r = 2e-4
     apex = (0.010, 0.002, 0.004)
-    wire = jno.Shape.line([(0.007, 0.002, 0.0015), apex, (0.013, 0.002, 0.0015)], r=r)
+    wire = jno.shape.line([(0.007, 0.002, 0.0015), apex, (0.013, 0.002, 0.0015)], r=r)
 
     # points just outside the swept tube, in the plane of the bend, above the apex
     out = np.array([[apex[0], apex[1], apex[2] + r * (1.0 + f)] for f in (0.05, 0.2, 0.5)])

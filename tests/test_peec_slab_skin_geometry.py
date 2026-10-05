@@ -36,10 +36,10 @@ def _skin(freq):
 def _microstrip(thick, freq, pitch=5.0e-4):
     """Wire out, via down, return through a plane whose TOP face is fixed at ``ZTOP``."""
     wire = (
-        jno.Shape.line([(0.0, 0.02, ZW), (LEN, 0.02, ZW), (LEN, 0.02, ZTOP)], r=RAD, size=5.0e-4).attach(sigma=CU).name("w")
+        jno.shape.line([(0.0, 0.02, ZW), (LEN, 0.02, ZW), (LEN, 0.02, ZTOP)], r=RAD, size=5.0e-4).attach(sigma=CU).name("w")
     )
     plane = (
-        jno.Shape.box(-0.004, 0.014, ZTOP - thick, LEN + 0.004, 0.026, ZTOP, size=(pitch, pitch, thick))
+        jno.shape.box(-0.004, 0.014, ZTOP - thick, LEN + 0.004, 0.026, ZTOP, size=(pitch, pitch, thick))
         .attach(sigma=CU)
         .name("plane")
     )
@@ -117,9 +117,9 @@ def test_the_loop_inductance_does_not_jump_where_a_sheet_pair_would_start():
     assert thick < 2 * d_lo and thick > 2 * d_hi  # the threshold really is crossed
 
     def bar(freq):
-        sh = jno.Shape.box(0, 0, 0, 0.040, 0.006, thick, size=(0.004, 0.006, thick)).attach(sigma=sig).name("b")
+        sh = jno.shape.box(0, 0, 0, 0.040, 0.006, thick, size=(0.004, 0.006, thick)).attach(sigma=sig).name("b")
         w = (
-            jno.Shape.line(
+            jno.shape.line(
                 [(0.004, 0.003, thick), (0.004, 0.003, 0.004), (0.036, 0.003, 0.004), (0.036, 0.003, thick)],
                 r=2e-4,
                 size=0.004,

@@ -23,11 +23,11 @@ CU, mm = 5.8e7, 1e-3
 
 def _welded(n_wire=6):
     """A trace layer with bond wires landing on it: a lattice block, a wire block, and the cross."""
-    plate = jno.Shape.box(0, 0, 0, 24 * mm, 12 * mm, 1 * mm, size=(1 * mm,) * 3).attach(sigma=CU).name("plate")
+    plate = jno.shape.box(0, 0, 0, 24 * mm, 12 * mm, 1 * mm, size=(1 * mm,) * 3).attach(sigma=CU).name("plate")
     sh = plate
     for k in range(n_wire):
         y = (2.0 + 1.5 * k) * mm
-        sh = sh + jno.Shape.line(
+        sh = sh + jno.shape.line(
             [(2 * mm, y, 1 * mm), (12 * mm, y, 4 * mm), (22 * mm, y, 1 * mm)], r=0.2 * mm, size=1.0 * mm
         ).attach(sigma=CU).name(f"w{k}")
     d = sh.domain()
@@ -84,7 +84,7 @@ def test_a_block_below_the_floor_is_left_exact():
 def test_a_plain_lattice_ignores_it():
     """A lattice is applied by FFT, which is exact and already O(N log N). There is nothing to
     compress, so the spec must be inert rather than quietly degrading a good path."""
-    plate = jno.Shape.box(0, 0, 0, 20 * mm, 10 * mm, 1 * mm, size=(1 * mm,) * 3).attach(sigma=CU).name("p")
+    plate = jno.shape.box(0, 0, 0, 20 * mm, 10 * mm, 1 * mm, size=(1 * mm,) * 3).attach(sigma=CU).name("p")
     d = plate.domain()
     d.tag("A", lambda x, y, z: x < 1.1 * mm)
     d.tag("B", lambda x, y, z: x > 18.9 * mm)

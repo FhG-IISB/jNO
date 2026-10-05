@@ -39,9 +39,9 @@ LB, WB, TB, GAP = 0.060, 0.006, 1e-3, 0.002  # length, bar width, thickness, gap
 # depth. Resolution goes ACROSS the width (1 mm cells on a 6 mm bar), which is the direction the
 # current actually redistributes in here.
 cells = (2 * mm, 1 * mm, TB)
-go = jno.Shape.box(0, 0, 0, LB, WB, TB, size=cells).attach(sigma=CU).name("go")
-ret = jno.Shape.box(0, WB + GAP, 0, LB, 2 * WB + GAP, TB, size=cells).attach(sigma=CU).name("return")
-link = jno.Shape.box(LB - 2 * mm, 0, 0, LB, 2 * WB + GAP, TB, size=cells).attach(sigma=CU).name("link")
+go = jno.shape.box(0, 0, 0, LB, WB, TB, size=cells).attach(sigma=CU).name("go")
+ret = jno.shape.box(0, WB + GAP, 0, LB, 2 * WB + GAP, TB, size=cells).attach(sigma=CU).name("return")
+link = jno.shape.box(LB - 2 * mm, 0, 0, LB, 2 * WB + GAP, TB, size=cells).attach(sigma=CU).name("link")
 
 d = (go + ret + link).domain()
 d.tag("A", lambda x, y, z: (x < 1.1 * mm) & (y < WB))

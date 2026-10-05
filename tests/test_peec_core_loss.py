@@ -21,7 +21,7 @@ jax.config.update("jax_enable_x64", True)
 
 CU, FREQ = 5.8e7, 1e5
 OUT, WIN, DEP, P = 0.024, 0.006, 0.008, 0.002  # outer, window inset, depth, cell pitch
-box = jno.Shape.box
+box = jno.shape.box
 
 
 def _core(mu_r):

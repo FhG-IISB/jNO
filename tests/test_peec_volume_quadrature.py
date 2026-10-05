@@ -26,15 +26,15 @@ from jno.utils.solver.peec import bar_filaments
 MU0 = 4e-7 * np.pi
 
 
-def mc_mutual(l, w, t, d, n=3_000_000, seed=0):
+def mc_mutual(length, w, t, d, n=3_000_000, seed=0):
     """The Neumann double integral between two parallel bars, by brute force."""
     rng = np.random.default_rng(seed)
-    a = rng.random((n, 3)) * np.array([w, l, t]) + np.array([-w / 2, -l / 2, -t / 2])
-    b = rng.random((n, 3)) * np.array([w, l, t]) + np.array([d - w / 2, -l / 2, -t / 2])
-    return MU0 / (4 * np.pi) * l**2 * np.mean(1.0 / np.linalg.norm(a - b, axis=1))
+    a = rng.random((n, 3)) * np.array([w, length, t]) + np.array([-w / 2, -length / 2, -t / 2])
+    b = rng.random((n, 3)) * np.array([w, length, t]) + np.array([d - w / 2, -length / 2, -t / 2])
+    return MU0 / (4 * np.pi) * length**2 * np.mean(1.0 / np.linalg.norm(a - b, axis=1))
 
 
-def _two_bar_mutual(l, w, t, d, quad=3, quad_t=2):
+def _two_bar_mutual(length, w, t, d, quad=3, quad_t=2):
     """M between two parallel lattice-shaped bars, through jNO's own sub-point machinery."""
     import jax.numpy as jnp
 
@@ -42,9 +42,9 @@ def _two_bar_mutual(l, w, t, d, quad=3, quad_t=2):
 
     gl, wl = np.polynomial.legendre.leggauss(quad)
     gt, wt = np.polynomial.legendre.leggauss(quad_t)
-    ox, oy, oz = (w / 2) * gt, (l / 2) * gl, (t / 2) * gt
+    ox, oy, oz = (w / 2) * gt, (length / 2) * gl, (t / 2) * gt
     P = np.stack(np.meshgrid(ox, oy, oz, indexing="ij"), -1).reshape(-1, 3)
-    W = ((wt[:, None, None] / 2) * (wl[None, :, None] / 2) * (wt[None, None, :] / 2)).reshape(-1) * l
+    W = ((wt[:, None, None] / 2) * (wl[None, :, None] / 2) * (wt[None, None, :] / 2)).reshape(-1) * length
     pos = np.concatenate([P, P + np.array([d, 0.0, 0.0])])
     mom = np.concatenate([np.stack([np.zeros_like(W), W, np.zeros_like(W)], -1)] * 2)
     grp = np.concatenate([np.zeros(len(P), int), np.ones(len(P), int)])
@@ -56,31 +56,31 @@ def _two_bar_mutual(l, w, t, d, quad=3, quad_t=2):
     return M[0, 1]
 
 
-@pytest.mark.parametrize("l,t,tol", [(0.5e-3, 0.0625e-3, 0.03), (0.25e-3, 0.25e-3, 0.06), (0.0625e-3, 0.5e-3, 0.12)])
-def test_the_transverse_rule_fixes_the_near_neighbour_mutual(l, t, tol):
+@pytest.mark.parametrize("length,t,tol", [(0.5e-3, 0.0625e-3, 0.03), (0.25e-3, 0.25e-3, 0.06), (0.0625e-3, 0.5e-3, 0.12)])
+def test_the_transverse_rule_fixes_the_near_neighbour_mutual(length, t, tol):
     """Across the aspect ratios a lattice actually produces, including the pathological one."""
     w = 0.0625e-3
     d = 2 * w
-    ref = mc_mutual(l, w, t, d)
-    got = _two_bar_mutual(l, w, t, d, quad=3, quad_t=2)
-    assert abs(got / ref - 1) < tol, f"l/t={l / t:.2f}: {got * 1e12:.4f} pH vs {ref * 1e12:.4f} pH"
+    ref = mc_mutual(length, w, t, d)
+    got = _two_bar_mutual(length, w, t, d, quad=3, quad_t=2)
+    assert abs(got / ref - 1) < tol, f"length/t={length / t:.2f}: {got * 1e12:.4f} pH vs {ref * 1e12:.4f} pH"
 
 
-@pytest.mark.parametrize("l,t", [(0.25e-3, 0.25e-3), (0.0625e-3, 0.5e-3)])
-def test_the_transverse_rule_is_strictly_better_than_the_line_rule(l, t):
+@pytest.mark.parametrize("length,t", [(0.25e-3, 0.25e-3), (0.0625e-3, 0.5e-3)])
+def test_the_transverse_rule_is_strictly_better_than_the_line_rule(length, t):
     """The regression guard: whatever the tolerance, sampling the cross-section must help."""
     w = 0.0625e-3
     d = 2 * w
-    ref = mc_mutual(l, w, t, d)
-    line = abs(_two_bar_mutual(l, w, t, d, quad=3, quad_t=1) / ref - 1)
-    vol = abs(_two_bar_mutual(l, w, t, d, quad=3, quad_t=2) / ref - 1)
+    ref = mc_mutual(length, w, t, d)
+    line = abs(_two_bar_mutual(length, w, t, d, quad=3, quad_t=1) / ref - 1)
+    vol = abs(_two_bar_mutual(length, w, t, d, quad=3, quad_t=2) / ref - 1)
     assert vol < 0.5 * line, f"line {100 * line:.1f} % -> volume {100 * vol:.1f} %"
 
 
 def test_a_lattice_elements_moments_still_sum_to_its_length():
     """Whatever the rule, an element's total current moment is length x tangent. It is the one
     invariant the whole partial-inductance machinery rests on."""
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 4e-3, 2e-3, 1e-3), size=(1e-3, 1e-3, 1e-3))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 4e-3, 2e-3, 1e-3), size=(1e-3, 1e-3, 1e-3))
     mom, grp = np.asarray(f.mom), np.asarray(f.group)
     ln = np.asarray(f.length)
     ne = int(grp.max()) + 1
@@ -96,7 +96,7 @@ def test_the_published_bar_converges_instead_of_diverging():
     L0 = 5.0e-3
     got = []
     for p in (0.25e-3, 0.125e-3):
-        bar = jno.Shape.box(0, 0, 0, W, L0, T, size=(p, p, T)).attach(sigma=5.8e7).name("bar")
+        bar = jno.shape.box(0, 0, 0, W, L0, T, size=(p, p, T)).attach(sigma=5.8e7).name("bar")
         d = bar.domain()
         d.tag("A", lambda x, y, z, p=p: y < p * 1.01)
         d.tag("B", lambda x, y, z, p=p: y > L0 - p * 1.01)
@@ -119,7 +119,7 @@ def _bar_L(cells, quad_t, hz=1.0):
     from jno.utils.solver.peec import solve_network, terminal_nodes
 
     sig, t = 5.8e7, 0.002
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, t), size=(0.002, 0.004, t / cells), quad_t=quad_t)
+    f = bar_filaments(jno.shape.box(0, 0, 0, 0.040, 0.004, t), size=(0.002, 0.004, t / cells), quad_t=quad_t)
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
@@ -134,8 +134,8 @@ def test_the_assembled_bar_inductance_moves_onto_grovers_formula():
     """An analytic oracle for the whole assembled solve, not just one element pair.
 
     Grover, *Inductance Calculations* (1946), rectangular bar:
-    L = (mu0 l / 2pi) [ln(2l/(w+t)) + 1/2 + 0.2235 (w+t)/l] = 23.364 nH here, good to a couple of
-    percent at this bar's l/(w+t) = 6.3. The line rule sat 25 % above it; the volume rule halves
+    L = (mu0 length / 2pi) [ln(2l/(w+t)) + 1/2 + 0.2235 (w+t)/length] = 23.364 nH here, good to a couple of
+    percent at this bar's length/(w+t) = 6.3. The line rule sat 25 % above it; the volume rule halves
     that and keeps closing as the transverse order rises (23.92 nH, +2.4 %, at 8 cells / order 4).
 
         order 1    29.320 nH   +25.5 %

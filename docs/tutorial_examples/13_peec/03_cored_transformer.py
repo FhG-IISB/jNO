@@ -33,7 +33,7 @@ import numpy as np  # noqa: E402
 
 import jno  # noqa: E402
 
-box, CU = jno.Shape.box, 5.8e7
+box, CU = jno.shape.box, 5.8e7
 OUT, WIN, DEP, P = 0.024, 0.006, 0.008, 0.002  # outer size, window inset, depth, cell pitch
 
 

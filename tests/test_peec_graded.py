@@ -31,7 +31,7 @@ BOX = (0.0, 0.0, 0.0, 16 * mm, 8 * mm, 0.8 * mm)
 
 
 def _shape(p):
-    return jno.Shape.box(*BOX, size=(p, p, p))
+    return jno.shape.box(*BOX, size=(p, p, p))
 
 
 def _uniform_edges(p):
@@ -129,7 +129,11 @@ def test_a_graded_solve_reproduces_the_uniform_answer_it_approximates():
         A = terminal_nodes(f, lambda P: P[:, 0] < xs.min() + 1e-9)
         B = terminal_nodes(f, lambda P: P[:, 0] > xs.max() - 1e-9)
         _c, _p, inj = solve_network(
-            f, CU, {"A": A, "B": B}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6,
+            f,
+            CU,
+            {"A": A, "B": B},
+            [("A", "B", 1.0 + 0j)],
+            omega=2 * np.pi * 1e6,
             operator=jno.solve.hierarchical(tol=1e-8, leaf=64, floor=0),
         )
         got[name] = complex(1.0 / inj["A"])

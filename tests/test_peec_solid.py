@@ -29,7 +29,7 @@ def ends(f):
 
 @pytest.mark.parametrize("pitch", [0.004, 0.002, 0.001])
 def test_the_lattice_conducts_exactly(pitch):
-    f = bar_filaments(jno.Shape.box(0, 0, 0, LX, WY, TZ), size=pitch)
+    f = bar_filaments(jno.shape.box(0, 0, 0, LX, WY, TZ), size=pitch)
     a, b = ends(f)
     _cur, _phi, inj = solve_network(f, SIG, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=0.0)
     p = np.asarray(f.nodes)[:, 0]
@@ -38,7 +38,7 @@ def test_the_lattice_conducts_exactly(pitch):
 
 
 def test_the_lattice_is_a_grid_with_one_bar_family_per_axis():
-    f = bar_filaments(jno.Shape.box(0, 0, 0, LX, WY, TZ), size=0.002)
+    f = bar_filaments(jno.shape.box(0, 0, 0, LX, WY, TZ), size=0.002)
     n = f.lattice["n"]
     assert n == (20, 2, 1)
     counts = np.bincount(f.lattice["axis"], minlength=3)
@@ -49,11 +49,11 @@ def test_the_lattice_is_a_grid_with_one_bar_family_per_axis():
 
 def test_a_pitch_that_leaves_one_cell_everywhere_is_refused():
     with pytest.raises(ValueError, match="no bar joins two cells"):
-        bar_filaments(jno.Shape.box(0, 0, 0, 0.01, 0.01, 0.01), size=0.02)
+        bar_filaments(jno.shape.box(0, 0, 0, 0.01, 0.01, 0.01), size=0.02)
 
 
 def test_a_solid_solves_through_the_front_door():
-    bar = jno.Shape.box(0, 0, 0, LX, WY, TZ, size=0.001).attach(sigma=SIG).name("bar")
+    bar = jno.shape.box(0, 0, 0, LX, WY, TZ, size=0.001).attach(sigma=SIG).name("bar")
     d = bar.domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > LX - 0.0011)
@@ -66,9 +66,9 @@ def test_a_solid_solves_through_the_front_door():
 
 def test_a_wire_landing_on_a_trace_carries_current():
     """The mixed case: separate discretisations, welded where the geometry says the metal touches."""
-    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("trace")
+    trace = jno.shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("trace")
     wire = (
-        jno.Shape.line([(0.019, 0.002, 0.0005), (0.019, 0.002, 0.006), (0.030, 0.002, 0.0005)], r=1.9e-4, size=0.001)
+        jno.shape.line([(0.019, 0.002, 0.0005), (0.019, 0.002, 0.006), (0.030, 0.002, 0.0005)], r=1.9e-4, size=0.001)
         .attach(sigma=SIG)
         .name("wire")
     )
@@ -84,8 +84,8 @@ def test_a_wire_landing_on_a_trace_carries_current():
 
 def test_conductors_that_do_not_touch_are_refused_rather_than_returning_infinity():
     """A singular solve returns inf without complaining, and an infinite resistance reads physical."""
-    a = jno.Shape.box(0, 0, 0, 0.01, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("a")
-    b = jno.Shape.box(0.02, 0, 0, 0.03, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("b")
+    a = jno.shape.box(0, 0, 0, 0.01, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("a")
+    b = jno.shape.box(0.02, 0, 0, 0.03, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("b")
     d = (a + b).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0289)
@@ -98,10 +98,10 @@ def test_conductors_that_do_not_touch_are_refused_rather_than_returning_infinity
 def test_any_closed_form_solid_is_discretised_not_just_a_box():
     """The lattice covers a bounding box and a mask says which cells are metal, so the SHAPE is free."""
     for solid in (
-        jno.Shape.cylinder(0, 0, 0, 0.02, 0, 0, 0.003),
-        jno.Shape.sphere(0.01, 0, 0, 0.004),
-        jno.Shape.box(0, 0, 0, 0.02, 0.006, 0.002) | jno.Shape.box(0.014, 0.006, 0, 0.02, 0.02, 0.002),
-        jno.Shape.box(0, 0, 0, 0.02, 0.006, 0.002) - jno.Shape.cylinder(0.01, 0.003, -0.001, 0, 0, 0.004, 0.0015),
+        jno.shape.cylinder(0, 0, 0, 0.02, 0, 0, 0.003),
+        jno.shape.sphere(0.01, 0, 0, 0.004),
+        jno.shape.box(0, 0, 0, 0.02, 0.006, 0.002) | jno.shape.box(0.014, 0.006, 0, 0.02, 0.02, 0.002),
+        jno.shape.box(0, 0, 0, 0.02, 0.006, 0.002) - jno.shape.cylinder(0.01, 0.003, -0.001, 0, 0, 0.004, 0.0015),
     ):
         f = bar_filaments(solid, size=(0.001, 0.001, 0.001))
         assert len(np.asarray(f.length)) > 0
@@ -110,8 +110,8 @@ def test_any_closed_form_solid_is_discretised_not_just_a_box():
 
 def test_a_solid_with_no_closed_form_membership_says_so():
     """A fillet has no `contains`, and the lattice is built by asking which cells lie inside."""
-    solid = jno.Shape.box(0, 0, 0, 0.02, 0.006, 0.002, size=0.001).fillet(0.0005).attach(sigma=SIG).name("blob")
-    box = jno.Shape.box(0.02, 0, 0, 0.03, 0.006, 0.002, size=0.001).attach(sigma=SIG).name("b")
+    solid = jno.shape.box(0, 0, 0, 0.02, 0.006, 0.002, size=0.001).fillet(0.0005).attach(sigma=SIG).name("blob")
+    box = jno.shape.box(0.02, 0, 0, 0.03, 0.006, 0.002, size=0.001).attach(sigma=SIG).name("b")
     d = (solid + box).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0289)

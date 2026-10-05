@@ -28,7 +28,7 @@ import jno
 
 SIG = 5.8e7                                          # copper, S/m
 L, W, T = 0.040, 0.004, 0.3e-3                       # a power-module trace, ONE cell thick
-trace = (jno.Shape.box(0, 0, 0, L, W, T, size=(1e-3, 1e-3, T))
+trace = (jno.shape.box(0, 0, 0, L, W, T, size=(1e-3, 1e-3, T))
          .attach(sigma=SIG).name("trace"))
 
 d = trace.domain()
@@ -73,13 +73,13 @@ constraints = [
 
 A conductor is one of two things.
 
-=== "A line — `jno.Shape.line`"
+=== "A line — `jno.shape.line`"
 
     A tube swept along a polyline: a bond wire, a via, a round conductor. Its filaments follow the
     centreline, and its cross-section is the tube radius.
 
     ```python
-    wire = jno.Shape.line(
+    wire = jno.shape.line(
         [(0, 0, 0), (5e-3, 0, 2e-3), (10e-3, 0, 0)],    # the arc of a bond wire
         r=1.9e-4, size=1e-3,
     ).attach(sigma=5.8e7).name("wire")
@@ -91,7 +91,7 @@ A conductor is one of two things.
     shape with a closed-form `contains` works, not just a box — including CSG.
 
     ```python
-    plate = jno.Shape.box(0, 0, 0, 0.02, 0.006, 1e-3, size=(1e-3, 1e-3, 1e-3))
+    plate = jno.shape.box(0, 0, 0, 0.02, 0.006, 1e-3, size=(1e-3, 1e-3, 1e-3))
     plate = plate.attach(sigma=5.8e7).name("plate")
     ```
 
@@ -113,11 +113,11 @@ A whole layout is therefore CSG for each part, `+` between them, and the cell pi
 
 ```python
 mm, P = 1e-3, 0.5e-3
-lower = (jno.Shape.box(0, 0, 0, 30*mm, 6*mm, 0.5*mm, size=(P, P, P))
-         - jno.Shape.cylinder(12*mm, 3*mm, -1*mm, 0, 0, 3*mm, r=1.2*mm)).name("lower")
-via   = jno.Shape.box(26*mm, 2*mm, 0.5*mm, 29*mm, 4*mm, 1.5*mm, size=(P, P, P)).name("via")
-upper = (jno.Shape.box(20*mm, 2*mm, 1.5*mm, 40*mm, 4*mm, 2.0*mm, size=(P, P, P))
-         | jno.Shape.box(36*mm, 2*mm, 1.5*mm, 40*mm, 10*mm, 2.0*mm)).name("upper")
+lower = (jno.shape.box(0, 0, 0, 30*mm, 6*mm, 0.5*mm, size=(P, P, P))
+         - jno.shape.cylinder(12*mm, 3*mm, -1*mm, 0, 0, 3*mm, r=1.2*mm)).name("lower")
+via   = jno.shape.box(26*mm, 2*mm, 0.5*mm, 29*mm, 4*mm, 1.5*mm, size=(P, P, P)).name("via")
+upper = (jno.shape.box(20*mm, 2*mm, 1.5*mm, 40*mm, 4*mm, 2.0*mm, size=(P, P, P))
+         | jno.shape.box(36*mm, 2*mm, 1.5*mm, 40*mm, 10*mm, 2.0*mm)).name("upper")
 
 d = (lower.attach(sigma=CU) + via.attach(sigma=CU) + upper.attach(sigma=AL)).domain()
 d.tag("IN",  lambda x, y, z: x < 0.6*mm)
@@ -217,8 +217,8 @@ The four constraint forms are **unchanged**. A port is electric whether or not t
 picture, so nothing you already know stops being true:
 
 ```python
-core = (jno.Shape.box(0, 0, 0, 0.024, 0.024, 0.008, size=(0.002,) * 3)
-        - jno.Shape.box(0.006, 0.006, -0.002, 0.018, 0.018, 0.010)).attach(mu_r=1000.0).name("core")
+core = (jno.shape.box(0, 0, 0, 0.024, 0.024, 0.008, size=(0.002,) * 3)
+        - jno.shape.box(0.006, 0.006, -0.002, 0.018, 0.018, 0.010)).attach(mu_r=1000.0).name("core")
 
 d = (core + turn).domain()       # `turn`: one solid turn threading the window, elided here
 ...
@@ -536,7 +536,7 @@ away:
 ```python
 T   = (3.65 - 3.08) * mm            # the trace copper -> dz
 z1  = 3.08 * mm - T                 # the plane's top: one empty cell below the traces
-plane = jno.Shape.box(x0, y0, z1 - T, x1, y1, z1, size=(P, P, T))
+plane = jno.shape.box(x0, y0, z1 - T, x1, y1, z1, size=(P, P, T))
 ```
 
 That gives plane / gap / traces — three cells, one per conductor, so the surface impedance is exact

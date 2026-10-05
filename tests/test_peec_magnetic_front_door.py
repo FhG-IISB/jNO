@@ -26,13 +26,13 @@ CU = 5.8e7
 
 
 def _net(core=None, both=False, wire=False):
-    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002, 0.002, 0.002)).attach(sigma=CU).name("bar")
+    bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002, 0.002, 0.002)).attach(sigma=CU).name("bar")
     sh = bar
     if core is not None:
         props = {"mu_r": core} | ({"sigma": CU} if both else {})
-        sh = sh + jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002, 0.002, 0.002)).attach(**props).name("core")
+        sh = sh + jno.shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002, 0.002, 0.002)).attach(**props).name("core")
     if wire:
-        sh = sh + jno.Shape.line(
+        sh = sh + jno.shape.line(
             [(0.002, 0.002, 0.002), (0.002, 0.002, 0.005), (0.018, 0.002, 0.002)], r=2e-4, size=0.002
         ).attach(sigma=CU).name("w")
     d = sh.domain()
@@ -68,8 +68,8 @@ def test_a_conducting_magnetic_region_is_in_BOTH_meshes():
 
 def test_a_region_carrying_neither_property_is_refused():
     """Silence here would mean a region quietly excluded from a solve it was drawn into."""
-    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
-    lost = jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).name("lost")
+    bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    lost = jno.shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).name("lost")
     d = (bar + lost).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)
@@ -81,7 +81,7 @@ def test_a_region_carrying_neither_property_is_refused():
 
 def test_a_core_on_a_filament_is_refused():
     """A filament has no cross-section, so there is nothing for flux to pass through."""
-    sh = jno.Shape.line([(0, 0, 0), (0.02, 0, 0)], r=2e-4, size=0.002).attach(mu_r=2000.0).name("bad")
+    sh = jno.shape.line([(0, 0, 0), (0.02, 0, 0)], r=2e-4, size=0.002).attach(mu_r=2000.0).name("bad")
     d = sh.domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)
@@ -109,11 +109,11 @@ def test_a_core_above_a_conductor_raises_the_inductance():
     """Placed where it can actually link flux, a core does what a core is for."""
 
     def stacked(mu=None):
-        bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+        bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
         sh = (
             bar
             if mu is None
-            else bar + jno.Shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=mu).name("core")
+            else bar + jno.shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=mu).name("core")
         )
         d = sh.domain()
         d.tag("A", lambda x, y, z: x < 0.0011)
@@ -134,8 +134,8 @@ def test_a_core_at_DC_is_refused():
     dropped -- which is exactly the failure the front-door refusal existed to prevent, so it does not
     stop being refused merely because the rest now works.
     """
-    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
-    core = jno.Shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=2000.0).name("core")
+    bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    core = jno.shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=2000.0).name("core")
     d = (bar + core).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)
@@ -166,8 +166,8 @@ def test_a_unit_permeability_region_is_air_and_says_so():
     Dropping it is exact rather than an approximation. With nothing else attached it is air with a
     name, which is a modelling slip worth refusing rather than solving around.
     """
-    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
-    air = jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(mu_r=1.0).name("air")
+    bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    air = jno.shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(mu_r=1.0).name("air")
     d = (bar + air).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)
@@ -179,8 +179,8 @@ def test_a_unit_permeability_region_is_air_and_says_so():
 
 def test_a_unit_permeability_conductor_still_conducts():
     """The same region carrying a sigma is a perfectly good conductor; only the core part is air."""
-    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
-    both = jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(mu_r=1.0, sigma=CU).name("both")
+    bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    both = jno.shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(mu_r=1.0, sigma=CU).name("both")
     d = (bar + both).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)
@@ -218,7 +218,7 @@ def test_a_conductor_only_network_keeps_the_grid_it_always_had():
     every existing model, which must see byte-identical geometry."""
     from jno.utils.solver.peec import bar_filaments
 
-    sh = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    sh = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
     a = bar_filaments(sh, sigma=CU)
     b = bar_filaments(sh, sigma=CU, grid_shapes=())
     assert a.lattice["n"] == b.lattice["n"] and a.lattice["d"] == b.lattice["d"]
@@ -232,8 +232,8 @@ def test_a_magnetic_network_still_jits():
     geometry, which `.build()` has already frozen. Only the conductivity is traced here -- which is
     what an electro-thermal loop or a density optimisation does every pass.
     """
-    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
-    core = jno.Shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=500.0).name("core")
+    bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    core = jno.shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=500.0).name("core")
     d = (bar + core).domain()
     d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0189)

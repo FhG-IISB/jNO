@@ -16,7 +16,7 @@ the port is the pair of open ends.
 ## The whole problem statement
 
 ```python
-loop = jno.Shape.line(route, r=RAD, size=2e-3).attach(sigma=CU).name("loop")
+loop = jno.shape.line(route, r=RAD, size=2e-3).attach(sigma=CU).name("loop")
 sol  = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0).solve()
 ```
 

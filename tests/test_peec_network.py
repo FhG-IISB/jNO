@@ -38,7 +38,7 @@ def test_a_series_chain_is_exactly_R_plus_jwL(freq):
     from jno.utils.solver.kernel import internal_impedance
 
     ell, a = 0.050, 5e-4
-    f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, ell)], r=a), size=ell / 10, quad=3)
+    f = line_filaments(jno.shape.line([(0, 0, 0), (0, 0, ell)], r=a), size=ell / 10, quad=3)
     w = 2 * np.pi * freq
     z, _ = network_impedance(f, SIG, ((0, 0, 0), (0, 0, ell)), omega=w)
     zint = complex(np.sum(np.asarray(internal_impedance(f.length, f.area, f.skin, f.round_, w, SIG))))
@@ -49,7 +49,7 @@ def test_a_series_chain_is_exactly_R_plus_jwL(freq):
 
 
 def test_a_series_chain_carries_one_current():
-    f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0.01, 0), (0.02, 0.01, 0)], r=3e-4), size=0.002)
+    f = line_filaments(jno.shape.line([(0, 0, 0), (0, 0.01, 0), (0.02, 0.01, 0)], r=3e-4), size=0.002)
     _, cur = network_impedance(f, SIG, ((0, 0, 0), (0.02, 0.01, 0)), omega=2 * np.pi * 1e6)
     cur = np.asarray(cur)
     assert np.allclose(cur, cur[0])  # a bend is not a branch
@@ -57,7 +57,7 @@ def test_a_series_chain_carries_one_current():
 
 def test_parallel_branches_split_by_conductance_at_dc():
     r1, r2 = 4e-4, 2e-4
-    path = lambda s, r: jno.Shape.line([(0, 0, 0), (0, s, 0), (0.05, s, 0), (0.05, 0, 0)], r=r)
+    path = lambda s, r: jno.shape.line([(0, 0, 0), (0, s, 0), (0.05, s, 0), (0.05, 0, 0)], r=r)
     f = line_filaments([path(0.02, r1), path(-0.02, r2)], size=0.004)
     z, cur = network_impedance(f, SIG, ((0, 0, 0), (0.05, 0, 0)), omega=0.0)
 
@@ -72,8 +72,8 @@ def test_parallel_branches_split_by_conductance_at_dc():
 
 def test_current_abandons_the_low_resistance_path_for_the_low_inductance_one():
     """The reason to run PEEC at all: the DC answer is the wrong answer at switching frequencies."""
-    direct = jno.Shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4)  # short, thin  -> high R, low L
-    detour = jno.Shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4)
+    direct = jno.shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4)  # short, thin  -> high R, low L
+    detour = jno.shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4)
     f = line_filaments([direct, detour], size=0.004)
     thin = np.asarray(f.area) < np.pi * 3e-4**2
     share = lambda c: abs(np.asarray(c)[thin][0]) / (abs(np.asarray(c)[thin][0]) + abs(np.asarray(c)[~thin][0]))
@@ -96,9 +96,9 @@ def test_current_abandons_the_low_resistance_path_for_the_low_inductance_one():
 
 def test_lines_that_meet_share_a_node():
     tee = [
-        jno.Shape.line([(0, 0, 0), (0.01, 0, 0)], r=1e-4),
-        jno.Shape.line([(0.01, 0, 0), (0.02, 0, 0)], r=1e-4),
-        jno.Shape.line([(0.01, 0, 0), (0.01, 0.01, 0)], r=1e-4),
+        jno.shape.line([(0, 0, 0), (0.01, 0, 0)], r=1e-4),
+        jno.shape.line([(0.01, 0, 0), (0.02, 0, 0)], r=1e-4),
+        jno.shape.line([(0.01, 0, 0), (0.01, 0.01, 0)], r=1e-4),
     ]
     f = line_filaments(tee, size=0.01)
     assert f.incidence.shape == (4, 3)  # 3 free ends + the junction, not 6 endpoints
@@ -107,14 +107,14 @@ def test_lines_that_meet_share_a_node():
 
 def test_a_closed_loop_has_no_port():
     ang = np.linspace(0, 2 * np.pi, 41)
-    ring = jno.Shape.line([(0.02 * np.cos(t), 0.02 * np.sin(t), 0.0) for t in ang], r=2e-4)
+    ring = jno.shape.line([(0.02 * np.cos(t), 0.02 * np.sin(t), 0.0) for t in ang], r=2e-4)
     f = line_filaments(ring, size=0.005)
     with pytest.raises(ValueError, match="opened where its source sits"):
         network_impedance(f, SIG, ((0.02, 0, 0), (0.02, 0, 0)))
 
 
 def test_the_impedance_is_differentiable_in_the_conductivity():
-    f = line_filaments(jno.Shape.line([(0, 0, 0), (0.03, 0, 0)], r=3e-4), size=0.005)
+    f = line_filaments(jno.shape.line([(0, 0, 0), (0.03, 0, 0)], r=3e-4), size=0.005)
     r_of = lambda s: jnp.real(network_impedance(f, s, ((0, 0, 0), (0.03, 0, 0)), omega=0.0)[0])
     g = float(jax.grad(r_of)(SIG))
     fd = float((r_of(SIG * 1.001) - r_of(SIG * 0.999)) / (0.002 * SIG))

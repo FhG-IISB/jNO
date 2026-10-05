@@ -26,7 +26,7 @@ LX, WY, TZ = 0.040, 0.004, 0.002
 
 
 def _bar(sigma, pitch=0.002):
-    f = bar_filaments(jno.Shape.box(0, 0, 0, LX, WY, TZ), size=pitch, sigma=[sigma])
+    f = bar_filaments(jno.shape.box(0, 0, 0, LX, WY, TZ), size=pitch, sigma=[sigma])
     p = np.asarray(f.nodes)
     term = {
         "A": terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9),
@@ -63,7 +63,7 @@ def test_the_gradient_reaches_one_component_alone():
     """R = rho_x L / A is exactly inverse in sigma_x, so dR/ds at s=1 is -R. An oracle, not a re-run."""
 
     def loss(s):
-        f = bar_filaments(jno.Shape.box(0, 0, 0, LX, WY, TZ), size=0.002, sigma=[(s * SIG, SIG, SIG)])
+        f = bar_filaments(jno.shape.box(0, 0, 0, LX, WY, TZ), size=0.002, sigma=[(s * SIG, SIG, SIG)])
         p = np.asarray(f.nodes)
         term = {
             "A": terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9),
@@ -84,7 +84,7 @@ def test_a_WIRE_takes_the_component_along_its_own_tangent():
     Checked on a 45-degree wire in the x-y plane, where t.sigma.t = (sx + sy)/2 exactly.
     """
     d = 1.0 / np.sqrt(2.0)
-    sh = jno.Shape.line([(0, 0, 0), (0.01 * d, 0.01 * d, 0)], r=2e-4, size=0.002)
+    sh = jno.shape.line([(0, 0, 0), (0.01 * d, 0.01 * d, 0)], r=2e-4, size=0.002)
     f = line_filaments(sh)
     from jno.utils.solver.peec import element_centres, resolve_sigma
 
@@ -103,7 +103,7 @@ def test_a_three_element_conductor_refuses_the_ambiguous_spelling():
     """``(3,)`` on a 3-element conductor is either three components or three elements. Ask, do not guess."""
     with pytest.raises(ValueError, match="ambiguous"):
         bar_filaments(
-            jno.Shape.box(0, 0, 0, 0.003, 0.001, 0.001),
+            jno.shape.box(0, 0, 0, 0.003, 0.001, 0.001),
             size=0.001,  # exactly 3 cells
             sigma=[np.array([SIG, SIG, SIG])],
         )

@@ -25,16 +25,16 @@ CU = 5.8e7
 
 def test_a_solid_thinner_than_the_pitch_is_refused():
     """The power-module case, reduced: a thin die on a thick trace, one cell through the trace."""
-    trace = jno.Shape.box(0, 0, 0.0, 0.020, 0.010, 0.00057).attach(sigma=CU).name("trace")
-    die = jno.Shape.box(0.006, 0.003, 0.00057, 0.010, 0.007, 0.00075).attach(sigma=CU).name("die")
+    trace = jno.shape.box(0, 0, 0.0, 0.020, 0.010, 0.00057).attach(sigma=CU).name("trace")
+    die = jno.shape.box(0.006, 0.003, 0.00057, 0.010, 0.007, 0.00075).attach(sigma=CU).name("die")
     with pytest.raises(ValueError, match="got no cell of this lattice"):
         bar_filaments([trace, die], size=(0.001, 0.001, 0.00057), sigma=[CU, CU])
 
 
 def test_the_refusal_names_the_conductor_and_how_thin_it_is():
     """A guard that says only "something is wrong" costs as much time as no guard."""
-    trace = jno.Shape.box(0, 0, 0.0, 0.020, 0.010, 0.00057).attach(sigma=CU).name("trace")
-    die = jno.Shape.box(0.006, 0.003, 0.00057, 0.010, 0.007, 0.00075).attach(sigma=CU).name("die")
+    trace = jno.shape.box(0, 0, 0.0, 0.020, 0.010, 0.00057).attach(sigma=CU).name("trace")
+    die = jno.shape.box(0.006, 0.003, 0.00057, 0.010, 0.007, 0.00075).attach(sigma=CU).name("die")
     with pytest.raises(ValueError) as e:
         bar_filaments([trace, die], size=(0.001, 0.001, 0.00057), sigma=[CU, CU])
     msg = str(e.value)
@@ -45,16 +45,16 @@ def test_the_refusal_names_the_conductor_and_how_thin_it_is():
 def test_a_solid_drawn_inside_another_is_refused_too():
     """The other cause: cells go to the FIRST solid containing them, so a piece drawn inside another
     never gets any -- and its own conductivity is then silently never applied."""
-    outer = jno.Shape.box(0, 0, 0, 0.020, 0.010, 0.004).attach(sigma=CU).name("outer")
-    inner = jno.Shape.box(0.005, 0.002, 0.001, 0.010, 0.006, 0.003).attach(sigma=CU).name("inner")
+    outer = jno.shape.box(0, 0, 0, 0.020, 0.010, 0.004).attach(sigma=CU).name("outer")
+    inner = jno.shape.box(0.005, 0.002, 0.001, 0.010, 0.006, 0.003).attach(sigma=CU).name("inner")
     with pytest.raises(ValueError, match="got no cell of this lattice"):
         bar_filaments([outer, inner], size=(0.001,) * 3, sigma=[CU, CU / 100])
 
 
 def test_a_finer_pitch_meshes_it_and_is_not_refused():
     """The fix the message recommends has to actually work, or the guard is just an obstacle."""
-    trace = jno.Shape.box(0, 0, 0.0, 0.020, 0.010, 0.00057).attach(sigma=CU).name("trace")
-    die = jno.Shape.box(0.006, 0.003, 0.00057, 0.010, 0.007, 0.00075).attach(sigma=CU).name("die")
+    trace = jno.shape.box(0, 0, 0.0, 0.020, 0.010, 0.00057).attach(sigma=CU).name("trace")
+    die = jno.shape.box(0.006, 0.003, 0.00057, 0.010, 0.007, 0.00075).attach(sigma=CU).name("die")
     f = bar_filaments([trace, die], size=(0.001, 0.001, 0.00009), sigma=[CU, CU])
     part = np.asarray(f.part)
     assert int((part == 0).sum()) > 0 and int((part == 1).sum()) > 0
@@ -62,7 +62,7 @@ def test_a_finer_pitch_meshes_it_and_is_not_refused():
 
 def test_an_ordinary_layout_is_untouched():
     """The regression guard: every model that already meshed must still mesh."""
-    a = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002).attach(sigma=CU).name("a")
-    b = jno.Shape.box(0, 0.006, 0, 0.020, 0.010, 0.002).attach(sigma=CU).name("b")
+    a = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002).attach(sigma=CU).name("a")
+    b = jno.shape.box(0, 0.006, 0, 0.020, 0.010, 0.002).attach(sigma=CU).name("b")
     f = bar_filaments([a, b], size=(0.002,) * 3, sigma=[CU, CU])
     assert set(np.unique(np.asarray(f.part)).tolist()) == {0, 1}

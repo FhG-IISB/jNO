@@ -26,7 +26,7 @@ SIG, MM, H, RV = 5.8e7, 1e-3, 2e-3, 5e-3
 
 
 def _plate():
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 30 * MM, 20 * MM, 2 * MM), size=(H, H, 2 * MM))
+    f = bar_filaments(jno.shape.box(0, 0, 0, 30 * MM, 20 * MM, 2 * MM), size=(H, H, 2 * MM))
     node = np.asarray(f.nodes)
     csc = f.incidence.tocsc()
     ne = len(np.asarray(f.length))

@@ -25,7 +25,7 @@ LX, LY, TZ, H = 0.040, 0.020, 0.001, 0.002
 
 
 def network(sigma=SIG, freq=0.0):
-    d = jno.Shape.box(0, 0, 0, LX, LY, TZ, size=(H, H, TZ)).attach(sigma=sigma).name("plate").domain()
+    d = jno.shape.box(0, 0, 0, LX, LY, TZ, size=(H, H, TZ)).attach(sigma=sigma).name("plate").domain()
     d.tag("A", lambda x, y, z: x < 1.1 * H)
     d.tag("B", lambda x, y, z: x > LX - 1.1 * H)
     _i, v = d.peec_symbols()
@@ -35,9 +35,9 @@ def network(sigma=SIG, freq=0.0):
 
 def wire_network(sigma=SIG):
     """Lines AND a solid, welded -- the path where the resolver order has to survive `_weld`."""
-    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("trace")
+    trace = jno.shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("trace")
     wire = (
-        jno.Shape.line([(0.019, 0.002, 0.0005), (0.019, 0.002, 0.006), (0.030, 0.002, 0.0005)], r=1.9e-4, size=0.001)
+        jno.shape.line([(0.019, 0.002, 0.0005), (0.019, 0.002, 0.006), (0.030, 0.002, 0.0005)], r=1.9e-4, size=0.001)
         .attach(sigma=sigma)
         .name("wire")
     )
@@ -219,13 +219,13 @@ def test_building_once_beats_rediscretising(monkeypatch):
 def device_network(rdev=5e-3):
     """Two collinear wires with a gap: nothing conducts across it but the device."""
     ell, rad, gap = 0.05, 5e-4, 0.004
-    lo = jno.Shape.line([(0, 0, 0), (0, 0, ell)], r=rad, size=ell / 10).attach(sigma=SIG).name("lo")
-    hi = jno.Shape.line([(0, 0, ell + gap), (0, 0, 2 * ell + gap)], r=rad, size=ell / 10).attach(sigma=SIG).name("hi")
+    lo = jno.shape.line([(0, 0, 0), (0, 0, ell)], r=rad, size=ell / 10).attach(sigma=SIG).name("lo")
+    hi = jno.shape.line([(0, 0, ell + gap), (0, 0, 2 * ell + gap)], r=rad, size=ell / 10).attach(sigma=SIG).name("hi")
     pads = (
-        jno.Shape.sphere(0, 0, 0.0, 2 * rad).name("A")
-        + jno.Shape.sphere(0, 0, ell, 2 * rad).name("M")
-        + jno.Shape.sphere(0, 0, ell + gap, 2 * rad).name("N")
-        + jno.Shape.sphere(0, 0, 2 * ell + gap, 2 * rad).name("B")
+        jno.shape.sphere(0, 0, 0.0, 2 * rad).name("A")
+        + jno.shape.sphere(0, 0, ell, 2 * rad).name("M")
+        + jno.shape.sphere(0, 0, ell + gap, 2 * rad).name("N")
+        + jno.shape.sphere(0, 0, 2 * ell + gap, 2 * rad).name("B")
     )
     d = (lo + hi + pads).domain()
     i, v = d.peec_symbols()

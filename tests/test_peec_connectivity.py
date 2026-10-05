@@ -24,9 +24,9 @@ SIG = 5.8e7
 
 def _two_islands(gap=True):
     """Two boxes, touching or not, each with a pad at its far end."""
-    a = jno.Shape.box(0, 0, 0, 0.010, 0.004, 0.001).name("a")
+    a = jno.shape.box(0, 0, 0, 0.010, 0.004, 0.001).name("a")
     x0 = 0.010 if not gap else 0.020
-    b = jno.Shape.box(x0, 0, 0, x0 + 0.010, 0.004, 0.001).name("b")
+    b = jno.shape.box(x0, 0, 0, x0 + 0.010, 0.004, 0.001).name("b")
     f = bar_filaments(a + b, size=0.001)
     p = np.asarray(f.nodes)
     term = {
@@ -67,8 +67,8 @@ def test_a_DEVICE_bridges_the_gap_it_sits_across():
 
 def test_an_island_no_PORT_spans_is_not_an_error():
     """Only a source pair has to be connected. Stray metal is a modelling choice, not a fault."""
-    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.001).name("bar")
-    island = jno.Shape.box(0, 0.010, 0, 0.020, 0.014, 0.001).name("island")  # parallel, not touching
+    bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.001).name("bar")
+    island = jno.shape.box(0, 0.010, 0, 0.020, 0.014, 0.001).name("island")  # parallel, not touching
     f = bar_filaments(bar + island, size=0.001)
     p = np.asarray(f.nodes)
     on_bar = p[:, 1] < 0.005

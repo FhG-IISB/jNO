@@ -22,8 +22,8 @@ FREQ = 1e6
 
 def _wire(x, name):
     """A straight wire along z at offset `x`, with a pad at each end."""
-    w = jno.Shape.line([(x, 0, 0), (x, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name(name)
-    pads = jno.Shape.sphere(x, 0, 0.0, 2 * RAD).name(f"{name}0") + jno.Shape.sphere(x, 0, ELL, 2 * RAD).name(f"{name}1")
+    w = jno.shape.line([(x, 0, 0), (x, 0, ELL)], r=RAD, size=ELL / 10).attach(sigma=SIG).name(name)
+    pads = jno.shape.sphere(x, 0, 0.0, 2 * RAD).name(f"{name}0") + jno.shape.sphere(x, 0, ELL, 2 * RAD).name(f"{name}1")
     return w + pads
 
 

@@ -56,7 +56,7 @@ exactly as ``fem.solve()`` does -- which is what puts a PEEC objective behind ``
 on the gradient, because the host pass, not the solve, was the cost. The same split as
 :meth:`jno.precond.ams.build` and :class:`jno.trace.FemLinearSystem`.
 
-**Scope, up front.** A conductor is either a :meth:`jno.Shape.line` tube or a closed-form solid,
+**Scope, up front.** A conductor is either a :meth:`jno.shape.line` tube or a closed-form solid,
 which voxelises onto a lattice shared with every other solid on it. A network containing a lattice
 is applied matrix-free -- that block by FFT -- and solved by GMRES; a network of wires alone has no
 such structure, forms the dense operator, and is therefore the small-network path. Each filament

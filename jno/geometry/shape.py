@@ -1667,6 +1667,6 @@ def _can_sample_meshfree(shape):
 
 
 # `Shape` was the spelling until this rename. Kept as an alias: every existing script, the tutorials
-# and any downstream code still says `jno.Shape`, and breaking all of them over a capital letter is
+# and any downstream code still says `jno.shape`, and breaking all of them over a capital letter is
 # not a trade worth making. Prefer `shape`, which matches `jno.domain` / `jno.core` / `jno.fem`.
 Shape = shape

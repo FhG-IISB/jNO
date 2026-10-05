@@ -28,8 +28,8 @@ P = 0.8 * mm
 
 def _net(grid, freq=1e6):
     """Two coplanar traces with a gap: interior faces on y, none on x."""
-    a = jno.Shape.box(0, 0, 0, 16 * mm, 2 * mm, P, size=(P,) * 3).attach(sigma=CU).name("t1")
-    b = jno.Shape.box(0, 5 * mm, 0, 16 * mm, 7 * mm, P, size=(P,) * 3).attach(sigma=CU).name("t2")
+    a = jno.shape.box(0, 0, 0, 16 * mm, 2 * mm, P, size=(P,) * 3).attach(sigma=CU).name("t1")
+    b = jno.shape.box(0, 5 * mm, 0, 16 * mm, 7 * mm, P, size=(P,) * 3).attach(sigma=CU).name("t2")
     d = (a + b).domain()
     d.tag("A", lambda x, y, z: x < 0.9 * mm)
     d.tag("B", lambda x, y, z: x > 15.1 * mm)
@@ -103,8 +103,8 @@ def _slotted(grid, freq=1e6):
     them, and how many nodes each pad captures depends on the local spacing -- so refining changes
     the circuit, and comparing the two meshes would measure a port change rather than a mesh change.
     """
-    bar = jno.Shape.box(0, 0, 0, 16 * mm, 8 * mm, P, size=(P,) * 3)
-    sh = (bar - jno.Shape.box(4 * mm, 3 * mm, -P, 12 * mm, 5 * mm, 2 * P)).attach(sigma=CU).name("t")
+    bar = jno.shape.box(0, 0, 0, 16 * mm, 8 * mm, P, size=(P,) * 3)
+    sh = (bar - jno.shape.box(4 * mm, 3 * mm, -P, 12 * mm, 5 * mm, 2 * P)).attach(sigma=CU).name("t")
     d = sh.domain()
     d.tag("A", lambda x, y, z: x < 0.9 * mm)
     d.tag("B", lambda x, y, z: x > 15.1 * mm)

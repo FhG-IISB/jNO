@@ -31,7 +31,7 @@ L, H = 1.0, 0.25
 
 def problem():
     """-div(grad u) = q on a rectangle, pinned left; q is a P0 field derived from a scalar `a`."""
-    d = jno.Shape.rect(0, 0, L, H, size=0.1).domain()
+    d = jno.shape.rect(0, 0, L, H, size=0.1).domain()
     _ = d.mesh
     n = int(d._cells_p1().shape[0])
     xc = np.asarray(d._points)[np.asarray(d._cells_p1())].mean(axis=1)[:, 0]

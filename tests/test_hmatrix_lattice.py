@@ -32,7 +32,7 @@ mm = 1e-3
 def _plate(pitch_mm=0.8, x=16.0, y=8.0):
     """A trace layer: flat, one cell thick, two bar families. The shape of every real conductor."""
     p = pitch_mm * mm
-    return bar_filaments(jno.Shape.box(0, 0, 0, x * mm, y * mm, p, size=(p, p, p)), sigma=5.8e7)
+    return bar_filaments(jno.shape.box(0, 0, 0, x * mm, y * mm, p, size=(p, p, p)), sigma=5.8e7)
 
 
 def _arrays(f):

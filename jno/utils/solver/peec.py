@@ -245,7 +245,7 @@ def resolve_sigma(value, xyz, what: str, tangent=None):
 
 
 def line_filaments(shape, size: float = None, quad: int = 3, points=None, radii=None, quad_t: int = 1):
-    """Discretise :meth:`jno.Shape.line` conductors into filaments, with Gauss sub-points.
+    """Discretise :meth:`jno.shape.line` conductors into filaments, with Gauss sub-points.
 
     Args:
         shape: a ``Shape`` whose plan is a single ``Line`` leaf, or a sequence of them. A sequence
@@ -614,7 +614,7 @@ def _device_impedance(node, current, potential):
 def terminal_nodes(fil: Filaments, where):
     """Indices of the network nodes lying inside ``where`` — a terminal is a REGION, not a point.
 
-    ``where`` is anything with a ``.contains(points)`` (a :class:`jno.Shape`) or a callable taking
+    ``where`` is anything with a ``.contains(points)`` (a :class:`jno.shape`) or a callable taking
     ``(N, 3)`` and returning a boolean mask. A real pad has many filament ends on it, and they are
     held at one potential by :func:`solve_network`.
     """

@@ -377,7 +377,7 @@ class Line:
         seg = P[1:] - P[:-1]
         L = np.linalg.norm(seg, axis=1)
         if not np.any(L > TOL):
-            raise ValueError("Shape.line: every segment is shorter than the tolerance; nothing to build.")
+            raise ValueError("shape.line: every segment is shorter than the tolerance; nothing to build.")
         u = seg / np.maximum(L, 1e-300)[:, None]
         parts = [(3, occ.addCylinder(*P[k], *(u[k] * L[k]), self.r)) for k in range(len(seg))]
         # A SPHERE at each interior joint, which is the solid `contains` describes. Mitring the

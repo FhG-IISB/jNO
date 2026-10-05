@@ -50,7 +50,7 @@ def test_straight_wire_matches_its_closed_form():
     """``L = (mu0 l/2pi)[ln(2l/a) - 3/4]``, including the internal inductance of a uniform current."""
     L, a = 0.050, 2.5e-4
     exact = (MU0 * L / (2 * np.pi)) * (np.log(2 * L / a) - 0.75)
-    got = _inductance(jno.Shape.line([(0, 0, 0), (0, 0, L)], r=a), size=L / 16, quad=3)
+    got = _inductance(jno.shape.line([(0, 0, 0), (0, 0, L)], r=a), size=L / 16, quad=3)
     assert abs(got / exact - 1) < 0.02, f"{got * 1e9:.4f} nH vs {exact * 1e9:.4f} nH"
 
 
@@ -62,7 +62,7 @@ def test_loop_converges_in_quadrature_order():
     """
     R, a, ns = 0.010, 2.5e-4, 128
     exact = MU0 * R * (np.log(8 * R / a) - 1.75)
-    wire = jno.Shape.line(_circle(R, ns), r=a)
+    wire = jno.shape.line(_circle(R, ns), r=a)
     err = [abs(_inductance(wire, 2 * np.pi * R / ns, q) / exact - 1) for q in (1, 2, 3, 8)]
     assert err[0] > 0.05, f"one point per filament should be several percent low, got {err[0]:.4f}"
     assert all(b < a_ for a_, b in zip(err, err[1:])), f"not monotone in quadrature order: {err}"
@@ -78,14 +78,14 @@ def test_refining_the_polyline_does_not_fix_the_near_field():
     R, a = 0.010, 2.5e-4
     exact = MU0 * R * (np.log(8 * R / a) - 1.75)
     errs = [
-        abs(_inductance(jno.Shape.line(_circle(R, n), r=a), 2 * np.pi * R / n, quad=1) / exact - 1) for n in (64, 128, 256)
+        abs(_inductance(jno.shape.line(_circle(R, n), r=a), 2 * np.pi * R / n, quad=1) / exact - 1) for n in (64, 128, 256)
     ]
     assert min(errs) > 0.05, f"refining alone should stay several percent out, got {errs}"
 
 
 def test_filament_lengths_sum_to_the_polyline_length():
     pts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 2.0, 0.0), (1.0, 2.0, 0.5)]
-    wire = jno.Shape.line(pts, r=0.01)
+    wire = jno.shape.line(pts, r=0.01)
     f = line_filaments(wire, size=0.17, quad=2)
     per = jax.ops.segment_sum(jnp.asarray(f.mom), jnp.asarray(f.group), num_segments=len(f.self_g))
     total = float(jnp.linalg.norm(per, axis=1).sum())
@@ -96,7 +96,7 @@ def test_filament_lengths_sum_to_the_polyline_length():
 def test_a_vertex_is_always_a_filament_boundary():
     """A bend must not fall inside a straight element, even when ``size`` exceeds a whole leg."""
     pts = [(0.0, 0.0, 0.0), (0.3, 0.0, 0.0), (0.3, 0.9, 0.0)]
-    f = line_filaments(jno.Shape.line(pts, r=0.01), size=5.0, quad=1)
+    f = line_filaments(jno.shape.line(pts, r=0.01), size=5.0, quad=1)
     per = np.asarray(jax.ops.segment_sum(jnp.asarray(f.mom), jnp.asarray(f.group), num_segments=len(f.self_g)))
     tang = per / np.linalg.norm(per, axis=1)[:, None]
     ok = [
@@ -107,9 +107,9 @@ def test_a_vertex_is_always_a_filament_boundary():
 
 def test_refuses_geometry_it_cannot_discretise():
     with pytest.raises(NotImplementedError, match="expected a single Line primitive"):
-        line_filaments(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5), size=0.5)
+        line_filaments(jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5), size=0.5)
 
 
 def test_refuses_to_guess_a_filament_length():
     with pytest.raises(ValueError, match="no filament length"):
-        line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, 1)], r=0.01))
+        line_filaments(jno.shape.line([(0, 0, 0), (0, 0, 1)], r=0.01))

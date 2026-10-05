@@ -27,7 +27,7 @@ LX, LY, TZ, H = 0.040, 0.006, 0.001, 0.001
 
 
 def bar():
-    d = jno.Shape.box(0, 0, 0, LX, LY, TZ, size=(H, H, TZ)).attach(sigma=SIG).name("bar").domain()
+    d = jno.shape.box(0, 0, 0, LX, LY, TZ, size=(H, H, TZ)).attach(sigma=SIG).name("bar").domain()
     d.tag("A", lambda x, y, z: x < 1.1 * H)
     d.tag("B", lambda x, y, z: x > LX - 6 * H)  # a WIDE pad, so weighting has room to matter
     _i, v = d.peec_symbols()

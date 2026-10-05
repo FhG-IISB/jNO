@@ -28,7 +28,7 @@ QUAD_W = 3 * 2**2  # the sub-point count a bar lattice carries; see jno.peec._QU
 
 
 def _lattice():
-    return bar_filaments(jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.001), size=(0.002, 0.002, 0.001), sigma=SIG)
+    return bar_filaments(jno.shape.box(0, 0, 0, 0.020, 0.004, 0.001), size=(0.002, 0.002, 0.001), sigma=SIG)
 
 
 def _welded():
@@ -37,10 +37,10 @@ def _welded():
 
     fb = _lattice()
     nb = int(np.asarray(fb.length).size)
-    wires = [jno.Shape.line([(0.004, 0.002, 0.001), (0.004, 0.002, 0.003), (0.016, 0.002, 0.001)], r=2e-4, size=0.002)]
+    wires = [jno.shape.line([(0.004, 0.002, 0.001), (0.004, 0.002, 0.003), (0.016, 0.002, 0.001)], r=2e-4, size=0.002)]
     fl = line_filaments(wires, quad=QUAD_W)
     nl = int(np.asarray(fl.length).size)
-    box = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.001)
+    box = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.001)
     fil, sg = _weld([(fb, jnp.full(nb, SIG)), (fl, jnp.full(nl, SIG))], [[box], wires])
     return fil, sg
 
@@ -152,9 +152,9 @@ def test_the_krylov_subspace_is_chosen_by_structure():
 def _module(with_wire):
     """A small network, optionally with a line conductor welded to the solid."""
     CU = 5.8e7
-    sh = jno.Shape.box(0, 0, 0, 0.012, 0.006, 0.001, size=(0.002, 0.002, 0.001)).attach(sigma=CU).name("bar")
+    sh = jno.shape.box(0, 0, 0, 0.012, 0.006, 0.001, size=(0.002, 0.002, 0.001)).attach(sigma=CU).name("bar")
     if with_wire:
-        sh = sh + jno.Shape.line(
+        sh = sh + jno.shape.line(
             [(0.001, 0.003, 0.001), (0.001, 0.003, 0.003), (0.011, 0.003, 0.001)], r=2e-4, size=0.002
         ).attach(sigma=CU).name("w")
     d = sh.domain()

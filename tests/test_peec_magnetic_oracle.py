@@ -35,7 +35,7 @@ CU, MU0 = 5.8e7, 4e-7 * np.pi
 OUT, WIN, DEP, P = 0.024, 0.006, 0.008, 0.002  # outer, window inset, depth, cell pitch
 AREA = WIN * DEP  # a limb's cross-section, 6 x 8 mm
 PATH = 4.0 * (OUT - WIN)  # mean magnetic path around the ring, 4 x 18 mm
-box = jno.Shape.box
+box = jno.shape.box
 
 
 def _core(mu_r, gap=0.0, size=(P,) * 3):
