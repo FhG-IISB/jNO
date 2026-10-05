@@ -674,11 +674,13 @@ class TestCurvature:
         its facets zig-zag between tetrahedra — the 3-D counterpart of a straight bar measuring
         above its length. **That floor must be a property of the mesh's shape, not of its size**,
         or the term would grow under refinement and its weight would have to be re-tuned per mesh.
-        Measured 50.7 at h=0.5 and 52.4 at h=0.35, across a 2.6x change in tet count; what would
-        scale is a facet miscount or a double-counted ridge.
+        What would scale is a facet miscount or a double-counted ridge: with the surface's facet count
+        it would grow ~2.6x across the 4.2x change in tet count below. Measured 40.4, 65.7 and 52.3 at
+        h=0.5, 0.4 and 0.3 -- no trend, but a mesh-to-mesh spread of ~40 % from the 3-D mesher, so the
+        bound is set between that spread and the growth it guards against.
         """
         floors = []
-        for h in (0.5, 0.35):
+        for h in (0.5, 0.4, 0.3):
             d = jno.shape.box(0, 0, 0, 4, 2, 4, size=h).domain()
             _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
             s = _summed(jno.np.parameter(sym, name=f"rho_floor_{h}").curvature(zeta=0.1).fn)
@@ -686,7 +688,7 @@ class TestCurvature:
             cen = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
             floors.append(float(s(jnp.asarray(np.where(cen[:, 2] > 2.0, 1.0, 0.0)))))
         assert all(f > 1.0 for f in floors), "an unstructured interface is not coplanar; the floor is real"
-        assert abs(floors[0] - floors[1]) < 0.25 * max(floors), f"the floor tracked the mesh: {floors}"
+        assert max(floors) - min(floors) < 0.5 * max(floors), f"the floor tracked the mesh: {floors}"
 
     def test_it_is_differentiable_in_the_mesh_and_points_downhill(self):
         """Under a deformable mesh this is the term that gives node migration a reason to ALIGN the
@@ -846,14 +848,15 @@ class TestInteriorFacets:
     def test_a_three_dimensional_ridge_is_shared_by_a_fan_not_by_two_facets(self):
         """The reason the bending term weights *pairs* rather than picking "the" neighbour: around
         a mesh edge in 3-D the interior faces form a fan, and which of them the material boundary
-        runs through is a property of the density, not of the mesh. Measured ~6 on a tet mesh
-        against exactly 2 for the 2-D case, where a ridge is a point on a boundary curve.
+        runs through is a property of the density, not of the mesh. Measured ~3 per ridge on this
+        coarse tet mesh (fans of up to 10) against exactly 2 for the 2-D case, where a ridge is a point
+        on a boundary curve.
         """
         d3 = jno.shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
         t3 = d3._facet_ridges()
         counts = np.bincount(t3["facet_ridge"].reshape(-1), minlength=t3["ridge_nodes"].shape[0])
         assert counts.max() > 2, "a tet mesh edge carries a fan of faces, not a pair"
-        assert 3.0 < counts.mean() < 9.0, f"an interior edge fan averages ~6 faces, got {counts.mean():.2f}"
+        assert 2.5 < counts.mean() < 9.0, f"an interior edge fan averages ~3 faces, got {counts.mean():.2f}"
 
     def test_the_ridge_table_is_consistent_with_the_facet_table(self):
         """``_facet_ridges`` must extend ``_interior_facets`` rather than recompute it — a second

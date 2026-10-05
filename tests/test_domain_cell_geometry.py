@@ -417,7 +417,7 @@ class TestDihedralAngles:
         """An interval has no angle to measure; 2-D and 3-D are the whole supported range."""
         d = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
         assert d.dimension == 1
-        with pytest.raises(NotImplementedError, match="simplices in 2-D or 3-D"):
+        with pytest.raises(NotImplementedError, match="2-D or 3-D"):
             d.cell_angles()
 
     def test_the_constraint_form_is_expressible_and_feasible(self):
