@@ -146,3 +146,20 @@ def test_a_one_element_parameter_is_one_conductivity_for_the_whole_conductor():
 
     out = resolve_sigma(jnp.asarray([2.0]), np.zeros((5, 3)), "c")
     assert np.allclose(np.asarray(out), 2.0) and out.shape == (5,)
+
+
+def test_jno_core_trains_a_design_variable_through_the_coupled_solve():
+    """The public route to a gradient: the coupled field is a trace node, so an objective on it is an
+    ordinary jno.core loss. A cooler target needs a less conductive conductor at a fixed voltage."""
+    import optax
+
+    d = _domain()
+    a = jno.np.parameter((1,), name="a")
+    a.initialize(jax.nn.initializers.constant(1.0))
+    a.optimizer(optax.adam(2e-2))
+    em, heat, _T = _problems(d, lambda T: a * SIG20 / (1 + 3.93e-3 * (T - 293.15)))
+    field = _quiet(lambda: jno.core([em, heat]).solve())
+    fit = jno.core([(field - 320.0).mse], domain=d)
+    _quiet(lambda: fit.solve(6))
+    # every step moved it downhill: the conductor starts too hot for the 320 K target
+    assert float(np.asarray(fit.eval([a])[0]).ravel()[0]) < 1.0 - 5 * 2e-2 * 0.9
