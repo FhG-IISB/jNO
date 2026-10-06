@@ -110,7 +110,7 @@ already expressible with the slots on this page.
 
 **1. Solve in the subspace** rather than regressing into it. The A-orthogonal projection
 `U(UᵀAU)⁻¹Uᵀb` is the *provably best* starting point from `span(U)` — and it is exactly what
-[`fem.solve(basis=U)`](fem/inverse.md#reduced-order-solves-fembasisu) computes, certificate included.
+[`fem.solve(basis=U)`](fem/inverse.md#reduced-order-solves-femsolvebasisu) computes, certificate included.
 
 **2. Put the subspace in the preconditioner**, as a coarse-space correction
 `M⁻¹ = diag⁻¹ + U(UᵀAU)⁻¹Uᵀ` (Nicolaides, *SINUM* **24**(2), 1987, 355; Frank & Vuik, *SISC*
@@ -291,6 +291,19 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
           ))
 ```
 
+**Periodic ties, slip and hanging nodes.** These make the solve run on the reduced system `PᵀAP`,
+reduced field by field. The block preconditioners split *that* operator: the slices they are handed
+(`ctx.blocks`) are each field's reduced DOFs, while `fem.blocks` keeps slicing the full solution that
+`fem.solve` returns. An auxiliary `form([...])` is written on the full space as usual (no ties in it) and
+reduced with the same field's `P`. So `block_diag`, `triangular`, `saddle` (mass, Cahouet–Chabard,
+`lsc`), `pcd` and `jno.solve.staggered` are written exactly as on the untied problem. The preconditioners
+that build a pattern once (`fsai`, `schwarz`) build it from the reduced operator, and
+`schwarz(nullspace="rigid")` builds its rigid-body modes on the full mesh and restricts them to the kept
+DOFs (a translation along a periodic direction restricts exactly). One case is refused
+by name: a complex form solved as its fused real-equivalent `[Re; Im]` block. There a field is not one
+contiguous slice, so use a complex-native composition (a child such as `ams()`) or a whole-system
+preconditioner.
+
 ??? note "`jno.precond.chebyshev(degree=…)`"
     fixed-degree Chebyshev **polynomial** preconditioner: matvecs and
     AXPYs only, the GPU-era substitute for Gauss-Seidel/ILU smoothing, and a fixed *linear* map so it
@@ -367,6 +380,24 @@ the march themselves and are not chunked, so a cadence beside one raises rather 
 
 A frozen preconditioner is probed once and refused if it makes a random residual worse — but only when it
 stands alone, since a block preconditioner need not reduce a full residual in one application.
+
+A **steady** nonlinear solve has the same problem one level down: Newton runs as a `lax.while_loop`, so the
+tangent is traced there too. An unbuilt `amg()` (or `ilu()`, or a block holding one) is therefore
+built **once**, before the loop, from the assembled tangent at the initial guess `x0` (zero by default; a
+periodic, slip or hanging-node system uses its reduced tangent). It does not follow the tangent as Newton
+moves: the root is unchanged and only the Krylov speed depends on how far the tangent drifts from `x0`.
+Specs that already materialize inside the loop (`jacobi`, `form`, `lsc`, `pcd`) are left as they were.
+
+```python
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())                  # nonlinear: built at x0
+fem.solve(linear=jno.solve.fgmres(),
+          precond=jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([pb * qb / mu]))))
+```
+
+For Navier–Stokes, lag the convecting velocity (`jno.lag`, [above](#the-momentum-block-picard-not-newton))
+so the velocity block AMG is built on is the Oseen operator. `cached(spec, refresh=k)` is **refused**
+here rather than ignored: a rebuild every `k` Newton iterations would need the loop cut into chunks,
+which the steady solve does not do. To rebuild at a better state, solve again from that state (`x0=`).
 
 ### When the pressure mass is not enough
 
@@ -822,7 +853,7 @@ fem.solve(nonlinear=jno.solve.staggered([[v, p], [T]], direct=True), linear=jno.
 ```
 
 This is not a convenience. A velocity/pressure pair **cannot be swept apart**: the pressure block is the
-constraint block, with no diagonal of its own — the block [`jno.precond.saddle`](#saddle) locates
+constraint block, with no diagonal of its own — the block [`jno.precond.saddle`](#preconditioners) locates
 structurally — so "solve `p` with `v` frozen" is not a well-posed sub-problem. Any flow staggered
 against a solid or a temperature therefore has to group its Stokes pair. Measured on a three-field
 Stokes/temperature problem (`tests/test_fem_staggered_groups.py`): the grouped sweep lands on the
@@ -935,7 +966,9 @@ Over-relaxation also acts on the **free** DOFs only. Farrell & Maurini's `ũ` li
 space `C_ū`, where a prescribed DOF has `δ = 0`; jNO imposes essential conditions as residual rows, so
 without the mask the sub-solve's exact hit on the prescribed value gets extrapolated past — measured on
 one row with `g = 2`, ω = 1.7 gave 3.40 → 1.02 → 2.69, an oscillation decaying only as `|1−ω|ᵏ`, worst
-on a *ramped* condition where `g` moves every load step.
+on a *ramped* condition where `g` moves every load step. The mask covers every nonlinear problem — plain
+or parametric, 2-D/3-D or 1-D (non-nodal families excepted) — and on a periodic, slip or hanging-node
+system the prescribed DOFs are mapped into the reduced space the sweep runs in.
 
 Cost when ω ≠ 1: one extra full residual evaluation per block per sweep.
 
@@ -1260,6 +1293,45 @@ The same flag exists on `jno.core(...).solve(profile=True)` (see
 
 ## Transient problems
 
+### What a march keeps — only the frames you ask for
+
+Evaluated eagerly (`fem.solve(...).fn()`, `fem.solve(k=2.0)`), a march keeps **no past on the device**.
+Each step writes its state into a save slot when a frame at `save_ts` will read it (a save time on the
+grid, or the two grid points either side of one off it) and into a scratch row otherwise, and the frames
+come back as a **host NumPy array**. Saving every step of a march whose frames would outgrow 1/16 of the
+device runs it in chunks: each chunk's frames are copied out while the next chunk is already queued, with
+nothing inside the compiled step (no callback, no sync). The answer is bit-identical to the one-scan march
+on CPU, under every scheme below; on a GPU it moves only by the run-to-run noise the old march had
+(measured 4–7e-11, scatter-add order).
+
+Measured (RTX 3070, 2-D linear heat, 22,801 DOFs, 5 frames saved): peak device memory 186 → 59 MiB at
+500 steps and 708 → 59 MiB at 2,000 steps; wall time unchanged.
+
+**Pass `save_ts=` for a long march.** The default saves every grid point, which keeps the whole trajectory
+— on the host now, not the device. **Under `jit`/`grad`** (`jno.core`, an inverse problem) the march stays
+one `lax.scan` holding every step: the adjoint needs the states.
+
+### What a march's Newton keeps — its tangent
+
+A nonlinear march's default per-step Newton is `jno.solve.newton(reuse=True)`: it keeps the assembled step
+tangent while that still contracts the residual (`‖r_new‖ < ‖r_old‖/2`), refreshes it the moment it does
+not, and rejects a step that fails to reduce the residual -- so a stale tangent costs at most one wasted
+solve, never a divergence. Evaluated eagerly, the march also carries the tangent **from step to step**
+(on the step-merge plan's fixed sparsity pattern), because a march's tangent changes little between steps.
+The step's convergence record reuses the norms Newton already computed instead of evaluating the residual
+twice more. And on a kept tangent the inner Krylov solve is **inexact**: a step contracts the residual by
+the tangent's own contraction, not by the accuracy of the linear solve, so each correction is solved only to
+a forcing tolerance -- half the outer target over the current residual, floored at 1e-3, capped at 0.1
+(Dembo, Eisenstat & Steihaug 1982) -- instead of to 1e-10.
+
+Measured (RTX 3070, the Taylor–Green LES of the turbulence tutorial: residual-based VMS + Vreman, P1/P1,
+BDF2): at 55,296 DOFs one tangent for an 8-step march instead of two per step, **0.80 → 0.30 s per step**;
+at 442,368 DOFs, where the Krylov solves dominate once the tangent is kept, the inexact solves take
+1,200 → 160 matvecs per step, **2.14 → 1.50 s per step** -- same trajectory (energy identical to 6 digits). The answer moves only within the Newton tolerance: a reused
+tangent converges linearly, so the final residual lands under the test rather than far below it. Pass
+`nonlinear=jno.solve.newton()` for a fresh tangent at every iteration. Under `jit`/`grad` the march keeps
+the tangent within a step but not across steps (the reverse pass would store one tangent per step).
+
 ### Time schemes — `fem.solve(time=…)`
 
 | Scheme | Order | Stability | Use |
@@ -1287,9 +1359,15 @@ where the pressure has no time derivative at all, that ringing is exactly what y
 The first BDF2 step is plain backward Euler — a multistep method has no second level to start from.
 A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
 `c(uⁿ⁺¹)(3uⁿ⁺¹ − 4uⁿ + uⁿ⁻¹)/(2Δt)`, second order in time (measured on a manufactured `c(u) = 1 + u²`);
-it is not the conservative form an enthalpy mass `H(u)_t` would want. Refused loudly rather than
-mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not damped),
-and `.adaptive()` (step doubling sizes a one-step method).
+it is not the conservative form an enthalpy mass `H(u)_t` would want. It composes with periodic ties
+(the march carries the reduced state; the mass action is reduced like the residual). Refused loudly
+rather than mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not
+damped), and `.adaptive()` (step doubling sizes a one-step method).
+
+Every scheme needs each transient term **linear in `u_t`** — `c(u)·u_t`, or `u_t` inside a contraction such
+as `τ (u·∇v)·u_t` (the time derivative inside a residual-based stabilisation). A term quadratic in `u_t`, or
+`u_t` inside a nonlinear function, is refused: it used to be marched with `(u − u_prev)²/Δt` where `/Δt²`
+belonged. The `u_t⊗u_t` piece of a residual-based VMS Reynolds stress is such a term — drop that piece.
 
 ### Higher order — `sdirk` and `rosenbrock`
 
@@ -1303,8 +1381,12 @@ non-conservative form.
 `jno.solve.rosenbrock()` is linearly implicit: every stage is **one linear solve** with the same matrix
 `W = M + γh·J`, `J` the tangent at the step's start — no Newton loop on a nonlinear block. The default
 `"ros34pw2"` (Rang & Angermann, BIT 45, 2005) is order 3, stiffly accurate and consistent for index-1
-DAEs; `"ros2"` (Verwer et al., SIAM J. Sci. Comput. 20(4), 1999) is order 2. Time-varying Dirichlet data
-is exact. It refuses a time-, parameter- or state-dependent mass (use `sdirk` or `bdf2`).
+DAEs; `"ros2"` (Verwer et al., SIAM J. Sci. Comput. 20(4), 1999) is order 2. A time-varying Dirichlet
+row lands exactly on `g(tₙ₊₁)` under the default, which is stiffly accurate; `"ros2"` is not, and holds it
+only to its order (`g = e^{-2t}`: 5.3e-4 off at `T = 0.5` after 16 steps, 1.4e-3 at the first step — see
+[the measured orders](fem/limitations.md#the-detail)). Re-imposing `g` after each step would make the wall
+exact, but was measured to leave an O(dt) error in the interior, so it is not done. Rosenbrock refuses a
+time-, parameter- or state-dependent mass (use `sdirk` or `bdf2`).
 
 ```python
 sol = fem.solve(time=jno.solve.sdirk(order=3))

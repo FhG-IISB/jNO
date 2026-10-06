@@ -30,6 +30,7 @@ path is unaffected.
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
+| Time-varying Dirichlet `g(x, t)` | first-order transients, linear or nonlinear, single-field or coupled, a trainable **parameter** inside the value included (differentiable); not a trainable net inside the value, nor a net/parameter-valued Dirichlet beside it, not a parameter inside it on a `u_tt` form or the τ load path, not a nonlinear `u_tt` form. `sdirk(3)` and `ros2` lose some order to it, and `ros2` holds the wall value only to its order (measured below) | raises |
 | Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
@@ -61,9 +62,11 @@ path is unaffected.
     - **runtime parameters** — the parametric coupled steady assembly underneath is not wired;
     - periodic ties.
 
-    Time-varying Dirichlet is refused on nonlinear forms. A **complex coefficient** on any `u_tt`
-    form is refused by name — it used to be silently cast to real. Write the problem first-order in
-    time instead; the complex transient is supported.
+    Time-varying Dirichlet is refused on nonlinear `u_tt` forms (a first-order nonlinear transient
+    takes it). A nonlocal `jno.Coupling` is refused on any `u_tt` form, and on a single-field transient
+    with a periodic tie; both routes used to drop it silently. A **complex coefficient** on any `u_tt` form is refused by name — it used to be
+    silently cast to real. Write the problem first-order in time instead; the complex transient is
+    supported.
 
     A coupled 1-D system carries `u_tt` on narrower terms (linear, undamped): the augmented state is
     `[u_all; v_all]`, so `fem.offsets` lists the displacement blocks then the velocity blocks.
@@ -101,14 +104,53 @@ path is unaffected.
     through the solve's / each step's `custom_root` (nonlinear / transient).
 
     Refused loudly: a value that is **both** parametric and t/τ-dependent (`u(top) - g*tau`). Train
-    the amplitude through a Neumann / body term instead. A FIELD-sized optimizer-less parameter stays
+    the amplitude through a Neumann / body term instead. A parametric wall **beside** a τ-ramped one
+    (`u(left) - g` with `u(right) - delta*tau`) is fine on the load path: both are held at every step.
+    A t/τ-dependent essential value needs steps to be held at: on a steady form that reads no step
+    history (`.i(k)`), and so does not march its `domain(tau=...)` grid, it is refused, with or without
+    a parameter in the form. A FIELD-sized optimizer-less parameter stays
     the nodal data-field value (a neighbour's field in a DD solve), gathered per node.
+
+??? measured "Time-varying Dirichlet `g(x, t)` — the orders each scheme keeps"
+    The constrained rows are imposed at the time each step or stage lands on, on linear and nonlinear,
+    single-field and coupled first-order transients alike (see
+    [Boundary conditions](boundary-conditions.md#time-varying-dirichlet-data-gx-t)). What that costs in
+    accuracy depends on the scheme. Measured on the Taylor–Green vortex (Navier–Stokes, Taylor–Hood
+    P2/P1, `ν = 1`, `T = 0.5`, `h = π/6`): the walled box `[0, π]²` has the exact velocity imposed on
+    all four walls; the periodic box `[0, 2π]²` has no Dirichlet data at all. Velocity error against a
+    same-mesh 256-step `ros34pw2` reference (so the spatial error cancels), rates over 8 → 16 → 32 steps:
+
+    | scheme | walls driven by `g(x, t)` | periodic box | wall rows exact? |
+    |---|---|---|---|
+    | `theta(1.0)` | 0.98, 0.99 | 0.96, 0.98 | yes |
+    | `theta(0.5)` | 2.18, 2.01 | 2.10, 2.01 | yes |
+    | `bdf2()` | 2.23, 1.82 (→ 1.96 by 128 steps) | 2.10, 2.04 | yes |
+    | `sdirk(2)` | 2.01, 2.00 | 2.01, 2.00 | yes |
+    | `sdirk(3)` | **2.63, 2.60** | 2.95, 2.98 | yes |
+    | `rosenbrock()` (ros34pw2) | 2.87, 2.93 | 2.95, 2.98 | yes |
+    | `rosenbrock("ros2")` | **1.48, 1.68** | 1.77, 1.87 | **no** — 5.3e-4 off at 16 steps |
+
+    The losses in bold are the classical *order reduction* of one-step methods with low stage order
+    under time-dependent boundary data (Ostermann & Roche, *Math. Comp.* 59 (1992) 403–420), not a
+    mis-timed boundary value: the same form with the convection dropped, marched as a linear block,
+    gives rates identical to three digits, and the one-step-late control drops BDF2 to first order
+    (1.05) at ~900× the error. "Wall rows exact" means the nodal wall value equals `g(x, tⁿ)` to
+    round-off at every step: a stiffly accurate scheme's last stage *is* the step, so it lands on
+    `g(tₙ₊₁)`; `ros2` is not stiffly accurate, so its step is a combination of stages and holds the wall
+    value only to its order (1.4e-3 off after the first step, 5.3e-4 at `T`, falling as `dt²`). Re-imposing
+    `g(tₙ₊₁)` on the wall rows after each step was tried and not adopted: the wall becomes exact, but the
+    change it makes to the interior decays only as O(dt) — on the walled Taylor–Green box the ros2 rate over
+    32 → 64 → 128 → 256 steps fell from 1.81, 1.89, 1.94 to 1.77, 1.83, 1.82, with 19 % more interior error
+    at 256 steps. Use the default `ros34pw2` when a time-varying wall value must hold exactly.
 
 ??? note "Plasticity — what runs today"
     Deformation theory (monotonic / proportional) and the path-dependent flow-theory **`tau=`
     load-path march** both run. The march assembles on the real, steady native-Lagrange path,
-    **single-field or coupled** — not transient / complex / 1-D / non-nodal / periodic, each rejected
-    with a clear error.
+    **single-field or coupled** — not transient / complex / 1-D / non-nodal, each rejected with a
+    clear error. Periodic ties, exact slip conditions and hanging-node constraints compose (each step
+    solves in the reduced space `u = P ũ`); with one of them, `tau=jno.solve.arclength(...)` refuses by
+    name. A `.bounds(...)` box composes with a periodic tie whose bound is the same on both faces, and
+    refuses beside a weighted elimination (mortar, hanging nodes, slip).
 
     An internal state advances on every cell by default; `state.evolves(formula, region="strip")`
     restricts it to one region, and outside it the state is **frozen** at the value it already has —

@@ -148,6 +148,10 @@ u = fem.solve(adapt=jno.solve.relocate(max_iters=60))
     solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
     not wired yet.
 
+    The `nonlinear=`/`linear=`/`precond=` slots configure the solve on the **final** mesh, the one returned
+    (`linear=jno.solve.lu()` on a saddle problem, say); the descent itself keeps its own differentiable
+    solves. `x0=` and `time=` are refused: a warm start and a time scheme do not survive the change of mesh.
+
 ### A mesh objective that names the physics — `objective=<expression>`
 
 The three built-in objectives (`"equidistribution"`, `"energy"`, `"huang"`) are mesh-*quality* measures:
@@ -205,8 +209,17 @@ transient problem it is checked on the current mesh every `k` steps, and the mes
 some cell breaks it; `fem.adapt_history` records `remeshed: False` for the rounds it held, so a
 condition that never breaks never remeshes. A ranking criterion (`1 - phi**2`, `|grad u|`) is evaluated
 on the live state at each remesh -- and at that remesh's time, so it may read `t` (a moving source) -- and
-the vertex budget (`max_dofs`, else the starting count) is held on both the isotropic and the anisotropic
+the DOF budget (`max_dofs`, else the starting count) is held on both the isotropic and the anisotropic
 path.
+
+`max_dofs` counts **DOFs** — every unknown of the assembled system (`fem.dofs`), so a vector field counts
+each component, a Taylor–Hood P2/P1 pair about nine per vertex in 2-D, and a complex field its real and
+imaginary halves — not vertices. The mesher is steered by a vertex count and only approximates it, so
+each remesh is counted before it is applied and redone with a corrected target if it misses: the DOF
+count stays within **20 %** of `max_dofs`, and a remesh that cannot be brought under `1.2 × max_dofs`
+(an `hmax` too small to coarsen that far, say) raises. On a steady loop the budget caps each round's
+growth and stops the loop once reached. (It used to be handed to the mesher as a vertex count: a
+Taylor–Hood march asked for `max_dofs=4000` produced 23,793 DOFs.)
 
 Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
 bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
@@ -422,7 +435,7 @@ silently permute the state.
     * **Connectivity-preserving, unless told to remesh**: a move that would invert an element raises. With
       `fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 3.0), every=1))` the march
       checks the condition on the moved mesh every `every` steps and, where it breaks, rebuilds the mesh
-      (mmg, at the starting vertex budget), re-assembles and carries the state across. Measured on a top edge
+      (mmg, at the starting DOF budget), re-assembles and carries the state across. Measured on a top edge
       bulging as `y' = 2y sin(πx)`: worst cell aspect 6.27 → 3.19 with one remesh, the surface where the plain
       march puts it, a constant field exact to 4e-16. The laws may read only `boundary` and `interior` (any
       other region is found by a position that does not follow a moved surface), a remesh is not
@@ -881,6 +894,10 @@ also how you reach the options below:
   `T` in a heat+flow / thermo-mechanical solve).
 - **Transient.** The coupling enters each implicit step, so enclosure radiation over a heating cycle
   solves in-residual. (Not combined with periodic ties.)
+- **Essential rows.** The contribution is zeroed on every Dirichlet row -- constant, time- or
+  τ-dependent, or parameter/net-valued -- so it never moves a prescribed value. A coupling on a linear
+  form promotes it to a residual operator that still declares those rows, so
+  `jno.solve.staggered(over_relax>1)` leaves them alone.
 
 All four (bare function, `params`, `field_key`, transient) are covered in
 `tests/test_fem_enclosure_radiation.py`. Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed.,

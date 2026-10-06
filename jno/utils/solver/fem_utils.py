@@ -1484,7 +1484,7 @@ def _eval_integrand(domain, node, local):
                 "steady, native-Lagrange path (2D/3D, single-field or coupled), marched over a "
                 "`domain(tau=(start, end, n))` pseudo-time grid by a plain `fem.solve()` — nothing is "
                 "passed to it. Not carried by: 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, "
-                "periodic ties, a `u.t` transient, or a complex form."
+                "a `u.t` transient, or a complex form."
             )
         buf_c = table[node.history_key]  # (n_quad, depth, *value_shape) for this cell
         return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)
@@ -3424,6 +3424,34 @@ def _periodic_facet_weights(
     return None
 
 
+def _nearest_in_interface(s_loc, m_loc):
+    """``(index, distance)`` of the nearest ``m_loc`` row for every ``s_loc`` row (in-interface coordinates).
+
+    A k-d tree; with no main nodes the indices are 0 and the distances 0, as the caller expects. Equal
+    distances are broken by the LOWEST main index, as the dense ``argmin`` this replaces did."""
+    n_s = len(s_loc)
+    if not len(m_loc) or not n_s:
+        return np.zeros(n_s, dtype=int), np.zeros(n_s)
+    if np.shape(s_loc)[1] == 0:  # a point interface (1-D): every node is at the origin of its frame
+        return np.zeros(n_s, dtype=int), np.zeros(n_s)
+    from scipy.spatial import cKDTree
+
+    s_loc, m_loc = np.asarray(s_loc, dtype=float), np.asarray(m_loc, dtype=float)
+    tree = cKDTree(m_loc)
+    d0, _ = tree.query(s_loc, k=1)
+    # Every main node within a hair of the nearest distance is a candidate; the dense formula then decides
+    # among them, so the pick -- and its lowest-index tie break -- is exactly the dense argmin's.
+    cands = tree.query_ball_point(s_loc, r=d0 * (1.0 + 1e-9) + 1e-300)
+    idx = np.empty(n_s, dtype=int)
+    dist = np.empty(n_s)
+    for i, c in enumerate(cands):
+        c = np.sort(np.asarray(c, dtype=int))
+        d2 = np.sum((s_loc[i] - m_loc[c]) ** 2, axis=-1)
+        j = int(np.argmin(d2))
+        idx[i], dist[i] = c[j], np.sqrt(d2[j])
+    return idx, dist
+
+
 def build_periodic_prolongation(
     points: np.ndarray,
     pairs: Sequence[Tuple[str, str]],
@@ -3598,10 +3626,13 @@ def build_periodic_prolongation(
                 loc = _s_all[:, None]
         m_loc, s_loc = loc[m_ids], loc[s_ids]
 
-        # Nearest in-interface main node for every secondary node.
-        d2 = np.sum((s_loc[:, None, :] - m_loc[None, :, :]) ** 2, axis=-1)
-        nn = np.argmin(d2, axis=1) if m_ids.size else np.zeros(len(s_ids), dtype=int)
-        dist = np.sqrt(d2[np.arange(len(s_ids)), nn]) if m_ids.size and len(s_ids) else np.zeros(len(s_ids))
+        # Nearest in-interface main node for every secondary node -- by a k-d tree: the dense (n_s, n_m)
+        # distance table grew with the SQUARE of the face (a 128^2-node face: 268M entries, 2 GB).
+        nn, dist = _nearest_in_interface(s_loc, m_loc)
+        # A conforming interface needs nothing else: every secondary has its main node, the tie is a 0/1
+        # map, and the integrated mortar rows below would be computed only to be discarded (see `_mode`).
+        # They cost 14 of a 34 s build on a 32^3 periodic box -- pure-Python polygon clipping per face.
+        _all_match = bool(m_ids.size) and len(s_ids) > 0 and bool(np.all(dist <= tol))
 
         # Rim nodes carry no multiplier under the boundary-modified space, so they get no row and stay
         # KEPT. Computed once, here, and handed to the row builder so the two cannot drift.
@@ -3628,7 +3659,7 @@ def build_periodic_prolongation(
         # nothing to integrate over, so those nodes keep the collocated node-to-segment weights. Which
         # one each tie used is reported back in ``coupling`` rather than left to guesswork.
         mortar: Dict[int, List[Tuple[int, float]]] = {}
-        if s_fc is not None and m_fc is not None and loc.shape[1] in (1, 2):
+        if s_fc is not None and m_fc is not None and loc.shape[1] in (1, 2) and not _all_match:
             span = float(np.ptp(loc)) if loc.size else 1.0
             if loc.shape[1] == 1:  # 2-D interface: edge facets, clipping is an interval intersection
                 if _faces_span_the_same_extent(s_fc, m_fc, loc, span=span):
@@ -3676,7 +3707,7 @@ def build_periodic_prolongation(
         # tie mechanism for a 1-D interface (the frame has zero columns, so there is nothing to
         # integrate over), for Morley's value block (delegated with no facets at all), for quad/hex
         # facets, and for 3-D P2 tets -- the last two have no dual basis of this form at all.
-        _exact_ok = bool(m_ids.size) and len(s_ids) > 0 and bool(np.all(dist <= tol))
+        _exact_ok = _all_match
         # Mortar only if every NON-RIM secondary has a row; a tag selecting nodes but not whole facets
         # leaves some without one, and filling those from collocation is the mixing this removes.
         _mortar_ok = bool(mortar) and all(int(sid) in mortar for sid in s_ids if int(sid) not in _rim)
@@ -3800,6 +3831,53 @@ def _prolongation_dof_level(n_nodes, vec, secondary_set, raw, exclude, *, is_blo
     }
 
 
+def _prescribed_dofs_kept_out(prescribed, raw, secondary_interp, secondary_set, vec):
+    """The prescribed DOFs to keep out of the tie elimination; the rest are left to the tie.
+
+    **Kept out** — a prescribed DOF on the eliminated side whose tie partner is prescribed as well: where
+    a tied face meets a constrained boundary (the corner of a periodic channel with no-slip walls, the rim
+    of a mortar interface). Each side holds its own data, the tie adds nothing there, and non-periodic
+    data could not satisfy it anyway, so the DOF keeps a row of its own for its value.
+
+    **Left to the tie** — a prescribed DOF whose *exact* (weight-1) partner is FREE: a single node pinned
+    on a tied face, such as ``p(corner) - 0`` on a periodic corner. The tie says the node and its images
+    are ONE unknown, so the value has to hold at all of them. Keeping it out instead tore the tie at that
+    node, silently: the node held its value, its images did not, and the field was no longer periodic
+    there (measured: a 0.037 jump between a pinned corner and its three images on a doubly periodic
+    Poisson problem, u ~ 1). The DOF is eliminated like any other secondary, and
+    :func:`reduced_dirichlet_pairs` imposes its value on the reduced DOF it resolves to.
+
+    A lone prescribed DOF on a *weighted* tie (mortar / collocated / Bloch phase) is refused: its value
+    would be a multipoint constraint ``sum_j w_j x_j = g`` on the main side, which has no unit row to
+    impose it into, and tearing the tie would be wrong without saying so.
+    """
+    if not prescribed:
+        return prescribed
+    out = set(prescribed)
+    for d in prescribed:
+        s, c = divmod(int(d), vec)
+        if s not in secondary_set:
+            continue
+        partners = raw[s]
+        if any((int(m) * vec + c) in prescribed for m, _w in partners):
+            continue  # both sides prescribed: keep this DOF's own row
+        exact = s not in secondary_interp and len(partners) == 1
+        w = complex(partners[0][1]) if exact else None
+        if exact and abs(w - 1.0) <= 1e-12:
+            out.discard(d)  # left to the tie: the value is carried to the DOF this one resolves to
+            continue
+        kind = "Bloch-phase" if exact else "non-matching (mortar/collocated)"
+        raise NotImplementedError(
+            f"jno.fem: a value is prescribed on DOF {int(d)} (node {s}), which a {kind} tie eliminates, and "
+            "none of the nodes it is tied to is prescribed. The tie makes its value a weighted combination of "
+            "those nodes, so the prescription would be a multipoint constraint -- there is no row to impose "
+            "it into, and keeping the node out of the tie would break the tie there without saying so. "
+            "Prescribe the value on a node the tie keeps (the `B` side of `u(A) - u(B)`) or off the tied face; "
+            "for a gauge, `p.pin()` already picks such a node."
+        )
+    return out
+
+
 def prolongation_from_ties(
     n_nodes: int,
     secondary_to_main: Dict[int, int],
@@ -3862,7 +3940,10 @@ def prolongation_from_ties(
     #
     # Done BEFORE the transitive resolution, not by post-processing P: a chain s1 -> s2 -> k bakes
     # `w(s1,s2)*w(s2,k)` into s1's row, and promoting s2 afterwards cannot un-bake it.
-    _excl = {int(d) for d in (exclude_dofs or ())}
+    #
+    # Not every prescribed secondary is kept out, though: one whose exact tie partner is FREE is left to
+    # the tie, so its value holds at every periodic image (see `_prescribed_dofs_kept_out`).
+    _excl = _prescribed_dofs_kept_out({int(d) for d in (exclude_dofs or ())}, raw, secondary_interp, secondary_set, vec)
     if _excl and any((d // vec) in secondary_set for d in _excl):
         return _prolongation_dof_level(
             n_nodes, vec, secondary_set, raw, _excl, is_bloch=is_bloch, coupling=coupling, tie_counts=tie_counts
@@ -4683,6 +4764,31 @@ def _fn_content_key(fn, chunk, seen=None, renumber=None):
     return (fn.__code__, tok, chunk)
 
 
+def _baked_arrays(obj, seen=None):
+    """Every leaf a compilation bakes from ``obj``, NESTED functions included: a function leaf contributes
+    the leaves of its own closure cells and defaults, recursively -- as :func:`_fn_content_key` walks them.
+
+    The donated-buffer check in :func:`elem_map` needs this depth. An element function passed as
+    ``lambda c, la, _k=kernel: ...`` (the chunked tangent scatter does) has ONE top-level leaf, the
+    ``kernel`` function; the runtime ``args`` it closes over sit one level down. The check saw no array,
+    so a content-hit alias ran a compilation whose parameter buffer an optimizer step had donated:
+    "Array has been deleted with shape=float64[1]" in the second of two crux recoveries of one form."""
+    if seen is None:
+        seen = set()
+    out = []
+    for leaf in jax.tree_util.tree_leaves(obj):
+        if hasattr(leaf, "__code__") and id(leaf) not in seen:
+            seen.add(id(leaf))
+            try:
+                cells = tuple(c.cell_contents for c in (leaf.__closure__ or ()))
+            except ValueError:  # an unfilled cell: nothing baked through it yet
+                cells = ()
+            out.extend(_baked_arrays((cells, leaf.__defaults__ or ()), seen))
+        else:
+            out.append(leaf)
+    return out
+
+
 def _bake_fingerprint(fn, chunk):
     """Identity of everything a ``jit`` of ``fn`` would BAKE IN: its code object, and the *leaves* of
     its closure cells and default arguments.
@@ -4711,26 +4817,35 @@ def _bake_fingerprint(fn, chunk):
 
 def _chunked_scatter(fn, xs, c, out, index):
     """``out.at[index].add(vmap(fn)(*xs))`` in chunks of ``c`` cells, WITHOUT materialising the per-cell
-    result: each chunk scatter-adds straight into ``out``. Padding rows repeat the last cell and scatter to
-    an out-of-range index, which ``mode="drop"`` discards."""
+    result: each chunk scatter-adds straight into ``out``.
+
+    When ``c`` does not divide the cell count the LAST chunk is slid back to end at the last cell, and the
+    cells it shares with the previous chunk scatter to an out-of-range index that ``mode="drop"`` discards.
+    Nothing is padded. Padding used to concatenate a filler tail onto every input -- a full copy of each,
+    the index block included: on a 24^3 P1/P1 Navier-Stokes tangent that was 81 MiB of index copies (the
+    one-int32-per-raw-triplet scatter map) in the compiled march, for 7 filler cells. The overlap costs at
+    most one chunk of element work, which the filler tail cost too."""
     n = xs[0].shape[0]
     nb = -(-n // c)
-    pad = nb * c - n
+    if nb * c == n:
+        blocks = tuple(x.reshape((nb, c) + x.shape[1:]) for x in xs) + (index.reshape((nb, c) + index.shape[1:]),)
 
-    def padded(x, fill):
-        if not pad:
-            return x
-        return jnp.concatenate([x, jnp.broadcast_to(fill, (pad,) + x.shape[1:]).astype(x.dtype)])
+        def body(acc, blk):
+            r = jax.vmap(fn)(*blk[:-1])
+            return acc.at[blk[-1].reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
-    xs_p = [padded(x, x[-1]) for x in xs]
-    idx_p = padded(index, out.shape[0])
-    blocks = tuple(x.reshape((nb, c) + x.shape[1:]) for x in xs_p) + (idx_p.reshape((nb, c) + index.shape[1:]),)
+        return jax.lax.scan(body, out, blocks)[0]
 
-    def body(acc, blk):
-        r = jax.vmap(fn)(*blk[:-1])
-        return acc.at[blk[-1].reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
+    def body_slid(acc, i):
+        start = jnp.minimum(i * c, n - c)  # the last chunk ends at the last cell instead of running past it
+        blk = [jax.lax.dynamic_slice_in_dim(x, start, c) for x in xs]
+        idx = jax.lax.dynamic_slice_in_dim(index, start, c)
+        fresh = (start + jnp.arange(c)) >= i * c  # cells the previous chunk has not already added
+        idx = jnp.where(fresh.reshape((c,) + (1,) * (idx.ndim - 1)), idx, out.shape[0])
+        r = jax.vmap(fn)(*blk)
+        return acc.at[idx.reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
-    return jax.lax.scan(body, out, blocks)[0]
+    return jax.lax.scan(body_slid, out, jnp.arange(nb))[0]
 
 
 def elem_map(fn, xs, chunk, *, scatter=None):
@@ -4802,7 +4917,7 @@ def elem_map(fn, xs, chunk, *, scatter=None):
     # is what makes the donated-buffer check below possible.
     def _baked_dead(entry):
         return entry[2] is not entry[1] and any(
-            isinstance(_l, jax.Array) and _l.is_deleted() for _l in jax.tree_util.tree_leaves(entry[2])
+            isinstance(_l, jax.Array) and _l.is_deleted() for _l in _baked_arrays(entry[2])
         )
 
     hit = _ELEM_MAP_CACHE.get(key)
@@ -4824,9 +4939,7 @@ def elem_map(fn, xs, chunk, *, scatter=None):
         chit = None
         if ckey is not None:
             chit = _ELEM_MAP_CONTENT.get(ckey)
-            if chit is not None and any(
-                isinstance(_l, jax.Array) and _l.is_deleted() for _l in jax.tree_util.tree_leaves(chit[2])
-            ):
+            if chit is not None and any(isinstance(_l, jax.Array) and _l.is_deleted() for _l in _baked_arrays(chit[2])):
                 # Same corpse check for the content table (its entries keep the ORIGINAL build's
                 # leaves as ``baked``, which are exactly the compiled closure's buffers).
                 del _ELEM_MAP_CONTENT[ckey]
@@ -5532,6 +5645,67 @@ def wrap_reduced_dirichlet(periodic, residual_fn=None, jacobian_fn=None):
     return r_bc, _jac_bc
 
 
+def wrap_reduced_dirichlet_transient(
+    periodic, mass_fn, residual_fn, jacobian_fn=None, mass_residual_fn=None, mass_residual_jac_fn=None
+):
+    """``(mass, residual, jacobian, mass_residual, mass_residual_jac)`` of a reduced NONLINEAR time block,
+    carrying the reduced-space Dirichlet rows. ``mass`` is ``None`` for a state-dependent mass, whose action
+    is ``mass_residual(u, t, args)`` instead; its prescribed rows are emptied the same way.
+
+    The time-block companion of :func:`wrap_reduced_dirichlet`, with the block's signatures:
+    ``mass(t, args)``, ``residual(u, t, args)``, ``jacobian(u, t, args)``. Handing the residual to
+    :func:`wrap_reduced_dirichlet` directly failed on the first step (its projected residual takes the
+    state alone), so a nonlinear transient with a prescribed value on a tie target -- a pressure pinned on
+    the retained corner of a periodic box -- could not march at all. The mass gets the treatment the linear
+    march gives it (:func:`impose_reduced_dirichlet` with ``mass=``): ``P^T M P`` refills the prescribed
+    row, and it has to be empty again, or the step equation ``M(u+ - u)/dt + r(u+) = 0`` no longer reduces
+    to ``u+[d] = g`` on that row.
+    """
+    pairs = (periodic or {}).get("dirichlet_reduced")
+    if not pairs:
+        return mass_fn, residual_fn, jacobian_fn, mass_residual_fn, mass_residual_jac_fn
+    from .fem_1d import _apply_dirichlet_projected
+
+    dofs = jnp.asarray([int(d) for d, _v in pairs], dtype=jnp.int32)
+
+    def _zero_rows_cols(M):
+        if hasattr(M, "indices"):
+            return bcoo_zero_rows_cols(M, dofs)
+        return jnp.asarray(M).at[dofs, :].set(0.0).at[:, dofs].set(0.0)
+
+    mass_bc = None
+    if mass_fn is not None:
+
+        def mass_bc(t, args=None):
+            return _zero_rows_cols(mass_fn(t, args))
+
+    mres_bc = None
+    if mass_residual_fn is not None:
+
+        def mres_bc(u, t, args=None):
+            return jnp.asarray(mass_residual_fn(u, t, args)).reshape(-1).at[dofs].set(0.0)
+
+    mjac_bc = None
+    if mass_residual_jac_fn is not None:
+
+        def mjac_bc(u, t, args=None):
+            return _zero_rows_cols(mass_residual_jac_fn(u, t, args))
+
+    def residual_bc(u, t, args=None):
+        return _apply_dirichlet_projected(lambda uu: residual_fn(uu, t, args), pairs)(u)
+
+    jac_bc = None
+    if jacobian_fn is not None:
+
+        def jac_bc(u, t, args=None):
+            J = jacobian_fn(u, t, args)
+            if hasattr(J, "indices"):
+                return bcoo_eliminate_dirichlet(J, dofs)
+            return jnp.asarray(J).at[dofs, :].set(0.0).at[:, dofs].set(0.0).at[dofs, dofs].set(1.0)
+
+    return mass_bc, residual_bc, jac_bc, mres_bc, mjac_bc
+
+
 def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False):
     """``[(reduced_dof, value)]`` for the prescribed DOFs whose reduced row the congruence pollutes.
 
@@ -5545,9 +5719,12 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
     only genuinely polluted rows are returned (a reduced column carrying more than its own identity
     entry), so a tie with no Dirichlet overlap yields ``[]``.
 
-    Requires every prescribed DOF to be KEPT, which ``prolongation_from_ties(exclude_dofs=...)``
-    guarantees; a prescribed DOF that was eliminated has no reduced row to write into and is skipped
-    here rather than silently mapped to the wrong one.
+    A prescribed DOF is normally KEPT (``prolongation_from_ties(exclude_dofs=...)``). The exception is one
+    the tie was left to carry -- a single prescribed node whose exact partner is free, see
+    :func:`_prescribed_dofs_kept_out`. Its ``P`` row is a single weight-1 entry, and its value is imposed
+    on that reduced DOF, i.e. at the node and every periodic image of it. Two different values landing on
+    one reduced DOF that way are refused, as is an eliminated DOF with a weighted row: there is no single
+    row to impose either into, and picking one would lose a boundary condition in silence.
     """
     if not dirichlet_pairs:
         return []
@@ -5556,6 +5733,7 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
     # reduced columns carrying more than their own identity entry == the rows P^T pollutes
     polluted = set()
     full_to_red = {}
+    entries = []  # per block: (P row ids, P col ids, P weights), to resolve an eliminated DOF
     for bi, blk in enumerate(blocks):
         P = blk["P"]
         vec = int(blk.get("vec", 1) or 1)
@@ -5566,6 +5744,7 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
         idx = np.asarray(P.indices) if hasattr(P, "indices") else None
         if idx is None:
             return []
+        entries.append((idx[:, 0], idx[:, 1], np.asarray(P.data)))
         counts = np.bincount(idx[:, 1], minlength=int(P.shape[1]))
         for r in np.flatnonzero(counts > 1):
             polluted.add(int(off_red[bi]) + int(r))
@@ -5574,18 +5753,50 @@ def reduced_dirichlet_pairs(periodic, dirichlet_pairs, *, all_rows: bool = False
             for c in range(vec):
                 full_to_red[int(off_full[bi]) + n * vec + c] = int(off_red[bi]) + r * vec + c
 
-    out = []
+    def _carried(d):
+        """The reduced DOF an eliminated ``d`` resolves to with weight 1, or ``None``."""
+        bi = int(np.searchsorted(off_full, d, side="right")) - 1
+        if not 0 <= bi < len(entries):
+            return None
+        rows, cols, data = entries[bi]
+        sel = np.flatnonzero(rows == d - int(off_full[bi]))
+        if sel.size != 1 or abs(complex(data[sel[0]]) - 1.0) > 1e-12:
+            return None
+        return int(off_red[bi]) + int(cols[sel[0]])
+
+    def _concrete(g):
+        try:
+            return complex(np.asarray(g).reshape(()))
+        except Exception:  # noqa: BLE001 - a traced / array-valued value: nothing to compare eagerly
+            return None
+
+    out, held = [], {}
     for d, g in dirichlet_pairs:
         r = full_to_red.get(int(d))
         if r is None:
-            raise RuntimeError(
-                f"jno.fem: prescribed DOF {int(d)} was eliminated by a tie, so it has no reduced row to "
-                "impose its value into. It should have been excluded from the elimination "
-                "(`prolongation_from_ties(exclude_dofs=...)`); dropping it here would lose a boundary "
-                "condition in silence."
-            )
-        if all_rows or r in polluted:
-            out.append((r, g))
+            r = _carried(int(d))
+            if r is None:
+                raise RuntimeError(
+                    f"jno.fem: prescribed DOF {int(d)} was eliminated by a weighted tie, so it has no reduced "
+                    "row to impose its value into. It should have been excluded from the elimination "
+                    "(`prolongation_from_ties(exclude_dofs=...)`); dropping it here would lose a boundary "
+                    "condition in silence."
+                )
+        if not (all_rows or r in polluted):
+            continue
+        if r in held and held[r][0] != int(d):
+            # Two prescribed NODES the tie identifies: one unknown, so one value -- or a contradiction.
+            a, b = _concrete(held[r][1]), _concrete(g)
+            if a is not None and b is not None and abs(a - b) > 1e-12 * max(1.0, abs(a), abs(b)):
+                raise ValueError(
+                    f"jno.fem: two different values ({a.real if a.imag == 0 else a} and "
+                    f"{b.real if b.imag == 0 else b}) are prescribed on DOFs {held[r][0]} and {int(d)}, which a "
+                    "tie identifies as one unknown. Prescribe one value there, or prescribe both sides of the "
+                    "tie so each keeps its own row."
+                )
+            continue
+        held.setdefault(r, (int(d), g))
+        out.append((r, g))
     return out
 
 

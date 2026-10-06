@@ -267,6 +267,46 @@ def test_coupled_transient_time_varying_dirichlet():
     assert np.linalg.norm(w[n:] - p_ex) / np.linalg.norm(p_ex) < 1e-9  # p = y
 
 
+@pytest.mark.parametrize("scheme", ["theta", "bdf2"])
+def test_coupled_parametric_transient_keeps_its_time_varying_dirichlet(scheme):
+    """The same coupled block with a runtime parameter on the diffusion. That takes the re-assembled
+    (parametric) branch, which read only the CONSTANT Dirichlet pairs -- so the driven boundary u = x + t
+    was dropped and marched as a free one: the final state was 0.42 off, with nothing to flag it. u = x + t
+    and p = y are exact for any diffusivity (both harmonic), so the answer must not depend on k."""
+    import jax.numpy as jnp
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.2, 5))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pi, qi = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    k = jno.np.parameter((1,), name="k")
+    fem = jno.fem(
+        [
+            ui.t * vi + k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi,
+            pi.t * qi + pi.x * qi.x + pi.y * qi.y,
+            u(xb, yb) - (xb + tb),
+            p(xb, yb) - yb,
+            u(ci[0], ci[1]) - ci[0],
+            p(ci[0], ci[1]) - ci[1],
+        ]
+    )
+    blk = fem.operator
+    assert blk.operator_fn is not None, "the runtime parameter must take the re-assembled branch"
+    sch = jno.solve.theta(1.0) if scheme == "theta" else jno.solve.bdf2()
+    ts = jnp.linspace(blk.t0, blk.t1, 5)
+    pts = np.asarray(d.mesh.points)
+    n = pts.shape[0]
+    for kv in (1.0, 2.5):
+        traj = np.asarray(sch.integrate(blk, {"k": jnp.asarray([kv])}, ts, linear_solve=None, nonlinear_solve=None))
+        u_ex = pts[None, :, 0] + np.asarray(ts)[:, None]
+        assert np.abs(traj[:, :n] - u_ex).max() < 1e-9, f"k={kv}: u off by {np.abs(traj[:, :n] - u_ex).max():.2e}"
+        assert np.abs(traj[:, n:] - pts[None, :, 1]).max() < 1e-9
+
+
 def test_transient_purely_temporal_dirichlet_solves_without_nan():
     """A time-varying Dirichlet with NO spatial part (``g = a·sin(ωt)``) and a zero IC made
     ``fem.solve()`` march an all-NaN trajectory from step 1: jax's BiCGStab hit an unguarded

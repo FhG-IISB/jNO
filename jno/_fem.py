@@ -522,16 +522,24 @@ def _discover_domain(constraints: List[Any]):
     )
 
 
-def _lower_gauge_pin(pin: GaugePin) -> Any:
+def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
     """Lower a ``p.pin()`` marker to a single-node Dirichlet residual ``field(node) - value``.
 
-    Picks a deterministic vertex (nearest the mesh min-corner) and reuses
-    ``domain.point_region`` + ``domain.variable``, so the synthesized residual is identical to a
-    hand-written ``p(xpn, ypn) - value`` -- the value side is the literal constant, so the
-    transient route treats it as a plain (time-independent) Dirichlet at every step. The pin's
-    coordinate Variables are cached per (domain, field) so a second ``jno.fem(...)`` on the same
-    domain neither re-registers the region nor re-samples (the cached vars are Dirichlet-only and
-    never retagged, so reuse is safe).
+    Picks a deterministic vertex and reuses ``domain.point_region`` + ``domain.variable``, so the
+    synthesized residual is identical to a hand-written ``p(xpn, ypn) - value`` -- the value side is
+    the literal constant, so the transient route treats it as a plain (time-independent) Dirichlet at
+    every step. The pin's coordinate Variables are cached per (domain, field, vertex) so a second
+    ``jno.fem(...)`` on the same domain neither re-registers the region nor re-samples (the cached vars
+    are Dirichlet-only and never retagged, so reuse is safe).
+
+    **Which vertex.** With no ties, the one nearest the mesh min-corner. With periodic / tied faces
+    (``ties``, the ``(main, secondary, ...)`` specs), the vertex nearest the min-corner that lies on NO
+    tied face. The min-corner of a periodic box is exactly the node the ties eliminate, and a gauge only
+    needs some DOF of the field's constant null space: a node off every tied face is never eliminated,
+    never merged with an image, and never has another row summed into it, so the pin is the same plain
+    one-node Dirichlet it is without ties, on every route (steady or transient, single-field or coupled,
+    conforming or mortar ties). Only a mesh with no vertex off the tied faces (one cell across) falls back
+    to the min-corner; the reduction then carries the value to all of its periodic images.
     """
     import numpy as _np
 
@@ -542,6 +550,21 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
             "jno.fem: p.pin() needs a field from domain.fem_symbols(...); the pinned symbol carries no domain."
         )
     dim = int(domain.dimension)
+    pts = _np.asarray(domain.mesh.points)[:, :dim]
+    corner = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex...
+    d2 = ((pts - corner) ** 2).sum(axis=1)
+    nid = int(d2.argmin())
+    if ties:
+        # ...or, with ties, the vertex nearest it that no tie touches (either side of any tie: the
+        # eliminated side loses its row, the retained side has the eliminated rows summed into it).
+        on_tie = _np.zeros(len(pts), dtype=bool)
+        every = _np.arange(len(pts))
+        for tag in {t for (m, s, *_r) in ties for t in (m, s)}:
+            ids = _face_nodes(domain, pts, every, tag)
+            if ids is not None:
+                on_tie[_np.asarray(ids, dtype=int).reshape(-1)] = True
+        if not on_tie.all():
+            nid = int(_np.where(on_tie, _np.inf, d2).argmin())
     # Single leading underscore (not "__...__"): the pin node is a genuine single-vertex boundary
     # region that `_region_and_support` must SEE, so its tag must not match the reserved
     # double-underscore filter that hides internal/temporal tags from region detection.
@@ -552,12 +575,15 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
     # keys on content). The name is deterministic, and just as unique where uniqueness matters:
     # trial names are distinct within a problem, and the per-domain cache WANTS two problems pinning
     # the same-named field on the same domain to share the pin region.
+    #
+    # A vertex other than the min-corner is named in the tag too: the same field pinned with and without
+    # ties on one domain must not share a region that sits at the wrong node for one of them.
     tag = f"_gauge_pin_{getattr(field, 'name', None) or field.field_key}"
+    if nid != int(d2.argmin()):
+        tag = f"{tag}_v{nid}"
     cache = domain.__dict__.setdefault("_gauge_pin_coords", {})
     if tag not in cache:
-        pts = _np.asarray(domain.mesh.points)[:, :dim]
-        target = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex
-        domain.point_region(tag, target)
+        domain.point_region(tag, pts[nid])
         cache[tag] = domain.variable(tag, split=True)
     spatial = cache[tag][:dim]
     return field(*spatial) - pin.value
@@ -721,10 +747,9 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     Note: a runtime-*scalar* parameter AND a single-field nodal FIELD parameter k(x) are allowed here
     (this gate only runs on single-field problems -- multifield returns earlier). The transient call
     sites add their own runtime-parameter exclusion (native transient-parametric is not wired yet).
-    Periodic ties are allowed here for the steady scalar single-field case (the caller scopes out the
-    transient / vector / parametric periodic sub-cases, which build the reduction in their own
-    branches); the reduction (``_build_periodic_reduction``) is fed the native assembly cells in
-    ``_finalize``.
+    Periodic ties are allowed here. A steady tie is reduced in ``_finalize`` (``_build_periodic_reduction``
+    fed the native assembly cells); a single-field TRANSIENT tie, scalar or vector, builds its reduction in
+    its own branch of :func:`fem`, and a coupled one goes through ``_finalize`` block by block.
     """
     if getattr(domain, "dimension", None) not in (2, 3):
         return False
@@ -1676,22 +1701,18 @@ def _is_temporal_value_node(node: Any) -> bool:
     return any(isinstance(v, Variable) and getattr(v, "axis", None) == "temporal" for v in _walk(node))
 
 
-def _eval_value_node_at_time(value_node: Any, points: Any, t: Any) -> Any:
+def _eval_value_node_at_time(value_node: Any, points: Any, t: Any, params: Any = None) -> Any:
     """Evaluate a time-dependent coordinate value ``g(x, t)`` at ``points`` and time ``t``.
 
-    Like :func:`_eval_value_node_at`, but the **temporal** Variable carries its own tag
-    (``'__time__'``, separate from the spatial coordinate tag), so its context entry is a
-    ``(n, 1)`` array filled with ``t`` while each spatial tag maps to the points. (Mapping
-    every tag to the points, as the steady evaluator does, makes the time variable read a
-    spatial column.) Reuses the existing ``TraceEvaluator``."""
-    from .trace_evaluator import TraceEvaluator
+    The **temporal** Variable carries its own tag (``'__time__'``, separate from the spatial coordinate
+    tag), so its context entry is a ``(n, 1)`` array filled with ``t`` while each spatial tag maps to the
+    points. (Mapping every tag to the points makes the time variable read a spatial column.)
 
-    pts = jnp.atleast_2d(jnp.asarray(points))
-    ctx: dict = {}
-    for v in _walk(value_node):
-        if isinstance(v, Variable):
-            ctx[v.tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype) if getattr(v, "axis", None) == "temporal" else pts
-    return jnp.reshape(TraceEvaluator({}).evaluate(value_node, context=ctx), (-1,))
+    ``params`` (the runtime ``args``) substitutes the value's trainable parameters -- ``u(wall) -
+    a*sin(t)`` with ``a = jno.np.parameter(...)`` -- so the held value, and every step built on it, stays
+    differentiable in them. ``None`` keeps their stored values. This is :func:`_eval_value_node_at` with a
+    time; one evaluator, so the two cannot drift."""
+    return _eval_value_node_at(value_node, points, params=params, t=t)
 
 
 def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any, Any]:
@@ -1945,7 +1966,10 @@ class FEM:
         """Per-field DOF ``slice``s into the flat solution (``None`` without block structure).
 
         The structural handle block preconditioners build on: ``jno.precond.block_diag`` /
-        ``triangular`` resolve their field arguments to these slices (see ``docs/solvers.md``)."""
+        ``triangular`` resolve their field arguments to these slices (see ``docs/solvers.md``).
+        These always slice the FULL solution. When a periodic tie, slip ``n·u = 0`` or hanging-node
+        constraint makes the solve run on the reduced ``P^T A P``, a preconditioner is handed the
+        per-field slices of that reduced system instead (``PrecondContext.blocks``)."""
         off = self.offsets
         if off is None:
             return None
@@ -2243,7 +2267,9 @@ class FEM:
           n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
           ``dt``, each step solved by the same default Newton; ``save_ts=`` overrides
           the sample times, default the domain's time grid). For a custom integrator build it
-          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``.
+          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``. Evaluated eagerly,
+          the built-in schemes keep only the states the ``save_ts`` frames read and return a HOST NumPy
+          array; under ``jit``/``grad`` the march stays one scan (docs: solvers, "What a march keeps").
 
         Enable x64 — the assembly is float64.
 
@@ -2752,6 +2778,27 @@ class FEM:
                     "that bodies which come within about 2*alpha*h merge. This problem has no geometry "
                     "term, so nothing moves the nodes: add one (`coord.d(t) - velocity`), or drop alpha=."
                 )
+            if getattr(adapt, "relocate", False) or getattr(adapt, "enrich", False):
+                # These two drivers take the solver slots only as keywords they forward to the solves they
+                # hand back (relocate: the solve on the final mesh; enrich: each round's solve). The slots
+                # never reached them -- so `linear=jno.solve.lu()`, the very advice the saddle-point warning
+                # gives, was dropped without a word and the default iterative solve ran anyway. They are
+                # forwarded now. The relocation DESCENT keeps its own differentiable solves (sparse-direct,
+                # Newton, or the default march), which these slots do not configure.
+                if (x0 is not None) or (time is not None):
+                    raise NotImplementedError(
+                        "fem.solve(adapt=jno.solve.relocate(...) / enrich(...)) does not take x0= or time=: a "
+                        "warm start and a time scheme do not survive the change of mesh or space. The "
+                        "nonlinear=/linear=/precond= slots configure the solve it hands back."
+                    )
+                kwargs = {
+                    **kwargs,
+                    **{
+                        k: v
+                        for k, v in (("nonlinear", nonlinear), ("linear", linear), ("precond", precond))
+                        if v is not None
+                    },
+                }
             if getattr(adapt, "enrich", False):
                 # p-adaptivity: raise the local order by switching interpolation covers on at the marked
                 # NODES. The mesh -- points, cells, connectivity -- is untouched, so the DOF *nodes* are
@@ -2863,7 +2910,9 @@ class FEM:
         # history buffers (``.i(k)`` in the form) and the domain a ``tau=`` pseudo-time grid. March the
         # grid, threading τ as the load coordinate and the per-QP internal state on ``args["__history__"]``;
         # each step solves equilibrium then advances the states via their ``.evolves`` readout. Triggered
-        # with NOTHING passed — exactly as ``u.t`` triggers the transient stepper. ----
+        # with NOTHING passed — exactly as ``u.t`` triggers the transient stepper. A reduction on
+        # ``self._periodic`` (periodic tie / slip / hanging nodes) is applied per step INSIDE the march,
+        # which is why this dispatch sits above the reduced steady-nonlinear branch below. ----
         if getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None):
             if not getattr(self.domain, "_is_pseudo_time", False):
                 raise ValueError(
@@ -2879,7 +2928,9 @@ class FEM:
                 )
             from .utils.solver.history_march import run_history_march
 
-            return run_history_march(self, solve_fn if from_slots else solve_fn, path=tau, contact=contact)
+            return run_history_march(
+                self, solve_fn if from_slots else solve_fn, path=tau, contact=contact, values=kwargs.get("values")
+            )
         if tau is not None:
             raise ValueError(
                 "fem.solve(tau=...) sizes the steps of a pseudo-time LOAD-PATH march, but this form does "
@@ -2890,6 +2941,12 @@ class FEM:
             # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
             # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
             # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
+            if kwargs.get("values"):
+                raise NotImplementedError(
+                    "fem.solve(precond=<complex-native>, <parameter>=...): the complex-native solve works on the "
+                    "assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
+                    "Use a real-equivalent preconditioner, or build the form with the value fixed."
+                )
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
             # Non-parametric steady linear. Default: matrix-free Jacobi-preconditioned BiCGStab on the
@@ -3896,7 +3953,7 @@ class FEM:
             box-constrained solve against ``residual_fn`` reads a correct answer as a failure. Only
             ``Phi`` vanishes at the solution."""
             u0 = jnp.asarray(u0).reshape(-1)
-            resolved = self._resolve_bounds(u0)
+            resolved = self._resolve_bounds_in(u0)
             if resolved is None:
                 return residual_fn, u0
             lo, hi = resolved
@@ -3927,7 +3984,7 @@ class FEM:
             wrong operator for the constrained problem — so the same selection is applied to the matrix
             here. The active set is a function of the iterate, hence a traced mask rather than a DOF
             list, which is what :func:`bcoo_identity_rows` exists for."""
-            resolved = self._resolve_bounds(u0)
+            resolved = self._resolve_bounds_in(u0)
             if resolved is None:
                 return jacobian_fn
             from .utils.solver.fem_utils import bcoo_identity_rows
@@ -3953,7 +4010,7 @@ class FEM:
 
             Handed to a driver that extrapolates past its own sub-solve (``staggered(over_relax>1)``):
             the sub-solve's answer is feasible by construction, a step BEYOND it need not be."""
-            resolved = self._resolve_bounds(u0)
+            resolved = self._resolve_bounds_in(u0)
             if resolved is None:
                 return None
             lo, hi = resolved
@@ -3980,6 +4037,33 @@ class FEM:
         if solve_fn is None:
             _bounded.wants_jacobian = True  # the default Newton runs on the assembled tangent when offered
         return _bounded
+
+    def _resolve_bounds_in(self, u):
+        """``(lo, hi)`` in the space ``u`` lives in, or ``None`` if there are no boxes.
+
+        Usually the full DOF vector. A form with a periodic tie root-finds on the REDUCED unknowns
+        ``u = P ũ``, so its box must be stated on ``ũ``: it is the full box restricted to the kept DOFs.
+        That is exact, not an approximation — a tie that reaches here is a weight-1 selection and every
+        eliminated DOF's bound equals the bound of the DOF it resolves to, both checked when the form is
+        built (:func:`_check_bounds_under_reduction`). The full box is resolved at ``P ũ``, so a
+        ``u.i(-1)`` bound still reads the previous step's full field."""
+        u = jnp.asarray(u).reshape(-1)
+        per = getattr(self, "_periodic", None)
+        if per is None or u.shape[0] == int(self.dofs):
+            return self._resolve_bounds(u)
+        from .utils.solver.fem_utils import _periodic_blocks, prolong_periodic, restrict_state_periodic
+
+        n_red = int(_periodic_blocks(per)[2][-1])
+        if u.shape[0] != n_red:
+            raise ValueError(
+                f"jno.fem internal: a box-constrained solve was handed a state of size {u.shape[0]}, which "
+                f"is neither the full DOF count {int(self.dofs)} nor the tie's reduced count {n_red}."
+            )
+        resolved = self._resolve_bounds(jnp.asarray(prolong_periodic(per, u)).reshape(-1))
+        if resolved is None:
+            return None
+        lo, hi = resolved
+        return restrict_state_periodic(per, lo), restrict_state_periodic(per, hi)
 
     def _resolve_bounds(self, u_warm):
         """``(lo, hi)`` over the whole DOF vector for the declared boxes, or ``None`` if there are none.
@@ -4936,17 +5020,24 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
 
 
 def _build_periodic_reduction_multifield(
-    domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any
+    domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any, exclude_dofs: Any = None
 ) -> dict:
     """Periodic reduction for a coupled (multi-field) problem: one block per field. Each field's
     ``P_i`` is built from its own DOF nodes / element order / vec and its own ties (matched by
     ``field_key``), so heterogeneous-order couplings (e.g. Taylor-Hood: P2 velocity + P1 pressure)
     are supported. The Galerkin reduction stays block-wise (``P_i^T M[i,j] P_j``) via the
     ``fem_utils`` helpers — no block-diagonal ``P`` is materialised — and when all fields share a
-    mesh + order a single node-``P`` is built once and shared (the common case)."""
+    mesh + order a single node-``P`` is built once and shared (the common case).
+
+    ``exclude_dofs`` are the prescribed DOFs in the COUPLED numbering; each field's builder gets its own
+    slice, shifted to that field's local numbering, so a prescribed DOF on a tied face keeps its own row
+    exactly as on the single-field path. Without it every coupled problem with a Dirichlet value on a
+    tied face -- a periodic channel with no-slip walls -- failed to build."""
     offs = [int(o) for o in offsets]
     n_fields = len(offs) - 1
     sizes = [offs[i + 1] - offs[i] for i in range(n_fields)]
+    _ex = sorted({int(d) for d in (exclude_dofs or ())})
+    excl = [[d - offs[i] for d in _ex if offs[i] <= d < offs[i + 1]] for i in range(n_fields)]
 
     pts_all = getattr(domain, "_fem_native_dof_points_all", None) or [points] * n_fields
     cells_all = getattr(domain, "_fem_native_assembly_cells_all", None) or [cells] * n_fields
@@ -4966,11 +5057,22 @@ def _build_periodic_reduction_multifield(
         seen: set = set()
         uniq = [t for t in ties if (t[0], t[1]) not in seen and not seen.add((t[0], t[1]))]
         red = _build_periodic_reduction(domain, uniq, pts_all[0], cells_all[0], int(orders[0]), int(vec))
-        P, kept, v = red["P"], red["kept_nodes"], red["vec"]
-        nrf = int(P.shape[1])
-        blocks = [{"P": P, "kept": kept, "vec": v, "is_selection": red["is_selection"]} for _ in range(n_fields)]
-        off_full = [i * sizes[0] for i in range(n_fields + 1)]
-        off_red = [i * nrf for i in range(n_fields + 1)]
+        blocks, off_full, off_red = [], [0], [0]
+        for i in range(n_fields):
+            # the shared P serves every field with nothing prescribed on it; one that has prescribed
+            # DOFs gets its own, which differs only if one of them sits on a tied face
+            red_i = (
+                _build_periodic_reduction(
+                    domain, uniq, pts_all[0], cells_all[0], int(orders[0]), int(vec), exclude_dofs=excl[i]
+                )
+                if excl[i]
+                else red
+            )
+            blocks.append(
+                {"P": red_i["P"], "kept": red_i["kept_nodes"], "vec": red_i["vec"], "is_selection": red_i["is_selection"]}
+            )
+            off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
+            off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
         return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
 
     # Heterogeneous: a distinct P_i per field, from its own nodes/order/vec and its own ties.
@@ -4980,7 +5082,9 @@ def _build_periodic_reduction_multifield(
         vec_i = max(1, sizes[i] // int(pts_i.shape[0]))
         ties_i = [t for t in ties if _tie_field_index(t) in (i, None)]
         if ties_i:
-            red_i = _build_periodic_reduction(domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i))
+            red_i = _build_periodic_reduction(
+                domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i), exclude_dofs=excl[i]
+            )
             P_i, kept_i, v_i, sel_i = red_i["P"], red_i["kept_nodes"], red_i["vec"], red_i["is_selection"]
         else:  # a field with no periodic tie -> sparse identity (a selection: one main per row)
             import jax.experimental.sparse as jsparse
@@ -5125,11 +5229,12 @@ def _annotate_reduced_dirichlet(periodic: Any, pairs: list, tv: list) -> Any:
     # constant to put back. Refuse rather than march a condition that stopped being imposed.
     if tv and reduced_dirichlet_pairs(periodic, [(d, 0.0) for d in tv]):
         raise NotImplementedError(
-            "jno.fem: a node carrying a TIME-VARYING essential value sits on a non-matching tied/periodic "
-            "interface, where the tie reduction destroys the row that holds it. The constant-value "
-            "restoration cannot be used, because the held value changes every step. Either make the "
-            "interface conforming (`jno.shape.regions(..., conforming=True)`), or move the time-varying "
-            "condition off the tied face."
+            "jno.fem: a node carrying a TIME-VARYING essential value sits on a tied/periodic interface where "
+            "the tie reduction destroys the row that holds it (a non-matching interface, or a single node "
+            "whose tie partner is free, so the value is carried to its periodic image). The constant-value "
+            "restoration cannot be used, because the held value changes every step. Make the interface "
+            "conforming (`jno.shape.regions(..., conforming=True)`) and prescribe both sides of the tie, or "
+            "move the time-varying condition off the tied face."
         )
     return periodic
 
@@ -5294,7 +5399,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         reduce_matrix_periodic,
         reduce_vector_periodic,
         restrict_state_periodic,
-        wrap_reduced_dirichlet,
+        wrap_reduced_dirichlet_transient,
     )
 
     # A block whose state is TWO stacked copies of the field reduces by P on each half; see
@@ -5333,15 +5438,48 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
 
     blocks, off_f, off_r = _periodic_blocks(periodic)
     n_full, n_red = int(off_f[-1]), int(off_r[-1])
+    # The initial state takes each reduced DOF's value from its MAIN node. A second-order block starts
+    # from a wall-consistent state (``u[d] = g``, ``v[d] = 0``, set by its assembler); where a prescribed
+    # value was carried onto a free main DOF (a node held on the eliminated side of a tie), the main node
+    # holds the initial condition instead, and the t=0 frame showed the held node off its value (measured:
+    # 0 against a held 0.5) until the first step re-imposed it. Start from the value, as the untied block
+    # does. A FIRST-order block keeps its own convention -- its t=0 frame is the initial condition itself,
+    # on an untied wall too -- so it is left alone.
+    state0_red = restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1))
+    if _meta_in.get("second_order") and periodic.get("dirichlet_reduced"):
+        _dr = periodic["dirichlet_reduced"]
+        state0_red = state0_red.at[jnp.asarray([int(r) for r, _g in _dr], dtype=jnp.int32)].set(
+            jnp.asarray([float(np.real(g)) for _r, g in _dr], dtype=state0_red.dtype)
+        )
     meta = dict(getattr(block, "metadata", None) or {})
     meta.update(periodic=True, full_state_size=n_full, reduced_state_size=n_red)
     prol = blocks[0]["P"] if len(blocks) == 1 else periodic
 
     if block.is_nonlinear():
         _mass, _res, _jac = block.mass, block.residual, block.jacobian
+        _mres, _mjac = getattr(block, "mass_residual", None), getattr(block, "mass_residual_jac", None)
 
-        def mass_red(t, args=None, _p=periodic, _m=_mass):
-            return reduce_matrix_periodic(_p, _m(t, args))
+        # A STATE-DEPENDENT mass (`c(u) u_t`, e.g. `u_t` inside a stabilised residual) has no mass matrix --
+        # its action is the `mass_residual` -- so there is none to reduce, and wrapping None in a reducer
+        # made the block look as if it had one.
+        mass_red = None
+        if _mass is not None:
+
+            def mass_red(t, args=None, _p=periodic, _m=_mass):
+                return reduce_matrix_periodic(_p, _m(t, args))
+
+        # ...and the mass action itself is reduced like the residual (prolong in, Pᵀ out). It was left in the
+        # FULL layout, so the step residual added a full-size mass action to a reduced spatial residual.
+        mres_red = mjac_red = None
+        if _mres is not None:
+
+            def mres_red(u_red, t, args=None, _p=periodic, _m=_mres):
+                return reduce_vector_periodic(_p, jnp.asarray(_m(prolong_periodic(_p, u_red), t, args)).reshape(-1))
+
+        if _mjac is not None:
+
+            def mjac_red(u_red, t, args=None, _p=periodic, _m=_mjac):
+                return reduce_matrix_periodic(_p, _m(prolong_periodic(_p, u_red), t, args))
 
         def residual_red(u_red, t, args=None, _p=periodic, _r=_res):
             return reduce_vector_periodic(_p, jnp.asarray(_r(prolong_periodic(_p, u_red), t, args)).reshape(-1))
@@ -5354,15 +5492,20 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
 
         # `Pᵀ` sums an eliminated DOF's equation into the rows it ties to, so a prescribed DOF that is a
         # tie target loses the row holding its value -- in the reduced residual exactly as in the reduced
-        # matrix. Same pairs, same helper as every other reduced path.
-        residual_red, jac_red = wrap_reduced_dirichlet(periodic, residual_red, jac_red)
+        # matrix, and `PᵀMP` refills its (zeroed) mass row. Same pairs as every other reduced path; the
+        # time-block helper exists because these callables take `(u, t, args)`, not the state alone.
+        mass_red, residual_red, jac_red, mres_red, mjac_red = wrap_reduced_dirichlet_transient(
+            periodic, mass_red, residual_red, jac_red, mres_red, mjac_red
+        )
 
         return dataclasses.replace(
             block,
             mass=mass_red,
             residual=residual_red,
             jacobian=jac_red,
-            state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
+            mass_residual=mres_red,
+            mass_residual_jac=mjac_red,
+            state0=state0_red,
             prolongation=prol,
             metadata=meta,
         )
@@ -5419,7 +5562,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         operator_fn=op_red,
         affine_bias=c_red,
         forcing_vector_fn=f_red,
-        state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
+        state0=state0_red,
         prolongation=prol,
         metadata=meta,
     )
@@ -5502,6 +5645,62 @@ def _galerkin_reduction(basis: Any, n_dofs: int, *, ortho_tol: float = 1e-8) -> 
                 "(np.linalg.qr(U)[0], or take it straight from jno.solve.svd, whose factors already are)."
             )
     return {"P": U, "kept_nodes": None, "vec": 1, "is_selection": False}
+
+
+def _check_bounds_under_reduction(fem_obj: Any, periodic: Any, kind: str) -> None:
+    """Refuse a box ``u.bounds(lo, hi)`` that cannot be stated on a reduction's kept unknowns.
+
+    A reduced solve root-finds on ``ũ`` with ``u = P ũ``, and the box is imposed there as the full box
+    restricted to the kept DOFs (:meth:`FEM._resolve_bounds_in`). That bounds every eliminated DOF too
+    exactly when ``P`` is a weight-1 selection -- each eliminated DOF IS one kept DOF -- and the bound
+    is the same on both. Otherwise the restricted box would silently leave eliminated DOFs unbounded:
+
+    * a weighted ``P`` (a non-matching mortar / collocated interface, a hanging node, a slip condition,
+      an antiperiodic or Bloch phase): an eliminated value is a combination of kept ones, which a box
+      on the kept ones does not bound (mortar weights can even be negative);
+    * a box that differs across the tie: the tie makes the two DOFs one unknown, so it cannot hold
+      both bounds, and which one wins would be an accident of which side is kept.
+
+    A ``u.i(-1)`` bound is the previous step's field, which lies in the range of ``P`` and so is
+    periodic by construction; it is resolved here at zero, which passes.
+    """
+    if periodic is None or not getattr(fem_obj, "_bound_specs", None):
+        return
+    from .utils.solver.fem_utils import _is_selection, _periodic_blocks, restrict_state_periodic
+
+    blocks, off_f, off_r = _periodic_blocks(periodic)
+    main = np.zeros(int(off_f[-1]), dtype=np.int64)
+    for i, b in enumerate(blocks):
+        P = b.get("P")
+        weight_one = (
+            P is not None
+            and hasattr(P, "indices")
+            and b.get("kept") is not None
+            and _is_selection(P)
+            and bool(np.all(np.asarray(P.data) == 1.0))
+        )
+        if not weight_one:
+            raise NotImplementedError(
+                f"jno.fem: `.bounds(lo, hi)` together with a {kind} whose elimination is WEIGHTED (a "
+                "non-matching mortar or collocated interface, a hanging node, a slip condition, or an "
+                "antiperiodic / Bloch phase). The box is imposed on the kept unknowns, and there it does "
+                "not bound an eliminated value that is a combination of them. Make the tied interface "
+                "conforming (`jno.shape.regions(..., conforming=True)`), or drop one of the two."
+            )
+        idx = np.asarray(P.indices)
+        main[int(off_f[i]) + idx[:, 0]] = int(off_r[i]) + idx[:, 1]
+    lo, hi = fem_obj._resolve_bounds(jnp.zeros((int(fem_obj.dofs),)))
+    for side, full in (("lower", np.asarray(lo)), ("upper", np.asarray(hi))):
+        kept = np.asarray(restrict_state_periodic(periodic, jnp.asarray(full)))
+        bad = np.flatnonzero(~np.isclose(full, kept[main], rtol=1e-12, atol=1e-12))
+        if bad.size:
+            d = int(bad[0])
+            raise ValueError(
+                f"jno.fem: the {side} bound of `.bounds(lo, hi)` differs across the {kind}: DOF {d} has "
+                f"{full[d]:.6g}, but the DOF it is tied to has {kept[main[d]]:.6g} ({bad.size} DOF(s) "
+                "disagree). The tie makes them ONE unknown, which cannot hold two bounds. Make the bound "
+                "periodic too (the same value on both tied faces), or drop the tie."
+            )
 
 
 def reduce_op_periodic(op: Any, mode: str, periodic: dict) -> Any:
@@ -5603,12 +5802,26 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     ``field_key`` acts on that field's DOF sub-block (multifield, e.g. radiation on T in a heat+flow system);
     without one it acts on the whole vector (single field). For a **transient** form the coupling enters each
     implicit step: a nonlinear time block gains the term in its residual, a linear one is promoted to a
-    nonlinear (backward-Euler) block -- so e.g. enclosure radiation over a heating cycle solves in-residual."""
+    nonlinear (backward-Euler) block -- so e.g. enclosure radiation over a heating cycle solves in-residual.
+    On a step-history form (``.i(k)`` / ``.evolves`` over ``domain(tau=...)``) the coupling enters every
+    load step's residual: the wrapped operator keeps the history layout and state readout that make
+    ``fem.solve()`` march, and passes the step's load-path time through to the local residual."""
     if fem_obj._mode not in ("linear", "nonlinear", "transient"):
         raise NotImplementedError(f"jno.fem: nonlocal Coupling terms are not supported for mode {fem_obj._mode!r}.")
     n = int(fem_obj.dofs)
-    pairs = getattr(domain, "_fem_native_dirichlet_pairs", None) or []
-    d_dofs = jnp.asarray([int(p[0]) for p in pairs], dtype=jnp.int32) if pairs else None
+    # EVERY constrained row, not only the constant-valued ones: a row whose held value moves with τ / t
+    # (`u(right) - (0.5 + tau)`) or rides the runtime args (`u(left) - g`, a net profile) has no constant
+    # pair either, and a contribution left on it is added to its `u - g` -- measured: a coupling of 0.1
+    # held such a wall at 0.4 where 0.5 was prescribed. The operator's own declaration joins in for the
+    # paths that do not stash on the domain (1-D).
+    _d = [int(p[0]) for p in (getattr(domain, "_fem_native_dirichlet_pairs", None) or [])]
+    for _dofs, _node, _coords in getattr(domain, "_fem_native_dirichlet_tv", None) or []:
+        _d.extend(int(i) for i in np.asarray(_dofs).reshape(-1))
+    _d.extend(int(i) for i in getattr(domain, "_fem_native_dirichlet_args_dofs", None) or [])
+    _op_d = getattr(fem_obj._op, "dirichlet_dofs", None)
+    if _op_d is not None:
+        _d.extend(int(i) for i in np.asarray(_op_d).reshape(-1))
+    d_dofs = jnp.asarray(np.unique(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
 
     # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
     # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
@@ -5701,17 +5914,35 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
             return (A @ u) - jnp.asarray(b).reshape(-1) + coupling_residual(u, args)
 
         fem_obj._op = FemResidualOperator(residual, size=n, runtime_parameter_exprs=rpe)
+        # The promoted operator states its essential rows like every other residual operator does, so an
+        # extrapolating driver (`staggered(over_relax>1)`) leaves them on their prescribed values.
+        fem_obj._op.dirichlet_dofs = d_dofs
         fem_obj._mode = "nonlinear"
         fem_obj._A = fem_obj._b = None
     else:  # already a nonlinear residual operator -> add the coupling
         base_residual = op.residual
 
-        def residual(u, args=None, _base=base_residual):
-            return jnp.asarray(_base(u, args)).reshape(-1) + coupling_residual(u, args)
+        # `*rest` carries the load-path time: a step-history form's residual is `R(u, args, tau)`, called
+        # so by the `domain(tau=...)` march. A keyword default here swallowed it -- tau landed in `_base`.
+        def residual(u, args=None, *rest, _base=base_residual):
+            return jnp.asarray(_base(u, args, *rest)).reshape(-1) + coupling_residual(u, args)
 
-        fem_obj._op = FemResidualOperator(
+        wrapped = FemResidualOperator(
             residual, jacobian_fn=None, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
         )
+        # Everything else the assembler hung on the operator describes the SAME problem and must survive
+        # the wrap: the step-history layout and state readout that make `fem.solve()` march a
+        # `domain(tau=...)` grid (dropped, the march never started and the first residual raised on an
+        # unbuffered `u.i(-1)`), the load-path fields, the derived-field rules, the contact search and
+        # the Dirichlet DOF set. Only what the wrap changes is not copied: the residual; the tangent,
+        # which cannot see the opaque coupling (the solve goes matrix-free, as for every Coupling); and
+        # the runtime parameters, now merged with the coupling's.
+        for _k, _v in vars(op).items():
+            if _k not in ("residual", "jacobian", "runtime_parameter_exprs"):
+                setattr(wrapped, _k, _v)
+        if d_dofs is not None:
+            wrapped.dirichlet_dofs = d_dofs  # the full set the coupling is zeroed on (see above)
+        fem_obj._op = wrapped
     return fem_obj
 
 
@@ -5884,17 +6115,18 @@ def _fem_impl(
     _refuse_point_indexing(constraints)
     _orig_fem_kwargs = {"quad_degree": quad_degree}
 
-    # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
-    # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
-    # bare marker, not a walkable expression, so it must not reach `_discover_domain` (which walks
-    # coordinate Variables) or the `_region_and_support` classifier.
+    # Gauge pins (`p.pin()`) remove a field's constant null space. Each lowers to a single-node
+    # Dirichlet `p(node) - value`. A GaugePin is a bare marker, not a walkable expression, so it must
+    # not reach `_discover_domain` (which walks coordinate Variables) or the `_region_and_support`
+    # classifier: the markers are set aside here and lowered right after the periodic ties are split
+    # off (below), still before classification -- which vertex a pin may use depends on the ties.
     _mean_gauge_fields: List[Any] = []
-    if any(isinstance(c, GaugePin) for c in constraints):
-        pins = [c for c in constraints if isinstance(c, GaugePin)]
+    _gauge_pins = [c for c in constraints if isinstance(c, GaugePin)]
+    if _gauge_pins:
         # `mean=True` keeps the node pin (it is what makes the system non-singular) and additionally
         # re-levels the field after the solve; only the constant the pin leaves behind is replaced.
-        _mean_gauge_fields = [pin.field for pin in pins if getattr(pin, "mean", False)]
-        constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
+        _mean_gauge_fields = [pin.field for pin in _gauge_pins if getattr(pin, "mean", False)]
+        constraints = [c for c in constraints if not isinstance(c, GaugePin)]
 
     # Nonlocal coupling terms (radiation, integral/non-reflecting BCs, ...) are not local weak forms and
     # not walkable trace expressions: a plain pure-JAX residual function ``f(u) -> (n_dofs,)``. A bare
@@ -5951,6 +6183,8 @@ def _fem_impl(
     constraints = core_constraints
     if periodic_ties and not constraints:
         raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
+    # Gauge pins lower to a one-node Dirichlet at a vertex off every tied face (see `_lower_gauge_pin`).
+    constraints = constraints + [_lower_gauge_pin(p, periodic_ties) for p in _gauge_pins]
 
     # Essential normal-flux BCs `u·n - g` (H(div) RT) pin boundary-edge DOFs at assembly; like periodic
     # ties they must be separated before classification (the Cartesian Dirichlet parser would reject them).
@@ -6094,16 +6328,15 @@ def _fem_impl(
     # displacement field's energy history is the same march as one-field plasticity. Reject the
     # structurally-incompatible routes up front — fail loud, never a silently dropped update.
     # (transient / complex are rejected below, once the IR reveals them.)
+    # A periodic tie composes: the march solves each step in the tie's reduced space and the readout
+    # evaluates the evolution formula on the prolonged (tie-satisfying) solution.
     if _evolution and (
-        is_vpinn
-        or getattr(domain, "dimension", None) == 1
-        or (_trial_spaces(constraints) - _NATIVE_SPACES)
-        or periodic_ties
+        is_vpinn or getattr(domain, "dimension", None) == 1 or (_trial_spaces(constraints) - _NATIVE_SPACES)
     ):
         raise NotImplementedError(
             "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, "
             "native-Lagrange path only (the load-path march over `domain(tau=...)`), single-field or "
-            "coupled. Not yet: VPINN, 1D, non-nodal (Argyris/Morley/edge) elements, or periodic ties."
+            "coupled. Not yet: VPINN, 1D, or non-nodal (Argyris/Morley/edge) elements."
         )
 
     # The transient route reduces M/A from the assembly context at *assembly* time, so its P must be
@@ -6221,6 +6454,7 @@ def _fem_impl(
             # returned a centre value of 0.0194 against 0.0737, with the constraint reported as built.
             fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, _hp)
             fem_obj._periodic = _hp
+            _check_bounds_under_reduction(fem_obj, _hp, "hanging-node constraint")
             return _fuse_complex_steady(fem_obj)
         if not periodic_ties and not slip_bcs:
             return _fuse_complex_steady(fem_obj)
@@ -6262,7 +6496,13 @@ def _fem_impl(
             periodic = _build_periodic_reduction_nonnodal(domain, periodic_ties, fem_obj.offsets)
         elif multifield:
             periodic = _build_periodic_reduction_multifield(
-                domain, periodic_ties, fem_obj.points, cells, ele_order, fem_obj.offsets
+                domain,
+                periodic_ties,
+                fem_obj.points,
+                cells,
+                ele_order,
+                fem_obj.offsets,
+                exclude_dofs=[int(d) for d, _g in _dpairs] + _tvdofs,
             )
         else:
             # A prescribed DOF must not be eliminated by the tie, and a prescribed DOF that the tie
@@ -6325,6 +6565,9 @@ def _fem_impl(
         # ops are returned unchanged and reduce lazily in FEM.solve.
         fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
         fem_obj._periodic = periodic
+        _check_bounds_under_reduction(
+            fem_obj, periodic, "slip condition `n·u = 0`" if periodic.get("coupling") == "slip" else "periodic tie"
+        )
         return _fuse_complex_steady(fem_obj)
 
     def _finalize(fem_obj: "FEM") -> "FEM":
@@ -6554,6 +6797,16 @@ def _fem_impl(
                 "u_tt mass term. Use a jno.fn indicator coefficient instead, e.g. (1 + k*ind)*(u.x*v.x + "
                 "u.y*v.y), which gives the same piecewise-material dynamics."
             )
+        if couplings:
+            # This route returns its augmented block without passing through `_finalize`, where a
+            # Coupling is folded in -- so the coupling was DROPPED, silently: a `1e6 * u` coupling left
+            # the trajectory bit-identical to the uncoupled one.
+            raise NotImplementedError(
+                "jno.fem: a nonlocal `jno.Coupling` on a second-order-in-time (u_tt) form is not wired -- "
+                "the augmented [u; v] block has no slot for it, and it would be dropped. Write the problem "
+                "first order in time with an explicit velocity field (a first-order transient takes a "
+                "Coupling), or express the term locally in the weak form."
+            )
         # Coupled second-order-in-time is the SAME augmented formula with the coupled M2/C/K blocks —
         # one assembler serves both, so damping, a nonlinear spatial operator and driven boundaries
         # apply to the coupled case with no second copy of the path.
@@ -6574,9 +6827,26 @@ def _fem_impl(
         if periodic_ties:
             # Bloch / phononic in the time domain: reduce the augmented [u, v] block by the field
             # prolongation P (duplicated per block inside _reduce_transient_block_periodic).
+            #
+            # Prescribed DOFs go through the SAME exclude/restore the first-order routes use. Without it a
+            # wall value on a tied face was lost silently wherever the two sides of the tie disagree about
+            # it: `PᵀAP` sums the eliminated DOF's row into its partner's, so a value held on one side only
+            # (or a non-periodic one, g = x on a wall meeting the tie) was averaged or overwritten --
+            # measured 0.5 and 1.0 off the prescribed value on a u_tt membrane, while the same data written
+            # without the corner conflict held it exactly.
+            _tdp, _ttv = _prescribed_dofs(domain)
             _cells = getattr(domain, "_fem_native_assembly_cells", None)
             _eo = int(getattr(domain, "_fem_native_assembly_order", 1))
-            _periodic = _build_periodic_reduction(domain, periodic_ties, _so.points, _cells, _eo, vec or 1)
+            _periodic = _build_periodic_reduction(
+                domain,
+                periodic_ties,
+                _so.points,
+                _cells,
+                _eo,
+                vec or 1,
+                exclude_dofs=[int(d) for d, _g in _tdp] + _ttv,
+            )
+            _periodic = _annotate_reduced_dirichlet(_periodic, _tdp, _ttv)
             _so._op = reduce_op_periodic(_so._op, "transient", _periodic)
             _so._periodic = _periodic
         return _so
@@ -6925,10 +7195,9 @@ def _fem_impl(
         )
 
     # ---- native Lagrange (single field): the standard fast path. Covers 2D triangle and 3D tet (incl.
-    # Neumann/Robin surfaces), steady (incl. runtime-scalar-parametric) and transient (constant
-    # Dirichlet + a time-dependent source). complex / VPINN / field-param / time-varying-Dirichlet /
-    # transient-parametric / vector-or-parametric-periodic fall through to the specialized branches
-    # below. ----
+    # Neumann/Robin surfaces), steady and transient, runtime-parametric or not, with constant or
+    # time-varying g(x, t) Dirichlet data and a time-dependent source. complex / VPINN / transient-periodic
+    # fall through to the specialized branches below. ----
     from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
 
     # Native periodic is wired for the STEADY single-field case that ``_finalize`` reduces -- scalar or
@@ -6944,37 +7213,26 @@ def _fem_impl(
         and not _is_complex_form(domain, ir)
         and _native_periodic_ok
     ):
-        _native_now = True
-        if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-            # native transient covers a runtime SCALAR parameter and a single-field nodal FIELD
-            # parameter k(x). A time-varying Dirichlet g(x,t) routes native only for the LINEAR,
-            # non-parametric transient (the row-replacement + per-step Dirichlet-lift forcing path);
-            # combined with a runtime parameter or a nonlinear residual it is rejected below.
-            from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs as _cnce
-            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin
+        # A time-varying Dirichlet g(x, t) routes native on every first-order transient, parametric or not:
+        # the row replacement (linear: the per-step Dirichlet lift in the forcing; nonlinear: u[d] - g(x_d, t)
+        # in the residual) is the same code the coupled route runs, re-assembled branch included. It used
+        # to be refused here with a runtime parameter or a trainable net in the form, after the coupled route
+        # had already been taught to thread it.
+        from .utils.solver.fem_native import assemble_fem_native
 
-            _native_now = (
-                not any(_crp(b) for b in weak_bares)
-                and not any(_nlin(domain, b) for b in weak_bares)
-                # tv-Dirichlet g(x,t) + a TRAINABLE net: rejected below (frozen nets stay native)
-                and not any(_cnce(b) for b in weak_bares)
-            )
-        if _native_now:
-            from .utils.solver.fem_native import assemble_fem_native
-
-            domain._fem_problem = None  # native owns this domain's FE state
-            op, mode, offs = assemble_fem_native(
-                domain,
-                volume_terms,
-                boundary_terms,
-                dirichlet_raw,
-                ic_residuals,
-                vec=vec or 1,
-                quad_degree=quad_degree,
-                evolution=_evolution,
-                bounded=bool(_bounds),
-            )
-            return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+        domain._fem_problem = None  # native owns this domain's FE state
+        op, mode, offs = assemble_fem_native(
+            domain,
+            volume_terms,
+            boundary_terms,
+            dirichlet_raw,
+            ic_residuals,
+            vec=vec or 1,
+            quad_degree=quad_degree,
+            evolution=_evolution,
+            bounded=bool(_bounds),
+        )
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 
     # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively.
     # ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so wrapping each term in ``.real`` /
@@ -7160,26 +7418,34 @@ def _fem_impl(
             )
         return _finalize(FEM(domain=domain, op=block, classification=classification, mode="transient"))
 
-    # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble
-    # the full native transient block, build the prolongation P from the native assembly mesh, then
-    # reduce the block (P^T M P, P^T·operator_fn·P, ...). The reduced block carries P, so its trajectory
-    # prolongs back with u = P u_red. This is the optimized scalar single-field fast path; vector and
-    # coupled multi-field fall through to the general assembly + `_finalize` block-wise reduction. ----
+    # ---- native periodic transient (single field, scalar or vector; linear or nonlinear, incl.
+    # runtime-parametric): assemble the full native transient block, build the prolongation P from the
+    # native assembly mesh, then reduce the block (P^T M P, P^T·operator_fn·P, ...). The reduced block
+    # carries P, so its trajectory prolongs back with u = P u_red. A vector field needs nothing extra:
+    # the tie's node-pair weights expand componentwise, `kron(P_node, I_vec)`, exactly as on the steady
+    # path and the coupled transient (whose per-field blocks are this same call with each field's vec).
+    # Coupled multi-field falls through to the general assembly + `_finalize` block-wise reduction. ----
     if (
         not is_vpinn
         and periodic_ties
         and is_transient
         and not multifield
-        and (vec or 1) == 1
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not _is_complex_form(domain, ir)
-        and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
     ):
         from .utils.solver.fem_native import assemble_fem_native
 
+        if couplings:
+            # Refused on the coupled route too (`_finalize`); this branch returns without it, so the
+            # coupling used to be dropped in silence (a `1e6 * u` coupling changed nothing).
+            raise NotImplementedError(
+                "jno.fem: periodic ties combined with a *transient* nonlocal Coupling are not yet supported "
+                "-- the transient march runs on the tie's reduced unknowns, which the coupling's full-space "
+                "residual cannot address. Drop the tie, or express the term locally in the weak form."
+            )
         domain._fem_problem = None
         op, mode, offs = assemble_fem_native(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
         )
         if mode != "transient":
             # fail loud rather than silently mis-reduce a steady/nonlinear op as a time block
@@ -7193,7 +7459,7 @@ def _fem_impl(
             domain._fem_native_dof_points,
             domain._fem_native_assembly_cells,
             int(getattr(domain, "_fem_native_assembly_order", 1)),
-            1,
+            vec or 1,
             exclude_dofs=[int(d) for d, _g in _tdp] + _ttv,
         )
         reduced = _reduce_transient_block_periodic(op, _annotate_reduced_dirichlet(periodic, _tdp, _ttv))
@@ -7367,18 +7633,18 @@ def _fem_impl(
     _parametric = any(_crp(b) for b in weak_bares)
     _nonlinear = any(_nlin(domain, b) for b in weak_bares)
     if periodic_ties:
+        # Every standard single-field tie has returned above: steady or transient (first or second order
+        # in time), scalar or vector, linear or nonlinear, with constant or time-varying Dirichlet data,
+        # real or complex. What reaches here is a combination no route assembles; say which.
+        _tv_dir = any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
         raise NotImplementedError(
-            "jno.fem: a periodic tie on a TRANSIENT form is supported on a scalar single field only "
-            f"(the transient route pre-builds its own reduction). This form has vec={vec or 1}, "
-            f"nonlinear={_nonlinear}, parametric+steady={_parametric and not is_transient}. A STEADY "
-            "vector tie is supported — drop the time derivative, write the field as a scalar, or drop "
-            "the periodic tie."
-        )
-    if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-        raise NotImplementedError(
-            "jno.fem: a time-varying Dirichlet g(x, t) on a transient form is supported natively only for a "
-            f"LINEAR, non-parametric problem (got nonlinear={_nonlinear}, parametric={_parametric}). "
-            "Linearize the form, or remove the runtime parameter."
+            "jno.fem: this single-field form with a periodic tie matched no assembly route. The form is "
+            f"transient={bool(is_transient)}, complex={bool(_is_complex_form(domain, ir))}, "
+            f"time-varying Dirichlet={_tv_dir}, vec={vec or 1}, nonlinear={_nonlinear}, "
+            f"parametric={_parametric}, dimension={getattr(domain, 'dimension', None)}. A tie is supported "
+            "on steady and transient single-field Lagrange forms, scalar or vector, linear or nonlinear, "
+            "real or complex; a COMPLEX transient with a time-varying Dirichlet value is not wired (with or "
+            "without a tie). Hold the Dirichlet value constant in time, or drop the tie."
         )
     raise NotImplementedError(
         "jno.fem: this single-field weak form is not handled by the native assembler. Please report the "
@@ -7470,7 +7736,6 @@ def _assemble_multifield(
     # uses — so the Dirichlet field indices match the kernel's field order.
     fields, field_index = _infer_fields(ir.volume_expr)
     by_field: dict[int, dict[str, Any]] = {}
-    dirichlet_tv: List[Any] = []  # (field_idx, region, comp, value_node) for time-varying g(x,t)
     for field_key, region, comp, value, value_node in dirichlet_raw:
         fidx = field_index.get(field_key)
         if fidx is None:
@@ -7483,8 +7748,6 @@ def _assemble_multifield(
             current = dict(current) if isinstance(current, dict) else {}
             current[_COMPONENT_NAMES[comp]] = value
             region_values[region] = current
-        if _is_temporal_value_node(value_node):
-            dirichlet_tv.append((fidx, region, comp, value_node))
     domain._fem_dirichlet_by_field = by_field
 
     # Native 2D Lagrange coverage gate (expressed over the inferred fields -- no `constraints` here):
@@ -7510,8 +7773,8 @@ def _assemble_multifield(
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
     # constant (incl. non-homogeneous) Dirichlet + a time-dependent source, and a time-varying Dirichlet
-    # g(x,t) for the LINEAR block (row-replacement + per-step Dirichlet-lift forcing); a nonlinear block
-    # with a time-varying Dirichlet is rejected below (the native branch carries only constant Dirichlet).
+    # g(x,t) on a linear block (row replacement + the per-step Dirichlet lift in the forcing) and on a
+    # nonlinear one (the same row replacement in the residual, its held value read at the step's time).
     if is_transient:
         if evolution:
             # Same rejection the single-field path makes once its IR reveals the transient — restated here
@@ -7522,7 +7785,6 @@ def _assemble_multifield(
                 "coupled (multi-field) form — the load path is the *pseudo-time* march over "
                 "`domain(tau=...)`, not a `u.t` transient. Drop `u.t`, or drive time through the `tau` grid."
             )
-        _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
         # The native coupled-transient assembler threads runtime SCALAR parameters through ``args``
         # (``fem_native._runtime_vals`` packs each parameter per cell, re-evaluated every step), so a
         # *parametric* coupled transient -- e.g. trainable rate constants recovered through the
@@ -7535,7 +7797,7 @@ def _assemble_multifield(
             and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
             and not _is_complex_form(domain, ir)
         )
-        if _native_transient_ok and _tv_native:
+        if _native_transient_ok:
             from .utils.solver.fem_native import assemble_fem_native
 
             domain._fem_problem = None
@@ -7543,15 +7805,15 @@ def _assemble_multifield(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
             )
             return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
-        # Coupled transient that the native block does not cover (a complex coefficient, or a time-varying
-        # Dirichlet on a nonlinear block) -- reject explicitly rather than mis-assemble.
+        # Coupled transient that the native block does not cover (a complex coefficient, a non-Lagrange
+        # field, or a mesh that is not 2-D/3-D) -- reject explicitly rather than mis-assemble.
         raise NotImplementedError(
             "jno.fem: this coupled (multi-field) transient is not supported natively. The native coupled "
-            "transient covers constant / time-dependent / runtime-parametric coefficients (incl. nonlinear) "
-            "and a time-varying Dirichlet on a LINEAR block "
-            f"(got nonlinear={any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)}, "
-            f"complex={_is_complex_form(domain, ir)}, "
-            f"time_varying_dirichlet={bool(dirichlet_tv)})."
+            "transient covers REAL, 2-D/3-D, Lagrange fields -- constant / time-dependent / runtime-parametric "
+            "coefficients (incl. nonlinear), with constant or time-varying g(x, t) Dirichlet data "
+            f"(got dimension={getattr(domain, 'dimension', None)}, "
+            f"spaces={sorted({str(f.get('space', 'Lagrange')) for f in fields})}, "
+            f"complex={_is_complex_form(domain, ir)})."
         )
 
     if _native_ok:
@@ -8061,6 +8323,10 @@ def _assemble_second_order_time(
         sop, _sm, _soffs = assemble_fem_native(
             domain, stiff_raw, boundary_terms, [], [], vec=_vec_asm, quad_degree=quad_degree
         )
+        # That Dirichlet-free assembly overwrote the SHARED prescribed-DOF stash with nothing. Put this
+        # problem's back: a periodic tie reads it to keep prescribed DOFs out of the elimination and to
+        # restore the rows the congruence destroys, and a nonlocal Coupling reads it to zero pinned rows.
+        domain._fem_native_dirichlet_pairs, domain._fem_native_dirichlet_tv = pairs, tv
         if multifield and list(_soffs) != gm["offs"]:
             raise NotImplementedError(
                 f"jno.fem: coupled second-order-in-time requires one consistent block layout; the "

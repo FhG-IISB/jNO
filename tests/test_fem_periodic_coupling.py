@@ -115,3 +115,42 @@ def test_periodic_coupling_constant_load_matches_extra_source():
     # and the coupling genuinely moved the solution off the no-load periodic solve
     u_plain = _eval(_build())
     assert float(np.linalg.norm(u_coupled - u_plain)) > 1e-3, "the coupling did not change the solution"
+
+
+def _transient(order, tie, value_shape=()):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.1, 3))
+    d.tag("left", lambda x, y: x < 1e-9)
+    d.tag("right", lambda x, y: x > 1 - 1e-9)
+    u, phi = d.fem_symbols(value_shape=value_shape) if value_shape else d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    x0, y0, t0 = d.variable("initial", split=True)
+    dot = (lambda a, b: jno.np.inner(a, b, n_contract=1)) if value_shape else (lambda a, b: a * b)
+    rate = ui.tt if order == 2 else ui.t
+    zero = (0.0,) * value_shape[0] if value_shape else 0.0
+    terms = [dot(rate, vi) + dot(ui.x, vi.x) + dot(ui.y, vi.y), u(x0, y0) - zero]
+    if order == 2:
+        terms.append(u.bind(x=x0, y=y0, t=t0).t - zero)
+    if tie:
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        terms.append(u(xl, yl) - u(xr, yr))
+    return terms + [jno.Coupling(lambda U: 1e6 * U, name="stiff")]
+
+
+@pytest.mark.parametrize(
+    "order, tie, value_shape",
+    [(2, False, ()), (2, True, ()), (1, True, ()), (1, True, (2,))],
+    ids=["u_tt", "u_tt-periodic", "u_t-periodic", "u_t-periodic-vector"],
+)
+def test_a_coupling_on_a_route_that_cannot_carry_it_is_refused_not_dropped(order, tie, value_shape):
+    """The u_tt route and the single-field periodic transient return their time block without passing
+    the step that folds a Coupling in; a ``1e6 * u`` coupling used to leave the trajectory bit-identical
+    to the uncoupled one. Each now refuses by name."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        with pytest.raises(NotImplementedError, match="Coupling"):
+            jno.fem(_transient(order, tie, value_shape))
+    finally:
+        jax.config.update("jax_enable_x64", prev)

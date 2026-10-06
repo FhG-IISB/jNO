@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 class _TimeScheme:
@@ -244,6 +245,79 @@ class _BDF2Scheme(_TimeScheme):
             _, ys = jax.lax.scan(jax.checkpoint(step), (first, s0), grid[2:])
             return s1, ys
 
+        from .backend_blocks import _march_eagerly, _march_to_host
+
+        if _march_eagerly(args, save_ts):
+            # Eager: the start-up step, then the BDF2 steps in chunks whose frames go to the host as they
+            # are made -- the carry is the two-level state (u^n, u^{n-1}), so a chunk boundary changes
+            # nothing about the scheme (see `_march_to_host`).
+            def startup(s0, grid2, args):
+                blk = hoist_time_invariant(block, args, grid2[0])
+                return blk.step(
+                    s0, grid2[1] - dt, dt, args=args, theta=1.0,
+                    linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=_judge,
+                )  # fmt: skip
+
+            from .backend_blocks import _carried_tangent0
+
+            # The step tangent rides the carry (`SemidiscreteTimeBlock.step`, `tangent=`). It starts empty
+            # rather than from the start-up step's: that one is scaled by 1/dt, the BDF2 steps by 3/(2dt).
+            tang0 = _carried_tangent0(block, s0, nonlinear_solve, dtype)
+
+            def make_step(args, t_start):
+                blk = hoist_time_invariant(block, args, t_start)
+
+                def step(carry, t_next):
+                    (u_n, u_nm1), tang = carry if tang0 is not None else (carry, None)
+                    u_star = (4.0 * u_n - u_nm1) / 3.0
+                    out = blk.step(
+                        u_star, t_next - dt_eff, dt_eff, args=args, theta=1.0,
+                        linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=_judge, tangent=tang,
+                    )  # fmt: skip
+                    if tang is not None:
+                        out, tang = out
+                    wn = out[0] if _judge else out
+                    nxt = (wn, u_n) if tang is None else ((wn, u_n), tang)
+                    return nxt, out
+
+                return step
+
+            cfg = (linear_solve, nonlinear_solve, "bdf2", dt)
+            first = _split_cached_march(block, args, (*cfg, "startup"), startup, s0, jnp.asarray(grid_ts[:2], dtype), args)
+            s1 = first[0] if _judge else first
+
+            def _verdict(r_end, r_start, n_done, final, unchanged):
+                _check_march_converged(
+                    np.concatenate([np.reshape(np.asarray(first[1]), (1,)), r_end]),
+                    np.concatenate([np.reshape(np.asarray(first[2]), (1,)), r_start]),
+                    grid_ts[1 : n_done + 2],
+                    nonlinear_solve,
+                    what="transient march (BDF2)",
+                    coord="t",
+                    advice=_TRANSIENT_ADVICE,
+                    unchanged=unchanged,
+                )
+
+            if grid_ts.size < 3:  # one step: the start-up step is the whole march
+                if _judge:
+                    _verdict(np.zeros((0,)), np.zeros((0,)), 0, True, None)
+                traj = jnp.concatenate([s0[None, :], s1[None, :]], axis=0)
+                return np.asarray(_resample_trajectory(traj, grid_ts, save_ts, dtype))
+            return _march_to_host(
+                block,
+                args,
+                (*cfg, tang0 is not None),
+                make_step,
+                (s1, s0) if tang0 is None else ((s1, s0), tang0),
+                grid_ts[1:],
+                dtype,
+                save_ts,
+                state_of=(lambda c: c[0]) if tang0 is None else (lambda c: c[0][0]),
+                prefix_ts=grid_ts[:2],
+                prefix_states=[s0, s1],
+                judge=_verdict if _judge else None,
+            )
+
         # Traced ONCE per block and configuration (see `_cached_march`): an eager BDF2 march used to re-trace
         # its scan on every call -- measured ~0.3 s per warm call of a 12k-DOF heat march.
         s1, ys = _split_cached_march(
@@ -389,8 +463,8 @@ class _SDIRKScheme(_TimeScheme):
         grid_ts = jnp.asarray(grid_np, dtype)
         judge = bool(block.is_nonlinear())
 
-        def march(s0, grid_ts, args):
-            blk = hoist_time_invariant(block, args, grid_ts[0])
+        def make_step(args, t_start):
+            blk = hoist_time_invariant(block, args, t_start)
 
             def step(u, t_next):
                 un, reps = self._one_step(blk, u, t_next - dt, dt, args, linear_solve, nonlinear_solve, judge)
@@ -398,9 +472,35 @@ class _SDIRKScheme(_TimeScheme):
                     return un, un
                 return un, (un, jnp.stack([r[0] for r in reps]), jnp.stack([r[1] for r in reps]))
 
-            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+            return step
 
-        ys = _split_cached_march(block, args, (linear_solve, nonlinear_solve, repr(self), dt), march, s0, grid_ts, args)
+        def march(s0, grid_ts, args):
+            return jax.lax.scan(jax.checkpoint(make_step(args, grid_ts[0])), s0, grid_ts[1:])
+
+        from .backend_blocks import _march_eagerly, _march_to_host
+
+        cfg = (linear_solve, nonlinear_solve, repr(self), dt)
+        if _march_eagerly(args, save_ts):  # chunks, frames to the host as they are made (`_march_to_host`)
+            from .history_march import _TRANSIENT_ADVICE, _check_march_converged
+
+            n_stage = self.A.shape[0]
+
+            def _verdict(r_end, r_start, n_done, final, unchanged):
+                _check_march_converged(
+                    r_end.reshape(-1),  # one entry per STAGE: every stage is a Newton solve that must converge
+                    r_start.reshape(-1),
+                    np.repeat(grid_np[1 : n_done + 1], n_stage),
+                    nonlinear_solve,
+                    what=f"transient march ({self!r}, per stage)",
+                    coord="t",
+                    advice=_TRANSIENT_ADVICE,
+                )
+
+            return _march_to_host(
+                block, args, cfg, make_step, s0, grid_np, dtype, save_ts,
+                state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0], judge=_verdict if judge else None,
+            )  # fmt: skip
+        ys = _split_cached_march(block, args, cfg, lambda *a: march(*a)[1], s0, grid_ts, args)
         if judge:
             from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
@@ -609,8 +709,8 @@ class _RosenbrockScheme(_TimeScheme):
         t0, t1 = float(block.t0), float(block.t1)
         grid_ts = jnp.asarray(np.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1), dtype)
 
-        def march(s0, grid_ts, args):
-            blk = hoist_time_invariant(block, args, grid_ts[0])
+        def make_step(args, t_start):
+            blk = hoist_time_invariant(block, args, t_start)
             if block.is_nonlinear():
                 if block.mass is not None and blk.mass is block.mass:
                     raise NotImplementedError(
@@ -627,9 +727,21 @@ class _RosenbrockScheme(_TimeScheme):
                 un = self._one_step(blk, u, t_next - dt, dt, args, linear_solve)
                 return un, un
 
-            return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+            return step
 
-        ys = _split_cached_march(block, args, (linear_solve, repr(self), dt), march, s0, grid_ts, args)
+        def march(s0, grid_ts, args):
+            return jax.lax.scan(jax.checkpoint(make_step(args, grid_ts[0])), s0, grid_ts[1:])
+
+        from .backend_blocks import _march_eagerly, _march_to_host
+
+        cfg = (linear_solve, repr(self), dt)
+        if _march_eagerly(args, save_ts):  # chunks, frames to the host as they are made (`_march_to_host`)
+            grid_np = np.asarray(grid_ts, dtype=float)
+            return _march_to_host(
+                block, args, cfg, make_step, s0, grid_np, dtype, save_ts,
+                state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0],
+            )  # fmt: skip
+        ys = _split_cached_march(block, args, cfg, lambda *a: march(*a)[1], s0, grid_ts, args)
         traj = jnp.concatenate([s0[None, :], ys], axis=0)
         return _resample_trajectory(traj, grid_ts, save_ts, dtype)
 
@@ -836,6 +948,57 @@ def adaptive_march(
     return out * poison
 
 
+def _refuse_what_the_mask_would_zero(Aop, mask, s0, forcings):
+    """Raise where holding every zero-mass DOF at 0 would be WRONG, instead of returning it.
+
+    The exponential integrator treats a zero-mass row as a homogeneous Dirichlet row and masks the DOF to
+    0. That is exact for ``u = 0`` on the wall and silently wrong for anything else. Measured on a 2-D heat
+    block before this guard: with ``u = 1`` on the wall the boundary came back 0, and with ``u = t`` the
+    whole field stayed 0 -- plausible numbers, no warning. The same mask would zero any other algebraic
+    unknown (a pressure row), whose value is not 0 either.
+
+    Two checks, both on concrete values (under ``jit``/``grad`` the values are tracers and cannot be
+    inspected, so a traced call relies on the eager call that precedes it):
+
+    * no zero-mass row may reference an unconstrained DOF -- a Dirichlet row, or the real/imaginary pair of
+      a fused complex one, qualifies; a pressure or flux row does not;
+    * the data on those rows -- the forcing, sampled at both ends of the window for a time-varying one --
+      must be zero. (An initial state that is non-zero on the wall is not refused: it is inconsistent with a
+      zero wall value, and every scheme overwrites it at the first step.)
+    """
+    arrays = [mask, s0, *forcings]
+    if any(isinstance(a, jax.core.Tracer) for a in arrays):
+        return
+    bnd = np.asarray(mask) < 0.5
+    if not bnd.any():
+        return
+    data = getattr(Aop, "data", None)
+    idx = getattr(Aop, "indices", None)
+    if data is not None and idx is not None and not isinstance(data, jax.core.Tracer):
+        rows, cols, vals = np.asarray(idx)[:, 0], np.asarray(idx)[:, 1], np.asarray(data)
+        # A zero-mass row may couple to other ZERO-MASS DOFs -- a fused complex Dirichlet row ties the real
+        # and imaginary halves of the same DOF -- because with zero data that subsystem is solved by 0.
+        # It must not reach an unconstrained DOF: that is an algebraic equation (a pressure row) whose
+        # solution is not 0.
+        coupled = bnd[rows] & ~bnd[cols] & (np.abs(vals) > 0)
+        if coupled.any():
+            raise NotImplementedError(
+                "jno.solve.exponential: this block has zero-mass rows that couple to other unknowns (an "
+                "algebraic constraint -- a pressure or a flux row -- not a plain Dirichlet row). The "
+                "exponential integrator holds every zero-mass DOF at 0, which would be wrong for them. Use "
+                "jno.solve.theta(...), bdf2() or sdirk(), which impose algebraic rows exactly."
+            )
+    for v in forcings:
+        v = np.asarray(v).reshape(-1)
+        scale = max(1.0, float(np.max(np.abs(v)))) if v.size else 1.0
+        if v.size and float(np.max(np.abs(v[bnd]))) > 1e-12 * scale:
+            raise NotImplementedError(
+                "jno.solve.exponential: a Dirichlet value on this block is NOT zero. The exponential "
+                "integrator holds every zero-mass DOF at 0, so it would silently return u = 0 there. Use jno.solve.theta(...), bdf2() or sdirk(), or write "
+                "the problem for w = u - g with a lifting g of the boundary data so the wall value is 0."
+            )
+
+
 def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     """Advance ``M u̇ + A u = f(t)`` per step via ``exp(-dt·M⁻¹A)``: exact for the homogeneous decay, with a
     ``φ₁`` weight for a constant source and a ``φ₂`` ramp weight (ETD2) for a time-varying one.
@@ -902,6 +1065,7 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
 
     d = lumped_diagonal(Mop)  # Dirichlet DOFs carry NO mass (d=0) — algebraic (u=0), not ODEs
     mask = (d > 1e-12 * jnp.max(d)).astype(dtype)  # 1 interior / 0 boundary — a *multiply* (trace-safe)
+    _refuse_what_the_mask_would_zero(Aop, mask, s0, [c_aff] + ([_f_of(grid[0]), _f_of(grid[-1])] if _time_varying else []))
 
     def _consistent_m_solve():
         """A masked, Jacobi-preconditioned CG solve for ``M⁻¹·(mask·rhs)`` — used by the consistent-mass
@@ -988,6 +1152,25 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
                     wn = wn + dt * apply_f(g, _phi1)
             return wn, wn
 
+    from .backend_blocks import _march_eagerly, _march_to_host
+
+    if _march_eagerly(args, save_ts):
+        # Eager: chunks whose frames go to the host as they are made (`_march_to_host`). Each step emits its
+        # full field `to_field(w)` -- a fixed diagonal map, so this is the same per-row value as mapping the
+        # stacked trajectory afterwards; frames between grid points blend with the shared resampler.
+        def make_step(_args, _t_start):
+            def step_u(wc, t_target):
+                wn, _ = step(wc, t_target)
+                return wn, to_field(wn)
+
+            return step_u
+
+        grid_np = np.asarray(grid, dtype=float)
+        return _march_to_host(
+            block, args, ("exponential", order, mass, symmetric, dt), make_step, w0, grid_np, dtype, save_ts,
+            state_of=to_field, prefix_ts=grid_np[:1], prefix_states=[to_field(w0)],
+            cache=False,  # the step closes over the source evaluated at THIS call's args
+        )  # fmt: skip
     _, ws = jax.lax.scan(step, w0, grid[1:])
     traj_u = jax.vmap(to_field)(jnp.concatenate([w0[None, :], ws], axis=0))  # each row → the full field u
     save_ts = jnp.asarray(save_ts, dtype)

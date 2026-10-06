@@ -65,12 +65,12 @@ def _wave_fem(mesh_size=0.1, n_periods=4, n_steps=240, damping=0.0, u0_fn=_mode1
     return jno.fem([weak, u(xb, yb) - float(dirichlet), u_ic, vel_ic])
 
 
-def _trajectory(fem, theta=None):
+def _trajectory(fem, theta=None, nonlinear_solve=None):
     block = fem.operator
     if theta is not None:
         block.metadata["theta"] = theta
     ts = np.asarray(_block_time_grid(block))
-    ys = np.asarray(_default_transient_integrate(block, {}, ts))
+    ys = np.asarray(_default_transient_integrate(block, {}, ts, nonlinear_solve=nonlinear_solve))
     # The augmented state is [displacements | velocities], so the split is the MIDPOINT — the same
     # thing as offsets[1] for a single field, but not for a coupled system, whose displacement half
     # already spans several field blocks.
@@ -417,7 +417,10 @@ def test_second_order_1d_nonlinear_reduces_to_the_linear_path():
         if eps:
             weak = weak + eps * ((u * u * u) * vi)
         fem = jno.fem([weak, u(xb) - 0.0, u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]), ui0.t - 0.0])
-        _ts, U, _ = _trajectory(fem)
+        # The routes are compared below the march Newton's own tolerance (it stops just under atol=1e-8 and
+        # solves each correction only as far as that needs), so the nonlinear one is solved tightly.
+        tight = jno.solve.newton(rtol=1e-13, atol=1e-15) if eps else None
+        _ts, U, _ = _trajectory(fem, nonlinear_solve=tight)
         return U
 
     lin, nl = wave(0.0), wave(1e-9)
@@ -607,6 +610,105 @@ def test_second_order_periodic_bloch_standing_wave():
     exact = np.cos(2 * PI * pts[:, 0])[None, :] * np.cos(2 * PI * ts)[:, None]
     rel = np.linalg.norm(Yf[:, :nf] - exact) / np.linalg.norm(exact)
     assert rel < 0.03, f"periodic wave does not track cos(2πx)cos(2πt): rel L2 = {rel:.4f}"
+
+
+# ---- a periodic tie meeting a Dirichlet wall ---------------------------------------------------------
+# A membrane periodic in x (`u(left) - u(right)`, the faces INCLUDING their corners) with held walls at
+# y = 0 and y = 1: the walls touch the tied faces at the four corners. The tie reduction `PᵀAP` sums an
+# eliminated corner's row into its partner's, so the u_tt route used to lose a wall value silently
+# wherever the two sides of the tie disagree about it (a non-periodic value, or a value held on one side
+# only): measured 1.0 and 0.5 off the prescribed value. The oracles are the analytic standing wave and
+# the same data written so the tie never meets the wall.
+def _tied_membrane(bottom, g, *, corners=True, order_t=2, cubic=0.0, ramp=True, t1=0.4, n_steps=40, mesh_size=0.1):
+    """``u_tt = Δu - cubic·u³`` (or ``u_t = …`` for ``order_t=1``) on the unit square, periodic in x, with
+    ``u = g`` on the ``bottom`` predicate and ``u = 0`` on y = 1, released from the (2, 1) mode (plus the
+    wall ramp ``(1 - y) g`` when ``ramp``). Returns ``(times, U, nodes)`` with the trajectory prolonged back
+    to every mesh node."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, t1, n_steps))
+    if corners:
+        d.tag("left", lambda x, y: x < 1e-6)
+        d.tag("right", lambda x, y: x > 1 - 1e-6)
+    else:  # open faces: the tie never reaches the walls
+        d.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+        d.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    d.tag("bottom", bottom)
+    d.tag("top", lambda x, y: y > 1 - 1e-6)
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    x0, y0, t0 = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ui0 = u.bind(x=x0, y=y0, t=t0)
+    rate = ui.tt if order_t == 2 else ui.t
+    grad_grad = ui.x * vi.x + ui.y * vi.y
+    pde = rate * vi + grad_grad + (cubic * ui * ui * ui * vi if cubic else 0.0 * vi)
+    terms = [
+        pde,
+        u(xl, yl) - u(xr, yr),
+        u(xb, yb) - jno.fn(g, [xb, yb]),
+        u(xt, yt) - 0.0,
+        u(x0, y0) - jno.fn(lambda x, y: ramp * (1 - y) * g(x, 0 * y) + jnp.cos(2 * PI * x) * jnp.sin(PI * y), [x0, y0]),
+    ]
+    if order_t == 2:
+        terms.append(ui0.t - 0.0)
+    fem = jno.fem(terms)
+    blk = fem.operator
+    ts = np.asarray(_block_time_grid(blk))
+    Yr = jnp.asarray(_default_transient_integrate(blk, {}, ts))
+    Y = np.asarray(jax.vmap(blk.prolong)(Yr))
+    n = Y.shape[1] // 2 if order_t == 2 else Y.shape[1]
+    return ts, Y[:, :n], np.asarray(fem.points)
+
+
+def test_second_order_tie_holds_a_wall_value_and_tracks_the_standing_wave():
+    """Walls held at u = 1 (y = 0) and u = 0 (y = 1), periodic in x: the exact solution is the static
+    ramp plus the (2, 1) standing wave, ``u = (1 - y) + cos(2πx) sin(πy) cos(√5 π t)``. Every wall node --
+    the tied corners included -- holds its value at every step, and the trajectory tracks the analytic
+    wave to the discretization error."""
+    ts, U, X = _tied_membrane(lambda x, y: y < 1e-6, lambda x, y: 1.0 + 0.0 * x, t1=0.5, n_steps=60, mesh_size=0.08)
+    exact = (1 - X[None, :, 1]) + np.cos(2 * PI * X[None, :, 0]) * np.sin(PI * X[None, :, 1]) * np.cos(
+        np.sqrt(5.0) * PI * ts[:, None]
+    )
+    rel = np.linalg.norm(U - exact) / np.linalg.norm(exact)
+    assert rel < 0.015, f"tied membrane does not track the analytic standing wave: rel L2 = {rel:.4f}"
+    wall = X[:, 1] < 1e-6
+    assert np.abs(U[:, wall] - 1.0).max() < 1e-12, "the wall value is not held on the tied corners"
+
+
+def test_second_order_tie_keeps_a_non_periodic_wall_value():
+    """``u = x`` on the bottom wall is NOT periodic: the corners hold 0 and 1, which the tie would equate.
+    A prescribed value wins over the tie, so the answer must be the one written with open faces (no tie at
+    the corners). Before the fix the tied run moved a corner by 1.0 -- the full wall value -- silently."""
+    bottom, g = (lambda x, y: y < 1e-6), (lambda x, y: x)
+    _ts, U_tied, X = _tied_membrane(bottom, g, corners=True)
+    _ts, U_open, _X = _tied_membrane(bottom, g, corners=False)
+    wall = X[:, 1] < 1e-6
+    assert np.abs(U_tied[:, wall] - X[None, wall, 0]).max() < 1e-12, "the wall value g = x is not held"
+    assert np.abs(U_tied - U_open).max() < 1e-9, "a wall value on a tied corner changed the solution"
+
+
+@pytest.mark.parametrize("order_t, cubic", [(2, 0.0), (2, 0.5), (1, 0.0)], ids=["u_tt", "u_tt-nonlinear", "u_t"])
+def test_tie_carries_a_one_sided_wall_value_to_its_image(order_t, cubic):
+    """A wall held on ONE side of the tie (``u = 0.5`` on y = 0, x < 1/2): the tie makes the two corners one
+    unknown, so the answer must equal holding the value on both corners -- at every step, the t = 0 frame
+    included. The initial condition is the bare mode, which does not satisfy the wall. A second-order block
+    starts from a wall-consistent state (``u = g``, ``u_t = 0``), so the held value must show at t = 0 at
+    the image too; a first-order march reports the initial condition itself at t = 0, on an untied wall as
+    well, so there the check starts at the first step. Before the fix the u_tt route lost the value (0.5
+    off at t = 0, 4e-4 after, at the image); the first-order case is the regression guard it was fixed
+    against."""
+    g = lambda x, y: 0.5 + 0.0 * x  # noqa: E731
+    one_side = lambda x, y: (y < 1e-6) & (x < 0.5)  # noqa: E731
+    both = lambda x, y: (y < 1e-6) & ((x < 0.5) | (x > 1 - 1e-6))  # noqa: E731
+    _ts, U_one, X = _tied_membrane(one_side, g, order_t=order_t, cubic=cubic, ramp=False)
+    _ts, U_both, _X = _tied_membrane(both, g, order_t=order_t, cubic=cubic, ramp=False)
+    corners = (X[:, 1] < 1e-6) & ((X[:, 0] < 1e-6) | (X[:, 0] > 1 - 1e-6))
+    k0 = 0 if order_t == 2 else 1  # first order: the t = 0 frame is the initial condition (untied too)
+    assert np.abs(U_one[k0:, corners] - 0.5).max() < 1e-12, "the one-sided wall value is not held at its image"
+    assert np.abs(U_one - U_both).max() < 1e-8, "one-sided and two-sided prescriptions disagree"
 
 
 def _elastodynamics_fem(mesh_size=0.12, n_periods=4, n_steps=240, E=1.0, nu=0.25, rho=1.0):

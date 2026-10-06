@@ -81,6 +81,12 @@ problem to change one number. Measured on an 8-value sweep: **6.20 s rebuilding,
 The solve is staged **once** (6 tracings for 8 values, not 48) because the value arrives as a runtime
 argument and jit keys on shape, not on value; `x0=` warm-starts across the sweep without re-staging.
 
+The same call works on every path that solves: steady linear and nonlinear, a transient (it returns the
+trajectory), a load-path `.i(k)` march (the declared grid, an explicit `tau=<schedule>`, and the
+`tau=jno.solve.adaptive(...)` pilot, which needs concrete values to choose its steps), and a remeshing
+transient (`adapt=jno.solve.remesh(...)`, which refuses a parametric form given no values rather than
+marching it at the stored ones). Every runtime parameter must be named; a missing one raises.
+
 !!! tip "`continuation=` does the same march for you, and returns the family"
     The loop above is the manual form. `jno.solve.continuation` is the driver: it marches the values,
     warm-starts each solve from the previous one, and can hand back either the endpoint or the whole

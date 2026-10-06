@@ -297,24 +297,33 @@ def _bisect_slope(f, x, delta, *, atol, rtol, max_iters, dtype):
     linear solve grows. In jNO it matters even less: a residual is ~14.6 ms against a ~613 ms tangent
     assembly on the problem this was profiled on.
 
-    NaN-safe by the same construction as everything else in this module: a non-finite ``phi'`` fails its
-    sign comparison, so the bracket shrinks rather than the NaN propagating."""
+    **A non-finite trial is not the minimum.** Past an inverted element (``det F <= 0`` makes
+    ``J**(-2/3)`` NaN) ``phi'`` is NaN. Such a trial fails its sign comparison, so the bracket shrinks
+    toward ``lo``; and the bisection KEEPS GOING, because a NaN slope is not a slope under tolerance. The
+    answer is the bracket's midpoint only while its upper end is a finite point; otherwise it is ``lo``,
+    which only ever moves to a trial with a finite, still-descending slope. Before, ``|NaN| > tol`` read
+    as converged: the search stopped at the first non-finite trial and returned the midpoint of
+    ``[lo, NaN point]`` -- never evaluated, and on a 3-D Yeoh phase-field march itself inside the inverted
+    region, so the sub-solve took a NaN step and stopped there (its own ``||r|| > atol`` is also False
+    for NaN). Which runs hit it was round-off luck: reordering a 3x3 contraction's sum flipped it."""
     slope = lambda lam: jnp.dot(jnp.asarray(f(x + lam * delta)).reshape(-1), delta)  # noqa: E731
     s0, s1 = slope(jnp.zeros((), dtype)), slope(jnp.ones((), dtype))
     # Scaled by ||delta|| so `atol` is a slope in physical units rather than a raw dot product.
     tol = atol * jnp.linalg.norm(delta) + rtol * jnp.abs(s0)
 
     def cond(st):
-        lo, hi, sl, it = st
-        return (jnp.abs(sl) > tol) & ((hi - lo) > 1e-12) & (it < max_iters)
+        lo, hi, sl, it, _hi_ok = st
+        # `not (|sl| <= tol)`: a NaN slope is NOT converged (see the docstring), so the bisection goes on.
+        return jnp.logical_not(jnp.abs(sl) <= tol) & ((hi - lo) > 1e-12) & (it < max_iters)
 
     def body(st):
-        lo, hi, _sl, it = st
+        lo, hi, _sl, it, hi_ok = st
         mid = 0.5 * (lo + hi)
         sm = slope(mid)
         # `sm * s0 > 0` -> the root is to the RIGHT of mid (same sign as the left end), else to the left.
         right = sm * s0 > 0.0
-        return jnp.where(right, mid, lo), jnp.where(right, hi, mid), sm, it + 1
+        return (jnp.where(right, mid, lo), jnp.where(right, hi, mid), sm, it + 1,
+                jnp.where(right, hi_ok, jnp.isfinite(sm)))  # fmt: skip
 
     # The carried slope starts at INFINITY, not at ``s0``. Seeding it with ``s0`` lets the loop exit
     # before bisecting even once whenever ``|phi'(0)|`` is already under tolerance -- and it then returns
@@ -323,10 +332,10 @@ def _bisect_slope(f, x, delta, *, atol, rtol, max_iters, dtype):
     # step of every sub-solve. Measured before the fix: an exact line search needing MORE staggered
     # sweeps than the backtracking it replaced (22 vs 21), and a probe whose minimum lay at ``lam = 0``
     # returning ``lam = 0.5`` with ``phi' = +1.0``. The convergence test belongs on midpoints only.
-    lo, hi, _sl, _it = jax.lax.while_loop(
-        cond, body, (jnp.zeros((), dtype), jnp.ones((), dtype), jnp.asarray(jnp.inf, dtype), 0)
+    lo, hi, _sl, _it, hi_ok = jax.lax.while_loop(
+        cond, body, (jnp.zeros((), dtype), jnp.ones((), dtype), jnp.asarray(jnp.inf, dtype), 0, jnp.isfinite(s1))
     )
-    lam = 0.5 * (lo + hi)
+    lam = jnp.where(hi_ok, 0.5 * (lo + hi), lo)  # never the midpoint of a bracket ending in a non-finite trial
     # No sign change over [0, 1]: phi' never crosses zero, so the energy is still decreasing at the full
     # step and there is nothing to find inside it (their Fig. 2a).
     return jnp.where(s0 * s1 > 0.0, jnp.ones((), dtype), lam)
@@ -638,27 +647,40 @@ def assembled_krylov_solve(tol=1e-10, maxit=2000):
     and GMRES all converge to the same trajectory). The check is one SpMV per solve; a healthy solve never
     pays for the GMRES."""
 
-    def solve(J, b):
+    def solve(J, b, rtol=None):
+        """``rtol`` (traced allowed) overrides ``tol`` for this solve -- an inexact-Newton forcing term."""
         from ..._fem import _bicgstab_jacobi
         from .krylov import gmres as _scaled_gmres
         from .linear import jacobi, sparse_matvec
 
         b = jnp.asarray(b).reshape(-1)
-        x = _bicgstab_jacobi(J, b, float(tol), int(maxit))
+        if rtol is None:
+            tol_ = float(tol)
+            x = _bicgstab_jacobi(J, b, tol_, int(maxit))
+        else:  # a traced forcing term cannot be the compiled helper's STATIC tolerance; same iteration
+            tol_ = rtol
+            x = jax.scipy.sparse.linalg.bicgstab(sparse_matvec(J), b, tol=tol_, atol=0.0, maxiter=int(maxit), M=jacobi(J))[
+                0
+            ]
         mv = sparse_matvec(J)
         eps = float(jnp.finfo(b.dtype).eps)
         r_rel = jnp.linalg.norm(mv(x) - b) / jnp.maximum(jnp.linalg.norm(b), eps)
-        ktol = max(float(tol), 100.0 * eps)
+        ktol = jnp.maximum(tol_, 100.0 * eps)
+        # A solve asked for less is judged against what it was asked for: a BiCGStab that broke down still
+        # misses that by orders of magnitude, while the GMRES rescue is not paid by every loose solve.
         return jax.lax.cond(
-            r_rel < max(1e-9, 1e4 * eps),
+            r_rel < jnp.maximum(jnp.maximum(1e-9, 10.0 * tol_), 1e4 * eps),
             lambda: x,
             lambda: _scaled_gmres(mv, b, tol=ktol, atol=0.0, restart=min(int(b.shape[0]), 40), M=jacobi(J))[0],
         )
 
+    solve.accepts_rtol = True
     return solve
 
 
-def newton_default(residual_fn, u0, *, jacobian=None, inner_tol=1e-10, inner_maxit=2000, **kw):
+def newton_default(
+    residual_fn, u0, *, jacobian=None, inner_tol=1e-10, inner_maxit=2000, reuse=False, tangent0=None, info=None, **kw
+):  # fmt: skip
     """jNO's default Newton: on the ASSEMBLED tangent whenever the assembler provides one, else matrix-free.
 
     With ``jacobian`` (a callable ``u -> BCOO``, the assembler's tangent): each step assembles ``J(u)`` and
@@ -667,10 +689,23 @@ def newton_default(residual_fn, u0, *, jacobian=None, inner_tol=1e-10, inner_max
     ``-div((1+u^2) grad u)`` problem (RTX 3070, 4 Newton steps, same root to 2e-16): 516 -> 206 ms at
     10k DOF, 1133 -> 428 ms at 29k, 4025 -> 1181 ms at 87k (2.3-3.4x). Without one (a residual-only
     problem) it is :func:`newton_krylov`, the previous default. Differentiable either way (implicit
-    diff through ``custom_root``)."""
+    diff through ``custom_root``).
+
+    ``reuse`` / ``tangent0`` / ``info`` are :func:`newton_direct`'s (lagged tangent, carried across calls;
+    the solve's own residual norms); without an assembled tangent there is none to keep and ``info`` stays
+    empty."""
     if jacobian is not None:
-        return newton_direct(residual_fn, jacobian, u0, linear_solve=assembled_krylov_solve(inner_tol, inner_maxit), **kw)
+        return newton_direct(
+            residual_fn, jacobian, u0, linear_solve=assembled_krylov_solve(inner_tol, inner_maxit), reuse=reuse,
+            tangent0=tangent0, info=info, **kw,
+        )  # fmt: skip
     return newton_krylov(residual_fn, u0, inner_tol=inner_tol, inner_maxit=inner_maxit, **kw)
+
+
+#: The inexact-Newton forcing floor on a KEPT tangent (``newton_direct(reuse=True)``): the inner Krylov
+#: solve stops at this relative residual unless the outer target needs more. A carried tangent measured
+#: ~1e-3 contraction per step on the flows that motivated it; 1e-2 and 1e-4 ran within noise of it there.
+_CHORD_FORCING_FLOOR = 1e-3
 
 
 def newton_direct(
@@ -687,6 +722,8 @@ def newton_direct(
     ls_c=1e-4,
     linear_solve=None,
     reuse=False,
+    tangent0=None,
+    info=None,
 ):
     """Root-find ``residual_fn(u) = 0`` with a **sparse-direct** Newton: each step solves against the
     ASSEMBLED Jacobian ``jacobian_fn(u)`` (a ``jax.experimental.sparse.BCOO``) instead of the
@@ -739,7 +776,15 @@ def newton_direct(
     many residual evaluations, i.e. a large 3-D saddle; on a small problem it can be slower. The
     count is reported as ``fem.stats["nonlinear"]["factorizations"]``. Convergence and the gradient
     are unaffected: the loop still stops on the true residual, and the implicit gradient uses a fresh
-    tangent at the root."""
+    tangent at the root.
+
+    ``tangent0 = (J, valid)`` (with ``reuse=True``) starts from a tangent the CALLER kept -- a time march
+    carrying the last step's tangent into the next -- treated as a reused one: the contraction rule above
+    decides whether it still serves. ``valid=False`` (a traced flag) assembles a fresh one instead.
+    ``info`` (a dict) receives ``"norms"`` -- ``(||r(root)||, ||r(u0)||)``, which a time march reports per
+    step instead of evaluating the residual twice more -- and, with ``reuse=True``, ``"tangent"``: the last
+    tangent, gradient-free, for the caller to carry. A carried tangent is never part of the answer or of
+    its gradient (the implicit gradient re-assembles at the root)."""
     if linear_solve is None:
         from .linear import sparse_lu_solve
 
@@ -789,7 +834,7 @@ def newton_direct(
 
         if not reuse:
             u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
-            return u, k, k, jnp.linalg.norm(r), r0n  # a fresh tangent (one factorization) every step
+            return u, k, k, jnp.linalg.norm(r), r0n, None  # a fresh tangent (one factorization) every step
 
         def body_reuse(state):
             # Lagged-Jacobian step: see the docstring for the rule. `J` is the tangent carried from
@@ -797,7 +842,18 @@ def newton_direct(
             u, r, k, J, fresh, nfact = state
             rn = jnp.linalg.norm(r)
             with gate_suspended():  # as in `body`: no host callback inside the loop (reverse mode, remat)
-                delta = linear_solve(J, -r)
+                if getattr(linear_solve, "accepts_rtol", False):
+                    # INEXACT Newton (Dembo, Eisenstat & Steihaug, SIAM J. Numer. Anal. 19 (1982) 400): a
+                    # step on a kept tangent contracts the residual by its tangent's contraction, not by the
+                    # accuracy of the linear solve, so solving far below it buys nothing. The forcing term
+                    # tracks what this iteration needs -- half the outer target over the current residual --
+                    # floored at _CHORD_FORCING_FLOOR, capped at 0.1. Measured on a 442k-DOF stabilised
+                    # flow: 1200 -> 160 matvecs per step, 2.14 -> 1.49 s per step, same Newton count.
+                    target = atol + rtol * r0n
+                    eta = jnp.clip(0.5 * target / jnp.maximum(rn, 1e-300), _CHORD_FORCING_FLOOR, 0.1)
+                    delta = linear_solve(J, -r, rtol=eta)
+                else:
+                    delta = linear_solve(J, -r)
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u_try = u + alpha * delta
             r_try = f_fwd(u_try)
@@ -811,11 +867,23 @@ def newton_direct(
             J_new = jax.lax.cond(refresh, lambda: J_fwd(u_new), lambda: J)
             return u_new, r_new, k + 1, J_new, refresh, nfact + refresh.astype(jnp.int32)
 
-        state0 = (x0, r_start, 0, J_fwd(x0), jnp.asarray(True), jnp.asarray(1, jnp.int32))
-        u, r, k, _J, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
-        return u, k, nfact, jnp.linalg.norm(r), r0n
+        if tangent0 is None:
+            J0, fresh0 = J_fwd(x0), jnp.asarray(True)
+        else:
+            # A tangent the caller carried (the last time step's): taken as a REUSED one, so the first
+            # step on it is judged by the contraction rule; an invalid one (the march's first step) is
+            # replaced by a fresh assembly, here, in one place.
+            J_carried, valid = tangent0
+            valid = jnp.asarray(valid)
+            J0 = jax.lax.cond(valid, lambda: J_carried, lambda: J_fwd(x0))
+            fresh0 = jnp.logical_not(valid)
+        state0 = (x0, r_start, 0, J0, fresh0, fresh0.astype(jnp.int32))
+        u, r, k, J_last, _f, nfact = jax.lax.while_loop(cond, body_reuse, state0)
+        return u, k, nfact, jnp.linalg.norm(r), r0n, J_last
 
-    root, _steps, _nfact, _rn, _r0n = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
+    if tangent0 is not None and not reuse:
+        raise ValueError("newton_direct(tangent0=...) starts from a kept tangent, which only reuse=True does.")
+    root, _steps, _nfact, _rn, _r0n, _J = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
     _convergence_check(
         f0,
         u0,
@@ -838,6 +906,10 @@ def newton_direct(
         tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, linear_solve, "the newton_direct tangent", "transpose")  # noqa: E731
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
+    if info is not None:
+        info["norms"] = (_rn, _r0n)
+        if _J is not None:
+            info["tangent"] = jax.lax.stop_gradient(_J)
     return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
 
 

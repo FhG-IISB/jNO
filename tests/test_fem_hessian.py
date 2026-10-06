@@ -280,3 +280,30 @@ def test_a_vector_field_on_a_c1_family_is_refused_by_name(space):
     # The non-nodal path assembles eagerly, so the refusal lands at build -- like `space="N1E", order=2`.
     with pytest.raises(NotImplementedError, match="hold SCALAR DOFs"):
         jno.fem([inner(laplacian(ui, [xi, yi]), laplacian(vi, [xi, yi]), n_contract=1)])
+
+
+@pytest.mark.parametrize("make, dim", [("lagrange_triangle", 2), ("lagrange_tet", 3)])
+def test_a_p1_hessian_push_forward_compiles_no_contraction(make, dim):
+    """The P1 reference Hessian is a zero table; its push-forward is a zero constant, not an einsum. The
+    einsum was the most expensive kernel of a 3-D stabilised Navier-Stokes residual (``lap(u)`` in the
+    strong residual: 26 -> 14 ms at 55k DOFs). P2 keeps the contraction, and the zero stays differentiable
+    in the cell Jacobian (a zero gradient, which is exact) and refuses a curved cell as before."""
+    import jno.utils.solver.fem_lagrange as fl
+
+    J = jax.numpy.asarray(np.eye(dim) * 0.3 + 0.05 * np.arange(dim * dim).reshape(dim, dim))
+    p1, p2 = getattr(fl, make)(1), getattr(fl, make)(2)
+    rh1 = jax.numpy.asarray(p1.ref_hess)  # a concrete device table, as the assembler holds it
+    assert not np.any(p1.ref_hess)
+    jaxpr = str(jax.make_jaxpr(lambda J: fl.identity_pushforward_hess(rh1, J))(J))
+    assert "dot_general" not in jaxpr, "the P1 Hessian push-forward still contracts a zero table"
+    H1 = fl.identity_pushforward_hess(rh1, J)
+    assert H1.shape == (*p1.ref_hess.shape[:2], dim, dim) and not np.any(np.asarray(H1))
+    g = jax.grad(lambda J: fl.identity_pushforward_hess(rh1, J).sum())(J)
+    assert not np.any(np.asarray(g))
+    # P2: the full push-forward, K_ia K_jb H_ij, against the contraction written out on the host.
+    K = np.linalg.inv(np.asarray(J))
+    want = np.einsum("qnij,ia,jb->qnab", p2.ref_hess[..., 0, :, :], K, K)
+    got = np.asarray(fl.identity_pushforward_hess(jax.numpy.asarray(p2.ref_hess), J))
+    assert np.abs(want).max() > 1.0 and np.allclose(got, want, rtol=1e-12, atol=1e-12)
+    with pytest.raises(NotImplementedError, match="AFFINE"):
+        fl.identity_pushforward_hess(rh1, jax.numpy.stack([J, J]))

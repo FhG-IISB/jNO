@@ -38,6 +38,7 @@ linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary con
 
 from __future__ import annotations
 
+import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 import jax
@@ -93,7 +94,7 @@ from .sharding import element_mesh as _element_mesh
 from .sharding import element_partials as _element_partials
 from .sharding import reduce_partials as _reduce_partials
 from .sharding import sharded_element_add as _sharded_element_add
-from .small_linalg import small_det, small_inv
+from .small_linalg import small_det, small_inv, small_matmul
 from .weak_form import (
     _apply_sign,
     _contains_temporal_derivative,
@@ -782,6 +783,147 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
+def _dirichlet_value_columns(gs, vt, comp, region):
+    """A Dirichlet value table ``(n_nodes, n_values)`` checked against the clamped components.
+
+    ``n_values`` must be 1 (a scalar, the same on every clamped component) or, for an all-component clamp
+    ``u(region) - g`` on a ``vt``-vector field, exactly ``vt`` (one column per component). Anything else is
+    a shape the user did not mean, so it is refused rather than truncated: a vector value used to be cut
+    to its first component and broadcast, which imposed ``(1.0, 1.0)`` for ``(1.0, -0.5)``."""
+    n_values = gs.shape[1] if gs.ndim == 2 else 1
+    if n_values == 1:
+        return gs.reshape(-1)
+    if comp is None and n_values == vt:
+        return gs
+    what = f"component {int(comp)} (`u(...)[{int(comp)}] - g`)" if comp is not None else f"a {vt}-component field"
+    raise ValueError(
+        f"jno.fem: the Dirichlet value on {region!r} has {n_values} components per point, but it clamps {what}. "
+        "Give a scalar, or one value per component for an all-component clamp `u(region) - (g0, g1, ...)`."
+    )
+
+
+def _time_value_components(value_node, coords, vt, comp, region):
+    """How many values per point a time-varying ``g(x, t)`` has -- 1 or ``vt`` -- read from one evaluation
+    at ``t = 0`` with the stored parameter values. A value that does not scale with the number of points
+    (constant in space) and has several components cannot be laid out per node here: refused with the
+    per-component spelling that works."""
+    from ..._fem import _eval_value_node_at_time
+
+    n = int(coords.shape[0])
+    if n == 0:
+        return 1
+    k = min(2, n)
+    r = np.asarray(_eval_value_node_at_time(value_node, coords[:k], 0.0))
+    r1 = np.asarray(_eval_value_node_at_time(value_node, coords[:1], 0.0))
+    if k == 2 and r.size == r1.size:  # constant in space
+        if r1.size == 1:
+            return 1
+        raise NotImplementedError(
+            f"jno.fem: the time-varying Dirichlet value on {region!r} is a {r1.size}-vector that does not depend "
+            "on position. Write it per component, `u(region)[i] - g_i(t)`, which is supported."
+        )
+    per = r.size // k
+    if per == 1:
+        return 1
+    _dirichlet_value_columns(np.zeros((1, per)), vt, comp, region)  # raises unless per == vt, all-component
+    return per
+
+
+#: The field key of a test function evaluated as a seeded trial field (see ``_seeded_element_residual``).
+_SEED_KEY = ("__test_seed__",)
+#: Internal A/B switch (tests): ``[False]`` evaluates every term per test DOF, as before. Read at build time.
+_SEEDED_TEST = [True]
+
+
+class _NotSeedable(Exception):
+    """A seeded test-function piece did not reduce to a real scalar per quadrature point."""
+
+
+#: ``piece -> (rewritten, test_nodes) | None``. Module-level and weak-keyed ON PURPOSE: the element kernels'
+#: closures are walked by the compile cache's content fingerprint and its baked-array liveness check, and
+#: a mutable cache inside them is neither -- it made that walk fail outright. A piece's rewrite depends on
+#: the piece alone, so sharing it across builds is exact.
+_SEED_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _seeded_piece(piece):
+    """``(rewritten, test_nodes)`` -- ``piece`` with its test function as a trial field keyed ``_SEED_KEY``
+    -- or ``None`` when ``piece`` is not provably linear in it (see ``_seeded_element_residual``)."""
+    if not _SEEDED_TEST[0]:
+        return None
+    try:
+        return _SEED_CACHE[piece]
+    except (KeyError, TypeError):
+        pass
+    from ...trace import TestFunction as _Test
+    from ...trace import TrialFunction as _Trial
+    from ...trace import substitute as _substitute
+    from .solver_helper import iter_children
+    from .time_route import linear_degree
+
+    res = None
+    if linear_degree(piece, lambda n: isinstance(n, _Test), strict=True) == 1:
+        tests: Dict[int, Any] = {}
+
+        def _walk(n):
+            if isinstance(n, _Test):
+                tests[id(n)] = n
+                return
+            for ch in iter_children(n) or ():
+                _walk(ch)
+
+        _walk(piece)
+        proxies = {}
+        for n in tests.values():
+            pr = _Trial(name="seed", value_shape=getattr(n, "value_shape", ()), order=getattr(n, "order", 1),
+                        space=getattr(n, "space", "Lagrange"))  # fmt: skip
+            pr.field_key = _SEED_KEY
+            proxies[n] = pr
+        res = (_substitute(piece, proxies), tuple(tests.values()))
+    try:
+        _SEED_CACHE[piece] = res
+    except TypeError:  # not weak-referenceable: recompute next time, it is a trace-time cost only
+        pass
+    return res
+
+
+class _FusedVolumeTerms(tuple):
+    """Additive volume sub-terms that share ONE test field and ONE region mask, assembled as one kernel.
+
+    ``_split_additive_terms`` lowers a weak form to its additive pieces, and each piece used to become its
+    own element kernel: its own ``lax.map`` over the cells, its own per-cell ``jacfwd`` in the tangent,
+    and -- the expensive part -- its own copy of the tangent's triplet pattern. Pieces with the same test
+    field and mask have the IDENTICAL pattern (same cells, same test DOFs, same local DOFs), so the
+    compressed-scatter plan held one int32 per raw triplet for every piece: ``n_pieces x n_cells x
+    n_test x n_local``. A stabilised 3-D Navier-Stokes momentum equation splits into 16 pieces, and on a
+    16^3 P1/P1 cube those 16 identical index copies were 288 MiB of the march's 0.56 GiB peak -- more
+    than the element blocks, the operator (16 MiB) and the Krylov vectors together. That, not the
+    physics, is what made the device memory grow at ~35 kB per DOF.
+
+    ``sum_i int f_i v = int (sum_i f_i) v``, so fusing them changes the answer only by the order of the
+    floating-point summation: each cell sums its pieces before the one scatter, where the global
+    scatter used to sum them. The pieces still evaluate one by one against the SAME per-cell field
+    data (``_vol_elem_res`` builds it once), so the fused kernel is also one ``jacfwd`` per cell
+    instead of one per piece.
+    """
+
+    __slots__ = ()
+
+
+def _content_keyable(coeff) -> bool:
+    """Can ``elem_map``'s cache key a kernel baking ``coeff`` by content? The same allow-list walk the
+    cache runs (:func:`~jno.utils.solver.fem_utils._expr_digest`), with its bail tally put back: this is a
+    grouping question asked at build time, not a cache miss, and the tally is what measures the misses."""
+    from .fem_utils import _ELEM_MAP_STATS, _expr_digest
+
+    saved = dict(_ELEM_MAP_STATS["content_bail"])
+    try:
+        return _expr_digest(coeff) is not None
+    finally:
+        _ELEM_MAP_STATS["content_bail"].clear()
+        _ELEM_MAP_STATS["content_bail"].update(saved)
+
+
 class _CellFieldData(dict):
     """One field's per-cell data, with ``shape_hess`` built only if a term actually reads it.
 
@@ -1423,6 +1565,24 @@ def assemble_fem_native(
     # (IndexError gathering a length-1 value by node id) rather than meaning anything.
     _dir_param_exprs: Dict[str, Any] = {}
     _dir_param_rows: set = set()
+    # A trainable parameter inside a TIME-varying value (`u(wall) - a*sin(t)`, an inflow amplitude to
+    # identify). Not an args-dependent row of the kind above -- its held value changes every step -- so it
+    # stays in the time-varying stash, whose held value `_tv_hold(t, args)` is evaluated at the time the
+    # step's residual/forcing is called at WITH the runtime args. Its exprs only have to reach
+    # `runtime_parameter_exprs` so the solve node hands them over. That is the first-order transient;
+    # the τ load-path march and the second-order (u_tt) block evaluate g(x, t) without args and refuse.
+    _tv_param_exprs: Dict[str, Any] = {}
+    _first_order_transient = (
+        not tv_dirichlet_external
+        and not _is_march
+        and (
+            bool(ic_residuals)
+            or any(
+                _contains_temporal_derivative(t)
+                for t in list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
+            )
+        )
+    )
     for _i, (_fk, _rg, _comp, _val, _vnode) in enumerate(dirichlet_raw):
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is None or _is_neural_coefficient(_vn):
@@ -1440,20 +1600,23 @@ def assemble_fem_native(
             from ..._fem import _is_temporal_value_node as _is_tv
 
             if _is_tv(_vnode):
-                # `u(top) - g * tau`: the value is BOTH parametric and time/τ-dependent. The parametric
-                # branch would hold it constant in τ (silently un-ramping the load); the temporal branch
-                # would freeze the parameter at its stored value (silently un-training it). Neither is
-                # right, so refuse until the two held-value mechanisms compose.
+                if _first_order_transient:
+                    _tv_param_exprs.update(_found)  # held value re-formed per (t, args); see above
+                    continue
+                # `u(top) - g * tau` on the load path, or g(x, t) on a u_tt block: those consumers evaluate
+                # the value at the step's τ/t only. The parametric branch would hold it constant in τ
+                # (silently un-ramping the load); the temporal one would freeze the parameter at its
+                # stored value (silently un-training it). Neither is right, so refuse.
                 raise NotImplementedError(
                     f"jno.fem: the essential value on {_rg!r} is BOTH runtime-parametric "
-                    f"({sorted(_found)}) and time/τ-dependent. A trainable parameter in a t/τ-varying "
-                    "essential value is not supported yet -- train the amplitude through a Neumann/body "
-                    "term written as a function of τ, or fix one of the two."
+                    f"({sorted(_found)}) and time/τ-dependent. That is supported on a first-order transient "
+                    "(`u.t`), not on a τ load-path march or a second-order (`u.tt`) form. There, train the "
+                    "amplitude through a Neumann/body term written as a function of τ/t, or fix one of the two."
                 )
             _dir_param_exprs.update(_found)
             _dir_param_rows.add(_i)
-    if _dir_param_exprs:
-        _param_and_neural_exprs = {**_param_and_neural_exprs, **_dir_param_exprs}
+    if _dir_param_exprs or _tv_param_exprs:
+        _param_and_neural_exprs = {**_param_and_neural_exprs, **_dir_param_exprs, **_tv_param_exprs}
 
     def _dir_static_args() -> Dict[str, Any]:
         """Stored-value args for every args-dependent Dirichlet slot (net modules + parameter values) --
@@ -2048,7 +2211,8 @@ def assemble_fem_native(
         n_q = qw_shared.shape[0]
         h_qp = jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (n_q, 1))
         K = small_inv(J)  # dxi/dx: (dim, dim) affine, (n_q, dim, dim) curved
-        G_qp = jnp.broadcast_to(jnp.swapaxes(K, -1, -2) @ K, (n_q, dim, dim))
+        # K^T K as a multiply-sum: `@` on a batch of 3x3s is a padded batched GEMM on a GPU (small_einsum).
+        G_qp = jnp.broadcast_to(small_matmul(jnp.swapaxes(K, -1, -2), K), (n_q, dim, dim))
         return h_qp, G_qp
 
     # Cell-local DOF bookkeeping for per-cell element-Jacobian assembly. ``cell_all_dofs[c]`` lists
@@ -2481,7 +2645,8 @@ def assemble_fem_native(
         un = jax.lax.dynamic_slice(u_flat, (offs[fidx],), (n_geom * vt,)).reshape(n_geom, vt)
         return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
 
-    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None):
+    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None,
+                      seeded=True):  # fmt: skip
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
@@ -2527,7 +2692,61 @@ def assemble_fem_native(
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
-        return _integrate_term(domain, coeff, loc, qw_shared * meas)
+        # One test field, one mask: every piece integrates against this same `loc` and has the same
+        # (n_test,) layout, so their sum is the group's element residual.
+        w = qw_shared * meas
+        pieces = tuple(coeff) if isinstance(coeff, _FusedVolumeTerms) else (coeff,)
+        # The TANGENT keeps the per-DOF evaluation (``seeded=False``): its element matrix of a symmetric form
+        # is then bitwise symmetric, which is what admits LDLᵀ and keeps the eigs symmetry guard quiet; the
+        # seeded one is forward-over-reverse and symmetric only to round-off (3e-17 measured).
+        seeds = [p for p in (_seeded_piece(pc) for pc in pieces) if p is not None] if seeded else []
+        out = _seeded_element_residual(seeds, tfi, per, loc, w) if seeds else None
+        plain = pieces if out is None else [pc for pc in pieces if _seeded_piece(pc) is None]
+        for piece in plain:
+            r = _integrate_term(domain, piece, loc, w)
+            out = r if out is None else out + r
+        return out
+
+    # ---- the test function as a seeded trial field ---------------------------------------------------
+    # A weak term is LINEAR in its test function: per quadrature point it is ``f·v + F:∇v (+ ...)``. The
+    # evaluator used to carry the test basis through every product as an extra axis -- n_local x n_comp
+    # one-hot columns for a vector field -- so each term was evaluated once per test DOF, mostly on
+    # zeros. Evaluating the test function instead as a field with coefficients ``s``, ``v = Σ_a φ_a s_a``,
+    # gives the integrand as a scalar per point, linear in ``s``, and the element residual is exactly its
+    # gradient: ``r_a = ∂/∂s_a Σ_q w_q I(s)``. One reverse pass does the basis contraction for every
+    # derivative of ``v`` the term reads. Measured on a 3-D residual-based VMS residual (P1/P1, 442k
+    # DOFs, RTX 3070): 71.7 -> 53.6 ms, and 48.9 -> 34.6 ms for its mass residual.
+    #
+    # Only where linearity is PROVEN (``linear_degree(..., strict=True) == 1``): a test function under
+    # ``stop_gradient``, a network, or a call the walk does not know keeps the per-DOF evaluation, which
+    # is the same number for every linear term and the old number for anything else.
+    def _seeded_element_residual(seeded, tfi, per, loc, w):
+        """``r = ∂/∂s Σ_q w_q I(s)`` for the seeded pieces, or ``None`` if one of them does not reduce to a
+        real scalar per quadrature point (the per-DOF path then takes every piece, and raises as before)."""
+        from .fem_utils import _field_slot_or_none
+
+        base = per[tfi]
+        if any(_field_slot_or_none(loc, t) != tfi for _rw, tests in seeded for t in tests):
+            return None  # a test basis other than this group's field: not this kernel's layout
+        slot = len(per)
+        index = {**loc["field_index"], _SEED_KEY: slot}
+
+        def total(s):
+            fd = _CellFieldData({**base, "cell_sol": s}, getattr(base, "_hess_fn", None))
+            loc2 = {**loc, "fields": list(per) + [fd], "field_index": index}
+            acc = 0.0
+            for rewritten, _tests in seeded:
+                val = _eval_integrand(domain, rewritten, loc2)
+                if jnp.iscomplexobj(val) or jnp.ndim(val) == 0 or val.shape[0] != w.shape[0] or val.size != w.shape[0]:
+                    raise _NotSeedable
+                acc = acc + jnp.sum(val.reshape(-1) * w)
+            return acc
+
+        s0 = jnp.zeros(jnp.shape(base["cell_sol"]), jnp.result_type(base["cell_sol"], w))
+        try:
+            return jax.grad(total)(s0).reshape(-1)
+        except _NotSeedable:
+            return None
 
     def _vol_readout_loc(c, local_all, t=0.0, args=None, pts=None, rnames=()):
         """The per-cell ``loc`` a TEST-FREE volume expression is evaluated in, plus the geometric measure
@@ -3046,7 +3265,7 @@ def assemble_fem_native(
             "test field (it determines the equation block)."
         )
 
-    _preprocess_cache: Dict[Tuple[int, int], Tuple[Any, Any]] = {}
+    _preprocess_cache: Dict[Tuple[int, int], Tuple[Any, Any, Any, Any]] = {}
 
     def _preprocess_terms(terms, bterms):
         """``(typed_with_masks, surface_work)``: lower each additive sub-term to
@@ -3061,17 +3280,38 @@ def assemble_fem_native(
         it is thrown away with the closure. Keyed on the identity of the term containers, which is
         what "the same list, twice" means; a caller that mutated ``terms`` between the two calls would
         defeat it, but that would be a bug in its own right (the residual and the Jacobian must come
-        from one form)."""
+        from one form).
+
+        Each entry PINS the containers it was keyed on, and a hit must be the SAME objects: an id is only
+        unique while its object lives, and a build passes short-lived lists here. Without the pin, a list
+        freed after its pass handed its id to a later, different one, which then got the first list's
+        lowered terms -- a wrong operator with nothing to flag it. Measured on a 3-D enrichment loop
+        (``adapt=jno.solve.enrich``): the p-adaptive solution's energy came out 0.119 against a correct
+        1.763, and which runs hit it depended on allocation history (prior builds, import order)."""
         _ck = (id(terms), id(bterms))
         _hit = _preprocess_cache.get(_ck)
-        if _hit is not None:
-            return _hit
+        if _hit is not None and _hit[0] is terms and _hit[1] is bterms:
+            return _hit[2], _hit[3]
         typed: List[Tuple[Any, int]] = []
         for bare in terms:
             for sign, sub in _split_additive_terms(domain, bare):
                 coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
                 typed.extend(_classify_one(coeff, "volume"))
         typed_with_masks = [(coeff, tfi, tuple(sorted(_collect_region_mask_names(coeff)))) for coeff, tfi in typed]
+        # Fuse the pieces that share (test field, region mask): one kernel, one tangent pattern per group
+        # rather than per piece (see `_FusedVolumeTerms`). Grouped in first-appearance order, so the
+        # block order every consumer below iterates is deterministic.
+        #
+        # ...and by whether the compiled-kernel cache can key the piece by CONTENT (`_content_keyable`).
+        # A piece it cannot (a trainable parameter or a net in the coefficient) would make the whole fused
+        # kernel unkeyable, so a rebuild of a parametric form shared NO kernel -- measured 0 content hits
+        # where the unfused pieces got 6, i.e. the plain load term recompiled on every rebuild.
+        _groups: Dict[Tuple[int, Tuple[str, ...], bool], List[Any]] = {}
+        for coeff, tfi, rn in typed_with_masks:
+            _groups.setdefault((tfi, rn, _content_keyable(coeff)), []).append(coeff)
+        typed_with_masks = [
+            (cs[0] if len(cs) == 1 else _FusedVolumeTerms(cs), tfi, rn) for (tfi, rn, _k), cs in _groups.items()
+        ]
 
         surface_work: List[Tuple[str, np.ndarray, List[Tuple[Any, int]]]] = []
         if bterms and conn.n_bfaces > 0:
@@ -3085,7 +3325,7 @@ def assemble_fem_native(
                         bcoeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
                         btyped.extend(_classify_one(bcoeff, f"boundary ({region!r})"))
                 surface_work.append((region, np.asarray(face_ids, dtype=np.int32), btyped))
-        _preprocess_cache[_ck] = (typed_with_masks, surface_work)
+        _preprocess_cache[_ck] = (terms, bterms, typed_with_masks, surface_work)
         return typed_with_masks, surface_work
 
     # --- element-loop chunking -----------------------------------------------------------------
@@ -3547,6 +3787,29 @@ def assemble_fem_native(
         if dynamic_topology:
             _plan_builders.append(_host_plan)
 
+        _inv_blocks_cache: Dict[Tuple[int, int], Any] = {}
+
+        def _inv_block(plan, i, off, k, shape=None):
+            """Block ``i`` of the plan's ``inverse`` -- the SAME object on every call for a host plan.
+
+            Slicing the NumPy inverse afresh per call hands the trace a NEW array object each time, and
+            a trace keys its captured constants on object identity: a march that evaluates this tangent
+            in several places (the start-up step, the stepped body, the convergence check) baked one
+            full copy of the per-raw-triplet map per evaluation. Measured on a 16^3 P1/P1 Navier-Stokes
+            march: 4 copies, 72 MiB of index constants where one copy is 18 MiB. A traced plan (a
+            runtime-connectivity bundle) is sliced in the trace and never cached."""
+            inv = plan[1]
+            if isinstance(inv, jax.core.Tracer):
+                blk = inv[off : off + k]
+                return blk if shape is None else blk.reshape(shape)
+            key = (id(inv), i, shape)
+            hit = _inv_blocks_cache.get(key)
+            if hit is None or hit[0] is not inv:
+                blk = inv[off : off + k]
+                hit = (inv, blk if shape is None else blk.reshape(shape))
+                _inv_blocks_cache[key] = hit
+            return hit[1]
+
         def jacobian(u_flat, t=0.0, args=None):
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
@@ -3578,9 +3841,9 @@ def assemble_fem_native(
                     rows_l.append(rows_fn())
                     cols_l.append(cols_fn())
                     return
-                _inv, _nse = _plan[1], _plan[2]
+                _nse = _plan[2]
                 k = _blk_sizes[_nblk[0]]
-                part = jax.ops.segment_sum(flat, _inv[_off[0] : _off[0] + k], num_segments=_nse)
+                part = jax.ops.segment_sum(flat, _inv_block(_plan, _nblk[0], _off[0], k), num_segments=_nse)
                 _acc[0] = part if _acc[0] is None else _acc[0] + part
                 _off[0] += k
                 _nblk[0] += 1
@@ -3588,12 +3851,33 @@ def assemble_fem_native(
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d))(la)
+                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=False))(la)
 
+                _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
+                if _plan is not None:
+                    # Scatter each CHUNK's element blocks straight into the compressed slots (the residual's
+                    # own `scatter=` path), so the (n_cell, n_test, n_local) stack of every cell's block is
+                    # never built. That stack -- and the copy XLA made of it -- was the largest mesh-sized
+                    # buffer left in a march once the per-term patterns were fused: 2 x 36 MiB of the
+                    # 16^3 P1/P1 Navier-Stokes tangent, growing with the cell count where the chunked
+                    # scratch does not.
+                    k = _blk_sizes[_nblk[0]]
+                    n_t, n_l = int(cd_d[tfi].shape[1]), int(cad_d.shape[1])
+                    inv_b = _inv_block(_plan, _nblk[0], _off[0], k, shape=(n_cells, n_t * n_l))
+                    acc = _acc[0] if _acc[0] is not None else jnp.zeros((_plan[2],), dtype=local_all.dtype)
+                    _acc[0] = _elem_map(
+                        lambda c, la, _k=_ke: _k(c, la).reshape(-1),
+                        (jnp.arange(n_cells), local_all),
+                        _chunk_v,
+                        scatter=(acc, inv_b),
+                    )
+                    _off[0] += k
+                    _nblk[0] += 1
+                    continue
                 Ke = _elem_map(  # (n_cell, n_test_tfi, n_local_all)
                     _ke,
                     (jnp.arange(n_cells), local_all),
-                    _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
+                    _chunk_v,
                 )
                 _emit(
                     Ke.reshape(-1),
@@ -4006,12 +4290,24 @@ def assemble_fem_native(
 
         pairs: List[Tuple[int, float]] = []
         tv_stash: List[Tuple[Any, Any, Any]] = []  # (dofs, value_node, coords) for time-varying g(x,t)
+        # The DOFs of the rows whose held value rides the runtime args (a parameter or a net in the value).
+        # They get no constant pair either, and a consumer that zeroes "the constrained rows" -- a nonlocal
+        # `Coupling` -- must see them, or it adds its contribution onto the row's `u - g` and shifts the wall.
+        args_dofs: List[int] = []
+
+        def _row_dofs(fidx, region, comp):
+            vt = vecs[fidx]
+            comps = range(vt) if comp is None else [int(comp)]
+            return [int(offs[fidx] + nid * vt + c) for nid in _boundary_node_ids(fidx, region) for c in comps]
+
         for _row_i, (field_key, region, comp, value, value_node) in enumerate(dirichlet_raw):
             fidx = field_index.get(field_key)
             if fidx is None:
                 continue
             if _row_i in _dir_param_rows:
-                continue  # args-dependent value: (re-)formed per args in _dirichlet_pairs_at, never frozen here
+                # args-dependent value: (re-)formed per args in _dirichlet_pairs_at, never frozen here
+                args_dofs.extend(_row_dofs(fidx, region, comp))
+                continue
             # Time-varying Dirichlet g(x,t): no constant pair — stash (dofs, value_node, coords) so a
             # transient caller (e.g. the second-order augmented block) writes g(x_d, t) each step.
             if value_node is not None and _is_temporal_value_node(value_node):
@@ -4019,9 +4315,17 @@ def assemble_fem_native(
                 pts_all = np.asarray(pts_f_all[fidx])
                 nids = list(_boundary_node_ids(fidx, region))
                 coords = jnp.asarray(pts_all[np.asarray(nids, dtype=int)]) if nids else jnp.zeros((0, dim))
-                for c in range(vt) if comp is None else [int(comp)]:
-                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
+                per = _time_value_components(value_node, coords, vt, comp, region)
+                if per == vt and vt > 1:
+                    # g(x, t) evaluates to (n_nodes, vt): ONE entry whose DOFs are node-major, so every
+                    # consumer's `g.reshape(-1)` lands component c of node k on DOF k*vt + c. Stashing it once
+                    # per component with the whole flattened g wrote the wrong values (or the wrong count).
+                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids for c in range(vt)], dtype=jnp.int32)
                     tv_stash.append((dofs, value_node, coords))
+                else:  # a scalar g(x, t): the same value on each clamped component
+                    for c in range(vt) if comp is None else [int(comp)]:
+                        dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
+                        tv_stash.append((dofs, value_node, coords))
                 continue
             _vn = _bare_node(value_node) if value_node is not None else None
             # A nodal DATA-field value (a `jno.np.parameter` carrying a field with NO optimizer — e.g. a
@@ -4036,6 +4340,7 @@ def assemble_fem_native(
             ):
                 _field_vals = np.asarray(_vn.model.module.value).reshape(-1)
             elif _vn is not None and _is_neural_coefficient(_vn):
+                args_dofs.extend(_row_dofs(fidx, region, comp))
                 continue  # a net-valued Dirichlet is (re-)built per args in _dirichlet_pairs_at
             vt = vecs[fidx]
             pts_all = pts_f_all[fidx]
@@ -4056,16 +4361,22 @@ def assemble_fem_native(
                 # single-point evaluation settles it and costs nothing.
                 one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
                 if raw.shape == one.shape or len(nids) == 0:
-                    gs = np.full(len(nids), float(np.real(one).reshape(-1)[0]))  # constant over the region
+                    const = np.real(one).reshape(-1).astype(float)  # constant over the region: (n_values,)
+                    gs = np.broadcast_to(const, (len(nids), const.size))
                 else:
-                    gs = np.real(raw).reshape(len(nids), -1)[:, 0].astype(float)  # first component per node
+                    gs = np.real(raw).reshape(len(nids), -1).astype(float)  # (n_nodes, n_values)
+                # EVERY component, not the first one broadcast to all: `u(wall) - (1.0, -0.5)` on a vector
+                # field used to impose (1.0, 1.0) -- silently, steady and transient alike.
+                gs = _dirichlet_value_columns(gs, vt, comp, region)
             elif callable(value):
                 gs = np.array([float(_real_dirichlet_values(value(p), region)) for p in pts], dtype=float)
             else:
                 gs = np.full(len(nids), float(_real_dirichlet_values(value, region)))
             comps_range = range(vt) if comp is None else [int(comp)]
-            for nid, g in zip(nids, gs):
+            gs = np.asarray(gs, dtype=float)
+            for k, nid in enumerate(nids):
                 for c in comps_range:
+                    g = gs[k] if gs.ndim == 1 else gs[k, c if gs.shape[1] > 1 else 0]
                     pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g)))
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
@@ -4073,6 +4384,7 @@ def assemble_fem_native(
         # second-order block, the velocity ġ) per step.
         domain._fem_native_dirichlet_pairs = pairs
         domain._fem_native_dirichlet_tv = tv_stash
+        domain._fem_native_dirichlet_args_dofs = args_dofs
         _mask_cover_pins(pairs)
         _gauge_cover_modes(pairs)
         return pairs
@@ -4261,6 +4573,11 @@ def assemble_fem_native(
             comps_range = range(vt) if comp is None else [int(comp)]
             if value_node is not None and _is_temporal_value_node(value_node):
                 coords = jnp.asarray(pts_all[np.asarray(nids, dtype=int)]) if nids else jnp.zeros((0, dim))
+                if _time_value_components(value_node, coords, vt, comp, region) == vt and vt > 1:
+                    # One node-major entry for a vector g(x, t): see `_build_dirichlet_pairs`.
+                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids for c in range(vt)], dtype=jnp.int32)
+                    tv_entries.append((dofs, value_node, coords))
+                    continue
                 for c in comps_range:
                     dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
                     tv_entries.append((dofs, value_node, coords))
@@ -4268,12 +4585,14 @@ def assemble_fem_native(
             for nid in nids:
                 p = pts_all[nid]
                 if value_node is not None:
-                    g = float(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None])).reshape(-1)[0])
+                    gv = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None]))).reshape(1, -1)
+                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region)).reshape(-1)
                 elif callable(value):
-                    g = float(value(p))
+                    gv = np.array([float(value(p))])
                 else:
-                    g = float(value)
+                    gv = np.array([float(value)])
                 for c in comps_range:
+                    g = float(gv[c] if gv.size > 1 else gv[0])  # every component, not the first one broadcast
                     const_pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g)))
         return const_pairs, tv_entries
 
@@ -4322,6 +4641,10 @@ def assemble_fem_native(
             refuse_mixed_temporal_group(_t, where="jno.fem")
         temporal = [t for t in sub_signed if _contains_temporal_derivative(t)]
         spatial = [t for t in sub_signed if not _contains_temporal_derivative(t)]
+        from .time_route import refuse_nonlinear_in_rate
+
+        for _t in temporal:
+            refuse_nonlinear_in_rate(_t)
         if not temporal:
             raise ValueError(
                 "jno.fem (native): an initial condition was provided but no temporal term "
@@ -4452,6 +4775,54 @@ def assemble_fem_native(
         d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
+        # Time-varying essential values g(x, t). `_build_dirichlet_pairs` keeps them OUT of the constant pairs
+        # and stashes (dofs, value node, coords) instead, so every branch below must either thread them or
+        # refuse: a branch that only reads `d_dofs` drops the condition, and the boundary then marches as if
+        # it were free -- a plausible trajectory with nothing to flag it.
+        from ..._fem import _eval_value_node_at_time
+
+        _tv_entries_t = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])
+        tv_dofs = jnp.concatenate([jnp.asarray(e[0], dtype=jnp.int32) for e in _tv_entries_t]) if _tv_entries_t else None
+
+        def _tv_hold(t, args=None, _tv=_tv_entries_t):
+            """``g(x_d, t)`` on every time-varying Dirichlet DOF, in ``tv_dofs`` order. ``args`` carries a
+            trainable parameter of the value (``u(wall) - a*sin(t)``), so the held value is differentiable in
+            it; ``None`` reads the stored values."""
+            return jnp.concatenate(
+                [jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t, params=args)), (-1,)) for _d, n, c in _tv]
+            )
+
+        # Every row that carries a condition instead of an equation: constant and time-varying alike.
+        if tv_dofs is None:
+            row_dofs = d_dofs
+        else:
+            row_dofs = tv_dofs if d_dofs is None else jnp.concatenate([d_dofs, tv_dofs])
+
+        # The rows whose held value is re-formed from the runtime args -- a net- or parameter-valued Dirichlet
+        # `u(wall) - net(x)` / `u(wall) - g` -- are NOT in `d_dofs`: `_build_dirichlet_pairs` skips them so their
+        # value is never frozen. Anything that clears "the Dirichlet rows" from `d_dofs` alone therefore leaves
+        # theirs standing. The per-step parametric mass did exactly that: next to a trainable density
+        # `rho(x) u_t`, the wall row kept its mass and read `M_dd (u⁺ - u)/dt + u⁺ = g`, a condition softened into
+        # a relaxation (~0.1 off g after the first step, decaying), with nothing to flag it. This is the full
+        # set -- constant and args-dependent -- the branches below build for their own rows.
+        const_dofs = (
+            jnp.asarray([p[0] for p in _dirichlet_pairs_at(_dir_static_args())], dtype=jnp.int32)
+            if _dir_args_dependent
+            else d_dofs
+        )
+
+        def _zero_mass_rows(Mx, _d=const_dofs, _t=tv_dofs):
+            """The mass with no time derivative on a constrained DOF.
+
+            A constant condition zeroes its row AND column, as it always has. A time-varying one zeroes only
+            its ROW: its column is what gives each free row its share of the boundary's rate, ``M_fd·ġ``,
+            through ``M (u⁺ - u)/dt`` -- the boundary value moves from ``g(tⁿ)`` to ``g(tⁿ⁺¹)`` inside the
+            step. Zeroing it would drop that term from every interior equation next to a moving boundary.
+            (The linear block keeps the columns for the same reason.)"""
+            if _d is not None:
+                Mx = bcoo_zero_rows_cols(Mx, _d)
+            return Mx if _t is None else bcoo_zero_rows(Mx, _t)
+
         # ---- STATE-DEPENDENT (nonlinear) MASS: ``c(u)·u_t`` with a coefficient depending on the unknown.
         # The fixed ``M = _mass_jac(zeros)`` freezes ``c`` at ``u=0`` (silently wrong; see jno-fem-hard-limits).
         # Reformulate each temporal term to backward-Euler *residual* form ``c(u)·(u − u_prev)·v`` — with
@@ -4489,20 +4860,22 @@ def assemble_fem_native(
             _mass_res_raw = _make_residual(temporal_be)  # ∫ c(u)·(u − u_prev)·v  (volume only; mass has no boundary)
             _mass_jac_raw = _make_jacobian(temporal_be)
 
-            def mass_res_bc(u, t, args=None, _d=d_dofs, _f=_mass_res_raw):
+            # Rows only, constant and time-varying alike: the mass ACTION `c(u)(u - u_prev)` on a free row keeps
+            # its boundary columns either way, which is what carries a moving boundary's rate into it.
+            def mass_res_bc(u, t, args=None, _d=row_dofs, _f=_mass_res_raw):
                 R = jnp.asarray(_f(jnp.asarray(u), t, args)).reshape(-1)
                 return R if _d is None else R.at[_d].set(0.0)  # a constrained DOF carries no mass equation
 
-            def mass_jac_bc(u, t, args=None, _d=d_dofs, _f=_mass_jac_raw):
+            def mass_jac_bc(u, t, args=None, _d=row_dofs, _f=_mass_jac_raw):
                 J = _f(jnp.asarray(u), t, args)
                 return J if _d is None else bcoo_zero_rows(J, _d)
 
         # Parametric mass ``mass_fn(t, args)`` (unknown density net(x)*u_t): re-assemble M from args each
-        # step with the Dirichlet rows/cols zeroed (a constrained DOF carries no time derivative). ``None``
-        # keeps the static ``M_bc`` for a non-parametric mass.
-        def _mass_cb(t, args=None, _d=d_dofs):
-            Mt = _mass_jac(zeros, t, args)
-            return Mt if _d is None else bcoo_zero_rows_cols(Mt, _d)
+        # step with EVERY Dirichlet row zeroed, args-dependent ones included (a constrained DOF carries no time
+        # derivative; see `const_dofs`, and `_zero_mass_rows` for the columns). ``None`` keeps the static
+        # ``M_bc`` for a non-parametric mass.
+        def _mass_cb(t, args=None):
+            return _zero_mass_rows(_mass_jac(zeros, t, args))
 
         # A mass-only nonlinearity (state-dependent mass) also requires the nonlinear step path, even when
         # every spatial term is linear — the mass action lives in the residual there (``mass_residual``).
@@ -4519,6 +4892,13 @@ def assemble_fem_native(
                     "jno.fem: a net-valued Dirichlet with a state-dependent (nonlinear) mass c(u)·u_t on a "
                     "transient form is not supported (the mass residual holds a static Dirichlet dof set). "
                     "Use a linear/parametric mass."
+                )
+            if _dir_args_dependent and tv_dofs is not None:
+                raise NotImplementedError(
+                    "jno.fem: a net- or parameter-valued Dirichlet combined with a time-varying g(x, t) "
+                    "Dirichlet on a transient form is not supported yet (the first re-forms its held values "
+                    "from the runtime args, the second from the step time, and the two row sets are not "
+                    "merged). Use one or the other."
                 )
 
             if _dir_args_dependent:
@@ -4541,6 +4921,27 @@ def assemble_fem_native(
                     return bcoo_set_dirichlet_rows(spatial_jac(jnp.asarray(u), t, args), _d)
 
                 _mdofs = _tnpd
+            elif tv_dofs is not None:
+                # Time-varying Dirichlet g(x, t): the same row replacement as a constant g (below), with the
+                # held value re-evaluated at the time the RESIDUAL is called at. Every scheme calls it at the
+                # time its step or stage lands on -- t_{n+1} for θ (whose zero-mass rows take θ = 1, see
+                # `_theta_row_weights`) and BDF2, each stage time t_n + c_i·dt for SDIRK, and
+                # t_n + α_i·h for a Rosenbrock stage, whose ∂R/∂t term then carries -ġ -- so the row reads
+                # u[d] = g(x_d, t) at the right time without the scheme knowing the condition exists. It is
+                # the linear block's per-step Dirichlet lift (`forcing_vector_fn` writes g(x_d, t) onto the
+                # same rows) and the load-path march's displacement control, applied on the residual path.
+                def res_bc(u, t, args=None, _d=d_dofs, _g=d_vals, _t=tv_dofs):
+                    u = jnp.asarray(u)
+                    R = spatial_res(u, t, args)
+                    if _d is not None:
+                        R = R.at[_d].set(u[_d] - _g)
+                    return R.at[_t].set(u[_t] - _tv_hold(t, args).astype(R.dtype))
+
+                def jac_bc(u, t, args=None, _d=row_dofs):
+                    # identity rows, columns kept: the exact Jacobian of the row-replaced residual
+                    return bcoo_set_dirichlet_rows(spatial_jac(jnp.asarray(u), t, args), _d)
+
+                _mdofs = d_dofs  # the time-varying rows are zeroed below, their columns kept
             else:
                 # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
                 # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
@@ -4555,6 +4956,8 @@ def assemble_fem_native(
                 _mdofs = d_dofs
 
             M_bc = M if _mdofs is None else bcoo_zero_rows_cols(M, _mdofs)
+            if tv_dofs is not None:
+                M_bc = bcoo_zero_rows(M_bc, tv_dofs)  # rows only -- see `_zero_mass_rows`
             return (
                 SemidiscreteTimeBlock(
                     # A state-dependent mass carries no fixed matrix; the mass action is in mass_residual.
@@ -4569,6 +4972,9 @@ def assemble_fem_native(
                     metadata={
                         **({"prev_state_slices": prev_state_slices} if _nonlinear_mass else {}),
                         **({"derived_specs": derived_specs} if derived_specs else {}),
+                        # The tangent's sparsity pattern can change during the march (a reconnection, a contact
+                        # re-pairing): no host-side merge plan may be built on it (`_plan_step_tangent_merge`).
+                        "pattern_moves": bool(dynamic_topology or _gap_tables),
                     },
                     **common,
                 ),
@@ -4588,7 +4994,7 @@ def assemble_fem_native(
         # X and ``du/dX`` is exactly ZERO. That is a wrong gradient with no symptom, not a missing feature.
         if runtime_parameter_tags or neural_param_names or _dir_args_dependent or _ic_net_models or _coord_specs:
             if _dir_args_dependent:
-                if getattr(domain, "_fem_native_dirichlet_tv", None):
+                if tv_dofs is not None:
                     raise NotImplementedError(
                         "jno.fem: a net-valued Dirichlet combined with a time-varying g(x, t) Dirichlet on a "
                         "transient form is not supported yet (the net value rides the forcing; the g(x, t) lift "
@@ -4602,9 +5008,14 @@ def assemble_fem_native(
 
                 def _dhold(args):  # held value on every Dirichlet dof (net entries live in the weights)
                     return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
+
+                M_bc = M if _dd is None else bcoo_zero_rows_cols(M, _dd)
             else:
-                _dd = d_dofs
-            M_bc = M if _dd is None else bcoo_zero_rows_cols(M, _dd)
+                # Constant AND time-varying rows. The time-varying ones used to be left out here -- `d_dofs`
+                # holds only the constant pairs -- so a runtime-parametric coupled transient marched its
+                # driven boundary as a free one: a plausible trajectory with the condition simply gone.
+                _dd = row_dofs
+                M_bc = _zero_mass_rows(M)  # time-varying rows keep their columns, as on every other path
             free_mask = jnp.ones((total,), dtype=zeros.dtype)
             if _dd is not None:
                 free_mask = free_mask.at[_dd].set(0.0)
@@ -4622,8 +5033,10 @@ def assemble_fem_native(
             else:
                 c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
 
-                def forcing_vector_fn(t, args=None, _mask=free_mask):
-                    return _mask * (-spatial_res(zeros, t, args))
+                def forcing_vector_fn(t, args=None, _mask=free_mask, _t=tv_dofs):
+                    f = _mask * (-spatial_res(zeros, t, args))
+                    # the time-varying held value, written onto its identity rows (the per-step Dirichlet lift)
+                    return f if _t is None else f.at[_t].set(_tv_hold(t, args).astype(f.dtype))
 
             return (
                 SemidiscreteTimeBlock(
@@ -4673,11 +5086,20 @@ def assemble_fem_native(
             def forcing_vector_fn(t, args=None, _mask=free_tv, _tv=_tv_entries):
                 f = _mask * (-spatial_res(zeros, t))  # source load on the free rows
                 for dofs, vnode, coords in _tv:
-                    f = f.at[dofs].set(jnp.asarray(_eval_value_node_at_time(vnode, coords, t)).reshape(-1))
+                    # `args` reaches a trainable parameter in the value (`u(wall) - a*sin(t)`); the operator
+                    # does not depend on it, so it stays assembled once.
+                    f = f.at[dofs].set(jnp.asarray(_eval_value_node_at_time(vnode, coords, t, params=args)).reshape(-1))
                 return f
 
             return (
-                SemidiscreteTimeBlock(M=M_tv, A=A_tv, affine_bias=c_tv, forcing_vector_fn=forcing_vector_fn, **common),
+                SemidiscreteTimeBlock(
+                    M=M_tv,
+                    A=A_tv,
+                    affine_bias=c_tv,
+                    forcing_vector_fn=forcing_vector_fn,
+                    runtime_parameter_exprs=dict(_tv_param_exprs),
+                    **common,
+                ),
                 "transient",
                 offs,
             )
@@ -4750,6 +5172,23 @@ def assemble_fem_native(
     s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
     s_d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
+    # A τ/t-dependent essential value is held at a STEP's τ (the load-path march) or t (the transient
+    # steppers, which returned above). A steady form that marches nothing has no τ to hold it at, so it is
+    # refused here -- AHEAD of the runtime-parametric branch. Placed after it, the guard never saw a
+    # parametric form: the linear one dropped the wall outright (u = 0 everywhere, where u = g x was
+    # prescribed) and the nonlinear one held it at τ = 0, while the same forms without a parameter raised.
+    # EXCEPT when the caller declared it consumes the tv stash itself (`tv_dirichlet_external=True`): the
+    # second-order u_tt block calls this assembler for the spatial operator and the Dirichlet stashes,
+    # then writes g(x_d, t) and the compatible ġ(x_d, t) onto its augmented [u, v] system per step.
+    if _tv_dirichlet and not tv_dirichlet_external and not (history_specs or surface_history_specs):
+        raise NotImplementedError(
+            "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is held at each step's "
+            "τ or t, and this form has no steps: it reads no step history (`.i(k)`), so `fem.solve()` does "
+            "not march its `domain(tau=...)` grid, and it has no `u.t`. Add the history read that makes it "
+            "a load-path march, use a constant essential value, or drive the load through a Neumann/body "
+            "term written as a function of τ."
+        )
+
     # ---- runtime-parametric (inverse): the operator/residual is re-evaluated at the runtime args
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
@@ -4768,64 +5207,68 @@ def assemble_fem_native(
             # ``t`` carries the pseudo-time (load) coordinate τ for the history march — the load written
             # as a function of τ in the weak form varies through it. Defaults to 0.0, so the ordinary
             # (non-marching) parametric/inverse call sites are unchanged.
-            if _dir_args_dependent:
-                # net- or parameter-valued Dirichlet: the held value is a differentiable function of the
-                # args (net weights or a trainable boundary value), so the row-replacement value is
-                # re-evaluated from args each residual call (mirrors the linear parametric path's
-                # ``_dirichlet_pairs_at``). The dof set is static; only the held values ride the args.
-                _npd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
-                    dtype=jnp.int32,
-                )
+            if _dir_args_dependent or _tv_dirichlet:
+                # Held values that are not constants. Two kinds, and one form can carry both -- a trainable
+                # grip on one face beside a ramped one on another -- so they are written TOGETHER. (An
+                # `if/elif` between them dropped the τ rows whenever a parameter-valued row was present:
+                # the ramped face was left free, measured at 0.25 where 0.5 -> 1.0 -> 1.5 was prescribed.)
+                #
+                # * net- or parameter-valued (`u(top) - g`, `u(top) - net(x)`): the held value is a
+                #   differentiable function of the args, re-evaluated from them each residual call (mirrors
+                #   the linear parametric path's ``_dirichlet_pairs_at``, which also returns the constant
+                #   pairs);
+                # * τ-DEPENDENT (`u(top)[1] - delta*tau`, i.e. DISPLACEMENT CONTROL, which is how a softening
+                #   test is driven at all -- under load control the specimen snaps at the peak and there is
+                #   no branch to follow): re-evaluated at this step's τ.
+                #
+                # Either way the dof set is static; only the held VALUES ride the args / τ.
+                if _dir_args_dependent:
+                    _bd = jnp.asarray([p[0] for p in _dirichlet_pairs_at(_dir_static_args())], dtype=jnp.int32)
 
-                def _np_hold(args):  # held value on every Dirichlet dof (const + net), net entries live
-                    return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
+                    def _base_hold(args):  # const + net + parameter entries; the latter two live in args
+                        return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
 
-                def _np_project(u, args, _d=_npd):
-                    return jnp.asarray(u).at[_d].set(_np_hold(args))
+                else:
+                    _bd = s_d_dofs
 
-                def res_p(u, args=None, t=0.0, _d=_npd):
+                    def _base_hold(args, _g=s_d_vals):
+                        return _g
+
+                _tvd = None
+                if _tv_dirichlet:
+                    from ..._fem import _eval_value_node_at_time
+
+                    _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
+
+                    def _tv_hold(t):
+                        return jnp.concatenate(
+                            [
+                                jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,))
+                                for _d, n, c in _tv_dirichlet
+                            ]
+                        )
+
+                _all_d = jnp.concatenate([d for d in (_bd, _tvd) if d is not None])
+
+                def _hold_project(u, args, t, _b=_bd, _t=_tvd):
                     u = jnp.asarray(u)
-                    R = residual(_np_project(u, args), t, args)
-                    return R.at[_d].set(u[_d] - _np_hold(args))
+                    if _b is not None:
+                        u = u.at[_b].set(jnp.asarray(_base_hold(args)).astype(u.dtype))
+                    if _t is not None:
+                        u = u.at[_t].set(_tv_hold(t).astype(u.dtype))
+                    return u
 
-                def jac_p(u, args=None, t=0.0, _d=_npd):
-                    return bcoo_eliminate_dirichlet(jacobian(_np_project(u, args), t, args), _d)
-
-                _constrained = _npd  # the dof set is static here; only the HELD VALUES ride the weights
-            elif _tv_dirichlet:
-                # A τ-DEPENDENT essential value on the load path -- `u(top)[1] - delta*tau`, i.e.
-                # DISPLACEMENT CONTROL, which is how a softening test is driven at all (under load
-                # control the specimen snaps at the peak and there is no branch to follow). The value is
-                # not a constant pair, so it is re-evaluated at this step's τ and written into the same
-                # row-replacement the constant pairs use. Before this it was collected and then dropped:
-                # the constraint simply vanished and the solve returned u = 0, which looks entirely
-                # plausible. The dof set is static, so only the held VALUES ride τ.
-                from ..._fem import _eval_value_node_at_time
-
-                _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
-                _all_d = _tvd if s_d_dofs is None else jnp.concatenate([s_d_dofs, _tvd])
-
-                def _tv_hold(t):
-                    return jnp.concatenate(
-                        [jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,)) for _d, n, c in _tv_dirichlet]
-                    )
-
-                def _tv_project(u, t, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
+                def res_p(u, args=None, t=0.0, _b=_bd, _t=_tvd):
                     u = jnp.asarray(u)
-                    if _d is not None:
-                        u = u.at[_d].set(_g.astype(u.dtype))
-                    return u.at[_t].set(_tv_hold(t).astype(u.dtype))
-
-                def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
-                    u = jnp.asarray(u)
-                    R = residual(_tv_project(u, t), t, args)
-                    if _d is not None:
-                        R = R.at[_d].set(u[_d] - _g)
-                    return R.at[_t].set(u[_t] - _tv_hold(t))
+                    R = residual(_hold_project(u, args, t), t, args)
+                    if _b is not None:
+                        R = R.at[_b].set(u[_b] - _base_hold(args))
+                    if _t is not None:
+                        R = R.at[_t].set(u[_t] - _tv_hold(t))
+                    return R
 
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
-                    return bcoo_eliminate_dirichlet(jacobian(_tv_project(u, t), t, args), _d)
+                    return bcoo_eliminate_dirichlet(jacobian(_hold_project(u, args, t), t, args), _d)
 
                 _constrained = _all_d
             else:
@@ -4892,21 +5335,6 @@ def assemble_fem_native(
         )
         return op, "linear", offs
 
-    # A τ/t-dependent essential value that no branch above threaded would be silently DROPPED here --
-    # the constraint disappears and the solve returns a plausible-looking wrong answer. Fail instead.
-    # EXCEPT when the caller declared it consumes the tv stash itself (`tv_dirichlet_external=True`):
-    # the second-order u_tt block calls this assembler for the spatial operator and the Dirichlet
-    # stashes, then writes g(x_d, t) and the compatible ġ(x_d, t) onto its augmented [u, v] system per
-    # step -- a legitimate consumer this guard was firing on (found by the pre-push suite: two wave
-    # oracles that pass on origin/main NotImplementedError'd from the guard's own commit onward).
-    if _tv_dirichlet and not tv_dirichlet_external:
-        raise NotImplementedError(
-            "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is threaded on the "
-            "steady residual path -- the load-path march and the runtime-parametric solve -- and by the "
-            "linear transient stepper. This form assembled through neither. Use a constant essential "
-            "value, or drive the load through a Neumann/body term written as a function of τ."
-        )
-
     # nonlinear (non-parametric)
     if nonlinear:
         # Wrapped PER CALL rather than once, so `args` reaches the free residual: `fem.solve(contact=...)`
@@ -4927,6 +5355,11 @@ def assemble_fem_native(
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating
+        # driver (``staggered(over_relax != 1)``) must leave them alone. Missing here, every NON-parametric
+        # problem over-relaxed its prescribed values -- measured g = 2 held at 3.0 after one sweep with
+        # omega = 1.5, the rest of the field solved against that wrong boundary value until it decayed.
+        _op_np.dirichlet_dofs = s_d_dofs
         _op_np.derived_specs = derived_specs  # {fid: {fn, in_slices, every, ...}} — jno.derived rules
         _op_np.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
         _op_np.contact_pairs = dict(_contact_pairs)

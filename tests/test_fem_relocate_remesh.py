@@ -182,10 +182,28 @@ def test_a_surface_objective_survives_the_remesh():
     fem.solve(
         adapt=jno.solve.relocate(objective=flux, max_iters=60, lr=3e-2).remesh(
             criterion=lambda dm: jno.le(dm.cell_aspect(), 1.9), max_iters=4
-        )
+        ),
+        # A direct solve on the final mesh: this Stokes cell is a saddle problem, where the default
+        # Jacobi-BiCGStab is a gamble (jno.fem warns so). It passed by luck: a change in the assembly's
+        # summation order moved the relocated vertices by 2.4e-15, the remesh then came out at 60 points,
+        # and on that mesh BiCGStab stalled at 3.1e-3. The subject here is the surface objective. (The
+        # slot used to be dropped on this path; see test_relocate_forwards_the_solver_slots.)
+        linear=jno.solve.lu(),
     )
     n1 = int(np.asarray(fem.domain.mesh.points).shape[0])
     assert n1 > n0, f"no remesh happened, so this pins nothing: {n0} -> {n1}"
     objs = [e["objective"] for e in fem.adapt_history]
     assert min(objs) < objs[0] / 2.0, f"through-flow was not reduced: {objs[0]:.3e} -> {min(objs):.3e}"
     assert _aspect(fem.domain).max() <= 1.9 + 1e-9
+
+
+def test_relocate_forwards_the_solver_slots_and_refuses_x0_and_time():
+    """relocate/enrich used to drop nonlinear=/linear=/precond= without a word. They now reach the solve on
+    the final mesh: a wrong-typed slot fails THERE, which it could not when the slot was dropped. A warm
+    start and a time scheme do not survive the change of mesh, so those are refused."""
+    _d, fem, flux = _free_surface_channel()
+    with pytest.raises(NotImplementedError, match="x0= or time="):
+        fem.solve(adapt=jno.solve.relocate(objective=flux, max_iters=2), x0=np.zeros(int(fem.dofs)))
+    _d, fem, flux = _free_surface_channel()
+    with pytest.raises(ValueError, match="nonlinear= given, but this problem is linear"):
+        fem.solve(adapt=jno.solve.relocate(objective=flux, max_iters=2), nonlinear=jno.solve.newton())

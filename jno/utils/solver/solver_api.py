@@ -602,12 +602,100 @@ class NonlinearSolver:
         # differently or the second silently reuses the first's compiled solve.
         self.config = dict(config or {})
 
-    def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None, project=None):
+    def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None, project=None, **carry):
         kw = {"project": project} if project is not None else {}
-        return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian, **kw)
+        return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian, **kw, **carry)
 
     def __repr__(self):
         return f"jno.solve.{self.name}({', '.join(f'{k}={v!r}' for k, v in self.config.items())})"
+
+
+def _fem_reductions(fem):
+    """The DOF reductions ``u = P u_red`` a solve on ``fem`` may run on, as periodic-format dicts.
+
+    One slot serves every elimination jNO performs -- periodic/Bloch ties, the exact slip ``n·u = 0``
+    elimination and hanging-node constraints all build a dict of the same shape onto ``fem._periodic``.
+    A complex form solved as its fused real-equivalent ``2n`` block reduces by ``fem._periodic_2n``
+    (``blkdiag(P, P)``) instead, so that is a candidate too.
+    """
+    return [p for p in (getattr(fem, "_periodic", None), getattr(fem, "_periodic_2n", None)) if p is not None]
+
+
+def _matching_reduction(fem, n):
+    """The reduction (a periodic-format dict) whose REDUCED space has ``n`` DOFs and whose per-field full
+    offsets are ``fem.blocks``' -- i.e. the one a length-``n`` vector on ``fem``'s system lives in -- or
+    ``None``."""
+    full = getattr(fem, "blocks", None)
+    if full is None or n is None:
+        return None
+    from .fem_utils import _periodic_blocks
+
+    starts = [int(s.start) for s in full] + [int(full[-1].stop)]
+    for per in _fem_reductions(fem):
+        _b, off_f, off_r = _periodic_blocks(per)
+        if int(off_r[-1]) == int(n) and len(off_f) == len(starts) and [int(o) for o in off_f] == starts:
+            return per
+    return None
+
+
+def _field_layout(fem, n):
+    """``(slices, red_blocks)``: the per-field slices of a length-``n`` vector on ``fem``'s system.
+
+    ``fem.blocks`` slice the FULL solution -- the layout ``fem.solve`` returns. A reduction (periodic tie,
+    slip elimination, hanging nodes) makes the solver work on ``P^T A P`` instead, and it reduces BLOCK-WISE:
+    the reduced vector is each field's reduced DOFs concatenated in block order (``off_red``). A
+    preconditioner is handed that reduced operator, so slicing it with the full offsets cut it in the wrong
+    places -- the last field's slice ran past the end and came back EMPTY (a 3-D periodic Navier-Stokes
+    ``triangular`` preconditioner failed with "incompatible shapes (729,), (0,)"), or, where it happened to
+    fit, a "block" straddled two fields.
+
+    So the layout is read off the operator's SIZE: ``n`` equal to the full size gives ``fem.blocks``
+    (``red_blocks`` is ``None``); equal to a reduction's size gives that reduction's per-field slices, and
+    ``red_blocks`` its per-field ``P_i`` dicts (what an auxiliary form on one field's full space is reduced
+    with). A size that matches neither is refused by name -- there is no correct way to guess.
+    """
+    full = getattr(fem, "blocks", None)
+    if full is None:
+        return None, None
+    n_full = int(full[-1].stop)
+    if n is None or int(n) == n_full:
+        return list(full), None
+    n = int(n)
+    from .fem_utils import _periodic_blocks
+
+    per = _matching_reduction(fem, n)
+    if per is not None:
+        blocks, _off_f, off_r = _periodic_blocks(per)
+        return [slice(int(off_r[i]), int(off_r[i + 1])) for i in range(len(full))], list(blocks)
+    sizes = [int(_periodic_blocks(p)[2][-1]) for p in _fem_reductions(fem)]
+    reduced = f" (reduced: {', '.join(str(s) for s in sizes)})" if sizes else ""
+    fused = (
+        " A complex form is solved as its fused real-equivalent [Re; Im] block, where a field's DOFs are "
+        "not one contiguous slice: precondition it with a complex-native block composition (a child such as "
+        "jno.precond.ams(), which routes the solve onto the complex operator), or with a whole-system "
+        "preconditioner."
+        if getattr(fem, "_complex_n", None) is not None
+        else ""
+    )
+    raise ValueError(
+        f"jno.precond: the operator being preconditioned has {n} rows, but this system's field blocks cover "
+        f"{n_full} DOFs{reduced}, so it cannot be split by field -- a per-field slice would cut it in the "
+        f"wrong places.{fused}"
+    )
+
+
+def _field_reduction(block: dict) -> dict:
+    """One field's block of a multifield reduction (``{"P", "kept", "vec", "is_selection"}``) as a
+    single-field reduction dict -- what ``reduce_matrix_periodic`` takes to form ``P_i^T M P_i``."""
+    return {
+        "P": block["P"],
+        "kept_nodes": block.get("kept"),
+        "vec": block.get("vec", 1),
+        "is_selection": block.get("is_selection"),
+    }
+
+
+_UNRESOLVED = object()
 
 
 class PrecondContext:
@@ -616,15 +704,19 @@ class PrecondContext:
     ``ctx.A`` is the assembled :class:`LinearOperator` (matvec-only on the Jacobian-free
     nonlinear path), ``ctx.fem`` the owning :class:`jno.FEM` (``None`` outside ``fem.solve``),
     ``ctx.diag()`` the operator diagonal. For multifield systems ``ctx.blocks`` are the
-    per-field DOF slices (from ``fem.offsets``), ``ctx.block_slice(field)`` resolves a trial
-    symbol (or integer index) to its slice, and ``ctx.sub(i, j=None)`` is the ``(i, j)``
+    per-field DOF slices **of** ``ctx.A`` (from ``fem.offsets``, or — when a periodic tie, slip
+    elimination or hanging-node constraint reduced the system to ``P^T A P`` — the per-field
+    slices of that reduced system), ``ctx.block_slice(field)`` resolves a trial symbol (or
+    integer index) to its slice, and ``ctx.sub(i, j=None)`` is the ``(i, j)``
     sub-operator as a :class:`LinearOperator` — applied through the *full* operator's matvec
     (embed into block ``j``, extract block ``i``), so it stays sparse/matrix-free; ``diag`` and
     ``dense`` are exact views for ``i == j`` direct/diagonal inner solvers.
 
     ``ctx.assemble(terms, quad_degree=...)`` assembles an **auxiliary weak form** with the
     ordinary ``jno.fem`` machinery and returns its operator — the "preconditioners are weak
-    forms" primitive (weighted mass matrices, low-order proxies, shifted operators).
+    forms" primitive (weighted mass matrices, low-order proxies, shifted operators). On a
+    reduced system the form (assembled on the full finite-element space) is reduced with the
+    same ``P`` as ``ctx.A``, so the two act on the same space.
     """
 
     def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None, mesh: Any = None):
@@ -634,6 +726,94 @@ class PrecondContext:
         # The device mesh of a SHARDED solve (``None`` otherwise): a spec that distributes itself partitions
         # its own data over it (see ``sharding.sharded_solve``).
         self.mesh = mesh
+        # The reduction ``u = P u_red`` from the full finite-element space onto the space ``A`` acts on (a
+        # periodic-format dict; ``None``: ``A`` is on the full space). Resolved from the FEM for a
+        # whole-system context; a per-field child context (``_block_context``) carries its own field's P.
+        self._space = _UNRESOLVED
+        # The field block this context IS, for a per-field child of a block preconditioner (``None`` for a
+        # whole-system context). A child applies what it builds to exactly that block's vector, so an
+        # auxiliary form of any other size is an error there -- not so on the whole system, where a user's
+        # own block scheme may legitimately build a one-field form and apply it to that field's slice.
+        self._field = None
+
+    def _n(self):
+        shape = getattr(self.A, "shape", None) if self.A is not None else None
+        return None if shape is None else int(shape[0])
+
+    def _space_reduction(self):
+        """The reduction mapping the full FE space onto ``A``'s space, or ``None`` (see ``_space``)."""
+        if self._space is not _UNRESOLVED:
+            return self._space
+        n = self._n()
+        if n is None:
+            return None
+        from .fem_utils import _periodic_blocks
+
+        for per in _fem_reductions(self.fem):
+            _b, off_f, off_r = _periodic_blocks(per)
+            if n == int(off_r[-1]) and n != int(off_f[-1]):
+                return per
+        return None
+
+    def _on(self, A, grid: Any = None) -> "PrecondContext":
+        """A context for another operator on the SAME space as this one (a precision cast, the inner
+        solve's own operator), keeping what that space is -- its reduction."""
+        ctx = PrecondContext(A, self.fem, grid)
+        ctx._space = self._space_reduction()
+        ctx._field = self._field
+        return ctx
+
+    def _block_context(self, field) -> "PrecondContext":
+        """The context a per-field child of a block preconditioner is materialized against: ``sub(field)``,
+        on that field's own space -- the field's REDUCED space on a reduced system, so an auxiliary form
+        the child assembles on the full field space is reduced with that field's ``P_i``."""
+        idx = field if isinstance(field, int) else self.fem.block_index(field)
+        ctx = PrecondContext(self.sub(idx), self.fem)
+        _slices, red = _field_layout(self.fem, self._n())
+        ctx._space = None if red is None else _field_reduction(red[idx])
+        ctx._field = idx
+        return ctx
+
+    def _to_space(self, op: LinearOperator, *, what: str = "the auxiliary operator") -> LinearOperator:
+        """``op``, assembled on the full finite-element space, carried onto the space ``A`` acts on.
+
+        On a reduced system that is the Galerkin reduction ``P^T op P`` with the same ``P`` as ``A`` -- the
+        preconditioner then approximates the operator actually being solved. On a whole reduced system a
+        form over ONE field's full space (a user's own block scheme, applied to that field's slice) is
+        reduced with that field's ``P_i`` when the field is unambiguous. A per-field child context refuses a
+        size nothing explains; a whole-system one returns such an operator unchanged, as it always did.
+        """
+        n = self._n()
+        m = None if op.shape is None else int(op.shape[0])
+        if n is None or m is None or m == n:
+            return op
+        red = self._space_reduction()
+        if red is not None:
+            from .fem_utils import _periodic_blocks, reduce_matrix_periodic
+
+            blocks, off_f, off_r = _periodic_blocks(red)
+            target = None
+            if m == int(off_f[-1]) and n == int(off_r[-1]):
+                target = red
+            elif self._field is None and len(blocks) > 1:
+                hits = [i for i in range(len(blocks)) if int(off_f[i + 1] - off_f[i]) == m]
+                if hits and len({id(blocks[i]["P"]) for i in hits}) == 1:  # one field space: unambiguous
+                    target = _field_reduction(blocks[hits[0]])
+            if target is not None:
+                # CONCRETE even when materialized inside a trace (the matrix-free Newton materializes in its
+                # loop body): the form and P are both concrete, and a host-side consumer -- the default
+                # factor-once LU, an AMG setup -- needs the reduced matrix as data, not as a tracer.
+                with jax.ensure_compile_time_eval():
+                    mat = reduce_matrix_periodic(target, op.bcoo if op.bcoo is not None else op.dense())
+                return LinearOperator(mat)
+        if self._field is not None:
+            raise ValueError(
+                f"jno.precond: {what} is {m} x {m}, but the operator it preconditions is {n} x {n}"
+                + (" (a reduced system: periodic ties / slip / hanging nodes)" if red is not None else "")
+                + ". A form must be written on the same space as the (sub-)system it preconditions -- over "
+                "one field's symbols inside block_diag/triangular, over every field for the whole system."
+            )
+        return op
 
     def diag(self):
         return self.A.diag()
@@ -652,7 +832,9 @@ class PrecondContext:
 
     @property
     def blocks(self):
-        blocks = getattr(self.fem, "blocks", None)
+        """Per-field ``slice``s of ``A`` -- of the REDUCED system when the solve runs on one (see
+        :func:`_field_layout`); ``fem.blocks`` itself always slices the full solution."""
+        blocks, _red = _field_layout(self.fem, self._n())
         if blocks is None:
             raise TypeError("PrecondContext.blocks: no per-field block structure (single field, or no FEM attached).")
         return blocks
@@ -723,8 +905,12 @@ class PrecondContext:
                     "PrecondContext.assemble: a complex auxiliary form with periodic ties is not supported "
                     "(the outer P-reduction is not mirrored onto the preconditioner block)."
                 )
+        # On a reduced system (periodic ties, slip, hanging nodes) `ctx.A` is `P^T A P`, while the form was
+        # assembled on the full finite-element space; `_to_space` reduces it with the same P so the two act
+        # on the same space (a form of any other size -- one field's, inside a user's own block scheme --
+        # is returned as assembled).
         if aux.is_complex:
-            return LinearOperator(_bcoo(aux.A))  # the fused 2n real-equivalent block IS `.A`
+            return self._to_space(LinearOperator(_bcoo(aux.A)))  # the fused 2n block IS `.A`
         # `.A` is DOCUMENTED dense ("use fem.operator for the raw sparse form on large problems"), so
         # reaching for it here cost n^2 on every auxiliary -- 1.74 GB for a velocity-space mass at
         # 14,739 dofs, which is a preconditioner running out of memory doing the one thing it exists
@@ -733,8 +919,8 @@ class PrecondContext:
         if raw is not None:
             A_raw = raw.evaluate(None)[0] if hasattr(raw, "evaluate") else (raw[0] if isinstance(raw, tuple) else raw)
             if hasattr(A_raw, "indices"):  # already a BCOO -- keep it sparse end to end
-                return LinearOperator(A_raw)
-        return LinearOperator(_bcoo(aux.A))
+                return self._to_space(LinearOperator(A_raw))
+        return self._to_space(LinearOperator(_bcoo(aux.A)))
 
 
 def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:
@@ -1082,12 +1268,14 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     ``inner(<krylov>)``, ``chebyshev`` (bounds by power iteration on the JVP), a **pre-built**
     ``amg`` (``spec.build(A_representative)``), and ``block_diag``/``triangular`` over those.
     What cannot: specs that need the assembled matrix -- ``jacobi`` (no diagonal on a matvec),
-    an unbuilt ``amg``, ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own
-    targeted errors when materialized.
+    ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own targeted errors when
+    materialized.
 
-    On a **transient march** an unbuilt ``amg`` composes anyway: the march's own driver freezes it
-    first (:func:`_freeze_precond_for_march`), building the hierarchy from the step tangent at the
-    initial state, outside the scan. That is the one place the representative operator is known.
+    An unbuilt ``amg`` (any leaf whose setup cannot run under a trace) composes anyway: it is frozen
+    ONCE, eagerly, from the assembled tangent at the entry iterate ``x0``, outside the Newton
+    ``while_loop`` (:func:`_freeze_precond_for_newton`) -- on a **transient march** from the step tangent
+    at the initial state, outside the scan (:func:`_freeze_precond_for_march`). A frozen preconditioner
+    changes how fast each Krylov solve converges, never what Newton converges to.
 
     **A DIRECT ``linear=`` slot picks the direct Newton.** ``lu``/``dense``/``amg`` need an assembled
     matrix, and a matrix-free tangent has none to give them, so pairing one with the matrix-free
@@ -1122,12 +1310,13 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     if _prep is not None and fem is not None:
         _prep(fem)
 
-    inner = None
+    solver = None
     if linear is not None or precond is not None:
         solver = linear if linear is not None else _solve_ns.bicgstab()  # historic matrix-free default
         if precond is not None:
             prepare_precond(precond, fem)  # aux assembly now, NOT inside the traced Newton loop
 
+    def _inner_with(pc):
         def inner(operator, rhs):
             # The direct Newton hands us the ASSEMBLED tangent, the matrix-free one a JVP callable.
             # ``LinearOperator`` is the uniform handle over both, so the same composed inner serves
@@ -1139,23 +1328,38 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
                 if callable(operator) and not hasattr(operator, "shape")
                 else LinearOperator(operator)
             )
-            M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+            M = materialize_precond(pc, PrecondContext(op, fem)) if pc is not None else None
             return solver(op, rhs, M=M)
 
-    def _composed(residual_fn, u0, *, jacobian=None, project=None):
+        return inner
+
+    inner = None if solver is None else _inner_with(precond)
+
+    def _composed(residual_fn, u0, *, jacobian=None, project=None, **carry):
         # Solution-dependent preconditioner refresh -- the Picard lag. Every Newton driver's loop is
         # a ``lax.while_loop``, so the per-step iterate is a tracer no host assembly can see; the
         # solve's ENTRY iterate (warm start / previous march step) is the one concrete solution a
         # solution-dependent auxiliary form can be assembled from, and it is refreshed here, once
         # per composed invocation. A fully traced caller passes a tracer and skips the refresh --
         # the spec then raises its own loud error at materialization if it was never assembled.
+        lin = inner
         if precond is not None and fem is not None and not isinstance(u0, jax.core.Tracer):
             for s in _iter_specs(precond):
                 hook = getattr(s, "refresh_from", None)
                 if hook is not None:
                     hook(u0, fem)
-        return nonlinear(residual_fn, u0, linear_solve=inner, jacobian=jacobian, project=project)
+            # A spec whose setup needs a CONCRETE matrix (an unbuilt amg: pyamg; ilu: scipy) cannot set up
+            # inside the loop; it is built ONCE, eagerly, from the tangent at the entry iterate. Everything
+            # else keeps materializing per linearization, exactly as before.
+            if getattr(precond, "host_setup", False):
+                lin = _inner_with(_freeze_precond_for_newton(precond, fem, u0, jacobian))
+        return nonlinear(residual_fn, u0, linear_solve=lin, jacobian=jacobian, project=project, **carry)
 
+    # A carried tangent (a march, step to step) is honoured by a driver that keeps its tangent (reuse=True).
+    _traits_nl = getattr(nonlinear, "traits", None) or {}
+    _composed.carries_tangent = bool(_traits_nl.get("carries_tangent", False))
+    # ...and hands back its own residual norms (a march reports them per step instead of re-evaluating).
+    _composed.reports_info = bool(_traits_nl.get("reports_info", False))
     # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller
     # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
     # ``direct=None`` (newton's default) assembles the tangent whenever one is offered, so it wants it too.
@@ -1233,12 +1437,23 @@ class _FrozenMarchPrecond:
     accepts), so nothing downstream needs to know a march is what it came from.
     """
 
-    __slots__ = ("_apply", "_of")
+    __slots__ = ("_apply", "_of", "_n")
 
-    def __init__(self, apply, of):
-        self._apply, self._of = apply, of
+    def __init__(self, apply, of, n=None):
+        self._apply, self._of, self._n = apply, of, n
 
-    def __call__(self, _ctx):
+    def __call__(self, ctx):
+        m = getattr(ctx, "_n", lambda: None)()
+        if self._n is not None and m is not None and m != self._n:
+            # A driver that solves SUB-systems (jno.solve.staggered sweeps one field group at a time) hands the
+            # inner solve a smaller operator than the tangent this was built from; applying it would fail
+            # deep inside the Krylov loop with a broadcasting error.
+            raise ValueError(
+                f"fem.solve(precond={self._of!r}): this preconditioner was built once, from the {self._n} x "
+                f"{self._n} tangent, but is being applied to a {m} x {m} system (a driver that solves "
+                "sub-systems, e.g. jno.solve.staggered). Use a traceable preconditioner there "
+                "(jno.precond.jacobi()), or staggered(direct=True) with a linear= slot."
+            )
         return self._apply
 
     def __repr__(self):
@@ -1277,8 +1492,8 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
     # of its wrapper took a configuration that worked (measured 0.18 s/step on the melt pool's T+w) and
     # refused it at the probe, since a block-triangular applier is not required to reduce a full
     # residual in one application the way a V-cycle is.
-    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
-    if all(bool(getattr(s, "traceable", True)) for s in leaves):
+    leaves, untraceable = _untraceable_leaves(precond)
+    if not untraceable:
         return precond  # nothing here needs a concrete matrix -- leave the per-linearization path alone
 
     name = getattr(precond, "name", type(precond).__name__)
@@ -1307,28 +1522,101 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
         # tangent is ``J_spatial + J_mass/dt`` -- the same combination `SemidiscreteTimeBlock.step` forms.
         # ``mass_residual_jac`` reads the previous state off the load-path channel, so it is delivered
         # here exactly as the stepper delivers it, from the initial state.
-        _lp: dict = {}
-        _u0 = jnp.asarray(at).reshape(-1)
-        for _fid, _s0, _s1, _vec in (block.metadata or {}).get("prev_state_slices", []):
-            _slice = _u0[_s0:_s1]
-            _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
-        J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": _lp})
+        J_mass = block.mass_residual_jac(at, t0, {"__loadpath__": block.prev_state_loadpath(at)})
         A_rep = _add_step_operator(J, J_mass, 1.0 / scale)  # ∝ J_mass + scale·J; scale = dt for backward Euler
-        op = LinearOperator(A_rep)
-        prepare_precond(precond, fem)
-        applier = materialize_precond(precond, PrecondContext(op, fem))
-        _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
-        return _FrozenMarchPrecond(applier, precond)
+        return _frozen_at(precond, fem, A_rep, name, leaves)
     M = block.mass(t0, None)
     A_rep = _add_step_operator(M, J, scale)
+    return _frozen_at(precond, fem, A_rep, name, leaves)
+
+
+def _untraceable_leaves(precond):
+    """``(leaves, any_untraceable)`` of a preconditioner tree. Only a LEAF decides whether a tree needs a
+    concrete matrix: a block container (``triangular``, ``block_diag``) assembles nothing itself."""
+    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
+    return leaves, not all(bool(getattr(s, "traceable", True)) for s in leaves)
+
+
+def _frozen_at(precond, fem, A_rep, name, leaves, *, where="march"):
+    """Materialize ``precond`` once against the concrete ``A_rep`` and wrap it as a frozen spec (probed once:
+    a lone leaf that amplifies a residual is refused rather than left to stall the Krylov solve)."""
     op = LinearOperator(A_rep)
     prepare_precond(precond, fem)
     applier = materialize_precond(precond, PrecondContext(op, fem))
-    _refuse_a_useless_applier(applier, A_rep, name, single_leaf=len(leaves) == 1 and leaves[0] is precond)
-    return _FrozenMarchPrecond(applier, precond)
+    single = len(leaves) == 1 and leaves[0] is precond
+    _refuse_a_useless_applier(applier, A_rep, name, single_leaf=single, where=where)
+    return _FrozenMarchPrecond(applier, precond, n=int(A_rep.shape[0]))
 
 
-def _refuse_a_useless_applier(applier, A, name, *, single_leaf):
+def _assembled_tangent_at(fem, u):
+    """The problem's ASSEMBLED tangent at ``u``, on the space ``u`` lives in, or ``None`` if it has none.
+
+    For a driver that is not handed one (``newton(direct=False)``, ``picard()``): the full-space
+    ``fem._op.jacobian`` at the prolonged iterate, carried onto the reduced space (``P^T J P``, reduced
+    Dirichlet rows eliminated) when a periodic tie / slip / hanging nodes reduce the solve."""
+    op = getattr(fem, "_op", None)
+    jac, size = getattr(op, "jacobian", None), getattr(op, "size", None)
+    if not callable(jac) or size is None:
+        return None
+    u = jnp.asarray(u).reshape(-1)
+    if int(u.shape[0]) == int(size):
+        J = jac(u, {})
+        return J if hasattr(J, "shape") else None
+    per = _matching_reduction(fem, int(u.shape[0]))
+    if per is None:
+        return None
+    from ...precond import _on_solved_space
+    from .fem_utils import prolong_periodic
+
+    J = jac(prolong_periodic(per, u), {})
+    return _on_solved_space(fem, J) if hasattr(J, "todense") else None
+
+
+def _freeze_precond_for_newton(precond, fem, u0, jacobian=None):
+    """Materialize a preconditioner with a NON-traceable leaf once, from the tangent at the entry iterate.
+
+    Only a spec whose ``host_setup`` says so (an unbuilt ``amg``, ``ilu``, ``hypre``, an unbuilt
+    ``schwarz``/``fsai``, or a block / sum / ``cached`` holding one) -- a ``form``, ``lsc`` or ``jacobi``
+    tree keeps materializing per linearization inside the loop, as it always did.
+
+    A steady nonlinear solve runs Newton as a ``lax.while_loop``, so the tangent it hands the inner
+    linear solve is traced, and a host-side setup (``amg``: pyamg; ``ilu``: scipy) died inside it with
+    "AMG setup needs a concrete matrix but got a traced one" -- on the ordinary
+    ``fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())`` over a nonlinear problem. The
+    march solved this before its scan (:func:`_freeze_precond_for_march`); this is the same move before
+    the Newton loop: the tangent at ``x0`` (the default guess is zero) is assembled eagerly -- the one the
+    Newton driver itself uses when it is handed one (``jacobian``), else the problem's own assembled
+    tangent on the solve's space -- and the whole tree is materialized against it once.
+
+    The frozen setup does not follow the tangent as Newton moves. That is always CORRECT (a preconditioner
+    changes the Krylov convergence speed, never the root Newton converges to); how much speed it costs
+    depends on how far the tangent drifts from ``x0``. A ``cached(spec, refresh=k)`` cadence cannot be
+    honoured inside the single ``while_loop`` (rebuilding every k Newton iterations would need the loop cut
+    into chunks), so it is refused rather than silently ignored.
+    """
+    leaves, _ = _untraceable_leaves(precond)
+    name = getattr(precond, "name", type(precond).__name__)
+    cadence = _refresh_cadence(precond)
+    if cadence is not None:
+        raise NotImplementedError(
+            f"fem.solve(precond=jno.precond.cached(..., refresh={cadence})): a steady nonlinear solve builds "
+            "this preconditioner ONCE, from the tangent at the initial guess, because the Newton loop is a "
+            f"single lax.while_loop -- a rebuild every {cadence} iterations cannot happen inside it, and would "
+            "silently never fire. Drop the cadence (the frozen setup is always correct, only slower as the "
+            "tangent drifts), or re-solve from a better x0= to rebuild it there."
+        )
+    A_rep = jacobian(u0) if jacobian is not None else _assembled_tangent_at(fem, u0)
+    if A_rep is None or not hasattr(A_rep, "shape") or isinstance(getattr(A_rep, "data", A_rep), jax.core.Tracer):
+        raise TypeError(
+            f"fem.solve(precond={name}): this preconditioner is set up on the host from a CONCRETE matrix, and "
+            "this nonlinear solve offers no assembled tangent to build it from. Use the default "
+            "jno.solve.newton() (it assembles the tangent), a traceable preconditioner (jno.precond.jacobi()), "
+            "or pre-build this one yourself with spec.build(A)."
+        )
+    return _frozen_at(precond, fem, A_rep, name, leaves, where="newton")
+
+
+def _refuse_a_useless_applier(applier, A, name, *, single_leaf, where="march"):
     """One probe: does ``M^-1`` actually reduce a residual on the operator it was built from?
 
     A preconditioner is free to be mediocre, but one that AMPLIFIES is worse than none, and inside a
@@ -1362,16 +1650,17 @@ def _refuse_a_useless_applier(applier, A, name, *, single_leaf):
     if not (left == left) or left <= 1.0:
         return
     raise ValueError(
-        f"fem.solve(precond={name}): on this march the preconditioner makes a random residual "
+        f"fem.solve(precond={name}): {'on this march' if where == 'march' else 'in this nonlinear solve'} the "
+        "preconditioner makes a random residual "
         f"{left:.1f}x WORSE, so the Krylov solve cannot converge with it -- it would stall inside the "
-        "time loop instead of failing here. This is what an algebraic-multigrid hierarchy does on a "
+        f"{'time' if where == 'march' else 'Newton'} loop instead of failing here. This is what an algebraic-multigrid hierarchy does on a "
         "tangent that is not Laplacian-like (a strongly nonlinear coefficient contributes a term that "
         "breaks its strength-of-connection assumption). Use jno.precond.jacobi(), which reads the "
         "diagonal off the tangent itself, or precondition a problem whose step operator is definite."
     )
 
 
-def _add_step_operator(M, A, scale):
+def _add_step_operator(M, A, scale, plan=None):
     """Form the theta-step operator ``M + scale * A`` once, eagerly.
 
     Both BCOO: concatenate triplets (duplicates are legal COO — every consumer sums them:
@@ -1387,13 +1676,92 @@ def _add_step_operator(M, A, scale):
     if hasattr(M, "todense") and hasattr(A, "todense"):
         import jax.experimental.sparse as jsp
 
-        from .fem_utils import sum_duplicate_triplets
+        from .fem_utils import compress_plan, sum_duplicate_triplets
 
         data = jnp.concatenate([M.data, scale * A.data])
+        if plan is not None and (int(M.nse), int(A.nse), tuple(M.shape)) == plan[1]:
+            # Planned, host-side, before the march was traced (`_plan_step_tangent_merge`): an O(nnz) scatter
+            # into the sorted, duplicate-free union pattern, flagged as such so the CSR conversion does not
+            # sort it again. The flags are static pytree data, so they survive the closure conversion a
+            # Newton driver applies to the tangent -- where the indices themselves become tracers.
+            (idx, inverse, nse), _sig = plan
+            return jsp.BCOO(
+                (jax.ops.segment_sum(data, inverse, num_segments=nse), idx),
+                shape=M.shape,
+                indices_sorted=True,
+                unique_indices=True,
+            )
+        if not isinstance(M.indices, jax.core.Tracer) and not isinstance(A.indices, jax.core.Tracer):
+            # The PATTERN is concrete even when the values are traced (a march builds its step tangent under
+            # `backend_blocks._concrete_pattern`), so the merge is decided once, host-side -- `compress_plan`,
+            # content-cached -- and applied as an O(nnz) scatter into a sorted, duplicate-free pattern. Without
+            # it the step operator kept every triplet of both operands (M and A overlap almost entirely) and
+            # the CSR conversion argsorted them on every Newton iteration: 6.15M triplets and ~300 MiB of
+            # sort scratch on a 24^3 P1/P1 Navier-Stokes march.
+            plan = compress_plan(np.concatenate([np.asarray(M.indices), np.asarray(A.indices)], axis=0))
+            if plan is not None:
+                idx, inverse, nse = plan
+                return jsp.BCOO(
+                    (jax.ops.segment_sum(data, inverse, num_segments=nse), idx),
+                    shape=M.shape,
+                    indices_sorted=True,
+                    unique_indices=True,
+                )
         indices = jnp.concatenate([M.indices, A.indices], axis=0)
         return sum_duplicate_triplets(jsp.BCOO((data, indices), shape=M.shape))
     dense = lambda x: x.todense() if hasattr(x, "todense") else jnp.asarray(x)
     return dense(M) + scale * dense(A)
+
+
+def _plan_step_tangent_merge(block, state=None):
+    """Plan, host-side and once, how a nonlinear march merges its step tangent ``J + M/dt``.
+
+    ``SemidiscreteTimeBlock.step`` forms the tangent as ``_add_step_operator(J, M, 1/dt)`` inside the march's
+    trace, where every index array is a tracer: the merge could not be planned, so the operator reached the
+    linear solve as a raw concatenation of both operands (they overlap almost entirely) and the CSR
+    conversion ARGSORTED it on every Newton iteration. Measured on a 24^3 periodic P1/P1 Navier-Stokes
+    march: 6.15M raw triplets and ~300 MiB of sort scratch, the largest buffer of the compiled step.
+
+    The pattern is fixed by mesh and constraints, so it is read here from ONE eager evaluation of the same
+    two operands at the initial state, compressed once (``compress_plan``, content-cached), and stored on
+    the block. ``_add_step_operator`` applies it only when both operands arrive with the planned sizes.
+
+    Not planned -- the unplanned path stays, correct and as before -- when the pattern can move during the
+    march: a runtime topology (``metadata["pattern_moves"]``: reconnection, contact re-pairing), or when the
+    operands cannot be evaluated eagerly here.
+    """
+    from .fem_utils import compress_plan
+
+    meta = block.metadata or {}
+    if meta.get("pattern_moves") or block.jacobian is None or block.dt is None:
+        return None
+    at = block.state0 if state is None else state
+    if at is None:
+        return None
+    t0 = float(meta.get("t0", 0.0))
+    try:
+        J = block.jacobian(at, t0, None)
+        if block.mass is None:
+            if block.mass_residual_jac is None:
+                return None
+            S = block.mass_residual_jac(at, t0, {"__loadpath__": block.prev_state_loadpath(at)})
+        else:
+            S = block.mass(t0, None)
+    except Exception:  # noqa: BLE001 -- an operand that needs runtime args: leave the march unplanned
+        return None
+    if not (hasattr(J, "indices") and hasattr(S, "indices")):
+        return None
+    if isinstance(J.indices, jax.core.Tracer) or isinstance(S.indices, jax.core.Tracer):
+        return None
+    plan = compress_plan(np.concatenate([np.asarray(J.indices), np.asarray(S.indices)], axis=0))
+    if plan is None:
+        return None
+    idx, inverse, nse = plan
+    # DEVICE arrays, made once: every consumer of the merged operator slices its indices
+    # (`A.indices[:, 0]`, validity masks), and on a NumPy array each slice is a fresh host array the trace
+    # captures as its own constant -- measured 6 copies of the pattern and 6 masks in one compiled march.
+    # A single device constant is sliced by staged ops instead, and captured once.
+    return (jnp.asarray(idx), jnp.asarray(inverse), int(nse)), (int(J.nse), int(S.nse), tuple(J.shape))
 
 
 def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None, state=None):
@@ -1424,7 +1792,19 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # BDF2 steps (the last of `step_scales`, which every step but the first uses).
         scales = tuple(scheme.step_scales(block)) if scheme is not None and hasattr(scheme, "step_scales") else ()
         precond = _freeze_precond_for_march(precond, fem, block, state, scale=scales[-1] if scales else None)
+        if block.step_merge_plan is None:
+            block.step_merge_plan = _plan_step_tangent_merge(block, state)
         if not linear_step:
+            if nonlinear is None:
+                # The march's own default Newton KEEPS its tangent while it contracts (reuse=True): within a
+                # step, and -- carried by the marcher -- from step to step. A march's tangent changes little
+                # from one step to the next, and assembling it is the dominant cost of a long integrand
+                # (measured, a stabilised 3-D flow at 55k DOFs: 220 of ~300 ms per Newton iteration); the
+                # contraction rule refreshes it the moment it stops paying, so it never costs more than one
+                # wasted solve. An explicit `nonlinear=` keeps exactly what it asked for.
+                from ... import solve as _solve_ns
+
+                nonlinear = _solve_ns.newton(direct=True if getattr(linear, "direct", False) else None, reuse=True)
             return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
         # A LINEARLY implicit scheme (Rosenbrock) solves linear systems with the stage matrix even on a
         # nonlinear block: it takes the linear step solve composed below, not a Newton driver.

@@ -16,6 +16,59 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+#### Time-varying Dirichlet data — `g(x, t)`
+
+On a transient form `g` may depend on time too: write it with the boundary variable's `t`. Nothing is
+passed to `fem.solve()`:
+
+```python
+xin, yin, tin = d.variable("inlet", split=True)
+ramp = 1.0 - jno.np.exp(-tin / 0.1)                              # smooth start-up
+fem = jno.fem([
+    momentum, continuity,
+    u(xin, yin)[0] - ramp * 4 * U * yin * (H - yin) / H**2,      # ramped (or pulsatile) inflow
+    u(xin, yin)[1] - 0.0,
+    ...                                                          # walls, initial condition
+])
+```
+
+The constrained row reads `u = g(x, t)` at the time the step lands on, in every time scheme: `t_{n+1}`
+for `theta` (a Dirichlet row carries no time derivative, so every θ imposes it at the new time) and
+`bdf2`, each stage time for `sdirk`, and each stage time plus the `∂g/∂t` term for `rosenbrock`. The
+interior equations see the boundary's rate through the mass matrix, whose columns on those rows are
+kept. This holds on linear and **nonlinear** forms, single-field or **coupled** — so a ramped or
+pulsatile inflow, a moving lid, or a manufactured solution with exact time-dependent boundary values on
+Navier–Stokes is written the same way — and the march stays differentiable in the form's runtime
+parameters, a `jno.np.parameter` or a trainable net coefficient, single-field or coupled (a P2
+manufactured solution with `k` set at runtime is reproduced to 1e-8, identical to `k` written as a
+number). Measured on the Taylor–Green vortex with the exact velocity imposed on all four walls
+(`tests/test_fem_coupled_time_dirichlet.py`): BDF2 stays second order in time (2.3; with the data one
+step late it drops to 1.05, and at 16 steps is ~900× less accurate).
+
+**Boundary data you want to identify.** A trainable parameter may sit inside the value — an inflow
+amplitude, a ramp rate. The held value is re-evaluated at each step's time with the runtime value of the
+parameter, so the march is differentiable in it (reverse mode through every scheme):
+
+```python
+a = jno.np.parameter((1,), name="a")                                  # unknown amplitude
+a.dtype(jnp.float64); a.initialize(jax.nn.initializers.constant(0.5)); a.optimizer(optax.adam(5e-2))
+fem = jno.fem([form, u(xb, yb) - a * xb * jno.np.sin(3 * tb), u(ci[0], ci[1]) - 0.0])
+crux = jno.core([(fem.solve(time=jno.solve.bdf2()) - u_traj).mse], domain=obs)
+crux.solve(300)                                                       # a: 0.5 -> 1.7
+```
+
+Measured (`tests/test_fem_coupled_time_dirichlet.py`): the recovery above lands on 1.70000007. With `a`
+set at runtime the march is bit-identical to the one with `a` written as a number — linear and nonlinear,
+coupled and single-field, in `theta`, `bdf2`, `sdirk` and `ros2` — and `jax.grad` w.r.t. `a` of an
+interior functional matches central differences to 1e-6.
+
+*Scope, all loud:* a trainable **net** inside a time-varying value, or a net/parameter-valued Dirichlet
+**beside** one on a transient form; a parameter inside the value on a second-order (`u_tt`) form or on
+the τ load path; a nonlinear second-order (`u_tt`) form; a time-varying value on a non-matching tied interface (see
+below). **Accuracy:** a time-varying boundary value costs Runge–Kutta-type schemes order — the classical
+*order reduction* from their low stage order (Ostermann & Roche, *Math. Comp.* 59 (1992) 403–420). See
+[the measured orders](limitations.md#the-detail).
+
 #### Per-tag surface coefficients — `d.attach(tag, h=...)`
 
 A boundary term is normally written per tag, on that tag's coordinates. When the *same* condition
@@ -96,7 +149,16 @@ rather than a box, and is rejected.
 
 **Scope.** Bounds are wired on the steady residual path (real, 2D/3D native Lagrange, single-field or
 coupled), including inside a `tau=` load-path march; a transient or complex assembly is rejected with
-a clear error. One box per field. Note that a bound is not a cure for an ill-posed operator: in a
+a clear error. One box per field. A box composes with a **periodic tie**, steady or on a `tau=` march:
+the tied solve runs on the kept unknowns `u = P ũ`, and the box is imposed there — the full box restricted
+to the kept DOFs, which is exact because an eliminated DOF *is* the DOF it is tied to. So the bound must be
+the same on both tied faces (a periodic `lo`/`hi`, or `u.i(-1)`, which satisfies the tie by construction);
+a bound that differs across the tie is refused by name, and so is a box beside a *weighted* elimination
+(a non-matching mortar interface, hanging nodes, a slip condition), whose eliminated values a box on the
+kept ones would not bound. Measured: the periodic obstacle problem matches its analytic free boundary, and
+a tied ratchet `u.bounds(u.i(-1), None)` holds the unit-load linear solve to 1e-8
+(`tests/test_fem_bounds_periodic.py`, `tests/test_fem_history_march_periodic.py`). Note that a bound is
+not a cure for an ill-posed operator: in a
 phase-field form `dm.bounds(0, 1)` keeps the damage in range but does **not** remove the need for a
 floor on `(1-dm)²`, which at `dm = 1` would otherwise make the displacement block singular. And on a
 non-convex energy a monolithic Newton is not expected to converge whether or not a bound is present —
@@ -119,6 +181,16 @@ components, and the message points at `u.d(x)`.
 (Historically a raw `u[0]` indexed the leading array axis, which at assembly is quadrature points, so
 it died inside the assembler with a broadcast error naming nothing — while `u(region)[0]` and
 `u.vector[0]`, built by the views as `u[..., 0]`, selected the component correctly.)
+
+A **vector wall value** clamps every component at once: `u(xb, yb) - (1.0, -0.5)`, or a varying one
+`u(xb, yb) - jno.np.stack([gx, gy], axis=-1)` (`gx`, `gy` may read `t` for a driven wall). A scalar value
+on a vector field is the same number on every component, and `u(xb, yb)[i] - g` clamps one component
+and wants a scalar `g`; a vector there raises. Pinned in `tests/test_fem_vector_dirichlet_values.py`.
+
+!!! warning "Fixed: a vector wall value used to keep only its first component"
+    Until this was fixed, `u(xb, yb) - (1.0, -0.5)` imposed `(1.0, 1.0)` — silently, steady and
+    transient alike — and a vector `g(x, t)` wrote the wrong values. Examples that only used `(0, 0)`
+    could not show it.
 
 ### Reading the reaction off a constrained region — `fem.eval`
 
@@ -194,14 +266,20 @@ partition of unity, so summing the weak term `F·φ` over every DOF is the same 
 A term that names two boundary regions and carries no test function is a **tie**: it identifies the
 DOFs on region `A` with those on region `B`. It is enforced by algebraic reduction (a prolongation
 `P` that eliminates the `A` DOFs), not by assembly, so it composes with everything downstream —
-complex, transient, Bloch (`u(A) - c*u(B)`), and `basis=` all reuse the same `P`.
+complex, transient, Bloch (`u(A) - c*u(B)`), `basis=`, and the `domain(tau=...)` load-path march all
+reuse the same `P`.
 
 ```python
 d.tag("left",  lambda x, y: x < 1e-9)      # a tag predicate includes the corner nodes,
 d.tag("right", lambda x, y: x > 1 - 1e-9)  # which matters — see below
+xl, yl = d.variable("left", split=True)[:2]
+xr, yr = d.variable("right", split=True)[:2]
 
-fem = jno.fem([weak_form, u("left") - u("right")])
+fem = jno.fem([weak_form, u(xl, yl) - u(xr, yr)])
 ```
+
+The faces enter through their coordinates, like every other boundary term: `u("left")` with a bare tag
+name is not a tie and raises.
 
 A tie works on a **scalar or a vector** field. On a vector field the mortar rows are unchanged — they
 are node-pair weights — and the prolongation is expanded componentwise, `kron(P_node, I_vec)`. That is
@@ -215,9 +293,36 @@ fem = jno.fem([mech,
                maximum(0.0, -c * u.gap(seam2_a, seam2_b, domain=d)) * inner(n, phi_s, 1)])  # contact
 ```
 
+**A value on one node of a tied face, and `p.pin()`.** The tie says a node and its periodic images are
+**one** unknown, so a value written at one of them holds at all of them: `u(corner) - 0` on the corner of a
+doubly periodic box fixes all four corners. `p.pin()` needs no such care. It pins the vertex nearest the
+min-corner that lies on **no** tied face (with no ties, the min-corner itself). A gauge only needs some DOF
+of the field's constant null space, and a node off every tied face is never eliminated and never has
+another row summed into it. So the pin is the same one-node condition with or without periodicity, steady
+or transient, single-field or coupled. `p.pin(mean=True)` re-levels afterwards to `∫p dx = 0` exactly as
+without ties. Two different values on nodes a tie identifies are refused by name. So is a value on a
+single node of a *weighted* (mortar / collocated / Bloch) tie, whose image is a weighted sum of other
+nodes: prescribe it on the kept side of the tie (the `B` in `u(A) - u(B)`) instead.
+
+```python
+at = lambda tag: d.variable(tag, split=True)[:2]                          # (x, y) on a face
+fem = jno.fem([momentum, continuity,
+               u(*at("left")) - u(*at("right")), u(*at("bottom")) - u(*at("top")),   # fully periodic
+               p(*at("left")) - p(*at("right")), p(*at("bottom")) - p(*at("top")),
+               p.pin()])                                                  # a vertex off the tied faces
+```
+
 !!! warning "Scope"
-    A **transient** tie is still scalar-only (that route pre-builds its own reduction), and refuses by
-    name. A tie combined with `u.gap` assembles but solves to a **deferred trace node** rather than an
+    A tie works on a **transient** form as on a steady one: a single field, scalar or vector, first or
+    second order in time (`u.t`, `u.tt`), linear or nonlinear, with constant or time-varying wall data
+    `g(x, t)`; and a coupled first-order system. Measured: a vector march equals two scalar marches of
+    the same equation to 1e-10 with the seam equal node for node, and the mortar patch test marched in
+    time stays on the linear field to 1e-17 (`tests/test_fem_periodic_transient_vector.py`,
+    `tests/test_fem_vector_tie.py`). Refused by name: a tie on a **coupled** `u_tt` form; a **complex**
+    transient with a time-varying Dirichlet value (not wired with or without a tie); a Bloch tie on a
+    real transient (see [solvers](../solvers.md)).
+
+    A tie combined with `u.gap` assembles but solves to a **deferred trace node** rather than an
     array, because the gap marks the form structurally nonlinear and a reduced nonlinear system stays
     lazy so its node can flow into `jno.core` for an inverse problem. Evaluate it the way
     `tests/test_fem_periodic_unstructured.py::test_periodic_nonlinear_reaction_diffusion` does, via a
@@ -262,15 +367,47 @@ fem = jno.fem([mech,
     are re-imposed in the reduced space — symmetrically, because restoring the row alone leaves the
     reduced column populated and silently downgrades LDL^T to general LU.
 
+    The exclusion applies where the tie partner is prescribed as well, e.g. the corner of a periodic
+    channel with no-slip walls. A prescribed DOF whose exact partner is **free** is left to the tie instead,
+    and its value is imposed on the reduced DOF it resolves to. Excluding it tore the tie at that node,
+    silently: a pinned corner of a doubly periodic Poisson problem held 0 while its three images held
+    -0.037, for a solution of order 1. The coupled (multi-field) reduction did not apply the exclusion at
+    all, so every coupled problem with a value on a tied face failed to build, a pressure pin on a
+    periodic box among them. A nonlinear **transient** with a restored row failed on its first step, and
+    its reduced mass row is now emptied as the linear march empties it. All of this is pinned in
+    `tests/test_fem_pin_periodic.py` against Poisson, Poiseuille and Taylor–Green solutions.
+
     Every reduced-space path goes through one helper for this (`impose_reduced_dirichlet`, or
     `wrap_reduced_dirichlet` for the residual-form paths). That matters: the steady real path was fixed
     first and the others stayed wrong for exactly as long as they had their own copy of the logic —
     5.8e-04 on the fused-complex path, whose `blkdiag(P, P)` transform dropped the record entirely, and
     4.2e-04 on the transient, which built its reduction through a second construction site that never
-    annotated it. Both are now at round-off and are measured against their conforming controls.
+    annotated it. Both are now at round-off and are measured against their conforming controls. The
+    second-order (`u_tt`) route was a third construction site, with neither the exclusion nor the
+    record: on a membrane periodic in x with held walls, a non-periodic wall value (`u = x` on y = 0)
+    moved a tied corner by the whole value, 1.0, and a value held on one side of the tie only was 0.5 off
+    at its image. It now goes through the same helpers, and since a `u_tt` block starts from a
+    wall-consistent state (`u = g`, `u_t = 0`), the image starts at the held value too. Pinned in
+    `tests/test_fem_second_order_time.py` against the analytic standing wave and the same data written
+    without the corner conflict.
 
     A **time-varying** essential value on a polluted interface row is refused by name: its held value is
     written into the full row every step and there is no constant to put back.
+
+!!! measured "A tie on a load-path march — applied at every step"
+    A form that reads step history (`u.i(-1)`, or a `state.evolves(...)` update) marches over a
+    `domain(tau=...)` grid, and that march used to hand Newton the **full** residual: the tie was dropped
+    without a word. A backward-Euler heat step written by hand, periodic in x, came back bit-identical to
+    the same form with *no* condition on the tied faces (natural Neumann) — 30% of max|u| off the `u.t`
+    reference. The exact slip condition `n·u = 0` and the hanging-node constraint ride the same `P` and
+    were dropped the same way (a wall velocity of full magnitude; 29% of max|u| on a hanging node).
+
+    Each step now solves `Pᵀ r(P ũ) = 0` and the march carries `u = P ũ`, so the history buffers and every
+    `.evolves` update are computed from a field that satisfies the tie. The same hand-written step matches
+    the `u.t` march with `time=jno.solve.theta(1.0)` to ~1e-10 relative, single-field and coupled, with the
+    seam values equal exactly. Pinned in `tests/test_fem_history_march_periodic.py`.
+    `tau=jno.solve.arclength(...)` does not solve in the reduced space and refuses such a form by name. A
+    `.bounds(...)` box is imposed on the reduced unknowns (see [inequalities](#inequalities-uboundslo-hi)).
 
 ### The tangential companion — `u.slide`
 

@@ -39,11 +39,12 @@ $H^1$ elements carry it.
 
 The interface is where the resolution matters, and it moves. `remesh(criterion=...)` refines on any
 traced field — here $1-\phi^2$, which is $\approx 1$ on the interface and $\approx 0$ in both bulks — and on a
-march it is evaluated on the **live** state at every remesh, at a fixed vertex budget:
+march it is evaluated on the **live** state at every remesh, at a fixed DOF budget (`max_dofs` counts
+every unknown of the system, `fem.dofs`, not vertices):
 
 ```python
 phi_now = c.bind(x=xi, y=yi)
-traj = fem.solve(adapt=jno.solve.remesh(criterion=1.0 - phi_now * phi_now, every=3, max_dofs=n0),
+traj = fem.solve(adapt=jno.solve.remesh(criterion=1.0 - phi_now * phi_now, every=3, max_dofs=fem.dofs),
                  nonlinear=jno.solve.newton(direct=True))
 ```
 

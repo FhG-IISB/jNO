@@ -8,19 +8,24 @@ from typing import Any, Callable, Dict, Optional
 # ---------------------------------------------------------------------
 
 
-def _verdict(G, u_prev, wn, report):
+def _verdict(G, u_prev, wn, report, norms=None):
     """The step's own residual norms, for a march that wants to judge its steps afterwards.
 
     ``G`` is the function the driver actually root-finds, so both norms are for the SAME equation --
     one at the incoming iterate and one at the solved state. That is what lets the caller apply the
     driver's own ``atol + rtol*||r(u_prev)||`` test outside the trace, where it can concretise.
 
-    Costs two residual evaluations per step, and only when asked. Same arrangement, for the same
+    Costs two residual evaluations per step, and only when asked -- none when the Newton solve hands back
+    the norms it already took (``norms = (||G(wn)||, ||G(u_prev)||)``, the same two numbers: measured as
+    ~20% of a step of a stabilised 3-D flow whose tangent is carried). Same arrangement, for the same
     reason, as the load-path march in ``history_march.py``.
     """
     if not report:
         return wn
     import jax.numpy as jnp
+
+    if norms is not None:
+        return wn, jnp.asarray(norms[0]), jnp.asarray(norms[1])
 
     return (
         wn,
@@ -300,6 +305,9 @@ class SemidiscreteTimeBlock:
 
     # optional hints
     forcing_mode: str = "none"
+    #: Host-side merge plan for the step tangent ``J + M/dt`` (see ``solver_api._plan_step_tangent_merge``):
+    #: set once, eagerly, before a march is traced; ``None`` keeps the unplanned (concatenated) operator.
+    step_merge_plan: Any = None
 
     def is_linear(self) -> bool:
         """
@@ -324,6 +332,23 @@ class SemidiscreteTimeBlock:
 
         return _prolong(self.prolongation, reduced)
 
+    def prev_state_loadpath(self, u):
+        """The previous state ``u`` as a state-dependent mass reads it: each prev-field's nodal slice, keyed
+        by its frozen id, for the assembler's load-path channel (a vector field node-major, ``(n, vec)``).
+
+        The slices index the FULL nodal layout. On a reduced block (periodic tie, slip, hanging nodes) the
+        march carries the REDUCED state, so it is prolonged first -- slicing the reduced vector with full
+        offsets read the wrong DOFs, and raised outright when the length was not a multiple of the field's
+        components (a periodic Navier-Stokes march with u_t in its stabilisation)."""
+        import jax.numpy as jnp
+
+        full = jnp.asarray(self.prolong(u) if self.prolongation is not None else u).reshape(-1)
+        lp = {}
+        for fid, s0, s1, vec in (self.metadata or {}).get("prev_state_slices", []):
+            sl = full[s0:s1]
+            lp[fid] = sl if vec == 1 else sl.reshape(-1, vec)
+        return lp
+
     def is_nonlinear(self) -> bool:
         """
         Return True if this block contains a nonlinear semidiscrete payload.
@@ -340,7 +365,7 @@ class SemidiscreteTimeBlock:
             self.mass_residual is not None and self.residual is not None
         )
 
-    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False):
+    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None):
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
 
         The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
@@ -369,7 +394,82 @@ class SemidiscreteTimeBlock:
         * ``report=True`` additionally returns ``(u, ||G(u)||, ||G(u_prev)||)`` on a NONLINEAR
           step, so a marcher can judge the step outside the trace -- see :func:`_verdict`. A
           linear step is a linear solve with its own guard and ignores the flag.
-        """
+
+        ``tangent`` (``(data, valid)``) is a step tangent CARRIED from the previous step: with it the call
+        returns ``(result, tangent_next)``. jNO's default Newton then starts from it and keeps it while it
+        still contracts the residual (see :func:`~jno.utils.solver.newton_krylov.newton_direct`,
+        ``reuse``), instead of assembling a fresh tangent at every step -- the dominant cost of a march
+        whose element integrand is long (a stabilised flow: 220 of ~300 ms per Newton iteration). The data
+        rides the step-merge plan's fixed pattern (``step_merge_plan``); a path that has no such tangent (a
+        user ``nonlinear=`` slot, a matrix-free residual, a linear block) hands ``tangent`` back unchanged.
+        Without ``tangent`` the default Newton still keeps its tangent WITHIN the step."""
+        box = {}
+        out = self._step(
+            u, t, dt, args, theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=report,
+            tangent=tangent, _box=box,
+        )  # fmt: skip
+        if tangent is None:
+            return out
+        return out, box.get("tangent", tangent)
+
+    @staticmethod
+    def _carried_bcoo(tangent, plan, dtype):
+        """The carried tangent's data on the step-merge plan's fixed pattern, with its validity flag."""
+        import jax.experimental.sparse as jsp
+        import jax.numpy as jnp
+
+        (idx, _inv, _nse), (_n_j, _n_m, shape) = plan
+        data, valid = tangent
+        J0 = jsp.BCOO((jnp.asarray(data, dtype), idx), shape=tuple(shape), indices_sorted=True, unique_indices=True)
+        return J0, valid
+
+    @classmethod
+    def _slot_newton(cls, nonlinear_solve, G, u, jac, tangent, plan, dtype, box):
+        """A composed ``nonlinear=`` driver on the assembled step tangent, given the carried tangent when it
+        keeps tangents (``reuse=True``, the march default)."""
+
+        info = {}
+        if tangent is not None and plan is not None and getattr(nonlinear_solve, "carries_tangent", False):
+            wn = nonlinear_solve(G, u, jacobian=jac, tangent0=cls._carried_bcoo(tangent, plan, dtype), info=info)
+        elif getattr(nonlinear_solve, "reports_info", False):
+            wn = nonlinear_solve(G, u, jacobian=jac, info=info)
+        else:
+            return nonlinear_solve(G, u, jacobian=jac)
+        cls._collect(info, box)
+        return wn
+
+    @staticmethod
+    def _collect(info, box):
+        """The Newton solve's carried tangent and residual norms, for :meth:`step` to hand back / report."""
+        import jax.numpy as jnp
+
+        # Only a SPARSE tangent rides the carry (on the merge plan's pattern); a dense one -- a march reduced
+        # to a Galerkin basis, whose tangent is the projected UᵀJU -- is kept within the step only.
+        if "tangent" in info and hasattr(info["tangent"], "indices"):
+            box["tangent"] = (info["tangent"].data, jnp.asarray(True))
+        if "norms" in info:
+            box["norms"] = info["norms"]
+
+    @staticmethod
+    def _default_newton(G, u, jac, tangent, plan, dtype, box):
+        """jNO's per-step Newton on the assembled step tangent ``jac``, keeping that tangent while it
+        contracts -- within the step always, and across steps when a ``tangent`` is carried in."""
+
+        from .newton_krylov import newton_default
+
+        info = {}
+        tangent0 = (
+            SemidiscreteTimeBlock._carried_bcoo(tangent, plan, dtype)
+            if (tangent is not None and plan is not None)
+            else None
+        )
+        wn = newton_default(G, u, jacobian=jac, reuse=True, tangent0=tangent0, info=info)
+        SemidiscreteTimeBlock._collect(info, box)
+        return wn
+
+    def _step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False,
+              tangent=None, _box=None):  # fmt: skip
+        """The body of :meth:`step`; see there."""
         import jax.numpy as jnp
 
         args = args or {}
@@ -397,7 +497,11 @@ class SemidiscreteTimeBlock:
             return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
 
         if self.is_nonlinear():
-            from .newton_krylov import newton_default, newton_krylov
+            from .newton_krylov import newton_krylov
+
+            # The step tangent's host merge plan, unless this evaluation hands the assembler a runtime
+            # topology (a reconnecting march): its pattern is then not the one the plan was built on.
+            _merge_plan = None if (args and "__topology__" in args) else self.step_merge_plan
 
             # θ-method: M(y⁺−y)/dt + θ R(y⁺) + (1−θ) R(y) = 0. θ=1 (default) is backward Euler — the
             # existing first-order behaviour; a second-order (u_tt) block sets θ=½ (trapezoidal /
@@ -422,11 +526,7 @@ class SemidiscreteTimeBlock:
                 # Deliver the previous state y as each prev-field's nodal slice on the load-path channel.
                 # A vector field's DOFs are node-major interleaved (node·vec + comp), so reshape its slice to
                 # (n_nodes, vec); a scalar field stays 1-D. The assembler's load-path gather handles either.
-                _lp = dict((args or {}).get("__loadpath__", {}) or {})
-                _uprev = jnp.asarray(u, dtype).reshape(-1)
-                for _fid, _s0, _s1, _vec in self.metadata.get("prev_state_slices", []):
-                    _slice = _uprev[_s0:_s1]
-                    _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
+                _lp = {**dict((args or {}).get("__loadpath__", {}) or {}), **self.prev_state_loadpath(u)}
                 _ap = {**(args or {}), "__loadpath__": _lp}
 
                 def G(wn):
@@ -440,10 +540,14 @@ class SemidiscreteTimeBlock:
                         def jac_step(wn):
                             # J = J_spatial(wn) + (1/dt)·J_mass(wn); both assembled BCOO (exact ∂M/∂u).
                             return _add_step_operator(
-                                self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
+                                self.jacobian(wn, t_next, args),
+                                self.mass_residual_jac(wn, t_next, _ap),
+                                1.0 / dt,
+                                plan=_merge_plan,
                             )
 
-                        return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
+                        wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                        return _verdict(G, u, wn, report, _box.get("norms"))
                     return _verdict(G, u, nonlinear_solve(G, u), report)
                 # default Newton: on the assembled step tangent when both Jacobians exist
                 if self.jacobian is not None and self.mass_residual_jac is not None:
@@ -451,10 +555,14 @@ class SemidiscreteTimeBlock:
 
                     def jac_default(wn):
                         return _add_step_operator(
-                            self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
+                            self.jacobian(wn, t_next, args),
+                            self.mass_residual_jac(wn, t_next, _ap),
+                            1.0 / dt,
+                            plan=_merge_plan,
                         )
 
-                    return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
+                    wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                    return _verdict(G, u, wn, report, _box.get("norms"))
                 return _verdict(G, u, newton_krylov(G, u), report)
 
             M_t = _operand(self.mass(t_next, args))
@@ -479,9 +587,10 @@ class SemidiscreteTimeBlock:
 
                     def jac_step(wn):  # ∂G/∂wn = M/dt + diag(w)·J_R; it used to drop the θ, a wrong tangent for θ < 1
                         J = self.jacobian(wn, t_next, args)
-                        return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt)
+                        return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
-                    return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
+                    wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                    return _verdict(G, u, wn, report, _box.get("norms"))
                 return _verdict(G, u, nonlinear_solve(G, u), report)
             # default Newton: on the assembled step tangent M/dt + J when the assembler provides J
             if self.jacobian is not None:
@@ -489,9 +598,10 @@ class SemidiscreteTimeBlock:
 
                 def jac_default(wn):  # the same ∂G/∂wn = M/dt + diag(w)·J_R as `jac_step`
                     J = self.jacobian(wn, t_next, args)
-                    return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt)
+                    return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
-                return _verdict(G, u, newton_default(G, u, jacobian=jac_default), report)
+                wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                return _verdict(G, u, wn, report, _box.get("norms"))
             return _verdict(G, u, newton_krylov(G, u), report)
 
         from .linear import matrix_diagonal, sparse_matvec
@@ -546,7 +656,7 @@ class SemidiscreteTimeBlock:
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
         return _default_step_solve(step_op, rhs, u, d, krylov=(self.metadata or {}).get("krylov"))
 
-    def solve(self, solve_fn=None, *, save_ts=None):
+    def solve(self, solve_fn=None, *, save_ts=None, values=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
         trace node (mirrors :meth:`FemLinearSystem.solve` for the steady case).
 
@@ -569,6 +679,13 @@ class SemidiscreteTimeBlock:
         ``block.operator_fn(t, args)``) and ``block.state0`` -- and form ``u_dot = M^-1(c - A u)``.
         Note a Dirichlet problem zeroes M's Dirichlet rows (a DAE), so the implicit
         ``(M + dt A)`` default is preferred there; an explicit field must hold those rows.
+
+        ``values`` (what ``fem.solve(k=2.0)`` passes) marches at those parameter values NOW and returns the
+        trajectory array, as the steady solves do; every runtime parameter must be named.
+
+        Evaluated eagerly, the built-in schemes keep only the states the ``save_ts`` frames read -- no past on
+        the device -- and the trajectory comes back as a HOST NumPy array (see :func:`_march_to_host`). Under
+        ``jit``/``grad`` the march stays one ``lax.scan``, and the result a traced array.
 
         Enable x64 (``jax_enable_x64``); the assembly is float64.
         """
@@ -615,6 +732,9 @@ class SemidiscreteTimeBlock:
                         "not timed: .fn() returns asynchronously, and timing it would force a device "
                         "sync — wrap it in jax.block_until_ready yourself to time it"
                     )
+            import numpy as _np
+
+            on_host = isinstance(ys, _np.ndarray)  # an eager march handed its frames to the host
             if self.prolongation is not None:
                 # Periodic tie: the block integrates in the reduced main-DOF space. Prolong each saved
                 # step ``u = P·u_red`` back to the full nodal layout, so the returned trajectory lives on the
@@ -623,7 +743,7 @@ class SemidiscreteTimeBlock:
                 # periodic transient hands back reduced DOFs a caller then mis-slices with full offsets.
                 import jax
 
-                ys = jax.vmap(self.prolong)(ys)
+                ys = _prolong_on_host(self, ys) if on_host else jax.vmap(self.prolong)(ys)
             if (self.metadata or {}).get("complex"):
                 # A complex transient integrates as the real-equivalent 2n block over y=[u_r; u_i].
                 # Recombine ONCE, here, after any periodic prolongation -- P is real and linear, so
@@ -633,7 +753,35 @@ class SemidiscreteTimeBlock:
                 ys = ys[..., :h] + 1j * ys[..., h:]
             return ys
 
+        if values is not None:
+            # `fem.solve(k=2.0)` on a parametric transient: the caller named the parameters, so march at them
+            # now. (This used to raise a TypeError -- the keyword had no way in.)
+            import jax.numpy as jnp
+
+            from ...trace import check_runtime_values
+
+            check_runtime_values(names, values)
+            return _solve(*(jnp.asarray(values[n]) for n in names))
         return FunctionCall(_solve, params, name="fem_transient_solve")
+
+
+def _prolong_on_host(block, ys):
+    """``P u_red`` for every frame of a HOST trajectory, the full layout back on the host.
+
+    The frames go through the device in batches no larger than a march chunk (:func:`_offload_chunk`):
+    prolonging them all at once would rebuild the whole (now full-size) trajectory on the device, which
+    is what handing the frames to the host avoided."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    n_full = int(jnp.shape(block.prolong(jnp.zeros((ys.shape[1],), ys.dtype)))[0])
+    k = _offload_chunk(ys.shape[0], n_full, ys.dtype)
+    run = jax.jit(jax.vmap(block.prolong))
+    out = np.empty((ys.shape[0], n_full), dtype=ys.dtype)
+    for a in range(0, ys.shape[0], k):
+        out[a : a + k] = np.asarray(run(jnp.asarray(ys[a : a + k])))
+    return out
 
 
 def _block_time_grid(block):
@@ -692,7 +840,8 @@ def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, t
             out.append(ys[_np.flatnonzero(keep)])
         done += k
         lo = hi
-    return jnp.concatenate(out, axis=0)
+    # An eager chunk hands back HOST frames: join them there, not on the device.
+    return _np.concatenate(out, axis=0) if all(isinstance(o, _np.ndarray) for o in out) else jnp.concatenate(out, axis=0)
 
 
 def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None, theta=None):
@@ -744,8 +893,9 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # step is a linear solve with its own guard and is not judged here.
     _judge = bool(block.is_nonlinear())
 
-    def march(s0, grid_ts, args):
-        blk = hoist_time_invariant(block, args, grid_ts[0])  # static loads/operators: once, not per step
+    def make_step(args, t_start):
+        """One implicit step, the block's static loads/operators hoisted once at ``t_start``."""
+        blk = hoist_time_invariant(block, args, t_start)  # static loads/operators: once, not per step
 
         def step(w, t_next):
             out = blk.step(
@@ -763,7 +913,68 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
             wn, r_end, r_start = out
             return wn, (wn, r_end, r_start)
 
-        return jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])[1]
+        return step
+
+    def march(s0, grid_ts, args):
+        return jax.lax.scan(jax.checkpoint(make_step(args, grid_ts[0])), s0, grid_ts[1:])[1]
+
+    if _march_eagerly(args, save_ts):
+        # Evaluated eagerly: march in chunks and hand each chunk's frames to the host as it goes, so the
+        # device never holds the past (see `_march_to_host`). Returns a host array.
+        import numpy as np
+
+        from .history_march import _TRANSIENT_ADVICE, _check_march_converged
+
+        grid_np = np.asarray(grid_ts, dtype=float)
+
+        def _verdict(r_end, r_start, n_done, final, unchanged):
+            _check_march_converged(
+                r_end,
+                r_start,
+                grid_np[1 : n_done + 1],
+                nonlinear_solve,
+                what="transient march",
+                coord="t",
+                advice=_TRANSIENT_ADVICE,
+                unchanged=unchanged,
+            )
+
+        # The step tangent rides the carry from step to step (see `SemidiscreteTimeBlock.step`, `tangent=`):
+        # assembled once and kept while it still contracts, instead of once per step.
+        tang0 = _carried_tangent0(block, s0, nonlinear_solve, dtype)
+        if tang0 is None:
+            carry0, state_of, stepper = s0, (lambda c: c), make_step
+        else:
+
+            def stepper(args, t_start):
+                blk = hoist_time_invariant(block, args, t_start)
+
+                def step(c, t_next):
+                    w, tang = c
+                    out, tang = blk.step(
+                        w, t_next - dt, dt, args=args, theta=theta, linear_solve=linear_solve,
+                        nonlinear_solve=nonlinear_solve, report=_judge, tangent=tang,
+                    )  # fmt: skip
+                    return (out[0] if _judge else out, tang), out
+
+                return step
+
+            carry0, state_of = (s0, tang0), (lambda c: c[0])
+        return _march_to_host(
+            block,
+            args,
+            (linear_solve, nonlinear_solve, theta, dt, tang0 is not None),
+            stepper,
+            carry0,
+            grid_np,
+            dtype,
+            save_ts,
+            state_of=state_of,
+            prefix_ts=grid_np[:1],
+            prefix_states=[s0],
+            judge=_verdict if _judge else None,
+            skip_first_compare=True,  # the one-scan guard compared the produced states, not s0
+        )
 
     # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
     # residuals (the rhs, the θ-combination, the Krylov solve's saved primals — measured ~32 vectors
@@ -1082,6 +1293,293 @@ def _sharded_transient(block, args, save_ts, linear_solve, nonlinear_solve, thet
         return _default_transient_integrate(local, args, save_ts, theta=theta)
 
     return jax.jit(march, in_shardings=(split, split, split, split), out_shardings=repl)(Md, Mi, Ad, Ai)
+
+
+#: An eager march keeps at most this fraction of the solving device's memory in stacked states at once
+#: (``bytes_limit // _OFFLOAD_BUDGET_DIVISOR``): the chunk in flight. A policy relative to the device the
+#: march runs on, not a number tuned on one card.
+_OFFLOAD_BUDGET_DIVISOR = 16
+
+
+def _offload_chunk(n_steps, n_dofs, dtype):
+    """Steps per chunk for an eager march that hands its frames to the host as it goes.
+
+    Sized from the solving device's own memory limit. A device that reports none (the CPU) IS the host
+    memory, so there is nothing to protect and the march runs as one chunk."""
+    import numpy as np
+
+    from .placement import solve_device
+
+    try:
+        stats = solve_device().memory_stats() or {}
+    except Exception:  # noqa: BLE001 - a backend without memory stats: treat as host memory
+        stats = {}
+    limit = stats.get("bytes_limit")
+    if not limit:
+        return int(n_steps)
+    per_step = max(1, int(n_dofs) * np.dtype(dtype).itemsize)
+    return int(max(1, min(n_steps, (int(limit) // _OFFLOAD_BUDGET_DIVISOR) // per_step)))
+
+
+def _chunk_bounds(n_steps, k):
+    """``[(a, b), ...]`` step ranges of at most ``k`` steps covering ``0..n_steps``. Equal lengths when a
+    divisor of ``n_steps`` lies in ``[k/2, k]`` -- every chunk then runs ONE compiled program; otherwise
+    full chunks and a shorter tail (one more compile)."""
+    k = max(1, min(int(k), int(n_steps)))
+    for d in range(k, (k + 1) // 2 - 1, -1):
+        if d > 0 and n_steps % d == 0:
+            k = d
+            break
+    return [(a, min(a + k, n_steps)) for a in range(0, n_steps, k)]
+
+
+def _carried_tangent0(block, state, nonlinear_solve, dtype):
+    """The empty carried step tangent ``(zeros(nse), False)`` for a march whose per-step Newton keeps its
+    tangent (jNO's default; a ``newton(reuse=True)`` slot) on an assembled tangent, or ``None`` where
+    nothing can be carried: a linear block, a driver that does not keep tangents, no assembled tangent, or
+    no fixed tangent pattern to carry it on (no step-merge plan -- a pattern that moves during the march).
+    Builds the plan if no slot did."""
+    import jax.numpy as jnp
+
+    if not block.is_nonlinear() or block.jacobian is None:
+        return None
+    if nonlinear_solve is not None and not (
+        getattr(nonlinear_solve, "carries_tangent", False) and getattr(nonlinear_solve, "wants_jacobian", False)
+    ):
+        return None
+    if getattr(block, "mass_residual", None) is not None and getattr(block, "mass_residual_jac", None) is None:
+        return None
+    if block.step_merge_plan is None:
+        from .solver_api import _plan_step_tangent_merge
+
+        block.step_merge_plan = _plan_step_tangent_merge(block, state)
+    if block.step_merge_plan is None:
+        return None
+    return (jnp.zeros((int(block.step_merge_plan[0][2]),), dtype), jnp.asarray(False))
+
+
+def _march_eagerly(args, save_ts):
+    """True when the march runs on concrete values: no trace is active and nothing handed in is traced.
+    Then it can hand its frames to the host as it goes. Under ``jit``/``grad``/``vmap`` -- even of a form
+    with no parameter, whose inputs are all concrete -- it stays one ``lax.scan`` (the adjoint needs the
+    states anyway)."""
+    import jax
+    from jax._src import core as _core
+
+    if not _core.trace_state_clean():
+        return False
+    return not any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves((args, save_ts)))
+
+
+def _needed_steps(grid_np, save):
+    """The steps of a march over ``grid_np`` whose states the frames at ``save`` read.
+
+    Index 0 is the march's start state, ``j >= 1`` the state after step ``j``. A save time on a grid point
+    reads that point; one between two reads both (the blend of :func:`_resample_trajectory`); one past the
+    end reads the last state. Save times at or before ``grid_np[0]`` belong to whatever came before."""
+    import numpy as np
+
+    n = int(grid_np.size) - 1
+    s = save[save > grid_np[0]]
+    hi = np.clip(np.searchsorted(grid_np, s, side="right"), 1, n)
+    lo = hi - 1
+    on_grid = grid_np[lo] == s
+    past_end = s >= grid_np[n]
+    need = np.concatenate([lo[on_grid & ~past_end], hi[~on_grid | past_end], lo[~on_grid & ~past_end]])
+    return np.unique(need[need >= 1])
+
+
+def _frame_chunks(n_steps, needed, budget_frames):
+    """Chunk bounds ``[(a, b)]`` over ``0..n_steps`` and the most needed states any chunk holds.
+
+    The device holds a chunk's needed states (its save slots) and nothing else of the march, so the bound is
+    on NEEDED states per chunk, not on steps: a march that saves 10 frames of 10^4 steps is one chunk."""
+
+    budget = max(1, int(budget_frames))
+    if needed.size <= budget:
+        return [(0, n_steps)], max(1, int(needed.size))
+    k = max(1, (n_steps * budget) // max(1, int(needed.size)))
+    while True:
+        bounds = _chunk_bounds(n_steps, k)
+        per = [int(((needed > a) & (needed <= b)).sum()) for a, b in bounds]
+        if max(per) <= budget or k == 1:
+            return bounds, max(1, max(per))
+        k = max(1, (k * budget) // max(per))
+
+
+def _march_to_host(
+    block,
+    args,
+    config,
+    make_step,
+    carry0,
+    grid_np,
+    dtype,
+    save_ts,
+    *,
+    state_of,
+    prefix_ts,
+    prefix_states,
+    judge=None,
+    skip_first_compare=False,
+    cache=True,
+):
+    """Run a march and return its frames at ``save_ts`` as a HOST array; the device keeps no past steps.
+
+    ``make_step(args, t_start)`` returns the scheme's ``step(carry, t_next) -> (carry, out)``, with ``out``
+    the new state, or ``(state, *residuals)`` when ``judge`` is given; ``state_of(carry)`` is the state in a
+    carry. ``prefix_ts`` / ``prefix_states`` are the states the scheme already has at and before
+    ``grid_np[0]`` (the initial state; BDF2's start-up step).
+
+    **No past on the device.** Each step writes its state into a slot of a small buffer when a frame will
+    read it -- a save time's grid point, or the two points either side of an off-grid one -- and into one
+    scratch row otherwise. The device holds the save slots and the current state, never the steps between.
+    The march runs in chunks only when the save slots would outgrow ``1/_OFFLOAD_BUDGET_DIVISOR`` of the
+    device (:func:`_frame_chunks`); each chunk's frames are then sampled on the device -- gathered on the
+    grid, blended by :func:`_resample_trajectory` off it, the arithmetic of the one-scan path -- their copy
+    to the host started, and the next chunk queued before they are collected. Nothing runs inside the
+    compiled step: no callback, no sync.
+
+    ``judge(r_end, r_start, n_steps_done, final, unchanged)`` sees every step's residuals so far as host
+    arrays, one chunk behind the march, so a diverged step raises before the rest is returned.
+    ``unchanged`` (final call) is whether no step changed the state -- carried through the scan as one flag
+    (``skip_first_compare`` leaves the first step out, for a march whose start state is not a state the
+    one-scan guard compared).
+
+    ``cache=False`` compiles the chunk afresh for this call instead of through :func:`_cached_march`, for a
+    ``make_step`` that closes over values derived from ``args`` (the cache would replay the first call's)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    save = np.asarray(save_ts, dtype=float).reshape(-1)
+    n = int(grid_np.size) - 1
+    n_dofs = int(jnp.shape(state_of(carry0))[-1])
+    needed = _needed_steps(grid_np, save)
+    # The device's budget in states (`_offload_chunk`: all of them where the device is the host memory).
+    chunks, n_slots = _frame_chunks(n, needed, _offload_chunk(n, n_dofs, dtype))
+    judged = judge is not None
+
+    def chunk_march(ext, grid, slots, compare, args):
+        step = make_step(args, grid[0])
+
+        def body(c, x):
+            carry, buf, same = c
+            t_next, slot, cmp = x
+            carry, out = step(carry, t_next)
+            st = out[0] if judged else out
+            buf = jax.lax.dynamic_update_slice(buf, st[None, :].astype(buf.dtype), (slot, jnp.zeros_like(slot)))
+            if judged:
+                same = same & (~cmp | jnp.all(st == state_of(c[0])))
+            return (carry, buf, same), (tuple(out[1:]) if judged else None)
+
+        return jax.lax.scan(jax.checkpoint(body), ext, (grid[1:], slots, compare))
+
+    out = np.empty((save.size, n_dofs), dtype=np.dtype(dtype))
+    landed = []  # (rows, device arrays, how to make the frames on the host) whose host copy is under way
+
+    def _ship(rows, fr):
+        fr.copy_to_host_async()
+        landed.append((rows, (fr,), None))
+
+    def _ship_states(rows, prev, buf, k, ts_local):
+        """A chunk's frames, made on the HOST from its raw slot buffer: the device keeps no copy of them.
+
+        Sampling them on the device -- the start state concatenated before the slots, then gathered or
+        blended -- held THREE copies of the frames there next to the march's own memory, and a 442k-DOF
+        stabilised flow saving 81 frames ran the 8 GB card out of memory landing them."""
+        prev.copy_to_host_async()
+        buf.copy_to_host_async()
+        landed.append((rows, (prev, buf), (k, ts_local)))
+
+    def _land():
+        for rows, arrs, how in landed:
+            if how is None:
+                out[rows] = np.asarray(arrs[0])
+                continue
+            k, ts_local = how
+            states = np.concatenate([np.asarray(arrs[0])[None, :], np.asarray(arrs[1])[:k]], axis=0)
+            out[rows] = _sample_host(states, ts_local, save[rows])
+        landed.clear()
+
+    def _sample(states, ts_local, rows):
+        """Frames at ``save[rows]`` from ``states`` (rows of a trajectory on the grid points ``ts_local``)."""
+        ts = save[rows]
+        hit = np.searchsorted(ts_local, ts)
+        if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
+            return states[jnp.asarray(hit)]
+        return _resample_trajectory(states, jnp.asarray(ts_local, dtype), ts, dtype)
+
+    t_prev = float(grid_np[0])
+    rows = np.flatnonzero(save <= t_prev)
+    if rows.size:
+        pts = jnp.stack([jnp.asarray(p, dtype) for p in prefix_states])
+        _ship(rows, _sample(pts, np.asarray(prefix_ts, dtype=float), rows))
+    prev = jnp.asarray(prefix_states[-1], dtype)
+    carry = carry0
+    run = None if cache else jax.jit(lambda e, g, sl, cm: chunk_march(e, g, sl, cm, args))
+    res, res_dev, flags = [], None, []
+    for ci, (a, b) in enumerate(chunks):
+        mine = needed[(needed > a) & (needed <= b)]  # global step indices this chunk keeps
+        slots = np.full((b - a,), n_slots, dtype=np.int32)  # the scratch row
+        slots[mine - a - 1] = np.arange(mine.size, dtype=np.int32)
+        compare = np.ones((b - a,), dtype=bool)
+        if skip_first_compare and a == 0:
+            compare[0] = False
+        ext = (carry, jnp.zeros((n_slots + 1, n_dofs), dtype), jnp.asarray(True))
+        g = jnp.asarray(grid_np[a : b + 1], dtype)
+        if cache:
+            (carry, buf, same), r = _split_cached_march(
+                block, args, (*config, "to_host"), chunk_march, ext, g, jnp.asarray(slots), jnp.asarray(compare), args
+            )
+        else:
+            (carry, buf, same), r = run(ext, g, jnp.asarray(slots), jnp.asarray(compare))
+        last = ci == len(chunks) - 1
+        rows = np.flatnonzero((save > t_prev) & ((save <= grid_np[b]) | last))
+        if rows.size:
+            _ship_states(rows, prev, buf, int(mine.size), np.concatenate([[t_prev], grid_np[mine]]))
+        if judged:
+            for x in (*r, same):
+                x.copy_to_host_async()
+        # This chunk is queued: collect the PREVIOUS one's frames and verdict while it runs.
+        _land()
+        if judged:
+            if res_dev is not None:
+                res.append(tuple(np.asarray(x) for x in res_dev))
+                judge(*_stack_residuals(res), int(a), False, None)
+            res_dev = r
+            flags.append(same)
+        prev = state_of(carry)
+        t_prev = float(grid_np[b])
+        del buf
+    _land()
+    if judged:
+        res.append(tuple(np.asarray(x) for x in res_dev))
+        judge(*_stack_residuals(res), n, True, bool(all(bool(np.asarray(f)) for f in flags)))
+    return out
+
+
+def _sample_host(states, ts_local, ts):
+    """Rows of ``states`` (a trajectory on the grid times ``ts_local``) at the times ``ts``, on the host:
+    picked where a time is a grid point, else the linear blend of the two bracketing states with
+    :func:`_resample_trajectory`'s clamping."""
+    import numpy as np
+
+    hit = np.searchsorted(ts_local, ts)
+    if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
+        return states[hit]
+    hi = np.clip(np.searchsorted(ts_local, ts, side="right"), 1, ts_local.size - 1)
+    lo = hi - 1
+    span = ts_local[hi] - ts_local[lo]
+    w = np.clip(np.where(span > 0, (ts - ts_local[lo]) / np.where(span > 0, span, 1.0), 0.0), 0.0, 1.0)
+    return states[lo] * (1.0 - w[:, None]) + states[hi] * w[:, None]
+
+
+def _stack_residuals(res):
+    """Concatenate per-chunk host residual tuples along the step axis."""
+    import numpy as np
+
+    return tuple(np.concatenate([r[i] for r in res], axis=0) for i in range(len(res[0])))
 
 
 def _resample_trajectory(traj, grid_ts, save_ts, dtype):

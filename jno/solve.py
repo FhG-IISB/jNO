@@ -510,16 +510,22 @@ def _root_driver(
     name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False,
     reuse=False, anderson=0,
 ) -> NonlinearSolver:  # fmt: skip
-    if reuse and direct is not True:
+    if reuse and direct is False:
         raise ValueError(
-            f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED, factorized tangent between steps, and only "
-            f"the sparse-direct driver has one: pass direct=True as well. The default iterative and the "
-            f"matrix-free modes never factorize the tangent, so there is nothing to reuse."
+            f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED tangent between steps (and, for the sparse-direct "
+            f"driver, its factorization). The matrix-free mode (direct=False) never assembles one, so there is "
+            f"nothing to reuse: use the default direct=None (assembled tangent, iterative solve) or direct=True."
         )
 
     # direct: True = assembled tangent + sparse LU; None = assembled tangent + iterative inner solve when the
     # assembler provides one, matrix-free otherwise (newton's default); False = always matrix-free.
-    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
+    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None, tangent0=None, info=None):
+        # `tangent0`: a tangent the caller carries between calls (a time march, step to step) -- honoured only
+        # with reuse=True and an assembled tangent. `info` (a dict) receives the solve's own residual norms
+        # and, with reuse, its last tangent; see newton_direct.
+        carry = {"info": info} if jacobian is not None and direct is not False else {}
+        if reuse and jacobian is not None and direct is not False:
+            carry["tangent0"] = tangent0
         if direct is None and jacobian is not None:
             # The default: Newton on the ASSEMBLED tangent, solved iteratively -- the composed
             # ``linear=``/``precond=`` slots if given, else Jacobi-BiCGStab (see newton_default).
@@ -537,6 +543,8 @@ def _root_driver(
                 ls_max=ls_max,
                 ls_c=ls_c,
                 linear_solve=linear_solve if linear_solve is not None else assembled_krylov_solve(inner_tol, inner_maxit),
+                reuse=reuse,
+                **carry,
             )
         if direct:
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
@@ -567,6 +575,7 @@ def _root_driver(
                 # the historic sparse-LU default
                 linear_solve=linear_solve,
                 reuse=reuse,
+                **carry,
             )
         from .utils.solver.newton_krylov import newton_krylov
 
@@ -597,7 +606,13 @@ def _root_driver(
         config["anderson"] = anderson
     if reuse:
         config["reuse"] = reuse
-    return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol}, config=config)
+    return NonlinearSolver(
+        _fn,
+        name=name,
+        direct=direct,
+        traits={"rtol": rtol, "atol": atol, "carries_tangent": bool(reuse), "reports_info": direct is not False},
+        config=config,
+    )
 
 
 def newton(
@@ -636,13 +651,20 @@ def newton(
     ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
     to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning.
 
-    ``reuse=True`` (with ``direct=True``) is **lagged-Jacobian Newton**: step against the last factorized
-    tangent until its contraction drops below 1/2, then refresh -- fewer factorizations for more,
-    cheaper steps. A step on a stale tangent that does not reduce the residual is rejected, so it
-    cannot diverge where the fresh Newton would not. Pays off with a backend that keeps its
-    factorization (``lu(backend="cudss" | "pardiso")``); ``backend="device"`` refactorizes anyway.
-    ``fem.stats["nonlinear"]["factorizations"]`` reports the count. See
-    :func:`jno.utils.solver.newton_krylov.newton_direct` for the rule and its source."""
+    ``reuse=True`` is **lagged-Jacobian Newton**: step against the last ASSEMBLED tangent until its
+    contraction drops below 1/2, then refresh -- fewer assemblies (and, with ``direct=True``,
+    factorizations) for more, cheaper steps. A step on a stale tangent that does not reduce the residual is
+    rejected, so it cannot diverge where the fresh Newton would not. It pays wherever assembling the tangent
+    costs more than a solve -- a long element integrand (a stabilised flow), or a backend that keeps its
+    factorization (``lu(backend="cudss" | "pardiso")``; ``backend="device"`` refactorizes anyway). Refused
+    with ``direct=False``, which never assembles a tangent. ``fem.stats["nonlinear"]["factorizations"]``
+    reports the count. See :func:`jno.utils.solver.newton_krylov.newton_direct` for the rule and its source.
+
+    **A transient march's own default Newton is** ``newton(reuse=True)``, and an eager march carries the
+    tangent from step to step as well: the tangent of a march changes little between steps, so it is
+    assembled a handful of times per march rather than at every Newton iteration (measured on a stabilised
+    3-D flow: once for 8 steps, 0.80 -> 0.30 s per step). An explicit ``nonlinear=newton()`` keeps a fresh
+    tangent per iteration."""
     return _root_driver(
         "newton",
         damping=damping,
@@ -803,7 +825,9 @@ def staggered(
     free upgrade, and it is not the default.
 
     Scope: composes through ``fem.solve(nonlinear=...)`` on a multifield problem, which is where the
-    block layout comes from; it has no meaning on a single field and says so.
+    block layout comes from; it has no meaning on a single field and says so. On a system reduced by
+    periodic ties, a slip elimination or hanging nodes the driver is handed the reduced iterate and sweeps
+    each field's REDUCED DOFs (the layout is read off the iterate's size).
 
     **Groups.** An entry of ``fields`` may be a LIST of trial symbols, which are then solved *together*
     inside one sweep rather than alternated against each other::
@@ -867,9 +891,37 @@ def staggered(
             for g in gidx
         ]
         resolved["names"] = gidx
+        resolved["fem"] = fem
+        resolved["n_full"] = int(blocks[-1].stop)
         # Essential-condition dofs, so over-relaxation can leave them alone (see staggered_newton).
         _dd = getattr(getattr(fem, "_op", None), "dirichlet_dofs", None)
         resolved["constrained"] = None if _dd is None else _np.asarray(_dd, dtype=_np.int64)
+
+    def _layout_for(n):
+        """``(group index arrays, constrained dofs)`` for an iterate of length ``n``.
+
+        On a system a periodic tie, slip ``n·u = 0`` or hanging-node constraint reduced to ``P^T A P``
+        the driver is handed the REDUCED iterate, whose fields sit at the reduced offsets -- sweeping it
+        with ``fem.blocks`` (the full layout) would solve "fields" that straddle the real ones, and clamp
+        the last one's out-of-range indices. The layout is therefore read off the iterate's size (one
+        source of truth: :func:`~jno.utils.solver.solver_api._field_layout`), and the essential-condition
+        dofs are mapped into the reduced space with it."""
+        if n == resolved["n_full"]:
+            return resolved["blocks"], resolved["constrained"]
+        from .utils.solver.fem_utils import reduced_dirichlet_pairs
+        from .utils.solver.solver_api import _field_layout, _matching_reduction
+
+        fem = resolved["fem"]
+        slices, _red = _field_layout(fem, n)  # raises by name when no reduction explains n
+        groups = [
+            _np.concatenate([_np.arange(int(slices[i].start), int(slices[i].stop), dtype=_np.int32) for i in g])
+            for g in resolved["names"]
+        ]
+        con = resolved["constrained"]
+        if con is not None and len(con) and float(over_relax) != 1.0:  # only over-relaxation reads them
+            pairs = reduced_dirichlet_pairs(_matching_reduction(fem, n), [(int(d), 0.0) for d in con], all_rows=True)
+            con = _np.asarray(sorted(r for r, _g in pairs), dtype=_np.int64)
+        return groups, con
 
     if line_search not in (True, False, "backtrack"):
         raise ValueError(
@@ -894,6 +946,7 @@ def staggered(
             )
         from .utils.solver.newton_krylov import staggered_newton
 
+        groups, layout_constrained = _layout_for(int(_np.size(u0)))
         if direct and jacobian is None:
             raise ValueError(
                 "jno.solve.staggered(direct=True) factorizes each field's ASSEMBLED diagonal block, and "
@@ -905,7 +958,7 @@ def staggered(
         return staggered_newton(
             residual_fn,
             u0,
-            resolved["blocks"],
+            groups,
             rtol=rtol,
             atol=atol,
             max_sweeps=max_sweeps,
@@ -916,7 +969,7 @@ def staggered(
             jacobian=jacobian if direct else None,
             over_relax=float(over_relax),
             project=project,
-            constrained=constrained if constrained is not None else resolved["constrained"],
+            constrained=constrained if constrained is not None else layout_constrained,
             damping=damping,
             line_search=line_search,
             ls_max=ls_max,
@@ -1261,7 +1314,7 @@ def remesh(
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
     toward convergence. On a **transient** problem it remeshes every ``every`` steps and carries the
     state across (basis-aware transfer), so the mesh tracks a moving feature. It holds a *constant*
-    budget -- ``max_dofs`` vertices, else the initial vertex count -- on both paths: the isotropic one
+    budget -- ``max_dofs``, else the initial DOF count -- on both paths: the isotropic one
     refines the marked cells by ``refine_factor`` relative to the rest and then scales the whole size
     field to the budget, so the wake coarsens instead of the mesh ratcheting up::
 
@@ -1276,8 +1329,15 @@ def remesh(
     ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the curvature of the
     solution -- or of the ``criterion``, when one is given) instead of isotropic ZZ marking — far fewer
     DOFs for a layer or a front, and the right choice for an interface. ``hmin``/``hmax`` bound the edge
-    sizes; ``metric_field`` picks which coupled field drives the metric. DOF control is approximate on
-    both paths (the mesher honours a size field loosely), so ``max_dofs`` is a target, not a cap.
+    sizes; ``metric_field`` picks which coupled field drives the metric.
+
+    **``max_dofs`` counts DOFs** -- every unknown of the assembled system, ``fem.dofs``: a vector field
+    counts each component, a Taylor-Hood P2/P1 pair about nine per vertex in 2-D, a complex field its
+    real and imaginary halves. The mesher is steered by a vertex count and honours it only approximately,
+    so every remesh is counted before it is applied and redone with a corrected target if it misses: the
+    DOF count stays within **20 %** of ``max_dofs`` (a march holds it there; a steady round is capped at
+    it), and a remesh that cannot be brought under ``1.2 * max_dofs`` -- an ``hmax`` too small to coarsen
+    that far, say -- raises instead of proceeding over budget.
 
     ``alpha=`` is the **moving-mesh** form, and it is a different operation: instead of meshing the
     geometry afresh it re-triangulates the NODES the motion has carried and keeps the triangles whose
@@ -1297,7 +1357,8 @@ def remesh(
 
     Args:
         anisotropic: Hessian-metric refinement instead of isotropic ZZ + Dörfler marking.
-        max_dofs: Vertex budget. Steady: stop once reached. Transient: the constant target.
+        max_dofs: DOF budget (``fem.dofs``, not vertices), held within 20 %. Steady: stop once
+            reached; no round grows past it. Transient: the constant size every remesh holds.
         every: Transient only — remesh every ``every`` time steps (with ``alpha``, reconnect that often).
         alpha: Moving meshes only — re-triangulate the moved NODES and keep the triangles smaller than
             ``alpha`` × the starting mean edge length. Bodies closer than ~``2·alpha·h`` merge.
@@ -1377,8 +1438,9 @@ def refine(
     refinement level (a 2:1 balance), so no constrained node ever has a constrained parent.
 
     ``theta`` (Dörfler marking), ``criterion``, ``max_iters``, ``max_dofs``, ``tol`` and ``eps`` mean
-    exactly what they do on :func:`remesh`. There is no ``refine_factor``: a split halves the cell by
-    construction. There is no ``anisotropic``: the split is isotropic, so there is no direction to
+    exactly what they do on :func:`remesh`, except that a split has no size to steer, so ``max_dofs`` only
+    stops the loop and the last split may overshoot it. There is no ``refine_factor``: a split halves the
+    cell by construction. There is no ``anisotropic``: the split is isotropic, so there is no direction to
     stretch along -- that needs a simplex mesh and ``remesh(anisotropic=True)``.
 
     **Limitations, measured.** Quadrilateral and hexahedral meshes only; a simplex mesh refuses by name
@@ -1474,7 +1536,7 @@ def relocate(
             fem.solve(adapt=jno.solve.relocate(method="monge_ampere", every=20, escalate=0.5))
 
         Relocation gets first refusal because it costs ~0.4 ms against the 8-15 s a node-set change costs,
-        and escalation then *measures* whether that was enough instead of assuming it. The vertex budget
+        and escalation then *measures* whether that was enough instead of assuming it. The DOF budget
         grows by ``escalate_growth`` each time, capped by ``max_dofs``; the loop is self-limiting, since
         more vertices lower the indicator and the gate stops tripping.
 
@@ -1811,7 +1873,13 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     exponential, with forcing carried exactly through an augmented generator (a ramp row for ETD2) — still
     matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable; time-varying
     **coefficients** ``M(t)``/``A(t)`` (a moving/parametric operator) or a nonlinear form → use
-    :func:`theta`."""
+    :func:`theta`.
+
+    **Walls must be homogeneous.** Every zero-mass DOF is held at 0, which is a Dirichlet row with
+    ``g = 0`` and nothing else. A non-zero or time-varying wall value, or an algebraic row that reaches an
+    unconstrained DOF (a pressure row), raises ``NotImplementedError`` rather than silently returning 0 there
+    (checked eagerly; a traced call relies on the eager one before it). Lift the boundary data
+    (``w = u - g``) or use :func:`theta`, :func:`bdf2` or :func:`sdirk`."""
     from .utils.solver.timeschemes import _ExponentialScheme
 
     return _ExponentialScheme(order, mass, symmetric)

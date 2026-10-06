@@ -434,11 +434,26 @@ def lanczos_spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None):
         lo, hi = jnp.min(vals), jnp.max(vals)
     except Exception:  # a degenerate / broken-down decomposition must not fail the whole solve
         return None
+    if isinstance(lo, jax.core.Tracer) or isinstance(hi, jax.core.Tracer):
+        # Inside a trace (a Newton step's linearisation, a jitted solve) the validity of the interval is a
+        # traced value, and Python cannot branch on it -- it raised TracerBoolConversionError. The caller
+        # (`spectrum_bounds`) selects the fallback with `lax.cond` on the third entry instead.
+        return jnp.abs(lo), jnp.abs(hi), _usable_interval(lo, hi)
     # A breakdown can collapse or invert the interval; reject rather than hand the Chebyshev
     # recurrence something it divides by (delta = (hi - lo)/2 must be > 0).
-    if not (jnp.isfinite(lo) and jnp.isfinite(hi)) or hi <= 0.0 or hi - lo <= 0.0:
+    if not bool(_usable_interval(lo, hi)):
         return None
     return jnp.abs(lo), jnp.abs(hi)
+
+
+def _usable_interval(lo, hi):
+    """A Ritz interval a Chebyshev recurrence can be fitted to: finite, positive, of positive width.
+
+    ``lo > 0`` matters under ``jit``: a breakdown (a Krylov space that closes after one step, as on
+    a multiple of the identity) gives NaN Ritz values eagerly but finite, sign-mixed ones once XLA
+    has compiled the recurrence. An SPD operator has no negative Ritz value, so a negative one is the
+    breakdown showing through."""
+    return jnp.isfinite(lo) & jnp.isfinite(hi) & (lo > 0.0) & (hi > 0.0) & (hi - lo > 0.0)
 
 
 def nystrom_sketch(matvec, n, *, rank, key, dtype=None):
@@ -515,14 +530,27 @@ def spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None, lmin=None, lmax=
     if lmin is not None and lmax is not None:
         return float(lmin), float(lmax)
     est = None if lmax is not None else lanczos_spectrum_bounds(matvec, n, dtype=dtype, iters=iters, M=M)
+
+    def _from_lanczos(lo_e, hi_e):
+        return (lmin if lmin is not None else lo_e / safety), safety * hi_e
+
+    def _from_power():
+        hi = lmax if lmax is not None else safety * power_iteration_bound(matvec, n, dtype=dtype, iters=iters, M=M)
+        return (lmin if lmin is not None else lmin_ratio * hi), hi
+
+    if est is not None and len(est) == 3:
+        # Traced (see `lanczos_spectrum_bounds`): pick the fallback on the device. `lax.cond` runs one
+        # branch, so a usable Lanczos interval costs no power iteration, as on the eager path.
+        lo_e, hi_e, ok = est
+        rdt = jnp.result_type(lo_e)
+
+        def _as(pair):
+            return tuple(jnp.asarray(x, rdt) for x in pair)
+
+        return jax.lax.cond(ok, lambda: _as(_from_lanczos(lo_e, hi_e)), lambda: _as(_from_power()))
     if est is not None:
-        lo_e, hi_e = est
-        hi = safety * hi_e
-        lo = lmin if lmin is not None else lo_e / safety
-        return lo, hi
-    hi = lmax if lmax is not None else safety * power_iteration_bound(matvec, n, dtype=dtype, iters=iters, M=M)
-    lo = lmin if lmin is not None else lmin_ratio * hi
-    return lo, hi
+        return _from_lanczos(*est)
+    return _from_power()
 
 
 def chebyshev_iteration(matvec, b, *, lmin, lmax, M=None, x0=None, tol=1e-8, maxiter=200):

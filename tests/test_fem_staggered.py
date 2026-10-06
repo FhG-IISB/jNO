@@ -528,6 +528,33 @@ def test_retreat_bottoms_out_at_the_fallback():
     assert abs(got - 1.0) < 1e-6, got
 
 
+@pytest.mark.parametrize("cliff", [0.2, 0.3, 0.6])
+def test_the_exact_line_search_never_returns_a_non_finite_step(cliff):
+    """The energy along the step keeps falling (``phi'(t) = t - 0.8 < 0``) until the residual is NaN at
+    ``t >= cliff`` -- a stand-in for ``det F <= 0``. The minimum the bisection would find is past the
+    cliff, so the right answer is a step just short of it: finite, and not zero. The search used to stop
+    at the first NaN trial and return the midpoint of ``[0, 0.5]``, 0.25 -- itself past a cliff at 0.2,
+    which put a 3-D Yeoh phase-field march on a NaN step."""
+    from jno.utils.solver.newton_krylov import _bisect_slope
+
+    def f(y):
+        return jnp.where(y >= cliff, jnp.nan, y - 0.8)
+
+    x, d = jnp.zeros(1), jnp.ones(1)
+    lam = float(_bisect_slope(f, x, d, atol=1e-10, rtol=1e-4, max_iters=40, dtype=jnp.float64))
+    assert np.isfinite(float(f(x + lam * d)[0])), f"the step lam={lam} lands past the cliff at {cliff}"
+    assert cliff - 1e-6 < lam + 1e-6 and lam > 0.9 * cliff, f"lam={lam}: a usable step up to {cliff} existed"
+
+
+def test_the_exact_line_search_is_unchanged_where_everything_is_finite():
+    """A convex quadratic along the step, minimum at 0.37: found to the slope tolerance, as before."""
+    from jno.utils.solver.newton_krylov import _bisect_slope
+
+    lam = float(_bisect_slope(lambda y: y - 0.37, jnp.zeros(1), jnp.ones(1), atol=1e-12, rtol=1e-10,
+                              max_iters=60, dtype=jnp.float64))  # fmt: skip
+    assert abs(lam - 0.37) < 1e-9, lam
+
+
 def test_there_is_exactly_one_armijo_implementation():
     """Anti-drift. Three byte-identical Armijo loops existed before the retreat helper, and a fourth
     step-taker (over-relaxation) had none at all — which is precisely how the finite-strain NaN got in.
@@ -559,3 +586,149 @@ def test_anderson_accelerated_sweeps_reach_the_monolithic_root_faster():
     fast = fem.stats["nonlinear"]["steps"]
     assert np.linalg.norm(u - ref) / np.linalg.norm(ref) < 1e-8
     assert fast < plain, (fast, plain)
+
+
+# --------------------------------------------------------------------------------------------------
+# Oracle 6b — the Dirichlet mask reaches the driver on EVERY operator, and on a reduced system it is
+# carried into the reduced space. `test_over_relax_does_not_move_a_dirichlet_dof` checks the mask in
+# `staggered_newton`; the dofs come from the operator's `dirichlet_dofs`, which only the runtime-
+# parametric / history / moving-coordinate operator declared. On a plain nonlinear problem (2-D or 1-D)
+# the mask was empty and one over-relaxed sweep put a prescribed g = 2 at 3.0.
+#
+# The oracle is the sweep itself, truncated after ONE pass (the convergence guard is not under test):
+# the sub-solve lands every prescribed dof exactly on its value, and omega must not move it off.
+# --------------------------------------------------------------------------------------------------
+G_U, G_W, OMEGA = 2.0, 0.7, 1.5
+
+
+@pytest.fixture
+def one_sweep(monkeypatch):
+    import jno.utils.solver.newton_krylov as nk
+
+    monkeypatch.setattr(nk, "_convergence_check", lambda f0, u0, u, **k: u)
+
+    def run(fem, fields, **kw):
+        out = fem.solve(nonlinear=jno.solve.staggered(fields, max_sweeps=1, over_relax=OMEGA), **kw)
+        return np.asarray(out.fn() if hasattr(out, "fn") else out).reshape(-1)
+
+    return run
+
+
+def _coupled(periodic=False, parametric=False, n=6):
+    """``-Δu + u + 0.1 k u^3 - 0.5 w_x = f``, ``-Δw + w - 0.5 u e_x = g e_y`` on the unit square, u = 2 and
+    w = (0, 0.7) at the bottom. ``periodic``: tied in x (a REDUCED system). ``parametric``: k is a runtime
+    parameter (the operator kind that always declared its Dirichlet dofs)."""
+    grad, inner = _aliases()
+    sin, cos = jno.np.sin, jno.np.cos
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain()
+    d.tag("left", lambda x, y: x < 1e-9)
+    d.tag("right", lambda x, y: x > 1 - 1e-9)
+    d.tag("bottom", lambda x, y: y < 1e-9)
+    u, φ = d.fem_symbols(names=("u", "phi"))
+    w, ψ = d.fem_symbols(value_shape=(2,), names=("w", "psi"))
+    X = list(d.variable("interior", split=True)[:2])
+    ub, φb = u.bind(x=X[0], y=X[1]), φ.bind(x=X[0], y=X[1])
+    wb, ψb = w.bind(x=X[0], y=X[1]), ψ.bind(x=X[0], y=X[1])
+    f, g = sin(2 * np.pi * X[0]) * cos(np.pi * X[1]), cos(2 * np.pi * X[0])
+    k = jno.np.parameter((1,), name="k") if parametric else 1.0
+    xb, yb, _ = d.variable("bottom", split=True)
+    terms = [
+        inner(grad(u, X), grad(φ, X), 1) + (ub + 0.1 * k * ub**3 - 0.5 * wb[0] - f) * φb,
+        inner(grad(w, X), grad(ψ, X), 2) + inner(wb, ψb, 1) - 0.5 * ub * ψb[0] - g * ψb[1],
+        u(xb, yb) - G_U,
+        w(xb, yb)[0] - 0.0,
+        w(xb, yb)[1] - G_W,
+    ]
+    if periodic:
+        (xl, yl, _), (xr, yr, _) = d.variable("left", split=True), d.variable("right", split=True)
+        terms += [u(xl, yl) - u(xr, yr), w(xl, yl) - w(xr, yr)]
+    return jno.fem(terms), u, w
+
+
+def _held_at_bottom(fem, sol):
+    """Max deviation from the prescribed values over the bottom nodes of both fields."""
+    bu = np.asarray(fem.field_points[0])[:, 1] < 1e-9
+    bw = np.asarray(fem.field_points[1])[:, 1] < 1e-9
+    U, W = sol[fem.blocks[0]], sol[fem.blocks[1]].reshape(-1, 2)
+    assert bu.sum() == bw.sum() == 7  # a 6 x 6 grid: 7 nodes on the bottom
+    return max(np.abs(U[bu] - G_U).max(), np.abs(W[bw] - [0.0, G_W]).max())
+
+
+def test_over_relax_holds_the_dirichlet_values_of_a_plain_problem(one_sweep):
+    fem, u, w = _coupled()
+    assert fem._op.dirichlet_dofs is not None and len(fem._op.dirichlet_dofs) == 3 * 7
+    assert _held_at_bottom(fem, one_sweep(fem, [u, w])) < 1e-10
+
+
+def test_over_relax_holds_the_dirichlet_values_of_a_1d_problem(one_sweep):
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+    d.tag("left", lambda x: x < 1e-9)
+    u, φ = d.fem_symbols(names=("u", "phi"))
+    w, ψ = d.fem_symbols(names=("w", "psi"))
+    xi, xl = d.variable("interior", split=True)[0], d.variable("left", split=True)[0]
+    ub, φb, wb, ψb = u.bind(x=xi), φ.bind(x=xi), w.bind(x=xi), ψ.bind(x=xi)
+    fem = jno.fem(
+        [
+            ub.x * φb.x + (ub + 0.1 * ub**3 - 0.5 * wb - 1.0) * φb,
+            wb.x * ψb.x + (wb - 0.5 * ub) * ψb,
+            u(xl) - G_U,
+            w(xl) - G_W,
+        ]
+    )
+    sol = one_sweep(fem, [u, w])
+    i0 = int(np.argmin(np.asarray(fem.field_points[0]).reshape(-1)))
+    assert abs(sol[fem.blocks[0]][i0] - G_U) < 1e-10 and abs(sol[fem.blocks[1]][i0] - G_W) < 1e-10
+
+
+def _reduced_bottom_dofs(fem):
+    """The reduced dofs whose KEPT dof sits on a bottom node, counted off the mesh. The reduced vector is
+    each field's kept entries at that field's reduced offset; a kept entry is ``vec`` consecutive full
+    dofs of the field (a vector field may be reduced dof by dof, ``vec = 1``), and a full dof ``j`` of a
+    field with ``m`` components per node lives on node ``j // m``."""
+    from jno.utils.solver.fem_utils import _periodic_blocks
+
+    blocks, off_f, off_r = _periodic_blocks(fem._periodic)
+    out = []
+    for i, b in enumerate(blocks):
+        pts, vec = np.asarray(fem.field_points[i]), int(b.get("vec", 1))
+        m = int(off_f[i + 1] - off_f[i]) // pts.shape[0]
+        for r, k in enumerate(np.asarray(b["kept"])):
+            for c in range(vec):
+                if pts[(int(k) * vec + c) // m, 1] < 1e-9:
+                    out.append(int(off_r[i]) + r * vec + c)
+    return sorted(out)
+
+
+@pytest.mark.parametrize("parametric", [False, True], ids=["plain", "parametric"])
+def test_over_relax_on_a_periodic_system_masks_the_reduced_dirichlet_dofs(parametric, one_sweep, monkeypatch):
+    """On a system reduced to ``P^T A P`` the driver sweeps the REDUCED iterate, so the prescribed dofs
+    must be mapped into the reduced space too (``staggered``'s ``_layout_for``)."""
+    import jno.utils.solver.newton_krylov as nk
+
+    fem, u, w = _coupled(periodic=True, parametric=parametric)
+    kw = {"k": 1.0} if parametric else {}
+    seen, real = [], nk.staggered_newton
+
+    def spy(residual_fn, u0, blocks, **k):
+        seen.append((int(np.size(u0)), k.get("constrained")))
+        return real(residual_fn, u0, blocks, **k)
+
+    monkeypatch.setattr(nk, "staggered_newton", spy)
+    sol = one_sweep(fem, [u, w], **kw)
+    n, con = seen[0]
+    assert n < fem.dofs, "the sweep must run on the reduced system"
+    assert sorted(int(c) for c in con) == _reduced_bottom_dofs(fem)
+    assert _held_at_bottom(fem, sol) < 1e-10
+
+
+def test_over_relax_on_a_periodic_system_finds_the_direct_root():
+    fem, u, w = _coupled(periodic=True)
+
+    def solve(**kw):
+        out = fem.solve(**kw)
+        return np.asarray(out.fn() if hasattr(out, "fn") else out).reshape(-1)
+
+    ref = solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-12, atol=1e-12), linear=jno.solve.lu(backend="host"))
+    got = solve(nonlinear=jno.solve.staggered([u, w], rtol=1e-12, atol=1e-12, over_relax=OMEGA))
+    assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-9
+    assert _held_at_bottom(fem, got) < 1e-10

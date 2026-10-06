@@ -123,6 +123,10 @@ def test_fem_reuse_matches_fresh_newton_and_the_exact_solution():
     assert n_lag < n_fresh, (n_lag, n_fresh)
 
 
-def test_reuse_without_direct_raises():
-    with pytest.raises(ValueError, match="direct=True"):
-        jno.solve.newton(reuse=True)
+def test_reuse_is_refused_only_where_no_tangent_is_assembled():
+    """``reuse=True`` keeps the ASSEMBLED tangent, which the default (``direct=None``, iterative) has as well
+    as ``direct=True``; only the matrix-free mode has nothing to keep."""
+    with pytest.raises(ValueError, match="matrix-free"):
+        jno.solve.newton(direct=False, reuse=True)
+    jno.solve.newton(reuse=True)  # the assembled iterative default: accepted
+    jno.solve.newton(direct=True, reuse=True)

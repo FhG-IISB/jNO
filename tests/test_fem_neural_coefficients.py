@@ -1398,6 +1398,43 @@ def test_dirichlet_net_nonlinear_transient_matches_const_and_differentiates():
     assert jnp.isfinite(g.c) and abs(float(g.c)) > 1e-6
 
 
+@pytest.mark.parametrize("nonlinear", [False, True], ids=["linear", "nonlinear"])
+@pytest.mark.parametrize("value", ["net", "parameter"])
+def test_args_valued_dirichlet_beside_a_trainable_density_holds_every_step(value, nonlinear):
+    """A net- or parameter-valued Dirichlet next to a trainable density ``rho(x) u_t``. The per-step mass is then
+    re-assembled from the args, and it zeroed only the CONSTANT Dirichlet rows -- the args-valued ones are kept out
+    of that set so their value is never frozen -- so the wall row kept its mass and read ``M_dd (u+ - u)/dt + u+ =
+    g``: the condition softened into a relaxation, ~0.1 off g after the first step. It must hold g exactly at every
+    step and march the constant-Dirichlet oracle's trajectory."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    g = 0.3
+
+    def build(val):
+        d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, _ = _transient_setup(mesh_size=0.3, time=(0.0, 0.2, 5))
+        rho = _const_net(1.0)  # a trainable density: the mass is re-assembled from the args every step
+        form = rho(xi, yi) * ui.t * vi + ui.x * vi.x + ui.y * vi.y + (ui**3 * vi if nonlinear else 0.0)
+        wall = {
+            "net": lambda: _const_net(g)(xb, yb),
+            "parameter": lambda: jno.np.reshape(jno.np.parameter((1,), name="gw"), ()),
+            "const": lambda: g,
+        }[val]
+        fem = jno.fem([form, u(xb, yb) - wall(), u(ci[0], ci[1]) - 0.0])
+        blk = fem.operator
+        args = {n: (jnp.asarray([g]) if n == "gw" else e.model.module) for n, e in blk.runtime_parameter_exprs.items()}
+        assert (blk.mass_fn if not nonlinear else blk.mass) is not None, "the mass must be the per-step one"
+        return d, _default_transient_integrate(blk, args, _grid_ts(blk))
+
+    d, traj = build(value)
+    _, ref = build("const")
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    onb = np.isclose(nodes[:, 0], 0) | np.isclose(nodes[:, 0], 1) | np.isclose(nodes[:, 1], 0) | np.isclose(nodes[:, 1], 1)
+    traj, ref = np.asarray(traj), np.asarray(ref)
+    assert np.abs(traj[1:, onb] - g).max() < 1e-12, f"wall off g by {np.abs(traj[1:, onb] - g).max():.2e}"
+    assert np.abs(ref[1:, onb] - g).max() < 1e-12  # the oracle's own wall
+    assert np.abs(traj - ref).max() < 1e-7, f"vs the constant-Dirichlet march: {np.abs(traj - ref).max():.2e}"
+
+
 def test_ic_net_matches_const_and_differentiates():
     """Net-valued initial condition ``u(initial) - net(xi, yi)`` on a TRANSIENT heat form: the initial
     state is now re-formed from the net weights (``state0_fn``), so a constant-output net reproduces the

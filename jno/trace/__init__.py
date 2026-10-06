@@ -3744,6 +3744,23 @@ class Noise(Placeholder):
         return f"Noise({self.distribution}, {params_str})"
 
 
+def check_runtime_values(names, values):
+    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter or leaves one out.
+
+    Every solve that accepts the values (steady linear and nonlinear, transient, load-path march) checks
+    them here, so the same call fails the same way whichever path the form takes."""
+    unknown = sorted(set(values) - set(names))
+    if unknown:
+        raise TypeError(f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}.")
+    missing = sorted(set(names) - set(values))
+    if missing:
+        raise ValueError(
+            f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
+            f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
+            "let `crux` resolve them (the solve is then a trace node, not an array)."
+        )
+
+
 class FemLinearSystem:
     """Container for a steady linear FEM system ``A(args) x = b(args)``."""
 
@@ -3844,18 +3861,7 @@ class FemLinearSystem:
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
-        unknown = sorted(set(values) - set(names))
-        if unknown:
-            raise TypeError(
-                f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
-            )
-        missing = sorted(set(names) - set(values))
-        if missing:
-            raise ValueError(
-                f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
-                f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
-                "let `crux` resolve them (the solve is then a trace node, not an array)."
-            )
+        check_runtime_values(names, values)
         return _solve(*(jnp.asarray(values[n]) for n in names))
 
     def __iter__(self):
@@ -4003,18 +4009,7 @@ class FemResidualOperator:
         if values is None:
             return FunctionCall(_solve, params, name="fem_solve")
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
-        unknown = sorted(set(values) - set(names))
-        if unknown:
-            raise TypeError(
-                f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
-            )
-        missing = sorted(set(names) - set(values))
-        if missing:
-            raise ValueError(
-                f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
-                f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
-                "let `crux` resolve them (the solve is then a trace node, not an array)."
-            )
+        check_runtime_values(names, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
         # jit, every call re-stages the solver -- `lax.while_loop` / `custom_root` / `linearize` trace
         # their bodies on each Python call -- so an 8-value sweep cost 48 tracings and the whole point,
@@ -4125,10 +4120,12 @@ class GaugePin:
     additive constant, so its discrete operator has a one-dimensional (constant) null space and
     the saddle system is singular. ``p.pin(value)`` removes it by fixing a single, *arbitrary*
     degree of freedom to ``value``: this is **gauge-fixing**, not a boundary condition. ``jno.fem``
-    lowers each pin to a single-node Dirichlet ``p(node) - value`` at a deterministic vertex
-    (nearest the mesh min-corner) -- the same essential path the explicit ``p(xpn, ypn) - value``
-    form takes -- so assembly is unchanged. The location is intentionally not user-specified;
-    any single DOF removes the null space.
+    lowers each pin to a single-node Dirichlet ``p(node) - value`` at a deterministic vertex -- the
+    same essential path the explicit ``p(xpn, ypn) - value`` form takes -- so assembly is unchanged.
+    The vertex is the one nearest the mesh min-corner; with periodic ties ``u(A) - u(B)`` in the
+    problem, the one nearest the min-corner that lies on **no** tied face (the min-corner of a
+    periodic box is exactly the node the ties eliminate). The location is intentionally not
+    user-specified; any single DOF removes the null space.
 
     ``mean=True`` picks a *different gauge*: the field is normalised after the solve so that
     ``int p dx == 0``. The node pin still runs (it is what makes the system non-singular); only the
@@ -4374,9 +4371,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
             fem = jno.fem([momentum, -q * div(u), p.pin(), *wall_bcs])
 
-        ``jno.fem`` pins a deterministic vertex (nearest the mesh min-corner), so the gauge is
-        reproducible; the location is intentionally not user-specified -- any single DOF removes
-        the null space.
+        ``jno.fem`` pins a deterministic vertex, so the gauge is reproducible: the one nearest the
+        mesh min-corner, or -- when the problem has periodic ties ``u(A) - u(B)`` -- the one nearest
+        the min-corner that lies on no tied face, so the tie reduction never eliminates it or sums
+        another row into it. Pinning works the same under full or partial periodicity, steady or
+        transient, single-field or coupled. The location is intentionally not user-specified -- any
+        single DOF removes the null space.
 
         ``mean=True`` swaps the gauge for the **zero-mean** one, ``int p dx == 0``::
 
