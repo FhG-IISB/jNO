@@ -79,6 +79,89 @@ not a detail: a plain `log(max(P* - P, eps))` is **constant** above the bound, s
 is exactly zero and the barrier silently stops doing anything — the failure mode is a satisfied-looking
 run whose perimeter sits far above target.
 
+### Perimeter is a *global* budget, and converged designs exploit that
+
+A design can meet $P^\*$ exactly and still be locally serrated, paying for a spike here with
+flatness elsewhere. Measured on a converged 3-D bracket with the barrier active and satisfied, the
+angle between adjacent surface facets had a **median of $33.5^\circ$, a 99th percentile of
+$88.9^\circ$, and $27\%$ of adjacent pairs above $60^\circ$** — a surface nobody would machine,
+scoring as well on eq. (38) as a smooth one would. Neither cheap lever fixes it: un-throttling node
+migration un-pinned the nodes ($27.3\% \to 6.2\%$ sitting at their move bound) and moved the
+roughness only $33.5^\circ \to 32.0^\circ$, while tightening $P^\*$ from 44 to 31 bought $26.9^\circ$
+at $91\%$ worse compliance. Both also collapsed the volume constraint, to $V=0.705$ and $0.635$
+against the baseline's $0.998$.
+
+`rho.curvature(zeta=0.1)` is the local measure the perimeter is not — the discrete bending energy
+of a triangle mesh (Grinspun, Hirani, Desbrun & Schröder, *Discrete Shells*, SCA 2003, §3), summed
+over pairs of interior facets sharing a **ridge** (a mesh vertex in 2-D, a mesh edge in 3-D). Each
+pair costs $|\Delta_i||\Delta_j|(1-\cos\theta_{ij})$ in the sharp limit, so it is zero unless *both*
+facets carry boundary and then grows with the angle between them. It is orientation-free (facet
+normal and density jump flip signs together), non-negative by construction, and exactly zero both on
+a flat boundary and where there is no boundary at all.
+
+Add it as a penalty rather than a constraint — MMA already has the volume and the geometric bounds
+to trade against, and that trade is where the volume collapses:
+
+```python
+S = rho.curvature(zeta=0.1)
+terms.append(WEIGHT * S)          # weight in compliance units; see the scale note below
+```
+
+A weight needs a scale and the *design* cannot supply one, because at iteration 0 the density is
+uniform and the bending is exactly zero. Take it from the **mesh** instead — what a single flat cut
+already costs, purely from its own faceting. That floor is real (an unstructured interface zig-zags
+between tetrahedra rather than lying in the plane it approximates, the same reason a straight bar's
+perimeter measures above its length) but it does **not** track refinement: measured $50.7$ at
+$h=0.5$ against $52.4$ at $h=0.35$, across a $2.6\times$ change in tet count. So `WEIGHT = w / S_ref`
+keeps $w$ comparable across meshes.
+
+The comparison that shows the two functionals are genuinely different: under a monotone staircase
+boundary the perimeter *telescopes* to one horizontal unit per column plus the total rise, whatever
+route the staircase takes. Three designs of identical volume and identical perimeter — $14.0000$ to
+every decimal place — score $S = 2$, $10$, $12$, exactly their right-angle counts.
+
+| | one big step | five small ones | a staircase |
+|---|---|---|---|
+| perimeter $P$ | $14.0000$ | $14.0000$ | $14.0000$ |
+| bending $S$ | $2$ | $10$ | $12$ |
+
+In 3-D the separation is milder and the honest number is the ratio *between* the functionals: a
+square corrugation at fixed volume raises $P$ by $1.59\times$ and $S$ by $1.90\times$; scrambling
+the same material raises $P$ by $14.6\times$ and $S$ by $48.2\times$. So bending is about
+$1.2\times$ sharper on a fold and $3.3\times$ sharper on noise — worth its own term, and **not** a
+replacement for perimeter control.
+
+Under a deformable mesh the term is also differentiable in the node coordinates, which is half the
+point: it gives node migration a reason to *align* the boundary rather than merely shorten it.
+
+### The patch filter has a size limit, and it is lower than it looks
+
+Eq. (18) is a **geometric mean** over $N-2$ factors, and a mean dilutes a single outlier by $1/N$.
+So the criterion's discriminating power is set by how many elements meet at the vertex. Measured on
+the shipped kernel (`tests/test_patch_filter_scaling.py`), with $f_\text{solid}=1$ throughout:
+
+| $N$ | lone dense element | one-node connection | uniform grey | hinge / solid |
+|---|---|---|---|---|
+| 5 (3-D edge fan, $6T/E$) | 0.100 | 0.013 | 0.831 | 0.01 |
+| **6** (2-D vertex, $3T/V$) | **0.178** | **0.038** | **0.842** | **0.04** |
+| 8 | 0.316 | 0.112 | 0.853 | 0.11 |
+| 12 | 0.501 | 0.755 | 0.862 | 0.76 |
+| 27 (3-D vertex, $4T/V$) | 0.758 | 0.845 | 0.870 | 0.85 |
+
+At the size a 2-D triangulation actually produces ($N\approx6$) the filter separates a defect from
+a grey patch by a factor of $4.7$, which is what makes it work. **By $N=12$ three-quarters of that
+is gone**, and a valence-12 vertex is not exotic on an unstructured mesh — so on a badly graded 2-D
+mesh the filter quietly weakens where the patches are largest. At $N\approx27$, the size of a
+tetrahedral **vertex** patch, a hinge sits within $3\%$ of uniform grey and nothing downstream can
+act on it; SIMP cannot finish the job either, since $0.758^3 = 0.44$ of solid against $0.006$ for
+the $0.178$ of a six-element patch.
+
+This is a property of *any* mean — a density-weighted geometric mean with exponent $1/\sum\rho$
+behaves the same — so it is not recoverable by reweighting. The practical consequences: a 3-D
+**vertex** criterion needs an order statistic rather than eq. (18), while a 3-D **edge fan**
+($6T/E\approx5.2$) sits in the regime where the formula is at its *strongest* — it discriminates a
+hinge three times more sharply than the 2-D vertex patch it was designed for — and so transfers
+verbatim. This is the extension Jung, Yun & Kim leave open in their §2.3.2.
 ## The objective is an integral
 
 Compliance is the strain energy `C = a(u,u) = ∫ σ(u):ε(u) dΩ`, and it is written as exactly that —
@@ -91,8 +174,18 @@ E   = lambda r: EMIN + r**penal_p * (E0 - EMIN)
 
 fem        = jno.fem([E(rho) * a(eps(u), eps(phi)), ...])
 compliance = (E(rho) * a(eps(u), eps(u))).integrate(fem)
-volume     = (rho * cellv).sum / (VOLFRAC * cellv.sum)     # NOT an .integrate(fem) — see below
+rho_e      = rho.reshape(-1)                                 # (n_cells, 1) -> (n_cells,); see below
+volume     = (rho_e * cellv).sum / (VOLFRAC * cellv.sum)     # NOT an .integrate(fem) — see below
 ```
+
+!!! warning "`reshape(-1)` is load-bearing, and omitting it fails silently"
+    A P0 parameter evaluates to `(n_cells, 1)` while `cell_volume()` is `(n_cells,)`, so
+    `rho * cellv` broadcasts to an `(n_cells, n_cells)` **outer product** whose `.sum` is
+    `n_cells` times too large. Nothing raises — it is a valid shape. The volume constraint then
+    reads as satisfied at a design carrying almost no material, and compliance climbs instead of
+    falling. Measured on a 128-cell 2-D problem: the constraint reported `1.0000` while the design
+    it accepted had a volume fraction of `0.0078`, and compliance ran to `4.5e4` against the `18.6`
+    the flattened form reaches on the same 12 iterations.
 
 `.integrate(fem)` inherits the quadrature the operator was assembled with, so this equals `f·u`
 exactly rather than to within a quadrature error nothing reports. The `fem` is named because it is
@@ -113,6 +206,51 @@ outside the trace, and the volume a lambda over `cell_volume()` — so every new
 own reduction over the DOF vector. As integrals, a stress constraint
 (`((sigma_vm/SIG_Y)**p).integrate(fem)`), a compliant mechanism's output displacement, and multiple
 load cases are all the same one construct.
+
+### Pick the solver — in 3-D it is most of the run
+
+`integrate(fem, solver=...)` selects the backend for the solve every functional over that `fem`
+shares. It is the single biggest lever on a design loop, because the solve runs once forward and
+once adjoint per iteration on a **sparsity that never changes** — relocation moves nodes, not
+connectivity — so a backend that caches its symbolic analysis pays only the numeric
+re-factorisation:
+
+```python
+C = (E(rho) * a(eps(u), eps(u))).integrate(fem, solver=jno.solve.lu(backend="pardiso"))
+```
+
+Measured on the 3-D cantilever, per design iteration, against the default:
+
+| tetrahedra | default | `backend="pardiso"` | speed-up |
+|---|---|---|---|
+| 2,847 | 620 ms | 335 ms | 1.9x |
+| 8,802 | 2,115 ms | 665 ms | 3.2x |
+| 14,063 | 4,014 ms | 810 ms | **5.0x** |
+
+The margin grows with the mesh because the two scale differently on this operator — the default's
+SuperLU costs $O(n^{1.9})$ against PARDISO's $O(n^{1.55})$ — so it is worth most exactly where it is
+needed. Two reasons the headroom is there: the stiffness is symmetric positive definite (to
+$5.6\times10^{-17}$) while the default throws a general LU at it, and the default re-runs its
+symbolic analysis every call.
+
+!!! warning "`backend="pardiso"` is not usable with the patch filter yet"
+    Those timings are measured on **plain SIMP with a volume constraint** — no
+    `rho.constrain(d.patch_filter())`. With the patch filter in place the PARDISO backend aborts the
+    process with a glibc `double free or corruption`, at every mesh size tried. Controlled A/B, with
+    no CUDA device visible: pardiso alone works, the filter alone works under the default backend,
+    the *pair* dies. It is not the GPU, not MKL threading, not `pure_callback` concurrency, not the
+    adjoint/transpose path, and not cache eviction — each was checked and ruled out; the cause is
+    still open.
+
+    So on a **design** run today the default backend is the one that works, and the speed-up above
+    is available only to problems that do not reparameterise their density. That is what bounds a
+    30-minute run to roughly **14k elements at ~350 iterations** rather than 65k.
+
+An **iterative** solver is not the answer here, which is worth stating because it is the usual
+advice at this size: smoothed-aggregation AMG with elasticity's near-nullspace converges fine
+(residual $10^{-11}$) but needs 103–145 CG iterations against the $10^3$ SIMP contrast, landing at
+244–1250 ms — an order of magnitude worse than the direct factorisation. Contrast is what makes a
+SIMP system hard for a multigrid hierarchy, and it is exactly what topology optimisation creates.
 
 ## Every sensitivity is automatic
 

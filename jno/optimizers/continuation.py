@@ -47,7 +47,7 @@ class SIMPContinuation(_Callback):
         maximum: float = 8.0,
         tol: float = 1e-4,
         window: int = 3,
-        mnd_tol: float = 1e-2,
+        mnd_tol: float = 1e-4,
         physical: Optional[Callable] = None,
         watch: Optional[int] = None,
         every: int = 1,
@@ -151,7 +151,7 @@ def simp_continuation(
     maximum: float = 8.0,
     tol: float = 1e-4,
     window: int = 3,
-    mnd_tol: float = 1e-2,
+    mnd_tol: float = 1e-4,
     physical: Optional[Callable] = None,
     watch: Optional[int] = None,
     every: int = 1,
@@ -172,7 +172,12 @@ def simp_continuation(
         maximum: Ceiling, so a design that never binarises cannot run the exponent away.
         tol: Relative-change tolerance for "the objective has converged" (the paper's 1e-4).
         window: How many consecutive intervals must all be below ``tol`` (the paper's three).
-        mnd_tol: Grey-level target. Above this, the exponent keeps rising (the paper's 1e-2).
+        mnd_tol: Grey-level target. Above this, the exponent keeps rising. **1e-4**, which is
+            what the paper states in Sec. 3.1 -- 'if the gray level indicator M_nd remains
+            larger than 10^-4, the penalization factor is increased by one until the criterion
+            on M_nd is satisfied'. This default was 1e-2, attributed to the paper in the same
+            breath; a design at M_nd = 1e-2 still carries visible intermediate-density members,
+            which is the difference between their Fig. 4d and Fig. 4e.
         physical: Optional map from the design density to the physical one, e.g.
             ``d.patch_filter()``. Pass it whenever the density is reparameterised with
             ``constrain(...)``: the hook sees the partitioned trainable half, where the paramax
@@ -271,3 +276,140 @@ def geometric_decay(param: Any, gamma: float, *, start: float = 1.0, minimum: fl
         minimum: Floor, so the barrier never vanishes entirely and let the design cross ``P*``.
     """
     return GeometricDecay(param, gamma, start=start, minimum=minimum)
+
+
+class HeavisideContinuation(_Callback):
+    """Ramp a projection sharpness from ``start`` to ``maximum``. See :func:`heaviside_continuation`."""
+
+    def __init__(
+        self,
+        param: Any,
+        *,
+        start: float = 1.0,
+        maximum: float = 16.0,
+        over: int,
+        hold: int = 0,
+        schedule: str = "geometric",
+    ):
+        if int(over) <= 0:
+            raise ValueError(
+                f"heaviside_continuation: over= must be a positive number of iterations, got {over!r}. "
+                "It is the length of the ramp and cannot be inferred -- see the docstring."
+            )
+        if float(maximum) < float(start):
+            raise ValueError(
+                f"heaviside_continuation: maximum ({maximum!r}) is below start ({start!r}). The ramp "
+                "sharpens the projection; to hold it fixed, pass a plain float as beta instead."
+            )
+        if schedule not in ("geometric", "linear"):
+            raise ValueError(f"heaviside_continuation: schedule must be 'geometric' or 'linear', got {schedule!r}.")
+        if schedule == "geometric" and float(start) <= 0.0:
+            raise ValueError(
+                f"heaviside_continuation: a geometric ramp needs start > 0, got {start!r}; it "
+                "multiplies, so it can never leave zero. Use schedule='linear' to start from 0."
+            )
+        self._lid = param.model.layer_id
+        self.start, self.maximum = float(start), float(maximum)
+        self.over, self.hold, self.schedule = int(over), int(hold), schedule
+        self.value = float(start)
+        self.calls = 0
+        self.history: List[float] = []
+
+    @property
+    def progress(self) -> float:
+        """How far along the ramp is, in ``[0, 1]``."""
+        return min(1.0, max(0.0, (self.calls - self.hold) / self.over))
+
+    @property
+    def saturated(self) -> bool:
+        return self.progress >= 1.0
+
+    def project(self, rho):
+        """The projection at the CURRENT sharpness, for a caller that needs it outside the trace.
+
+        ``simp_continuation(physical=...)`` measures ``M_nd`` on the physical density and cannot see
+        a map that lives in the trace, so hand it ``lambda r: hv.project(patch(r))``.
+        """
+        from ..trace import heaviside as _heaviside
+
+        return _heaviside(rho, self.value)
+
+    def on_before_update(self, *, grads, epoch, **kw):
+        import jax
+        import jax.numpy as jnp
+
+        # Count THIS invocation before reading the position, so `over` steps land exactly on
+        # `maximum` rather than one short of it: the first call is one step along the ramp, not zero.
+        self.calls += 1
+        t = self.progress
+        if self.schedule == "geometric":
+            new = self.start * (self.maximum / self.start) ** t
+        else:
+            new = self.start + (self.maximum - self.start) * t
+        delta = self.value - new
+        self.value = new
+        self.history.append(new)
+        grads = dict(grads)
+        grads[self._lid] = jax.tree_util.tree_map(lambda x: jnp.full_like(x, delta), grads[self._lid])
+        return grads
+
+
+def heaviside_continuation(
+    param: Any, *, start: float = 1.0, maximum: float = 16.0, over: int, hold: int = 0, schedule: str = "geometric"
+) -> HeavisideContinuation:
+    """Sharpen a density projection over a declared number of iterations.
+
+    A smoothed-Heaviside projection (see :func:`jno.np.heaviside`) is only useful if its sharpness
+    rises: at ``beta = 1`` it barely projects, and starting at the final ``beta`` gives the optimiser
+    a near-step map to descend through and it stalls in the first grey design it finds. The standard
+    answer is continuation, and this is it.
+
+    **The ramp is keyed to this callback's own invocation count, never to ``epoch``.** That is the
+    whole design and it is not a detail: ``epoch`` is per-``solve()``-call, so a schedule reading it
+    ramps once per CHUNK and the physics then depends on how the driver loop was written. Measured on
+    a 3-D bracket, the same 250-iteration run reached ``beta`` 10.8 at ``CHUNK=10`` and 1.6 at
+    ``CHUNK=50``, with ``M_nd`` 0.008 against 0.078 -- two different optimisations wearing the same
+    configuration. Counting invocations is chunk-independent by construction: ``solve(1)`` five times
+    and ``solve(5)`` once give the identical ramp.
+
+    ``over`` is **required and cannot be inferred**. ``on_solve_begin`` does not carry the run
+    length, and a driver that also stops on a wall clock does not know it either until it stops --
+    so any inference would be wrong exactly where it matters, on the short run. Pass the
+    fraction-of-the-run form directly, ``over=int(0.8 * ITERS)``, which is what the schedule means.
+
+    Register it BEFORE any callback that reads the projected density, so they see the current value:
+    callbacks fire in list order, each seeing the previous one's ``grads``. With
+    :func:`simp_continuation` that is::
+
+        beta = jno.np.parameter((1,), name="beta")
+        beta.dtype(jnp.float64)
+        beta.initialize(lambda k, sh, dtype=None: jnp.full(sh, 1.0))
+        beta.optimizer(optax.sgd(1.0))
+
+        hv = jno.optimizers.heaviside_continuation(beta, maximum=16.0, over=int(0.8 * ITERS))
+        sc = jno.optimizers.simp_continuation(penal, rho, physical=lambda r: hv.project(patch(r)))
+        crux.solve(CHUNK, callbacks=[hv, sc])
+
+    Give the parameter ``optax.sgd(1.0)`` and initialise it to ``start``; this hook writes it
+    directly, the same way :class:`SIMPContinuation` writes ``penal``.
+
+    **Scope note.** ``penal`` and ``beta`` both binarise, by different means -- SIMP makes grey
+    expensive, projection makes it unreachable. The paper's schedule raises ``penal`` only. Running
+    both is legitimate and is what a Heaviside topology optimisation usually does, but they compound,
+    so watch ``M_nd`` rather than assuming the two are independent.
+
+    Args:
+        param: The scalar ``jno.np.parameter`` used as ``beta``.
+        start: Initial sharpness. Must match the parameter's initializer. ``1.0`` is nearly linear.
+        maximum: Final sharpness, held once the ramp saturates.
+        over: Iterations from ``start`` to ``maximum``. Required.
+        hold: Iterations at ``start`` before the ramp begins, so the topology can form first.
+        schedule: ``"geometric"`` (default, multiplicative in beta) or ``"linear"``.
+
+    Attributes:
+        value: The current sharpness.
+        progress: Position along the ramp, ``[0, 1]``.
+        saturated: Whether ``maximum`` has been reached.
+        history: One entry per invocation.
+    """
+    return HeavisideContinuation(param, start=start, maximum=maximum, over=over, hold=hold, schedule=schedule)

@@ -737,6 +737,28 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     rhs2 = _np.asarray(rhs).reshape(rhs.shape[0], -1)
     rows, cols = idx[:, 0], idx[:, 1]
 
+    # MKL PARDISO does not defend itself against a non-finite operator: handed one it corrupts its
+    # own heap and the PROCESS dies -- "double free or corruption", SIGABRT, no exception, nothing
+    # above it runs. Measured on a 3-D SIMP run whose density carried `constrain(patch_filter())`:
+    # the diagonal read 2.0e-3, then 4.8e-1, then NaN, and the next free aborted. The crash surfaces
+    # far from the cause (glibc notices at an unrelated `free`, inside JAX's callback teardown), so
+    # without this check the report is a heap message naming numpy, and the actual NaN is invisible.
+    #
+    # Checked here rather than trusted from above because this is the last point that can still
+    # raise: everything after it is inside MKL. O(nnz), against a factorization -- unmeasurable.
+    if not _np.isfinite(data).all() or not _np.isfinite(rhs2).all():
+        _nd = int((~_np.isfinite(data)).sum())
+        _nr = int((~_np.isfinite(rhs2)).sum())
+        raise FloatingPointError(
+            f"MKL PARDISO was handed a non-finite system and would abort the process: "
+            f"{_nd} of {data.size} matrix value(s) and {_nr} of {rhs2.size} right-hand-side "
+            f"entr(ies) are NaN or Inf. PARDISO has no guard for this -- it corrupts its heap and "
+            f"raises SIGABRT, which no `except` can catch -- so jNO refuses the call instead. "
+            f"The operator went non-finite BEFORE the solver: look for a density or material field "
+            f"that left its bounds (a negative value under a fractional SIMP exponent gives NaN), a "
+            f"reparameterisation that divides by a vanishing quantity, or a diverging Newton step."
+        )
+
     # NO transpose in the key: one factorization serves both directions (iparm[12]). The matrix TYPE
     # is not in the key either -- it is a property of the values, so it lives in the entry and is
     # re-checked only when the values change. Detecting it up front would put two lexsorts on EVERY

@@ -125,6 +125,74 @@ def _auto_gram_terms(constraints, fm) -> list:
     return gram_terms
 
 
+def _tree_signature(tree):
+    """``(treedef, ((shape, dtype), ...))`` — what a traced argument looks like to ``jax.jit``.
+
+    Two arguments with the same signature produce the same jaxpr, which is exactly the condition
+    under which a compiled program may be reused. Values are deliberately absent: they are what
+    changes between solves.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    return (
+        str(treedef),
+        tuple((getattr(x, "shape", None), str(getattr(x, "dtype", type(x).__name__))) for x in leaves),
+    )
+
+
+def _reparam_scalar_constants(models):
+    """Scalar constants captured in the closures of every ``paramax.Parameterize`` transform.
+
+    A reparameterization lives in the STATIC half of the partition, so a Python value its transform
+    closes over is a trace-time constant. Mutating that value between ``solve()`` calls -- the
+    idiom every continuation schedule reaches for, ``beta = [1.0]`` and then ``beta[0] = 2.0`` --
+    changes what the program should compute while changing nothing ``_step_program_key`` can see:
+    not the tree, not a shape, not a dtype. The cached executable is reused and the gradient is
+    taken at the OLD value, while ``crux.eval`` recompiles and reports the new one.
+
+    Measured on a one-parameter core with ``constrain(lambda r: box[0] * r)`` and ``sgd(1.0)``:
+    mutating ``box`` from 1 to 10 and re-solving moved the stored parameter 1.5 -> 0.5, which is
+    exactly the step the stale ``box = 1`` program prescribes, while the reported physical value
+    read 5.0. Right-looking numbers, wrong optimisation, and nothing raised.
+
+    Only SCALARS are read, and that limit is the point rather than an oversight: an array in one of
+    these namespaces is usually a baked table (the patch filter's neighbour lists are megabytes of
+    them), and hashing those every step would cost more than the recompile this cache exists to
+    avoid. So a mutated numpy array, and a mutated attribute on an object, both still slip through --
+    the trace-time-constant contract holds, and this narrows it to the case that bites in practice.
+
+    Reading referenced globals is deliberately over-broad: a module-level scalar the transform never
+    meant to depend on still enters the key, so mutating it costs a recompile it did not need. That
+    is a wasted compile, not a wrong answer, and it is the right side to err on.
+    """
+
+    def _scalars(v, out):
+        if isinstance(v, (bool, int, float)):
+            out.append(float(v))
+        elif isinstance(v, (list, tuple)) and 0 < len(v) <= 8 and all(isinstance(e, (bool, int, float)) for e in v):
+            out.extend(float(e) for e in v)
+
+    out: list = []
+    for leaf in jax.tree_util.tree_leaves(models, is_leaf=lambda x: isinstance(x, _paramax.Parameterize)):
+        if not isinstance(leaf, _paramax.Parameterize):
+            continue
+        fn = leaf.fn
+        # BOTH capture routes, because which one a schedule uses is an accident of where it was
+        # written. `def physical(r)` at module scope reads `beta` as a GLOBAL (empty `__closure__`);
+        # the same function nested inside a builder reads it as a free variable. Reading only
+        # closures misses every script in this repo, all of which declare the cell at module level.
+        for cell in getattr(fn, "__closure__", None) or ():
+            try:
+                _scalars(cell.cell_contents, out)
+            except ValueError:  # an empty cell -- the closure is still being built
+                continue
+        g = getattr(fn, "__globals__", None) or {}
+        code = getattr(fn, "__code__", None)
+        for name in getattr(code, "co_names", ()) or ():
+            if name in g:
+                _scalars(g[name], out)
+    return tuple(out)
+
+
 def _optimizer_states_match(a, b) -> bool:
     """Whether two optax states have the same tree, leaf shapes and dtypes.
 
@@ -443,7 +511,18 @@ def _bay_key(lid: int, group_idx: int = 0) -> str:
 
 
 def _extract_user_name(orig_expr) -> str | None:
-    """Return the user-supplied ``.name()`` label from a constraint/tracker expression, or None."""
+    """Return the user-supplied ``.name()`` label from a constraint/tracker expression, or None.
+
+    A ``jno.le``/``jno.ge`` wrapper is unwrapped first. ``jno.le(g_ang.name("g_ang"), 1.0)`` is the
+    natural way to write a named bound, and without this the label is lost and every diagnostic can
+    only say "inequality row 2" -- which is exactly the row a feasibility report most needs to name.
+    """
+    from .trace import Constraint as _Constraint
+
+    if isinstance(orig_expr, _Constraint):
+        inner = _extract_user_name(getattr(orig_expr, "expr", None))
+        if inner:
+            return inner
     name = getattr(orig_expr, "_user_name", None)
     if name:
         return name
@@ -1206,6 +1285,36 @@ class core:
 
         return track_fn
 
+    def _step_program_key(self, trainable, opt_states, context, per_model_opts, settings):
+        """A hashable description of the step program, or ``None`` if it cannot be described.
+
+        ``None`` means "do not reuse": a signature that cannot be built must never compare equal to
+        one that can, or a changed configuration would silently run the previous executable.
+
+        Optimizers enter by ``(layer id, type name)``. That catches a swapped optimizer but not a
+        changed learning rate on the same one, which is the standard ``jax.jit`` closure-staleness
+        contract -- states live on the core, so a genuinely fresh run means a fresh core.
+
+        The one place that contract had to be narrowed is a ``constrain()`` transform's own closure:
+        see :func:`_reparam_scalar_constants`. A continuation schedule mutates a scalar there between
+        solves, and nothing else in this key moves when it does.
+        """
+        try:
+            opts = tuple(sorted((str(k), type(v).__name__) for k, v in dict(per_model_opts).items()))
+            return (
+                _tree_signature(trainable),
+                _tree_signature(opt_states),
+                _tree_signature(context),
+                opts,
+                tuple(settings),
+                id(self.compiled_constraints_fn),
+                _reparam_scalar_constants(self.models),
+            )
+        except Exception as exc:  # noqa: BLE001 — an undescribable configuration simply does not cache
+            if os.environ.get("JNO_DEBUG_STEP_KEY") == "1":
+                self.log.info(f"step program key unavailable ({type(exc).__name__}: {exc}); not caching")
+            return None
+
     def make_step_fn(
         self,
         per_model_opts,
@@ -1905,6 +2014,28 @@ class core:
         # can apply CSE across shared sub-expressions.
         self.compiled_constraints_fn = TraceCompiler.compile_multi_expression(constraint_exprs, self.all_ops)
         self.n_constraints = len(constraint_exprs)
+        # A SECOND unit holding only the inequality rows, for the constraint Jacobian.
+        #
+        # MMA needs a gradient per `jno.le` row, and takes them as one shared `jax.vjp` over the
+        # stacked residuals plus one pullback per row (`rowwise_jacobian`). Sharing the forward pass
+        # is the right instinct, but every pullback then re-walks the WHOLE tape -- including the
+        # objective's, which for a PDE-constrained problem contains a sparse factorisation the
+        # constraint rows do not depend on. Its cotangent is zero and JAX runs it anyway.
+        #
+        # Compiling the inequality rows on their own is correct BY CONSTRUCTION: a Jacobian taken
+        # over a function that computes exactly those rows is exactly those rows, whatever the other
+        # residuals contain. So no dependency analysis is needed, and a row that genuinely does need
+        # the solve still gets it -- shared with the other rows in this unit, since
+        # `compile_multi_expression` evaluates them through one `TraceEvaluator`.
+        #
+        # Measured on a 3-D topology optimisation (7 residuals, 6 of them `jno.le` on mesh geometry
+        # and volume): the shared-tape Jacobian cost 214 ms per row, of which only 37 ms was the
+        # wasted factorisation -- the rest was re-walking the objective's assembly tape once per row.
+        self.compiled_inequality_fn = (
+            TraceCompiler.compile_multi_expression([constraint_exprs[_i] for _i in self._inequality_idx], self.all_ops)
+            if self._inequality_idx
+            else None
+        )
         # Boolean row selector for the entries the loss is the mean OF. Built once, here, so the
         # step function stays free of Python-level branching.
         _obj = np.ones(self.n_constraints, dtype=bool)
@@ -3388,12 +3519,56 @@ class core:
                 replicated,  # individual_losses  (→ prev_losses next step)
                 _bay_info_template,  # bayesian_info dict
             )
-            jit_step = jax.jit(
-                step_fn,
-                in_shardings=in_shardings,
-                out_shardings=out_shardings,
-                donate_argnums=(0, 1, 2),
+            # REUSE the jitted step across solve() calls. `jax.jit` keys its trace and compilation
+            # cache on the wrapped function OBJECT, and `make_step_fn` returns a fresh closure every
+            # solve, so a second solve() re-traced, re-lowered and re-compiled a program it already
+            # had. Measured at 19,462 tets: ~8.7 s per call, of which 3.6 s was XLA compiling
+            # `grad_fn` and the rest tracing and lowering -- so 250 iterations in chunks of 10 spent
+            # about a third of the run rebuilding the same executable 25 times.
+            #
+            # The key below is what makes reuse safe: it carries the tree structure, shapes and
+            # dtypes of every input, plus the solve-time settings that change the program. Anything
+            # it does not cover forces a rebuild by being absent from the cache, EXCEPT a caller who
+            # swaps an optimizer's hyper-parameters on a live core without changing its type -- the
+            # ordinary `jax.jit` staleness contract, and the reason optimizer identity is in the key
+            # as coarsely as it can be described.
+            _step_key = self._step_program_key(
+                trainable,
+                opt_states,
+                trace_context,
+                per_model_opts,
+                (
+                    effective_batchsize,
+                    inner_steps,
+                    accumulation_steps,
+                    bool(checkpoint_gradients),
+                    min_consecutive,
+                    int(self.n_constraints),
+                    bool(bayesian_handles),
+                ),
             )
+            _cache = getattr(self, "_jit_program_cache", None)
+            if _cache is None or _cache.get("__key__") != _step_key or _step_key is None:
+                _cache = {"__key__": _step_key}
+                self._jit_program_cache = _cache
+            _cached_step = ("hit", _cache["step"]) if "step" in _cache else None
+            if os.environ.get("JNO_DEBUG_STEP_KEY") == "1" and _cached_step is not None:
+                _names = ("trainable", "opt_states", "context", "optimizers", "settings", "constraints_fn")
+                for _n, _a, _b in zip(_names, _cached_step[0], _step_key or ()):
+                    if _a != _b:
+                        self.log.info(f"step key differs in {_n}:\n  was {_a}\n  now {_b}")
+            if _cached_step is not None:
+                jit_step = _cached_step[1]
+                self.log.info("Reusing the compiled step function from the previous solve()")
+            else:
+                jit_step = jax.jit(
+                    step_fn,
+                    in_shardings=in_shardings,
+                    out_shardings=out_shardings,
+                    donate_argnums=(0, 1, 2),
+                )
+                if _step_key is not None:
+                    _cache["step"] = jit_step
 
             # JIT-compile gradient accumulation functions when enabled.
             if _use_accumulation:
@@ -3437,7 +3612,7 @@ class core:
                 _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
                 _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
 
-                jit_hook_grad = jax.jit(
+                jit_hook_grad = _cache.get("hook_grad") or jax.jit(
                     _hook_grad_fn,
                     in_shardings=(
                         _trainable_sharding,
@@ -3451,7 +3626,7 @@ class core:
                         replicated,  # individual_losses
                     ),
                 )
-                jit_hook_apply = jax.jit(
+                jit_hook_apply = _cache.get("hook_apply") or jax.jit(
                     _hook_apply_fn,
                     in_shardings=(
                         _trainable_sharding,
@@ -3466,6 +3641,8 @@ class core:
                     ),
                     donate_argnums=(2,),  # donate grads buffer
                 )
+                if _step_key is not None:
+                    _cache["hook_grad"], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
 
             if has_trackers:
                 jit_track = jax.jit(track_fn)
@@ -3699,6 +3876,7 @@ class core:
                 for _cb in callbacks:
                     _cb.on_solve_begin(
                         compiled_constraints_fn=self.compiled_constraints_fn,
+                        compiled_inequality_fn=self.compiled_inequality_fn,
                         n_constraints=self.n_constraints,
                         batchsize=batchsize,
                         frozen=frozen_arrays,
@@ -5420,6 +5598,8 @@ class core:
         # eqx.filter_jit wrappers are not picklable; drop the cache.
         # It will be rebuilt lazily on the next eval() call.
         state["_eval_cache"] = None
+        # Compiled step and hook programs hold device handles; they are rebuilt on the next solve().
+        state.pop("_jit_program_cache", None)
 
         return state
 

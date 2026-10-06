@@ -627,3 +627,59 @@ def test_a_transient_cover_solve_beats_p1_between_the_nodes():
         ex = exact_at(mid)
         errs[space] = float(np.linalg.norm(got - ex) / np.linalg.norm(ex))
     assert errs["cover"] < 0.5 * errs["Lagrange"], f"cover {errs['cover']:.3e} vs P1 {errs['Lagrange']:.3e}"
+
+
+def test_a_surface_traction_carries_the_same_force_on_an_enriched_space():
+    """A traction on ``space="cover"`` must assemble, and assemble the SAME physical load.
+
+    The surface residual builds its own shape tables rather than going through ``_cell_fields``,
+    so it did not apply the cover expansion the volume path applies. The assembler's static
+    sparsity pattern had already allocated ``n_local * blk`` test rows for the term while the
+    residual emitted ``n_local`` of them, and the mismatch surfaced far from its cause as a
+    broadcast error inside the Jacobian's scatter (``float64[108]`` against ``float64[324]`` on a
+    2-D elasticity problem -- a factor of exactly the cover block). The practical effect was that
+    ``space="cover"`` was unusable with any applied load: volume terms and Dirichlet conditions
+    alone happened to avoid the path, which is why every existing cover test passed.
+
+    The load vector is a different object in the two spaces -- the enriched one has ``blk`` times
+    the entries -- but it stands for the same force, so the sum over the VALUE slots must agree
+    exactly. A cover slot given the wrong weight fails this even when the shapes line up.
+    """
+    import jax.numpy as jnp
+
+    import jno
+
+    inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    L, H, tol = 4.0, 2.0, 1e-9
+    lam, mu = 1.0 * 0.3 / (1 - 0.3**2), 1.0 / (2 * 1.3)
+
+    def build(space):
+        d = jno.shape.rect(0, 0, L, H, size=0.5).domain()
+        kw = {"value_shape": (2,)} | ({"space": "cover"} if space == "cover" else {})
+        u, phi = d.fem_symbols(**kw)
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("root", where=lambda x, y: x < tol, split=True)[:2] + (None,)
+        xt, yt, _ = d.variable("tip", where=lambda x, y: x > L - tol, split=True)[:2] + (None,)
+        e = lambda w: symgrad(w, [xi, yi])  # noqa: E731
+        a = lambda p, q: lam * trace(p) * trace(q) + 2 * mu * inner(p, q, n_contract=2)  # noqa: E731
+        fem = jno.fem(
+            [a(e(u), e(phi)), u(xb, yb) - (0.0, 0.0), -1.0 * inner(jnp.array([0.0, -1.0]), phi.bind(x=xt, y=yt), 1)],
+            quad_degree=2,
+        )
+        op = fem.operator
+        _A, b = op.evaluate({}) if hasattr(op, "evaluate") else op
+        return fem, np.asarray(jnp.asarray(b)).reshape(-1)
+
+    fem_p1, b_p1 = build("Lagrange")
+    fem_cv, b_cv = build("cover")
+    blk = fem_cv.dofs // fem_p1.dofs
+    assert blk == 3, f"a 2-D first-order cover is 1 value + 2 slots; got {blk}"
+
+    res_p1 = b_p1.reshape(-1, 2).sum(axis=0)
+    res_cv = b_cv.reshape(-1, blk, 2)[:, 0, :].sum(axis=0)  # VALUE slot of each node
+    assert np.abs(res_p1).sum() > 1e-9, "the traction assembled nothing; the test would pass vacuously"
+    assert np.allclose(res_p1, res_cv, atol=1e-12), f"enriched traction carries {res_cv} against {res_p1}"
+
+    # The cover slots take load too -- they are real degrees of freedom, not padding. If they were
+    # all zero the expansion would be cosmetic and the solve would reduce to P1.
+    assert np.abs(b_cv.reshape(-1, blk, 2)[:, 1:, :]).max() > 1e-12, "the cover slots carry no load"

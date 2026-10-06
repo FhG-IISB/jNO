@@ -66,6 +66,8 @@ def test_namespace_is_just_the_optimizers():
         "SIMPContinuation",
         "geometric_decay",
         "GeometricDecay",
+        "heaviside_continuation",
+        "HeavisideContinuation",
     }
     for factory in (o.ssbroyden, o.ssbfgs, o.soap):
         opt = factory()

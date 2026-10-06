@@ -3838,6 +3838,29 @@ class domain(MeshIOMixin):
     # ------------------------------------------------------------------
     # Per-cell mesh geometry as trace nodes (differentiable in the mesh)
     # ------------------------------------------------------------------
+    #: Linear volume-cell blocks per dimension, simplex first. The order is the lookup order, so a
+    #: mesh carrying both (which :meth:`Shape.cell_choices` refuses to build) resolves to the simplex.
+    _TOPO_BLOCKS = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}
+
+    def _cells_topo(self):
+        """``(cells, kind)`` — the mesh's linear volume cells, simplex **or** tensor-product.
+
+        ``kind`` is the meshio block name, so a caller can branch on cell shape rather than infer it
+        from the column count. Sibling of :meth:`_cells_p1` rather than a replacement: that one
+        promises a simplex and a great deal of code reads it that way, while everything *geometric*
+        -- volume, angles, aspect, facets, patches -- has a tensor-product counterpart and should
+        take this instead.
+        """
+        mesh = self.built_mesh
+        cd = getattr(mesh, "cells_dict", {})
+        dim = int(self.dimension)
+        for key in self._TOPO_BLOCKS.get(dim, ()):
+            cells = cd.get(key)
+            if cells is not None:
+                return np.asarray(cells, dtype=np.int64), key
+        want = " or ".join(repr(k) for k in self._TOPO_BLOCKS.get(dim, ()))
+        raise ValueError(f"domain: no {want} cells on this {dim}-D mesh — cell geometry is unavailable.")
+
     def _cells_p1(self):
         """``(n_cells, dim+1)`` vertex ids of the P1 simplices."""
         mesh = self.built_mesh
@@ -3882,7 +3905,8 @@ class domain(MeshIOMixin):
         import jno as _jno
 
         dim = int(self.dimension)
-        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        cells_np, kind = self._cells_topo()
+        cells = jnp.asarray(cells_np, dtype=jnp.int32)
         args, rebuild = self._moving_points()
         fact = {1: 1.0, 2: 2.0, 3: 6.0}[dim]  # d! — the simplex volume factor
 
@@ -3891,29 +3915,105 @@ class domain(MeshIOMixin):
             jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
             return jnp.abs(jnp.linalg.det(jac)) / fact
 
-        return _jno.fn(_vol, args, name="cell_volume")
+        def _vol_quad(*vals):
+            """The shoelace area, which is exact for a quadrilateral of ANY shape.
+
+            ``|det J| / 2`` is the simplex formula and would read a quadrilateral as the parallelogram
+            spanned by two of its edges -- right only when it happens to be one. The shoelace sum over
+            the four corners in mesh order is exact for any simple polygon, convex or not, and is
+            linear in each coordinate, so it differentiates cleanly w.r.t. the moving nodes.
+            """
+            v = rebuild(*vals)[cells]  # (n_cells, 4, 2)
+            x, y = v[..., 0], v[..., 1]
+            xn, yn = jnp.roll(x, -1, axis=-1), jnp.roll(y, -1, axis=-1)
+            return jnp.abs(jnp.sum(x * yn - xn * y, axis=-1)) / 2.0
+
+        if kind == "hexahedron":
+            raise NotImplementedError(
+                "domain.cell_volume(): hexahedral cells are not supported yet — the quadrilateral "
+                "(2-D) and simplex paths are. A hexahedron's volume is not |det J| / 6 and its faces "
+                "need not be planar, so it needs its own formula rather than the simplex one."
+            )
+        return _jno.fn(_vol_quad if kind == "quad" else _vol, args, name="cell_volume")
 
     def cell_angles(self, eps: float = 1e-12):
-        """Per-cell interior angles in radians, ``(n_cells, 3)``, differentiable in the mesh. **2-D.**
+        """Per-cell angles in radians, differentiable in the mesh. **2-D and 3-D.**
 
-        The angle at each vertex from the inverse cosine of its two incident edge vectors. This is
-        the quantity a mesh-quality constraint is written on — a lower bound on the minimum angle
-        prevents the element tangling that free nodal movement otherwise causes::
+        The dihedral angle is the tetrahedron's counterpart of a triangle's interior angle, so one
+        name covers both and a mesh-quality constraint is the *same expression* in either dimension:
+
+        * **triangles** → ``(n_cells, 3)``, the interior angle at each vertex, from the inverse
+          cosine of its two incident edge vectors;
+        * **quadrilaterals** → ``(n_cells, 4)``, the interior angle at each corner, in ``(0, 2π)``
+          so that a **reflex** corner reads above ``π`` rather than being folded back below it;
+        * **tetrahedra** → ``(n_cells, 6)``, the dihedral angle across each edge, from the inward
+          normals of the two faces meeting there.
+
+        Both are bounded below by the same form, since a dihedral is also under ``π``::
 
             g = ((2 * jno.np.pi - d.cell_angles()) / (2 * jno.np.pi - theta_min)).pnorm(50)
             jno.core([compliance, jno.le(g, 1.0)])
 
-        Bounding the minimum angle bounds the maximum implicitly, since the three sum to ``π``.
-        ``eps`` guards the denominator; it does not otherwise shift the angles.
+        **The one thing that does differ, and it is physics rather than API.** On a **triangle** a
+        lower bound induces an upper bound, because three angles summing to ``π`` leave no room for a
+        large one once the small ones are held up. That argument is special to the triangle:
+
+        * a **tet's** six dihedrals sum to a *variable* quantity strictly inside ``(2π, 3π)`` —
+          measured 2.207π to 2.467π on a unit box, against 2.35π for the regular tet — so a **cap**,
+          two faces folded flat together, satisfies a minimum-angle bound while being degenerate;
+        * a **quadrilateral's** four angles sum to exactly ``2π``, which is enough room for three
+          corners at 45° and a fourth at 225°. That cell is non-convex and still has positive area,
+          so nothing else in the constraint set objects to it either.
+
+        In both cases bound the maximum explicitly as well::
+
+            jno.le((d.cell_angles() / theta_max).pnorm(50, normalize=True), 1.0)   # tets and quads
+
+        **What this does not catch.** A *needle* — a small base with a distant apex — keeps every
+        dihedral moderate while being badly conditioned; :meth:`cell_aspect` is what sees it. The two
+        are complements: a *sliver* (four near-coplanar vertices) holds its face angles above 20°
+        while its dihedrals collapse to 0.03° and 179.9°, and a needle does the converse. This
+        matters because of Babuška & Aziz (*SIAM J. Numer. Anal.* **13** (1976) 214–226): a needle
+        still satisfies the maximum-angle condition, so it costs conditioning, while a sliver and a
+        cap violate it and destroy interpolation accuracy outright.
+
+        ``eps`` guards the denominator; it does not otherwise shift the angles. Reference: Jung, Yun
+        & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 2.3.3 — eq. (21)/(24) is the
+        triangle case, and the tetrahedral one is the extension their Sec. 2.3.2 leaves open.
         """
+        import itertools
+
         import jno as _jno
 
-        if int(self.dimension) != 2:
-            raise NotImplementedError(f"domain.cell_angles(): triangles only (2-D); this domain is {self.dimension}-D.")
-        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        dim = int(self.dimension)
+        if dim not in (2, 3):
+            raise NotImplementedError(f"domain.cell_angles(): 2-D or 3-D; this domain is {dim}-D.")
+        cells_np, kind = self._cells_topo()
+        cells = jnp.asarray(cells_np, dtype=jnp.int32)
         args, rebuild = self._moving_points()
 
-        def _ang(*vals):
+        def _ang_quad(*vals):
+            """The four interior angles, in ``(0, 2π)`` -- a **reflex** corner reads above ``π``.
+
+            The ``arccos`` of two incident edges cannot express a reflex angle: its range is
+            ``[0, π]``, so a non-convex ("dart") quadrilateral reports its 225° corner as 135° and a
+            minimum-angle bound sees nothing wrong. A quadrilateral CAN go non-convex while keeping a
+            positive area, which a triangle cannot, so this is a real failure mode of a deformable
+            quad mesh rather than a nicety. ``atan2`` against the signed corner cross-product gives
+            the true interior angle, oriented by the cell's own signed area so mesh winding does not
+            matter. Checked by the four angles summing to ``2π``, reflex corners included.
+            """
+            v = rebuild(*vals)[cells]  # (n_cells, 4, 2)
+            x, y = v[..., 0], v[..., 1]
+            sgn = jnp.sign(jnp.sum(x * jnp.roll(y, -1, axis=-1) - jnp.roll(x, -1, axis=-1) * y, axis=-1))
+            sgn = jnp.where(sgn == 0.0, 1.0, sgn)[:, None]
+            a = jnp.roll(v, 1, axis=1) - v  # towards the previous corner
+            b = jnp.roll(v, -1, axis=1) - v  # towards the next corner
+            cross = b[..., 0] * a[..., 1] - b[..., 1] * a[..., 0]
+            th = jnp.arctan2(sgn * cross, jnp.sum(a * b, axis=-1))
+            return jnp.where(th < 0.0, th + 2.0 * np.pi, th)  # (n_cells, 4)
+
+        def _ang_2d(*vals):
             v = rebuild(*vals)[cells]  # (n_cells, 3, 2)
             out = []
             for i in range(3):
@@ -3923,7 +4023,36 @@ class domain(MeshIOMixin):
                 out.append(jnp.arccos(jnp.clip(cos, -1.0, 1.0)))
             return jnp.stack(out, axis=-1)  # (n_cells, 3)
 
-        return _jno.fn(_ang, args, name="cell_angles")
+        # Edge (i, j) is shared by the two faces that omit the other two vertices, which is what
+        # pairs an edge with the normals whose angle is its dihedral.
+        edges = list(itertools.combinations(range(4), 2))
+
+        def _inward_normal(v, k):
+            """Unit normal of the face opposite vertex ``k``, oriented towards the cell interior."""
+            keep = [i for i in range(4) if i != k]
+            n = jnp.cross(v[:, keep[1]] - v[:, keep[0]], v[:, keep[2]] - v[:, keep[0]])
+            n = n / (jnp.linalg.norm(n, axis=-1, keepdims=True) + eps)
+            s = jnp.sign(jnp.sum(n * (v[:, k] - v[:, keep[0]]), axis=-1, keepdims=True))
+            return n * jnp.where(s == 0.0, 1.0, s)
+
+        def _ang_3d(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, 4, 3)
+            nrm = [_inward_normal(v, k) for k in range(4)]
+            out = []
+            for i, j in edges:
+                a, b = [k for k in range(4) if k not in (i, j)]
+                cos = jnp.sum(nrm[a] * nrm[b], axis=-1)
+                # Both normals point inward, so the dihedral is π minus the angle between them.
+                out.append(np.pi - jnp.arccos(jnp.clip(cos, -1.0, 1.0)))
+            return jnp.stack(out, axis=-1)  # (n_cells, 6)
+
+        if kind == "hexahedron":
+            raise NotImplementedError(
+                "domain.cell_angles(): hexahedral cells are not supported yet — quadrilaterals (2-D) "
+                "and simplices are. A hexahedron's faces need not be planar, so 'the' dihedral across "
+                "an edge is not well defined without first deciding how to split them."
+            )
+        return _jno.fn(_ang_quad if kind == "quad" else (_ang_2d if dim == 2 else _ang_3d), args, name="cell_angles")
 
     def cell_aspect(self, eps: float = 1e-30):
         """Per-cell **aspect ratio** as a ``(n_cells,)`` node, differentiable in the mesh. 2-D and 3-D.
@@ -3955,8 +4084,34 @@ class domain(MeshIOMixin):
 
         dim = int(self.dimension)
         if dim not in (2, 3):
-            raise NotImplementedError(f"domain.cell_aspect(): simplices in 2-D or 3-D; this domain is {dim}-D.")
-        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+            raise NotImplementedError(f"domain.cell_aspect(): 2-D or 3-D; this domain is {dim}-D.")
+        cells_np, kind = self._cells_topo()
+        if kind == "hexahedron":
+            raise NotImplementedError(
+                "domain.cell_aspect(): hexahedral cells are not supported yet — quadrilaterals (2-D) and simplices are."
+            )
+        if kind == "quad":
+            # The SAME measure, longest edge over the inradius: r = 2A/P is the inradius of any
+            # tangential polygon and reads as an inscribed-circle scale for the rest, exactly as
+            # `dim * vol / surf` already does for a simplex. Only the normalising constant differs,
+            # because the reference cell does: a unit square has A = 1, P = 4, so r = 1/2 and the
+            # longest edge is 1, giving 2.0 where an equilateral triangle gives 2*sqrt(3). The
+            # measure is 1.0 on ANY square, grows with elongation (1.5 on a 1x2 rectangle) and with
+            # skew, and diverges as the cell collapses.
+            cells_q = jnp.asarray(cells_np, dtype=jnp.int32)
+            args_q, rebuild_q = self._moving_points()
+
+            def _asp_quad(*vals):
+                v = rebuild_q(*vals)[cells_q]  # (n_cells, 4, 2)
+                e = jnp.roll(v, -1, axis=1) - v  # the four edges, in mesh order
+                lengths = jnp.linalg.norm(e, axis=-1)
+                x, y = v[..., 0], v[..., 1]
+                area = jnp.abs(jnp.sum(x * jnp.roll(y, -1, axis=-1) - jnp.roll(x, -1, axis=-1) * y, axis=-1)) / 2.0
+                inradius = 2.0 * area / (jnp.sum(lengths, axis=-1) + eps)
+                return jnp.max(lengths, axis=-1) / (2.0 * inradius + eps)
+
+            return _jno.fn(_asp_quad, args_q, name="cell_aspect")
+        cells = jnp.asarray(cells_np, dtype=jnp.int32)
         args, rebuild = self._moving_points()
         fact = {2: 2.0, 3: 6.0}[dim]  # d!
         fac_fact = {2: 1.0, 3: 2.0}[dim]  # (d-1)!
@@ -4016,55 +4171,146 @@ class domain(MeshIOMixin):
         Returns:
             ``(target_n_cells,)`` numpy array.
 
+        Triangles in 2-D and tetrahedra in 3-D. The point location underneath
+        (:func:`fem_adapt._locate_in_cells`) is dimension-generic on a simplex -- ``dim + 1``
+        vertices and one ``dim x dim`` solve for the barycentric coordinates -- so the tetrahedral
+        case is the same code, not a second implementation.
+
         References:
             Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Fig. 7c-d, where the
             gap is +17.6 % for conventional elements and -0.5 % with the enriched formulation.
         """
-        if int(self.dimension) != 2:
-            raise NotImplementedError(
-                f"domain.transfer_cell_field(): 2-D triangles only; this domain is {self.dimension}-D."
+        dim = int(self.dimension)
+        if dim not in (2, 3):
+            raise NotImplementedError(f"domain.transfer_cell_field(): simplices in 2-D or 3-D; this domain is {dim}-D.")
+        if int(target.dimension) != dim:
+            raise ValueError(
+                f"domain.transfer_cell_field(): the target is {int(target.dimension)}-D but this domain is "
+                f"{dim}-D; a per-element field cannot cross dimensions."
             )
-        src_cells = self._cells_p1()
-        src_pts = np.asarray(self.mesh.points)[:, :2] if points is None else np.asarray(points)[:, :2]
+        src_cells, _ = self._cells_topo()
+        src_pts = np.asarray(self.mesh.points)[:, :dim] if points is None else np.asarray(points)[:, :dim]
         vals = np.asarray(values).reshape(-1)
         if vals.size != src_cells.shape[0]:
             raise ValueError(
                 f"domain.transfer_cell_field(): values has {vals.size} entries but this mesh has "
                 f"{src_cells.shape[0]} cells."
             )
-        tgt_cells = target._cells_p1()
-        tgt_centroids = np.asarray(target.mesh.points)[:, :2][tgt_cells].mean(axis=1)
+        tgt_cells, _ = target._cells_topo()
+        tgt_centroids = np.asarray(target.mesh.points)[:, :dim][tgt_cells].mean(axis=1)
 
         from jno.utils.solver.fem_adapt import _locate_in_cells
 
-        owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
+        # 4-tuple: `_locate_in_cells` grew a reference-coordinate return with the quad/hex elements
+        # (271363d3), after this call site was written against the 3-tuple.
+        #
+        # `k` is how many nearest CENTROIDS are tested for containment, and 32 is calibrated on
+        # triangles. It is not enough on tetrahedra: a tet is pointier than a triangle, so its
+        # centroid sits further from parts of the cell, and the containing tet can rank well down
+        # the centroid ordering. Measured on a 138-tet box against its own refinement, one target
+        # centroid of 767 -- at (1.545, 0.996, 1.015), the middle of the mesh, not a boundary case
+        # -- had its true tet at rank exactly 32, so a k=32 search missed it by one and the point
+        # was silently reported outside the mesh and given `outside`.
+        #
+        # So escalate, and only on the points that missed: the common path stays at k=32, and a
+        # handful of stragglers get a wider search rather than every query paying for one (the
+        # candidate solve is (Q, k, dim, dim), so a blanket k=128 would quadruple its memory).
+        # Genuinely exterior points -- disjoint domains, which `outside=` exists for -- never
+        # resolve, hence the cap: past it they are accepted as outside, which is the right answer
+        # for them and a bounded cost for everyone.
+        k, k_max = 32, min(512, int(src_cells.shape[0]))
+        owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=k)
+        owner, inside = np.asarray(owner).copy(), np.asarray(inside).copy()
+        while not inside.all() and k < k_max:
+            k = min(k * 4, k_max)
+            miss = ~inside
+            o_m, _w_m, _r_m, in_m = _locate_in_cells(src_pts, src_cells, tgt_centroids[miss], tol=1e-9, k=k)
+            owner[miss], inside[miss] = o_m, in_m
         return np.where(inside, vals[owner], float(outside))
 
-    def interior_edges(self):
-        """Interior facets — the edges shared by exactly two triangles.
+    def _interior_facets(self):
+        """Interior facets — those shared by exactly two cells. Edges in 2-D, triangles in 3-D.
 
         Returns a dict of host-side numpy arrays:
-            ``cells`` ``(n_edges, 2)`` int — the two triangles meeting at each edge.
-            ``nodes`` ``(n_edges, 2)`` int — the edge's two endpoints, for its length.
+            ``cells`` ``(n_facets, 2)`` int — the two cells meeting at each facet.
+            ``nodes`` ``(n_facets, n_face_nodes)`` int — the facet's corner nodes, for its measure
+            (2 in 2-D, giving a length; 3 in 3-D, giving a triangle area).
 
-        Boundary edges are excluded: they carry no density jump, since there is no element on the
+        Boundary facets are excluded: they carry no density jump, since there is no element on the
         far side. This is the traversal a perimeter functional needs (Haber, Jog & Bendsoe,
-        *Struct. Optim.* **11**, 1996, 1-12).
+        *Struct. Optim.* **11**, 1996, 1-12) — in 3-D the same functional measures the material
+        boundary's AREA rather than a length, which is what its target has to be given in.
+
+        Named for the facet rather than the edge because that is the dimension-generic word, and the
+        one :mod:`jno.utils.solver.fem_facets` already uses; the local-face tables come from there
+        (:func:`_face_table`) rather than being written out again per cell type.
         """
-        cells = self._cells_p1()
-        if int(self.dimension) != 2 or cells.shape[1] != 3:
+        from jno.utils.solver.fem_facets import _face_table
+
+        cells, kind = self._cells_topo()
+        dim = int(self.dimension)
+        # `_face_table` already carries the tensor-product tables, so a quadrilateral's four edges
+        # come from the same place a triangle's three do; only the block name has to be translated.
+        cell_key = {"triangle": "triangle", "quad": "quad", "tetra": "tetrahedron"}.get(kind)
+        if cell_key is None or dim not in (2, 3):
             raise NotImplementedError(
-                f"domain.interior_edges(): triangles in 2-D only; got {cells.shape[1]}-node cells in {self.dimension}-D."
+                f"domain._interior_facets(): triangles, quadrilaterals or tetrahedra; got {kind!r} in {dim}-D."
             )
-        seen: dict = {}
-        for k, tri in enumerate(cells):
-            for a, b in ((0, 1), (1, 2), (2, 0)):
-                key = (int(min(tri[a], tri[b])), int(max(tri[a], tri[b])))
-                seen.setdefault(key, []).append(k)
-        keys = [e for e, ks in seen.items() if len(ks) == 2]
+        local_faces, n_face_nodes = _face_table(cell_key)
+        lf = np.asarray([f[:n_face_nodes] for f in local_faces], dtype=np.int64)  # (n_local, n_fn)
+        n_cells, n_local = cells.shape[0], lf.shape[0]
+
+        # Canonical key per (cell, local facet): the sorted corner ids, so the two cells sharing a
+        # facet produce the same row whatever order they list it in.
+        keys = np.sort(cells[:, lf], axis=-1).reshape(n_cells * n_local, n_face_nodes)
+        uniq, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+        inverse = np.asarray(inverse).ravel()
+
+        # The two owners of each shared facet: order the slots by facet id, then a facet used twice
+        # occupies two adjacent positions. A stable sort keeps that pair in cell order.
+        slot_cell = np.repeat(np.arange(n_cells, dtype=np.int64), n_local)
+        order = np.argsort(inverse, kind="stable")
+        cell_sorted = slot_cell[order]
+        starts = np.searchsorted(inverse[order], np.arange(len(uniq), dtype=np.int64))
+        shared = np.where(counts == 2)[0]
         return {
-            "cells": np.asarray([seen[e] for e in keys], dtype=np.int64),
-            "nodes": np.asarray(keys, dtype=np.int64),
+            "cells": np.stack([cell_sorted[starts[shared]], cell_sorted[starts[shared] + 1]], axis=1),
+            "nodes": uniq[shared],
+        }
+
+    def _facet_ridges(self):
+        """:meth:`_interior_facets`, grouped by the **ridge** each facet borders.
+
+        A ridge is the facet's own facet — a *point* in 2-D, an *edge* in 3-D — so two interior
+        facets sharing a ridge are neighbours on the material boundary, and the angle between them
+        is that boundary's discrete curvature. This is the traversal a bending functional needs,
+        the way :meth:`_interior_facets` alone is the traversal a perimeter needs.
+
+        Returns :meth:`_interior_facets`' ``cells`` and ``nodes``, plus:
+            ``facet_ridge`` ``(n_facets, n_local_ridges)`` int — which ridge each of the facet's
+                sides belongs to. 2 per facet in 2-D (its endpoints), 3 in 3-D (its edges).
+            ``ridge_nodes`` ``(n_ridges, n_ridge_nodes)`` int — the ridge's own corners: 1 in 2-D,
+                2 in 3-D. Its measure follows — a point counts 1, an edge contributes its length.
+
+        **A ridge collects every incident interior facet, not two.** In 3-D a mesh edge is shared
+        by a whole fan of tetrahedra, hence by a fan of faces — 6 on average, not 2 — so there is
+        no such thing as "the" neighbour across it. Which of them the material boundary actually
+        runs through is a property of the *density*, not of the mesh, and so cannot be decided
+        here; a functional over this table has to weight the pairs by their density jump and let
+        the ones that carry no boundary contribute nothing. Grouping rather than pairing is what
+        leaves that open.
+        """
+        facets = self._interior_facets()
+        nodes = facets["nodes"]  # (F, n_face_nodes)
+        # The facet's own facets. An edge's ridges are its two endpoints; a triangle's are its
+        # three edges. Both are "drop one corner", which is why the tables are one line each.
+        local = np.array([[0], [1]] if nodes.shape[1] == 2 else [[0, 1], [1, 2], [0, 2]], dtype=np.int64)
+        keys = np.sort(nodes[:, local], axis=-1).reshape(-1, local.shape[1])
+        uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+        return {
+            **facets,
+            "facet_ridge": np.asarray(inverse).reshape(nodes.shape[0], local.shape[0]),
+            "ridge_nodes": uniq,
         }
 
     def patch_filter(self):
@@ -4076,7 +4322,7 @@ class domain(MeshIOMixin):
         layout unbuildable, and leaves every other element untouched.
 
         Around each vertex of element ``k`` the elements form a patch, walked counterclockwise
-        (:meth:`patch_topology`). For that patch,
+        (:meth:`_patch_topology`). For that patch,
 
             f_k = [ prod_{i=2}^{N-2} { 1 - r_i (1 - mean(r_1..r_{i-1})) (1 - mean(r_{i+1}..r_{N-1})) }
                     * { 1 - r_k (1 - (r_1 + r_{N-1}) / 2) } ] ^ (1 / (N - 2))
@@ -4107,7 +4353,7 @@ class domain(MeshIOMixin):
         neighbourhood -- so it cannot be written inside the weak form, where the kernel sees one
         element at a time. That is why the physics route is a reparameterisation.
         """
-        topo = self.patch_topology()
+        topo = self._patch_topology()
         others = jnp.asarray(topo["others"], dtype=jnp.int32)  # (K, 3, M) with -1 padding
         n_int = jnp.asarray(topo["size"], dtype=jnp.int32)  # (K, 3)
         interior = jnp.asarray(~topo["boundary"])  # (K, 3)
@@ -4149,46 +4395,77 @@ class domain(MeshIOMixin):
 
         return _patch
 
-    def patch_topology(self):
-        """Node→element patches, ordered counterclockwise — the connectivity eq. (17)-(19) needs.
+    # Local edges of a tetrahedron as vertex-index pairs. Only the six pairs matter here (a fan is
+    # keyed by the edge's two GLOBAL vertices, not by a local slot), so this is written out rather
+    # than taken from BASIX_TET_EDGES -- nothing indexes these against an element table.
+    _TET_EDGES = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
 
-        For every triangle ``k`` and every one of its three vertices, returns the OTHER elements of
-        that vertex's patch in counterclockwise order starting from the one adjacent to ``k``. This
-        is what makes the patch formula of Jung, Yun & Kim, *Computers & Structures* **331** (2026)
-        108403 evaluable: its indices ``rho_{k,1} ... rho_{k,N-1}`` are an angular walk around the
-        node, and ``rho_{k,1}`` / ``rho_{k,N-1}`` — the first and last — are precisely the two
-        elements sharing an edge with ``k``.
+    def _patch_topology(self):
+        """The element patches eq. (17)-(19) walks — vertex fans in 2-D, edge fans in 3-D.
+
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403. The formula's indices
+        ``rho_{k,1} ... rho_{k,N-1}`` are a walk around a patch, with ``rho_{k,1}`` and
+        ``rho_{k,N-1}`` the two elements sharing a facet with ``k``, so the patch has to come back
+        as an ORDER, not a set.
 
         Returns a dict of numpy arrays, all host-side and computed once:
-            ``others``   ``(n_cells, 3, Nmax-1)`` int — the ordered other-element ids, ``-1`` padded.
-            ``size``     ``(n_cells, 3)`` int — ``N^I``, the patch's element count.
-            ``boundary`` ``(n_cells, 3)`` bool — whether that vertex lies on the domain boundary.
+            ``others``   ``(n_cells, P, Nmax-1)`` int — the ordered other-element ids, ``-1`` padded.
+            ``size``     ``(n_cells, P)`` int — ``N``, the patch's element count, including ``k``.
+            ``boundary`` ``(n_cells, P)`` bool — whether that patch is open (touches the boundary).
+
+        ``P`` is the number of patches an element belongs to: **3 vertices** of a triangle, **4** of
+        a quadrilateral, or the **6 edges** of a tetrahedron.
+
+        **Quadrilaterals use vertex patches, like triangles, and are the sharpest case measured.**
+        Nothing in the walk is simplex-specific — the fan is ordered by the angle of each incident
+        cell's centroid about the shared vertex, which reads a quad exactly as it reads a triangle.
+        What changes is the patch SIZE, and eq. (18) is a geometric mean over ``N - 2`` factors, so
+        size is what governs its contrast: a structured quad mesh has valence 4 against a
+        triangulation's ~6, and ``tests/test_patch_filter_scaling.py`` measures a hinge scoring
+        **0.001** of solid at ``N = 4`` against 0.04 at ``N = 6``. A deforming structured grid also
+        holds that valence fixed wherever its nodes go, so unlike an unstructured mesh the criterion
+        behaves identically at every vertex.
+
+        **Why edges and not vertices in 3-D.** Around an interior edge, a tet's four faces contain
+        both endpoints in exactly two cases, so the fan's dual graph is 2-regular — a cycle — and
+        eq. (18) transfers verbatim with ``N^I -> N^edge``. Around an interior *vertex* the dual is
+        3-regular and there is no total order to walk at all, and the patch is far larger:
+        ``4T/V ~ 27`` against ``6T/E ~ 5.2`` for the edge fan on a Delaunay tetrahedral mesh. That
+        size is the real obstacle rather than the ordering — eq. (18) is a geometric mean, so its
+        contrast collapses as the patch grows, measured in ``tests/test_patch_filter_scaling.py``
+        as a hinge scoring 0.04 of solid at ``N=6`` but 0.85 at ``N=27``. The edge fan lands at
+        ``N ~ 5``, where the criterion is at its sharpest.
 
         The **ordering is taken once, from the current mesh**. Connectivity is fixed under
         ``.trainable()`` coordinates (relocation, not remeshing), so the patches themselves never
-        change; only a distortion large enough to reorder the angular fan would invalidate the walk,
-        which the geometric constraints of eq. (24)-(28) exist to prevent.
+        change; only a distortion large enough to reorder the fan would invalidate the walk, which
+        the geometric constraints of eq. (24)-(28) exist to prevent.
         """
-        cells = self._cells_p1()
-        pts = np.asarray(self.mesh.points)[:, : int(self.dimension)]
-        if int(self.dimension) != 2 or cells.shape[1] != 3:
+        cells, kind = self._cells_topo()
+        dim = int(self.dimension)
+        if kind == "tetra":
+            return self._edge_fan_topology(cells)
+        if dim != 2 or kind not in ("triangle", "quad"):
             raise NotImplementedError(
-                f"domain.patch_topology(): triangles in 2-D only; got {cells.shape[1]}-node cells "
-                f"in {self.dimension}-D. The patch formulation is 2-D (paper, Sec. 2.3.2)."
+                f"domain._patch_topology(): triangles or quadrilaterals in 2-D, tetrahedra in 3-D; got {kind!r} in {dim}-D."
             )
-        n_cells = cells.shape[0]
+        pts = np.asarray(self.mesh.points)[:, :dim]
+        n_cells, n_vert = cells.shape
         centroids = pts[cells].mean(axis=1)
 
         incident: List[List[int]] = [[] for _ in range(pts.shape[0])]
-        for k, tri in enumerate(cells):
-            for n in tri:
+        for k, cell in enumerate(cells):
+            for n in cell:
                 incident[int(n)].append(k)
 
         # A vertex is on the domain boundary iff one of its incident edges is used by one cell only.
+        # The cell's edges are its consecutive corner pairs, which is the same statement for a
+        # triangle and a quadrilateral -- both list their corners in cyclic order.
+        local_edges = tuple((i, (i + 1) % n_vert) for i in range(n_vert))
         edge_count: dict = {}
-        for tri in cells:
-            for a, b in ((0, 1), (1, 2), (2, 0)):
-                e = (int(min(tri[a], tri[b])), int(max(tri[a], tri[b])))
+        for cell in cells:
+            for a, b in local_edges:
+                e = (int(min(cell[a], cell[b])), int(max(cell[a], cell[b])))
                 edge_count[e] = edge_count.get(e, 0) + 1
         on_boundary = np.zeros(pts.shape[0], dtype=bool)
         for (a, b), c in edge_count.items():
@@ -4204,9 +4481,9 @@ class domain(MeshIOMixin):
             ccw[n] = [ks[i] for i in np.argsort(ang)]
 
         n_max = max((len(v) for v in ccw.values()), default=1)
-        others = np.full((n_cells, 3, max(n_max - 1, 1)), -1, dtype=np.int64)
-        size = np.zeros((n_cells, 3), dtype=np.int64)
-        boundary = np.zeros((n_cells, 3), dtype=bool)
+        others = np.full((n_cells, n_vert, max(n_max - 1, 1)), -1, dtype=np.int64)
+        size = np.zeros((n_cells, n_vert), dtype=np.int64)
+        boundary = np.zeros((n_cells, n_vert), dtype=bool)
         for k, tri in enumerate(cells):
             for v, n in enumerate(tri):
                 ring = ccw[int(n)]
@@ -4215,6 +4492,78 @@ class domain(MeshIOMixin):
                 others[k, v, : len(rest)] = rest
                 size[k, v] = len(ring)
                 boundary[k, v] = bool(on_boundary[int(n)])
+        return {"others": others, "size": size, "boundary": boundary}
+
+    def _edge_fan_topology(self, cells):
+        """The 3-D half of :meth:`_patch_topology`: the tetrahedra around each edge, in fan order.
+
+        For a tet ``(a,b,c,d)`` containing edge ``(a,b)``, only faces ``(a,b,c)`` and ``(a,b,d)``
+        contain both endpoints, so each tet in the fan has exactly two neighbours and the fan is a
+        **cycle** — the property that makes eq. (18)'s walk well defined without any angular sort.
+        Two tets are adjacent in it when they share a face through the edge, which is exactly when
+        their *far* vertices (the two that are not ``a`` or ``b``) overlap. That is the whole
+        traversal: no geometry is read, only connectivity, which is why the fan is valid for any
+        node positions the optimiser reaches.
+
+        A **boundary** edge is an open chain rather than a cycle — its end tets have one neighbour —
+        and is flagged so :meth:`patch_filter` applies the Fig. 2c-d boundary rule.
+        """
+        n_cells = cells.shape[0]
+        edges: dict = {}
+        for k in range(n_cells):
+            t = cells[k]
+            for slot, (i, j) in enumerate(self._TET_EDGES):
+                a, b = int(t[i]), int(t[j])
+                edges.setdefault((min(a, b), max(a, b)), []).append((k, slot))
+
+        rings: dict = {}
+        n_max = 1
+        for (a, b), members in edges.items():
+            ks = [k for k, _ in members]
+            # The two vertices of each tet that are NOT on the edge; sharing one means sharing the
+            # face through the edge, i.e. being neighbours in the fan.
+            far = [tuple(int(v) for v in cells[k] if int(v) not in (a, b)) for k in ks]
+            by_vertex: dict = {}
+            for idx, pair in enumerate(far):
+                for v in pair:
+                    by_vertex.setdefault(v, []).append(idx)
+            adj: List[List[int]] = [[] for _ in ks]
+            for lst in by_vertex.values():
+                if len(lst) == 2:  # an interior face: exactly two tets meet across it
+                    adj[lst[0]].append(lst[1])
+                    adj[lst[1]].append(lst[0])
+            closed = all(len(nb) == 2 for nb in adj)
+            if closed and len(ks) > 2:
+                # 2-regularity is the structural claim this rests on; a violation means a
+                # non-manifold mesh or a mis-extracted patch, and would silently give eq. (18) a
+                # walk that revisits an element.
+                assert sum(len(nb) for nb in adj) == 2 * len(ks), f"edge ({a},{b}) fan is not a cycle"
+            start = 0 if closed else next(i for i in range(len(ks)) if len(adj[i]) < 2)
+            order, seen, cur = [start], {start}, start
+            while len(order) < len(ks):
+                nxt = next((j for j in adj[cur] if j not in seen), None)
+                if nxt is None:  # a fan split by a non-manifold edge; keep what was reachable
+                    break
+                order.append(nxt)
+                seen.add(nxt)
+                cur = nxt
+            rings[(a, b)] = ([ks[i] for i in order], closed)
+            n_max = max(n_max, len(order))
+
+        n_slots = len(self._TET_EDGES)
+        others = np.full((n_cells, n_slots, max(n_max - 1, 1)), -1, dtype=np.int64)
+        size = np.zeros((n_cells, n_slots), dtype=np.int64)
+        boundary = np.zeros((n_cells, n_slots), dtype=bool)
+        for (a, b), members in edges.items():
+            ring, closed = rings[(a, b)]
+            for k, slot in members:
+                if k not in ring:  # dropped by a broken traversal above
+                    continue
+                q = ring.index(k)
+                rest = ring[q + 1 :] + ring[:q]  # fan order, starting adjacent to k
+                others[k, slot, : len(rest)] = rest
+                size[k, slot] = len(ring)
+                boundary[k, slot] = not closed
         return {"others": others, "size": size, "boundary": boundary}
 
     def variable(

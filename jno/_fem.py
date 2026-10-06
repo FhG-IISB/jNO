@@ -3685,7 +3685,7 @@ class FEM:
         quadrature error nothing would report."""
         return jnp.asarray(self._functional_fn(terms, bares)(jnp.asarray(u).reshape(-1), 0.0, args)).reshape(())
 
-    def _integral_node(self, expr):
+    def _integral_node(self, expr, solver=None):
         """``expr.integrate(fem)`` — the traced form of the scalar :meth:`eval` returns eagerly.
 
         This is the objective/constraint entry point: the returned node is a scalar, so it drops straight
@@ -3722,23 +3722,39 @@ class FEM:
         fn = self._functional_fn([expr], [bare])  # host side: classify the measure, retag, build once
         names = list(declared)
         params = [declared[n] for n in names]
-        sol = self._functional_solution()
+        sol = self._functional_solution(solver)
 
         def _run(u, *vals):
             return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
 
         return FunctionCall(_run, [sol, *params], name="fem_integral")
 
-    def _functional_solution(self):
+    def _functional_solution(self, solver=None):
         """The one solve every functional over this system shares.
 
         Memoised on purpose: ``solve()`` builds a NEW node on each call and CSE keys unrecognised nodes by
         identity, so an objective and three constraints written as four integrals would otherwise solve
-        the same system four times per step."""
+        the same system four times per step.
+
+        ``solver`` is the slot spec from ``expr.integrate(fem, solver=...)``. Because the solve is
+        SHARED, the choice belongs to the system rather than to any one integral -- so the first
+        functional fixes it and a later, different one is refused rather than silently ignored, which
+        is what would otherwise happen to a constraint that asked for a backend the objective had
+        already settled.
+        """
         sol = getattr(self, "_functional_sol", None)
-        if sol is None:
-            sol = self.solve()
-            self._functional_sol = sol
+        if sol is not None:
+            prev = getattr(self, "_functional_solver", None)
+            if solver is not None and prev is not solver:
+                raise ValueError(
+                    "expr.integrate(fem, solver=...): every functional over one `fem` shares a single "
+                    f"solve, and this one is already {'set to another spec' if prev is not None else 'using the default solver'}"
+                    ". Pass the same solver to the first integral over this system (or to none of "
+                    "them), rather than per-integral."
+                )
+            return sol
+        self._functional_solver = solver
+        self._functional_sol = sol = self.solve() if solver is None else self.solve(solver)
         return sol
 
     def _functional_fn(self, terms, bares):
@@ -5795,6 +5811,99 @@ class Coupling:
         return f"Coupling({self.name!r})"
 
 
+def _check_movable_bc_nodes(domain: Any, dirichlet_raw: Any, boundary_terms: Any) -> None:
+    """Warn when a boundary condition is anchored to nodes the optimiser is allowed to MOVE.
+
+    A region named by a spatial predicate is resolved to node IDS once, here, and those ids carry
+    the condition for the rest of the run. That is the right thing on a static mesh. Combine it with
+    ``Variable.trainable()`` on the coordinates and it becomes a trap: the nodes drift, the ids stay
+    bound, and the condition silently stops describing the geometry its predicate names. Nothing
+    fails -- the solve is well posed at every step -- so the only way to notice is to re-solve the
+    saved mesh independently and find a different answer.
+
+    Measured on a 3-D bracket whose relocation predicate accidentally promoted 175 boundary nodes:
+    the bolt clamp went from 146 nodes to 106 still on the hole wall, and the reported compliance
+    was 4.6412 against 5.2876 from an independent solve of the same mesh and density -- a 13.9 %
+    error that grew with every iteration and was invisible from inside the run.
+
+    Only BOUNDARY nodes are reported. A Dirichlet or Neumann condition lives on boundary facets, so
+    a movable interior node satisfying the predicate carries nothing and is not a conflict; counting
+    it produces phantom warnings (measured: 6-8 per snapshot on a mesh whose supports were provably
+    invariant).
+
+    Set ``domain._allow_moving_bc = True`` to silence it -- shape optimisation that deliberately
+    drives a loaded or supported surface is legitimate, and should say so explicitly.
+    """
+    specs = getattr(domain, "_trainable_coords", None)
+    if not specs or getattr(domain, "_allow_moving_bc", False):
+        return
+    movable: set = set()
+    for sp in specs:
+        movable.update(int(i) for i in np.asarray(sp["ids"]).reshape(-1))
+    if not movable:
+        return
+    preds = getattr(domain, "_tag_predicates", {}) or {}
+    regions = {r for (_fk, r, *_rest) in (dirichlet_raw or [])}
+    regions |= set(boundary_terms or {})
+    regions = sorted(r for r in regions if preds.get(r) is not None)
+    if not regions:
+        return
+
+    try:
+        cells = np.asarray(domain._cells_p1())
+        pts = np.asarray(domain.mesh.points)
+    except Exception:  # no P1 view / no mesh -- nothing to check against
+        return
+    dim = int(getattr(domain, "dimension", 0) or 0)
+    nv = cells.shape[1] if cells.ndim == 2 else 0
+    if (dim, nv) == (2, 3):
+        combos = ((0, 1), (1, 2), (2, 0))
+    elif (dim, nv) == (3, 4):
+        combos = ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3))
+    else:
+        return  # only simplices: a facet of a quad/hex is not a column subset, do not guess
+    facets = np.sort(np.stack([cells[:, list(c)] for c in combos], axis=1), axis=-1)
+    facets = facets.reshape(-1, len(combos[0]))
+    _uniq, _cnt = np.unique(facets, axis=0, return_counts=True)
+    bnodes = np.unique(_uniq[_cnt == 1])
+    if bnodes.size == 0:
+        return
+    coords = pts[bnodes]
+    hits = {}
+    for r in regions:
+        cols = [coords[:, i] for i in range(min(dim, coords.shape[1]))]
+        try:
+            mask = np.asarray(preds[r](*cols), dtype=bool).reshape(-1)
+        except TypeError:
+            mask = np.asarray(preds[r](*cols[:2]), dtype=bool).reshape(-1)
+        except Exception:
+            continue  # a predicate this resolver cannot evaluate is not evidence of a conflict
+        if mask.shape[0] != bnodes.shape[0]:
+            continue
+        overlap = movable.intersection(int(i) for i in bnodes[mask])
+        if overlap:
+            hits[r] = (len(overlap), int(mask.sum()))
+    if not hits:
+        return
+    detail = ", ".join(f"{r!r}: {n} of {tot} nodes" for r, (n, tot) in hits.items())
+    msg = (
+        f"jno.fem: a boundary condition is anchored to nodes that Variable.trainable() lets the "
+        f"optimiser MOVE ({detail}). The region is resolved to node ids once, now, so those ids keep "
+        f"the condition even after they drift away from the geometry the predicate describes -- and "
+        f"nothing will fail: the reported objective simply stops being the objective of the mesh you "
+        f"save. Exclude the BC-carrying surface from the trainable region (leave a margin, so no free "
+        f"node can drift INTO it either), or set domain._allow_moving_bc = True if moving it is the "
+        f"point."
+    )
+    log = getattr(domain, "log", None)
+    if log is not None and hasattr(log, "warning"):
+        log.warning(msg)
+    else:  # pragma: no cover - domains always carry a logger in practice
+        import warnings
+
+        warnings.warn(msg, stacklevel=2)
+
+
 def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) -> "FEM":
     """Fold nonlocal :class:`Coupling` terms into ``fem_obj``'s residual: ``R(u) = R_local(u) + sum_k c_k(u)``,
     zeroed on the Dirichlet-pinned DOFs. A *linear* local form is promoted to a nonlinear residual operator
@@ -6738,6 +6847,8 @@ def _fem_impl(
     # the condition visible in `fem.classification`, which is how a user confirms it was recognised at
     # all (the failure this whole feature exists to prevent was a condition that showed up nowhere).
     classification.extend(f"slip@{spec[1]}" for spec in slip_bcs)
+
+    _check_movable_bc_nodes(domain, dirichlet_raw, boundary_terms)
 
     if is_vpinn and multifield:
         # Single-field is a real boundary, not a guard: the network-trial lowering wraps ONE primary

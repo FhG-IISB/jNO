@@ -584,7 +584,9 @@ class TestInequalityConstraints:
         a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
         for sense, expect_negative in (("ge", True), ("le", False)):
-            node = (jno.ge if sense == "ge" else jno.le)(x.mean, 0.2)
+            # A small design-dependent term keeps the row's gradient non-zero: MMA refuses a
+            # violated row that no step can change, which is not what this test is about.
+            node = (jno.ge if sense == "ge" else jno.le)(x.mean + 1e-3 * (a * x).mean, 0.2)
             crux = jno.core([(a * x).mse, node], domain=d)
             g = float(jnp.asarray(crux.solve(1).training_logs[-1]["losses"])[0][1])
             assert (g < 0) is expect_negative, f"{sense}: g = {g}, feasible should be g <= 0"
