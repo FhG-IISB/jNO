@@ -129,3 +129,17 @@ def test_subwavelength_slab_still_matches_airy():
     n_eff = float(np.sqrt(np.real(np.mean(np.asarray(rc.spec.layers[1][1])))))
     d_eff = float(rc.spec.layers[1][0])
     assert float(rc.solve().efficiency("T")) == pytest.approx(_airy_T(n_eff, d_eff), abs=2e-3)
+
+
+@needs_fmmax
+def test_the_slab_is_as_thick_as_it_is_written():
+    """A layer is as thick as the permittivity says, not as the z-sampling happens to cover it.
+
+    The thickness used to be the span of the samples inside the slab: 0.952 for this 1.0 slab (64
+    samples over the 3.0 cell), with the reflectance following the wrong thickness. The Airy checks above
+    compare at the INFERRED thickness, so they could not see it; this one compares at the written one.
+    """
+    rc = _slab_sol(period=0.5, orders=20, grid=24)
+    assert float(rc.spec.layers[1][0]) == pytest.approx(Z1 - Z0, abs=1e-9)
+    T = float(rc.solve().efficiency("T"))
+    assert T == pytest.approx(_airy_T(float(np.sqrt(EPS)), Z1 - Z0), abs=1e-8)

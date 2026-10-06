@@ -106,7 +106,7 @@ class RcwaError(ValueError):
 # =====================================================================================
 # Layer auto-detection: group z-invariant slabs of a sampled permittivity into RCWA layers.
 # =====================================================================================
-def detect_layers(E, z, tol=1e-3, slices=None):
+def detect_layers(E, z, tol=1e-3, slices=None, locate=None):
     """Group a z-sampled permittivity into RCWA layers.
 
     Parameters
@@ -119,6 +119,16 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         In-plane change below which two adjacent z-slices are the same material.
     slices:
         If given, staircase a continuously-varying ``eps`` into this many layers instead of raising.
+    locate:
+        ``locate(z_lo, z_hi) -> z`` places the interface between two neighbouring layers, given heights
+        inside each (their middle samples). Without it the interface is put halfway between the last
+        sample of one layer and the first of the next, so a thickness is only known to one sample spacing.
+        The front door passes a bisection on the permittivity itself, which finds a sharp interface
+        exactly and a mesh field's interface where its interpolant crosses halfway between the layers.
+
+    A layer's thickness is the distance between the interfaces that bound it -- not between its first
+    and last samples, which is short by up to one spacing (a 0.2 slab sampled every 1/63 came out
+    11/63 = 0.175 thick, and its reflectance 0.34 against Airy's 0.62).
 
     Returns
     -------
@@ -148,6 +158,15 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         idx = np.linspace(0, Nz - 1, slices + 1).round().astype(int)
         slabs = [(idx[i], idx[i + 1]) for i in range(len(idx) - 1)]
 
+    # interface heights: slab i spans [iface[i], iface[i + 1]]; the outer two are the cell's ends
+    iface = [float(z[0])]
+    for (a0, b0), (a, b) in zip(slabs[:-1], slabs[1:]):
+        if locate is not None:
+            iface.append(float(locate(float(z[(a0 + b0) // 2]), float(z[(a + b) // 2]))))
+        else:
+            iface.append(0.5 * float(z[a - 1] + z[a]))
+    iface.append(float(z[-1]))
+
     layers, report, zmids, zspans = [], [], [], []
     for i, (a, b) in enumerate(slabs):
         mid = (a + b) // 2
@@ -156,14 +175,14 @@ def detect_layers(E, z, tol=1e-3, slices=None):
             raise RcwaError(
                 f"slab z=[{z[a]:.3f},{z[min(b, Nz - 1)]:.3f}] is not z-invariant (var={var:.2g}); pass slices=."
             )
-        thick = np.inf if (i == 0 or i == len(slabs) - 1) else float(z[b - 1] - z[a])
+        thick = np.inf if (i == 0 or i == len(slabs) - 1) else iface[i + 1] - iface[i]
         eps_xy = E[mid]
         kind = "uniform" if np.ptp(eps_xy) < tol else "patterned"
         layers.append((thick, eps_xy))
         zmids.append(float(z[mid]))
-        zspans.append((float(z[a]), float(z[min(b - 1, Nz - 1)])))  # (z_lo, z_hi) -> place an internal source
+        zspans.append((iface[i], iface[i + 1]))  # (z_lo, z_hi) -> place an internal source
         report.append(
-            f"  layer {i}: z=[{z[a]:.3f},{z[min(b - 1, Nz - 1)]:.3f}] {kind} eps~[{eps_xy.min():.2f},{eps_xy.max():.2f}]"
+            f"  layer {i}: z=[{iface[i]:.4f},{iface[i + 1]:.4f}] {kind} eps~[{eps_xy.min():.2f},{eps_xy.max():.2f}]"
         )
     detect_layers.last_report = "detected layers:\n" + "\n".join(report)
     detect_layers.last_zmid = zmids  # representative z of each layer -- lets a param sweep re-sample eps
@@ -174,11 +193,45 @@ def detect_layers(E, z, tol=1e-3, slices=None):
 # =====================================================================================
 # The forward engine (explicit layers) — the fmmax backend the front door constructs.
 # =====================================================================================
+def _as_jones(pol):
+    """A transverse Jones vector ``(p_x, p_y)`` of unit norm from ``"x"``, ``"y"`` or a 2-sequence (complex
+    entries give elliptical polarization). Raises on anything else, and on a zero vector."""
+    if isinstance(pol, str):
+        if pol == "x":
+            return (1.0 + 0j, 0j)
+        if pol == "y":
+            return (0j, 1.0 + 0j)
+        raise RcwaError(f"polarization must be 'x', 'y' or a Jones vector (px, py), got {pol!r}")
+    try:
+        px, py = (complex(c) for c in pol)
+    except (TypeError, ValueError):
+        raise RcwaError(f"polarization must be 'x', 'y' or a Jones vector (px, py), got {pol!r}") from None
+    n = float(np.sqrt(abs(px) ** 2 + abs(py) ** 2))
+    if n == 0.0:
+        raise RcwaError("polarization Jones vector is zero; give (px, py) with |px|^2 + |py|^2 > 0.")
+    return (px / n, py / n)
+
+
+def _incident(fm, ex, layer0, nt, pol):
+    """Forward 0th-order incident amplitude for the transverse Jones vector ``pol``, built as a UNIFORM
+    real-space plane wave and decomposed at k_in (x-pol E=x̂, H=ŷ; y-pol E=ŷ, H=-x̂). Each basis field is a
+    pure polarization: at oblique incidence (E_y, H_x) decomposes into s-waves only and (E_x, H_y) into
+    p-waves only, so their combination is exactly the requested polarization. jax-native (traces)."""
+    px, py = pol
+    gs = fm.min_array_shape_for_expansion(ex)
+    _u = jnp.ones((*gs, 1), complex)
+    _z = jnp.zeros((*gs, 1), complex)
+    fx = fm.amplitudes_for_fields(_u, _z, _z, _u, layer0)[0]
+    fy = fm.amplitudes_for_fields(_z, _u, -_u, _z, layer0)[0]
+    return jnp.reshape(px * fx + py * fy, (2 * nt, 1))
+
+
 class _Sol:
-    def __init__(self, fm, s, layers, expansion, nt, Pin, wavelength, thick=None, period=None):
+    def __init__(self, fm, s, layers, expansion, nt, Pin, wavelength, thick=None, period=None, pol=(1.0, 0.0)):
         self._fm, self._s, self._layers, self._ex = fm, s, layers, expansion
         self._nt, self._Pin, self._wl = nt, Pin, wavelength
         self._thick, self._period = thick, period
+        self._pol = pol  # the incident Jones vector every readout refers to
         self._fwd = np.zeros((2 * nt, 1), complex)
 
     def _flux(self, amps, layer, backward=False):
@@ -220,15 +273,7 @@ class _Sol:
         UNIFORM real-space plane wave (x-pol E=x̂,H=ŷ; y-pol E=ŷ,H=-x̂, both forward) and decomposed at k_in.
         Working in the field basis (not the eigenvalue-sorted eigenmode basis) avoids an argmax(flux) pick
         grabbing the wrong oblique mode for an asymmetric structure. jax-native (traces under grad/jit)."""
-        fm = self._fm
-        gs = fm.min_array_shape_for_expansion(self._ex)
-        _u = jnp.ones((*gs, 1), complex)
-        _z = jnp.zeros((*gs, 1), complex)
-        if pol == "x":
-            return jnp.reshape(fm.amplitudes_for_fields(_u, _z, _z, _u, self._layers[0])[0], (2 * self._nt, 1))
-        if pol == "y":
-            return jnp.reshape(fm.amplitudes_for_fields(_z, _u, -_u, _z, self._layers[0])[0], (2 * self._nt, 1))
-        raise RcwaError(f"polarization must be 'x' or 'y', got {pol!r}")
+        return _incident(self._fm, self._ex, self._layers[0], self._nt, _as_jones(pol))
 
     def jones(self, kind="T"):
         """The 2×2 complex **Jones matrix** at the 0th diffraction order — how the structure maps incident
@@ -338,7 +383,8 @@ class _Sol:
         kind:
             ``"T"`` (transmissive DUV mask, default) or ``"R"`` (reflective EUV mask).
         polarization:
-            ``None`` (default) → **scalar** imaging (uses ``E_x``), correct at low NA. A string turns on the
+            ``None`` (default) → **scalar** imaging of the field component along the incident polarization
+            (``E_x`` for an x-polarized solve), correct at low NA. A string turns on the
             **vector high-NA** model, which rotates each order's transverse ``(E_x, E_y)`` to the 3-D wafer
             field through the Richards-Wolf/Flagello vector pupil (so the TM component loses contrast at large
             angles): ``"x"`` / ``"y"`` → linearly polarized illumination; ``"unpolarized"`` → the two averaged.
@@ -372,8 +418,10 @@ class _Sol:
             pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(Apad)
             return jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)
 
-        if polarization is None:  # scalar imaging (E_x only)
-            A = _grid(self._spectrum(kind)[0])
+        if polarization is None:  # scalar imaging: the co-polarized component of the incident Jones vector
+            ex_, ey_ = self._spectrum(kind)
+            px, py = self._pol
+            A = _grid(np.conj(px) * ex_ + np.conj(py) * ey_)
 
             def one(s):  # image from a single source point s (a shift of the order frequencies)
                 r2 = (AX + s[0]) ** 2 + (AY + s[1]) ** 2
@@ -441,7 +489,8 @@ class _Sol:
         plane wave at direction cosine ``(α, β)``) is refracted into the film (``k_z = k0·√(n_r² − α² − β²)``,
         complex ⇒ absorption) and interferes with its substrate reflection ``r_s``, producing the vertical
         standing wave. Reuses the aerial Abbe sum with a per-order depth factor; returns ``(grid, grid, nz)``.
-        Scalar (``E_x``); single-substrate-reflection model (the dominant standing wave).
+        Scalar (the field component along the incident polarization, ``E_x`` for an x-polarized solve);
+        single-substrate-reflection model (the dominant standing wave).
 
         ``source_chunk`` bounds the peak memory: the Abbe sum over source points is accumulated
         ``source_chunk`` points at a time instead of materialising the whole stack (see below).
@@ -452,7 +501,13 @@ class _Sol:
         bc = np.asarray(self._ex.basis_coefficients)
         M = int(np.abs(bc).max())
         grid = max(int(grid), 2 * M + 2)
-        A = jnp.zeros((2 * M + 1, 2 * M + 1), complex).at[bc[:, 0] + M, bc[:, 1] + M].set(self._spectrum(kind)[0])
+        ex_, ey_ = self._spectrum(kind)
+        px, py = self._pol  # the co-polarized component, as in the scalar aerial image
+        A = (
+            jnp.zeros((2 * M + 1, 2 * M + 1), complex)
+            .at[bc[:, 0] + M, bc[:, 1] + M]
+            .set(np.conj(px) * ex_ + np.conj(py) * ey_)
+        )
         ms = jnp.asarray(np.arange(-M, M + 1))
         AX, AY = jnp.meshgrid(ms * wl / Px, ms * wl / Py, indexing="ij")
         S, W = _source_grid(source, float(NA))
@@ -598,8 +653,10 @@ class Rcwa:
         k_in=(0.0, 0.0),
         formulation="JONES_DIRECT_FOURIER",
         assume_periodic=False,
+        polarization="x",
     ):
         fm = _fmmax()
+        self.polarization = _as_jones(polarization)
         if period is None or len(period) != 2 or period[0] <= 0 or period[1] <= 0:
             raise RcwaError(f"period must be (Px,Py) > 0, got {period!r}.")
         if not assume_periodic:
@@ -636,12 +693,11 @@ class Rcwa:
         self._ex = fm.generate_expansion(self._lv, approximate_num_terms=orders)
         self._nt = self._ex.num_terms
 
-    def _eigensolve_stack(self, layers_spec, wl, kin):
-        """Eigensolve every layer (isotropic / anisotropic-ε / general ε&μ, by tuple length) and return the
-        ``LayerSolveResult`` list plus the thickness list. Shared by the plane-wave and internal-source paths."""
-        fm, lv, ex = self.fm, self._lv, self._ex
+    def _prepare_stack(self, layers_spec, kin):
+        """Each layer's permittivity as the eigensolve takes it, and the thickness list. EAGER on purpose:
+        collapsing a uniform layer reads its values, which a trace cannot do -- so this runs before the
+        compiled solve (:meth:`_solve_core`) and hands it the result as arguments."""
         kin = jnp.asarray(kin)
-        wl = jnp.asarray(wl).astype(kin.dtype)  # wl at the incidence real precision
         cdt = jnp.result_type(kin.dtype, jnp.complex64)  # one complex dtype for the eigensolve (robust to a
 
         def _grid(g):  # float32 design parameter, e.g. when trained through jno.core, vs float64 wavevectors)
@@ -675,44 +731,65 @@ class Rcwa:
             vals = [_uniform_value(g) for g in gs]
             if any(v is None for v in vals):
                 return gs
-            return [jnp.full((1, 1), v) for v in vals]
+            return [jnp.full((1, 1), v, dtype=cdt) for v in vals]
+
+        def prepare(e):
+            if isinstance(e, tuple) and len(e) in (5, 10):
+                return tuple(_collapse([_grid(c) for c in e]))
+            return _collapse([_grid(e)])[0]
+
+        grids = [prepare(e) for _, e in layers_spec]
+        thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
+        return grids, thick
+
+    def _eigensolve_grids(self, grids, wl, kin):
+        """Eigensolve every prepared layer (isotropic / anisotropic-ε / general ε&μ, by tuple length).
+        Pure in its arguments, so it compiles (:meth:`_solve_core`)."""
+        fm, lv, ex = self.fm, self._lv, self._ex
+        kin = jnp.asarray(kin)
+        wl = jnp.asarray(wl).astype(kin.dtype)  # wl at the incidence real precision
 
         def solve_layer(e):
             # general anisotropic layer: e = (ε_xx..ε_zz, μ_xx..μ_zz) -> ε AND μ tensors. Used for a uniaxial
             # PML (an in-plane coordinate stretch is a diagonal ε̂ and μ̂), and for magnetic / magneto-optic media.
             if isinstance(e, tuple) and len(e) == 10:
-                exx, exy, eyx, eyy, ezz, uxx, uxy, uyx, uyy, uzz = _collapse([_grid(c) for c in e])
-                return fm.eigensolve_general_anisotropic_media(
-                    jnp.asarray(wl),
-                    kin,
-                    lv,
-                    exx,
-                    exy,
-                    eyx,
-                    eyy,
-                    ezz,
-                    uxx,
-                    uxy,
-                    uyx,
-                    uyy,
-                    uzz,
-                    ex,
-                    formulation=self.formulation,
-                )
+                return fm.eigensolve_general_anisotropic_media(wl, kin, lv, *e, ex, formulation=self.formulation)
             # anisotropic layer: e = (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) grids -> fmmax's anisotropic eigensolve
             if isinstance(e, tuple) and len(e) == 5:
-                exx, exy, eyx, eyy, ezz = _collapse([_grid(c) for c in e])
-                return fm.eigensolve_anisotropic_media(
-                    jnp.asarray(wl), kin, lv, exx, exy, eyx, eyy, ezz, ex, formulation=self.formulation
-                )
-            (eps_g,) = _collapse([_grid(e)])
-            return fm.eigensolve_isotropic_media(jnp.asarray(wl), kin, lv, eps_g, ex, formulation=self.formulation)
+                return fm.eigensolve_anisotropic_media(wl, kin, lv, *e, ex, formulation=self.formulation)
+            return fm.eigensolve_isotropic_media(wl, kin, lv, e, ex, formulation=self.formulation)
 
-        layers = [solve_layer(e) for _, e in layers_spec]
-        thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
-        return layers, thick
+        return [solve_layer(e) for e in grids]
 
-    def solve(self, inc=None, wavelength=None, k_in=None, layers=None, source=None):
+    def _eigensolve_stack(self, layers_spec, wl, kin):
+        """Eigensolve every layer and return the ``LayerSolveResult`` list plus the thickness list. Used by
+        the internal-source path; the plane-wave path compiles the same steps (:meth:`_solve_core`)."""
+        grids, thick = self._prepare_stack(layers_spec, kin)
+        return self._eigensolve_grids(grids, wl, kin), thick
+
+    def _solve_core(self, grids, thick, wl, kin, pol):
+        """Eigensolves, S-matrix, incident amplitude and incident flux -- the numerical core of a plane-wave
+        solve, COMPILED once per stack structure.
+
+        Run eagerly, fmmax dispatches each primitive on its own: measured ~1,340 dispatches per solve of a
+        25-order crossed grating, a 0.7 s floor on the GPU that no truncation got below, while the dense
+        eigendecomposition it wraps takes milliseconds there. fmmax registers every type it returns as a
+        pytree for exactly this. Structural decisions that read VALUES (collapsing a uniform layer, the
+        guards) stay outside, eager."""
+        fn = self.__dict__.get("_core_jit")
+        if fn is None:
+
+            def core(grids, thick, wl, kin, pol):
+                layers = self._eigensolve_grids(grids, wl, kin)
+                s = self.fm.stack_s_matrix(layers, thick)
+                fwd = _incident(self.fm, self._ex, layers[0], self._nt, pol)
+                flux = self.fm.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0]
+                return layers, s, fwd, jnp.sum(jnp.real(flux))
+
+            fn = self._core_jit = jax.jit(core)
+        return fn(grids, thick, jnp.asarray(wl), jnp.asarray(kin), tuple(jnp.asarray(p) for p in pol))
+
+    def solve(self, inc=None, wavelength=None, k_in=None, layers=None, source=None, polarization=None):
         """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
         not conserved.
 
@@ -734,25 +811,19 @@ class Rcwa:
         nt = self._nt  # precomputed eagerly in __init__ (jit-safe)
         if source is not None:
             return self._solve_source(source, layers_spec, wl, kin)
-        with _annot("rcwa:eigensolve"):
-            layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
-        with _annot("rcwa:s_matrix"):
-            s = fm.stack_s_matrix(layers, thick)
-        # Incidence: the 0th diffraction order (at k_in) -- an x-polarised plane wave whose REAL-SPACE field
-        # is uniform. `argmax(eigenmode flux)` is wrong here: the (0,0) order does NOT carry the max eigenmode
-        # flux (the oblique first-ring orders can tie higher), so argmax would excite an oblique mode and tilt
-        # the incidence -- invisible in symmetric problems but wrong for anything direction-sensitive.
-        # `amplitudes_for_fields` divides out the Bloch phase, so a uniform E_x, H_y = E_x field decomposes to
-        # the forward 0th-order amplitude at k_in (jax-native, so the solve still traces under grad/jit).
-        gs = fm.min_array_shape_for_expansion(self._ex)
-        _u = jnp.ones((*gs, 1), complex)
-        _z = jnp.zeros((*gs, 1), complex)
-        fwd_amp, _bwd = fm.amplitudes_for_fields(_u, _z, _z, _u, layers[0])  # x-pol, H=+y -> forward-going
-        fwd = jnp.reshape(fwd_amp, (2 * nt, 1))
-        Pin = jnp.sum(jnp.real(fm.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0]))
+        # Incidence: the 0th diffraction order (at k_in) -- a plane wave of the requested polarization whose
+        # REAL-SPACE field is uniform. `argmax(eigenmode flux)` is wrong here: the (0,0) order does NOT carry
+        # the max eigenmode flux (the oblique first-ring orders can tie higher), so argmax would excite an
+        # oblique mode and tilt the incidence -- invisible in symmetric problems but wrong for anything
+        # direction-sensitive. `amplitudes_for_fields` divides out the Bloch phase, so a uniform field
+        # decomposes to the forward 0th-order amplitude at k_in (jax-native, so the solve still traces).
+        pol = self.polarization if polarization is None else _as_jones(polarization)
+        grids, thick = self._prepare_stack(layers_spec, kin)
+        with _annot("rcwa:eigensolve+s_matrix"):
+            layers, s, fwd, Pin = self._solve_core(grids, thick, wl, kin, pol)
         if _concrete(Pin) and float(Pin) <= 0:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
-        sol = _Sol(fm, s, layers, self._ex, nt, Pin, wl, thick=thick, period=self.period)
+        sol = _Sol(fm, s, layers, self._ex, nt, Pin, wl, thick=thick, period=self.period, pol=pol)
         sol._fwd = fwd
         T, R = sol.efficiency("T"), sol.efficiency("R")
         if _concrete(T):  # never-silent runtime guards run on the eager forward pass; they step aside under trace
@@ -826,6 +897,8 @@ class RcwaSpec:
     ambient_faces: tuple = ()
     periodic_axes: dict = field(default_factory=dict)
     source: dict = None  # an internal-source (dipole/Gaussian) emission spec, else None (plane-wave incidence)
+    polarization: tuple = (1.0 + 0j, 0j)  # incident transverse Jones vector (px, py), unit norm
+    polarization_from: str = ""  # how it was decided -- given, read from a vector source, or inferred
 
     def __repr__(self):
         return (
@@ -1346,6 +1419,74 @@ def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None, sub=
     return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
 
 
+def _interface_bisection(coeff_node, grid, period, params, sub=1, iters=60):
+    """``locate(z_lo, z_hi)`` for :func:`detect_layers`: bisect the height of the interface between two
+    layers on the analytic permittivity, to ``(z_hi - z_lo) / 2**iters`` -- machine precision.
+
+    Each probe samples the whole cell plane at one height and asks which of the two neighbouring slabs it
+    matches, so a pattern that changes at the interface (a pillar ending) is located as exactly as a
+    uniform film. Exact interfaces matter: RCWA's answer is a Fabry-Perot sum over the layer thicknesses."""
+    g = grid * sub
+
+    def plane(z):
+        vals = np.asarray(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, z), params or {}))
+        if vals.ndim >= 3 and vals.shape[-2:] == (3, 3):
+            vals = vals[..., 0, 0]
+        return _pixel_average(vals.reshape(g, g), grid, sub)
+
+    def locate(lo, hi):
+        below, above = plane(lo), plane(hi)
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            p = plane(mid)
+            if np.max(np.abs(p - below)) <= np.max(np.abs(p - above)):
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    return locate
+
+
+def _interface_bisection_nodal(points, values, grid, period, sub=1, iters=40):
+    """``locate(z_lo, z_hi)`` for a MESH-FIELD permittivity: bisect on its piecewise-linear interpolant
+    (a Delaunay triangulation of the nodes, as the differentiable re-sampling uses), so the interface is
+    where the field crosses halfway between the two layers -- the geometry the mesh actually represents,
+    to within its own resolution. A slab that falls between mesh nodes cannot be located better than that."""
+    from scipy.spatial import Delaunay, cKDTree
+
+    tri, tree = Delaunay(points), cKDTree(points)
+    vals_n = np.asarray(values).reshape(-1)
+    g = grid * sub
+
+    def plane(z):
+        q = _cell_grid_at_z(period, g, z)
+        s = tri.find_simplex(q)
+        out = np.empty(len(q), vals_n.dtype)
+        inside = s >= 0
+        if inside.any():
+            T = tri.transform[s[inside]]
+            b3 = np.einsum("kij,kj->ki", T[:, :3, :], q[inside] - T[:, 3, :])
+            w = np.c_[b3, 1.0 - b3.sum(axis=1)]
+            out[inside] = np.sum(w * vals_n[tri.simplices[s[inside]]], axis=1)
+        if (~inside).any():
+            out[~inside] = vals_n[tree.query(q[~inside])[1]]
+        return _pixel_average(out.reshape(g, g), grid, sub)
+
+    def locate(lo, hi):
+        below, above = plane(lo), plane(hi)
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            p = plane(mid)
+            if np.max(np.abs(p - below)) <= np.max(np.abs(p - above)):
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    return locate
+
+
 def _coeff_is_tensor(coeff_node, period, z_range, params):
     """True if the permittivity coefficient is a 3×3 tensor (anisotropic ε̂) rather than a scalar — decided
     by evaluating it once at a representative cell point and checking the value shape."""
@@ -1598,6 +1739,7 @@ class _RcwaProblem:
             k_in=self.spec.k_in,
             formulation=self.formulation,
             assume_periodic=True,
+            polarization=self.spec.polarization,
         )
 
     def _engine(self):
@@ -1792,6 +1934,67 @@ def _build_emitter_problem(
     return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample, rpe=rpe)
 
 
+def _source_jones(src_coeff, period, z0, params):
+    """The incident transverse Jones vector ``(E_x, E_y)`` of a VECTOR source (``inner(E_inc, n×v)``), or
+    None for a scalar one. Read at the face centre; the plane-wave phase is common to every component."""
+    pt = np.array([[period[0] * 0.5, period[1] * 0.5, z0]])
+    v = np.asarray(_eval_coeff_points(src_coeff, pt, params)).reshape(-1)
+    if v.size < 2:
+        return None
+    if abs(v[0]) ** 2 + abs(v[1]) ** 2 < 1e-24 * max(1.0, float(np.max(np.abs(v)) ** 2)):
+        raise RcwaError(
+            "the vector incident wave has no transverse (x, y) component at the illuminated face, so it "
+            "carries no power into the stack; give E_inc a component in the plane of the face."
+        )
+    return _as_jones((complex(v[0]), complex(v[1])))
+
+
+def _scalar_polarization(layers, k_in):
+    """The polarization a SCALAR Helmholtz list stands for, and why.
+
+    Maxwell reduces EXACTLY to the scalar equation ``Δu + k0²ε u = 0`` for the field component along an
+    in-plane axis ``a`` when every layer is invariant along ``a`` and the incidence has no component along
+    ``a`` (E ∥ a is then TE -- s-polarized): a 1-D grating in the classical mount, or any uniform stack.
+    That is the polarization solved, so ``jno.rcwa`` and ``jno.fem`` answer the same equation. A stack
+    patterned along both axes (or illuminated off its invariant axis) has no such polarization; it is then
+    solved x-polarized, and the returned note says so. Returns ``(jones, note)``."""
+    if any(isinstance(e, tuple) for _, e in layers):
+        return _as_jones("x"), (
+            "x by default: an anisotropic or PML stack reduces to the scalar equation for no polarization; "
+            "pass polarization= to choose, or write the vector (curl-curl) list"
+        )
+    vary_x = vary_y = False
+    for _, e in layers:
+        g = np.asarray(e)
+        if g.ndim != 2:
+            continue
+        tol = 1e-9 * max(1.0, float(np.max(np.abs(g))))
+        vary_x |= bool(np.max(np.abs(g - g[:1, :])) > tol)  # changes along x (axis 0)
+        vary_y |= bool(np.max(np.abs(g - g[:, :1])) > tol)  # changes along y (axis 1)
+    kx, ky = (float(k) for k in k_in)
+    kt = 1e-9 * max(1.0, abs(kx), abs(ky))
+    if not vary_y and abs(ky) <= kt and (vary_x or abs(kx) > kt):
+        return _as_jones(
+            "y"
+        ), "y: every layer is invariant along y and the incidence has no y component, so E_y is the scalar field (TE)"
+    if not vary_x and abs(kx) <= kt:
+        why = (
+            "the stack is uniform"
+            if not vary_y
+            else "every layer is invariant along x and the incidence has no x component"
+        )
+        return _as_jones("x"), f"x: {why}, so E_x is the scalar field (TE)"
+    if not vary_x and not vary_y:  # a uniform stack at any azimuth: s-polarized, E = z x k_in
+        return _as_jones(
+            (-ky, kx)
+        ), "s: the stack is uniform, so the field perpendicular to the plane of incidence is the scalar field"
+    return _as_jones("x"), (
+        "x by default: the stack is patterned along both in-plane axes (or lit off its invariant axis), so "
+        "Maxwell reduces to the scalar equation for no polarization; pass polarization= to choose, or write "
+        "the vector (curl-curl) list"
+    )
+
+
 def rcwa(
     problem,
     *,
@@ -1803,6 +2006,7 @@ def rcwa(
     params=None,
     formulation="JONES_DIRECT_FOURIER",
     smoothing=1,
+    polarization=None,
 ):
     """Infer and build an RCWA problem from a jNO constraint list (or built ``FEM``).
 
@@ -1843,6 +2047,15 @@ def rcwa(
         for **inverse design**: it cuts Fourier (Gibbs) ringing so fewer ``orders`` converge, and makes the
         gradient w.r.t. a boundary-moving design parameter smooth rather than staircased. Costs ``k²``× more
         coefficient evaluations (cheap) — the fmmax eigensolve size is unchanged.
+    polarization:
+        The incident polarization: ``"x"``, ``"y"``, or a transverse Jones vector ``(p_x, p_y)`` (complex
+        entries give elliptical light). Usually inferred, and the choice is logged and kept on
+        ``spec.polarization`` / ``spec.polarization_from``. A **vector** (curl-curl) list carries it in its
+        incident field ``E_inc``. A **scalar** Helmholtz list is solved in the polarization for which Maxwell
+        reduces exactly to the written equation -- E along the axis every layer is invariant along, when the
+        incidence has no component along it (a 1-D grating: E parallel to its lines; TE) -- so ``jno.rcwa``
+        and ``jno.fem`` answer the same equation. A stack patterned along both axes has no such
+        polarization; it is solved x-polarized, and the log says so.
 
     Returns
     -------
@@ -1876,9 +2089,18 @@ def rcwa(
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
             coeff_nodes = coeff_nodes.real.astype(complex)
         C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range, sub=sub)
+        locate = None if slices is not None else _interface_bisection_nodal(pts, coeff_nodes, grid, period, sub)
+        if slices is None:
+            from jno.utils.logger import get_logger
+
+            get_logger().info(
+                "rcwa: the permittivity is a mesh field, so each layer interface is placed where its "
+                "interpolant crosses halfway between the layers -- as sharp as the mesh, no sharper."
+            )
     else:  # analytic permittivity -> sample the grid exactly
         C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams, sub=sub)
-    coeff_layers = detect_layers(C, zs, slices=slices)
+        locate = None if slices is not None else _interface_bisection(coeff_node, grid, period, cparams, sub)
+    coeff_layers = detect_layers(C, zs, slices=slices, locate=locate)
     zmids = list(detect_layers.last_zmid)  # representative z of each layer (both paths) -> re-sampling
     zspans = list(detect_layers.last_zspan)  # (z_lo, z_hi) per layer -> place an internal source in its layer
 
@@ -2025,6 +2247,18 @@ def rcwa(
     if src_coeff is not None:
         _collect_runtime_parameter_exprs(src_coeff, rpe)  # an incidence-angle parameter in the source
 
+    if polarization is not None:
+        pol, pol_from = _as_jones(polarization), "given"
+    else:
+        vpol = _source_jones(src_coeff, period, src_z, cparams) if src_coeff is not None else None
+        if vpol is not None:
+            pol, pol_from = vpol, "read from the vector incident field"
+        else:
+            pol, pol_from = _scalar_polarization(layers, k_in)
+    from jno.utils.logger import get_logger
+
+    get_logger().info(f"rcwa: incident polarization (px, py) = ({pol[0]:.3g}, {pol[1]:.3g}) -- {pol_from}")
+
     spec = RcwaSpec(
         period=period,
         layers=layers,
@@ -2033,5 +2267,7 @@ def rcwa(
         source_face=source_face,
         ambient_faces=(bottom, top),
         periodic_axes=axes,
+        polarization=pol,
+        polarization_from=pol_from,
     )
     return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample, rpe=rpe)

@@ -125,9 +125,11 @@ def test_open_frame_gives_uniform_image():
 
 @needs_fmmax
 def test_partial_coherence_reduces_contrast():
-    """Increasing the partial-coherence factor σ (a larger conventional source) reduces the image contrast —
-    the defining behaviour of partially-coherent imaging."""
-    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
+    """Increasing the partial-coherence factor σ (a larger conventional source) reduces the image contrast of
+    this mask under x-polarized (TM) light. Not a law of imaging: this is a weak phase grating, and under
+    TE light -- what the scalar list alone would now solve -- its contrast rises with σ instead (0.074 ->
+    0.089), because a phase object's in-focus contrast comes from the partially-coherent terms."""
+    sol = jno.rcwa(_cons(_line), orders=60, grid=56, polarization="x").solve()
     c_lo = _contrast(sol.aerial(NA=0.6, source=0.2))
     c_hi = _contrast(sol.aerial(NA=0.6, source=0.9))
     assert c_lo > c_hi > 0.0  # contrast drops with σ, but the grating is still resolved
