@@ -837,6 +837,15 @@ class PEEC:
         # pad must be declared before the conductor, or that rule subtracts it to nothing.
         terms = {}
         for t in sorted(named):
+            if t in regions and t in preds and not getattr(preds[t], "_jno_region", False):
+                # Silently picking one dropped a whole conductor: a pad tagged "DCP" on a trace region
+                # also named "DCP" made the TRACE the terminal, removed it from the network, and then
+                # failed far away with "no network node lies in that terminal".
+                raise ValueError(
+                    f"jno.peec: {t!r} is both a region and a tag of this domain, so the port written on "
+                    f"it is ambiguous -- and read as the region, it would remove that conductor from the "
+                    f"network. Rename the tag, e.g. `d.tag({(t + '_pad')!r}, ...)`."
+                )
             if t in regions:
                 terms[t] = regions[t]
             elif t in preds:
@@ -1011,20 +1020,18 @@ class PEEC:
             # that is ten coplanar traces of equal thickness, which is the case it fits exactly.
             shs = [sh for sh, _ in solids]
             sgs = [sg for _, sg in solids]
-            # NOT passing the build frequency, so no sheet pairs are emitted. `bar_filaments(freq=)`
-            # discretises a conductor thick against the skin depth as a current sheet per face, which
-            # fixes a real defect (a return plane's thickness moving L where it cannot) -- but the
-            # model is WRONG for a conductor carrying the loop current, and by more than the defect
-            # it fixes. On a real power module, crossing the pairing threshold collapses the loop
-            # inductance discontinuously:
+            # A conductor thick against the skin depth carries a current SHEET PER FACE (see
+            # `bar_filaments(freq=)`), so its inductance sees the current where its surface impedance
+            # puts it. Measured on a power module at 1 MHz against Ansys Q3D (20.641 nH), same
+            # geometry and 1 mm pitch: one current per conductor +20.1 %, sheets +3.1 %.
             #
-            #     50 kHz, unpaired   60.5 nH        80 kHz, paired   20.1 nH
-            #
-            # where the physical change over that range is nil. The unpaired arm is the right one:
-            # it agrees with pypeec at 1 kHz (79.0 against 76.8 nH) and trends to its 51.3 nH at
-            # 1 MHz. Inductance cannot be discontinuous in frequency, so the feature stays off the
-            # front door until that is understood; the machinery and its tests are kept.
-            fb = bar_filaments(shs, sigma=sgs, grid_shapes=[s for s, _ in magnetic], edges=self.grid)
+            # The discretisation is fixed for the whole build, so a SWEEP is split at its LOWEST
+            # frequency: a conductor is paired only if it is skin-confined at every point, which
+            # leaves a sweep reaching down to where it is not on the one-current model it had before.
+            # A magnetic core keeps the one-current model too: its coupling is built for one
+            # sub-point offset per family, and a sheet family has its own.
+            _sheet_freq = 0.0 if magnetic else float(np.min(np.atleast_1d(self.freq)))
+            fb = bar_filaments(shs, sigma=sgs, grid_shapes=[s for s, _ in magnetic], edges=self.grid, freq=_sheet_freq)
             blocks.append((tuple(solid_names), fb.lattice["resolve"]))
             parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)

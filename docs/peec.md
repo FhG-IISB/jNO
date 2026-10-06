@@ -620,35 +620,35 @@ Every layer is checked against an oracle that does not go through the layer belo
 | a rectangular bar's partial inductance | Grover's rectangular-bar formula, `L = (μ₀l/2π)[ln(2l/(w+t)) + ½ + 0.2235(w+t)/l]` |
 | a near-neighbour mutual between two cells | a volume Monte-Carlo of the Neumann double integral — wrong in a completely different way from a Gauss rule |
 
-!!! danger "A return plane's thickness moves `L` when it should not — open"
+!!! note "A conductor thick against the skin depth carries a current sheet per face"
     `R` uses a shape-aware **surface impedance**, so it knows the current is confined to a skin layer
-    at the conductor's faces. The **partial inductance does not**: a single current per element has
-    nowhere to sit but the middle of the cell. A return plane's *thickness* therefore changes `L` at
-    a frequency where the copper below the skin layer is electromagnetically invisible.
+    at the conductor's faces. With one current per element the **partial inductance** did not: the
+    current had nowhere to sit but the middle of the cell, so a return plane's *thickness* changed `L`
+    at a frequency where the copper below the skin layer is electromagnetically invisible, and a trace
+    over a plane looked like a wider loop than it is.
 
-    Measured against [pypeec](https://github.com/otvam/pypeec) 5.8.0, which resolves the skin depth
-    with volume cells, taking a ground plane from 0.4 mm to 1.6 mm under a microstrip at 100 kHz:
+    A solid that is one cell thick and thicker than a skin depth is therefore discretised as **two
+    sheets**, one on each face, coupled through the 2-port slab impedance
+    (`slab_transfer_impedance`). The solve finds the split between them. The sheet is drawn on the
+    face, because the internal reactance of the skin layer is already in the surface impedance;
+    near the threshold the two sheets are the conductor's two halves, so `L` stays continuous in
+    frequency.
 
-    | ΔL, skin-confined | pypeec | jNO |
+    | case | one current per element | sheet per face |
     |---|---|---|
-    | 0.4 → 1.6 mm | −0.05 % | **+21.3 %** |
+    | ground plane 0.4 → 1.6 mm under a microstrip, 100 kHz, `Im Z / ω` (pypeec 5.8.0: −0.05 %) | +21.3 % | −2.5 % |
+    | strip over a plane, 1 MHz, per-length `L` against the closed-form microstrip | +52 % | +7.0 % |
+    | power module, 1 MHz, 1 mm pitch, facing faces on the grid, against Ansys Q3D (20.641 nH) | +20.1 % | **+3.1 %** |
 
-    At the 0.49 mm plane of a real power module this is worth about 8 %.
+    Three things to know. A sweep is discretised at its **lowest** frequency, so a conductor is
+    paired only if it is skin-confined at every point. A family is paired only when all of it is one
+    conductor thickness, so traces and a plate of different thickness on one grid keep one current
+    each; give them the same cell height. And a network with a **magnetic core** keeps one current
+    per element.
 
-    **The remedy is not shipped, because it was worse than the disease.** Giving a thick conductor a
-    current **sheet per face** (`bar_filaments(freq=)`, and `slab_transfer_impedance`) fixes the
-    plane case exactly — but it is wrong for a conductor carrying the LOOP current. Since the pairing
-    is triggered by thickness against the skin depth, it engages at a particular frequency, and the
-    answer jumps there:
-
-        50 kHz, unpaired   60.5 nH        80 kHz, paired   20.1 nH
-
-    on a real module, where nothing physical happens in between. An inductance is continuous in
-    frequency. The unpaired arm is the right one — it agrees with pypeec at 1 kHz (79.0 against
-    76.8 nH) and trends toward its 51.3 nH at 1 MHz.
-
-    So `jno.peec` never emits sheet pairs today. The machinery, its tests, and a continuity guard are
-    kept, and `bar_filaments(freq=)` still builds them for anyone working on it.
+    `sol.L` is the field-energy inductance, which leaves out the internal inductance of the skin
+    layer, as a solver that puts the current on the surface (Q3D's AC RL solve) does. pypeec reports
+    `Im Z / ω`, which includes it.
 
 !!! warning "A lattice element is a cube, and the quadrature costs what that implies"
     Sub-points sample an element's **volume**: `quad` along its axis, `quad_t` across each transverse
@@ -729,7 +729,8 @@ Three things to read off it.
 - A conductor is a `Shape.line` tube **or** a closed-form solid. A CSG *plan* has no centreline and no
   cross-section, so it cannot be a line — build the conductor from `Shape.line`, or discretise it as a
   solid.
-- Each filament carries **one** current: the skin effect within a filament is not represented. See
+- Each filament carries **one** current: the skin effect within a filament is not represented, except
+  that a one-cell solid thicker than a skin depth carries a sheet per face. See
   [Frequency and the skin effect](#frequency-and-the-skin-effect).
 - A **built** network freezes its geometry. A conductivity may be traced; a lattice shape may not.
 - A network of wires alone has no lattice structure, so it forms the **dense** operator — that is the

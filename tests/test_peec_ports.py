@@ -80,3 +80,17 @@ def test_an_unbound_constraint_says_to_bind_the_region(sym):
     i, v, at = sym
     with pytest.raises(ValueError, match="bind the region first"):
         port_spec([v - 1.0])
+
+
+def test_a_tag_that_shares_a_region_name_is_refused():
+    """A pad tagged with its own trace's name used to make the TRACE the terminal and drop it."""
+    mm = 1e-3
+    a = jno.shape.box(0, 0, 0, 10 * mm, 2 * mm, 0.5 * mm, size=(1 * mm, 1 * mm, 0.5 * mm)).attach(sigma=5.8e7)
+    b = jno.shape.box(0, 4 * mm, 0, 10 * mm, 6 * mm, 0.5 * mm, size=(1 * mm, 1 * mm, 0.5 * mm)).attach(sigma=5.8e7)
+    d = (a.name("DCP") + b.name("DCN")).domain()
+    d.tag("DCP", lambda x, y, z: (x < 1.1 * mm) & (y < 2.1 * mm))
+    d.tag("N", lambda x, y, z: (x < 1.1 * mm) & (y > 3.9 * mm))
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+    with pytest.raises(ValueError, match="both a region and a tag"):
+        jno.peec([v(*at("DCP")) - v(*at("N")) - 1.0], freq=1e3).build()

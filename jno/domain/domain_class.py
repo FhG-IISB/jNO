@@ -469,6 +469,8 @@ def _region_predicate(sub, earlier):
             m &= ~np.asarray(prior.contains(pts)).reshape(-1).astype(bool)
         return m
 
+    # so a consumer can tell a region's own membership from a `d.tag` that REPLACED it under the same name
+    where._jno_region = True
     return where
 
 
