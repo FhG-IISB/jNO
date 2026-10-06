@@ -12,14 +12,13 @@ top face, the trace, the gap and the port all fixed, taking the plane from 0.4 t
     skin-confined (100 kHz, 1.9 -> 7.7 delta)    pypeec  -0.05 %     jNO  +21.25 %
     uniform current (1 kHz, 0.2 -> 0.8 delta)    pypeec +20.90 %     jNO   +5.05 %
 
-The two are INVERTED -- jNO's sensitivity is 4x stronger where it must vanish. These tests pin the
-physical behaviour: thickness is invisible once the current is skin-confined, and matters when it is
-not.
+The two were INVERTED -- jNO's sensitivity was 4x stronger where it must vanish. A conductor thick
+against the skin depth now carries a current sheet per face, and these tests pin the physical
+behaviour: thickness is invisible once the current is skin-confined, and matters when it is not.
 """
 
 import jax
 import numpy as np
-import pytest
 
 import jno
 
@@ -49,20 +48,16 @@ def _microstrip(thick, freq, pitch=5.0e-4):
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
     s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build().solve()
-    return float(np.real(s.R)), float(np.real(s.L))
+    # pypeec's inductance is Im(Z) / omega (utils/matrix.py), which includes the INTERNAL inductance
+    # of the skin layer; `s.L` is the external, field-energy one, so it is not the quantity compared
+    z = complex(np.asarray(s.Z))
+    return z.real, z.imag / (2.0 * np.pi * freq)
 
 
-@pytest.mark.xfail(
-    reason="The sheet-pair model that fixes this is WRONG for a conductor carrying the loop current, "
-    "and by more than the defect it fixes, so it is off the front door. See "
-    "test_the_loop_inductance_does_not_jump_where_a_sheet_pair_would_start.",
-    strict=True,
-)
 def test_a_return_planes_thickness_is_invisible_once_the_current_is_skin_confined():
     """Copper 8 skin depths below the conducting face carries nothing, so it cannot change L.
 
-    pypeec measures -0.05 % over this range; jNO measures +21.25 %. REAL, and still unfixed: the
-    remedy (a current sheet per face) is a worse error than the disease, see the xfail reason.
+    pypeec measures -0.05 % over this range; the one-current model measured +21.25 %.
     """
     freq = 1e5
     delta = _skin(freq)
@@ -100,21 +95,20 @@ def test_the_loop_inductance_does_not_jump_where_a_sheet_pair_would_start():
     move the answer: an inductance is continuous in frequency, and nothing physical happens to a
     0.5 mm trace between 50 and 80 kHz.
 
-    The model failed exactly here while passing the plane-thickness test above, because a plane
-    carrying RETURN current and a trace carrying the LOOP current are not the same case. Measured on
-    a real power module before this was switched off:
+    The first sheet model failed exactly here while passing the plane-thickness test above. Measured
+    on a real power module:
 
         50 kHz, unpaired   60.5 nH        80 kHz, paired   20.1 nH
 
-    a 3x collapse. The unpaired arm is the correct one -- it agrees with pypeec at 1 kHz (79.0
-    against 76.8 nH) and trends toward its 51.3 nH at 1 MHz.
+    a 3x collapse. The cause was not the physics: the sheets duplicate and reorder the bars, and the
+    incidence was built in the original order, so each sheet was wired to another family's nodes.
     """
     sig, thick = 5.8e7, 1.0e-3
-    # the pairing threshold is thickness = 2 delta, which for 1 mm of copper is about 17 kHz
-    lo, hi = 8e3, 4e4
+    # the pairing threshold is thickness = delta, which for 1 mm of copper is about 4.4 kHz
+    lo, hi = 2e3, 1e4
     d_lo = 1.0 / np.sqrt(np.pi * lo * MU0 * sig)
     d_hi = 1.0 / np.sqrt(np.pi * hi * MU0 * sig)
-    assert thick < 2 * d_lo and thick > 2 * d_hi  # the threshold really is crossed
+    assert thick < d_lo and thick > d_hi  # the threshold really is crossed
 
     def bar(freq):
         sh = jno.shape.box(0, 0, 0, 0.040, 0.006, thick, size=(0.004, 0.006, thick)).attach(sigma=sig).name("b")
@@ -137,3 +131,69 @@ def test_the_loop_inductance_does_not_jump_where_a_sheet_pair_would_start():
 
     a, b = bar(lo), bar(hi)
     assert abs(b / a - 1) < 0.25, f"L jumped {a * 1e9:.2f} -> {b * 1e9:.2f} nH across the pairing threshold"
+
+
+def test_a_paired_bar_carries_the_same_current_as_an_unpaired_one():
+    """An isolated bar has no proximity to redistribute its current, so pairing must not move R or L.
+
+    The incidence regression: with the sheets wired to the wrong nodes this bar read R 5401 against
+    1509 uOhm and L 15.5 against 25.9 nH at 1 MHz.
+    """
+    length, width, thick = 0.040, 0.004, 0.51e-3
+
+    def solve(freq):
+        bar = jno.shape.box(0, 0, 0, length, width, thick, size=(1e-3, 1e-3, thick)).attach(sigma=CU).name("bar")
+        d = bar.domain()
+        d.tag("A", lambda x, y, z: x < 1.1e-3)
+        d.tag("B", lambda x, y, z: x > length - 1.1e-3)
+        i, v = d.peec_symbols()
+        at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
+        b = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build()
+        s = b.solve()
+        return int(np.asarray(b.fil.length).size), float(np.real(s.R)), float(np.real(s.L))
+
+    # either side of the pairing threshold, thick = delta at about 16.8 kHz
+    n0, r0, l0 = solve(1.6e4)
+    n1, r1, l1 = solve(1.75e4)
+    assert n1 == 2 * n0  # the second really is paired
+    assert abs(r1 / r0 - 1) < 0.01
+    assert abs(l1 / l0 - 1) < 0.01
+    # and deep in the skin regime it stays the conductor it was
+    _n, r_hi, l_hi = solve(1e6)
+    assert 1.4e-3 < r_hi < 1.6e-3  # the one-current surface-impedance model gives 1.509 mOhm
+    assert abs(l_hi / l0 - 1) < 0.03
+
+
+def test_a_strip_over_a_plane_matches_the_closed_form_microstrip():
+    """The loop inductance of a trace over its return plane, where the current is on the FACING faces.
+
+    One current per conductor puts it at mid-thickness, which widens the loop; measured here +52 %
+    over the closed form (Hammerstad-Jensen with Wheeler's thickness correction, accurate to about
+    1 % in this range). A sheet per face, drawn ON the face, gives +7.0 % at a 1 mm pitch and
+    +5.9 % at 0.5 mm. The per-length inductance is the difference of two lengths, so the ends and
+    the short cancel.
+    """
+    mm = 1e-3
+    pitch, gap, thick, width, plane_w = 1.0 * mm, 0.37 * mm, 0.37 * mm, 4.0 * mm, 20.0 * mm
+
+    def loop(length):
+        size = (pitch, pitch, thick)
+        y0 = -width / 2
+        geo = jno.shape.box(0, y0, gap, length, y0 + width, gap + thick, size=size).attach(sigma=CU).name("s")
+        geo = geo + jno.shape.box(0, -plane_w / 2, -thick, length, plane_w / 2, 0, size=size).attach(sigma=CU).name("p")
+        # the far-end short as round vias, so every bar of the strip and plane stays one cell thick
+        for k, yv in enumerate(np.arange(y0 + pitch / 2, y0 + width, pitch)):
+            pts = [(length - pitch / 2, yv, gap + thick / 2), (length - pitch / 2, yv, -thick / 2)]
+            geo = geo + jno.shape.line(pts, r=0.2 * pitch, size=pitch).attach(sigma=CU).name(f"v{k}")
+        d = geo.domain()
+        d.tag("A", lambda x, y, z: (x < pitch * 1.01) & (z > gap - 1e-9) & (np.abs(y) < width / 2))
+        d.tag("B", lambda x, y, z: (x < pitch * 1.01) & (z < 1e-9) & (np.abs(y) < width / 2))
+        i, v = d.peec_symbols()
+        at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
+        return float(np.real(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build().solve().L))
+
+    per_m = (loop(40 * mm) - loop(20 * mm)) / (20 * mm)
+    we = width + thick / np.pi * (1 + np.log(2 * gap / thick))
+    ue = we / gap
+    ref = 120 * np.pi / (ue + 1.393 + 0.667 * np.log(ue + 1.444)) / 299_792_458.0
+    assert 1.0 < per_m / ref < 1.10, f"{per_m * 1e9:.2f} nH/m against the closed form {ref * 1e9:.2f}"

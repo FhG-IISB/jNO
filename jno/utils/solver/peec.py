@@ -1562,13 +1562,40 @@ def _sheet_families(axis, skin, span, d, delta):
         if th.size != 1:
             continue  # mixed thicknesses cannot share one offset
         thick = float(th[0])
-        if thick <= 2.0 * delta:
-            continue  # the current fills the section, and one element already says so exactly
+        # Paired from ONE skin depth, not two. On pypeec's plane-thickness case (0.4 -> 1.6 mm at
+        # 100 kHz, where the thin plane is 1.9 delta) the thin plane unpaired put L 3.6 % off the
+        # thick one, and paired 2.5 % (pypeec: -0.05 %). Below a skin depth the current does fill the
+        # section and one element is the right model.
+        if thick <= delta:
+            continue
         # span == 1, so the conductor IS one cell thick and the thin axis is the matching pitch
         cand = [c for c in range(3) if c != ax and abs(float(d[c]) - thick) < 1e-12]
         if len(cand) == 1:
             out[int(ax)] = (int(cand[0]), thick)
     return out
+
+
+def _sheet_extent(thick, delta):
+    """How thick a face's current sheet is drawn, for its PARTIAL INDUCTANCE only.
+
+    The sheet's inductance must be the EXTERNAL one. Everything inside the metal -- the resistance
+    and the internal reactance of the skin layer -- is already in the surface impedance
+    (:func:`slab_transfer_impedance`), so a sheet drawn as thick as the skin layer counts the
+    internal energy twice and puts the current's centroid a skin depth inside the face. On a strip
+    over a plane at 1 MHz (gap 0.37 mm, 5.6 skin depths of copper each), against the closed-form
+    microstrip inductance:
+
+        sheet 2 delta thick     +27.6 %
+        sheet 1 delta           +16.6 %
+        sheet 0.3 delta          +8.9 %
+        sheet 0.1 delta          +6.7 %
+
+    So the deep-skin limit is a sheet ON the face. Near the pairing threshold (``thick = delta``)
+    the two sheets are instead the two halves of the conductor, which is what makes the switch from
+    one current to two continuous; ``4 delta^3 / thick^2`` joins the two, equal to ``thick / 2`` up
+    to ``thick = 2 delta`` and falling as the cube of the skin depth past it.
+    """
+    return float(min(0.5 * thick, 4.0 * delta**3 / thick**2))
 
 
 def _element_impedance(fil, omega, sig, mu0):
@@ -2208,7 +2235,7 @@ def bar_filaments(
                 thin, thick = sheets[ax]
                 # the layer the current actually occupies: the whole half below 2 skin depths, and
                 # the skin layer itself above it, so the sheet sits where the current does
-                ext = float(min(0.5 * thick, 2.0 * delta))
+                ext = _sheet_extent(thick, delta)
                 shift = 0.5 * (thick - ext)
                 blocks.append((idx, +shift, ext, thin))
                 blocks.append((idx, -shift, ext, thin))
@@ -2304,15 +2331,13 @@ def bar_filaments(
     group = np.repeat(np.arange(nb), nsub)
     self_g = bar_self(ln, wt[:, 0], wt[:, 1])  # numpy in, numpy out: a host constant of the grid
 
-    ir, ic, iv, off = [], [], [], 0
-    for na, nb_ in ends:
-        k = len(na)
-        cols = np.arange(off, off + k)
-        ir += [na, nb_]
-        ic += [cols, cols]
-        iv += [np.ones(k), -np.ones(k)]
-        off += k
-    inc = sp.coo_matrix((np.concatenate(iv), (np.concatenate(ir), np.concatenate(ic))), shape=(len(nodes), nb)).tocsr()
+    # from the PERMUTED ends, not the per-family `ends` list: a sheet pair duplicates and reorders the
+    # bars, and an incidence built in the original order wires each sheet to another family's nodes
+    cols = np.arange(nb)
+    inc = sp.coo_matrix(
+        (np.concatenate([np.ones(nb), -np.ones(nb)]), (np.concatenate([end_a, end_b]), np.concatenate([cols, cols]))),
+        shape=(len(nodes), nb),
+    ).tocsr()
 
     return Filaments(
         jnp.asarray(pos),
@@ -2366,7 +2391,7 @@ def bar_filaments(
             # {axis: (thin axis, conductor thickness, the layer each sheet's current occupies)}.
             # `lattice_apply` rebuilds the sub-points from this, so the FFT path and the assembled
             # one place the sheets identically -- they must, or they stop being the same operator.
-            "sheets": {int(a): (int(v[0]), float(v[1]), float(min(0.5 * v[1], 2.0 * delta))) for a, v in sheets.items()},
+            "sheets": {int(a): (int(v[0]), float(v[1]), _sheet_extent(v[1], delta)) for a, v in sheets.items()},
         },
         pair,
     )
