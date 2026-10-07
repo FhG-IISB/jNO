@@ -577,3 +577,112 @@ def test_lagrange_pk_mixed_with_n1e_k_reproduces_exactly():
     val, Xq, _ = _readback(d, sol, ref_points=rp, block=(off[0], off[1]))
     np.testing.assert_allclose(Vh, Vex(Xq[..., 0], Xq[..., 1], Xq[..., 2]), atol=1e-10)
     np.testing.assert_allclose(val, np.stack([Xq[..., 1], Xq[..., 2], Xq[..., 0]], -1), atol=1e-10)
+
+
+# ------------------------------------------------------------------------------------------------
+# discrete de Rham: the AMS transfer operators at degree k
+# ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tdim,family,k", [(2, "N1E", 2), (2, "N1E", 3), (3, "N1E", 2), (3, "N2E", 1), (3, "N2E", 2)])
+def test_discrete_gradient_spans_the_curl_kernel(tdim, family, k):
+    """``G : P_m → H(curl)`` (m = k for N1E_k, k+1 for N2E_k) satisfies ``curl(G φ) = 0`` exactly, has rank
+    ``dim P_m − 1`` (only constants vanish), and that rank IS the dimension of the curl-curl kernel --
+    so G spans the whole near-null space AMS must correct, not a part of it. ``Π_α · 1`` is the
+    constant field ``e_α``."""
+    from jno.utils.solver.ams import discrete_gradient, high_order_transfer, nodal_vector_interpolation
+
+    d = _domain(tdim, 0.45 if tdim == 2 else 0.8)
+    u, v, ui, vi, c = _bound(d, tdim, family, k)
+    curl_u = ui.curl() if tdim == 2 else ui.vector.curl(*c)
+    curl_v = vi.curl() if tdim == 2 else vi.vector.curl(*c)
+    K = _dense(jno.fem([curl_u * curl_v if tdim == 2 else inner(curl_u, curl_v)]).A)
+    topo = d._fem_nonnodal_topology
+    G = _dense(discrete_gradient(topo))
+    _G, Pis, dmL = high_order_transfer(topo)
+    assert G.shape == (K.shape[0], dmL.n_dofs)
+    np.testing.assert_allclose(K @ G, 0.0, atol=1e-9 * np.abs(K).max())
+    rank_G = np.linalg.matrix_rank(G, tol=1e-9)
+    assert rank_G == dmL.n_dofs - 1
+    wK = np.linalg.eigvalsh(0.5 * (K + K.T))
+    assert int(np.sum(np.abs(wK) < 1e-8 * np.abs(wK).max())) == rank_G
+    for a, P in enumerate(nodal_vector_interpolation(topo)):
+        val, X, _ = _readback(d, _dense(P) @ np.ones(dmL.n_dofs))
+        e = np.zeros(tdim)
+        e[a] = 1.0
+        np.testing.assert_allclose(val, np.broadcast_to(e, val.shape), atol=1e-10)
+
+
+def _ams_iterations(h, k):
+    """CG iterations to 1e-8 on curl curl + 1e-3·mass (N1E_k, unit cube) with jno.precond.ams()."""
+    import scipy.sparse.linalg as spla
+
+    from jno.precond import PrecondContext, _fem_concrete_operator
+    from jno.utils.solver.solver_api import LinearOperator, materialize_precond
+
+    d = _domain(3, h)
+    u, v, ui, vi, (x, y, z) = _bound(d, 3, "N1E", k)
+    cu, cv = ui.vector.curl(x, y, z), vi.vector.curl(x, y, z)
+    fem = jno.fem([inner(cu, cv) + 1e-3 * inner(ui, vi) - inner(_vec([0.0 * x, 0.0 * x, 1.0 + 0.0 * x]), vi)])
+    A = _fem_concrete_operator(fem)
+    with jax.default_device(jax.devices("cpu")[0]):
+        apply = materialize_precond(jno.precond.ams(), PrecondContext(LinearOperator(A), fem))
+        bc = A.bcoo if getattr(A, "bcoo", None) is not None else A
+        n = int(bc.shape[0])
+        Aop = spla.LinearOperator((n, n), matvec=lambda w: np.asarray(bc @ jnp.asarray(w)))
+        Mop = spla.LinearOperator((n, n), matvec=lambda w: np.asarray(apply(jnp.asarray(w))))
+        b = np.asarray(fem.operator[1]).reshape(-1)
+        it = [0]
+        x_, info = spla.cg(Aop, b, M=Mop, rtol=1e-8, maxiter=500, callback=lambda _x: it.__setitem__(0, it[0] + 1))
+    assert info == 0
+    return it[0], n
+
+
+def test_ams_iterations_are_flat_under_refinement_at_degree_two():
+    """AMS with the degree-2 G (P_2 → N1E_2) and Π keeps CG iteration counts essentially flat under
+    refinement on a gradient-dominated curl-curl + 1e-3·mass operator (Hiptmair & Xu 2007): the
+    count grows by at most a few iterations while the DOF count grows several-fold."""
+    i0, n0 = _ams_iterations(0.6, 2)
+    i1, n1 = _ams_iterations(0.25, 2)  # measured 23 its @ 856 dofs -> 27 @ 1756 -> 27 @ 3242
+    assert n1 > 3 * n0
+    assert i1 <= i0 + 6 and i1 < 60, f"AMS(k=2): {i0} its @ {n0} dofs -> {i1} its @ {n1} dofs"
+
+
+# ------------------------------------------------------------------------------------------------
+# the A-V pair, block-preconditioned
+# ------------------------------------------------------------------------------------------------
+
+
+def test_av_pair_at_degree_two_solves_with_block_ams():
+    """The eddy-current A-V system at degree 2 (N1E_2 x P_2, complex jω coupling, PEC on A, V = 0 on the
+    boundary): a GMRES solve preconditioned by triangular(ams() on A, jacobi on V) matches sparse LU --
+    the degree-2 G : P_2 → N1E_2 and Π are what the AMS block needs -- where Jacobi alone fails."""
+    d = _domain(3, 0.6)
+    u, v, ui, vi, (x, y, z) = _bound(d, 3, "N1E", 2)
+    p, q = d.fem_symbols(names=("p", "q"), space="Lagrange", order=2)
+    X = dict(x=x, y=y, z=z)
+    Vs, Vt = p.bind(**X), q.bind(**X)
+    cA, cV = ui.vector.curl(x, y, z), vi.vector.curl(x, y, z)
+    b = d.variable("boundary", split=True)
+    gV, gq = jno.np.grad(Vs, [x, y, z]), jno.np.grad(Vt, [x, y, z])
+    m = 1j * 1.0e2
+    fem = jno.fem(
+        [
+            # `1.0 * inner(A, v)`: an ε-gauge on A alone. Without it (A + ∇φ, V - φ), φ|∂Ω = 0, is a null
+            # mode of the A-V pair and "the" LU solution is an arbitrary member of it.
+            inner(cA, cV)
+            + 1.0 * inner(ui, vi)
+            + m * inner(ui, vi)
+            + m * inner(gV, vi)
+            - inner(_vec([1.0 + 0.0 * x, 0.0 * x, 0.0 * x]), vi),
+            m * inner(ui, gq) + m * inner(gV, gq),
+            u.vector.cross(d.variable("boundary", normals=True)),
+            p.bind(x=b[0], y=b[1], z=b[2]) - 0.0,
+        ]
+    )
+    ref = np.asarray(jnp.asarray(fem.solve(linear=jno.solve.lu()))).reshape(-1)
+    tri = jno.precond.triangular((u, jno.precond.ams()), (p, jno.precond.jacobi()))
+    got = np.asarray(jnp.asarray(fem.solve(linear=jno.solve.gmres(tol=1e-10, maxiter=400), precond=tri))).reshape(-1)
+    assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-5  # measured 3.6e-7
+    with pytest.raises(RuntimeError, match="did not solve"):  # Jacobi alone cannot, in the same budget
+        fem.solve(linear=jno.solve.gmres(tol=1e-10, maxiter=400), precond=jno.precond.jacobi())
