@@ -613,8 +613,9 @@ def test_discrete_gradient_spans_the_curl_kernel(tdim, family, k):
         np.testing.assert_allclose(val, np.broadcast_to(e, val.shape), atol=1e-10)
 
 
-def _ams_iterations(h, k):
-    """CG iterations to 1e-8 on curl curl + 1e-3·mass (N1E_k, unit cube) with jno.precond.ams()."""
+def _ams_iterations(h, k, spec=None):
+    """CG iterations to 1e-8 on curl curl + 1e-3·mass (N1E_k, unit cube) with jno.precond.ams()
+    (or the preconditioner spec ``spec()``)."""
     import scipy.sparse.linalg as spla
 
     from jno.precond import PrecondContext, _fem_concrete_operator
@@ -626,7 +627,7 @@ def _ams_iterations(h, k):
     fem = jno.fem([inner(cu, cv) + 1e-3 * inner(ui, vi) - inner(_vec([0.0 * x, 0.0 * x, 1.0 + 0.0 * x]), vi)])
     A = _fem_concrete_operator(fem)
     with jax.default_device(jax.devices("cpu")[0]):
-        apply = materialize_precond(jno.precond.ams(), PrecondContext(LinearOperator(A), fem))
+        apply = materialize_precond((spec or jno.precond.ams)(), PrecondContext(LinearOperator(A), fem))
         bc = A.bcoo if getattr(A, "bcoo", None) is not None else A
         n = int(bc.shape[0])
         Aop = spla.LinearOperator((n, n), matvec=lambda w: np.asarray(bc @ jnp.asarray(w)))
@@ -1045,3 +1046,24 @@ def test_solution_is_invariant_under_vertex_relabelling(tmp_path):
         a, b = fields[("orig", fam)], fields[("perm", fam)]
         assert np.abs(a).max() > 1e-3
         np.testing.assert_allclose(b, a, atol=1e-10 * np.abs(a).max(), err_msg=fam)
+
+
+def test_hypre_ams_at_degree_k_is_flat_under_refinement():
+    """hypre's AMS at degree k: jNO passes the degree-k discrete gradient and the full vector
+    interpolation Π (HYPRE_AMSSetInterpolations) instead of vertex coordinates, with the full-Π cycle
+    (cycle_type 1 -- petsc4py corrupts the heap when handed the per-component Π the default cycle
+    needs). Measured CG iterations: k = 2: 8 / 10 / 11 at 856 / 1756 / 3242 DOFs; k = 3: 12 / 14 at
+    2199 / 4785 (jno.precond.ams(): 23-27 and 28-34)."""
+    pytest.importorskip("petsc4py")
+    hyp = lambda: jno.precond.hypre(kind="ams")  # noqa: E731
+    i0, n0 = _ams_iterations(0.6, 2, hyp)
+    i1, n1 = _ams_iterations(0.25, 2, hyp)
+    assert n1 > 3 * n0 and i1 <= i0 + 5 and i1 < 25, (i0, n0, i1, n1)
+    j0, m0 = _ams_iterations(0.8, 3, hyp)
+    j1, m1 = _ams_iterations(0.35, 3, hyp)
+    assert m1 > 2 * m0 and j1 <= j0 + 5 and j1 < 25, (j0, m0, j1, m1)
+    # the cycle_type default is local to the degree-k PC: a degree-1 hypre AMS afterwards is unchanged
+    from petsc4py import PETSc
+
+    assert not PETSc.Options().hasName("pc_hypre_ams_cycle_type")
+    assert _ams_iterations(0.35, 1, hyp)[0] == 11  # measured 11 (coordinates, default cycle) before any degree-k run
