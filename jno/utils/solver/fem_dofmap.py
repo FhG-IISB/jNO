@@ -51,6 +51,7 @@ _FAMILIES = {
     "RT": ("RT", "contravariant"),
     "BDM": ("BDM", "contravariant"),
     "Lagrange": ("P", "identity"),
+    "DG": ("P", "identity"),  # discontinuous Lagrange: every DOF interior to its cell
 }
 
 
@@ -69,6 +70,12 @@ def basix_element(family: str, cell: str, degree: int):
     fam = getattr(ElementFamily, _FAMILIES[family][0])
     ct = getattr(CellType, cell)
     degree = int(degree)
+    if family == "DG":
+        if degree < 0:
+            raise ValueError(f"basix_element: DG degree must be >= 0, got {degree}.")
+        if degree <= 2:
+            return basix.create_element(fam, ct, degree, discontinuous=True)
+        return basix.create_element(fam, ct, degree, LagrangeVariant.gll_warped, discontinuous=True)
     if degree < 1:
         raise ValueError(f"basix_element: degree must be >= 1, got {degree} for {family}.")
     if degree == 1:

@@ -476,7 +476,7 @@ def test_impedance_mass_and_incident_load_are_exact_at_degree_two():
 
 
 # ------------------------------------------------------------------------------------------------
-# H(div): the natural pressure load at degree k
+# H(div): RT_k mixed Poisson with a DG_{k-1} pressure, and the natural pressure load
 # ------------------------------------------------------------------------------------------------
 
 
@@ -729,3 +729,94 @@ def test_bloch_periodic_cube_spectrum_at_degree_two():
     assert np.all(w[w > 1e-8] > 0.5 * phi**2), "spurious mode below the first Bloch band"
     np.testing.assert_allclose(nz[:2], phi**2, rtol=2e-2)
     np.testing.assert_allclose(nz[2:4], (2 * PI - phi) ** 2, rtol=5e-2)
+
+
+# ------------------------------------------------------------------------------------------------
+# RT_k mixed Poisson with a DG_{k-1} pressure
+# ------------------------------------------------------------------------------------------------
+
+
+def _mixed_poisson_error(tdim, k, h):
+    """u = -∇p, div u = f, p = p_D on ∂Ω (natural); RT_k × DG_{k-1}. Returns (‖u - u_h‖, ‖p - p_h‖)."""
+    d = _domain(tdim, h)
+    u, v = d.fem_symbols(value_shape=(tdim,), names=("u", "v"), space="RT", order=k)
+    if k == 1:
+        p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    else:
+        p, q = d.fem_symbols(names=("p", "q"), space="DG", order=k - 1)
+    c = d.variable("interior", split=True)[:tdim]
+    X = dict(zip("xyz", c))
+    ui, vi, pp, qq = u.bind(**X), v.bind(**X), p.bind(**X), q.bind(**X)
+    bvars = d.variable("boundary", normals=True, split=True)
+    if tdim == 2:
+        xb, yb, _, nx, ny = bvars
+        Xb, N = dict(x=xb, y=yb), [nx, ny]
+    else:
+        xb, yb, zb, nx, ny, nz = bvars[:3] + bvars[-3:]
+        Xb, N = dict(x=xb, y=yb, z=zb), [nx, ny, nz]
+    vb = v.bind(**Xb)
+    cos = jno.np.cos
+    if tdim == 2:
+        x, y = c
+        pex = lambda X: np.cos(PI * X[..., 0]) * np.cos(PI * X[..., 1]) + X[..., 0]  # noqa: E731
+        uex = lambda X: np.stack(
+            [
+                PI * np.sin(PI * X[..., 0]) * np.cos(PI * X[..., 1]) - 1.0,
+                PI * np.cos(PI * X[..., 0]) * np.sin(PI * X[..., 1]),
+            ],
+            -1,
+        )  # noqa: E731
+        f = 2 * PI**2 * cos(PI * x) * cos(PI * y)
+        pD = cos(PI * xb) * cos(PI * yb) + xb
+    else:
+        x, y, z = c
+        pex = lambda X: np.cos(PI * X[..., 0]) * np.cos(PI * X[..., 1]) * np.cos(PI * X[..., 2]) + X[..., 0]  # noqa: E731
+        uex = lambda X: np.stack(  # noqa: E731
+            [
+                PI * np.sin(PI * X[..., 0]) * np.cos(PI * X[..., 1]) * np.cos(PI * X[..., 2]) - 1.0,
+                PI * np.cos(PI * X[..., 0]) * np.sin(PI * X[..., 1]) * np.cos(PI * X[..., 2]),
+                PI * np.cos(PI * X[..., 0]) * np.cos(PI * X[..., 1]) * np.sin(PI * X[..., 2]),
+            ],
+            -1,
+        )
+        f = 3 * PI**2 * cos(PI * x) * cos(PI * y) * cos(PI * z)
+        pD = cos(PI * xb) * cos(PI * yb) * cos(PI * zb) + xb
+    vn = _sum([vb[i] * N[i] for i in range(tdim)])
+    fem = jno.fem([inner(ui, vi) - pp * vi.div(), qq * ui.div() - f * qq, pD * vn])
+    sol = _sparse_solve(fem)
+    off = fem.offsets
+    rule = _tri_rule if tdim == 2 else _tet_rule
+    gp, gw = rule(2 * k + 3)
+    val, Xq, cells = _readback(d, sol, ref_points=gp, block=(off[0], off[1]))
+    pts = np.asarray(d.mesh.points)[:, :tdim]
+    J, _ = cell_jacobians(pts, cells)
+    dJ = np.abs(np.linalg.det(J))
+    eu = np.sqrt(np.einsum("q,c,cq->", gw, dJ, np.sum((val - uex(Xq)) ** 2, -1)))
+    # pressure: P0 / DG read back through its own DOF map
+    if k == 1:
+        ph = sol[off[1] : off[2]][:, None] * np.ones((1, gp.shape[0]))
+    else:
+        dmp = build_dofmap(cells, "DG", k - 1, n_verts=pts.shape[0])
+        ph = np.asarray(nonnodal_field_at(pts, cells, dmp, jnp.asarray(sol[off[1] : off[2]]), ref_points=gp))
+    ep = np.sqrt(np.einsum("q,c,cq->", gw, dJ, (ph - pex(Xq)) ** 2))
+    return float(eu), float(ep)
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_rt_mixed_poisson_2d_converges_at_rate_k(k):
+    """RT_k × DG_{k-1} mixed Poisson (Raviart & Thomas 1977; Brezzi & Fortin 1991, Prop. IV.1.2):
+    ‖u - u_h‖ and ‖p - p_h‖ are both O(h^k) -- with the inhomogeneous natural pressure BC."""
+    e = [_mixed_poisson_error(2, k, h) for h in (0.5, 0.25, 0.125)]
+    ru = np.log2(e[1][0] / e[2][0])
+    rp = np.log2(e[1][1] / e[2][1])
+    assert ru > k - 0.3 and rp > k - 0.3, f"RT_{k}: errors {e}, rates u {ru:.2f} p {rp:.2f}"
+
+
+def test_rt_mixed_poisson_3d_degree_two():
+    """3-D RT_2 × DG_1 on tetrahedra (face moments with every face orientation): second order."""
+    # measured (u, p) errors at h = 0.5 / 0.35 / 0.25 / 0.18: (0.386, 0.039) (0.128, 0.021)
+    # (0.096, 0.015) (0.040, 0.0073) -- the coarse pair is pre-asymptotic for p, so rate the last pair
+    e0 = _mixed_poisson_error(3, 2, 0.25)
+    e1 = _mixed_poisson_error(3, 2, 0.18)
+    r = np.log(np.array(e0) / np.array(e1)) / np.log(0.25 / 0.18)
+    assert r.min() > 1.6, f"RT_2 3-D: {e0} -> {e1}, rates {r}"
