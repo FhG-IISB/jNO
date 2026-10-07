@@ -121,3 +121,27 @@ def test_a_failed_factorisation_leaves_no_key_claiming_success():
     assert P._LU_HOLDER.get("key") is None
     # and the next real solve still works rather than reusing a corpse
     assert np.isfinite(float(np.real(b.solve(sigma={"bar": 0.25 * SIG}).R)))
+
+
+def test_a_small_conductivity_change_keeps_the_factorisation_and_the_answer():
+    """A design step changes the conductivity a little; the preconditioner's factorisation is kept
+    while the solves it serves stay cheap. The ANSWER must not depend on it: GMRES converges to the
+    same tolerance whatever the preconditioner, so a reused factorisation and a fresh one agree."""
+    from jno.utils.solver import peec as P
+
+    def solve(sig, fresh):
+        if fresh:
+            P._LU_HOLDER.clear()
+        bar = jno.shape.box(0, 0, 0, 16e-3, 4e-3, 0.8e-3, size=(0.8e-3,) * 3).attach(sigma=sig).name("bar")
+        w = jno.shape.line([(1e-3, 2e-3, 0.8e-3), (8e-3, 2e-3, 3e-3), (15e-3, 2e-3, 0.8e-3)], r=1e-4, size=0.8e-3)
+        d = (bar + w.attach(sigma=3.8e7).name("w")).domain()
+        d.tag("A", lambda x, y, z: x < 0.9e-3)
+        d.tag("B", lambda x, y, z: x > 15.1e-3)
+        i, v = d.peec_symbols()
+        at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+        return complex(np.asarray(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).solve().Z))
+
+    solve(5.8e7, fresh=True)  # factorise at the reference
+    reused = solve(5.8e7 * 1.05, fresh=False)  # 5 % off: within the reuse band
+    fresh = solve(5.8e7 * 1.05, fresh=True)
+    assert abs(reused / fresh - 1) < 1e-6

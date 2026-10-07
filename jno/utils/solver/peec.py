@@ -1392,6 +1392,32 @@ def solve_network(
             ckey = (_fact_static, float(w_now), hash(zdn.tobytes()))
             if _LU_HOLDER.get("key") == ckey and _LU_HOLDER.get("lu") is not None:
                 return np.zeros((), dtype=np.float64)
+            # ...and a STALE one is kept while it still pays. The preconditioner only accelerates --
+            # GMRES converges to the same tolerance whatever it is, and the residual gate below holds
+            # it to that -- so the question is purely cost: one more factorisation, or the extra
+            # iterations a slightly-off one costs. Answered from the solves themselves rather than a
+            # tuned threshold: the applications the LAST solve needed against the ones the first
+            # solve after this factorisation needed. Measured on a design loop (welded half-bridge,
+            # 10 MHz, the conductivity a density field), a factorisation was 0.75 s of a step.
+            # Only a SMALL change qualifies: elementwise, the impedance diagonal within 25 % of what
+            # was factorised. A larger one -- a material swapped, a projection moving a boundary --
+            # can leave GMRES unable to converge inside its budget, which the residual gate then
+            # reports as a failed solve.
+            zref = _LU_HOLDER.get("zd")
+            near = zref is not None and zref.shape == zdn.shape and bool(np.all(np.abs(zdn - zref) <= 0.25 * np.abs(zref)))
+            if (
+                near
+                and _LU_HOLDER.get("lu") is not None
+                and _LU_HOLDER.get("key") is not None
+                and _LU_HOLDER["key"][:2] == ckey[:2]
+            ):
+                used = _LU_HOLDER.get("applies", 0) - _LU_HOLDER.get("mark", 0)
+                base = _LU_HOLDER.get("base")
+                if base is None:
+                    _LU_HOLDER["base"] = base = used
+                if used <= 2 * base + 8:
+                    _LU_HOLDER["mark"] = _LU_HOLDER.get("applies", 0)
+                    return np.zeros((), dtype=np.float64)
             _LU_HOLDER["key"] = None  # a failed factorisation must not leave a key claiming success
             if nv.size:  # the near field, for a welded network
                 off = (1j * float(w_now)) * nv
@@ -1408,6 +1434,9 @@ def solve_network(
                 _LU_HOLDER["lu"] = spla.splu((CI @ sp.diags(1.0 / zdn) @ AT + Cp).tocsc())
                 _LU_HOLDER["kind"] = "schur"
             _LU_HOLDER["key"] = ckey
+            _LU_HOLDER["base"] = None  # set by the first solve this factorisation serves
+            _LU_HOLDER["zd"] = zdn.copy()
+            _LU_HOLDER["mark"] = _LU_HOLDER.get("applies", 0)
             return np.zeros((), dtype=np.float64)
 
         @jax.custom_jvp
@@ -3125,6 +3154,7 @@ def _holder_solve(r):
     so sequential solves are safe; two solves running CONCURRENTLY in one process would not be, and
     nothing here is reentrant.
     """
+    _LU_HOLDER["applies"] = _LU_HOLDER.get("applies", 0) + 1  # what a stale factorisation is judged by
     return _LU_HOLDER["lu"].solve(np.asarray(r)).astype(r.dtype)
 
 
@@ -3135,6 +3165,7 @@ def _holder_solve_t(r):
     ``P^T`` that is. Reusing ``P`` there is what made the tangent system look intractable. The plain
     transpose, not the conjugate one, because that is the convention jax's linear transpose uses.
     """
+    _LU_HOLDER["applies"] = _LU_HOLDER.get("applies", 0) + 1
     return _LU_HOLDER["lu"].solve(np.asarray(r), trans="T").astype(r.dtype)
 
 
