@@ -616,6 +616,9 @@ def assemble_fem_nonnodal(
             "n_dofs": int(_dm_e.n_dofs),
             "dofmap": _dm_e,
             "cells": np.asarray(cells),
+            # every field's (space, DofMap or None) -- the degree-k periodic reduction ties each field
+            # through its own map (None: P1 Lagrange / P0, whose maps are the vertex / cell ids)
+            "field_dofmaps": [(spaces[i], dofmaps.get(i)) for i in range(len(spaces))],
         }
         if spaces[_edge_i] != "N1E" or _orders[_edge_i] > 1:
             # the lowest-order `n_edges`-sized fields above would size a G / P wrongly; consumers that

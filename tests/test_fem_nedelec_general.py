@@ -686,3 +686,46 @@ def test_av_pair_at_degree_two_solves_with_block_ams():
     assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-5  # measured 3.6e-7
     with pytest.raises(RuntimeError, match="did not solve"):  # Jacobi alone cannot, in the same budget
         fem.solve(linear=jno.solve.gmres(tol=1e-10, maxiter=400), precond=jno.precond.jacobi())
+
+
+# ------------------------------------------------------------------------------------------------
+# periodic / Bloch ties at degree k
+# ------------------------------------------------------------------------------------------------
+
+
+def test_bloch_periodic_cube_spectrum_at_degree_two():
+    """Fully periodic unit cube, Bloch phase φ along x: curl curl E = λE has λ = |k + G|², k = (φ, 0, 0),
+    each twice (two transverse polarisations) -- the first two pairs are φ² and (2π - φ)². N1E_2 ties
+    edge AND face DOFs across all three face pairs (edges on two pairs chain), by interpolation; the
+    spectrum must be spurious-free above the gradient kernel."""
+    from jno._fem import _build_periodic_reduction_entities, _periodic_tie_spec
+
+    phi = 1.1
+    d = jno.domain(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5))
+    e = 1e-6
+    for nm, ax, val in (("x0", 0, 0.0), ("x1", 0, 1.0), ("y0", 1, 0.0), ("y1", 1, 1.0), ("z0", 2, 0.0), ("z1", 2, 1.0)):
+        d.tag(nm, (lambda a, v: lambda *X: np.abs(X[a] - v) < e)(ax, val))
+    u, v, ui, vi, (x, y, z) = _bound(d, 3, "N1E", 2)
+    cu, cv = ui.vector.curl(x, y, z), vi.vector.curl(x, y, z)
+
+    def face(nm):
+        cc = d.variable(nm, split=True)
+        return u.bind(x=cc[0], y=cc[1], z=cc[2])
+
+    ties = [face("x1") - np.exp(1j * phi) * face("x0"), face("y1") - face("y0"), face("z1") - face("z0")]
+    fem_k = jno.fem([inner(cu, cv), *ties])  # triggers the conforming periodic re-mesh
+    specs = [_periodic_tie_spec(t, d) for t in ties]
+    K = _dense(jno.fem([inner(cu, cv)]).A)
+    M = _dense(jno.fem([inner(ui, vi)]).A)
+    red = _build_periodic_reduction_entities(d, specs, fem_k.offsets)
+    assert red["is_bloch"]
+    P = _dense(red["blocks"][0]["P"])
+    Kr, Mr = P.conj().T @ K @ P, P.conj().T @ M @ P
+    np.testing.assert_allclose(Kr, Kr.conj().T, atol=1e-10)
+    L = np.linalg.cholesky(Mr)
+    Li = np.linalg.inv(L)
+    w = np.sort(np.linalg.eigvalsh(Li @ Kr @ Li.conj().T))
+    nz = w[w > 0.05]
+    assert np.all(w[w > 1e-8] > 0.5 * phi**2), "spurious mode below the first Bloch band"
+    np.testing.assert_allclose(nz[:2], phi**2, rtol=2e-2)
+    np.testing.assert_allclose(nz[2:4], (2 * PI - phi) ** 2, rtol=5e-2)
