@@ -1003,3 +1003,43 @@ def test_fem_eigs_eliminates_the_essential_trace_at_degree_two():
     assert X.shape[0] == K.offsets[-1]  # modes come back on the full DOF vector
     # eliminated, not row-replaced: exactly zero on the PEC DOFs (row replacement gives x_d = λ(Mx)_d/K_dd)
     assert np.abs(X[pinned]).max() == 0.0
+
+
+def test_solution_is_invariant_under_vertex_relabelling(tmp_path):
+    """The same tetrahedral mesh written twice -- once with its vertices randomly RELABELLED (so every edge
+    direction and face orientation changes) -- gives the same N1E_2 / N2E_1 solution field, compared at
+    physical points. The physics cannot depend on the numbering; a wrong orientation rule would."""
+    import meshio
+
+    from jno.utils.solver.fem_nonnodal import nonnodal_field_at_points
+
+    base = _domain(3, 0.6)
+    pts0 = np.asarray(base.mesh.points)
+    tets0 = np.asarray(base.mesh.cells_dict["tetra"])
+    perm = np.random.default_rng(11).permutation(pts0.shape[0])
+    pts1 = np.empty_like(pts0)
+    pts1[perm] = pts0
+    tets1 = perm[tets0][np.random.default_rng(12).permutation(tets0.shape[0])]  # relabel + reorder cells
+    X = np.random.default_rng(13).random((30, 3)) * 0.96 + 0.02
+    fields = {}
+    for tag, (P, T) in {"orig": (pts0, tets0), "perm": (pts1, tets1)}.items():
+        path = tmp_path / f"{tag}.vtu"
+        meshio.write(path, meshio.Mesh(P, [("tetra", T)]))
+        d = jno.domain(constructor=str(path))
+        for fam, k in (("N1E", 2), ("N2E", 1)):
+            u, v, ui, vi, (x, y, z) = _bound(d, 3, fam, k)
+            cu, cv = ui.vector.curl(x, y, z), vi.vector.curl(x, y, z)
+            s = jno.np.sin
+            f = _vec([s(3 * y) + z, x * z, s(2 * x) * y])
+            fem = jno.fem([inner(cu, cv) + inner(ui, vi) - inner(f, vi)])
+            sol = _sparse_solve(fem)
+            topo = d._fem_nonnodal_topology
+            fields[(tag, fam)] = np.asarray(
+                nonnodal_field_at_points(
+                    np.asarray(d.mesh.points)[:, :3], topo["cells"], topo["dofmap"], jnp.asarray(sol), X
+                )
+            )
+    for fam in ("N1E", "N2E"):
+        a, b = fields[("orig", fam)], fields[("perm", fam)]
+        assert np.abs(a).max() > 1e-3
+        np.testing.assert_allclose(b, a, atol=1e-10 * np.abs(a).max(), err_msg=fam)
