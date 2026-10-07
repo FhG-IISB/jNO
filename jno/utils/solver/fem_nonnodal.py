@@ -249,7 +249,7 @@ def assemble_fem_nonnodal(
         if spaces[_fi] in ("RT", "N1E", "N2E"):
             raise NotImplementedError(
                 "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E/N2E; the essential BC is "
-                "the facet trace (u·n for RT, u×n for N1E/N2E) -- write it as `dot(u(region), n_region) - g` "
+                "the edge trace -- edge and face trace at degree k -- (u·n for RT, u×n for N1E/N2E) -- write it as `dot(u(region), n_region) - g` "
                 "(RT) or `u(region).vector.cross(n) - g` (3-D N1E/N2E). "
                 "(A vertex-valued field -- Lagrange / Hermite / Argyris / Morley -- DOES take a nodal "
                 "value Dirichlet u(region) - g.)"
