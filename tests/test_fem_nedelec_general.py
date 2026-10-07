@@ -150,7 +150,7 @@ def test_degree_one_map_is_the_edge_topology():
 def _domain(tdim, h):
     if tdim == 2:
         return jno.domain(box(0, 0, 1, 1), mesh_size=h)
-    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=h).domain()
+    return jno.shape.box(0, 0, 0, 1, 1, 1, size=h).domain()
 
 
 def _bound(d, tdim, space, k, names=("u", "v")):
@@ -701,7 +701,7 @@ def test_bloch_periodic_cube_spectrum_at_degree_two():
     from jno._fem import _build_periodic_reduction_entities, _periodic_tie_spec
 
     phi = 1.1
-    d = jno.domain(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5))
+    d = jno.domain(jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5))
     e = 1e-6
     for nm, ax, val in (("x0", 0, 0.0), ("x1", 0, 1.0), ("y0", 1, 0.0), ("y1", 1, 1.0), ("z0", 2, 0.0), ("z1", 2, 1.0)):
         d.tag(nm, (lambda a, v: lambda *X: np.abs(X[a] - v) < e)(ax, val))
@@ -892,7 +892,7 @@ def test_point_evaluation_and_dof_positions():
 
 def test_field_parameter_region_coefficient_and_shape_derivative_at_degree_two():
     """The coefficient machinery is degree-agnostic: (a) a P1 FIELD parameter k(x) reproduces the
-    analytic coefficient exactly and differentiates; (b) a per-region coefficient d.by_region equals
+    analytic coefficient exactly and differentiates; (b) a per-region coefficient (d.attach) equals
     the per-region loop; (c) a trainable coordinate gives a shape derivative matching central
     differences -- all on N1E_2."""
     from jno.utils.solver.linear import sparse_lu_solve
@@ -931,7 +931,9 @@ def test_field_parameter_region_coefficient_and_shape_derivative_at_degree_two()
     xr, yr, _ = d2.variable("interior_R", split=True)
     ui, vi = u.bind(x=xi2, y=yi2), v.bind(x=xi2, y=yi2)
     ul, vl, ur, vr = u.bind(x=xl, y=yl), v.bind(x=xl, y=yl), u.bind(x=xr, y=yr), v.bind(x=xr, y=yr)
-    kr = d2.by_region({"L": 3.0, "R": 7.0})
+    d2.attach("L", kreg=3.0)
+    d2.attach("R", kreg=7.0)
+    kr = d2.kreg
     one = _dense(jno.fem([kr * inner(ui, vi) + ui.curl() * vi.curl()]).A)
     loop = _dense(jno.fem([3.0 * inner(ul, vl), 7.0 * inner(ur, vr), ui.curl() * vi.curl()]).A)
     np.testing.assert_allclose(one, loop, atol=1e-12)
