@@ -888,3 +888,99 @@ def test_point_evaluation_and_dof_positions():
     np.testing.assert_allclose(C[e0], np.broadcast_to(pts[dm.entity_vertices[1][0]].mean(0), (len(e0), 3)))
     f0 = dm.entity_global_dofs(2, 0)
     np.testing.assert_allclose(C[f0], np.broadcast_to(pts[dm.entity_vertices[2][0]].mean(0), (len(f0), 3)))
+
+
+def test_field_parameter_region_coefficient_and_shape_derivative_at_degree_two():
+    """The coefficient machinery is degree-agnostic: (a) a P1 FIELD parameter k(x) reproduces the
+    analytic coefficient exactly and differentiates; (b) a per-region coefficient d.by_region equals
+    the per-region loop; (c) a trainable coordinate gives a shape derivative matching central
+    differences -- all on N1E_2."""
+    from jno.utils.solver.linear import sparse_lu_solve
+
+    # (a) field parameter
+    d = _domain(3, 0.6)
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    kf, _ = d.fem_symbols()
+    k = jno.np.parameter(kf, name="k")
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E", order=2)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+    fem = jno.fem([inner(cu, cv) - k * inner(ui, vi)])
+    nodes = np.asarray(d.built_mesh.points)[:, :3]
+    k_lin = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1] + 0.3 * nodes[:, 2])
+    u2, v2 = d.fem_symbols(value_shape=(3,), names=("u2", "v2"), space="N1E", order=2)
+    ux, vx = u2.bind(x=xi, y=yi, z=zi), v2.bind(x=xi, y=yi, z=zi)
+    ref = _dense(
+        jno.fem(
+            [
+                inner(u2.vector.curl(xi, yi, zi), v2.vector.curl(xi, yi, zi))
+                - (0.6 + 0.8 * xi + 0.5 * yi + 0.3 * zi) * inner(ux, vx)
+            ]
+        ).A
+    )
+    A_field, _b = fem.operator.evaluate({"k": k_lin})
+    np.testing.assert_allclose(_dense(A_field), ref, atol=1e-9)
+    g = np.asarray(jax.grad(lambda kv: jnp.sum(fem.operator.evaluate({"k": kv})[0].todense() ** 2))(k_lin))
+    assert np.all(np.isfinite(g)) and np.linalg.norm(g) > 0
+
+    # (b) per-region coefficient
+    d2 = jno.domain.csg.from_regions({"L": box(0, 0, 0.5, 1), "R": box(0.5, 0, 1, 1)}, mesh_size=0.3, time=None)
+    u, v = d2.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E", order=2)
+    xi2, yi2, _ = d2.variable("interior", split=True)
+    xl, yl, _ = d2.variable("interior_L", split=True)
+    xr, yr, _ = d2.variable("interior_R", split=True)
+    ui, vi = u.bind(x=xi2, y=yi2), v.bind(x=xi2, y=yi2)
+    ul, vl, ur, vr = u.bind(x=xl, y=yl), v.bind(x=xl, y=yl), u.bind(x=xr, y=yr), v.bind(x=xr, y=yr)
+    kr = d2.by_region({"L": 3.0, "R": 7.0})
+    one = _dense(jno.fem([kr * inner(ui, vi) + ui.curl() * vi.curl()]).A)
+    loop = _dense(jno.fem([3.0 * inner(ul, vl), 7.0 * inner(ur, vr), ui.curl() * vi.curl()]).A)
+    np.testing.assert_allclose(one, loop, atol=1e-12)
+
+    # (c) shape derivative w.r.t. the z-coordinates
+    d3 = _domain(3, 0.6)
+    pts = np.asarray(d3.mesh.points)
+    u, v = d3.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E", order=2)
+    ci = d3.variable("interior", split=True)
+    x, y, z = ci[0], ci[1], ci[2]
+    ci[2].trainable(name="X")
+    fem = jno.fem(
+        [
+            inner(u.vector.curl(x, y, z), v.vector.curl(x, y, z))
+            + 1e-1 * inner(u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z))
+            - inner(_vec([1.0 + 0.0 * x, 0.0 * x, 0.0 * x]), v.bind(x=x, y=y, z=z)),
+            u.vector.cross(d3.variable("boundary", normals=True)),
+        ]
+    )
+    op = fem.operator
+
+    def obj(vals):
+        A, b = op.evaluate({"X": vals})
+        return jnp.sum(sparse_lu_solve(A, b) ** 2)
+
+    z0 = jnp.asarray(pts[:, 2])
+    gz = np.asarray(jax.grad(obj)(z0))
+    assert np.linalg.norm(gz) > 0
+    h = 1e-6
+    for kk in np.argsort(-np.abs(gz))[:2]:
+        fd = (obj(z0.at[kk].add(h)) - obj(z0.at[kk].add(-h))) / (2 * h)
+        assert np.isclose(gz[kk], float(fd), rtol=5e-3), (gz[kk], float(fd))
+
+
+def test_second_order_in_time_wave_at_degree_two():
+    """u_tt + u = 0 on N1E_2 with u0 = (-y, x), u̇0 = 0: u(T) = cos(T) u0. The second-order path's IC
+    projection now takes a VECTOR basis (it was scalar-only, so an H(curl) wave equation failed at
+    every degree)."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.5, 51))
+    co = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E", order=2)
+    ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
+    fem = jno.fem([inner(ui.tt, vi) + inner(ui, vi), u(ci[0], ci[1]) - jno.np.vector(-ci[1], ci[0] + 0.0 * ci[1])])
+    assert fem.is_transient
+    traj = np.asarray(_default_transient_integrate(fem.operator, {}, jnp.linspace(fem.t0, fem.t1, 51)))
+    n = traj.shape[1] // 2
+    val, X, _ = _readback(d, traj[-1][:n])
+    T = float(fem.t1 - fem.t0)
+    np.testing.assert_allclose(val, np.cos(T) * np.stack([-X[..., 1], X[..., 0]], -1), atol=2e-4)
