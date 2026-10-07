@@ -1279,7 +1279,15 @@ def solve_network(
                 mu0,
                 "near",
                 lambda: near_block(
-                    geometry_host if geometry_host is not None else fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi)
+                    geometry_host if geometry_host is not None else fil,
+                    lambda r: 1.0 / r,
+                    mu_scale=mu0 / (4.0 * jnp.pi),
+                    # A network of face sheets wants a SHORT reach: the band's job is the strongest
+                    # couplings, and a sheet's partner on the opposite face is already within one
+                    # element size. Truncating further out leaves an indefinite band whose LU slows
+                    # GMRES down -- measured on a welded half-bridge at 10 MHz, preconditioner
+                    # applications to converge: reach 0.5 / 1.0 -> 67, 1.5 -> 925, 2.0 -> 391.
+                    reach=1.0 if pidx is not None else 2.0,
                 ),
             )
             if welded
@@ -2242,7 +2250,23 @@ def bar_filaments(
     # and a return plane's thickness moves L where it physically cannot. The pair is a second lattice
     # family on the same grid and masks, its current displaced to the opposite face; the split
     # between them is found by the solve, through `slab_transfer_impedance`.
-    delta = _skin_depth(sigma, freq)
+    # A conductivity given as a callable of position -- a design field -- is probed at the cell
+    # centres for the gate. Left unread, it switched the sheets OFF for every density-designed
+    # layout: the one-current model, +20 % on a loop over its return plane, and a slower solve.
+    def _probe(v):
+        if not callable(v):
+            return v
+        try:
+            k = _field_arity(v)
+            out = np.asarray(jax.lax.stop_gradient(jnp.asarray(v(*[np.asarray(nodes)[:, i] for i in range(k)]))))
+            return float(np.max(out))
+        except Exception:  # noqa: BLE001 -- a gate: unreadable means the old model, never an error
+            return None
+
+    _sig_gate = [_probe(v) for v in sigma] if isinstance(sigma, (list, tuple)) else _probe(sigma)
+    if isinstance(_sig_gate, list):
+        _sig_gate = [v for v in _sig_gate if v is not None] or None
+    delta = _skin_depth(_sig_gate, freq)
     sheets = (
         _sheet_families(axis, skin, span, d, delta, None if edges is None else np.asarray(node_d)[end_a]) if delta else {}
     )
