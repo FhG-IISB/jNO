@@ -278,6 +278,19 @@ class DofMap:
             return self.blocks[dim][k, int(self.orient[dim][c, k])]
         return np.eye(nd)
 
+    def dof_entity_centroids(self, points: np.ndarray) -> np.ndarray:
+        """``(n_dofs, gdim)``: the centroid of the mesh entity each global DOF belongs to (a vertex, edge
+        midpoint, face or cell centroid) -- where a DOF "lives", e.g. to select the DOFs on a plane."""
+        pts = np.asarray(points)
+        out = np.zeros((self.n_dofs, pts.shape[1]))
+        for d in range(self.tdim + 1):
+            nd = self.n_entity_dofs[d]
+            if nd == 0 or self.n_entities[d] == 0:
+                continue
+            cen = pts[self.entity_vertices[d]].mean(axis=1)  # (n_entities, gdim)
+            out[self.entity_offset[d] : self.entity_offset[d] + self.n_entities[d] * nd] = np.repeat(cen, nd, axis=0)
+        return out
+
     def entity_global_dofs(self, dim: int, e: int) -> np.ndarray:
         nd = self.n_entity_dofs[dim]
         return self.entity_offset[dim] + e * nd + np.arange(nd)

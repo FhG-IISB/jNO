@@ -820,3 +820,71 @@ def test_rt_mixed_poisson_3d_degree_two():
     e1 = _mixed_poisson_error(3, 2, 0.18)
     r = np.log(np.array(e0) / np.array(e1)) / np.log(0.25 / 0.18)
     assert r.min() > 1.6, f"RT_2 3-D: {e0} -> {e1}, rates {r}"
+
+
+# ------------------------------------------------------------------------------------------------
+# the other solver modes, and reading fields back, at degree k
+# ------------------------------------------------------------------------------------------------
+
+
+def test_transient_forced_decay_at_degree_two():
+    """∂ₜu + u = f(x) on N1E_2 with u0 = a quadratic-free LINEAR field: the IC projection is exact in
+    N1E_2, and the real time integrator's u(T) matches the analytic e^{-T} u0 + (1 - e^{-T}) f to the
+    backward-Euler error (f = (1 + y, x) also lies in N1E_2, so space is exact)."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.2, 41))
+    co = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E", order=2)
+    ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
+    ic = u(ci[0], ci[1]) - jno.np.vector(-ci[1], ci[0] + 0.0 * ci[1])
+    fem = jno.fem([inner(ui.t, vi) + inner(ui, vi) - ((1.0 + co[1]) * vi[0] + co[0] * vi[1]), ic])
+    assert fem.is_transient and fem.is_linear
+    traj = np.asarray(_default_transient_integrate(fem.operator, {}, jnp.linspace(fem.t0, fem.t1, 41)))
+    val0, X, _ = _readback(d, traj[0])
+    np.testing.assert_allclose(val0, np.stack([-X[..., 1], X[..., 0]], -1), atol=1e-10)  # exact IC projection
+    T = float(fem.t1 - fem.t0)
+    val, X, _ = _readback(d, traj[-1])
+    u0 = np.stack([-X[..., 1], X[..., 0]], -1)
+    f = np.stack([1.0 + X[..., 1], X[..., 0]], -1)
+    exact = np.exp(-T) * u0 + (1 - np.exp(-T)) * f
+    assert np.abs(val - exact).max() < 2e-3  # backward Euler, dt = 5e-3
+
+
+def test_nonlinear_solve_at_degree_two():
+    """A genuinely nonlinear ∫(1 + |u|²) u·v = ∫ f·v on N1E_2 goes to the Newton residual operator and
+    solves to a root -- the residual at NONZERO u, through the degree-2 transform."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.4)
+    u, v, ui, vi, (x, y) = _bound(d, 2, "N1E", 2)
+    fem = jno.fem([inner(ui, vi) + inner(ui, ui) * inner(ui, vi) - ((1.0 + y) * vi[0] + 0.5 * x * vi[1])])
+    assert not fem.is_linear
+    usol = np.asarray(fem.solve()).reshape(-1)
+    assert float(jnp.linalg.norm(fem.residual(jnp.asarray(usol)))) < 1e-7
+
+
+def test_point_evaluation_and_dof_positions():
+    """``nonnodal_field_at_points`` locates physical points and reproduces a field of the space there;
+    ``DofMap.dof_entity_centroids`` puts every DOF on its entity (edge DOFs at edge midpoints, face DOFs
+    at face centroids) -- what plane/face selections of DOFs (e.g. an RCWA source face) rely on."""
+    from jno.utils.solver.fem_nonnodal import nonnodal_field_at_points
+
+    d = _domain(3, 0.6)
+    u, v, ui, vi, (x, y, z) = _bound(d, 3, "N1E", 2)
+    M = _dense(jno.fem([inner(ui, vi)]).A)
+    b = np.asarray(jno.fem([inner(ui, vi) - inner(_vec([1 + y, 2 - x, z + 0.0 * x]), vi)]).b).reshape(-1)
+    sol = np.linalg.solve(M, b)
+    topo = d._fem_nonnodal_topology
+    pts, cells, dm = np.asarray(d.mesh.points)[:, :3], topo["cells"], topo["dofmap"]
+    X = np.random.default_rng(5).random((25, 3)) * 0.98 + 0.01
+    val = np.asarray(nonnodal_field_at_points(pts, cells, dm, jnp.asarray(sol), X))
+    np.testing.assert_allclose(val, np.stack([1 + X[:, 1], 2 - X[:, 0], X[:, 2]], -1), atol=1e-10)
+    crl = np.asarray(nonnodal_field_at_points(pts, cells, dm, jnp.asarray(sol), X, derivative="curl"))
+    np.testing.assert_allclose(crl, np.broadcast_to([0.0, 0.0, -2.0], crl.shape), atol=1e-10)  # curl(1+y, 2-x, z)
+    with pytest.raises(ValueError, match="outside the mesh"):
+        nonnodal_field_at_points(pts, cells, dm, jnp.asarray(sol), np.array([[2.0, 0.5, 0.5]]))
+    C = dm.dof_entity_centroids(pts)
+    e0 = dm.entity_global_dofs(1, 0)
+    np.testing.assert_allclose(C[e0], np.broadcast_to(pts[dm.entity_vertices[1][0]].mean(0), (len(e0), 3)))
+    f0 = dm.entity_global_dofs(2, 0)
+    np.testing.assert_allclose(C[f0], np.broadcast_to(pts[dm.entity_vertices[2][0]].mean(0), (len(f0), 3)))

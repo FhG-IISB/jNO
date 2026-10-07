@@ -2859,50 +2859,23 @@ def n1e_field_at_tet_centroids(points: np.ndarray, cells: np.ndarray, top, u_edg
     return jax.vmap(_val)(cells_j, signs, coeffs)
 
 
-def nonnodal_field_at(points, cells, dofmap, u, *, ref_points=None, cell_ids=None, derivative=None):
-    """Evaluate a solved non-nodal field of ANY degree inside its cells -- the degree-k read-back.
+def _readback_kernel(dofmap, pts, derivative):
+    """The per-(cell, points) evaluator shared by the read-backs: ``(c, cell_vertex_ids, coeffs, rv, rg)``
+    -> field data at the points whose reference tabulation is ``rv``/``rg``."""
+    from .fem_dofmap import map_type, transform_from_tables
 
-    ``dofmap`` is the field's :class:`fem_dofmap.DofMap` (``domain._fem_nonnodal_topology["dofmap"]``
-    after a solve, or :func:`fem_dofmap.build_dofmap`), ``u`` the field's block of the solution
-    (``n_dofs``). ``ref_points`` ``(n_pts, tdim)`` are reference-cell points (default: the centroid),
-    evaluated in every cell of ``cell_ids`` (default: all). The basis is the assembler's: basix reference
-    tabulation, the per-cell DOF transform ``B`` (or the ±1 signs at degree 1), then the family's Piola
-    map, so a read-back always describes the field that was solved.
-
-    ``derivative``: ``None`` -> values ``(n_sel, n_pts, value_size)`` (scalar Lagrange: ``(n_sel,
-    n_pts)``); ``"curl"`` (H(curl): ``(n_sel, n_pts)`` in 2-D, ``(n_sel, n_pts, 3)`` in 3-D); ``"div"``
-    (H(div): ``(n_sel, n_pts)``); ``"grad"`` (Lagrange: ``(n_sel, n_pts, tdim)``; vector families:
-    ``(n_sel, n_pts, value_size, tdim)``). Linear in ``u`` (complex ``u`` gives complex output) and pure
-    JAX after the host tabulation, so it differentiates in ``u`` and in ``points``."""
-    from .fem_dofmap import map_type
-
-    pts = jnp.asarray(points)
-    cells = np.asarray(cells, dtype=np.int64)
-    tdim = cells.shape[1] - 1
-    if ref_points is None:
-        ref_points = np.full((1, tdim), 1.0 / (tdim + 1))
-    ref_points = np.atleast_2d(np.asarray(ref_points, dtype=float))
-    sel = np.arange(cells.shape[0]) if cell_ids is None else np.asarray(cell_ids, dtype=np.int64)
-    elem = dofmap.element
-    tab = elem.tabulate(1, ref_points)  # (1 + tdim, n_pts, n_dof, vs)
-    rv = jnp.asarray(tab[0])
-    rg = jnp.asarray(np.stack([tab[1 + a] for a in range(tdim)], axis=-1))  # (n_pts, n_dof, vs, tdim)
+    tdim = dofmap.tdim
     mt = map_type(dofmap.family)
     if derivative not in (None, "curl", "div", "grad"):
-        raise ValueError(f"nonnodal_field_at: derivative must be None, 'curl', 'div' or 'grad'; got {derivative!r}.")
+        raise ValueError(f"nonnodal read-back: derivative must be None, 'curl', 'div' or 'grad'; got {derivative!r}.")
     if derivative == "curl" and mt != "covariant":
-        raise ValueError(f"nonnodal_field_at: 'curl' is the H(curl) derivative; {dofmap.family} is {mt}-mapped.")
+        raise ValueError(f"nonnodal read-back: 'curl' is the H(curl) derivative; {dofmap.family} is {mt}-mapped.")
     if derivative == "div" and mt != "contravariant":
-        raise ValueError(f"nonnodal_field_at: 'div' is the H(div) derivative; {dofmap.family} is {mt}-mapped.")
-    cells_j = jnp.asarray(cells[sel], dtype=jnp.int32)
-    coeffs = jnp.asarray(u)[jnp.asarray(dofmap.cell_dofs[sel], dtype=jnp.int32)]
-    sel_j = jnp.asarray(sel, dtype=jnp.int32)
+        raise ValueError(f"nonnodal read-back: 'div' is the H(div) derivative; {dofmap.family} is {mt}-mapped.")
     signs = None if not dofmap.is_diagonal else jnp.asarray(dofmap.signs)
-    from .fem_dofmap import transform_from_tables
-
     tables = None if signs is not None else dofmap.jax_tables()  # eager: never created under the vmap trace
 
-    def _one(c, cell, cf):
+    def _one(c, cell, cf, rv, rg):
         V = pts[cell]
         J = jnp.stack([V[k] - V[0] for k in range(1, tdim + 1)], axis=1)
         K = jnp.linalg.inv(J)
@@ -2931,4 +2904,85 @@ def nonnodal_field_at(points, cells, dofmap, u, *, ref_points=None, cell_ids=Non
             return G[:, 1, 0] - G[:, 0, 1]
         return jnp.stack([G[:, 2, 1] - G[:, 1, 2], G[:, 0, 2] - G[:, 2, 0], G[:, 1, 0] - G[:, 0, 1]], axis=-1)
 
-    return jax.vmap(_one)(sel_j, cells_j, coeffs)
+    return _one
+
+
+def _tabulate(dofmap, ref_points):
+    tdim = dofmap.tdim
+    tab = dofmap.element.tabulate(1, np.atleast_2d(np.asarray(ref_points, dtype=float)))
+    rv = jnp.asarray(tab[0])
+    rg = jnp.asarray(np.stack([tab[1 + a] for a in range(tdim)], axis=-1))  # (n_pts, n_dof, vs, tdim)
+    return rv, rg
+
+
+def nonnodal_field_at(points, cells, dofmap, u, *, ref_points=None, cell_ids=None, derivative=None):
+    """Evaluate a solved non-nodal field of ANY degree inside its cells -- the degree-k read-back.
+
+    ``dofmap`` is the field's :class:`fem_dofmap.DofMap` (``domain._fem_nonnodal_topology["dofmap"]``
+    after a solve, or :func:`fem_dofmap.build_dofmap`), ``u`` the field's block of the solution
+    (``n_dofs``). ``ref_points`` ``(n_pts, tdim)`` are reference-cell points (default: the centroid),
+    evaluated in every cell of ``cell_ids`` (default: all). The basis is the assembler's: basix reference
+    tabulation, the per-cell DOF transform ``B`` (or the ±1 signs at degree 1), then the family's Piola
+    map, so a read-back always describes the field that was solved.
+
+    ``derivative``: ``None`` -> values ``(n_sel, n_pts, value_size)`` (scalar Lagrange: ``(n_sel,
+    n_pts)``); ``"curl"`` (H(curl): ``(n_sel, n_pts)`` in 2-D, ``(n_sel, n_pts, 3)`` in 3-D); ``"div"``
+    (H(div): ``(n_sel, n_pts)``); ``"grad"`` (Lagrange: ``(n_sel, n_pts, tdim)``; vector families:
+    ``(n_sel, n_pts, value_size, tdim)``). Linear in ``u`` (complex ``u`` gives complex output) and pure
+    JAX after the host tabulation, so it differentiates in ``u`` and in ``points``.
+    :func:`nonnodal_field_at_points` evaluates at physical points instead."""
+    pts = jnp.asarray(points)
+    cells = np.asarray(cells, dtype=np.int64)
+    tdim = cells.shape[1] - 1
+    if ref_points is None:
+        ref_points = np.full((1, tdim), 1.0 / (tdim + 1))
+    sel = np.arange(cells.shape[0]) if cell_ids is None else np.asarray(cell_ids, dtype=np.int64)
+    rv, rg = _tabulate(dofmap, ref_points)
+    one = _readback_kernel(dofmap, pts, derivative)
+    cells_j = jnp.asarray(cells[sel], dtype=jnp.int32)
+    coeffs = jnp.asarray(u)[jnp.asarray(dofmap.cell_dofs[sel], dtype=jnp.int32)]
+    sel_j = jnp.asarray(sel, dtype=jnp.int32)
+    return jax.vmap(lambda c, cell, cf: one(c, cell, cf, rv, rg))(sel_j, cells_j, coeffs)
+
+
+def nonnodal_field_at_points(points, cells, dofmap, u, X, *, derivative=None, tol=1e-9):
+    """Evaluate a solved non-nodal field of any degree at PHYSICAL points ``X`` (``(n, tdim)``).
+
+    Each point is located in a cell on the host (candidates from a KD-tree on the cell centroids,
+    accepted by their barycentric coordinates within ``tol``, with a full scan as the fallback), then
+    the assembler's basis is evaluated there -- so a point on a shared facet takes its value from one of
+    the cells containing it (the conforming trace agrees; the other components of an H(curl)/H(div)
+    field may jump, which is the physics). Raises for a point outside the mesh rather than
+    extrapolating. Output shapes as :func:`nonnodal_field_at` without the cell axis: ``(n, ...)``.
+    Differentiable in ``u``; the point location is host-side (``X`` is data)."""
+    from scipy.spatial import cKDTree
+
+    P = np.asarray(points)
+    cells = np.asarray(cells, dtype=np.int64)
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    tdim = cells.shape[1] - 1
+    V = P[cells][:, :, :tdim]
+    J = np.stack([V[:, k] - V[:, 0] for k in range(1, tdim + 1)], axis=2)
+    Jinv = np.linalg.inv(J)
+    _d, cand = cKDTree(V.mean(axis=1)).query(X, k=min(len(cells), 32))
+    cand = np.asarray(cand).reshape(X.shape[0], -1)
+    found_c = np.full(X.shape[0], -1, dtype=np.int64)
+    found_xi = np.zeros((X.shape[0], tdim))
+    for i in range(X.shape[0]):
+        xi = np.einsum("cij,cj->ci", Jinv[cand[i]], X[i] - V[cand[i], 0])
+        ok = np.flatnonzero((xi.min(axis=1) >= -tol) & (xi.sum(axis=1) <= 1.0 + tol))
+        if ok.size:
+            found_c[i], found_xi[i] = cand[i][ok[0]], xi[ok[0]]
+            continue
+        xi = np.einsum("cij,cj->ci", Jinv, X[i] - V[:, 0])
+        ok = np.flatnonzero((xi.min(axis=1) >= -tol) & (xi.sum(axis=1) <= 1.0 + tol))
+        if ok.size == 0:
+            raise ValueError(f"nonnodal_field_at_points: point {X[i]} lies outside the mesh.")
+        found_c[i], found_xi[i] = ok[0], xi[ok[0]]
+    rv, rg = _tabulate(dofmap, found_xi)  # (n, n_dof, vs): one reference point per located point
+    one = _readback_kernel(dofmap, jnp.asarray(P), derivative)
+    coeffs = jnp.asarray(u)[jnp.asarray(dofmap.cell_dofs[found_c], dtype=jnp.int32)]
+    out = jax.vmap(lambda c, cell, cf, v, g: one(c, cell, cf, v[None], g[None])[0])(
+        jnp.asarray(found_c, dtype=jnp.int32), jnp.asarray(cells[found_c], dtype=jnp.int32), coeffs, rv, rg
+    )
+    return out
