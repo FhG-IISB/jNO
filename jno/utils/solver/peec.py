@@ -1224,7 +1224,6 @@ def solve_network(
 
     if free_form:
         import scipy.sparse as sp
-        import scipy.sparse.linalg as spla
 
         w = float(omega)
         Rc = R.astype(complex)
