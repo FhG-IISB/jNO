@@ -532,6 +532,63 @@ def _parameters_in(values):
     return out
 
 
+def _nodal_params(node):
+    """The NODAL FIELD parameters (``jno.np.parameter(<P1 symbol>)``) inside an attached value."""
+    return [mc for mc in _model_calls(node) if getattr(mc.model, "_fem_field", None) == "node"]
+
+
+_NODAL_STENCILS = {}
+
+
+def _nodal_stencil(mc, xyz):
+    """The P1 stencil of a nodal field parameter's mesh at points ``xyz`` -- host work, cached.
+
+    A lattice conductivity is one value per CELL and a nodal field is one value per mesh NODE, so the
+    field is read at the cell centres by the mesh's own P1 interpolation: the same shape functions the
+    FEM uses for it, which is what lets ONE design field drive both a PEEC conductivity and a FEM
+    coefficient. The stencil depends only on geometry, so a design loop pays for it once.
+    """
+    from .utils.solver.fem_adapt import _locate_barycentric
+
+    dom = mc.model._fem_field_domain
+    xyz = np.asarray(xyz, dtype=float)
+    key = (id(dom), xyz.shape, hash(xyz.tobytes()))
+    hit = _NODAL_STENCILS.get(key)
+    if hit is not None and hit[0] is dom:
+        return hit[1]
+    pts = np.asarray(dom.mesh.points, dtype=float)
+    cells = np.asarray(dom._cells_p1())
+    dim = pts.shape[1]
+    idx, w, inside = _locate_barycentric(pts, cells, xyz[:, :dim], tol=1e-9, k=12)
+    if not np.all(inside):
+        raise ValueError(
+            f"jno.peec: {int((~np.asarray(inside)).sum())} element centre(s) of a conductor whose "
+            "conductivity is a nodal field parameter lie outside that parameter's mesh, so the field "
+            "has no value there. Declare the parameter on the symbol of the domain the conductor is in."
+        )
+    out = (jnp.asarray(idx), jnp.asarray(w))
+    if len(_NODAL_STENCILS) > 32:
+        _NODAL_STENCILS.pop(next(iter(_NODAL_STENCILS)))
+    _NODAL_STENCILS[key] = (dom, out)
+    return out
+
+
+def _at_nodes(expr, params):
+    """An attached value holding a nodal field parameter, as a callable of position.
+
+    ``.attach(sigma=lambda x, y, z: ...)`` is already how a lattice takes a conductivity that varies in
+    space -- it is evaluated at each conductor's own element centres -- so a nodal field becomes exactly
+    that: the expression with the field read off at the points it is called with. Differentiable in
+    the field's values; the interpolation weights are geometry.
+    """
+
+    def at(x, y, z):
+        xyz = np.stack([np.asarray(x), np.asarray(y), np.asarray(z)], axis=1)
+        return _eval_material(expr, params, xyz=xyz)
+
+    return at
+
+
 def _field_symbols(node):
     """The FEM trial-function symbols inside an attached value -- a conductivity written in terms of a
     field another solver computes (``sigma(T)`` with ``T`` from ``d.fem_symbols()``)."""
@@ -549,7 +606,7 @@ def _field_symbols(node):
     return out
 
 
-def _eval_field_material(expr, field_values, params=None):
+def _eval_field_material(expr, field_values, params=None, xyz=None):
     """An attached material that depends on a FEM field, at given values of that field.
 
     ``field_values`` maps each :class:`~jno.trace.TrialFunction` in ``expr`` to an array (one value per
@@ -571,6 +628,16 @@ def _eval_field_material(expr, field_values, params=None):
         val = (params or {}).get(name) if name is not None else None
         if val is None:
             val = _initial_value(mc)
+        if getattr(mc.model, "_fem_field", None) == "node":
+            if val is None:
+                val = mod.value
+            if xyz is None:
+                # the structural build's reference value: there are no centres in scope there, and
+                # all it needs is a representative number (the skin-depth guard, the lattice)
+                val = jnp.mean(jnp.asarray(val))
+            else:
+                idx, w = _nodal_stencil(mc, xyz)
+                val = (w * jnp.asarray(val).reshape(-1)[idx]).sum(axis=1)
         if val is not None:
             mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(val))
         table[mc.model.layer_id] = mod
@@ -583,7 +650,7 @@ def _eval_field_material(expr, field_values, params=None):
     return jnp.broadcast_to(out.reshape(()), (size,))
 
 
-def _eval_material(expr, params):
+def _eval_material(expr, params, xyz=None):
     """An attached material expression at concrete parameter values -- a JAX array, differentiable.
 
     The same substitution `jno.rcwa` makes for its permittivity: swap each trainable parameter's
@@ -600,6 +667,10 @@ def _eval_material(expr, params):
         return expr
     from jno._fem import _walk
 
+    if xyz is None and _nodal_params(expr):
+        # one value per mesh node: handed to the lattice as a callable of position, which is how it
+        # takes a conductivity that varies in space (see `_at_nodes`)
+        return _at_nodes(expr, params)
     if any(isinstance(n, Variable) for n in _walk(expr)):
         raise ValueError(
             "jno.peec: this network's material depends on both a trainable parameter and POSITION, "
@@ -614,10 +685,16 @@ def _eval_material(expr, params):
         val = params.get(name) if name is not None else None
         if val is None:
             val = _initial_value(mc)
+        if xyz is not None and getattr(mc.model, "_fem_field", None) == "node":
+            if val is None:  # no initializer: the module's own value, still one per node
+                val = mod.value
+            idx, w = _nodal_stencil(mc, xyz)
+            val = (w * jnp.asarray(val).reshape(-1)[idx]).sum(axis=1)
         if val is not None:
             mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(val))
         table[mc.model.layer_id] = mod
-    return TraceEvaluator(table).evaluate(expr, context={})
+    out = TraceEvaluator(table).evaluate(expr, context={})
+    return jnp.asarray(out).reshape(-1) if xyz is not None else out
 
 
 def _initial_value(mc):
@@ -666,7 +743,15 @@ class ParametricSolution:
 
         shapes = {n: tuple(np.shape(self._params[n].model.module.value)) for n in names}
 
+        nodal = {n for n in names if getattr(self._params[n].model, "_fem_field", None) == "node"}
+
         def fn(*values):  # crux threads the current parameter values in here
+            # a nodal field parameter arrives with the trailing channel axis the trace evaluator gives
+            # a field (see trace_evaluator); it is the same values, so drop it rather than refuse
+            values = tuple(
+                jnp.reshape(v, shapes[n]) if n in nodal and int(np.size(v)) == int(np.prod(shapes[n])) else v
+                for n, v in zip(names, values)
+            )
             for nm, val in zip(names, values):
                 # A parameter arriving with the wrong SHAPE means this node is being evaluated
                 # somewhere that slices it -- a FEM region coefficient is evaluated PER QUADRATURE
@@ -971,8 +1056,9 @@ class PEEC:
                 if _model_calls(val):
                     param_exprs[n] = val
                     val = _eval_material(val, {})
-                    a = np.asarray(jax.lax.stop_gradient(jnp.asarray(val)))
-                    if not np.all(np.isfinite(a)) or not np.any(np.abs(a) > 0):
+                    # a nodal field comes back as a callable of position; the lattice evaluates it
+                    a = None if callable(val) else np.asarray(jax.lax.stop_gradient(jnp.asarray(val)))
+                    if a is not None and (not np.all(np.isfinite(a)) or not np.any(np.abs(a) > 0)):
                         raise ValueError(
                             f"jno.peec: the conductivity of {n!r} is a trainable parameter whose "
                             "initial value makes it zero everywhere, so the network has no metal to "

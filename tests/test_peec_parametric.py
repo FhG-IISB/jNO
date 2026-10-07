@@ -190,3 +190,36 @@ def test_a_readout_evaluated_per_point_says_so_instead_of_going_singular():
     node = _net(CU * _rho() ** 3).solve().R
     with pytest.raises(ValueError, match="per point"):
         _value_of(node, "rho", jnp.asarray(0.5))  # a scalar where the parameter is (n_cells,)
+
+
+def test_a_nodal_field_parameter_is_read_at_the_element_centres():
+    """ONE design field for two solvers: `jno.np.parameter(T)` is one value per mesh node, which is what
+    `jno.fem` takes for a coefficient, and the lattice reads it at its own element centres by the
+    mesh's P1 interpolation. A linear nodal field is reproduced exactly by P1, so the network must agree
+    with the same field written as a callable of position."""
+    from jno.peec import _nodal_params
+
+    bar = jno.shape.box(0, 0, 0, 16 * mm, 4 * mm, 0.8 * mm, size=0.8 * mm).name("bar")
+    d = bar.domain()
+    T, _s = d.fem_symbols()
+    rho = jno.np.parameter(T, name="rho_n")
+    d.attach(sigma=CU * (0.2 + rho))
+    d.tag("A", lambda x, y, z: x < 0.9 * mm)
+    d.tag("B", lambda x, y, z: x > 15.1 * mm)
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+    node = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e3).solve().R
+    assert _nodal_params(CU * (0.2 + rho))
+
+    ramp = lambda x: 0.3 + 0.5 * x / (16 * mm)  # linear, so P1 reproduces it exactly
+    P = np.asarray(d.mesh.points)
+    got = float(np.real(np.asarray(_value_of(node, "rho_n", jnp.asarray(ramp(P[:, 0]))))))
+    bar2 = jno.shape.box(0, 0, 0, 16 * mm, 4 * mm, 0.8 * mm, size=0.8 * mm).name("bar")
+    d2 = bar2.domain()
+    d2.attach(sigma=lambda x, y, z: CU * (0.2 + ramp(x)))
+    d2.tag("A", lambda x, y, z: x < 0.9 * mm)
+    d2.tag("B", lambda x, y, z: x > 15.1 * mm)
+    i2, v2 = d2.peec_symbols()
+    at2 = lambda t: d2.variable(t, split=True, sample=(2, None))[:3]
+    want = float(np.real(jno.peec([v2(*at2("A")) - v2(*at2("B")) - 1.0], freq=1e3).solve().R))
+    assert abs(got / want - 1) < 1e-9, (got, want)

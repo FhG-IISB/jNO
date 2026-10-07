@@ -4779,7 +4779,9 @@ def _array_digest(leaf):
         arr.dtype.str,
         arr.shape,
         extra,
-        _hashlib.blake2b(memoryview(arr).cast("B"), digest_size=16).digest(),
+        # tobytes, not a memoryview cast: a cast refuses an EMPTY array ("zeros in shape"), and an
+        # empty leaf is legitimate -- a field parameter on a region with no nodes of its own
+        _hashlib.blake2b(arr.tobytes(), digest_size=16).digest(),
     )
     _LEAF_DIGEST_CACHE[key] = (leaf, digest)
     while len(_LEAF_DIGEST_CACHE) > _LEAF_DIGEST_CACHE_MAX:

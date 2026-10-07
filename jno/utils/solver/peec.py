@@ -220,7 +220,11 @@ def resolve_sigma(value, xyz, what: str, tangent=None):
         return jnp.sum(out * tan**2, axis=1)
     if _is_field(value):
         k = _field_arity(value)
-        out = jnp.asarray(value(*[jnp.asarray(xyz)[:, i] for i in range(k)]))
+        # Concrete geometry stays concrete: a jnp copy of it is a TRACER inside a jit, and a callable
+        # that has to do host work on the points -- reading a nodal design field off its mesh at the
+        # element centres -- then has nothing to read. Traced coordinates still pass through.
+        pts = xyz if isinstance(xyz, np.ndarray) else jnp.asarray(xyz)
+        out = jnp.asarray(value(*[pts[:, i] for i in range(k)]))
         if out.ndim == 0:
             return jnp.broadcast_to(out, (n,))
         if out.shape != (n,):

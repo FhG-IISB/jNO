@@ -177,6 +177,7 @@ class ElectroThermal:
             stencils[n] = (jnp.asarray(idx), jnp.asarray(w))
         self._built, self._field_exprs, self._field = B, field_exprs, next(iter(fields), None)
         self._stencils = stencils
+        self._centres = seen  # where a nodal design field in the same expression is read
         self._T0 = jnp.asarray(T0).reshape(-1)
 
     # -- one pass of the coupling ----------------------------------------------------------------------------
@@ -189,7 +190,7 @@ class ElectroThermal:
         for n, expr in self._field_exprs.items():
             idx, w = self._stencils[n]
             T_elem = (w * T[idx]).sum(axis=1)
-            sig[n] = _eval_field_material(expr, {self._field: T_elem}, params)
+            sig[n] = _eval_field_material(expr, {self._field: T_elem}, params, xyz=self._centres[n])
         for n, expr in B._param_exprs.items():
             if n not in sig:
                 sig[n] = _eval_material(expr, params)
