@@ -134,7 +134,7 @@ def assemble_fem_nonnodal(
         piola_covariant,
         piola_covariant_grad,
     )
-    from .fem_topology import BASIX_TET_EDGES, build_edge_topology
+    from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES, build_edge_topology
     from .fem_utils import (
         _infer_fields,
         _lower_statefield_to_trial,
@@ -469,9 +469,17 @@ def assemble_fem_nonnodal(
     _cells_for_dm = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
     _n_pts_dm = int(np.asarray(domain.mesh.points).shape[0])
 
+    _edge_top_dm = []  # one edge numbering shared by every map (the same one `top` below uses)
+
     def _dofmap_for(fam, k):
         if (fam, k) not in _dm_cache:
-            _dm_cache[(fam, k)] = build_dofmap(_cells_for_dm, fam, k, n_verts=_n_pts_dm)
+            if not _edge_top_dm:
+                _t = build_edge_topology(_cells_for_dm, BASIX_TET_EDGES if dim == 3 else BASIX_TRIANGLE_EDGES)
+                _edge_top_dm.append(_t)
+            _t = _edge_top_dm[0]
+            _dm_cache[(fam, k)] = build_dofmap(
+                _cells_for_dm, fam, k, n_verts=_n_pts_dm, edges=(_t.cell_edges, _t.edge_vertices)
+            )
         return _dm_cache[(fam, k)]
 
     for _i, _s in enumerate(spaces):
@@ -572,7 +580,11 @@ def assemble_fem_nonnodal(
     # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris/Morley need it for the global
     # id + orientation of their edge-normal DOFs (Hermite, pure-vertex, does not).
     if has_edge or has_argyris or has_morley:
-        top = build_edge_topology(cells, BASIX_TET_EDGES if dim == 3 else ref_spec.local_edges)
+        top = (
+            _edge_top_dm[0]
+            if _edge_top_dm
+            else build_edge_topology(cells, BASIX_TET_EDGES if dim == 3 else ref_spec.local_edges)
+        )
         ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)  # (n_cells, 3) global edge ids
         n_edges = int(top.n_edges)
     else:
