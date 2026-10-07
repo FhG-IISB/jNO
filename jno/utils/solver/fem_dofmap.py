@@ -195,7 +195,18 @@ def _number_entities(cells: np.ndarray, local: np.ndarray) -> Tuple[np.ndarray, 
     cells = np.asarray(cells, dtype=np.int64)
     verts = np.sort(cells[:, local], axis=2)  # (n_cells, n_local, n_v)
     flat = verts.reshape(-1, verts.shape[-1])
-    uniq, first, inverse = np.unique(flat, axis=0, return_index=True, return_inverse=True)
+    nv = flat.shape[1]
+    n = int(cells.max()) + 1 if cells.size else 1
+    if float(n) ** nv < 2.0**62:
+        # pack the sorted vertex tuple into one int64 (mixed radix n): a 1-D unique is ~10x faster than
+        # np.unique(axis=0), which sorts rows lexicographically through a structured view
+        key = np.zeros(flat.shape[0], dtype=np.int64)
+        for j in range(nv):
+            key = key * np.int64(n) + flat[:, j]
+        _u, first, inverse = np.unique(key, return_index=True, return_inverse=True)
+        uniq = flat[first]
+    else:  # too many vertices to pack the tuple: the row-wise unique
+        uniq, first, inverse = np.unique(flat, axis=0, return_index=True, return_inverse=True)
     order = np.argsort(first, kind="stable")
     relabel = np.empty(len(uniq), dtype=np.int64)
     relabel[order] = np.arange(len(uniq), dtype=np.int64)
@@ -334,8 +345,12 @@ def transform_from_tables(tables, ndof_local: int, c):
     return B
 
 
-def build_dofmap(cells: np.ndarray, family: str, degree: int, n_verts: Optional[int] = None) -> DofMap:
-    """Build the :class:`DofMap` of ``family``/``degree`` on the simplex ``cells`` (``(n_cells, 3|4)``)."""
+def build_dofmap(cells: np.ndarray, family: str, degree: int, n_verts: Optional[int] = None, edges=None) -> DofMap:
+    """Build the :class:`DofMap` of ``family``/``degree`` on the simplex ``cells`` (``(n_cells, 3|4)``).
+
+    ``edges`` optionally passes an already-built ``(cell_edges, edge_vertices)`` numbering in basix edge
+    order (:func:`fem_topology.build_edge_topology` -- the same first-encounter numbering), so an
+    assembler that has one does not number the edges twice."""
     cells = np.asarray(cells, dtype=np.int64)
     tdim = cells.shape[1] - 1
     cell = "tetrahedron" if tdim == 3 else "triangle"
@@ -349,6 +364,13 @@ def build_dofmap(cells: np.ndarray, family: str, degree: int, n_verts: Optional[
     cell_entities: List[np.ndarray] = [cells]
     entity_vertices: List[np.ndarray] = [np.arange(n_verts, dtype=np.int64)[:, None]]
     for dim in range(1, tdim):
+        if dim == 1 and edges is not None:
+            ce, ev = np.asarray(edges[0], dtype=np.int64), np.asarray(edges[1], dtype=np.int64)
+            if ce.shape != (n_cells, len(topo[1])):
+                raise ValueError(f"build_dofmap: edges= has shape {ce.shape}, expected {(n_cells, len(topo[1]))}.")
+            cell_entities.append(ce)
+            entity_vertices.append(ev)
+            continue
         ce, ev = _number_entities(cells, np.asarray(topo[dim], dtype=np.int64))
         cell_entities.append(ce)
         entity_vertices.append(ev)
