@@ -55,8 +55,12 @@ def wire_network(sigma=SIG):
 @pytest.mark.parametrize("freq", [0.0, 1e6])
 def test_building_first_changes_no_digit(freq):
     a, b = network(freq=freq).solve(), network(freq=freq).build().solve()
+    # bitwise on CPU; on a GPU the preconditioner is factorised by cuDSS, whose parallel reductions
+    # are not bit-reproducible run to run, so the Krylov iterate differs in the last digits there
+    tol = 0.0 if jax.default_backend() == "cpu" else 1e-12
     for k in ("R", "L", "Z"):
-        assert complex(getattr(a, k)) == complex(getattr(b, k))
+        x, y = complex(getattr(a, k)), complex(getattr(b, k))
+        assert abs(x - y) <= tol * max(abs(x), abs(y)), (k, x, y)
 
 
 def test_a_welded_network_builds_the_same_too():

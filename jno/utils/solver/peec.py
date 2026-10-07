@@ -1428,10 +1428,10 @@ def solve_network(
                     ),
                     shape=(ne, ne),
                 ).tocsr()
-                _LU_HOLDER["lu"] = spla.splu(sp.bmat([[zblk, -AT], [CI, Cp]], format="csc"))
+                _LU_HOLDER["lu"] = _host_or_device_lu(sp.bmat([[zblk, -AT], [CI, Cp]], format="csc"))
                 _LU_HOLDER["kind"] = "whole"
             else:  # a plain lattice: the Schur complement of the diagonal, which is what suits it
-                _LU_HOLDER["lu"] = spla.splu((CI @ sp.diags(1.0 / zdn) @ AT + Cp).tocsc())
+                _LU_HOLDER["lu"] = _host_or_device_lu((CI @ sp.diags(1.0 / zdn) @ AT + Cp).tocsc())
                 _LU_HOLDER["kind"] = "schur"
             _LU_HOLDER["key"] = ckey
             _LU_HOLDER["base"] = None  # set by the first solve this factorisation serves
@@ -3144,6 +3144,90 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
 _THICKNESS_WARNED = set()  # (network, frequency, count) already reported; see the guard
 _KRYLOV_CACHE = {}  # one compiled Krylov solve per (network, size, tolerance), reused across frequencies
 _LU_HOLDER = {}  # the current host factorisation, so the callback closure does not change identity
+
+
+class _DeviceLU:
+    """The preconditioner's factorisation on the GPU (NVIDIA cuDSS), with SuperLU's ``solve`` face.
+
+    A preconditioner apply was a host round trip into scipy's SuperLU: 1.7 ms each, a few hundred per
+    design step, and the factorisation itself 1.2 s (welded half-bridge, 6,172 unknowns). On the
+    device: 0.06 s and 0.34 ms.
+
+    cuDSS pivots STATICALLY, and this matrix is a saddle point -- the KCL rows carry a zero diagonal
+    block -- so as given it factors to garbage (relative residual inf). Equilibrating rows and columns
+    first (Ruiz, to unit max-norm) and letting cuDSS match large entries onto the diagonal makes it
+    factor to a 1e-4 relative residual: an approximate inverse, which is all a preconditioner is --
+    GMRES converges to its own tolerance regardless, and the residual gate holds it there.
+
+    The transpose (the adjoint's ``P^T``) is a second factorisation of ``B^T``, built on first use:
+    cuDSS has no transpose flag on ``solve``.
+    """
+
+    def __init__(self, M):
+        import cupy as cp
+        import cupyx.scipy.sparse as csp
+        import scipy.sparse as _sp
+
+        M = _sp.csr_matrix(M).astype(complex)
+        n = M.shape[0]
+        r, c, B = np.ones(n), np.ones(n), M
+        for _ in range(10):
+            rn = np.sqrt(np.asarray(abs(B).max(axis=1).todense()).ravel())
+            cn = np.sqrt(np.asarray(abs(B).max(axis=0).todense()).ravel())
+            rn[rn == 0] = 1.0
+            cn[cn == 0] = 1.0
+            B = _sp.diags(1.0 / rn) @ B @ _sp.diags(1.0 / cn)
+            r, c = r / rn, c / cn
+        self._B, self._r, self._c, self._cp, self._csp = B.tocsr(), r, c, cp, csp
+        self._fwd = self._factor(self._B)
+        self._bwd = None
+
+    def _factor(self, B):
+        import nvmath.sparse.advanced as nsa
+
+        cp = self._cp
+        Bg = self._csp.csr_matrix(B)
+        bg = cp.zeros(B.shape[0], dtype=complex)
+        s = nsa.DirectSolver(Bg, bg, options={"sparse_system_type": nsa.DirectSolverMatrixType.GENERAL})
+        s.plan_config.matching_algorithm = nsa.DirectSolverMatchingAlg.AUTO
+        s.plan()
+        s.factorize()
+        return (s, bg)
+
+    def solve(self, rhs, trans="N"):
+        cp = self._cp
+        if trans == "T":
+            if self._bwd is None:
+                self._bwd = self._factor(self._B.T.tocsr())
+            (s, bg), pre, post = self._bwd, self._c, self._r
+        else:
+            (s, bg), pre, post = self._fwd, self._r, self._c
+        bg[...] = cp.asarray(pre * np.asarray(rhs))
+        s.reset_operands(b=bg)
+        return post * cp.asnumpy(s.solve())
+
+    def free(self):
+        for f in (self._fwd, self._bwd):
+            if f is not None:
+                f[0].free()
+        self._fwd = self._bwd = None
+
+
+def _host_or_device_lu(M):
+    """A factorisation of the preconditioner matrix: on the GPU when there is one and cuDSS is
+    installed, otherwise scipy's SuperLU. Decided per call from the RUNNING device, not a setting."""
+    import scipy.sparse.linalg as spla
+
+    old = _LU_HOLDER.get("lu")
+    if old is not None and hasattr(old, "free"):
+        old.free()  # a replaced device factorisation would otherwise hold its GPU memory
+        _LU_HOLDER["lu"] = None
+    if jax.default_backend() == "gpu":
+        from .linear import _cudss_available
+
+        if _cudss_available():
+            return _DeviceLU(M)
+    return spla.splu(M.tocsc())
 
 
 def _holder_solve(r):

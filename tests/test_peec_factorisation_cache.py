@@ -24,11 +24,12 @@ SIG, LX, WY, TZ = 5.8e7, 0.040, 0.004, 0.002
 
 
 def _counted():
-    """Wrap scipy's factorisation so a test can count how often it actually runs."""
-    import scipy.sparse.linalg as spla
+    """Wrap the preconditioner factorisation so a test can count how often it actually runs.
 
+    Wrapped at jNO's own seam rather than at scipy's: on a GPU with cuDSS the factorisation never
+    reaches `splu`, and a counter there would read zero whatever the cache did."""
     calls = {"n": 0}
-    real = spla.splu
+    real = P._host_or_device_lu
 
     def counting(*a, **k):
         calls["n"] += 1
@@ -48,32 +49,28 @@ def _built(pitch=0.002, freq=0.0):
 
 
 def test_repeating_the_same_solve_does_not_refactorise():
-    import scipy.sparse.linalg as spla
-
     b = _built()
     b.solve().R.block_until_ready()  # warm compile and prime the holder
     calls, real, counting = _counted()
-    spla.splu = counting
+    P._host_or_device_lu = counting
     try:
         for _ in range(4):
             b.solve().R.block_until_ready()
     finally:
-        spla.splu = real
+        P._host_or_device_lu = real
     assert calls["n"] == 0, f"{calls['n']} factorisations for four identical solves"
 
 
 def test_a_changed_conductivity_DOES_refactorise():
     """The other half of the contract: the cache must not serve a matrix it no longer describes."""
-    import scipy.sparse.linalg as spla
-
     b = _built()
     b.solve(sigma={"bar": SIG}).R.block_until_ready()
     calls, real, counting = _counted()
-    spla.splu = counting
+    P._host_or_device_lu = counting
     try:
         b.solve(sigma={"bar": 0.5 * SIG}).R.block_until_ready()
     finally:
-        spla.splu = real
+        P._host_or_device_lu = real
     assert calls["n"] >= 1, "a different conductivity reused a factorisation built for another one"
 
 
@@ -90,34 +87,30 @@ def test_the_answer_is_unchanged_by_caching():
 
 def test_a_frequency_sweep_refactorises_per_frequency():
     """The Schur complement carries jw, so two frequencies are two different matrices."""
-    import scipy.sparse.linalg as spla
-
     b = _built(freq=0.0)
     b.solve().R.block_until_ready()
     b2 = _built(pitch=0.002, freq=1e4)  # one cell through the thickness: legal at any frequency
     b2.solve().R.block_until_ready()
     calls, real, counting = _counted()
-    spla.splu = counting
+    P._host_or_device_lu = counting
     try:
         b.solve().R.block_until_ready()  # back to the DC network: its key is no longer the holder's
     finally:
-        spla.splu = real
+        P._host_or_device_lu = real
     assert calls["n"] >= 1, "a one-entry cache served a matrix built at another frequency"
 
 
 def test_a_failed_factorisation_leaves_no_key_claiming_success():
-    """If splu raises, the holder must not keep a key that would skip the rebuild next time."""
-    import scipy.sparse.linalg as spla
-
+    """If the factorisation raises, the holder must not keep a key that would skip the rebuild next time."""
     b = _built()
     b.solve().R.block_until_ready()
-    real = spla.splu
-    spla.splu = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    real = P._host_or_device_lu
+    P._host_or_device_lu = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
     try:
         with pytest.raises(Exception):
             b.solve(sigma={"bar": 0.25 * SIG}).R.block_until_ready()
     finally:
-        spla.splu = real
+        P._host_or_device_lu = real
     assert P._LU_HOLDER.get("key") is None
     # and the next real solve still works rather than reusing a corpse
     assert np.isfinite(float(np.real(b.solve(sigma={"bar": 0.25 * SIG}).R)))
