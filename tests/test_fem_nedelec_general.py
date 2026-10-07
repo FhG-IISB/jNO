@@ -984,3 +984,22 @@ def test_second_order_in_time_wave_at_degree_two():
     val, X, _ = _readback(d, traj[-1][:n])
     T = float(fem.t1 - fem.t0)
     np.testing.assert_allclose(val, np.cos(T) * np.stack([-X[..., 1], X[..., 0]], -1), atol=2e-4)
+
+
+def test_fem_eigs_eliminates_the_essential_trace_at_degree_two():
+    """``FEM.eigs`` on a non-nodal form eliminates the PEC DOFs (it read a nodal-only stash before, so the
+    pinned rows stayed in the pencil as scaled identity rows against full mass rows): the 3 modes nearest
+    σ = 30 on the PEC unit square with N1E_2 are 4π², 4π², 2π², and they vanish on the PEC DOFs."""
+    d = _domain(2, 0.25)
+    u, v, ui, vi, _ = _bound(d, 2, "N1E", 2)
+    xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+    ub = u.bind(x=xb, y=yb)
+    K = jno.fem([ui.curl() * vi.curl(), ub[0] * ny - ub[1] * nx - 0.0])
+    pinned = np.asarray(sorted({int(dof) for dof, _v in d._fem_native_dirichlet_pairs}))
+    assert pinned.size > 0
+    lam, X = K.eigs(mass=[inner(ui, vi)], k=3, sigma=30.0)
+    np.testing.assert_allclose(np.sort(np.asarray(lam).real) / PI**2, [2.0, 4.0, 4.0], rtol=2e-3)
+    X = np.asarray(X)
+    assert X.shape[0] == K.offsets[-1]  # modes come back on the full DOF vector
+    # eliminated, not row-replaced: exactly zero on the PEC DOFs (row replacement gives x_d = λ(Mx)_d/K_dd)
+    assert np.abs(X[pinned]).max() == 0.0
