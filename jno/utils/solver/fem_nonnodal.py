@@ -129,15 +129,12 @@ def assemble_fem_nonnodal(
         hermite_triangle,
         morley_pushforward,
         morley_triangle,
-        nedelec_tet,
-        nedelec_triangle,
         piola_contravariant,
         piola_contravariant_grad,
         piola_covariant,
         piola_covariant_grad,
-        raviart_thomas_triangle,
     )
-    from .fem_topology import build_edge_topology
+    from .fem_topology import BASIX_TET_EDGES, build_edge_topology
     from .fem_utils import (
         _infer_fields,
         _lower_statefield_to_trial,
@@ -174,39 +171,38 @@ def assemble_fem_nonnodal(
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
 
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
+    if any(s not in ("RT", "N1E", "N2E", "P0", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris, Morley "
-            f"and Lagrange; got {spaces}. (Lagrange is admitted so a nodal scalar can be MIXED with a "
-            f"non-nodal field -- the A-V pair is N1E x Lagrange. A Lagrange-only form belongs on the "
-            f"native nodal assembler, which this path never sees.)"
+            f"jno.fem (non-nodal): supported element spaces are RT, N1E, N2E, P0, Hermite, Argyris, "
+            f"Morley and Lagrange; got {spaces}. (Lagrange is admitted so a nodal scalar can be MIXED "
+            f"with a non-nodal field -- the A-V pair is N1E x Lagrange. A Lagrange-only form belongs on "
+            f"the native nodal assembler, which this path never sees.)"
         )
-    # ``order=`` is a nodal-Lagrange knob. Every family here has an order INTRINSIC to the element
-    # definition, and it is never plumbed to the factories (`degree=1` is hard-coded at the call
-    # sites below), so `space="N1E", order=2` used to return the SAME lowest-order space with no
-    # warning — measured: an identical 179-DOF operator. That is the worst shape of failure for a
-    # wave problem, where the user is paying for accuracy: they get first-order convergence and only
-    # find out from a convergence study that stalls at rate 1.
+    # ``order=`` selects the basix DEGREE of the H(curl)/H(div) families (``order=1`` is the lowest
+    # order: N1E0 / RT0 in the "k-1" naming, ``order=k`` converges at rate k in the energy norm) and of
+    # a Lagrange field mixed in here. Every other family here has an order INTRINSIC to its definition,
+    # so a request for another one is refused rather than ignored: an ignored order= was measured to
+    # return the SAME lowest-order space with no warning, which on a wave problem is found only when a
+    # convergence study stalls.
     _INTRINSIC_ORDER = {
-        "RT": "lowest order (RT0)",
-        "N1E": "lowest order (N1E0)",
         "P0": "0 (piecewise constant)",
         "Hermite": "3 (cubic)",
         "Argyris": "5 (quintic)",
         "Morley": "2 (quadratic)",
     }
+    _orders = []
     for _f in fields:
         _o = int(_f.get("order", 1) or 1)
-        if _o > 1:
-            _sp = str(_f["space"])
+        _sp = str(_f["space"])
+        if _o > 1 and _sp in _INTRINSIC_ORDER:
             raise NotImplementedError(
                 f"jno.fem: order={_o} is not selectable on the {_sp} element — its order is intrinsic "
-                f"to the family ({_INTRINSIC_ORDER.get(_sp, 'fixed')}) and jNO builds only that one. "
-                "Drop order= (the default) to get it. Higher-order H(curl)/H(div) (N1E/RT with face "
-                "and interior DOFs, and the face-orientation bookkeeping they need) is not built; "
-                "refine the mesh instead, or use a nodal Lagrange field where order= does apply."
+                f"to the family ({_INTRINSIC_ORDER[_sp]}) and jNO builds only that one. Drop order= "
+                "(the default) to get it. order= does apply to N1E, N2E, RT and Lagrange."
             )
-    has_edge = ("RT" in spaces) or ("N1E" in spaces)
+        _orders.append(_o)
+    _EDGE_FAMILIES = ("RT", "N1E", "N2E")
+    has_edge = any(s in _EDGE_FAMILIES for s in spaces)
     has_hermite = "Hermite" in spaces
     has_argyris = "Argyris" in spaces
     has_morley = "Morley" in spaces  # non-conforming biharmonic (vertex value + edge-normal DOFs)
@@ -242,10 +238,11 @@ def assemble_fem_nonnodal(
                 "condition must constrain one of the solved unknowns -- is the field's trial missing "
                 "from the weak form?"
             )
-        if spaces[_fi] in ("RT", "N1E"):
+        if spaces[_fi] in ("RT", "N1E", "N2E"):
             raise NotImplementedError(
-                "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
-                "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`. "
+                "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E/N2E; the essential BC is "
+                "the facet trace (u·n for RT, u×n for N1E/N2E) -- write it as `dot(u(region), n_region) - g` "
+                "(RT) or `u(region).vector.cross(n) - g` (3-D N1E/N2E). "
                 "(A vertex-valued field -- Lagrange / Hermite / Argyris / Morley -- DOES take a nodal "
                 "value Dirichlet u(region) - g.)"
             )
@@ -368,17 +365,17 @@ def assemble_fem_nonnodal(
         _param_and_neural_exprs = {**_param_and_neural_exprs, _cname: _cspec["expr"]}
         _coord_specs.append((jnp.asarray(_cspec["ids"], dtype=jnp.int32), int(_cspec["axis"]), _cname))
 
-    # Simplex dimension from the mesh: 2D triangle vs 3D tetrahedron. The edge (RT/N1E) push-forward and
-    # topology are dimension-agnostic; the vertex families (Hermite/Argyris/Morley) and RT are 2D-only, so
-    # in 3D only Nédélec (N1E, edge/H(curl)) is wired -- everything else raises rather than silently mis-map.
+    # Simplex dimension from the mesh: 2D triangle vs 3D tetrahedron. The H(curl)/H(div) push-forwards
+    # and the entity DOF maps (:mod:`fem_dofmap`) are dimension-agnostic, so N1E / N2E / RT / P0 /
+    # Lagrange assemble on both. The vertex families (Hermite/Argyris/Morley) are 2-D plate elements.
     dim = 3 if "tetra" in domain.mesh.cells_dict else 2
-    if dim == 3 and any(s not in ("N1E", "Lagrange") for s in spaces):
+    if dim == 3 and any(s not in ("N1E", "N2E", "RT", "P0", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh only Nédélec `N1E` and nodal `Lagrange` "
-            f"are supported; got spaces {spaces}. N1E x Lagrange is the A-V (magnetic vector potential "
-            "+ electric scalar potential) pair: V carries the terminal condition on a cut conductor, "
-            "which A alone cannot express. RT / P0 / Hermite / Argyris / Morley are 2D-triangle only."
+            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh the supported spaces are N1E, N2E, RT, P0 "
+            f"and Lagrange; got spaces {spaces}. Hermite / Argyris / Morley are 2-D (triangle) plate "
+            "elements."
         )
+    _cell_name = "tetrahedron" if dim == 3 else "triangle"
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :dim]
 
     def _apply_coord_params(p, args):
@@ -444,25 +441,65 @@ def assemble_fem_nonnodal(
             _fvals[cells_j].reshape(n_cells, cells_j.shape[1], 1) if _fvals.ndim == 1 else _fvals[cells_j]
         )
 
-    # --- edge families (RT/N1E): contravariant/covariant Piola over a shared edge topology (one
-    # ``edge_ref`` dispatch serves both -- same edge DOFs/topology, family-specific push-forward) ---
-    edge_ref = {}  # family -> (ref_values, ref_diffop, ref_grads, piola_fn, piola_grad_fn)
-    specs = {}
-    if "RT" in spaces:
-        specs["RT"] = raviart_thomas_triangle(degree=1, quad_degree=quad_degree)
-        s = specs["RT"]
-        edge_ref["RT"] = (s.ref_values, s.ref_div, s.ref_grads, piola_contravariant, piola_contravariant_grad)
-    if "N1E" in spaces:
-        specs["N1E"] = (
-            nedelec_tet(degree=1, quad_degree=quad_degree)
-            if dim == 3
-            else nedelec_triangle(degree=1, quad_degree=quad_degree)
-        )
-        s = specs["N1E"]
-        edge_ref["N1E"] = (s.ref_values, s.ref_curl, s.ref_grads, piola_covariant, piola_covariant_grad)
-    # ``ref_curl`` is ``None`` for the 3-D tet N1E (its curl is a vector recovered from the physical
-    # gradient, not a tabulated scalar) -- keep it ``None`` through the jnp conversion.
+    # --- quadrature for the polynomial degree in play. Degree 1 keeps the caller's rule untouched (the
+    # lowest-order operators stay bit-identical); degree k needs the mass (degree 2k) exact plus room
+    # for a coefficient, so the rule is raised to 2k + 2 when the caller's is lower. ---
+    _kmax = max([o for o, s_ in zip(_orders, spaces) if s_ in _EDGE_FAMILIES + ("Lagrange",)] + [1])
+    if _kmax > 1:
+        quad_degree = max(int(quad_degree), 2 * _kmax + 2)
+
+    # --- H(curl)/H(div) families (RT, N1E, N2E), any degree: contravariant/covariant Piola after the
+    # per-cell basix DOF transformation (:mod:`fem_dofmap`). One entry per FIELD, so two fields of the
+    # same family may carry different degrees. ---
+    from .fem_dofmap import build_dofmap
+    from .fem_elements import vector_element_spec
+
+    edge_ref = {}  # field index -> (ref_values, ref_diffop, ref_grads, piola_fn, piola_grad_fn)
+    specs = {}  # (family, degree) -> ElementSpec
+    dofmaps = {}  # field index -> DofMap (edge families, and Lagrange of order >= 2)
+    _dm_cache = {}
+    _cells_for_dm = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
+    _n_pts_dm = int(np.asarray(domain.mesh.points).shape[0])
+
+    def _dofmap_for(fam, k):
+        if (fam, k) not in _dm_cache:
+            _dm_cache[(fam, k)] = build_dofmap(_cells_for_dm, fam, k, n_verts=_n_pts_dm)
+        return _dm_cache[(fam, k)]
+
+    for _i, _s in enumerate(spaces):
+        if _s in _EDGE_FAMILIES:
+            _key = (_s, _orders[_i])
+            if _key not in specs:
+                specs[_key] = vector_element_spec(_s, _cell_name, _orders[_i], quad_degree)
+            _sp_ = specs[_key]
+            if _s == "RT":
+                edge_ref[_i] = (
+                    _sp_.ref_values,
+                    _sp_.ref_div,
+                    _sp_.ref_grads,
+                    piola_contravariant,
+                    piola_contravariant_grad,
+                )
+            else:
+                edge_ref[_i] = (_sp_.ref_values, _sp_.ref_curl, _sp_.ref_grads, piola_covariant, piola_covariant_grad)
+            dofmaps[_i] = _dofmap_for(_s, _orders[_i])
+        elif _s == "Lagrange" and _orders[_i] > 1:
+            dofmaps[_i] = _dofmap_for("Lagrange", _orders[_i])
+    # ``ref_curl`` is ``None`` for the 3-D H(curl) families (their curl is a vector recovered from the
+    # physical gradient, not a tabulated scalar) -- keep it ``None`` through the jnp conversion.
     edge_ref = {k: tuple(jnp.asarray(a) if a is not None else None for a in v[:3]) + v[3:] for k, v in edge_ref.items()}
+    # Per-field orientation: exact ±1 signs while the transform is diagonal (degree 1 -- the historic
+    # sign path, bit for bit), else the per-cell block transform B is applied to the reference data.
+    edge_signs = {
+        i: (jnp.asarray(dm_.signs) if dm_.is_diagonal else None)
+        for i, dm_ in dofmaps.items()
+        if spaces[i] in _EDGE_FAMILIES
+    }
+    # The per-cell transform tables, built HERE (eagerly) and held as plain tuples so `elem_map` lifts
+    # their mesh-sized orientation arrays out of the compiled kernel rather than baking them in.
+    from .fem_dofmap import transform_from_tables as _B_of
+
+    dm_tables = {i: (dm_.jax_tables(), int(dm_.ndof_local)) for i, dm_ in dofmaps.items() if not dm_.is_diagonal}
 
     # --- vertex-DOF families (the M(cell) DOF-transform path): Hermite (C0) and Argyris (C1) ---
     hermite_ref = None
@@ -496,7 +533,7 @@ def assemble_fem_nonnodal(
         if has_morley
         else hs
         if has_hermite
-        else (specs.get("RT") or specs.get("N1E") or raviart_thomas_triangle(1, quad_degree))
+        else (next(iter(specs.values()), None) or vector_element_spec("RT", _cell_name, 1, quad_degree))
     )
     qp, qw = jnp.asarray(ref_spec.quad_points), jnp.asarray(ref_spec.quad_weights)
     n_quad = int(qw.shape[0])
@@ -510,16 +547,26 @@ def assemble_fem_nonnodal(
         p1_shape_vals = jnp.stack([_bary0, qp[:, 0], qp[:, 1]] + ([qp[:, 2]] if dim == 3 else []), axis=1)
     else:
         p1_shape_vals = None
+    # Lagrange P_k (k >= 2) mixed into the non-nodal path: basix GLL-warped tabulation at the shared
+    # quadrature, values (n_quad, n_dof) and reference gradients (n_quad, n_dof, dim).
+    lagrange_ref = {}
+    for _i, _dm in dofmaps.items():
+        if spaces[_i] == "Lagrange":
+            _tab = _dm.element.tabulate(1, np.asarray(ref_spec.quad_points))
+            lagrange_ref[_i] = (
+                jnp.asarray(_tab[0][..., 0]),
+                jnp.asarray(np.stack([_tab[1 + a][..., 0] for a in range(dim)], axis=-1)),
+                None if _dm.is_diagonal else True,
+            )
 
     # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris/Morley need it for the global
     # id + orientation of their edge-normal DOFs (Hermite, pure-vertex, does not).
     if has_edge or has_argyris or has_morley:
-        top = build_edge_topology(cells, ref_spec.local_edges)
+        top = build_edge_topology(cells, BASIX_TET_EDGES if dim == 3 else ref_spec.local_edges)
         ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)  # (n_cells, 3) global edge ids
-        esigns = jnp.asarray(top.cell_edge_signs.astype(np.float64)) if has_edge else None  # (n_cells, 3)
         n_edges = int(top.n_edges)
     else:
-        top, ce, esigns, n_edges = None, None, None, 0
+        top, ce, n_edges = None, None, 0
 
     # Argyris/Morley edge-normal DOFs: a per-cell, GLOBALLY-oriented physical unit normal per local edge so the
     # two cells sharing an edge agree on the sign of the normal-derivative DOF. Orientation is fixed by the
@@ -548,9 +595,12 @@ def assemble_fem_nonnodal(
     # N1E (H(curl) edge) topology for periodic (Floquet/Bloch) ties: each DOF is one edge's tangential
     # moment, so a periodic tie matches boundary edges across faces (by midpoint) with an orientation sign
     # (the lo→hi edge direction). Read back in ``_fem._build_periodic_reduction_n1e`` when ties are present.
-    if "N1E" in spaces and top is not None:
+    _hcurl_i = next((i for i, s_ in enumerate(spaces) if s_ in ("N1E", "N2E")), None)
+    _edge_i = _hcurl_i if _hcurl_i is not None else next((i for i, s_ in enumerate(spaces) if s_ == "RT"), None)
+    if _edge_i is not None and top is not None:
         _evn = np.asarray(top.edge_vertices)
         _ptsn = np.asarray(pts)
+        _dm_e = dofmaps[_edge_i]
         domain._fem_nonnodal_topology = {
             "n_verts": int(_ptsn.shape[0]),
             "n_edges": int(n_edges),
@@ -558,8 +608,21 @@ def assemble_fem_nonnodal(
             "edge_vertices": _evn,
             "edge_midpoints": 0.5 * (_ptsn[_evn[:, 0]] + _ptsn[_evn[:, 1]]),
             "edge_dirs": _ptsn[_evn[:, 1]] - _ptsn[_evn[:, 0]],  # lo→hi direction (sets the tangential sign)
-            "family": "N1E",
+            # The entity DOF map of the edge field: degree, every DOF's entity and orientation. The
+            # degree-k consumers (AMS transfer operators, periodic ties, field read-back) build from it;
+            # the lowest-order fields above are kept so degree-1 consumers are untouched.
+            "family": spaces[_edge_i],
+            "degree": int(_orders[_edge_i]),
+            "n_dofs": int(_dm_e.n_dofs),
+            "dofmap": _dm_e,
+            "cells": np.asarray(cells),
         }
+        if spaces[_edge_i] != "N1E" or _orders[_edge_i] > 1:
+            # the lowest-order `n_edges`-sized fields above would size a G / P wrongly; consumers that
+            # need the DOF count read `n_dofs`, and the degree-1-only builders check this flag.
+            domain._fem_nonnodal_topology["lowest_order_n1e"] = False
+        else:
+            domain._fem_nonnodal_topology["lowest_order_n1e"] = True
 
     # Hermite per-cell global DOF map: 3 DOFs per vertex (value, ∂x, ∂y, in basix order) + 1 interior
     # (centroid) DOF per cell. Continuity is automatic from shared global vertex ids (point functionals --
@@ -587,7 +650,10 @@ def assemble_fem_nonnodal(
         _edofs = n_verts + ce  # (n_cells, 3) global edge-DOF ids
         morley_cdofs = jnp.concatenate([cells_j, _edofs], axis=1)  # (n_cells, 6)
 
-    def _field_ndof(s):
+    def _field_ndof(i):
+        s = spaces[i]
+        if i in dofmaps:  # edge families (any degree) and Lagrange P_k, k >= 2: entity DOF map
+            return int(dofmaps[i].n_dofs)
         if s == "Hermite":
             return 3 * n_verts + n_cells
         if s == "Argyris":
@@ -596,23 +662,23 @@ def assemble_fem_nonnodal(
             return n_verts + n_edges
         if s == "Lagrange":
             return n_verts
-        return n_edges if s in ("RT", "N1E") else n_cells
+        return n_cells
 
-    ndof = [_field_ndof(s) for s in spaces]
+    ndof = [_field_ndof(i) for i in range(len(spaces))]
     offs = [0]
     for n in ndof:
         offs.append(offs[-1] + n)
     total = offs[-1]
 
     def _field_cdofs(i):
+        if i in dofmaps:  # (n_cells, n_local) -- equals the edge ids `ce` for degree-1 N1E / 2-D RT
+            return offs[i] + jnp.asarray(dofmaps[i].cell_dofs, dtype=jnp.int32)
         if spaces[i] == "Hermite":
             return offs[i] + hermite_cdofs  # (n_cells, 10)
         if spaces[i] == "Argyris":
             return offs[i] + argyris_cdofs  # (n_cells, 21)
         if spaces[i] == "Morley":
             return offs[i] + morley_cdofs  # (n_cells, 6)
-        if spaces[i] in ("RT", "N1E"):
-            return offs[i] + ce  # (n_cells, 3)
         if spaces[i] == "Lagrange":
             return offs[i] + cells_j  # (n_cells, dim+1)
         return offs[i] + jnp.arange(n_cells)[:, None]  # (n_cells, 1) P0
@@ -645,6 +711,23 @@ def assemble_fem_nonnodal(
         detJ = small_det(J)
         per = []
         for i, s in enumerate(spaces):
+            if s == "Lagrange" and i in lagrange_ref:
+                # P_k (k >= 2): basix tabulation, the per-cell DOF transform (a permutation from P3 on,
+                # identity for P2), and the isoparametric chain rule for the gradient.
+                lv, lg, _needs_B = lagrange_ref[i]
+                if _needs_B is not None:
+                    Bc = _B_of(dm_tables[i][0], dm_tables[i][1], c)
+                    lv = jnp.einsum("ij,qj->qi", Bc, lv)
+                    lg = jnp.einsum("ij,qjd->qid", Bc, lg)
+                per.append(
+                    {
+                        "shape_vals": lv,
+                        "shape_grads": lg @ jnp.linalg.inv(J),
+                        "cell_sol": cell_sols[i][:, None],
+                        "space": "Lagrange",
+                    }
+                )
+                continue
             if s == "Lagrange":
                 # P1 on a simplex: barycentric values (already tabulated as `p1_shape_vals` for the
                 # field-parameter path) and CONSTANT gradients, J^-T @ ref. Tagged "Lagrange" for the
@@ -701,10 +784,23 @@ def assemble_fem_nonnodal(
                         "space": "Lagrange",
                     }
                 )
-            elif s in edge_ref:  # RT (contravariant) or N1E (covariant): same edge DOFs, family-specific push-forward
-                rval, rdop, rgr, pf, pgf = edge_ref[s]
-                phi, _d = pf(rval, rdop, J, detJ, esigns[c])  # (n_quad, 3, 2)
-                grad = pgf(rgr, J, detJ, esigns[c])  # (n_quad, 3, 2, 2)
+            elif i in edge_ref:  # RT (contravariant) or N1E/N2E (covariant): entity DOFs, family-specific push-forward
+                rval, rdop, rgr, pf, pgf = edge_ref[i]
+                _sg = edge_signs[i]
+                if _sg is not None:  # diagonal ±1 transform (degree 1): the historic sign path
+                    phi, _d = pf(rval, rdop, J, detJ, _sg[c])  # (n_quad, n_dof, d)
+                    grad = pgf(rgr, J, detJ, _sg[c])  # (n_quad, n_dof, d, d)
+                else:  # degree k: B = T(cell_info)^-1 mixes each entity's DOFs, then the Piola map
+                    Bc = _B_of(dm_tables[i][0], dm_tables[i][1], c)
+                    _ones = jnp.ones((Bc.shape[0],), dtype=Bc.dtype)
+                    phi, _d = pf(
+                        jnp.einsum("ij,qjv->qiv", Bc, rval),
+                        None if rdop is None else jnp.einsum("ij,qj->qi", Bc, rdop),
+                        J,
+                        detJ,
+                        _ones,
+                    )
+                    grad = pgf(jnp.einsum("ij,qjvm->qivm", Bc, rgr), J, detJ, _ones)
                 per.append({"shape_vals": phi, "shape_grads": grad, "cell_sol": cell_sols[i], "space": s})
             else:  # P0: a single constant DOF per cell
                 per.append(
@@ -868,7 +964,17 @@ def assemble_fem_nonnodal(
     # plain forward pass for the non-parametric build.
     nat_load_rt = (
         _apply_natural_boundary_terms(
-            jnp.zeros(total), pressure_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
+            jnp.zeros(total),
+            pressure_terms,
+            domain,
+            field_index,
+            spaces,
+            top,
+            np.asarray(pts),
+            offs,
+            n_cells,
+            quad_degree,
+            dofmaps=dofmaps,
         )
         if pressure_terms
         else jnp.zeros(total)
@@ -878,12 +984,12 @@ def assemble_fem_nonnodal(
     # depend on the runtime parameters, and rebuilding it per evaluation was both the dominant cost of a
     # parametric assembly and what made the path un-`jit`-able (a host `np.where` cannot see a tracer).
     _inc_static = (
-        _n1e_surface_static("load", incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim)
+        _n1e_surface_static("load", incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim, dofmaps)
         if incident_terms
         else None
     )
     _surf_static = (
-        _n1e_surface_static("mass", surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim)
+        _n1e_surface_static("mass", surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim, dofmaps)
         if surface_terms
         else None
     )
@@ -913,7 +1019,19 @@ def assemble_fem_nonnodal(
                 "mass is a fixed linear block, not re-linearised per step). (Raises rather than silently dropping it.)"
             )
     pins = (
-        _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree, dim=dim)
+        _flux_bc_pins(
+            flux_bcs,
+            domain,
+            field_index,
+            spaces,
+            top,
+            np.asarray(pts),
+            offs,
+            n_cells,
+            quad_degree,
+            dim=dim,
+            dofmaps=dofmaps,
+        )
         if flux_bcs
         else []
     )
@@ -925,7 +1043,9 @@ def assemble_fem_nonnodal(
     if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
     if ("Lagrange" in spaces) and dirichlet_raw:  # Lagrange value-Dirichlet: pin the region's vertex DOFs to g
-        pins = pins + _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
+        pins = pins + _lagrange_dirichlet_pins(
+            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, dofmaps=dofmaps, cells=cells
+        )
     extra = getattr(domain, "_extra_dof_pins", None)
     if extra:  # caller-supplied (dof, value) pins — e.g. a tree-cotree gauge + air-V restriction,
         _bad = [d_ for d_, _v in extra if not (0 <= int(d_) < total)]
@@ -1678,43 +1798,54 @@ def _n1e_surface_load_spec(bare):
     return (g,)
 
 
-def _n1e_surface_precompute(domain, top, quad_degree, spaces, dim):
-    """Shared precompute for N1E boundary-face surface integrals (impedance mass + incident load): validate
-    3-D/N1E, build facet connectivity, tabulate the N1E basis at reference face-quadrature points (per local
-    face), and return the topology arrays. Returns ``(fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges)``."""
+def _n1e_surface_precompute(domain, top, quad_degree, spaces, dim, dofmaps=None):
+    """Shared precompute for H(curl) boundary-face surface integrals (impedance mass + incident load), any
+    degree: validate 3-D/H(curl), build facet connectivity, tabulate the field's basix element at reference
+    face-quadrature points (per local face), and return the DOF map pieces. Returns ``(fidx, cells, fc,
+    fqp, fqw, face_rv, signs, cell_dofs, dm)``; ``signs`` is the ±1 orientation when the field's DOF
+    transform is diagonal (degree 1 -- the historic path), else ``None`` and ``dm`` carries the per-cell
+    transform."""
     import basix
-    from basix import CellType, ElementFamily
+    from basix import CellType
 
     from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity
 
     if dim != 3:
         raise NotImplementedError(
             "jno.fem (non-nodal): N1E tangential-trace surface terms (impedance / absorbing / incident BC) are "
-            "wired for 3-D N1E (Maxwell) only — the 2-D H(curl) tangential trace is a scalar u·t, not yet wired."
+            "wired for 3-D H(curl) (Maxwell) only — the 2-D H(curl) tangential trace is a scalar u·t, not yet wired."
         )
-    fidx = next((i for i, s in enumerate(spaces) if s == "N1E"), None)
+    fidx = next((i for i, s in enumerate(spaces) if s in ("N1E", "N2E")), None)
     if fidx is None:
-        raise NotImplementedError("jno.fem (non-nodal): N1E surface terms are only supported on an N1E field.")
+        raise NotImplementedError(
+            "jno.fem (non-nodal): N1E surface terms are only supported on an H(curl) (N1E/N2E) field."
+        )
 
     cells = np.asarray(domain.mesh.cells_dict["tetra"], dtype=np.int64)
     fc = build_facet_connectivity(cells, "tetrahedron")
-    elem = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, 1)
+    dm = None if dofmaps is None else dofmaps.get(fidx)
+    if dm is None:
+        from .fem_dofmap import build_dofmap
+
+        dm = build_dofmap(cells, "N1E", 1, n_verts=int(np.asarray(domain.mesh.points).shape[0]))
+    elem = dm.element
     fqp, fqw = (np.asarray(a) for a in basix.make_quadrature(CellType.triangle, quad_degree))  # (nqf,2),(nqf,)
     ref_tet = np.array([[0.0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]])
     b0, b1 = fqp[:, 0:1], fqp[:, 1:2]  # face barycentric weights (ξ, η); the third is 1−ξ−η
-    face_rv = []  # per local face f: N1E basis (nqf, 6, 3) at the face-mapped reference points
+    face_rv = []  # per local face f: basis (nqf, n_dof, 3) at the face-mapped reference points
     for f in range(4):
         V = ref_tet[list(_LOCAL_FACES_TET[f][:3])]
         face_rv.append(np.asarray(elem.tabulate(0, (1.0 - b0 - b1) * V[0] + b0 * V[1] + b1 * V[2])[0]))
-    signs = np.asarray(top.cell_edge_signs.astype(np.float64))  # (nc, 6)
-    cell_edges = np.asarray(top.cell_edges)  # (nc, 6) global edge ids
-    return fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges
+    signs = np.asarray(dm.signs) if dm.is_diagonal else None  # (nc, n_dof) — equals the edge signs at degree 1
+    cell_dofs = np.asarray(dm.cell_dofs)  # (nc, n_dof) — equals the global edge ids at degree 1
+    return fidx, cells, fc, fqp, fqw, face_rv, signs, cell_dofs, dm
 
 
-def _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs):
-    """Per boundary face ``bf``: the physical N1E basis (nqf, 6, 3), the OUTWARD unit normal, the face
-    measure |detJ_face| (= 2·area), and the physical quad points (nqf, 3). Covariant-Piola push with the
-    same cell Jacobian/edge signs the volume assembly uses."""
+def _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs, dm=None):
+    """Per boundary face ``bf``: the physical H(curl) basis (nqf, n_dof, 3), the OUTWARD unit normal, the
+    face measure |detJ_face| (= 2·area), and the physical quad points (nqf, 3). Covariant-Piola push with
+    the same cell Jacobian and DOF orientation (±1 signs, or the degree-k transform ``B``) the volume
+    assembly uses."""
     from .fem_elements import piola_covariant
     from .fem_facets import _LOCAL_FACES_TET
 
@@ -1722,7 +1853,11 @@ def _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs):
     cverts = pts_np[cells[c]]  # (4, 3)
     J = np.stack([cverts[k] - cverts[0] for k in (1, 2, 3)], axis=1)
     detJ = float(np.linalg.det(J))
-    phi = np.asarray(piola_covariant(jnp.asarray(face_rv[f]), None, jnp.asarray(J), detJ, jnp.asarray(signs[c]))[0])
+    if signs is not None:
+        phi = np.asarray(piola_covariant(jnp.asarray(face_rv[f]), None, jnp.asarray(J), detJ, jnp.asarray(signs[c]))[0])
+    else:
+        rv_c = np.einsum("ij,qjv->qiv", dm.cell_transform_np(c), face_rv[f])
+        phi = np.einsum("ji,qnj->qni", np.linalg.inv(J), rv_c)
     lv = list(_LOCAL_FACES_TET[f][:3])
     P = cverts[lv]  # physical face vertices (same local order as the reference map)
     nrm = np.cross(P[1] - P[0], P[2] - P[0])
@@ -1761,7 +1896,7 @@ def _bcast_surface_vals(vals, n, nq, comp=None):
     return jnp.broadcast_to(v.reshape((1,) * (2 + len(tail))), (n, nq) + tail)  # scalar
 
 
-def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_degree, dim):
+def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_degree, dim, dofmaps=None):
     """HOST-STATIC per-(face, term) structure for an N1E surface term — built ONCE.
 
     The mesh, the region membership and the face geometry do not depend on the runtime parameters, yet
@@ -1774,17 +1909,19 @@ def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_deg
     the incident source). Entries are grouped by coefficient node so each group evaluates and scatters
     in ONE batched op instead of one per face.
 
-    Returns ``(groups, fqw)`` with ``groups = [(coeff_node, gdofs(n,6), tens(n,nq,...), xq(n,nq,3),
+    Returns ``(groups, fqw)`` with ``groups = [(coeff_node, gdofs(n,n_dof), tens(n,nq,...), xq(n,nq,3),
     measure(n,)), ...]``."""
     from .fem_1d import _region_node_ids
 
-    fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges = _n1e_surface_precompute(domain, top, quad_degree, spaces, dim)
+    fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges, dm = _n1e_surface_precompute(
+        domain, top, quad_degree, spaces, dim, dofmaps
+    )
     fqw = np.asarray(fqw)
     groups = {}  # id(coeff node) -> [node, gdofs[], tens[], xq[], measure[]]  (insertion-ordered)
     for region, nodes in terms.items():
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for bf in _n1e_region_faces(fc, region_nodes):
-            c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs)
+            c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs, dm)
             if kind == "mass":
                 pn = phi @ nhat  # (nqf, 6) normal component
                 tens = np.einsum("qai,qbi->qab", phi, phi) - np.einsum("qa,qb->qab", pn, pn)
@@ -1865,7 +2002,99 @@ def _assemble_n1e_surface_load(total, static, params=None):
     return jnp.zeros(total, vals.dtype).at[ids].add(vals)
 
 
-def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
+def _facet_basis(dm, pts_np, cells, facets, quad_degree):
+    """Physical basis of ``dm``'s element on boundary facets ``facets`` (global facet ids), host numpy.
+
+    Returns ``(owner_cells, xq (n, nq, gdim), wq (n, nq) = weight · facet measure, normals (n, gdim)
+    outward, phi (n, nq, n_dof, value_size))`` -- the reference basis tabulated at the facet's quadrature
+    points mapped into the owner cell, oriented by the cell's DOF transform and Piola-mapped. One
+    tabulation per local facet index, so the cost is a few einsums per facet group."""
+    import basix
+
+    from .fem_dofmap import _reference_topology, cell_jacobians, facet_outward_normals, facet_owners, map_type
+
+    tdim = dm.tdim
+    topo = _reference_topology(dm.cell)
+    fd = tdim - 1
+    ref_cell = np.vstack([np.zeros(tdim), np.eye(tdim)])
+    if tdim == 2:
+        from .fem_1d import _line_quadrature
+
+        fqp, fqw = (np.asarray(a).reshape(-1) for a in _line_quadrature(quad_degree))
+        fqp = fqp[:, None]
+    else:
+        fqp, fqw = (np.asarray(a) for a in basix.make_quadrature(basix.CellType.triangle, quad_degree))
+    count, fcell, flocal = facet_owners(dm)
+    facets = np.asarray(facets, dtype=np.int64)
+    cs, ks = fcell[facets], flocal[facets]
+    J, x0 = cell_jacobians(pts_np, cells)
+    normals = facet_outward_normals(dm, pts_np, cells, cs, ks)
+    mt = map_type(dm.family)
+    nq = fqw.shape[0]
+    gd = pts_np.shape[1]
+    xq = np.zeros((len(facets), nq, gd))
+    wq = np.zeros((len(facets), nq))
+    phi = np.zeros((len(facets), nq, dm.ndof_local, dm.element.value_size))
+    for kf in range(len(topo[fd])):
+        sel = np.flatnonzero(ks == kf)
+        if sel.size == 0:
+            continue
+        V = ref_cell[list(topo[fd][kf])]  # reference facet vertices
+        Xr = V[0][None, :] + fqp @ (V[1:] - V[0])  # (nq, tdim) reference-cell points on the facet
+        tab = np.asarray(dm.element.tabulate(0, Xr)[0])  # (nq, n_dof, vs)
+        c = cs[sel]
+        Jc = J[c]
+        xq[sel] = x0[c][:, None, :] + np.einsum("qa,nda->nqd", Xr, Jc)
+        Pf = pts_np[np.asarray(cells)[c][:, list(topo[fd][kf])]]  # physical facet vertices
+        if tdim == 2:
+            meas = np.linalg.norm(Pf[:, 1] - Pf[:, 0], axis=1)
+        else:
+            meas = np.linalg.norm(np.cross(Pf[:, 1] - Pf[:, 0], Pf[:, 2] - Pf[:, 0]), axis=1)
+        wq[sel] = fqw[None, :] * meas[:, None]
+        if dm.is_diagonal:
+            tc = tab[None] * dm.signs[c][:, None, :, None]
+        else:
+            tc = np.einsum("nij,qjv->nqiv", np.stack([dm.cell_transform_np(int(ci)) for ci in c]), tab)
+        if mt == "covariant":
+            phi[sel] = np.einsum("nji,nqaj->nqai", np.linalg.inv(Jc), tc)
+        elif mt == "contravariant":
+            phi[sel] = np.einsum("nij,nqaj->nqai", Jc, tc) / np.linalg.det(Jc)[:, None, None, None]
+        else:
+            phi[sel] = tc
+    return cs, xq, wq, normals, phi
+
+
+def _rt_pressure_load_general(b, pd_node, fidx, region, dm, domain, pts_np, cells, offs, quad_degree):
+    """``b -= ∮_region p_D (φ·n_out) ds`` for an H(div) field of ANY degree, in 2-D or 3-D -- the natural
+    pressure BC of mixed Poisson, by genuine facet quadrature (the degree-1 2-D path keeps its exact
+    RT0 shortcut; this reproduces it, see the tests)."""
+    from ..._fem import _eval_value_node_at
+    from .fem_dofmap import facet_owners
+
+    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+    if mask is None:
+        raise ValueError(f"jno.fem (non-nodal): natural-BC region {region!r} has no location function.")
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    count, _c, _l = facet_owners(dm)
+    fd = dm.tdim - 1
+    facets = np.flatnonzero((count == 1) & mask[dm.entity_vertices[fd]].all(axis=1))
+    if facets.size == 0:
+        return b
+    cs, xq, wq, normals, phi = _facet_basis(dm, pts_np, cells, facets, quad_degree)
+    pd = np.asarray(_eval_value_node_at(pd_node, jnp.asarray(xq.reshape(-1, xq.shape[-1])))).reshape(-1)
+    pd = np.broadcast_to(pd, (xq.shape[0] * xq.shape[1],)) if pd.size == 1 else pd
+    pd = pd.reshape(xq.shape[:2])
+    # The pressure term ∮ p_D (v·n) belongs to the residual R(u), and b = -R(0): it enters b with a
+    # MINUS. (The legacy RT0 shortcut `sign_topo · ⟨p_D⟩` is the same thing; the degree-1 test pins it.)
+    contrib = -np.einsum("nq,nq,nqav,nv->na", wq, pd, phi, normals)
+    b = np.asarray(b).copy()
+    np.add.at(b, (offs[fidx] + dm.cell_dofs[cs]).reshape(-1), contrib.reshape(-1))
+    return b
+
+
+def _apply_natural_boundary_terms(
+    b, boundary_terms, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree, dofmaps=None
+):
     """Assemble RT natural (weak) boundary terms into ``b``. Supports the natural pressure BC
     ``p_D · (v·n)`` (mixed Poisson with prescribed ``p = p_D``): in the momentum residual this is
     ``+∮ p_D (v·n) ds``, and since the RT0 basis has ``v_e·n`` constant on its own edge it reduces to
@@ -1913,6 +2142,13 @@ def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces
             fidx = field_index.get(next(iter(fkeys))) if fkeys else None
             if fidx is None or spaces[fidx] != "RT":
                 raise NotImplementedError("jno.fem (non-nodal): a natural p_D*(v·n) BC is only supported on an RT field.")
+            _dm = None if dofmaps is None else dofmaps.get(fidx)
+            if _dm is not None and (_dm.degree > 1 or _dm.tdim == 3):  # degree k / tetrahedra: facet quadrature
+                _cells_g = np.asarray(domain.mesh.cells_dict["tetra" if _dm.tdim == 3 else "triangle"], dtype=np.int64)
+                b = _rt_pressure_load_general(
+                    b, pd_node, fidx, region, _dm, domain, pts_np[:, : _dm.tdim], _cells_g, offs, quad_degree
+                )
+                continue
             for eid in boundary:
                 va, vb = (int(x) for x in top.edge_vertices[eid])
                 if va not in region_nodes or vb not in region_nodes:
@@ -2030,7 +2266,7 @@ def _plate_moment_load(b, mn_node, fidx, region_nodes, space, domain, top, pts_n
     return jnp.asarray(b)
 
 
-def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs):
+def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, dofmaps=None, cells=None):
     """Value-Dirichlet ``(dof, value)`` pins for a P1 Lagrange field on the non-nodal path: one DOF per
     mesh vertex, so ``u = g`` on a region pins DOF ``offs[fidx] + v`` to ``g(vertex v)`` for every vertex
     the region's location predicate selects. This is the scalar-potential half of the A-V (N1E x Lagrange)
@@ -2051,6 +2287,9 @@ def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np,
     for fk, region, _comp, _value, value_node in dirichlet_raw:
         fidx = field_index.get(fk)
         if fidx is None or spaces[fidx] != "Lagrange":
+            continue
+        if dofmaps is not None and fidx in dofmaps:  # P_k, k >= 2: every DOF on the region, by interpolation
+            pins.extend(_general_trace_pins(dofmaps[fidx], "value", region, value_node, domain, pts_np, cells, offs[fidx]))
             continue
         vs = np.asarray(_region_node_ids(domain, region), dtype=np.int64)
         if vs.size == 0:
@@ -2258,8 +2497,8 @@ def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
     region to 0. Boundary faces are the tet faces used by exactly one cell (:func:`build_facet_connectivity`);
     each contributes its 3 edges, mapped to the global N1E edge id via the edge topology. This is the correct
     3-D criterion — the 2-D "edge used once" / "both endpoints on the region" tests are wrong on a tet mesh
-    (an interior edge can join two boundary vertices through the volume). Homogeneous PEC only: a nonzero
-    tangential trace ``n × E = g`` raises (its per-edge value ``∫_e g·t`` is a follow-on)."""
+    (an interior edge can join two boundary vertices through the volume). Homogeneous PEC, lowest order;
+    every other case (nonzero ``u×n = g``, degree k, N2E, RT) goes through :func:`_general_trace_pins`."""
     from ..._fem import _constant_of
     from .fem_1d import _region_node_ids
     from .fem_facets import build_facet_connectivity
@@ -2291,7 +2530,103 @@ def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
     return list(dict(pins).items())  # dedup edges shared by two boundary faces of the region
 
 
-def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree, *, dim=2):
+def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, base):
+    """Essential-trace pins of ANY degree on ``region``, by interpolation (:mod:`fem_dofmap`).
+
+    ``kind``: ``"tangential"`` (H(curl): ``u×n = g``; 2-D scalar ``g = u_x n_y - u_y n_x``, 3-D vector
+    ``g``), ``"normal"`` (H(div): ``u·n = g``) or ``"value"`` (Lagrange: ``u = g``). The trace data is
+    turned into a field whose trace is ``g`` -- ``g·(n_y, -n_x)`` in 2-D, ``n×g`` in 3-D (the
+    tangential part of a ``g`` given as ``u×n``), ``g·n``, ``g`` -- and every DOF in the closure of the
+    region's boundary facets is set to the corresponding entity functional of it, oriented by ``B⁻ᵀ``.
+    The functionals see only the trace (tangential moments on edges/faces, normal moments on faces), so
+    the extension off the facet never matters. A homogeneous trace pins those DOFs to 0 without
+    evaluating anything. Facet criterion: boundary facets whose vertices all lie in the region (for a
+    value BC on a region with no boundary facet, every facet, plus whole cells, of the region)."""
+    from ..._fem import _constant_of, _eval_value_node_at
+    from .fem_dofmap import (
+        entity_dofs_of_tasks,
+        facet_outward_normals,
+        facet_owners,
+        interpolate_tasks,
+        region_trace_entities,
+    )
+
+    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+    if mask is None:
+        raise ValueError(f"jno.fem (non-nodal): essential region {region!r} has no location function.")
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if not mask.any():
+        raise ValueError(
+            f"jno.fem (non-nodal): the essential region {region!r} matched NO mesh vertex -- the condition "
+            "would be silently dropped. Check the region name / tag predicate and its tolerance."
+        )
+    tasks = region_trace_entities(dm, mask, boundary_only=True)
+    if kind == "value" and not any(f >= 0 for (_c, _j, f) in tasks.values()):
+        tasks = region_trace_entities(dm, mask, boundary_only=False, cells_too=True)
+    if not tasks:
+        raise ValueError(
+            f"jno.fem (non-nodal): the essential region {region!r} contains no boundary facet of the mesh, "
+            "so its trace constrains nothing. A facet counts when ALL its vertices lie in the region."
+        )
+    try:
+        homogeneous = _constant_of(value_node) == 0.0
+    except Exception:  # noqa: BLE001 -- a non-constant node simply is not homogeneous
+        homogeneous = False
+    if homogeneous:
+        dofs = entity_dofs_of_tasks(dm, tasks)
+        return [(int(base + d_), 0.0) for d_ in dofs]
+    tdim = dm.tdim
+    count, fcell, flocal = facet_owners(dm)
+    normals = facet_outward_normals(dm, pts_np, cells, fcell, flocal)
+
+    def _g(X, comp):
+        v = np.asarray(_eval_value_node_at(value_node, jnp.asarray(X)))
+        if np.iscomplexobj(v):
+            if np.abs(v.imag).max() > 0.0:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): a COMPLEX essential trace value is not wired -- the complex form "
+                    "is solved as two real legs sharing one real pin value (u_re = g, u_im = 0). Drive with "
+                    "a real boundary value or split the constraint yourself."
+                )
+            v = v.real
+        v = v.reshape(-1)
+        n = X.shape[0]
+        if v.size == n * comp:
+            return v.reshape(n, comp)
+        if v.size == comp:
+            return np.broadcast_to(v.reshape(1, comp), (n, comp))
+        if v.size == 1:
+            return np.full((n, comp), float(v[0]))
+        raise ValueError(
+            f"jno.fem (non-nodal): the essential value on region {region!r} evaluated to {v.size} values at "
+            f"{n} points; expected {comp} per point."
+        )
+
+    if kind == "value":
+
+        def fn(X, N):
+            return _g(X, 1)
+
+    elif kind == "normal":
+
+        def fn(X, N):
+            return _g(X, 1) * N
+
+    elif tdim == 2:
+
+        def fn(X, N):  # u×n = u_x n_y - u_y n_x = g  <=  u = g·(n_y, -n_x)
+            return _g(X, 1) * np.stack([N[:, 1], -N[:, 0]], axis=1)
+
+    else:
+
+        def fn(X, N):  # u×n = g  <=  u_tan = n×g
+            return np.cross(N, _g(X, 3))
+
+    dofs, vals = interpolate_tasks(dm, pts_np[:, :tdim], cells, tasks, fn, normals=normals)
+    return [(int(base + d_), float(v_)) for d_, v_ in zip(dofs, vals)]
+
+
+def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree, *, dim=2, dofmaps=None):
     """Compute the ``(dof, value)`` boundary pins for essential edge-trace BCs, separated from
     *application* so the same pins can be enforced per solver mode (symmetric elimination for steady
     linear, residual rows for nonlinear, M/A/c rows for transient).
@@ -2312,8 +2647,40 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
     Boundary edges are the globally single-use edges, filtered to the BC's region by node membership. In
     **3-D** (tet mesh) this "single-use / both-endpoints-in-region" criterion is wrong, so the N1E tangential
     (PEC) pins are computed facet-based via :func:`_n1e_tangential_pins_3d`."""
+    # Degree-k / N2E / 3-D RT / nonzero 3-D tangential traces: the general interpolation route. The two
+    # lowest-order legacy routines below keep serving exactly the cases they always did, so those pins
+    # (and the operators built from them) are unchanged.
+    from ..._fem import _constant_of
+
+    def _legacy(bc):
+        fi = field_index.get(bc[0])
+        if fi is None or dofmaps is None or fi not in dofmaps:
+            return True  # let the legacy routine raise its own message
+        dm_ = dofmaps[fi]
+        if not (dm_.degree == 1 and spaces[fi] in ("RT", "N1E")):
+            return False
+        if dim == 3:
+            if spaces[fi] != "N1E":
+                return False
+            try:
+                return _constant_of(bc[2]) == 0.0
+            except Exception:  # noqa: BLE001
+                return False
+        return True
+
+    general = [bc for bc in flux_bcs if not _legacy(bc)]
+    flux_bcs = [bc for bc in flux_bcs if _legacy(bc)]
+    out = []
+    if general:
+        cells_g = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
+        for field_key, region, value_node in general:
+            fi = field_index[field_key]
+            kind = "normal" if spaces[fi] == "RT" else "tangential"
+            out.extend(_general_trace_pins(dofmaps[fi], kind, region, value_node, domain, pts_np, cells_g, offs[fi]))
+    if not flux_bcs:
+        return out
     if dim == 3:  # 3-D N1E tangential (PEC) — facet-based boundary edges, not the 2-D single-use rule
-        return _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs)
+        return out + _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs)
     from ..._fem import _eval_value_node_at
     from .fem_1d import _line_quadrature, _region_node_ids
 
@@ -2354,7 +2721,7 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
             else:  # RT normal flux
                 sgn = -float(top.cell_edge_signs[c, k])
             pins.append((offs[fidx] + eid, sgn * moment))
-    return pins
+    return out + pins
 
 
 def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
@@ -2372,6 +2739,10 @@ def rt_flux_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopolog
     per cell (with the edge-orientation signs used in assembly), and contracts with the
     cell's three edge-DOF coefficients ``u_edge[cell_edges]``.
     """
+    from .fem_dofmap import DofMap
+
+    if isinstance(top, DofMap):  # any degree: the general read-back (``top`` is the field's DofMap)
+        return nonnodal_field_at(points, cells, top, u_edge)[:, 0, :]
     import basix
 
     elem = basix.create_element(basix.ElementFamily.RT, basix.CellType.triangle, 1)
@@ -2399,6 +2770,10 @@ def n1e_field_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopol
     covariant-Piola-maps it per cell (with the edge-orientation signs used in assembly), and contracts
     with the cell's three edge-DOF coefficients ``u_edge[cell_edges]``.
     """
+    from .fem_dofmap import DofMap
+
+    if isinstance(top, DofMap):  # any degree: the general read-back (``top`` is the field's DofMap)
+        return nonnodal_field_at(points, cells, top, u_edge)[:, 0, :]
     import basix
 
     from .fem_elements import piola_covariant
@@ -2421,9 +2796,7 @@ def n1e_field_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopol
     return jax.vmap(_val)(cells_j, signs, coeffs)
 
 
-def n1e_field_at_tet_centroids(
-    points: np.ndarray, cells: np.ndarray, top: EdgeTopology, u_edge: jnp.ndarray, *, curl: bool = False
-):
+def n1e_field_at_tet_centroids(points: np.ndarray, cells: np.ndarray, top, u_edge: jnp.ndarray, *, curl: bool = False):
     """Evaluate the 3-D Nédélec (H(curl)) field ``u_h`` (and optionally its curl) at each tet centroid.
 
     The tetrahedral counterpart of :func:`n1e_field_at_centroids`. Tabulates the 6-DOF N1E tet basis at
@@ -2436,6 +2809,11 @@ def n1e_field_at_tet_centroids(
     Returns ``values`` ``(n_cells, 3)``, or ``(values, curls)`` (each ``(n_cells, 3)``) when ``curl=True``.
     Complex ``u_edge`` gives complex outputs (the map is linear).
     """
+    from .fem_dofmap import DofMap
+
+    if isinstance(top, DofMap):  # any degree: pass the field's DofMap as ``top``
+        val = nonnodal_field_at(points, cells, top, u_edge)[:, 0, :]
+        return (val, nonnodal_field_at(points, cells, top, u_edge, derivative="curl")[:, 0, :]) if curl else val
     import basix
 
     from .fem_elements import piola_covariant, piola_covariant_grad
@@ -2466,3 +2844,78 @@ def n1e_field_at_tet_centroids(
         return val, crl
 
     return jax.vmap(_val)(cells_j, signs, coeffs)
+
+
+def nonnodal_field_at(points, cells, dofmap, u, *, ref_points=None, cell_ids=None, derivative=None):
+    """Evaluate a solved non-nodal field of ANY degree inside its cells -- the degree-k read-back.
+
+    ``dofmap`` is the field's :class:`fem_dofmap.DofMap` (``domain._fem_nonnodal_topology["dofmap"]``
+    after a solve, or :func:`fem_dofmap.build_dofmap`), ``u`` the field's block of the solution
+    (``n_dofs``). ``ref_points`` ``(n_pts, tdim)`` are reference-cell points (default: the centroid),
+    evaluated in every cell of ``cell_ids`` (default: all). The basis is the assembler's: basix reference
+    tabulation, the per-cell DOF transform ``B`` (or the ±1 signs at degree 1), then the family's Piola
+    map, so a read-back always describes the field that was solved.
+
+    ``derivative``: ``None`` -> values ``(n_sel, n_pts, value_size)`` (scalar Lagrange: ``(n_sel,
+    n_pts)``); ``"curl"`` (H(curl): ``(n_sel, n_pts)`` in 2-D, ``(n_sel, n_pts, 3)`` in 3-D); ``"div"``
+    (H(div): ``(n_sel, n_pts)``); ``"grad"`` (Lagrange: ``(n_sel, n_pts, tdim)``; vector families:
+    ``(n_sel, n_pts, value_size, tdim)``). Linear in ``u`` (complex ``u`` gives complex output) and pure
+    JAX after the host tabulation, so it differentiates in ``u`` and in ``points``."""
+    from .fem_dofmap import map_type
+
+    pts = jnp.asarray(points)
+    cells = np.asarray(cells, dtype=np.int64)
+    tdim = cells.shape[1] - 1
+    if ref_points is None:
+        ref_points = np.full((1, tdim), 1.0 / (tdim + 1))
+    ref_points = np.atleast_2d(np.asarray(ref_points, dtype=float))
+    sel = np.arange(cells.shape[0]) if cell_ids is None else np.asarray(cell_ids, dtype=np.int64)
+    elem = dofmap.element
+    tab = elem.tabulate(1, ref_points)  # (1 + tdim, n_pts, n_dof, vs)
+    rv = jnp.asarray(tab[0])
+    rg = jnp.asarray(np.stack([tab[1 + a] for a in range(tdim)], axis=-1))  # (n_pts, n_dof, vs, tdim)
+    mt = map_type(dofmap.family)
+    if derivative not in (None, "curl", "div", "grad"):
+        raise ValueError(f"nonnodal_field_at: derivative must be None, 'curl', 'div' or 'grad'; got {derivative!r}.")
+    if derivative == "curl" and mt != "covariant":
+        raise ValueError(f"nonnodal_field_at: 'curl' is the H(curl) derivative; {dofmap.family} is {mt}-mapped.")
+    if derivative == "div" and mt != "contravariant":
+        raise ValueError(f"nonnodal_field_at: 'div' is the H(div) derivative; {dofmap.family} is {mt}-mapped.")
+    cells_j = jnp.asarray(cells[sel], dtype=jnp.int32)
+    coeffs = jnp.asarray(u)[jnp.asarray(dofmap.cell_dofs[sel], dtype=jnp.int32)]
+    sel_j = jnp.asarray(sel, dtype=jnp.int32)
+    signs = None if not dofmap.is_diagonal else jnp.asarray(dofmap.signs)
+    from .fem_dofmap import transform_from_tables
+
+    tables = None if signs is not None else dofmap.jax_tables()  # eager: never created under the vmap trace
+
+    def _one(c, cell, cf):
+        V = pts[cell]
+        J = jnp.stack([V[k] - V[0] for k in range(1, tdim + 1)], axis=1)
+        K = jnp.linalg.inv(J)
+        B = jnp.diag(signs[c]) if signs is not None else transform_from_tables(tables, dofmap.ndof_local, c)
+        v = jnp.einsum("ij,qjv->qiv", B, rv)
+        g = jnp.einsum("ij,qjvm->qivm", B, rg)
+        if mt == "covariant":
+            phi = jnp.einsum("ji,qnj->qni", K, v)
+            gp = jnp.einsum("ji,qnjm,ml->qnil", K, g, K)
+        elif mt == "contravariant":
+            dJ = jnp.linalg.det(J)
+            phi = jnp.einsum("ij,qnj->qni", J, v) / dJ
+            gp = jnp.einsum("ik,qnkm,ml->qnil", J, g, K) / dJ
+        else:
+            phi = v
+            gp = jnp.einsum("qnvm,ml->qnvl", g, K)
+        if derivative is None:
+            out = jnp.einsum("n,qnv->qv", cf, phi)
+            return out[..., 0] if mt == "identity" else out
+        G = jnp.einsum("n,qnil->qil", cf, gp)  # (n_pts, vs, tdim) physical gradient of the field
+        if derivative == "grad":
+            return G[:, 0, :] if mt == "identity" else G
+        if derivative == "div":
+            return jnp.trace(G, axis1=1, axis2=2)
+        if tdim == 2:
+            return G[:, 1, 0] - G[:, 0, 1]
+        return jnp.stack([G[:, 2, 1] - G[:, 1, 2], G[:, 0, 2] - G[:, 2, 0], G[:, 1, 0] - G[:, 0, 1]], axis=-1)
+
+    return jax.vmap(_one)(sel_j, cells_j, coeffs)
