@@ -547,8 +547,31 @@ class _Hypre(_Spec):
                     "the field: jno.precond.triangular((u, jno.precond.hypre(kind='ams')), (p, ...))."
                 )
             pc.setHYPREDiscreteGradient(PETSc.Mat().createAIJ(size=Gs.shape, csr=(Gs.indptr, Gs.indices, Gs.data)))
-            pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
-            pc.setCoordinates(pts)
+            _topo = fem.domain._fem_nonnodal_topology
+            if _topo.get("lowest_order_n1e", True):
+                pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
+                pc.setCoordinates(pts)
+            else:
+                # Degree k: G maps P_m (not the vertices) into the edge space, so vertex coordinates no
+                # longer describe the auxiliary space. hypre takes the vector interpolation Π instead
+                # (HYPRE_AMSSetInterpolations): the per-component blocks and the node-interleaved full
+                # one. NOT exercised in jNO's test environment (no petsc4py there) -- jno.precond.ams()
+                # is the tested degree-k path.
+                from .utils.solver.ams import nodal_vector_interpolation
+
+                def _petsc(M):
+                    mi, md = np.asarray(M.indices), np.asarray(M.data)
+                    Ms = sp.csr_matrix((md, (mi[:, 0], mi[:, 1])), shape=tuple(int(x) for x in M.shape))
+                    return Ms, PETSc.Mat().createAIJ(size=Ms.shape, csr=(Ms.indptr, Ms.indices, Ms.data))
+
+                blocks = [_petsc(P) for P in nodal_vector_interpolation(_topo)]
+                dim = len(blocks)
+                full = sp.hstack([b_[0] for b_ in blocks]).tocsc()
+                nL = blocks[0][0].shape[1]
+                inter = np.arange(dim * nL).reshape(dim, nL).T.reshape(-1)  # column 3j + a <- block a, node j
+                full = full[:, inter].tocsr()
+                full_m = PETSc.Mat().createAIJ(size=full.shape, csr=(full.indptr, full.indices, full.data))
+                pc.setHYPRESetInterpolations(dim, None, None, full_m, [b_[1] for b_ in blocks])
         opts = PETSc.Options()
         for k, v in self.options.items():
             opts.setValue(f"pc_hypre_{self.kind}_{k}", v)
