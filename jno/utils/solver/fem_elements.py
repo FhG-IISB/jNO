@@ -71,27 +71,45 @@ class ElementSpec(NamedTuple):
     ref_curl: Optional[np.ndarray] = None  # (n_quad, n_dof) for H(curl), else None
     ref_hess: Optional[np.ndarray] = None  # (n_quad, n_dof, value_size, tdim, tdim), reference d²Phi/dxi dxi
     ref_aux: Optional[Any] = None  # element-specific extra reference data (e.g. Argyris nodal tabulations for M(cell))
+    degree: int = 1  # basix degree (1 = lowest order: RT0/N1E0 in the "k-1" naming)
+    entity_dofs: Optional[Any] = None  # basix entity_dofs: local DOF ids per (dim, local entity)
 
 
 def raviart_thomas_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
-    """Lowest-order (``degree=1``) Raviart–Thomas on a triangle, tabulated via basix.
+    """Raviart–Thomas of any ``degree`` on a triangle, tabulated via basix (``degree=1`` is RT0).
 
     RT(degree 1) has 3 DOFs, one per edge (``num_entity_dofs == [[0,0,0],[1,1,1],[0]]``),
-    a vector value (``value_size == 2``) and a per-basis-constant divergence.
+    a vector value (``value_size == 2``) and a per-basis-constant divergence. Degree ``k`` has ``k``
+    normal moments per edge plus ``k(k-1)`` interior DOFs; their orientation is handled by
+    :mod:`fem_dofmap`, not here.
+    """
+    return vector_element_spec("RT", "triangle", degree, quad_degree)
+
+
+def vector_element_spec(family: str, cell: str, degree: int = 1, quad_degree: int = 2) -> ElementSpec:
+    """Reference tabulation of a basix H(div)/H(curl) element of any degree (RT, N1E, N2E, BDM).
+
+    Values ``(n_quad, n_dof, d)``, reference gradients ``(n_quad, n_dof, d, d)``; H(div) families also
+    get the reference divergence, the 2-D H(curl) families the scalar reference curl (in 3-D the vector
+    curl is recovered from the physical gradient downstream). ``degree=1`` creates the element with
+    basix's defaults -- the exact call the lowest-order factories always made -- so it is bit-identical.
     """
     import basix
-    from basix import CellType, ElementFamily
+    from basix import CellType
 
-    elem = basix.create_element(ElementFamily.RT, CellType.triangle, degree)
-    qp, qw = basix.make_quadrature(CellType.triangle, quad_degree)
+    from .fem_dofmap import basix_element, map_type
+
+    elem = basix_element(family, cell, degree)
+    qp, qw = basix.make_quadrature(getattr(CellType, cell), quad_degree)
+    tdim = 3 if cell == "tetrahedron" else 2
     tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, value_size)
-    ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 2)
-    # reference gradient d(Phi_ref)_k / d(xi)_m: tab[1] = d/dxi0, tab[2] = d/dxi1 -> stack on m
-    ref_grads = np.stack([np.asarray(tab[1]), np.asarray(tab[2])], axis=-1)  # (n_quad, n_dof, 2, 2)
-    # divergence = d(Phi_x)/dxi0 + d(Phi_y)/dxi1 (trace of the reference gradient)
-    ref_div = ref_grads[:, :, 0, 0] + ref_grads[:, :, 1, 1]  # (n_quad, n_dof)
+    ref_values = np.asarray(tab[0])
+    ref_grads = np.stack([np.asarray(tab[i]) for i in range(1, tdim + 1)], axis=-1)  # (nq, n_dof, d, d)
+    hdiv = map_type(family) == "contravariant"
+    ref_div = sum(ref_grads[:, :, i, i] for i in range(tdim)) if hdiv else None
+    ref_curl = (ref_grads[:, :, 1, 0] - ref_grads[:, :, 0, 1]) if (not hdiv and tdim == 2) else None
     return ElementSpec(
-        family="RT",
+        family=family,
         n_dof=elem.dim,
         value_size=elem.value_size,
         quad_points=np.asarray(qp),
@@ -99,7 +117,10 @@ def raviart_thomas_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpe
         ref_values=ref_values,
         ref_div=ref_div,
         ref_grads=ref_grads,
-        local_edges=BASIX_TRIANGLE_EDGES,
+        local_edges=BASIX_TET_EDGES if tdim == 3 else BASIX_TRIANGLE_EDGES,
+        ref_curl=ref_curl,
+        degree=int(degree),
+        entity_dofs=elem.entity_dofs,
     )
 
 
@@ -135,66 +156,28 @@ def piola_contravariant_grad(ref_grads: jnp.ndarray, J: jnp.ndarray, detJ: jnp.n
 
 
 def nedelec_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
-    """Lowest-order (``degree=1``) Nédélec first-kind (edge) element on a triangle, via basix.
+    """Nédélec first-kind (edge) element of any ``degree`` on a triangle, via basix.
 
     N1E(degree 1) has 3 DOFs, one tangential moment per edge (``num_entity_dofs ==
     [[0,0,0],[1,1,1],[0]]``), a vector value (``value_size == 2``) and a per-basis-constant
-    (2-D scalar) curl. The H(curl) counterpart of :func:`raviart_thomas_triangle`.
+    (2-D scalar) curl. Degree ``k`` has ``k`` tangential moments per edge and ``k(k-1)`` interior
+    DOFs. The H(curl) counterpart of :func:`raviart_thomas_triangle`.
     """
-    import basix
-    from basix import CellType, ElementFamily
-
-    elem = basix.create_element(ElementFamily.N1E, CellType.triangle, degree)
-    qp, qw = basix.make_quadrature(CellType.triangle, quad_degree)
-    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, value_size)
-    ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 2)
-    ref_grads = np.stack([np.asarray(tab[1]), np.asarray(tab[2])], axis=-1)  # (n_quad, n_dof, 2, 2)
-    # 2-D scalar curl = d(Phi_y)/dxi0 - d(Phi_x)/dxi1 (the antisymmetric part of the reference gradient)
-    ref_curl = ref_grads[:, :, 1, 0] - ref_grads[:, :, 0, 1]  # (n_quad, n_dof)
-    return ElementSpec(
-        family="N1E",
-        n_dof=elem.dim,
-        value_size=elem.value_size,
-        quad_points=np.asarray(qp),
-        quad_weights=np.asarray(qw),
-        ref_values=ref_values,
-        ref_div=None,
-        ref_grads=ref_grads,
-        local_edges=BASIX_TRIANGLE_EDGES,
-        ref_curl=ref_curl,
-    )
+    return vector_element_spec("N1E", "triangle", degree, quad_degree)
 
 
 def nedelec_tet(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
-    """Lowest-order (``degree=1``) Nédélec first-kind (edge) element on a **tetrahedron**, via basix.
+    """Nédélec first-kind (edge) element of any ``degree`` on a **tetrahedron**, via basix.
 
     N1E(degree 1) on a tet has **6 DOFs**, one tangential moment per edge (in :data:`BASIX_TET_EDGES`
     order), a 3-vector value (``value_size == 3``) and — unlike the 2-D triangle — a *vector* curl. The
     physical curl is recovered from the covariant-Piola physical gradient in the assembler (the
     antisymmetric parts of ``d(Φ_phys)_i/dx_l``), so no scalar ``ref_curl`` is tabulated here
     (``ref_curl=None``); the value push-forward is the same covariant Piola ``Φ_phys = J^{-T} Φ_ref``
-    (:func:`piola_covariant`), which is dimension-agnostic. The H(curl) counterpart of
-    :func:`nedelec_triangle` for 3-D Maxwell / curl-curl problems."""
-    import basix
-    from basix import CellType, ElementFamily
-
-    elem = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, degree)
-    qp, qw = basix.make_quadrature(CellType.tetrahedron, quad_degree)
-    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, value_size); tdim = 3
-    ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 3)
-    ref_grads = np.stack([np.asarray(tab[i]) for i in range(1, 4)], axis=-1)  # (n_quad, n_dof, 3, 3)
-    return ElementSpec(
-        family="N1E",
-        n_dof=elem.dim,
-        value_size=elem.value_size,
-        quad_points=np.asarray(qp),
-        quad_weights=np.asarray(qw),
-        ref_values=ref_values,
-        ref_div=None,
-        ref_grads=ref_grads,
-        local_edges=BASIX_TET_EDGES,
-        ref_curl=None,  # 3-D curl is a vector, taken from the physical gradient (not a scalar)
-    )
+    (:func:`piola_covariant`), which is dimension-agnostic. Degree ``k`` adds ``k`` DOFs per edge,
+    ``k(k-1)`` per face and ``k(k-1)(k-2)/2`` interior ones; the edge reversals and face
+    rotations/reflections that orient them are :mod:`fem_dofmap`'s job."""
+    return vector_element_spec("N1E", "tetrahedron", degree, quad_degree)
 
 
 def piola_covariant(
