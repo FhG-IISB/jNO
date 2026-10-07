@@ -224,3 +224,43 @@ def test_wire_radius_is_a_design_variable():
 def test_the_wrong_number_of_radii_is_refused():
     with pytest.raises(ValueError, match="radii for"):
         line_filaments([_shape(), _shape()], radii=[RW])
+
+
+def test_a_wires_path_and_radius_are_jno_core_parameters():
+    """Through the front door: `.attach(path=..., radius=...)` on a line region makes a bond wire's
+    routing and gauge `jno.np.parameter`s, so they optimise in `jno.core` next to a material field.
+    Pinned against central differences."""
+    import equinox as eqx
+
+    from jno._fem import _walk
+    from jno.trace_evaluator import TraceEvaluator
+
+    mm = 1e-3
+    p0 = np.array([(2, 1.5, 0.5), (10, 1.5, 3.0), (18, 1.5, 0.5)]) * mm
+    ez = np.zeros((3, 3))
+    ez[1, 2] = 1.0
+    h = jno.np.parameter((1,), name="h")
+    rr = jno.np.parameter((1,), name="rr")
+    plate = jno.shape.box(0, 0, 0, 20 * mm, 3 * mm, 0.5 * mm, size=(1 * mm, 1 * mm, 0.5 * mm)).attach(sigma=5.8e7).name("p")
+    wire = jno.shape.line([tuple(q) for q in p0], r=0.15e-3, size=1 * mm).name("w")
+    d = (plate + wire).domain()
+    d.attach("w", sigma=3.8e7, path=h * ez + p0, radius=rr)
+    d.tag("A", lambda x, y, z: x < 1.01 * mm)
+    d.tag("B", lambda x, y, z: x > 18.99 * mm)
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
+    node = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).solve().L
+    mcs = {m.model._parameter_name: m for m in _walk(node) if type(m).__name__ == "ModelCall"}
+
+    def value(hv, rv):
+        vals = {"h": jnp.reshape(hv, (1,)), "rr": jnp.reshape(rv, (1,))}
+        table = {m.model.layer_id: eqx.tree_at(lambda q: q.value, m.model.module, vals[n]) for n, m in mcs.items()}
+        return jnp.real(jnp.asarray(TraceEvaluator(table).evaluate(node, context={}))).reshape(())
+
+    h0, r0 = 0.0, 0.15e-3
+    gh, gr = jax.grad(value, argnums=(0, 1))(h0, r0)
+    fh = (value(h0 + 1e-6, r0) - value(h0 - 1e-6, r0)) / 2e-6
+    fr = (value(h0, r0 + 1e-7) - value(h0, r0 - 1e-7)) / 2e-7
+    assert abs(float(gh / fh) - 1) < 1e-5  # measured 1.3e-08
+    assert abs(float(gr / fr) - 1) < 1e-5  # measured 1.4e-07
+    assert float(gr) < 0  # a thicker wire has less self inductance

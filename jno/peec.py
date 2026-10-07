@@ -737,8 +737,9 @@ class ParametricSolution:
     ``solve(sigma=...)`` with concrete values is the way back to a plain number.
     """
 
-    def __init__(self, built, exprs, params, solve_kw=None):
+    def __init__(self, built, exprs, params, solve_kw=None, geometry=None):
         self._b, self._exprs, self._params = built, dict(exprs), dict(params)
+        self._geom = dict(geometry or {})
         #: what `solve(...)` was given besides the material -- `operator=` for a graded lattice --
         #: replayed on every traced solve, so a parametric readout solves the network it was asked to
         self._solve_kw = dict(solve_kw or {})
@@ -801,7 +802,9 @@ class ParametricSolution:
                         "initialising, that is the cause, and giving the material a non-zero floor "
                         "(`CU * (0.01 + 0.99 * rho**3)`) both fixes it and is better conditioned."
                     )
-            sol = self._b.solve(sigma=mats, **self._solve_kw)
+            ev = lambda e: None if e is None else _eval_material(e, at)
+            geo = {n: (ev(p), ev(r)) for n, (p, r) in self._geom.items()} or None
+            sol = self._b.solve(sigma=mats if mats else {}, geometry=geo, **self._solve_kw)
             out = getattr(sol, kind)
             if callable(out):
                 out = out(*args)
@@ -966,6 +969,12 @@ class PEEC:
         # `sigma` alone is a conductor; `mu_r` alone is a core that does not conduct, a ferrite or a
         # powder; both together is a conducting magnetic material, a lamination or a lossy core.
         sig, mur = _attached("sigma"), _attached("mu_r")
+        # A wire's GEOMETRY may be a design variable too: `.attach(path=..., radius=...)` on a line
+        # region overrides its vertices and radius by expressions in `jno.np.parameter`s. Structure --
+        # how many filaments, which node is which, where it welds -- stays the shape's own; only the
+        # positions and the gauge move (see `line_filaments(points=, radii=)`).
+        geo_pts, geo_rad = _attached("path"), _attached("radius")
+        line_geom: dict = {}
         # `d.attach(sigma=...)` with no target is the default for every region that declares neither
         # a conductivity nor a permeability -- the same rule `d.<name>` applies to a FEM coefficient.
         _default = type(self.domain)._DEFAULT_TARGET
@@ -1044,6 +1053,8 @@ class PEEC:
                 _ref = _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])})
                 sig[n] = _ref[0] if _ref.size == 1 else _ref
             if kind == "Line":
+                if _model_calls(geo_pts.get(n)) or _model_calls(geo_rad.get(n)):
+                    line_geom[n] = (geo_pts.get(n), geo_rad.get(n))
                 val = sig[n]
                 if _model_calls(val):
                     # A trainable parameter on a wire is recorded and evaluated at its CURRENT value for
@@ -1085,7 +1096,15 @@ class PEEC:
             # on points along its own length, where they do help it. With no solids there is nothing
             # to match and a wire keeps the plain rule -- the count is a WELD constraint, not a
             # property of a filament.
-            fl = line_filaments(lines, quad=_QUAD * _QUAD_T**2 if solids else _QUAD)
+            _lquad = _QUAD * _QUAD_T**2 if solids else _QUAD
+            fl = line_filaments(lines, quad=_lquad)
+            line_info = (
+                tuple(lines),
+                tuple(line_names),
+                _lquad,
+                int(np.asarray(fl.pos).shape[0]),
+                int(np.asarray(fl.length).size),
+            )
             # Each conductor's conductivity is resolved over ITS OWN filaments, so a field sees the
             # midpoints of the wire it belongs to and a per-element vector is that wire's own count.
             cen, fpart = element_centres(fl), np.asarray(fl.part)
@@ -1191,7 +1210,18 @@ class PEEC:
                 grid_shapes=[s for s, _ in solids],
             )
         self._field_exprs = field_exprs
-        return fil, terms, line_names + solid_names, resolve_all, mag, tuple(magnetic_names), param_exprs
+        if line_geom and not lines:
+            line_geom = {}
+        return (
+            fil,
+            terms,
+            line_names + solid_names,
+            resolve_all,
+            mag,
+            tuple(magnetic_names),
+            param_exprs,
+            (line_geom, line_info if lines else None),
+        )
 
     def build(self) -> "BuiltPEEC":
         """Freeze the discretisation and return the jittable :class:`BuiltPEEC`.
@@ -1234,7 +1264,7 @@ class BuiltPEEC:
     inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
     """
 
-    def __init__(self, spec, fil, terms, part_names, resolve, mag=None, mag_names=(), param_exprs=None):
+    def __init__(self, spec, fil, terms, part_names, resolve, mag=None, mag_names=(), param_exprs=None, lines=None):
         self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
         #: the magnetic mesh, when any region attached a `mu_r` -- a Filaments of the same shape as
         #: the electric one, since a core is voxels and faces just as a conductor is.
@@ -1250,7 +1280,10 @@ class BuiltPEEC:
         #: region -> attached material expression, for the regions whose material carries a
         #: `jno.np.parameter`. Non-empty makes `solve()` hand back trace nodes instead of numbers.
         self._param_exprs = dict(param_exprs or {})
-        self._params = _parameters_in(self._param_exprs.values())
+        #: line region -> (points expr, radius expr), for wires whose geometry is a design variable
+        self._line_geom, self._line_info = lines if lines is not None else ({}, None)
+        _geo_vals = [v for pr in self._line_geom.values() for v in pr if v is not None]
+        self._params = _parameters_in(list(self._param_exprs.values()) + _geo_vals)
         # Which nodes each pad owns is STRUCTURAL -- `terminal_nodes` reads coordinates, which are
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
         self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
@@ -1263,7 +1296,34 @@ class BuiltPEEC:
         for f in self.freq:
             _check_unresolved_thickness(fil, sig0, 2 * np.pi * float(f), MU0)
 
-    def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None, operator=None):
+    def _with_lines(self, geometry):
+        """The network with its wires moved: ``{line region: (points, radius)}``, either may be None.
+
+        The lattice and every structural decision stay as built; the wire block of the filaments is
+        recomputed from the given vertices and gauge and spliced in front of it -- lines come first
+        in the welded order.
+        """
+        shapes, names, quad, nsub, nel = self._line_info
+        pts, rad = [], []
+        for sh, nm in zip(shapes, names):
+            p, r = (geometry or {}).get(nm, (None, None))
+            node = sh._node[1]
+            pts.append(
+                jnp.asarray(np.asarray(node.points, dtype=float)) if p is None else jnp.reshape(jnp.asarray(p), (-1, 3))
+            )
+            rad.append(float(node.r) if r is None else jnp.reshape(jnp.asarray(r), ()))
+        fl = line_filaments(list(shapes), quad=quad, points=pts, radii=rad)
+        f = self.fil
+        return f._replace(
+            pos=jnp.concatenate([fl.pos, jnp.asarray(f.pos)[nsub:]]),
+            mom=jnp.concatenate([fl.mom, jnp.asarray(f.mom)[nsub:]]),
+            self_g=jnp.concatenate([jnp.asarray(fl.self_g), jnp.asarray(f.self_g)[nel:]]),
+            length=jnp.concatenate([jnp.asarray(fl.length), jnp.asarray(f.length)[nel:]]),
+            area=jnp.concatenate([jnp.asarray(fl.area), jnp.asarray(f.area)[nel:]]),
+            skin=jnp.concatenate([jnp.asarray(fl.skin).reshape(-1) * jnp.ones(nel), jnp.asarray(f.skin)[nel:]]),
+        )
+
+    def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None, operator=None, geometry=None):
         """Solve at every frequency and return a :class:`PEECSolution`.
 
         Args:
@@ -1303,7 +1363,7 @@ class BuiltPEEC:
                 perpendicular bar families, those blocks are detected and stored densely, and the
                 measured compression is 1.00x. See :mod:`~jno.utils.solver.hmatrix`.
         """
-        if self._param_exprs and sigma is None:
+        if (self._param_exprs or self._line_geom) and sigma is None:
             # The material carries a trainable parameter, so the readouts are trace nodes over it and
             # crux threads the values -- the same treatment `jno.rcwa` gives its readouts. Naming
             # concrete values in `sigma=` is the way back to a number.
@@ -1320,8 +1380,8 @@ class BuiltPEEC:
                 # traced solves `jno.core` runs later find them cached instead of trying to build
                 # them from tracers.
                 self.solve(sigma={}, **kw)
-            return ParametricSolution(self, self._param_exprs, self._params, kw)
-        fil, nodes, terms = self.fil, self.nodes, self.terminals
+            return ParametricSolution(self, self._param_exprs, self._params, kw, self._line_geom)
+        fil, nodes, terms = (self.fil if geometry is None else self._with_lines(geometry)), self.nodes, self.terminals
         if weights:
             nodes = dict(nodes)
             for name, w in weights.items():
@@ -1365,6 +1425,7 @@ class BuiltPEEC:
                 **({} if operator is None else {"operator": operator}),
                 **({} if self.mag is None else {"mag": self.mag, "chi": self.mag.lattice["sigma"]}),
                 magnetic_current=True,
+                geometry_host=None if fil is self.fil else self.fil,
             )
             cur.append(c)
             inject.append(inj)

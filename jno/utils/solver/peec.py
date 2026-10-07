@@ -735,6 +735,7 @@ def solve_network(
     quad_m=2,
     operator=None,
     magnetic_current=False,
+    geometry_host=None,
 ):
     """Solve the PEEC circuit for a network whose terminals are node SETS.
 
@@ -1270,7 +1271,17 @@ def solve_network(
         # its port excitation spreads over far more eigenmodes, and only a compressed spectrum makes
         # the residual polynomial cheap enough.
         nr, nc, nv = (
-            _geom_cached(fil, mu0, "near", lambda: near_block(fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi)))
+            # `geometry_host`: a concrete stand-in for a geometry that is traced inside a jit (a bond
+            # wire being routed under `jno.core`). The preconditioner only accelerates, so building it
+            # from the reference configuration costs iterations at most, never the answer.
+            _geom_cached(
+                geometry_host if geometry_host is not None else fil,
+                mu0,
+                "near",
+                lambda: near_block(
+                    geometry_host if geometry_host is not None else fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi)
+                ),
+            )
             if welded
             else (np.zeros(0, int), np.zeros(0, int), np.zeros(0))
         )
