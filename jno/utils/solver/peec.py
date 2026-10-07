@@ -1544,7 +1544,7 @@ def _skin_depth(sigma, freq, mu0=4e-7 * np.pi):
     return float(np.sqrt(2.0 / (2.0 * np.pi * f * mu0 * float(np.max(s)))))
 
 
-def _sheet_families(axis, skin, span, d, delta):
+def _sheet_families(axis, skin, span, d, delta, cell_d=None):
     """Which axis families should carry a current sheet per FACE, and the thickness between them.
 
     Only a family that is entirely one conductor thickness can be split: the two sheets are a second
@@ -1572,8 +1572,14 @@ def _sheet_families(axis, skin, span, d, delta):
         # section and one element is the right model.
         if thick <= delta:
             continue
-        # span == 1, so the conductor IS one cell thick and the thin axis is the matching pitch
-        cand = [c for c in range(3) if c != ax and abs(float(d[c]) - thick) < 1e-12]
+        # span == 1, so the conductor IS one cell thick and the thin axis is the matching pitch. On a
+        # GRADED grid there is no one pitch per axis, so it is the family's own cells that are asked:
+        # the thin axis is the one along which every one of them is exactly the conductor thickness.
+        if cell_d is None:
+            cand = [c for c in range(3) if c != ax and abs(float(d[c]) - thick) < 1e-12]
+        else:
+            cd = np.asarray(cell_d)[sel]
+            cand = [c for c in range(3) if c != ax and np.all(np.abs(cd[:, c] - thick) < 1e-12)]
         if len(cand) == 1:
             out[int(ax)] = (int(cand[0]), thick)
     return out
@@ -2226,7 +2232,9 @@ def bar_filaments(
     # family on the same grid and masks, its current displaced to the opposite face; the split
     # between them is found by the solve, through `slab_transfer_impedance`.
     delta = _skin_depth(sigma, freq)
-    sheets = _sheet_families(axis, skin, span, d, delta) if delta else {}
+    sheets = (
+        _sheet_families(axis, skin, span, d, delta, None if edges is None else np.asarray(node_d)[end_a]) if delta else {}
+    )
     pair = -np.ones(nb, dtype=int)
     sheet_thin = -np.ones(nb, dtype=int)
     sheet_ext = np.zeros(nb)
@@ -2974,9 +2982,13 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
     diag, sel = [], []
     for lo, hi, lat in spans:
         rows, gl, cnt = _sub_slice(fil, lo, hi)
+        # Geometry is sliced on the HOST while it is concrete: a jnp slice inside a jit is a tracer
+        # even of a constant, and the hierarchical build below needs concrete sub-points -- it is
+        # what made a parametric solve of a graded welded network fail under `jno.core`.
+        _host = lambda a: jnp.asarray(a)[rows] if isinstance(a, jax.core.Tracer) else np.asarray(a)[rows]
         sub = Filaments(
-            jnp.asarray(fil.pos)[rows],
-            jnp.asarray(fil.mom)[rows],
+            _host(fil.pos),
+            _host(fil.mom),
             jnp.asarray(fil.self_g)[lo:hi],
             gl,
             None,

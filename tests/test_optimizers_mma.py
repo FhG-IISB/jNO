@@ -235,6 +235,29 @@ class TestPerVariableBounds:
         # A single scalar box could not express this: the intervals do not overlap.
         assert lo[-1] > hi[0]
 
+    def test_a_fixed_variable_does_not_poison_the_free_ones(self):
+        """lower == upper holds a variable fixed -- a keep-in at full material. Its zero-width box
+        used to divide by zero inside the subproblem, and the NaN sent every FREE variable to its
+        lower bound while the objective rose."""
+        n = 6
+        lo = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 0.0])
+        hi = np.ones(n)
+        target = np.array([0.8, 0.2, 0.6, 1.0, 1.0, 0.4])
+
+        d = jno.domain.from_array({"_": np.zeros((1, 1))})
+        x = jno.np.parameter((n,), name="x")
+        x.dtype(jnp.float64)
+        x.initialize(lambda key, shape, dtype=None: jnp.asarray(np.where(lo == hi, 1.0, 0.5)))
+        x.optimizer(jno.optimizers.mma(move=0.2, lower=lo, upper=hi))
+        f0 = jno.fn(lambda xv: jnp.sum((xv - target) ** 2), [x], name="f0")
+        vol = jno.fn(lambda xv: jnp.sum(xv) / 10.0, [x], name="vol")  # inactive
+
+        crux = jno.core([f0, jno.le(vol, 1.0)], domain=d)
+        crux.solve(40)
+        xf = np.asarray(crux.eval([x])).reshape(-1)
+        np.testing.assert_allclose(xf[lo == hi], 1.0)
+        np.testing.assert_allclose(xf, target, atol=2e-2)  # was: every free variable at 0
+
     def test_a_wrong_length_bound_is_refused(self):
         d = jno.domain.from_array({"_": np.zeros((1, 1))})
         x = jno.np.parameter((4,), name="x")

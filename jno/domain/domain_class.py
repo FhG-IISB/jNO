@@ -2590,12 +2590,13 @@ class domain(MeshIOMixin):
         # rather than sent through the facets-vs-cells test below: such a region routinely reaches the
         # outer boundary (the air box of any real device does), which would register it as a boundary
         # region too and make it look ambiguous when it is not.
+        # A shape region is decided WITHOUT the mesh: reading `self.mesh` builds it, and a domain that
+        # no FEM ever meshes -- a PEEC network of solids and wires -- then fails in gmsh just for being
+        # given a material.
+        if target in (getattr(self, "_shape_regions", {}) or {}) or target in (getattr(self, "_source_regions", {}) or {}):
+            return "volume"
         _mesh_regions = mesh_cell_region_membership(getattr(self, "mesh", None), int(self.dimension))
-        if (
-            target in (getattr(self, "_shape_regions", {}) or {})
-            or target in (getattr(self, "_source_regions", {}) or {})
-            or target in _mesh_regions
-        ):
+        if target in _mesh_regions:
             return "volume"
         if target not in (getattr(self, "_tag_predicates", {}) or {}) and target not in (
             getattr(self, "_boundary_regions", {}) or {}

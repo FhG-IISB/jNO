@@ -285,6 +285,11 @@ class PEECSolution:
         lat = getattr(f, "lattice", None)
         welded = isinstance(lat, dict) and "welded" in lat
         structured = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
+        # a GRADED lattice has no FFT (lattice_apply refuses it), so its energy takes the pair sum below
+        graded = (
+            (lat or {}).get("graded") if not welded else any(b[2] is not None and b[2].get("graded") for b in lat["welded"])
+        )
+        structured = structured and not graded
 
         if structured:
             ap = (welded_apply if welded else lattice_apply)(f, lambda r: 1.0 / r, mu_scale=scale)
@@ -296,7 +301,7 @@ class PEECSolution:
             # structure even when each part had it, so there is nothing to exploit. The pair sum
             # stays: it is chunked, never holds an (N, N) array, and rematerialises on the reverse
             # pass, so the gradient is bounded too.
-            grp = jnp.asarray(f.group)
+            grp = np.asarray(f.group)  # structural: numpy, or a jit turns it into a tracer
 
             def _energy(x):
                 m = jnp.asarray(f.mom) * x[grp][:, None]
@@ -732,8 +737,11 @@ class ParametricSolution:
     ``solve(sigma=...)`` with concrete values is the way back to a plain number.
     """
 
-    def __init__(self, built, exprs, params):
+    def __init__(self, built, exprs, params, solve_kw=None):
         self._b, self._exprs, self._params = built, dict(exprs), dict(params)
+        #: what `solve(...)` was given besides the material -- `operator=` for a graded lattice --
+        #: replayed on every traced solve, so a parametric readout solves the network it was asked to
+        self._solve_kw = dict(solve_kw or {})
 
     def _node(self, kind, *args, key=None, label=None):
         from jno.trace import FunctionCall
@@ -793,7 +801,7 @@ class ParametricSolution:
                         "initialising, that is the cause, and giving the material a non-zero floor "
                         "(`CU * (0.01 + 0.99 * rho**3)`) both fixes it and is better conditioned."
                     )
-            sol = self._b.solve(sigma=mats)
+            sol = self._b.solve(sigma=mats, **self._solve_kw)
             out = getattr(sol, kind)
             if callable(out):
                 out = out(*args)
@@ -1208,13 +1216,14 @@ class PEEC:
         """
         return BuiltPEEC(self, *self._discretise())
 
-    def solve(self):
+    def solve(self, **kw):
         """Solve at every frequency and return a :class:`PEECSolution`.
 
         Discretises and solves in one call. For a design loop use :meth:`build` instead and solve
-        the result -- same answer, the host pass done once, and jittable.
+        the result -- same answer, the host pass done once, and jittable. Keyword arguments are
+        those of :meth:`BuiltPEEC.solve` -- ``operator=`` for a graded lattice, for one.
         """
-        return self.build().solve()
+        return self.build().solve(**kw)
 
 
 class BuiltPEEC:
@@ -1298,7 +1307,20 @@ class BuiltPEEC:
             # The material carries a trainable parameter, so the readouts are trace nodes over it and
             # crux threads the values -- the same treatment `jno.rcwa` gives its readouts. Naming
             # concrete values in `sigma=` is the way back to a number.
-            return ParametricSolution(self, self._param_exprs, self._params)
+            kw = {
+                k: v
+                for k, v in dict(
+                    devices=devices, weights=weights, restart=restart, matrix_free=matrix_free, operator=operator
+                ).items()
+                if v is not None
+            }
+            if operator is not None:
+                # A compressed operator's cluster tree and pivots are STRUCTURE, built from concrete
+                # geometry and cached per network. Built here, once, at the declared material, the
+                # traced solves `jno.core` runs later find them cached instead of trying to build
+                # them from tracers.
+                self.solve(sigma={}, **kw)
+            return ParametricSolution(self, self._param_exprs, self._params, kw)
         fil, nodes, terms = self.fil, self.nodes, self.terminals
         if weights:
             nodes = dict(nodes)

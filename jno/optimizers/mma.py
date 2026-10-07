@@ -448,22 +448,50 @@ class MMACallback(_Callback):
             self._report_initial_feasibility(g, dg)
 
         spec = _BlendedSpec(self._blocks, [p.size for p in x_parts], k=self._k)
-        x_new, self._low, self._upp = mma_subproblem(
-            x,
-            None,
-            df0,
-            g,
-            dg,
-            self._low,
-            self._upp,
-            xmin,
-            xmax,
-            self._xold1,
-            self._xold2,
-            self._k,
-            spec,
-            spec.dual_iters,
-        )
+        # A variable with lower == upper is FIXED -- a keep-in held at full material, say. MMA scales
+        # its asymptotes and move limit by the box width, so a zero-width box divides by zero and the
+        # NaN it makes poisons the dual for every other variable: measured, every free density ran
+        # to its lower bound while the objective rose. Fixed variables are taken out of the
+        # subproblem and keep their value.
+        free = xmax - xmin > 0
+        if free.all():
+            x_new, self._low, self._upp = mma_subproblem(
+                x,
+                None,
+                df0,
+                g,
+                dg,
+                self._low,
+                self._upp,
+                xmin,
+                xmax,
+                self._xold1,
+                self._xold2,
+                self._k,
+                spec,
+                spec.dual_iters,
+            )
+        else:
+            spec.subset(free)
+            sub = lambda a: None if a is None else a[free]
+            xf, self._low, self._upp = mma_subproblem(
+                x[free],
+                None,
+                df0[free],
+                g,
+                dg[:, free],
+                self._low,
+                self._upp,
+                xmin[free],
+                xmax[free],
+                sub(self._xold1),
+                sub(self._xold2),
+                self._k,
+                spec,
+                spec.dual_iters,
+            )
+            x_new = np.minimum(np.maximum(x, xmin), xmax)  # a fixed variable sits at its bound
+            x_new[free] = xf
         self._xold2, self._xold1 = self._xold1, x.copy()
         self._k += 1
 
@@ -508,6 +536,10 @@ class _BlendedSpec:
     block; letting them differ per block would make one subproblem out of two inconsistent
     approximations.
     """
+
+    def subset(self, keep):
+        """Restrict the per-variable parameters to the variables the subproblem actually moves."""
+        self.move = np.asarray(self.move)[keep]
 
     def __init__(self, blocks, sizes, k: int = 0):
         first = blocks[0][1]

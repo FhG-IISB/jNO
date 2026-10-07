@@ -139,3 +139,39 @@ def test_a_grid_that_could_not_resolve_anything_is_refused(kw, msg):
     asked for."""
     with pytest.raises(ValueError, match=msg):
         jno.peec.graded(**kw)
+
+
+def test_a_graded_grid_carries_face_sheets_like_a_uniform_one():
+    """A one-cell conductor thick against the skin depth carries a current sheet per face on a graded
+    grid too. Sheet detection used to read the axis's NOMINAL pitch, which on a graded grid is a mean
+    and matches no conductor -- so a graded layout silently fell back to one mid-thickness current.
+    With the graded edges placed exactly where the uniform ones are, the two must agree, and the L
+    readout must not route a graded lattice through the FFT apply (which refuses it)."""
+    mm = 1e-3
+
+    def run(graded):
+        p, gap, t = 1 * mm, 0.37 * mm, 0.37 * mm
+        geo = jno.shape.box(0, -2 * mm, gap, 20 * mm, 2 * mm, gap + t, size=(p, p, t)).attach(sigma=5.8e7).name("s")
+        geo = geo + jno.shape.box(0, -6 * mm, -t, 20 * mm, 6 * mm, 0, size=(p, p, t)).attach(sigma=5.8e7).name("p")
+        for k, yv in enumerate((-1.5, -0.5, 0.5, 1.5)):
+            geo = geo + jno.shape.line(
+                [(19.5 * mm, yv * mm, gap + t / 2), (19.5 * mm, yv * mm, -t / 2)], r=0.2 * mm, size=p
+            ).attach(sigma=5.8e7).name(f"v{k}")
+        d = geo.domain()
+        d.tag("A", lambda x, y, z: (x < 1.01 * mm) & (z > gap - 1e-9) & (np.abs(y) < 2 * mm))
+        d.tag("B", lambda x, y, z: (x < 1.01 * mm) & (z < 1e-9) & (np.abs(y) < 2 * mm))
+        i, v = d.peec_symbols()
+        at = lambda q: d.variable(q, split=True, sample=(4, None))[:3]
+        grid = (
+            (np.arange(0, 20.001, 1) * mm, np.arange(-6, 6.001, 1) * mm, np.array([-t, 0, gap, gap + t]))
+            if graded
+            else None
+        )
+        b = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e7, grid=grid).build()
+        s = b.solve(operator=jno.solve.hierarchical(tol=1e-7)) if graded else b.solve()
+        return float(np.real(s.L)), int((np.asarray(b.fil.pair) >= 0).sum())
+
+    l_u, p_u = run(False)
+    l_g, p_g = run(True)
+    assert p_g == p_u > 0
+    assert abs(l_g / l_u - 1) < 1e-6
