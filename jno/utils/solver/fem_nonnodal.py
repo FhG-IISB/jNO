@@ -1091,6 +1091,11 @@ def assemble_fem_nonnodal(
     # would apply the boundary lift twice; collapse to one (consistent value) before enforcement.
     if pins:
         pins = list(dict(pins).items())
+    # Publish the essential (dof, value) pins where `FEM.eigs` (and the other consumers that compose
+    # their own reduced system) read them. Written EVERY time, empty included: left unset, eigs on a
+    # non-nodal form skipped the elimination -- identity rows against full mass rows inject spurious
+    # pairs -- and a stash left behind by an earlier nodal build on the same domain was read instead.
+    domain._fem_native_dirichlet_pairs = list(pins)
     zeros = jnp.zeros(total)
 
     # --- SPARSE per-element assembly of a linear operator from a bare-term list -------------------------
