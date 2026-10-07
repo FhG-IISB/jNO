@@ -576,6 +576,143 @@ def entity_dofs_of_tasks(dm: DofMap, tasks: Dict) -> np.ndarray:
     return np.concatenate(out) if out else np.zeros((0,), np.int64)
 
 
+def basis_at_points(dm: DofMap, points: np.ndarray, cells: np.ndarray, c: int, X: np.ndarray) -> np.ndarray:
+    """Physical basis of cell ``c`` at physical points ``X`` (``(n, gdim)``) -> ``(n, n_dof, vs)``."""
+    J, x0 = cell_jacobians(points, cells[c : c + 1])
+    J, x0 = J[0], x0[0]
+    xi = np.linalg.solve(J, (np.asarray(X) - x0).T).T
+    tab = np.asarray(dm.element.tabulate(0, xi)[0])
+    B = dm.cell_transform_np(c) if not dm.is_diagonal else np.diag(dm.signs[c])
+    t = np.einsum("ij,qjv->qiv", B, tab)
+    mt = map_type(dm.family)
+    if mt == "covariant":
+        return np.einsum("ji,qnj->qni", np.linalg.inv(J), t)
+    if mt == "contravariant":
+        return np.einsum("ij,qnj->qni", J, t) / np.linalg.det(J)
+    return t
+
+
+def periodic_prolongation(dm: DofMap, points: np.ndarray, cells: np.ndarray, ties, *, tol: Optional[float] = None):
+    """DOF-level periodic / Floquet-Bloch prolongation ``u = P ũ`` for a field of ANY family and degree.
+
+    ``ties`` is a list of ``(main_vertex_mask, secondary_vertex_mask, phase)``. Every entity in the
+    closure of a secondary boundary facet is matched to the main entity it lands on under the
+    translation that maps the secondary face onto the main one (by entity centroid). Its DOFs are then
+    expressed through the main side by INTERPOLATION: the secondary entity's functionals (basix ``x``/``M``,
+    pulled back, oriented by ``B⁻ᵀ``) applied to ``phase · u_main(x - shift)``, with ``u_main`` the basis of
+    a main-facet cell. That one rule absorbs edge reversals, face rotations/reflections, the relative
+    orientation of the two faces and the Bloch phase -- no per-family sign logic. Ties that chain (an edge
+    on two periodic faces) are resolved by substitution until only retained DOFs remain.
+
+    Returns ``(P, kept, is_bloch)``: ``P`` a BCOO ``(n_dofs, n_kept)``, ``kept`` the retained DOF ids.
+    Raises if a secondary entity has no main partner (a non-conforming periodic mesh)."""
+    import jax.experimental.sparse as jsparse
+    import jax.numpy as jnp
+    from scipy.spatial import cKDTree
+
+    pts = np.asarray(points)[:, : dm.tdim]
+    cells = np.asarray(cells, dtype=np.int64)
+    span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    tol = max(span, 1.0) * 1e-6 if tol is None else tol
+    is_bloch = any(abs(complex(ph) - 1.0) > 1e-12 for (_m, _s, ph) in ties)
+    J, x0 = cell_jacobians(pts, cells)
+    elem = dm.element
+    mt = map_type(dm.family)
+    rel: Dict[int, Dict[int, complex]] = {}  # secondary dof -> {dof: weight}
+    for mmask, smask, ph in ties:
+        mmask = np.asarray(mmask, bool)
+        smask = np.asarray(smask, bool)
+        dvec = pts[smask].mean(axis=0) - pts[mmask].mean(axis=0)
+        axis = int(np.argmax(np.abs(dvec)))
+        shift = np.zeros(dm.tdim)
+        shift[axis] = dvec[axis]
+        t_main = region_trace_entities(dm, mmask, boundary_only=True)
+        t_sec = region_trace_entities(dm, smask, boundary_only=True)
+        if not t_main or not t_sec:
+            raise ValueError("periodic tie: a tied boundary has no boundary facet (check the tags).")
+        by_dim: Dict[int, list] = {}
+        for (d, e), (c, j, f) in t_main.items():
+            by_dim.setdefault(d, []).append((e, c, j))
+        trees = {
+            d: (cKDTree(np.stack([pts[dm.entity_vertices[d][e]].mean(axis=0) for e, _c, _j in lst])), lst)
+            for d, lst in by_dim.items()
+        }
+        for (d, e_s), (c_s, j_s, _f) in t_sec.items():
+            gd_s = dm.entity_global_dofs(d, e_s)
+            if gd_s.size == 0 or int(gd_s[0]) in rel:
+                continue
+            cen = pts[dm.entity_vertices[d][e_s]].mean(axis=0) - shift
+            tree, lst = trees[d]
+            dist, k = tree.query(cen)
+            if dist > tol:
+                raise ValueError(
+                    f"periodic tie: a secondary dim-{d} entity at {np.round(cen + shift, 6)} has no main partner "
+                    f"(nearest {dist:.2e} > tol {tol:.2e}); a conforming periodic mesh is required."
+                )
+            e_m, c_m, _j_m = lst[int(k)]
+            if e_m == e_s:
+                continue  # an entity on both faces of its own tie (degenerate): nothing to tie
+            Xr = np.asarray(elem.x[d][j_s])
+            Mk = np.asarray(elem.M[d][j_s])[..., 0]  # (nd, vs, npts)
+            Xs = x0[c_s] + Xr @ J[c_s].T
+            Phi = basis_at_points(dm, pts, cells, c_m, Xs - shift)  # (npts, n_dof, vs) of the main cell
+            Jc = J[c_s]
+            if mt == "covariant":
+                ref = np.einsum("pnd,da->pna", Phi, Jc)
+            elif mt == "contravariant":
+                ref = np.linalg.det(Jc) * np.einsum("ad,pnd->pna", np.linalg.inv(Jc), Phi)
+            else:
+                ref = Phi
+            lref = np.einsum("dvp,pnv->dn", Mk, ref)  # (nd, n_dof of the main cell)
+            Bk = dm.entity_block(c_s, d, j_s)
+            R = np.linalg.solve(Bk.T, lref) * complex(ph)  # (nd, n_dof)
+            cols = dm.cell_dofs[c_m]
+            scale = max(float(np.abs(R).max()), 1e-300)
+            for a, gs in enumerate(gd_s.tolist()):
+                row = {}
+                for b, gm in enumerate(cols.tolist()):
+                    w = R[a, b]
+                    if abs(w) > 1e-10 * scale:
+                        row[int(gm)] = row.get(int(gm), 0.0) + w
+                rel[int(gs)] = row
+    # resolve chains: substitute secondary dofs until every weight sits on a retained dof
+    resolved: Dict[int, Dict[int, complex]] = {}
+
+    def _resolve(sdof, stack=()):
+        if sdof in resolved:
+            return resolved[sdof]
+        if sdof in stack:
+            raise ValueError("periodic tie: the ties form a cycle (a face tied to itself through others).")
+        out: Dict[int, complex] = {}
+        for m, w in rel[sdof].items():
+            if m in rel:
+                for mm, ww in _resolve(m, stack + (sdof,)).items():
+                    out[mm] = out.get(mm, 0.0) + w * ww
+            else:
+                out[m] = out.get(m, 0.0) + w
+        resolved[sdof] = out
+        return out
+
+    for sd in list(rel):
+        _resolve(sd)
+    secondary = np.zeros(dm.n_dofs, dtype=bool)
+    secondary[list(rel)] = True
+    kept = np.flatnonzero(~secondary)
+    col = np.full(dm.n_dofs, -1, dtype=np.int64)
+    col[kept] = np.arange(kept.size)
+    rows, cols, vals = [kept], [np.arange(kept.size)], [np.ones(kept.size, dtype=complex)]
+    for sd, row in resolved.items():
+        if row:
+            rows.append(np.full(len(row), sd))
+            cols.append(col[np.asarray(list(row), dtype=np.int64)])
+            vals.append(np.asarray(list(row.values()), dtype=complex))
+    rows, cols, vals = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+    if not is_bloch:
+        vals = vals.real
+    P = jsparse.BCOO((jnp.asarray(vals), jnp.asarray(np.stack([rows, cols], axis=1))), shape=(dm.n_dofs, kept.size))
+    return P, kept, is_bloch
+
+
 __all__: Sequence[str] = (
     "DofMap",
     "basix_element",
