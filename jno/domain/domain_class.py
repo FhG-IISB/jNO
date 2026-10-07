@@ -1797,7 +1797,7 @@ class domain(MeshIOMixin):
 
         ``space`` selects the element family: ``"Lagrange"`` (default, nodal) or a non-nodal
         family — ``"N1E"`` (H(curl) Nédélec, first kind), ``"N2E"`` (H(curl), second kind: full
-        P_k), ``"RT"`` (H(div) Raviart-Thomas), ``"P0"`` (piecewise constant),
+        P_k), ``"RT"`` (H(div) Raviart-Thomas), ``"P0"`` / ``"DG"`` (discontinuous P_0 / P_k),
         all on triangles and tetrahedra; ``"Hermite"`` (C0 value+gradient), ``"Argyris"`` (C1
         conforming biharmonic) or ``"Morley"`` (non-conforming biharmonic, cheap: 6 DOF) on
         triangles. Non-nodal families assemble through the native push-forward engine.
@@ -1805,7 +1805,7 @@ class domain(MeshIOMixin):
         ``order`` is the polynomial degree. For N1E / N2E / RT it is the basix degree: ``order=1``
         is the lowest order (N1E_1 = "Whitney edges", 6 DOFs on a tet), ``order=k`` converges at
         rate ``k`` in the energy norm, with edge, face and interior DOFs oriented per cell by basix's
-        own DOF transformations. The C0/C1 plate families have a fixed
+        own DOF transformations. ``DG`` takes ``order >= 0``; the C0/C1 plate families have a fixed
         order and refuse another. A Lagrange field mixed with a non-nodal one (the A-V pair) may
         carry any order too.
 

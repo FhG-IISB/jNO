@@ -171,9 +171,9 @@ def assemble_fem_nonnodal(
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
 
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "N1E", "N2E", "P0", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
+    if any(s not in ("RT", "N1E", "N2E", "P0", "DG", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            f"jno.fem (non-nodal): supported element spaces are RT, N1E, N2E, P0, Hermite, Argyris, "
+            f"jno.fem (non-nodal): supported element spaces are RT, N1E, N2E, P0, DG, Hermite, Argyris, "
             f"Morley and Lagrange; got {spaces}. (Lagrange is admitted so a nodal scalar can be MIXED "
             f"with a non-nodal field -- the A-V pair is N1E x Lagrange. A Lagrange-only form belongs on "
             f"the native nodal assembler, which this path never sees.)"
@@ -185,21 +185,29 @@ def assemble_fem_nonnodal(
     # return the SAME lowest-order space with no warning, which on a wave problem is found only when a
     # convergence study stalls.
     _INTRINSIC_ORDER = {
-        "P0": "0 (piecewise constant)",
+        "P0": "0 (piecewise constant; use space='DG', order=k for discontinuous P_k)",
         "Hermite": "3 (cubic)",
         "Argyris": "5 (quintic)",
         "Morley": "2 (quadratic)",
     }
     _orders = []
     for _f in fields:
-        _o = int(_f.get("order", 1) or 1)
         _sp = str(_f["space"])
+        _raw = _f.get("order", 1)
+        _o = 1 if _raw is None else int(_raw)
+        if _sp == "DG" and _o < 0:
+            raise ValueError(f"jno.fem: order={_o} on a DG field; the lowest order is 0 (piecewise constant).")
         if _o > 1 and _sp in _INTRINSIC_ORDER:
             raise NotImplementedError(
                 f"jno.fem: order={_o} is not selectable on the {_sp} element — its order is intrinsic "
                 f"to the family ({_INTRINSIC_ORDER[_sp]}) and jNO builds only that one. Drop order= "
-                "(the default) to get it. order= does apply to N1E, N2E, RT and Lagrange."
+                "(the default) to get it. order= does apply to N1E, N2E, RT, DG and Lagrange."
             )
+        if _o < 1 and _sp != "DG":
+            if _sp in _INTRINSIC_ORDER:
+                _o = 1  # the intrinsic families ignore a zero/None default order -- historic behaviour
+            else:
+                raise ValueError(f"jno.fem: order={_o} on the {_sp} field; the lowest order is 1.")
         _orders.append(_o)
     _EDGE_FAMILIES = ("RT", "N1E", "N2E")
     has_edge = any(s in _EDGE_FAMILIES for s in spaces)
@@ -246,7 +254,7 @@ def assemble_fem_nonnodal(
                 "(A vertex-valued field -- Lagrange / Hermite / Argyris / Morley -- DOES take a nodal "
                 "value Dirichlet u(region) - g.)"
             )
-        if spaces[_fi] == "P0":
+        if spaces[_fi] in ("P0", "DG"):
             raise NotImplementedError(
                 "jno.fem (non-nodal): a P0 (cell-DOF) field carries no vertex values, so a nodal "
                 "Dirichlet u(region) - g does not apply to it; constrain it weakly instead."
@@ -369,9 +377,9 @@ def assemble_fem_nonnodal(
     # and the entity DOF maps (:mod:`fem_dofmap`) are dimension-agnostic, so N1E / N2E / RT / P0 /
     # Lagrange assemble on both. The vertex families (Hermite/Argyris/Morley) are 2-D plate elements.
     dim = 3 if "tetra" in domain.mesh.cells_dict else 2
-    if dim == 3 and any(s not in ("N1E", "N2E", "RT", "P0", "Lagrange") for s in spaces):
+    if dim == 3 and any(s not in ("N1E", "N2E", "RT", "P0", "DG", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh the supported spaces are N1E, N2E, RT, P0 "
+            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh the supported spaces are N1E, N2E, RT, P0, DG "
             f"and Lagrange; got spaces {spaces}. Hermite / Argyris / Morley are 2-D (triangle) plate "
             "elements."
         )
@@ -444,7 +452,7 @@ def assemble_fem_nonnodal(
     # --- quadrature for the polynomial degree in play. Degree 1 keeps the caller's rule untouched (the
     # lowest-order operators stay bit-identical); degree k needs the mass (degree 2k) exact plus room
     # for a coefficient, so the rule is raised to 2k + 2 when the caller's is lower. ---
-    _kmax = max([o for o, s_ in zip(_orders, spaces) if s_ in _EDGE_FAMILIES + ("Lagrange",)] + [1])
+    _kmax = max([o for o, s_ in zip(_orders, spaces) if s_ in _EDGE_FAMILIES + ("Lagrange", "DG")] + [1])
     if _kmax > 1:
         quad_degree = max(int(quad_degree), 2 * _kmax + 2)
 
@@ -485,6 +493,8 @@ def assemble_fem_nonnodal(
             dofmaps[_i] = _dofmap_for(_s, _orders[_i])
         elif _s == "Lagrange" and _orders[_i] > 1:
             dofmaps[_i] = _dofmap_for("Lagrange", _orders[_i])
+        elif _s == "DG":  # discontinuous P_k: all DOFs interior to a cell, no orientation
+            dofmaps[_i] = _dofmap_for("DG", _orders[_i])
     # ``ref_curl`` is ``None`` for the 3-D H(curl) families (their curl is a vector recovered from the
     # physical gradient, not a tabulated scalar) -- keep it ``None`` through the jnp conversion.
     edge_ref = {k: tuple(jnp.asarray(a) if a is not None else None for a in v[:3]) + v[3:] for k, v in edge_ref.items()}
@@ -551,7 +561,7 @@ def assemble_fem_nonnodal(
     # quadrature, values (n_quad, n_dof) and reference gradients (n_quad, n_dof, dim).
     lagrange_ref = {}
     for _i, _dm in dofmaps.items():
-        if spaces[_i] == "Lagrange":
+        if spaces[_i] in ("Lagrange", "DG"):
             _tab = _dm.element.tabulate(1, np.asarray(ref_spec.quad_points))
             lagrange_ref[_i] = (
                 jnp.asarray(_tab[0][..., 0]),
@@ -714,7 +724,7 @@ def assemble_fem_nonnodal(
         detJ = small_det(J)
         per = []
         for i, s in enumerate(spaces):
-            if s == "Lagrange" and i in lagrange_ref:
+            if s in ("Lagrange", "DG") and i in lagrange_ref:
                 # P_k (k >= 2): basix tabulation, the per-cell DOF transform (a permutation from P3 on,
                 # identity for P2), and the isoparametric chain rule for the gradient.
                 lv, lg, _needs_B = lagrange_ref[i]
