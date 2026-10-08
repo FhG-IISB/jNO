@@ -836,6 +836,38 @@ def _symmetric_ic_values(raw, n, n_nodes):
     return full[:, iu, ju].reshape(-1)
 
 
+def _unique_dirichlet_pairs(pairs):
+    """One ``(dof, value)`` pair per DOF; the LAST condition in the term list wins.
+
+    A node on two Dirichlet regions (the corner where ``left`` meets ``bottom``) is named by both. Every
+    consumer assumes one pair per DOF: the elimination appends one unit-diagonal triplet per pair and BCOO
+    sums duplicates, so a corner node's row became ``2 s u = s g`` -- the corner solved to HALF its value,
+    silently (measured: ``u = 1 + y`` on all four edges of a square gave 0.5 and 1.0 at the corners, against
+    1 and 2). Two DIFFERENT values at one DOF (a lid-driven cavity's top corners: lid 1, wall 0) are a
+    genuine ambiguity in the problem statement; the later condition is kept and the count is logged."""
+    if not pairs:
+        return pairs
+    keep: Dict[int, Any] = {}
+    clash = 0
+    for d, g in pairs:
+        d = int(d)
+        if d in keep:
+            try:
+                if abs(float(keep[d]) - float(g)) > 1e-12 * max(1.0, abs(float(g))):
+                    clash += 1
+            except Exception:  # a traced (net-valued) value: no concrete comparison, the later one wins
+                pass
+        keep[d] = g
+    if clash:
+        from ..logger import get_logger
+
+        get_logger().warning(
+            f"jno.fem: {clash} DOF(s) are prescribed by two Dirichlet conditions with DIFFERENT values (nodes "
+            "shared by two regions, e.g. corners). The condition written LATER in the term list is imposed there."
+        )
+    return list(keep.items())
+
+
 def _dirichlet_value_columns(gs, vt, comp, region, field=None):
     """A Dirichlet value table ``(n_nodes, n_values)`` checked against the clamped components.
 
@@ -4525,6 +4557,7 @@ def assemble_fem_native(
         domain._fem_native_dirichlet_args_dofs = args_dofs
         _mask_cover_pins(pairs)
         _gauge_cover_modes(pairs)
+        pairs[:] = _unique_dirichlet_pairs(pairs)  # in place: the stash above is this same list
         return pairs
 
     def _cover_g(fidx, nid, g):
