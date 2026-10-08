@@ -7049,6 +7049,11 @@ def _fem_impl(
     )
     if _reads_across and not _nonnodal_families:
         _nonnodal_families = {"Lagrange (across)"}
+    # A term on a body's faces INSIDE the mesh (`d.tag(..., region=body)`) likewise: the nodal assemblers
+    # walk boundary facets only, so such a term -- a load in particular -- would be dropped without a word.
+    _iface = set(getattr(domain, "_interior_face_tags", ()) or ())
+    if _iface and not _nonnodal_families and any(r in _iface for r in boundary_terms):
+        _nonnodal_families = {"Lagrange (interior faces)"}
     # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
     # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
     _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}

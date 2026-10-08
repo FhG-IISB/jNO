@@ -322,3 +322,16 @@ def test_cell_size_resolves_on_the_nonnodal_path(k):
     C = np.asarray(d.mesh.cells_dict["tetra"])
     dJ = np.abs(np.linalg.det(np.stack([P[C[:, j]] - P[C[:, 0]] for j in (1, 2, 3)], axis=2)))
     np.testing.assert_allclose(a @ Mh @ a, np.sum(dJ / 6 * dJ ** (1 / 3)), rtol=1e-10)
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_load_on_a_body_face_inside_the_mesh_is_not_dropped(order):
+    """A trial-free Lagrange term on a body-owned tag whose facets lie INSIDE the mesh: the nodal
+    assemblers walk boundary facets only, so ∫ 1·v over the unit-length face used to assemble to 0."""
+    d = jno.domain.csg.from_regions({"top": box(0, 0.5, 1, 1), "cu": box(0, -0.5, 1, 0.5)}, mesh_size=0.2, time=None)
+    d.tag("ftop", lambda x, y: np.abs(y - 0.5) < 1e-9, region="interior_cu")
+    u, v = d.fem_symbols(names=("u", "v"), order=order)
+    x, y, _ = d.variable("interior", split=True)
+    c = d.variable("ftop", split=True)
+    b = np.asarray(jno.fem([u.bind(x=x, y=y) * v.bind(x=x, y=y), 1.0 * v.bind(x=c[0], y=c[1])]).b).reshape(-1)
+    np.testing.assert_allclose(abs(b.sum()), 1.0, rtol=1e-12)
