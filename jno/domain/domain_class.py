@@ -2102,6 +2102,10 @@ class domain(MeshIOMixin):
             dim = int(self.dimension)
             mask = np.asarray(where(*(pts64[:, i] for i in range(dim)))).reshape(-1).astype(bool)
             full = self._boundary_regions.get("boundary", None)
+            if tag in (getattr(self, "_tag_regions", {}) or {}) and tag in self._boundary_regions:
+                # a body-owned tag can name facets INSIDE the mesh (a region's own surface): restrict to
+                # the tag's facets, not to the domain boundary
+                full = self._boundary_regions[tag]
             if full is not None and mask.any():
                 # the boundary test is the costly part (point vs every boundary facet): run it only on
                 # the points the predicate already accepts
@@ -2657,6 +2661,34 @@ class domain(MeshIOMixin):
         ek = key(ents)
         return np.array([all(tuple(v) in own for v in f) for f in ek], dtype=bool)
 
+    def _region_surface_facets(self, region):
+        """``(E, dim, dim)`` vertex coordinates of the facets separating cells of volume ``region`` from
+        cells of other regions in a conforming mesh (the facets on the domain boundary are not included),
+        or ``None`` without a mesh / named cell regions."""
+        from .mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
+
+        try:
+            mesh = getattr(self, "mesh", None)
+        except Exception:  # noqa: BLE001  a mesh-free domain
+            mesh = None
+        if mesh is None:
+            return None
+        dim = int(self.dimension)
+        memb = mesh_cell_region_membership(mesh, dim).get(str(region))
+        if memb is None:
+            return None
+        cells = np.asarray(p1_cells_dict(mesh)[volume_cell_type(mesh, dim)], dtype=np.int64)
+        memb = np.asarray(memb, dtype=bool)
+        k = cells.shape[1]
+        loc = [tuple(j for j in range(k) if j != i) for i in range(k)]  # local facet = all vertices but one
+        fac = np.sort(np.concatenate([cells[:, list(lf)] for lf in loc]), axis=1)
+        owner = np.tile(np.arange(len(cells)), k)
+        _u, inv, cnt = np.unique(fac, axis=0, return_inverse=True, return_counts=True)
+        inv = inv.reshape(-1)
+        n_in = np.bincount(inv, weights=memb[owner].astype(float), minlength=len(_u))
+        sel = (cnt[inv] == 2) & memb[owner] & (n_in[inv] == 1)  # interior facet, exactly one side in region
+        return np.asarray(mesh.points)[fac[sel]][:, :, :dim]
+
     def _register_tag_boundary_region(self, name, where, region=None):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
         so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
@@ -2703,6 +2735,13 @@ class domain(MeshIOMixin):
                 if "|" in _t and _r.facets is not None:
                     blocks.append(_r.facets)
                     owners.append(_t.rsplit(".", 1)[-1] if "." in _t else None)
+            # ...and the body's own surface where it lies INSIDE a conforming mesh (facets between a cell
+            # of `region` and a cell of another region): a thin conductor meshed with its surroundings
+            # has its faces there, not on the domain boundary.
+            _rs = self._region_surface_facets(region)
+            if _rs is not None and len(_rs):
+                blocks.append(_rs)
+                owners.append(str(region))
         _bo = [(np.asarray(b), o) for b, o in zip(blocks, owners) if b is not None and len(b)]
         blocks, owners = [b for b, _ in _bo], [o for _, o in _bo]
         # Every block must be the same kind of facet to stack: they are, on the single-cell-type mesh

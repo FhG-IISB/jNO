@@ -1125,6 +1125,7 @@ def assemble_fem_nonnodal(
         return (_Lit(-1.0) if x is None else (-1.0) * x) if sign < 0 else x
 
     pressure_terms, surface_terms, incident_terms, gsurf_terms = {}, {}, {}, {}
+    _body_owned = set(getattr(domain, "_tag_regions", {}) or {})
     for region, terms in (boundary_terms or {}).items():
         for t in terms:
             bt = _bare_nn(t)
@@ -1133,7 +1134,9 @@ def assemble_fem_nonnodal(
                 wrap, inner_expr = bt._name, bt.args[0]
             for sign, sub in _split_additive_terms(domain, inner_expr):
                 sub_w = sub if wrap is None else (sub.real if wrap == "real" else sub.imag)
-                if _reads_across(sub_w):  # non-local: never one of the host-assembled patterns
+                # non-local, or a body-owned tag that may lie INSIDE the mesh: never one of the
+                # host-assembled patterns (those walk boundary facets only)
+                if region in _body_owned or _reads_across(sub_w):
                     gsurf_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
                 elif dim == 3 and (mass := _n1e_surface_mass_spec(sub_w)) is not None:
                     surface_terms.setdefault(region, []).append(_signed(mass[0], sign))
@@ -2104,13 +2107,45 @@ def _build_general_surface(
         if mask is None:
             raise ValueError(f"jno.fem (non-nodal): boundary region {region!r} has no location function.")
         mask = np.asarray(mask, dtype=bool).reshape(-1)
-        fac = np.flatnonzero((count == 1) & mask[fverts].all(axis=1))
+        inside = mask[fverts].all(axis=1)
+        fac = np.flatnonzero((count == 1) & inside)
+        cel, loc = fcell[fac], flocal[fac]
+        owner = (getattr(domain, "_tag_regions", {}) or {}).get(region)
+        if owner is not None:
+            # A body-owned tag (`d.tag(name, where, region=body)`): only that body's facets, including
+            # its surface INSIDE a conforming mesh (against another region), each integrated from the
+            # body's side -- so the normal points out of the body, as it does on a boundary face.
+            from ...domain.mesh_utils import mesh_cell_region_membership
+
+            memb = mesh_cell_region_membership(domain.mesh, dim).get(owner)
+            if memb is None:
+                raise ValueError(f"jno.fem (non-nodal): tag {region!r} names region {owner!r}, which has no cells.")
+            memb = np.asarray(memb, dtype=bool)
+            keep = memb[cel]
+            fac, cel, loc = fac[keep], cel[keep], loc[keep]
+            fi2 = np.flatnonzero((count == 2) & inside)
+            if fi2.size:
+                pos = np.full(int(count.size), -1, dtype=np.int64)
+                pos[fi2] = np.arange(len(fi2))
+                n_in = np.zeros(len(fi2), dtype=np.int64)
+                oc = np.full(len(fi2), -1, dtype=np.int64)
+                ol = np.full(len(fi2), -1, dtype=np.int64)
+                ce = np.asarray(tdm.cell_entities[dim - 1])
+                for kk in range(ce.shape[1]):  # every (cell, local facet) on a candidate facet
+                    p_ = pos[ce[:, kk]]
+                    hit = np.flatnonzero((p_ >= 0) & memb)
+                    np.add.at(n_in, p_[hit], 1)
+                    oc[p_[hit]], ol[p_[hit]] = hit, kk
+                one = n_in == 1  # exactly one side in the body: its surface, not a facet inside it
+                fac = np.concatenate([fac, fi2[one]])
+                cel = np.concatenate([cel, oc[one]])
+                loc = np.concatenate([loc, ol[one]])
         if fac.size == 0:
             raise ValueError(
                 f"jno.fem (non-nodal): boundary region {region!r} contains no boundary facet (a facet counts "
                 "when ALL its vertices lie in the region) -- its terms would be silently dropped."
             )
-        return fac
+        return fac, cel, loc
 
     def _raw_normals(c, k):
         V = P[np.asarray(cells)[c]]
@@ -2121,7 +2156,7 @@ def _build_general_surface(
         return np.stack([-t[:, 1], t[:, 0]], axis=1)
 
     def _project(X, main_fac):
-        """Closest point of the facets ``main_fac`` to each point of ``X`` -> (facet index, point)."""
+        """Closest point of the facets ``main_fac`` to each point of ``X`` -> (index into ``main_fac``, point)."""
         from scipy.spatial import cKDTree
 
         FV = P[fverts[main_fac]]  # (m, dim, dim) facet vertices
@@ -2147,13 +2182,12 @@ def _build_general_surface(
             dd = np.linalg.norm(Xp - X, axis=1)
             better = dd < best_d
             best_d[better], best_f[better], best_x[better] = dd[better], cand[better, j], Xp[better]
-        return main_fac[best_f], best_x
+        return best_f, best_x  # index INTO main_fac
 
     across_pairs = dict(getattr(domain, "_across_pairs", {}) or {})
     groups = []
     for region, terms in gsurf_terms.items():
-        fac = _region_facets(region)
-        c, k = fcell[fac], flocal[fac]
+        fac, c, k = _region_facets(region)
         nout = facet_outward_normals(tdm, P, cells, c, k)
         sgn = np.sign(np.einsum("nd,nd->n", _raw_normals(c, k), nout))
         # physical quadrature points of every facet (host, static mesh -- the across pairing)
@@ -2175,10 +2209,10 @@ def _build_general_surface(
                     "main points, which this pairing does not build. The H(curl)/H(div)/Lagrange/DG/P0 "
                     "families are supported."
                 )
-            mf = _region_facets(main)
+            mf, mcell, _mloc = _region_facets(main)
             Xf = X.reshape(-1, dim)
             mfi, Xp = _project(Xf, mf)
-            cB = fcell[mfi]
+            cB = mcell[mfi]
             if sp == "P0":
                 dofs = offs[fi] + cB[:, None]
                 phi = np.ones((len(cB), 1, 1))

@@ -250,3 +250,55 @@ def test_basis_at_points_batch_matches_per_cell(family, degree):
     X = np.einsum("nk,nkd->nd", lam, P[C[cs]])
     ref = np.stack([basis_at_points(dm, P, C, int(c), X[i : i + 1])[0] for i, c in enumerate(cs)])
     np.testing.assert_allclose(basis_at_points_batch(dm, P, C, cs, X), ref, rtol=0, atol=1e-12)
+
+
+def _foil_2d_hybrid(order, f, Ht, Hb, Hd=0.5e-3, L=1e-3):
+    """The foil MESHED (as μ0, σ = 0) between the air layers, its two faces now interior facets named by
+    ``d.tag(..., region=<the foil>)``; the meshed foil carries the static block 1/(μt)[[1,-1],[-1,1]], so
+    only the conduction part of the two-port goes on the faces."""
+    w, Zc, coth, csch, c11, c12 = _two_port(f)
+    t = T_FOIL
+    c11p, c12p = c11 - 1 / (MU0 * t), c12 + 1 / (MU0 * t)
+    d = jno.domain.csg.from_regions(
+        {"top": box(0, t / 2, L, Hd), "cu": box(0, -t / 2, L, t / 2), "bot": box(0, -Hd, L, -t / 2)}, mesh_size=2e-4, time=None
+    )
+    e = 1e-9
+    d.tag("ztop", lambda x, y: np.abs(y - Hd) < e)
+    d.tag("zbot", lambda x, y: np.abs(y + Hd) < e)
+    d.tag("ftop", lambda x, y: np.abs(y - t / 2) < e, region="interior_cu")
+    d.tag("fbot", lambda x, y: np.abs(y + t / 2) < e, region="interior_cu")
+    A, v = d.fem_symbols(names=("A", "v"), order=order)
+    xi, yi, _ = d.variable("interior", split=True)
+    Ai, vi = A.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+
+    def on(tag):
+        c = d.variable(tag, split=True)
+        return A.bind(x=c[0], y=c[1]), v.bind(x=c[0], y=c[1])
+
+    (At, vt), (Ab, vb), (_a, vzt), (_b, vzb) = on("ftop"), on("fbot"), on("ztop"), on("zbot")
+    fem = jno.fem(
+        [
+            (1 / MU0) * (Ai.x * vi.x + Ai.y * vi.y),
+            c11p * At * vt + c12p * A.across("fbot", domain=d) * vt,
+            c11p * Ab * vb + c12p * A.across("ftop", domain=d) * vb,
+            Ht * vzt,
+            (-Hb) * vzb,
+        ]
+    )
+    sol = np.asarray(fem.solve()).reshape(-1)
+    Y = np.array([[coth, -csch], [csch, -coth]]) / Zc
+    Ep, Em = np.linalg.solve(Y, [Ht, Hb])
+    Ap, Am = Ep / (-1j * w), Em / (-1j * w)
+    zz = np.asarray(d.mesh.points)[:, 1]
+    ex = np.where(zz > 0, Ap - MU0 * Ht * (zz - t / 2), Am - MU0 * Hb * (zz + t / 2))
+    air = np.abs(zz) >= t / 2 - 1e-12  # inside the foil the meshed field is the linear interpolant
+    return np.abs(sol[: zz.size] - ex)[air].max() / np.abs(ex).max()
+
+
+@pytest.mark.parametrize("order", [1, 2])
+@pytest.mark.parametrize("f,tol", [(1e7, 1e-12), (100.0, 1e-8)])
+def test_foil_on_interior_facets_of_a_meshed_body_is_exact(order, f, tol):
+    """Surface terms on a body's faces INSIDE a conforming mesh (`region=`): exact at 10 MHz (measured
+    1e-15) and at 100 Hz (2e-11, the c11/c12 cancellation), net-current and mixed drives."""
+    for Ht, Hb in ((1.0, -1.0), (0.3, 2.0)):
+        assert _foil_2d_hybrid(order, f, Ht, Hb) < tol
