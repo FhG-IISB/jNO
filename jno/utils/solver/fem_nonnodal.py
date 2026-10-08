@@ -1223,7 +1223,15 @@ def assemble_fem_nonnodal(
 
     _incident_const = _incident_of(None)
     nat_load = nat_load_rt + _incident_const  # the constant boundary load (used by the non-parametric path)
-    surf_mass = _surf_mass_of(None)
+    # SPARSE: the dense (total x total) form is O(n_dof^2) -- measured 10 GB at 36k DOFs, 284 GB asked
+    # for at 188k -- and only the two small dense (C1 / second-order) paths below add it to a dense
+    # matrix; they densify it there. Every sparse path re-assembles it per args (`_surf_mass_of(args,
+    # sparse=True)`), so this eager copy exists only for those, and for the presence check.
+    surf_mass = _surf_mass_of(None, sparse=True)
+
+    def _surf_mass_dense():
+        return None if surf_mass is None else jnp.asarray(surf_mass.todense())
+
     if surf_mass is not None or incident_terms:
         # The surface mass is a fixed LINEAR block added to the spatial operator A (and the incident load to
         # b), so it composes with the steady AND transient linear problem (M u̇ + A u = c: the impedance is a
@@ -1660,7 +1668,7 @@ def assemble_fem_nonnodal(
             def _A_of(args):  # A_aug(args) = [[0, -M2], [K(args), C]]: M2 u̇ = M2 v ; M2 v̇ + C v + K u = F
                 K = jax.jacfwd(lambda u: spatial_res2(u, args))(zeros)
                 if surf_mass is not None:  # N1E tangential-trace surface mass (impedance) → the stiffness K
-                    K = K + surf_mass
+                    K = K + _surf_mass_dense()
                 return _dir_A(jnp.block([[Z, -M2], [K, Cmat]]))
 
             def _f_of(args):  # load F(args) on the v-block rows (Dirichlet g rides affine_bias, not the forcing)
@@ -1873,7 +1881,7 @@ def assemble_fem_nonnodal(
                     return A if _d is None else bcoo_eliminate_dirichlet(A, _d)  # Dirichlet rows -> identity
                 A = jax.jacfwd(lambda u: spatial_res(u, args))(zeros)  # C¹ vertex families: dense (small 2-D)
                 if _sm is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
-                    A = A + _sm
+                    A = A + _sm.todense()
                 return A if _d is None else A.at[_d, :].set(0.0).at[_d, _d].set(1.0)  # Dirichlet rows -> identity
 
             def forcing_vector_fn(t, args=None, _mask=free_mask):
@@ -1902,7 +1910,7 @@ def assemble_fem_nonnodal(
         else:
             A = jax.jacfwd(spatial_res)(zeros)  # C¹ vertex families: dense (small 2-D)
             if surf_mass is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
-                A = A + surf_mass
+                A = A + _surf_mass_dense()
         c = -spatial_res(zeros) + nat_load  # spatial load + natural-BC constant load
         M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
         # Applied on every timestep, so the per-term/per-element triplet redundancy is paid the whole
