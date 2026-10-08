@@ -205,7 +205,7 @@ def _full_matrix_p1(mode):
     Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
     return jno.fem(
         [inner(Si.T, Ti, n_contract=2) + 0.1 * inner(Si @ Si, Ti, n_contract=2) - (x * Ti[0, 1] + Ti[1, 0])]
-    ).solve()
+    ).solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-12, atol=1e-14))
 
 
 CASES = {

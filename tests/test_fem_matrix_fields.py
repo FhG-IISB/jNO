@@ -393,3 +393,26 @@ def test_symmetric_outside_the_native_assembler_is_refused():
     S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), symmetric=True)
     with pytest.raises(NotImplementedError, match="native 2-D/3-D Lagrange"):
         jno.fem([inner(S.bind(x=x), T.bind(x=x), n_contract=2) - J.trace(T.bind(x=x))])
+
+
+def test_a_matrix_unknown_squared_is_nonlinear():
+    """S + c S @ S = F, pointwise, with F built from a known non-symmetric S0: the solution is S0.
+
+    `S @ S` used to classify LINEAR (matmul was a linear wrapper whatever its arguments), and the linear
+    path builds its operator at S = 0, where the quadratic term has no slope -- the term vanished. A
+    coefficient matrix times the unknown, A @ S, stays linear."""
+    d = _square()
+    x, y = d.variable("interior", split=True)[:2]
+    S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"))
+    Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
+    S0 = np.array([[0.3, 0.6], [-0.2, 0.1]])
+    c = 0.7
+    F = S0 + c * S0 @ S0
+    for square in (Si @ Si, J.matmul(Si, Si)):
+        fem = jno.fem([inner(Si + c * square - J.array(F), Ti, n_contract=2)])
+        assert fem._mode == "nonlinear"
+        U = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-13, atol=1e-14))).reshape(-1, 2, 2)
+        np.testing.assert_allclose(U, np.broadcast_to(S0, U.shape), atol=1e-12)
+    A = J.array([[2.0, 1.0], [0.0, 1.0]])
+    assert jno.fem([inner(A @ Si - J.array(F), Ti, n_contract=2)])._mode == "linear"
+

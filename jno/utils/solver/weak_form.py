@@ -781,7 +781,14 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
         # inner(grad u, grad u). It stays in ``linearish`` for the common bilinear case
         # inner(grad u, grad v), where the second factor is the *test* function (not the unknown);
         # so we count factors carrying the unknown (any node type, not only Placeholder args).
-        if name in {"inner", "einsum"} and sum(bool(_contains_unknown_symbol(domain, a)) for a in expr.args) >= 2:
+        # The same holds for every bilinear wrapper in ``linearish``: ``S @ S`` (a matrix unknown squared,
+        # e.g. an Oldroyd / Giesekus quadratic stress term), ``dot(u, u)``, ``u × u``. Only ``inner`` and
+        # ``einsum`` were checked once, so ``inner(S @ S, T)`` classified LINEAR; the linear path builds
+        # its operator at u = 0, where a quadratic term has no slope, and the term silently vanished
+        # (measured: scaling it by 10 left the solution unchanged to the last bit).
+        if name in {"inner", "einsum", "matmul", "matvec", "dot", "cross"} and (
+            sum(bool(_contains_unknown_symbol(domain, a)) for a in expr.args) >= 2
+        ):
             return True
 
         # Jacobian/Hessian are handled through their own nodes
