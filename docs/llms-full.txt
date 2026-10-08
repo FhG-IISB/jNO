@@ -383,6 +383,12 @@ call — `jno.fem` classifies each term by the region its symbols are bound to.
 
 ### Symbols
 
+`u = d.unknown(); v = u.test()` — the unknown (the same object `jno.fdm` solves for) and its derived test
+function. By shape: `d.unknown.scalar()`, `d.unknown.vector(2, order=2)`, `d.unknown.matrix(2, 2,
+symmetric=True)` (n(n+1)/2 stored values per node, a full matrix in expressions); keywords `order=`,
+`space=`, `complex=`, `name=`. `constant=True` is ONE value over the domain: `u(xr, yr) - U` ties a field
+to it exactly, `U - g` pins it, a weak term carrying `U.test()` is an integral row. Equivalent older form:
+
 `d.fem_symbols(value_shape=(), order=1, space=None, names=("u", "phi"))`
 
 - `value_shape=(2,)` → vector unknown (elasticity, velocity)
