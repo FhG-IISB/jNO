@@ -2112,6 +2112,22 @@ class domain(MeshIOMixin):
                 hit = np.flatnonzero(mask)
                 pts, n = pts[hit], int(hit.size)
                 mask[hit] = _vmapped(full.contains).astype(bool)
+            # ...and every vertex of the facets the tag SELECTED. The tag picks its facets by the
+            # predicate at facet centroids, but a node test re-asks it at the vertices, and the two can
+            # disagree: on a curved wall the centroids sit inside the surface by the chord sagitta, and a
+            # predicate written to keep a neighbouring plane out ("not on z = 0") drops the vertices where
+            # the wall MEETS that plane. Every edge touching that junction then went unpinned in silence --
+            # measured on a mirror-cell eddy problem in a cylindrical can: L 8 % high. The closure of the
+            # selected facets is what the tag means.
+            reg = self._boundary_regions.get(tag)
+            fac = None if reg is None else getattr(reg, "facets", None)
+            if fac is not None and len(fac):
+                from scipy.spatial import cKDTree
+
+                fv = np.unique(np.asarray(fac, dtype=np.float64).reshape(-1, np.asarray(fac).shape[-1])[:, :dim], axis=0)
+                span = float(np.ptp(pts64[:, :dim])) if len(pts64) else 1.0
+                d_, _i = cKDTree(fv).query(pts64[:, :dim], distance_upper_bound=1e-12 * max(span, 1e-30) + 1e-300)
+                mask |= np.isfinite(d_)
             return mask
 
         num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
