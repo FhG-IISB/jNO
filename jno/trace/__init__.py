@@ -4649,6 +4649,52 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
             dom.context[key] = _np.zeros((1, _dim))
         return Variable(tag=key, dim=[0, _dim], domain=dom, axis="spatial")
 
+    def across(self, main: str, *, domain):
+        """The trace of this field on the tagged boundary face ``main``, as a symbol usable in a weak
+        term integrated on ANOTHER face -- the non-local ingredient of a two-face (thin-layer) condition.
+
+        At every quadrature point of the face the term lives on, the value is this field evaluated at
+        the point of ``main`` facing it (its projection onto ``main``), with ``main``'s own adjacent
+        cell and basis. So a coupling between the two faces of a thin conductor removed from the mesh
+        is written as ordinary terms, once per face -- the exact layered-conductor two-port (Dowell, Proc.
+        IEE 113(8), 1966) in admittance form, ``Y = (1/Zc) [[coth γt, -csch γt], [-csch γt, coth γt]]``,
+        ``Zc = γ/σ``. Per face ``c11 = jωσ coth(γt)/γ`` and ``c12 = -jωσ csch(γt)/γ``; both stay finite as
+        ``ω -> 0`` (``±1/(μt)``), and their sum, the conductance, is a difference of large numbers there --
+        relative accuracy ``~ ε (δ/t)²``, i.e. 1e-9 at 1 Hz for a 35 µm copper foil::
+
+            ua = u.across("cu_bot", domain=d)            # on the top face, read the bottom face
+            n = d.variable("cu_top", normals=True)
+            c11 = 1j*w*sigma*coth(g*t)/g;  c12 = -1j*w*sigma/(g*sinh(g*t))
+            fem = jno.fem([..., c11*inner(u.vector.cross(n), v.vector.cross(n))
+                                + c12*inner(jno.np.cross(ua, n), v.vector.cross(n)), ...])  # + same on cu_bot
+
+        Like :meth:`gap` it is a placeholder symbol: the per-point value is packed during assembly (it is
+        LINEAR in the main face's DOFs, so the operator gains the main-cell columns exactly), and the
+        pairing is frozen at build time from the static mesh -- differentiable in the DOF values, not
+        in the mesh coordinates. Assembled on the non-nodal path, for every family it carries (N1E /
+        N2E / RT of any degree, Lagrange, DG, P0), in 2-D and 3-D.
+
+        **Matched faces.** The two faces should carry matching meshes (e.g. an extruded foil), so each
+        point's partner lies exactly on ``main``. On non-matching faces the partner is the closest point
+        of ``main``, and a strongly coupling coefficient -- the ``±1/(μt)`` of a thin conductor's
+        two-port at low frequency -- then acts like a penalty on that mismatch: correct only to the
+        resolution of the coarser face.
+        """
+        dom = domain
+        if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
+            raise TypeError(f"u.across: `domain=` must be a jno domain, got {type(dom).__name__}.")
+        breg = getattr(dom, "_boundary_regions", {}) or {}
+        if main not in breg:
+            raise ValueError(f"u.across: {main!r} is not a boundary region on this domain. Known: {sorted(breg)}.")
+        import numpy as _np
+
+        n = int(_np.prod(self.value_shape)) if self.value_shape else 1
+        key = f"across_{self.field_key}_{main}"
+        dom.__dict__.setdefault("_across_pairs", {})[key] = (self.field_key, main)
+        if key not in dom.context:  # placeholder so the Variable constructs; assembly packs the value
+            dom.context[key] = _np.zeros((1, n))
+        return Variable(tag=key, dim=[0, n], domain=dom, axis="spatial")
+
     def pin(self, value=0.0, mean=False):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
 

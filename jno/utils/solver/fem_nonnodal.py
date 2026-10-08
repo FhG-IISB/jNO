@@ -717,7 +717,21 @@ def assemble_fem_nonnodal(
         tangent."""
         return [u_blocks[i][cdofs[i][c] - offs[i]] for i in range(len(fields))]
 
-    def _cell_fields(c, cell_sols, pts_dyn=None):
+    # Reference tables every field reads in `_cell_fields`: the volume quadrature by default; the
+    # general boundary path hands the same structure tabulated at FACE points (`_tabulate_at`).
+    _VOL_TABS = {
+        "pts": qp,
+        "n": n_quad,
+        "p1": p1_shape_vals,
+        "edge": {i: v[:3] for i, v in edge_ref.items()},
+        "lag": {i: v[:2] for i, v in lagrange_ref.items()},
+        "hermite": hermite_ref,
+        "argyris": None if argyris_ref is None else argyris_ref[:3],
+        "morley": None if morley_ref is None else morley_ref[:3],
+    }
+
+    def _cell_fields(c, cell_sols, pts_dyn=None, tabs=None):
+        T = _VOL_TABS if tabs is None else tabs
         # `pts_dyn` is the coordinate-parameter-scattered geometry; it defaults to the static mesh.
         # Defaulting is REFUSED when coordinates are trainable rather than silently falling back --
         # a static fallback there returns a shape derivative of exactly zero, which looks like a
@@ -739,7 +753,8 @@ def assemble_fem_nonnodal(
             if s in ("Lagrange", "DG") and i in lagrange_ref:
                 # P_k (k >= 2): basix tabulation, the per-cell DOF transform (a permutation from P3 on,
                 # identity for P2), and the isoparametric chain rule for the gradient.
-                lv, lg, _needs_B = lagrange_ref[i]
+                lv, lg = T["lag"][i]
+                _needs_B = lagrange_ref[i][2]
                 if _needs_B is not None:
                     Bc = _B_of(dm_tables[i][0], dm_tables[i][1], c)
                     lv = jnp.einsum("ij,qj->qi", Bc, lv)
@@ -763,15 +778,15 @@ def assemble_fem_nonnodal(
                 g = g_ref @ small_inv(J)  # (dim+1, dim)
                 per.append(
                     {
-                        "shape_vals": p1_shape_vals,  # (n_quad, dim+1)
-                        "shape_grads": jnp.broadcast_to(g, (n_quad, dim + 1, dim)),
+                        "shape_vals": T["p1"],  # (n_quad, dim+1)
+                        "shape_grads": jnp.broadcast_to(g, (T["n"], dim + 1, dim)),
                         "cell_sol": cell_sols[i][:, None],
                         "space": "Lagrange",
                     }
                 )
                 continue
             if s == "Hermite":  # C0 vertex value+derivative DOFs via the M(cell) DOF-transform
-                rv, rg, rh = hermite_ref
+                rv, rg, rh = T["hermite"]
                 phi, grad, hess = hermite_pushforward(rv, rg, rh, J, detJ, None)
                 # Tag "Lagrange": the M(cell) transform is baked into phi/grad/hess, so this SCALAR field's
                 # shape data matches nodal Lagrange and the shared evaluator (value / .x / Hessian) serves
@@ -786,7 +801,7 @@ def assemble_fem_nonnodal(
                     }
                 )
             elif s == "Argyris":  # C1 conforming: M(cell) DOF-transform + globally-oriented edge-normal DOFs
-                rv, rg, rh, nodal = argyris_ref
+                (rv, rg, rh), nodal = T["argyris"], argyris_ref[3]
                 phi, grad, hess = argyris_pushforward(rv, rg, rh, J, detJ, argyris_normals[c], nodal)
                 per.append(
                     {
@@ -798,7 +813,7 @@ def assemble_fem_nonnodal(
                     }
                 )
             elif s == "Morley":  # non-conforming biharmonic: M(cell) DOF-transform + globally-oriented edge normal
-                rv, rg, rh, nodal = morley_ref
+                (rv, rg, rh), nodal = T["morley"], morley_ref[3]
                 phi, grad, hess = morley_pushforward(rv, rg, rh, J, detJ, argyris_normals[c], nodal)
                 per.append(
                     {
@@ -810,7 +825,7 @@ def assemble_fem_nonnodal(
                     }
                 )
             elif i in edge_ref:  # RT (contravariant) or N1E/N2E (covariant): entity DOFs, family-specific push-forward
-                rval, rdop, rgr, pf, pgf = edge_ref[i]
+                (rval, rdop, rgr), (pf, pgf) = T["edge"][i], edge_ref[i][3:]
                 _sg = edge_signs[i]
                 if _sg is not None:  # diagonal ±1 transform (degree 1): the historic sign path
                     phi, _d = pf(rval, rdop, J, detJ, _sg[c])  # (n_quad, n_dof, d)
@@ -830,13 +845,138 @@ def assemble_fem_nonnodal(
             else:  # P0: a single constant DOF per cell
                 per.append(
                     {
-                        "shape_vals": jnp.ones((n_quad, 1)),
-                        "shape_grads": jnp.zeros((n_quad, 1, dim, dim)),
+                        "shape_vals": jnp.ones((T["n"], 1)),
+                        "shape_grads": jnp.zeros((T["n"], 1, dim, dim)),
                         "cell_sol": cell_sols[i],
                         "space": "P0",
                     }
                 )
-        return per, verts[0][None, :] + qp @ J.T, jnp.abs(detJ)
+        return per, verts[0][None, :] + T["pts"] @ J.T, jnp.abs(detJ)
+
+    # ---- GENERAL boundary integrands (any family, any degree, 2-D and 3-D) ------------------------
+    # A boundary term the legacy patterns below do not own is evaluated like a volume term: per
+    # boundary facet, every field's trace (its owner cell's basis at the facet's quadrature points,
+    # through the same DOF transform and Piola map), the facet's outward normal as `n_<region>`, and
+    # the shared evaluator. `u.across(main)` adds the value of `u` on ANOTHER face at the facing
+    # points -- linear in that face's cell DOFs, which become extra columns of the facet's block.
+    _all_cdofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
+    _all_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
+    _GS: dict = {"groups": []}  # filled after the boundary classification
+
+    def _tabulate_at(Xr):
+        """Every field's reference tables at reference-cell points ``Xr`` -- the `_cell_fields` input."""
+        Xr = np.asarray(Xr, dtype=float)
+        T = {"pts": jnp.asarray(Xr), "n": int(Xr.shape[0]), "edge": {}, "lag": {}}
+        T["p1"] = jnp.asarray(np.column_stack([1.0 - Xr.sum(axis=1), Xr]))
+        for _i, _s in enumerate(spaces):
+            if _i in edge_ref:
+                _tab = dofmaps[_i].element.tabulate(1, Xr)
+                _rv = np.asarray(_tab[0])
+                _rg = np.stack([np.asarray(_tab[1 + a]) for a in range(dim)], axis=-1)
+                if _s == "RT":
+                    _rd = sum(_rg[:, :, a, a] for a in range(dim))
+                elif dim == 2:
+                    _rd = _rg[:, :, 1, 0] - _rg[:, :, 0, 1]
+                else:
+                    _rd = None
+                T["edge"][_i] = (jnp.asarray(_rv), None if _rd is None else jnp.asarray(_rd), jnp.asarray(_rg))
+            elif _i in lagrange_ref:
+                _tab = dofmaps[_i].element.tabulate(1, Xr)
+                T["lag"][_i] = (
+                    jnp.asarray(_tab[0][..., 0]),
+                    jnp.asarray(np.stack([_tab[1 + a][..., 0] for a in range(dim)], axis=-1)),
+                )
+        T["hermite"] = T["argyris"] = T["morley"] = None
+        if has_hermite:
+            import basix as _bx
+
+            from .fem_lagrange import _ref_hessian_from_tab
+
+            _tab = _bx.create_element(_bx.ElementFamily.Hermite, _bx.CellType.triangle, 3).tabulate(2, Xr)
+            T["hermite"] = (
+                jnp.asarray(_tab[0]),
+                jnp.asarray(np.stack([_tab[1], _tab[2]], axis=-1)),
+                jnp.asarray(_ref_hessian_from_tab(_tab, 2)),
+            )
+        if has_argyris:
+            from .fem_elements import argyris_ref_basis_at
+
+            T["argyris"] = argyris_ref_basis_at(Xr)
+        if has_morley:
+            from .fem_elements import morley_ref_basis_at
+
+            T["morley"] = morley_ref_basis_at(Xr)
+        return T
+
+    def _select_tabs(TS, k):
+        """The tables of local facet ``k`` (traced) out of the per-local-facet stack ``TS``."""
+
+        def _sel(a):
+            return None if a is None else a[k]
+
+        return {
+            "pts": TS["pts"][k],
+            "n": TS["n"],
+            "p1": TS["p1"][k],
+            "edge": {i: tuple(_sel(a) for a in v) for i, v in TS["edge"].items()},
+            "lag": {i: tuple(_sel(a) for a in v) for i, v in TS["lag"].items()},
+            "hermite": None if TS["hermite"] is None else tuple(_sel(a) for a in TS["hermite"]),
+            "argyris": None if TS["argyris"] is None else tuple(_sel(a) for a in TS["argyris"]),
+            "morley": None if TS["morley"] is None else tuple(_sel(a) for a in TS["morley"]),
+        }
+
+    def _facet_res(g, f, la, lbs, coeffs, rt_scalar, field_vals, nt, pts_dyn):
+        """Residual (test DOFs of the group's field) of the group's terms on facet ``f`` from the owner
+        cell's all-field local DOFs ``la`` and, per ``across`` key, the main cells' DOF values ``lbs``."""
+        c, k = g["cell"][f], g["kf"][f]
+        tabs = _select_tabs(g["tabs"], k)
+        cell_sols = [la[_all_splits[i] : _all_splits[i + 1]] for i in range(len(fields))]
+        per, xq, _m = _cell_fields(c, cell_sols, pts_dyn, tabs)
+        fv = pts_dyn[cells_j[c]][g["lv"][k]]  # facet vertices
+        if dim == 3:
+            nr = jnp.cross(fv[1] - fv[0], fv[2] - fv[0])
+        else:
+            _t = fv[1] - fv[0]
+            nr = jnp.stack([-_t[1], _t[0]])
+        meas = jnp.linalg.norm(nr)
+        nvec = g["sgn"][f] * nr / meas  # outward from the field domain
+        dctx = {**ctx, f"n_{g['region']}": nvec}
+        for key, (_dofs, phiB) in g["across"].items():
+            dctx[key] = jnp.einsum("qj,qjv->qv", lbs[key], phiB[f])
+        vol_vars = tuple(
+            (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
+            for name in runtime_parameter_tags
+        )
+        local = {
+            "physical_quad_points": xq,
+            "fields": per,
+            "field_index": field_index,
+            "tag": f"gauss_{g['region']}",
+            "surface": True,
+            "domain_context": dctx,
+            "temporal_tags": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "region_mask_names": (),
+            "volume_vars": vol_vars,
+        }
+        if _field_param_names or _frozen_gathered:
+            local["shape_vals"] = tabs["p1"]
+        if _frozen_gathered:
+            local["frozen_fields"] = {fid: gg[c] for fid, gg in _frozen_gathered.items()}
+        if nt is not None:
+            local["neural_coefficients"] = nt
+        w = g["fqw"] * meas
+        r = None
+        for e in coeffs:
+            t_ = _integrate_term(domain, e, local, w)
+            r = t_ if r is None else r + t_
+        return r
+
+    def _facet_inputs(g, u_flat):
+        """Per facet: owner-cell local DOFs ``(n_f, n_local_all)`` and, per across key, main DOFs."""
+        la = jnp.asarray(u_flat)[_all_cdofs[g["cell"]]]
+        lbs = {key: jnp.asarray(u_flat)[dofs] for key, (dofs, _phi) in g["across"].items()}
+        return la, lbs
 
     # A complex COEFFICIENT with a real basis: the element residual is complex while the
     # linearisation point stays real, so ONE data pass carries the full complex operator. The flag
@@ -858,7 +998,7 @@ def assemble_fem_nonnodal(
         + [e for _bt in (boundary_terms or {}).values() for e in _bt if not _provably_real(e)]
     )
 
-    def _make_residual(terms):
+    def _make_residual(terms, with_gsurf=False):
         """Build a ``residual(u_flat)`` closure for the given weak ``terms`` over the shared field
         layout. Reused for the steady system (``jacfwd`` -> A, ``-residual(0)`` -> b), the steady
         nonlinear :class:`FemResidualOperator`, and the transient mass/spatial split (mirrors the 1D
@@ -929,6 +1069,14 @@ def assemble_fem_nonnodal(
                     _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(cdofs[tfi].shape[1]), _chunk_setting),
                 )
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1).astype(R.dtype))
+            for g in _GS["groups"] if with_gsurf else ():  # general boundary integrands
+                la, lbs = _facet_inputs(g, u_flat)
+
+                def _fr(f, la_f, lbs_f, _g=g, _sc=rt_scalar, _fv=field_vals, _p=_pts_r):
+                    return _facet_res(_g, f, la_f, lbs_f, _g["coeffs"], _sc, _fv, _nt, _p)
+
+                elem = jax.vmap(_fr)(jnp.arange(g["n_facets"]), la, lbs)
+                R = R.at[cdofs[g["tfi"]][g["cell"]].reshape(-1)].add(elem.reshape(-1).astype(R.dtype))
             return R
 
         return residual
@@ -951,7 +1099,7 @@ def assemble_fem_nonnodal(
     def _signed(x, sign):  # fold a −1 summand sign into the extracted coefficient/source
         return (_Lit(-1.0) if x is None else (-1.0) * x) if sign < 0 else x
 
-    pressure_terms, surface_terms, incident_terms = {}, {}, {}
+    pressure_terms, surface_terms, incident_terms, gsurf_terms = {}, {}, {}, {}
     for region, terms in (boundary_terms or {}).items():
         for t in terms:
             bt = _bare_nn(t)
@@ -960,12 +1108,31 @@ def assemble_fem_nonnodal(
                 wrap, inner_expr = bt._name, bt.args[0]
             for sign, sub in _split_additive_terms(domain, inner_expr):
                 sub_w = sub if wrap is None else (sub.real if wrap == "real" else sub.imag)
-                if (mass := _n1e_surface_mass_spec(sub_w)) is not None:
+                if _reads_across(sub_w):  # non-local: never one of the host-assembled patterns
+                    gsurf_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
+                elif dim == 3 and (mass := _n1e_surface_mass_spec(sub_w)) is not None:
                     surface_terms.setdefault(region, []).append(_signed(mass[0], sign))
-                elif (load := _n1e_surface_load_spec(sub_w)) is not None:
+                elif dim == 3 and (load := _n1e_surface_load_spec(sub_w)) is not None:
                     incident_terms.setdefault(region, []).append(_signed(load[0], sign))
-                else:
+                elif _legacy_natural(sub_w, field_index, spaces):
                     pressure_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
+                else:  # anything else: the general boundary-integrand path
+                    gsurf_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
+    if gsurf_terms:
+        _GS["groups"] = _build_general_surface(
+            gsurf_terms,
+            domain,
+            dim,
+            _cell_name,
+            cells,
+            spaces,
+            field_index,
+            dofmaps,
+            offs,
+            quad_degree,
+            _dofmap_for,
+            _tabulate_at,
+        )
     # A runtime parameter in a host-assembled RT pressure / plate BC cannot be threaded differentiably
     # (the load is baked once); only the N1E surface/incident coefficient re-assembles per args. Reject the
     # former loudly (rather than silently freeze it) now that classification separates the two.
@@ -1118,7 +1285,7 @@ def assemble_fem_nonnodal(
     # assembler ``fem_native._make_jacobian``, and is the ONE assembler behind the steady operator A(args),
     # the transient block mass M, and the transient spatial operator A — so a 3-D vector transient (eddy
     # currents, time-domain Maxwell) marches sparse instead of hitting the dense-assembly wall.
-    def _make_sparse_assembler(term_source):
+    def _make_sparse_assembler(term_source, with_gsurf=False):
         """Return ``assemble(args=None, *, surface=True) -> BCOO`` for the bare weak terms ``term_source``.
 
         Only the element data and the tangential-trace surface-mass values depend on ``args``; the BCOO
@@ -1164,7 +1331,16 @@ def assemble_fem_nonnodal(
         _uidx = _vinv = _vol_idx = None
         _vol_nse = None
         _grp_sizes = []
-        if _groups:
+        # General boundary-integrand groups: rows = the owner cell's test DOFs, columns = the owner
+        # cell's all-field DOFs followed by every across key's main-cell DOFs (per quadrature point).
+        _sgs = list(_GS["groups"]) if with_gsurf else []
+        _s_cols = []
+        for _g in _sgs:
+            _cc = [np.asarray(_cell_all_dofs)[_g["cell_np"]]]
+            for _key, (_dofs, _phi) in _g["across"].items():
+                _cc.append(np.asarray(_dofs).reshape(_g["n_facets"], -1))
+            _s_cols.append(np.concatenate(_cc, axis=1))
+        if _groups or _sgs:
             try:
                 _enc_l = []
                 for _tfi_p, _terms_p in _groups:
@@ -1174,6 +1350,15 @@ def assemble_fem_nonnodal(
                     _c = np.broadcast_to(np.asarray(_cell_all_dofs)[:, None, :], (n_cells, _nt, _nl))
                     _enc_l.append((_r.astype(np.int64) * np.int64(total) + _c.astype(np.int64)).reshape(-1))
                     _grp_sizes.append(n_cells * _nt * _nl)
+                    del _r, _c
+                for _g, _cols in zip(_sgs, _s_cols):
+                    _nt = int(cdofs[_g["tfi"]].shape[1])
+                    _r = np.broadcast_to(
+                        np.asarray(cdofs[_g["tfi"]])[_g["cell_np"]][:, :, None], (_g["n_facets"], _nt, _cols.shape[1])
+                    )
+                    _c = np.broadcast_to(_cols[:, None, :], _r.shape)
+                    _enc_l.append((_r.astype(np.int64) * np.int64(total) + _c.astype(np.int64)).reshape(-1))
+                    _grp_sizes.append(int(_r.size))
                     del _r, _c
                 _enc = np.concatenate(_enc_l) if len(_enc_l) > 1 else _enc_l[0]
                 del _enc_l
@@ -1197,17 +1382,22 @@ def assemble_fem_nonnodal(
             except Exception:  # noqa: BLE001 -- a traced pattern cannot be planned on the host
                 _uidx = _vinv = None
                 _vol_nse = None  # fall back to the uncompressed (still correct) operator
-        if _vinv is None and _groups:
+        if _vinv is None and (_groups or _sgs):
             _vol_rows_l, _vol_cols_l = [], []
             for _tfi_p, _terms_p in _groups:
                 _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])
                 _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
                 _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
+            for _g, _cols in zip(_sgs, _s_cols):
+                _rr = jnp.asarray(cdofs[_g["tfi"]])[_g["cell"]]
+                _kshape = (_g["n_facets"], int(_rr.shape[1]), _cols.shape[1])
+                _vol_rows_l.append(jnp.broadcast_to(_rr[:, :, None], _kshape).reshape(-1))
+                _vol_cols_l.append(jnp.broadcast_to(jnp.asarray(_cols)[:, None, :], _kshape).reshape(-1))
             _vol_idx = jnp.stack(
                 [jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)],
                 axis=1,
             )
-        elif not _groups:
+        elif not (_groups or _sgs):
             _vol_idx = jnp.zeros((0, 2), jnp.int32)
 
         def assemble(args=None, *, surface=True, u_flat=None):
@@ -1290,6 +1480,31 @@ def assemble_fem_nonnodal(
                 else:
                     data_l.append(Ke.reshape(-1))
 
+            for sgi, _g in enumerate(_sgs):  # general boundary integrands: one jacfwd per facet
+                _la, _lbs = _facet_inputs(_g, jnp.zeros((total,), zeros.dtype) if u_flat is None else u_flat)
+                _keys = list(_g["across"])
+                _nl = int(_la.shape[1])
+
+                def _kf(f, la_f, lbs_f, _g=_g, _keys=_keys, _nl=_nl):
+                    _shapes = [lbs_f[k_].shape for k_ in _keys]
+
+                    def _r(v):
+                        lb = {}
+                        o = _nl
+                        for k_, shp in zip(_keys, _shapes):
+                            n_ = int(np.prod(shp))
+                            lb[k_] = v[o : o + n_].reshape(shp)
+                            o += n_
+                        return _facet_res(_g, f, v[:_nl], lb, _g["coeffs"], rt_scalar, field_vals, _nt, _pts_dyn)
+
+                    v0 = jnp.concatenate([la_f] + [lbs_f[k_].reshape(-1) for k_ in _keys])
+                    return jax.jacfwd(_r)(v0)
+
+                Kf = jax.vmap(_kf)(jnp.arange(_g["n_facets"]), _la, _lbs)  # (n_f, n_test, n_cols)
+                if _acc is not None:
+                    _acc = _acc.at[_vinv[len(_groups) + sgi]].add(Kf.reshape(-1).astype(_acc.dtype))
+                else:
+                    data_l.append(Kf.reshape(-1))
             data = _acc if _acc is not None else (jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype))
             # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
             # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
@@ -1390,7 +1605,9 @@ def assemble_fem_nonnodal(
             M2 = jax.jacfwd(_make_residual([_strip_n(t, 2) for t in temporal if _mto(t) >= 2]))(zeros)  # ∫ü·v ⇒ mass
             damp = [_strip_n(t, 1) for t in temporal if _mto(t) == 1]  # ∫u̇·v ⇒ damping (optional)
             Cmat = jax.jacfwd(_make_residual(damp))(zeros) if damp else jnp.zeros((total, total), zeros.dtype)
-            spatial_res2 = _make_residual(spatial)  # residual(u, args) -> threads a spatial runtime parameter
+            spatial_res2 = _make_residual(
+                spatial, with_gsurf=True
+            )  # residual(u, args) -> threads a spatial runtime parameter
             n = total
             Z = jnp.zeros((n, n), zeros.dtype)
             dd = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
@@ -1494,9 +1711,9 @@ def assemble_fem_nonnodal(
         # edges). ``spatial_res`` (a cheap O(n) residual eval) still supplies the RHS load and the nonlinear
         # residual; only the operator MATRICES go sparse. Vertex C0/C1 families keep the dense path (small 2-D).
         _strip_mass = [_strip_temporal_trial_derivative(t) for t in temporal]
-        _assemble_spatial = _make_sparse_assembler(spatial)
+        _assemble_spatial = _make_sparse_assembler(spatial, with_gsurf=True)
         M = _make_sparse_assembler(_strip_mass)(None, surface=False)  # BCOO mass — no impedance on the u̇ term
-        spatial_res = _make_residual(spatial)
+        spatial_res = _make_residual(spatial, with_gsurf=True)
         t0, t1, dt = _infer_time_window(domain)
         common = dict(
             backend="transient",
@@ -1654,7 +1871,7 @@ def assemble_fem_nonnodal(
         M, A = compress_eager(M), compress_eager(A)
         return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
 
-    residual = _make_residual(volume_terms)
+    residual = _make_residual(volume_terms, with_gsurf=True)
 
     def full_residual(u_flat, args=None):  # the natural BC is a constant load on the RHS: R(u) = assembled(u) - load
         return residual(u_flat, args) - nat_load
@@ -1666,7 +1883,7 @@ def assemble_fem_nonnodal(
     # re-run every optimizer step); ``args=None`` reduces to the non-parametric assembly exactly. Vertex C0/C1
     # families keep the dense path below (their Hessian-shape element assembly is not ported; small 2-D problems).
 
-    _assemble_sparse_A = _make_sparse_assembler(volume_terms)
+    _assemble_sparse_A = _make_sparse_assembler(volume_terms, with_gsurf=True)
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
@@ -1751,6 +1968,211 @@ def assemble_fem_nonnodal(
     if pins:  # symmetric elimination; `_apply_dirichlet_symmetric` keeps a BCOO sparse
         A, b = _apply_dirichlet_symmetric(A, b, pins)
     return (compress_eager(A), b), "linear", offs
+
+
+def _reads_across(node) -> bool:
+    """Does a boundary term read ``u.across(...)`` (a ``across_*`` Variable)?"""
+    from ..._fem import _walk
+    from ...trace import Variable
+
+    return any(isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_") for n in _walk(node))
+
+
+def _legacy_natural(bare, field_index, spaces) -> bool:
+    """The two host-assembled natural terms the old path owns: a plate edge moment ``M_n * v.dn`` on an
+    Argyris/Morley field, and the RT pressure load ``p_D * (v·n)``. Everything else is general."""
+    from ..._fem import _contains, _walk
+    from ...trace import BinaryOp, TestFunction, TrialFunction, Variable
+
+    if _match_plate_moment(bare, field_index, spaces) is not None:
+        return True
+    if not (isinstance(bare, BinaryOp) and bare.op == "*") or _contains(bare, TrialFunction):
+        return False
+    for side, other in ((bare.left, bare.right), (bare.right, bare.left)):
+        if _contains(side, TestFunction) and not _contains(other, TestFunction):
+            walked = list(_walk(side))
+            if not any(isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("n_") for n in walked):
+                return False
+            fk = {n.field_key for n in walked if isinstance(n, TestFunction)}
+            fi = field_index.get(next(iter(fk))) if fk else None
+            return fi is not None and spaces[fi] == "RT"
+    return False
+
+
+def _build_general_surface(
+    gsurf_terms, domain, dim, cell_name, cells, spaces, field_index, dofmaps, offs, quad_degree, dofmap_for, tabulate
+):
+    """Host-static structure of the general boundary-integrand path, built once.
+
+    One group per (region, test field): the region's boundary facets (all vertices in the region's
+    node mask, used by one cell), their owner cell / local facet, the outward-orientation sign, the
+    facet quadrature, every field's reference tables per local facet, and for each ``u.across(main)``
+    the term reads: per facet quadrature point, the facing point of ``main`` (its projection), that
+    point's owner cell, the field's DOFs there and its physical basis -- so the across value is
+    ``sum_j u[dofs_j] * phi_j`` and its operator columns are exactly those main DOFs."""
+    import basix
+
+    from ..._fem import _walk
+    from .fem_1d import _line_quadrature
+    from .fem_dofmap import _reference_topology, basis_at_points, facet_outward_normals, facet_owners
+    from .fem_utils import _lower_statefield_to_trial, _test_field_index
+    from .weak_form import _apply_sign, _split_additive_terms
+
+    tdm = dofmap_for("Lagrange", 1)  # numbering of every entity dim (facets included); P1 = vertex ids
+    count, fcell, flocal = facet_owners(tdm)
+    fverts = tdm.entity_vertices[dim - 1]
+    P = np.asarray(domain.mesh.points)[:, :dim]
+    topo = _reference_topology(cell_name)
+    lv = [list(v) for v in topo[dim - 1]]
+    ref_cell = np.vstack([np.zeros(dim), np.eye(dim)])
+    if dim == 2:
+        fq, fw = (np.asarray(a).reshape(-1) for a in _line_quadrature(quad_degree))
+        fq = fq[:, None]
+    else:
+        fq, fw = (np.asarray(a) for a in basix.make_quadrature(basix.CellType.triangle, quad_degree))
+    Xref = [ref_cell[lv[k][0]] + fq @ (ref_cell[lv[k][1:]] - ref_cell[lv[k][0]]) for k in range(len(lv))]
+    per_k = [tabulate(X) for X in Xref]
+
+    def _stack(get):
+        vals = [get(T) for T in per_k]
+        if vals[0] is None:
+            return None
+        if isinstance(vals[0], tuple):
+            return tuple(None if vals[0][j] is None else jnp.stack([v[j] for v in vals]) for j in range(len(vals[0])))
+        return jnp.stack(vals)
+
+    TS = {
+        "pts": _stack(lambda T: T["pts"]),
+        "n": per_k[0]["n"],
+        "p1": _stack(lambda T: T["p1"]),
+        "edge": {i: _stack(lambda T, i=i: T["edge"][i]) for i in per_k[0]["edge"]},
+        "lag": {i: _stack(lambda T, i=i: T["lag"][i]) for i in per_k[0]["lag"]},
+        "hermite": _stack(lambda T: T["hermite"]),
+        "argyris": _stack(lambda T: T["argyris"]),
+        "morley": _stack(lambda T: T["morley"]),
+    }
+
+    def _region_facets(region):
+        mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+        if mask is None:
+            raise ValueError(f"jno.fem (non-nodal): boundary region {region!r} has no location function.")
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        fac = np.flatnonzero((count == 1) & mask[fverts].all(axis=1))
+        if fac.size == 0:
+            raise ValueError(
+                f"jno.fem (non-nodal): boundary region {region!r} contains no boundary facet (a facet counts "
+                "when ALL its vertices lie in the region) -- its terms would be silently dropped."
+            )
+        return fac
+
+    def _raw_normals(c, k):
+        V = P[np.asarray(cells)[c]]
+        fvv = np.take_along_axis(V, np.asarray(lv)[k][:, :, None], axis=1)
+        if dim == 3:
+            return np.cross(fvv[:, 1] - fvv[:, 0], fvv[:, 2] - fvv[:, 0])
+        t = fvv[:, 1] - fvv[:, 0]
+        return np.stack([-t[:, 1], t[:, 0]], axis=1)
+
+    def _project(X, main_fac):
+        """Closest point of the facets ``main_fac`` to each point of ``X`` -> (facet index, point)."""
+        from scipy.spatial import cKDTree
+
+        FV = P[fverts[main_fac]]  # (m, dim, dim) facet vertices
+        tree = cKDTree(FV.mean(axis=1))
+        kq = min(len(main_fac), 12)
+        _d, cand = tree.query(X, k=kq)
+        cand = np.asarray(cand).reshape(len(X), -1)
+        best_f = np.zeros(len(X), dtype=np.int64)
+        best_x = np.zeros_like(X)
+        best_d = np.full(len(X), np.inf)
+        for j in range(cand.shape[1]):
+            fvj = FV[cand[:, j]]
+            A0 = fvj[:, 0]
+            E = fvj[:, 1:] - A0[:, None, :]  # (n, dim-1, dim)
+            G = np.einsum("nad,nbd->nab", E, E)
+            rhs = np.einsum("nad,nd->na", E, X - A0)
+            lam = np.linalg.solve(G, rhs[..., None])[..., 0]  # barycentric of the in-plane projection
+            # clamp into the simplex (cheap, exact for points over the facet, a bound otherwise)
+            lam = np.clip(lam, 0.0, 1.0)
+            sm = lam.sum(axis=1, keepdims=True)
+            lam = np.where(sm > 1.0, lam / np.maximum(sm, 1e-300), lam)
+            Xp = A0 + np.einsum("na,nad->nd", lam, E)
+            dd = np.linalg.norm(Xp - X, axis=1)
+            better = dd < best_d
+            best_d[better], best_f[better], best_x[better] = dd[better], cand[better, j], Xp[better]
+        return main_fac[best_f], best_x
+
+    across_pairs = dict(getattr(domain, "_across_pairs", {}) or {})
+    groups = []
+    for region, terms in gsurf_terms.items():
+        fac = _region_facets(region)
+        c, k = fcell[fac], flocal[fac]
+        nout = facet_outward_normals(tdm, P, cells, c, k)
+        sgn = np.sign(np.einsum("nd,nd->n", _raw_normals(c, k), nout))
+        # physical quadrature points of every facet (host, static mesh -- the across pairing)
+        J = np.stack([P[np.asarray(cells)[c][:, a + 1]] - P[np.asarray(cells)[c][:, 0]] for a in range(dim)], axis=2)
+        X = P[np.asarray(cells)[c][:, 0]][:, None, :] + np.einsum("nqa,nda->nqd", np.asarray([Xref[kk] for kk in k]), J)
+        keys = sorted({str(n.tag) for t in terms for n in _walk(t) if str(getattr(n, "tag", "")).startswith("across_")})
+        across = {}
+        for key in keys:
+            if key not in across_pairs:
+                raise ValueError(f"jno.fem: {key!r} was not declared through u.across(...) on this domain.")
+            fk, main = across_pairs[key]
+            fi = field_index.get(fk)
+            if fi is None:
+                raise ValueError(f"u.across: its field {fk!r} is not one of this form's unknowns.")
+            sp = spaces[fi]
+            if sp in ("Hermite", "Argyris", "Morley"):
+                raise NotImplementedError(
+                    f"u.across on a {sp} (plate) field: its basis needs the per-cell M(cell) transform at the "
+                    "main points, which this pairing does not build. The H(curl)/H(div)/Lagrange/DG/P0 "
+                    "families are supported."
+                )
+            mf = _region_facets(main)
+            Xf = X.reshape(-1, dim)
+            mfi, Xp = _project(Xf, mf)
+            cB = fcell[mfi]
+            if sp == "P0":
+                dofs = offs[fi] + cB[:, None]
+                phi = np.ones((len(cB), 1, 1))
+            else:
+                dmB = dofmaps.get(fi) or dofmap_for("Lagrange", 1)
+                phi = np.zeros((len(cB), dmB.ndof_local, dmB.element.value_size))
+                for cc in np.unique(cB):  # one tabulation per main cell
+                    sel = np.flatnonzero(cB == cc)
+                    phi[sel] = basis_at_points(dmB, P, np.asarray(cells), int(cc), Xp[sel])
+                dofs = offs[fi] + dmB.cell_dofs[cB]
+            nq = X.shape[1]
+            across[key] = (
+                jnp.asarray(dofs.reshape(len(fac), nq, -1), dtype=jnp.int32),
+                jnp.asarray(phi.reshape(len(fac), nq, phi.shape[1], phi.shape[2])),
+            )
+        by_test: dict = {}
+        for t in terms:
+            for sign_, sub in _split_additive_terms(domain, t):
+                coeff = _lower_statefield_to_trial(_apply_sign(domain, sign_, sub), {})
+                tfi = _test_field_index(coeff, field_index)
+                if tfi is None:
+                    raise ValueError("jno.fem (non-nodal): a boundary term must contain exactly one test field.")
+                by_test.setdefault(tfi, []).append(coeff)
+        for tfi, coeffs in by_test.items():
+            groups.append(
+                {
+                    "region": region,
+                    "tfi": tfi,
+                    "coeffs": coeffs,
+                    "cell": jnp.asarray(c, dtype=jnp.int32),
+                    "kf": jnp.asarray(k, dtype=jnp.int32),
+                    "sgn": jnp.asarray(sgn),
+                    "lv": jnp.asarray(np.asarray(lv), dtype=jnp.int32),
+                    "fqw": jnp.asarray(fw),
+                    "tabs": TS,
+                    "across": across,
+                    "n_facets": int(len(fac)),
+                    "cell_np": np.asarray(c),
+                }
+            )
+    return groups
 
 
 def _n1e_surface_mass_spec(bare):

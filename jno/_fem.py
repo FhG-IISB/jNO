@@ -966,6 +966,10 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
             tag = tag[6:]
         return _normalize_quad_tag(tag, _bregions)
 
+    def _is_across(tag) -> bool:
+        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on
+        return isinstance(tag, str) and tag.startswith("across_")
+
     def _effective_tag(v) -> str:
         # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
         # pool ("fem_gauss" / "gauss_<tag>"); recover its original region from `_jno_region_tag` so a
@@ -978,7 +982,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
     tags = {
         _region_of(_effective_tag(v))
         for v in _spatial_coord_vars(constraint)
-        if isinstance(_effective_tag(v), str) and not _effective_tag(v).startswith("__")
+        if isinstance(_effective_tag(v), str)
+        and not _effective_tag(v).startswith("__")
+        and not _is_across(_effective_tag(v))
     }
     # The t=t0 slice is its own support; an IC residual lives here. A *velocity* IC `u.t(initial)-v0`
     # carries its region only on the temporal variable (the `.t` derivative drops the spatial bind),
@@ -1125,7 +1131,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
-            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -7033,6 +7039,16 @@ def _fem_impl(
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
     _nonnodal_families = _trial_spaces(constraints) - _NATIVE_SPACES
+    # `u.across(main)` (a two-face boundary coupling) is assembled by the non-nodal path's general
+    # boundary-integrand machinery, which also carries Lagrange fields -- so a Lagrange-only form that
+    # reads it (a 2-D A_z eddy problem with a thin-conductor two-port) is routed there too.
+    _reads_across = any(
+        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_")
+        for c in constraints
+        for n in _walk(_bare(c))
+    )
+    if _reads_across and not _nonnodal_families:
+        _nonnodal_families = {"Lagrange (across)"}
     # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
     # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
     _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}
