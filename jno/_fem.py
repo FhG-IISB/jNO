@@ -2903,6 +2903,10 @@ class FEM:
         # it root-finds the min-map instead of the bare residual. Done here, once, so the same wrapper
         # serves the plain steady solve and every step of the history march below, and composes with any
         # `nonlinear=` slot the caller picked. ----
+        # Whether a parametric solve's verdict may RAISE (see `_record_values_verdict`): only for jNO's own
+        # drivers, whose tolerances the verdict knows. A user `solve_fn=` carries its own tolerances, and a
+        # box-constrained solve root-finds the min-map, not the residual the verdict re-evaluates.
+        _jno_driver = (solve_fn is None or from_slots) and not getattr(self, "_bound_specs", None)
         if getattr(self, "_bound_specs", None):
             solve_fn = self._bounded_solve_fn(solve_fn)
 
@@ -3119,7 +3123,8 @@ class FEM:
 
             _out = self._op.solve(solve_fn=_reduced, **kwargs)
             if kwargs.get("values"):
-                self._record_values_verdict(_out, kwargs, nonlinear)  # see that method: jit hides the guard
+                # see that method: jit hides the guard
+                self._record_values_verdict(_out, kwargs, nonlinear, judge=_jno_driver)
             # A SLIP reduction returns the array, matching the non-reduced steady-nonlinear branch below:
             # it is a boundary condition, not a training construct, and leaving it lazy meant
             # `np.asarray(fem.solve(...))` silently produced a 0-d OBJECT array that only blew up later
@@ -3152,11 +3157,11 @@ class FEM:
             return self._op.solve(solve_fn, **kwargs).fn()
         out = self._op.solve(solve_fn, **kwargs)
         if kwargs.get("values") and self._mode == "nonlinear":
-            self._record_values_verdict(out, kwargs, nonlinear)
+            self._record_values_verdict(out, kwargs, nonlinear, judge=_jno_driver)
         return out
 
-    def _record_values_verdict(self, out, kwargs, nonlinear):
-        """Judge a ``fem.solve(param=value)`` solve and write it to :attr:`stats`.
+    def _record_values_verdict(self, out, kwargs, nonlinear, *, judge=True):
+        """Judge a ``fem.solve(param=value)`` solve, write it to :attr:`stats`, and raise if it stalled.
 
         That solve is jitted -- which is how it avoids re-staging for every value -- and the driver's
         own convergence check self-disables under a trace, so without this it returns with NO verdict
@@ -3164,6 +3169,12 @@ class FEM:
         the residual the solver actually worked on: the REDUCED one on a reduced system, because the
         full residual of a constrained problem keeps the constraint's reaction, which is physical and
         stays O(1) however well converged the solve is.
+
+        A failed verdict RAISES, exactly as the driver's own check does on an eager solve. It used to be
+        recorded only (``fem.stats["nonlinear"]["converged"] = False``), so a stalled Newton -- a 3-D
+        rolling model warm-started from a different problem, residual 1e-1 against a 1e-10 tolerance --
+        came back as an ordinary-looking field. ``judge=False`` (a user ``solve_fn=`` or a box-constrained
+        solve, whose tolerances or residual the verdict does not know) records without raising.
         """
         from .utils.solver.slip_runtime import bind_periodic
         from .utils.solver.solver_api import record_nonlinear_verdict
@@ -3189,7 +3200,21 @@ class FEM:
             u = restrict_state_periodic(per, u)
             if u0.shape[0] != u.shape[0]:
                 u0 = restrict_state_periodic(per, u0)
-        record_nonlinear_verdict(res_at, u, u0, nonlinear, getattr(nonlinear, "name", None) or "newton")
+        who = getattr(nonlinear, "name", None) or "newton"
+        r_end, bound, ok = record_nonlinear_verdict(res_at, u, u0, nonlinear, who)
+        if ok is False and judge:
+            cfg = getattr(nonlinear, "config", None) or {}
+            traits = getattr(nonlinear, "traits", None) or {}
+            rtol, atol = float(traits.get("rtol", 1e-8)), float(traits.get("atol", 1e-8))
+            cap = f" in max_steps={cfg['max_steps']}" if "max_steps" in cfg else ""
+            raise RuntimeError(
+                f"fem.solve({', '.join(f'{k}=...' for k in vals)}): {who} did not converge{cap}: residual norm "
+                f"{r_end:.3e} against the tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, "
+                f"rtol={rtol:g}){' on the reduced system' if per is not None else ''}. The last iterate is "
+                "NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
+                "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0 (a nearby "
+                "solved parameter value, e.g. fem.solve(continuation=...))."
+            )
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""

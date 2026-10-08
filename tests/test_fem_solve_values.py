@@ -133,6 +133,33 @@ def test_the_verdict_survives_the_jit():
     assert st["residual"] <= st["bound"], st
 
 
+@pytest.mark.parametrize("direct", [True, False])
+def test_a_stalled_parametric_solve_raises(direct):
+    """The verdict must RAISE, not only be recorded. Oracle: one Newton step cannot reach 1e-8 on
+    ``-div((1 + 50 u^2) grad u) = 1`` from a warm start at the k = 0 root (measured residual ~1e-2), so
+    the solve must fail; it used to return that iterate with ``converged=False`` in ``fem.stats`` only."""
+    fem = _diffusion()
+    x0 = np.asarray(fem.solve(k=0.0)).reshape(-1)
+    with pytest.raises(RuntimeError, match=r"fem\.solve\(k=\.\.\.\): newton did not converge in max_steps=1"):
+        fem.solve(k=50.0, x0=x0, nonlinear=jno.solve.newton(direct=direct, max_steps=1))
+    assert fem.stats["error"].startswith("RuntimeError"), fem.stats
+    # The same spec with room to converge still passes, and matches the form built at that constant.
+    got = np.asarray(fem.solve(k=50.0, x0=x0, nonlinear=jno.solve.newton(direct=direct))).reshape(-1)
+    ref = np.asarray(_diffusion(k_value=50.0).solve()).reshape(-1)
+    np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-10)
+
+
+def test_a_stalled_reduced_parametric_solve_raises():
+    """The reduced (slip-eliminated) path, judged on the REDUCED residual: a sparse-direct Newton held to
+    one step from rest stalls (residual ~2.5e-4 against 1e-8) and must raise; with its default step cap it
+    converges and the verdict is recorded as such."""
+    fem = _slip_stokes()
+    with pytest.raises(RuntimeError, match=r"did not converge in max_steps=1.*on the reduced system"):
+        fem.solve(visc=50.0, nonlinear=jno.solve.newton(direct=True, max_steps=1))
+    fem.solve(visc=50.0, nonlinear=jno.solve.newton(direct=True, line_search=True))
+    assert fem.stats["nonlinear"]["converged"] is True, fem.stats
+
+
 def test_a_partly_supplied_problem_is_refused_by_name():
     """Naming one of two parameters is neither a solve nor a trace node -- say which is missing rather
     than resolving the rest from somewhere else."""
