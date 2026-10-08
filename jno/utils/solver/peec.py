@@ -656,20 +656,36 @@ def _finite(ok):
         )
 
 
-def _check(value, fn, *args):
-    """Run a correctness guard on ``value``, eagerly OR under ``jit``.
+def _check(value, fn, *args, on=None):
+    """Run a correctness guard on ``value``, eagerly OR under ``jit``; returns ``on``.
 
     The house pattern elsewhere is to SKIP a concrete-only guard when the value is a tracer, which
     silently disarms it exactly when a long unattended optimisation is running. This solver is one
     that can diverge quietly -- a transpose solve reaching 1e+26 while the forward converged is a
-    thing that has actually happened here -- so the guard is routed through ``jax.debug.callback``
-    instead. That fires on the HOST with the runtime value, so it survives ``jit`` and still raises;
-    the cost is one sync point per solve, which against a Krylov solve is nothing.
+    thing that has actually happened here -- so under a trace the guard is a host callback that
+    fires with the runtime value and still raises; the cost is one sync point per solve, which
+    against a Krylov solve is nothing.
+
+    The guard is tied to ``on`` -- the result it vouches for -- rather than being a side effect of
+    its own. A side-effecting callback keeps the whole solve alive in a program that never reads its
+    result: an optimiser that differentiates only a constraint re-ran the field solve every step for
+    a check nobody would see. Tied to ``on``, the guard runs exactly when the result is used.
     """
-    if isinstance(value, jax.core.Tracer):
-        jax.debug.callback(lambda v, *a: fn(np.asarray(v).item() if np.ndim(v) == 0 else v, *a), value, *args)
-    else:
+    if not isinstance(value, jax.core.Tracer):
         fn(np.asarray(value).item() if np.ndim(value) == 0 else value, *args)
+        return on
+
+    def host(v):
+        fn(np.asarray(v).item() if np.ndim(v) == 0 else v, *args)
+        return np.zeros((), np.float64)
+
+    if on is None:  # nothing to tie it to: keep it as an effect, as before
+        jax.debug.callback(host, jax.lax.stop_gradient(value))
+        return None
+    tok = jax.pure_callback(
+        host, jax.ShapeDtypeStruct((), jnp.float64), jax.lax.stop_gradient(value), vmap_method="sequential"
+    )
+    return on + tok.astype(on.dtype)
 
 
 #: Built-once-per-network geometry, bounded. Each entry holds its Filaments so the id cannot be
@@ -1563,13 +1579,13 @@ def solve_network(
 
         x = _run(b, jnp.asarray(w), zdiag, Rc, czc)
         resid = jnp.linalg.norm(M_apply(x, w, zdiag, Rc, czc) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
-        _check(resid, _converged, max(1e2 * float(tol), 1e-9))
+        x = _check(resid, _converged, max(1e2 * float(tol), 1e-9), on=x)
     else:
         top = jnp.concatenate([Z, -jnp.asarray(Asp0.toarray()).T.astype(complex)], axis=1)
         bot = jnp.zeros((nn, ne + nn), dtype=complex).at[crow, ccol].add(jnp.asarray(cval))
         M = jnp.concatenate([top, bot], axis=0)
         x = jnp.linalg.solve(M, b)
-    _check(jnp.all(jnp.isfinite(x)), _finite)
+    x = _check(jnp.all(jnp.isfinite(x)), _finite, on=x)
     cur, phi = x[:ne], x[ne : ne + nn]
     inj = {t: jnp.asarray(np.asarray(Asp0[idx[t]].sum(0)).reshape(-1), dtype=complex) @ cur for t in names}
     if magnetic_current:
