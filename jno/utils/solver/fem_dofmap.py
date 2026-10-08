@@ -634,6 +634,29 @@ def basis_at_points(dm: DofMap, points: np.ndarray, cells: np.ndarray, c: int, X
     return t
 
 
+def basis_at_points_batch(dm: DofMap, points: np.ndarray, cells: np.ndarray, cs: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """:func:`basis_at_points` for many (cell, point) pairs at once: point ``X[i]`` in cell ``cs[i]``
+    -> ``(n, n_dof, vs)``. One tabulation for all points, the orientation transforms gathered per pair."""
+    cs = np.asarray(cs, dtype=np.int64)
+    J, x0 = cell_jacobians(points, np.asarray(cells)[cs])
+    xi = np.linalg.solve(J, (np.asarray(X) - x0)[..., None])[..., 0]
+    tab = np.asarray(dm.element.tabulate(0, xi)[0])  # (n, n_dof, vs)
+    if dm.is_diagonal:
+        t = np.asarray(dm.signs)[cs][:, :, None] * tab
+    else:
+        t = np.array(tab)
+        for dim, blk in dm.blocks.items():
+            for k, idx in enumerate(dm.entity_dofs[dim]):
+                Bk = blk[k][np.asarray(dm.orient[dim])[cs, k].astype(np.int64)]  # (n, nd, nd)
+                t[:, idx] = np.einsum("nij,njv->niv", Bk, tab[:, idx])
+    mt = map_type(dm.family)
+    if mt == "covariant":
+        return np.einsum("nji,nqj->nqi", np.linalg.inv(J), t)
+    if mt == "contravariant":
+        return np.einsum("nij,nqj->nqi", J, t) / np.linalg.det(J)[:, None, None]
+    return t
+
+
 def periodic_prolongation(dm: DofMap, points: np.ndarray, cells: np.ndarray, ties, *, tol: Optional[float] = None):
     """DOF-level periodic / Floquet-Bloch prolongation ``u = P ũ`` for a field of ANY family and degree.
 
