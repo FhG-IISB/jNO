@@ -209,7 +209,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
     # reported (or cached) as though they were the same solver
     name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss", "pardiso": "lu-pardiso"}[backend]
     # `multi_rhs` lets a caller holding a BLOCK of right-hand sides (the shift-invert eigensolver's
-    # subspace iteration) hand the whole block over in one call instead of looping its columns.
+    # block Krylov sweep) hand the whole block over in one call instead of looping its columns.
     # `host_kernel` names the numpy-level solve this spec corresponds to, for the callers that run
     # on the host and cannot go back through JAX -- notably ARPACK's shift-invert OPinv in the
     # non-symmetric eigensolver. "device" has none: it IS a JAX primitive.

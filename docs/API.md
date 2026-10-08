@@ -275,10 +275,13 @@ a small problem, but it materializes the operator (`O(N²)` memory). Passing `pr
 **preconditioned LOBPCG** (Knyazev, *SIAM J. Sci. Comput.* **23**(2), 517–541, 2001), which only applies
 `K`/`M` as matvecs and so runs where the dense reduction cannot. Passing `sigma=` targets the `k`
 eigenvalues **nearest the shift** — interior modes (a cavity resonance inside a band, a Brillouin-zone
-point away from the band edge), which no extremal-end iteration can reach — by shift-invert block
-subspace iteration (Ericsson & Ruhe, *Math. Comp.* **35**, 1980; Bathe & Wilson, *IJNME* **6**, 1973):
-`θ = 1/(λ−σ)` makes the near-σ modes dominant with enormous transformed gaps, so the transformation is
-its own preconditioner and `precond=` is rejected there. The inner solves against `K − σM` default to a
+point away from the band edge), which no extremal-end iteration can reach — by shift-invert with a
+depth-2 block Krylov space per sweep (Ericsson & Ruhe, *Math. Comp.* **35**, 1980; Golub & Underwood,
+*The block Lanczos method*, 1977): `θ = 1/(λ−σ)` makes the near-σ modes dominant with enormous
+transformed gaps, so the transformation is its own preconditioner and `precond=` is rejected there. A
+wide degenerate cluster at the same distance as the wanted modes — the hundreds of exact zeros of a
+curl-curl (Maxwell) operator, with σ between 0 and the first cavity mode — converges too: the restart
+keeps at most `k` copies of any one Ritz value, so the cluster cannot crowd out a wanted mode. The inner solves against `K − σM` default to a
 host sparse LU **factorized once** (every sweep is then triangular substitutions); `linear=` swaps in a
 different inner solver when a factorization is too big. Constrained pencils (Dirichlet pins, periodic
 ties) compose: the reduced `K − σM` is assembled sparsely through the same triplet remap the periodic

@@ -13,8 +13,8 @@ must preserve:
   ``jno.precond.*`` apply, so a sparse/matrix-free operator is never densified.
 
 * :func:`shift_invert_geneigh` — the ``k`` eigenpairs **nearest a shift** ``σ`` (interior modes:
-  cavity resonances, band structure away from the band edge), by block subspace iteration on the
-  spectrally transformed operator ``C = (K−σM)⁻¹M`` with ``θ = 1/(λ−σ)``.
+  cavity resonances, band structure away from the band edge), by depth-2 block Krylov iteration on
+  the spectrally transformed operator ``C = (K−σM)⁻¹M`` with ``θ = 1/(λ−σ)``.
 
 :mod:`jno.solve` exposes all three through ``jno.solve.eigs``: ``precond=`` selects LOBPCG,
 ``sigma=`` selects shift-invert, otherwise the dense reduction runs exactly as before.
@@ -735,11 +735,20 @@ def shift_invert_geneigh(
     so the eigenvalues **nearest σ become the largest |θ|** — the dominant subspace — and the
     transformed gaps are enormous exactly where the original gaps are tiny (the transform is its own
     preconditioner; no ``precond=`` is needed or accepted here). ``C`` is self-adjoint in the
-    M-inner product (``M C = M(K−σM)⁻¹M`` is symmetric), so **block subspace iteration** on ``C``
-    (Bathe & Wilson 1973; guards absorbing the slow boundary direction, as in LOBPCG) converges the
-    ``k`` nearest pairs wherever they lie — both sides of σ or all on one — and, being a BLOCK
-    method, converges a degenerate cluster near σ (the double modes of a symmetric cavity) as a
-    block, where single-vector shift-invert Lanczos finds one copy.
+    M-inner product (``M C = M(K−σM)⁻¹M`` is symmetric). Each sweep builds a **depth-2 block Krylov
+    space** ``span{CV, C²V}`` of the ``m``-block ``V`` (Golub & Underwood 1977; guards as in LOBPCG),
+    which converges the ``k`` nearest pairs wherever they lie — both sides of σ or all on one — and,
+    being a BLOCK method, converges a degenerate cluster near σ (the double modes of a symmetric
+    cavity) as a block, where single-vector shift-invert Lanczos finds one copy.
+
+    It also survives a **wide degenerate cluster at the same distance** as the wanted pairs, which
+    plain subspace iteration on ``C`` does not: the gradient kernel of a curl-curl (Maxwell) operator,
+    hundreds of exact zeros, with σ between 0 and the first cavity mode. Plain subspace iteration
+    stalled there (rate 0.974 per sweep, NaN after 200 sweeps on the PEC unit square at σ = 5); the
+    Krylov space separates θ = −1/σ from a wanted θ of the same size and opposite sign, and the
+    restart keeps at most ``k`` copies of any one Ritz value, so the exact kernel modes cannot crowd a
+    still-converging wanted mode out of the block. Both are pinned by
+    ``tests/test_fem_eigs_shift_invert_kernel.py``.
 
     Every sweep closes with a Rayleigh–Ritz of the **original pencil** on the block, so the
     convergence gate is the caller's quantity — the λ-space relative residual ``‖Kx − λMx‖`` of the
@@ -808,20 +817,29 @@ def shift_invert_geneigh(
     else:
         inner = lambda b: inner_solve(A_sig, b)  # noqa: E731
         # A solver advertising ``multi_rhs`` takes the WHOLE subspace block in one call. This is the
-        # method's inner loop -- one application of C per sweep, m columns each -- and a factorization
+        # method's inner loop -- two applications of C per sweep, m columns each -- and a factorization
         # solved as a block beats the same factorization solved column by column by 1.9x at m=4 rising
         # to 5.5x at m=32 (cuDSS, measured). Solvers without the trait keep the column loop.
         block_inner = inner if getattr(inner_solve, "traits", {}).get("multi_rhs") else None
 
-    # Block shift-invert SUBSPACE ITERATION (Bathe & Wilson, *Solution methods for eigenvalue
-    # problems in structural mechanics*, IJNME 6 (1973) — the classical pairing with the Ericsson-Ruhe
-    # transformation). One application of ``C = (K−σM)⁻¹M`` per sweep multiplies every unwanted
-    # direction by |θ_unwanted/θ_wanted| — tiny, because the transformation makes the near-σ |θ| the
-    # dominant ones by construction — so the m-block converges to the k nearest pairs (wherever they
-    # lie: both sides of σ, or all on one) with the m−k guards absorbing the slow boundary direction,
-    # exactly as in LOBPCG. Each sweep closes with a Rayleigh–Ritz of the ORIGINAL pencil on the
-    # block, so the convergence gate is the quantity the caller cares about — the λ-space residual —
-    # never a θ-space proxy whose mapping back is amplified by ``‖K−σM‖/|θ|``.
+    # Block shift-invert iteration with a depth-2 BLOCK KRYLOV basis (Ericsson & Ruhe 1980 for the
+    # transformation; Golub & Underwood, *The block Lanczos method for computing eigenvalues*, in
+    # Mathematical Software III (1977), for the block Krylov space). Each sweep applies
+    # ``C = (K−σM)⁻¹M`` twice, ``W₁ = CV`` and ``W₂ = CW₁``, and closes with a Rayleigh–Ritz of the
+    # ORIGINAL pencil on span{W₁, W₂}, so the convergence gate is the quantity the caller cares about —
+    # the λ-space residual — never a θ-space proxy whose mapping back is amplified by ``‖K−σM‖/|θ|``.
+    #
+    # Why two applications and not one (plain subspace iteration, span{CV}): its rate is
+    # ``|θ_{m+1}/θ_k|``, the next transformed eigenvalue outside the m-block over the k-th wanted one.
+    # A curl-curl operator has a kernel of dimension ~ the number of interior vertices at λ = 0
+    # (θ = −1/σ), far wider than any guard block; with σ between 0 and the first cavity mode that
+    # ratio sat at 0.974 (σ = 5 on the PEC unit square, measured) and 200 sweeps did not converge, so
+    # the result came back NaN. In span{W₁, W₂} an exactly degenerate cluster contributes only the
+    # directions already in the block (``C`` maps each of them to a multiple of itself), and the
+    # Rayleigh–Ritz separates a wanted θ from one of equal size but opposite sign — which a power
+    # iteration cannot. Measured on the same pencil: 8 sweeps (16 applications of C) to tol 1e-6.
+    # Where plain subspace iteration did converge it was not cheaper: σ = 20, k = 3 on that pencil
+    # took 23 applications against 10.
     Kop = LinearOperator(K)
     Mop_full = LinearOperator(M) if M is not None else None
     m = min(n, k + max(3, (k + 1) // 2))  # guard vectors, as in LOBPCG
@@ -838,22 +856,52 @@ def shift_invert_geneigh(
 
     def sweep(state):
         i, V, _res, _lam = state
+        # W₁ is M-orthonormalized before C is applied again: near an eigenvalue |θ| is large and
+        # C·W₁ unnormalized would swamp the Gram below (every other direction declared dead).
         W = _apply_C(V)
-        Z, keepc = _m_orth_basis(W, _blockmv(Mop_full, W), eps * 1e2)
-        Sb = W @ Z  # M-orthonormal basis (a collapsed direction -> zero column)
+        Z1, _keep1 = _m_orth_basis(W, _blockmv(Mop_full, W), eps * 1e2)
+        W1 = W @ Z1
+        W2 = _apply_C(W1)
+        W2 = W2 - W1 @ (W1.T @ _blockmv(Mop_full, W2))  # one block Gram-Schmidt step against W₁
+        B = jnp.concatenate([W1, W2], axis=1)
+        Z, keepc = _m_orth_basis(B, _blockmv(Mop_full, B), eps * 1e2)
+        Sb = B @ Z  # M-orthonormal basis (a collapsed direction -> zero column)
         A = Sb.T @ _blockmv(Kop, Sb)
         A = 0.5 * (A + A.T)
         big = 1e6 * (jnp.max(jnp.abs(A)) + abs(sigma) + 1.0)  # exile dead columns far from the shift
         A = A + jnp.diag(jnp.where(keepc, 0.0, big).astype(A.dtype))
         mu, Q = jnp.linalg.eigh(A)
-        order = jnp.argsort(jnp.abs(mu - sigma))  # nearest-σ first, guards after
-        Vn = Sb @ Q[:, order]
+        # Restart selection, nearest σ first. Two kinds of column are pushed back: dead ones (a
+        # collapsed direction, class 2) and copies of one Ritz value beyond the k-th (class 1). The
+        # answer holds at most k pairs, so a (k+1)-th copy of the same value carries nothing it can
+        # use; kept, the copies of an exactly degenerate cluster -- the curl-curl kernel, already exact
+        # after one sweep -- fill the whole restart block and evict a wanted mode whose Ritz value is
+        # still converging. That evicted mode never comes back (the kernel is invariant under C), and
+        # the iteration then converges to valid eigenpairs that are NOT the nearest: measured on the PEC
+        # square at σ = 9.87 with k = 6, the 2π² mode was replaced by a fourth zero.
+        dist = jnp.abs(mu - sigma)
+        first = jnp.argsort(dist)
+        ms = mu[first]
+        group_scale = jnp.maximum(jnp.abs(sigma), jnp.max(jnp.abs(ms[:k])))
+        same = jnp.abs(ms[:, None] - ms[None, :]) <= 1e-8 * group_scale
+        copies_before = jnp.sum(jnp.tril(same, -1), axis=1)  # earlier (nearer) members of the same value
+        cls_sorted = jnp.where(copies_before >= k, 1, 0)
+        cls = jnp.zeros_like(cls_sorted).at[first].set(cls_sorted)
+        cls = jnp.where(mu > 0.5 * big, 2, cls)  # an exiled (dead) direction
+        order = jnp.lexsort((dist, cls))
+        Vn = (Sb @ Q[:, order])[:, :m]
         X = Vn[:, :k]
         KX = _blockmv(Kop, X)
         MX = _blockmv(Mop_full, X) if M is not None else X
         lam = mu[order][:k]
-        scale = jnp.maximum(jnp.max(jnp.abs(lam)), jnp.finfo(lam.dtype).tiny)
+        # λ-space residual relative to max(|λ|, |σ|): the eigenvalues' own size alone collapses to
+        # roundoff when the wanted pairs ARE kernel modes (λ ≈ 1e-13 at σ = 1 on a curl-curl pencil),
+        # and the gate then could never pass on an exactly converged answer.
+        scale = jnp.maximum(jnp.maximum(jnp.max(jnp.abs(lam)), abs(sigma)), jnp.finfo(lam.dtype).tiny)
         rel = jnp.max(jnp.linalg.norm(KX - MX * lam[None, :], axis=0) / scale)
+        # a dead or capped column among the k returned is never "converged" (a zero column has a zero
+        # residual and would otherwise pass)
+        rel = jnp.where(jnp.all(cls[order][:k] == 0), rel, jnp.inf)
         return (i + 1, Vn, rel, lam)
 
     key = jax.random.PRNGKey(seed)
