@@ -972,6 +972,15 @@ def assemble_fem_nonnodal(
             r = t_ if r is None else r + t_
         return r
 
+    def _unflatten_lbs(flat, shapes):
+        """Inverse of the per-facet concatenation of the across blocks: ``{key: (n_q, n_dof_main)}``."""
+        out, o = {}, 0
+        for k_, shp in shapes:
+            n_ = int(np.prod(shp))
+            out[k_] = flat[o : o + n_].reshape(shp)
+            o += n_
+        return out
+
     def _facet_inputs(g, u_flat):
         """Per facet: owner-cell local DOFs ``(n_f, n_local_all)`` and, per across key, main DOFs."""
         la = jnp.asarray(u_flat)[_all_cdofs[g["cell"]]]
@@ -1072,10 +1081,26 @@ def assemble_fem_nonnodal(
             for g in _GS["groups"] if with_gsurf else ():  # general boundary integrands
                 la, lbs = _facet_inputs(g, u_flat)
 
-                def _fr(f, la_f, lbs_f, _g=g, _sc=rt_scalar, _fv=field_vals, _p=_pts_r):
-                    return _facet_res(_g, f, la_f, lbs_f, _g["coeffs"], _sc, _fv, _nt, _p)
+                _shp_r = [(k_, tuple(lbs[k_].shape[1:])) for k_ in lbs]  # per-facet shape of each across block
+                _lb_flat = (
+                    jnp.concatenate([lbs[k_].reshape(g["n_facets"], -1) for k_, _s in _shp_r], axis=1)
+                    if _shp_r
+                    else jnp.zeros((g["n_facets"], 0), la.dtype)
+                )
 
-                elem = jax.vmap(_fr)(jnp.arange(g["n_facets"]), la, lbs)
+                def _fr(f, la_f, lb_f, _g=g, _sc=rt_scalar, _fv=field_vals, _p=_pts_r, _ss=tuple(_shp_r)):
+                    return _facet_res(_g, f, la_f, _unflatten_lbs(lb_f, _ss), _g["coeffs"], _sc, _fv, _nt, _p)
+
+                elem = _elem_map(  # chunked like the volume path: bounded memory on a large face
+                    _fr,
+                    (jnp.arange(g["n_facets"]), la, _lb_flat),
+                    _cell_chunk_of(
+                        g["n_facets"],
+                        int(cdofs[g["tfi"]].shape[1]),
+                        int(la.shape[1]) + int(_lb_flat.shape[1]),
+                        _chunk_setting,
+                    ),
+                )
                 R = R.at[cdofs[g["tfi"]][g["cell"]].reshape(-1)].add(elem.reshape(-1).astype(R.dtype))
             return R
 
@@ -1485,22 +1510,36 @@ def assemble_fem_nonnodal(
                 _keys = list(_g["across"])
                 _nl = int(_la.shape[1])
 
-                def _kf(f, la_f, lbs_f, _g=_g, _keys=_keys, _nl=_nl):
-                    _shapes = [lbs_f[k_].shape for k_ in _keys]
+                _ss = tuple((k_, tuple(_lbs[k_].shape[1:])) for k_ in _keys)
+                _lbf = (
+                    jnp.concatenate([_lbs[k_].reshape(_g["n_facets"], -1) for k_ in _keys], axis=1)
+                    if _keys
+                    else jnp.zeros((_g["n_facets"], 0), _la.dtype)
+                )
 
-                    def _r(v):
-                        lb = {}
-                        o = _nl
-                        for k_, shp in zip(_keys, _shapes):
-                            n_ = int(np.prod(shp))
-                            lb[k_] = v[o : o + n_].reshape(shp)
-                            o += n_
-                        return _facet_res(_g, f, v[:_nl], lb, _g["coeffs"], rt_scalar, field_vals, _nt, _pts_dyn)
+                def _kf(f, la_f, lb_f, _g=_g, _nl=_nl, _ss=_ss):
+                    def _r(vv):
+                        return _facet_res(
+                            _g,
+                            f,
+                            vv[:_nl],
+                            _unflatten_lbs(vv[_nl:], _ss),
+                            _g["coeffs"],
+                            rt_scalar,
+                            field_vals,
+                            _nt,
+                            _pts_dyn,
+                        )
 
-                    v0 = jnp.concatenate([la_f] + [lbs_f[k_].reshape(-1) for k_ in _keys])
-                    return jax.jacfwd(_r)(v0)
+                    return jax.jacfwd(_r)(jnp.concatenate([la_f, lb_f]))
 
-                Kf = jax.vmap(_kf)(jnp.arange(_g["n_facets"]), _la, _lbs)  # (n_f, n_test, n_cols)
+                Kf = _elem_map(  # (n_f, n_test, n_cols); chunked: the AD tangent is n_cols wide per facet
+                    _kf,
+                    (jnp.arange(_g["n_facets"]), _la, _lbf),
+                    _cell_chunk_of(
+                        _g["n_facets"], int(cdofs[_g["tfi"]].shape[1]), _nl + int(_lbf.shape[1]), _chunk_setting
+                    ),
+                )
                 if _acc is not None:
                     _acc = _acc.at[_vinv[len(_groups) + sgi]].add(Kf.reshape(-1).astype(_acc.dtype))
                 else:
