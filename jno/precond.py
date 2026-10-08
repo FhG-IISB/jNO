@@ -486,7 +486,11 @@ class _Hypre(_Spec):
 
     def __init__(self, kind, options):
         self.kind = str(kind)
-        self.options = dict(options)
+        options = dict(options)
+        # the sigma = 0 machinery of AMS: these are not PETSc option-database keys
+        self.interior_nodes = options.pop("interior_nodes", None)
+        self.zero_beta = bool(options.pop("zero_beta", False))
+        self.options = options
 
     def materialize(self, ctx: PrecondContext):
         import numpy as np
@@ -577,6 +581,20 @@ class _Hypre(_Spec):
                 full_m = PETSc.Mat().createAIJ(size=full.shape, csr=(full.indptr, full.indices, full.data))
                 pc.setHYPRESetInterpolations(dim, None, None, full_m, None)
                 _hypre_high_order = True
+            if self.zero_beta:
+                # the operator has NO mass where sigma = 0 (curl-curl only there): tell AMS the
+                # beta-Poisson problem is zero, so it does not build a mass-weighted gradient correction
+                pc.setHYPRESetBetaPoissonMatrix(None)
+            if self.interior_nodes is not None:
+                m_ = self.interior_nodes(fem) if callable(self.interior_nodes) else self.interior_nodes
+                m_ = np.asarray(m_, dtype=np.float64).reshape(-1)
+                if m_.size != Gs.shape[1]:
+                    raise ValueError(
+                        f"jno.precond.hypre(interior_nodes=...): {m_.size} entries, but the nodal (gradient) "
+                        f"space has {Gs.shape[1]} -- one entry per column of the discrete gradient G, "
+                        "1.0 for a node interior to a sigma = 0 region, 0.0 otherwise."
+                    )
+                pc.setHYPREAMSSetInteriorNodes(PETSc.Vec().createWithArray(m_))
         opts = PETSc.Options()
         for k, v in self.options.items():
             opts.setValue(f"pc_hypre_{self.kind}_{k}", v)
@@ -623,6 +641,12 @@ def hypre(kind: str = "ams", *, float32: bool = False, **options) -> _Hypre:
     (interior-node marking, a restricted gradient, gradient projection). jNO's own :func:`ams` has
     none of that. Measured on an A–V eddy problem where it matters, hypre reached 8.6e-03 with
     interior nodes marked against no progress at all without them.
+
+    Two keywords reach that machinery (they are not PETSc options): ``interior_nodes=`` -- one value
+    per column of the discrete gradient ``G`` (a vertex at degree 1, a ``P_k`` node at degree k), 1.0
+    for a node interior to a ``sigma = 0`` region, or a callable ``fem -> array`` -- and
+    ``zero_beta=True``, which declares that the operator carries no mass there (a pure curl-curl
+    block), so AMS builds no mass-weighted gradient correction.
 
     **It is not automatically faster.** On the same 89,920-DOF H(curl) block of a production-scale
     A–V system, hypre reached 4.33e-09 and jNO's own ``ams()`` reached 8.03e-09 — equivalent. Reach
