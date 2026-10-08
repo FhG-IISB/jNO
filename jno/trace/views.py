@@ -1315,6 +1315,11 @@ class ComplexPair:
     def bind(self, **kw) -> "ComplexPair":
         return self._map(lambda p: p.bind(**kw))
 
+    def test(self) -> "ComplexPair":
+        """The test function of a complex unknown (``domain.unknown(..., complex=True)``): the pair of the
+        real and imaginary parts' test functions."""
+        return self._map(lambda p: p.test())
+
     partials = bind
 
     def d(self, v, **kw) -> "ComplexPair":

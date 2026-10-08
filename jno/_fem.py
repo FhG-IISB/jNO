@@ -370,6 +370,57 @@ def _bare(obj: Any):
     return obj.expr if _is_view(obj) else obj
 
 
+def _unknown_symbol_of(node: Any) -> Any:
+    """The trial symbol a ``domain.unknown()`` field stands for in a weak form, or ``None``.
+
+    ``domain.unknown()`` is a valued nodal field (``jno.fdm`` solves for its values); the model it wraps
+    records the ``TrialFunction`` it was built from. Read from the instance dict on purpose: a plain
+    ``jno.np.parameter`` coefficient has no such entry and stays a coefficient."""
+    if isinstance(node, ModelCall):
+        return getattr(node.model, "__dict__", {}).get("_unknown_symbol")
+    return None
+
+
+def _lower_unknowns(obj: Any) -> Any:
+    """Replace every ``domain.unknown()`` field in a term (or a list of terms) by its trial symbol.
+
+    One object serves FEM and FDM: ``jno.fdm`` consumes the unknown's values, ``jno.fem`` its symbol.
+    The substitution happens once, at the door, so every classification site downstream sees an ordinary
+    ``TrialFunction`` -- exactly what ``fem_symbols`` would have produced. A view's bound coordinates (the
+    region of ``u(xb, yb) - g``) are carried over to the rewritten term."""
+    from .trace import substitute
+
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_lower_unknowns(o) for o in obj)
+    sym = _unknown_symbol_of(_bare(obj))
+    if sym is not None:
+        return sym
+    bare = _bare(obj)
+    if not isinstance(bare, Placeholder):
+        return obj
+    from .trace import Jacobian, TemporalDerivative
+
+    nodes = list(_walk(bare))
+    mapping = {n: _unknown_symbol_of(n) for n in nodes if _unknown_symbol_of(n) is not None}
+    if not mapping:
+        return obj
+    for n in nodes:
+        # A nodal field's `.t` is the strong-form TemporalDerivative (a cross-step difference for jno.fdm);
+        # the weak-form time derivative of a trial is a Jacobian in the time coordinate, which is what the
+        # fem_symbols view builds and what the transient classifier looks for.
+        if isinstance(n, TemporalDerivative) and any(_unknown_symbol_of(m) is not None for m in _walk(n.target)):
+            mapping[n] = Jacobian(_lower_unknowns(n.target), [n.time_var])
+    out = substitute(bare, mapping)
+    if _is_view(obj):
+        cv = getattr(obj, "_coord_vars", None)
+        if cv and "_coord_vars" not in getattr(out, "__dict__", {}):
+            out._coord_vars = dict(cv)
+        tie = getattr(obj, "_periodic_tie", None)  # `u(A) - u(B)`: the view is where the two regions survive
+        if tie is not None:
+            out._periodic_tie = tie
+    return out
+
+
 def _walk(node: Any):
     """Yield every node in a Placeholder tree (deduplicated by id)."""
     from .utils.solver.solver_helper import iter_placeholder_children
@@ -2102,6 +2153,7 @@ class FEM:
         :attr:`offsets` — the field order is first appearance in the ``jno.fem`` constraints."""
         if isinstance(field, int):
             return field
+        field = _lower_unknowns(field)  # a `domain.unknown()` field resolves through its trial symbol
         # the native assembler records the keys in assembly (= offsets) order — snapshotted onto
         # this FEM at finalize time (the domain attribute is overwritten by any later assembly on
         # the same domain, e.g. an auxiliary jno.precond.form); the constraint-walk order is only
@@ -3696,7 +3748,7 @@ class FEM:
         """
         from .utils.solver.solver_helper import contains_node_type
 
-        terms = list(term) if isinstance(term, (list, tuple)) else [term]
+        terms = _lower_unknowns(list(term) if isinstance(term, (list, tuple)) else [term])
         bares = [getattr(t, "expr", t) for t in terms]
         weak = [contains_node_type(b, TestFunction) for b in bares]
         if any(weak) and not all(weak):
@@ -6199,7 +6251,7 @@ def fem(
     try:
         with _host_assembly_scope():
             out = _fem_impl(
-                constraints,
+                _lower_unknowns(list(constraints) if isinstance(constraints, tuple) else constraints),
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )

@@ -39,7 +39,12 @@ same list — no separate BC objects.
 
 `domain.unknown()` returns a **valued** nodal field: one degree of freedom per mesh vertex (a P1
 field). It is discrete, so autodiff with respect to a coordinate is meaningless — the derivative
-views therefore default to **finite differences**:
+views therefore default to **finite differences**. The shape namespace builds the identical field:
+`d.unknown.vector(2)` is `d.unknown(value_shape=(2,))`, `d.unknown.matrix(2, 2)` is
+`d.unknown(value_shape=(2, 2))`, and a vector or matrix unknown's `.bind(...)` is its vector or matrix view.
+The same object is the trial function in `jno.fem` (`v = u.test()`); options that only a finite-element
+space has — `order=2`, a non-nodal `space=`, `complex=True`, `symmetric=True` — make it FEM-only, and
+`jno.fdm` refuses it.
 
 | you write        | meaning                                                        |
 | ---------------- | ------------------------------------------------------------- |

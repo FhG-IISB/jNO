@@ -388,6 +388,34 @@ def _facet_current_names(boundary_regions, mid):
     return names
 
 
+class _UnknownNamespace:
+    """``domain.unknown`` -- callable as ``d.unknown(...)``, and the shape namespace ``.scalar`` / ``.vector``
+    / ``.matrix``. Each builds the same kind of unknown; the namespace only spells the shape."""
+
+    __slots__ = ("_domain",)
+
+    def __init__(self, domain):
+        self._domain = domain
+
+    def __call__(self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False):
+        return self._domain._make_unknown(
+            value_shape=value_shape, name=name, order=order, space=space, complex=complex, symmetric=symmetric
+        )
+
+    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False):
+        """A scalar unknown, ``value_shape=()``."""
+        return self(value_shape=(), name=name, order=order, space=space, complex=complex)
+
+    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False):
+        """A vector unknown with ``n`` components, ``value_shape=(n,)``."""
+        return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex)
+
+    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False):
+        """An ``n x m`` matrix unknown. ``symmetric=True`` (square only) stores the ``n(n+1)/2`` upper-triangle
+        values per node while the symbol behaves as the full matrix in every expression."""
+        return self(value_shape=(int(n), int(m)), name=name, order=order, complex=complex, symmetric=symmetric)
+
+
 class domain(MeshIOMixin):
     """
     Mesh-based domain class for defining computational domains and sampling collocation points.
@@ -1783,6 +1811,7 @@ class domain(MeshIOMixin):
             im_te = TestFunction(name=f"{test_name}_im", value_shape=value_shape, order=order, space=space)
             re_te.field_key = re_tr.field_key
             im_te.field_key = im_tr.field_key
+            re_tr._test, im_tr._test = re_te, im_te  # so `u.test()` returns this very pair
             for _s in (re_tr, im_tr, re_te, im_te):
                 _s._domain = self
                 # Mark these as members of a complex (re, im) pair. The real-equivalent weak form
@@ -1794,6 +1823,7 @@ class domain(MeshIOMixin):
         trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order, space=space, symmetric=symmetric)
         test = TestFunction(name=test_name, value_shape=value_shape, order=order, space=space, symmetric=symmetric)
         test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
+        trial._test = test  # so `u.test()` returns this very test function
         # Carry the owning domain so a consumer can recover the mesh / FE space from a
         # symbol alone -- e.g. jno.np.parameter(phi) sizing a field parameter to the
         # space (mirrors how Variable carries its _domain).
@@ -1847,23 +1877,54 @@ class domain(MeshIOMixin):
         """Advanced helper for explicit FEM-only authoring."""
         return TrialFunction(name=name, value_shape=value_shape, order=order)
 
-    def unknown(self, value_shape=(), name="u"):
-        """The discrete **unknown solution field** on this domain's mesh — a *valued* P1 nodal field
-        for strong-form / collocation methods (``jno.fdm``, …), the counterpart to the *symbolic*
-        trial from :meth:`fem_symbols`.
+    @property
+    def unknown(self) -> "_UnknownNamespace":
+        """The field you solve for — the same object for ``jno.fem``, ``jno.fdm`` and a PINN residual.
 
-        Where ``fem_symbols()`` gives an abstract weak-form ``TrialFunction`` (valued only during FE
-        assembly), ``unknown()`` gives a field whose DOFs *are* the unknown, so it supports strong-form
-        derivatives (``u.d2(x, scheme=...)``) and is the object a strong-form solver solves for::
+        ``d.unknown(value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False)``,
+        or by shape::
 
-            u = domain.unknown()
-            jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()
+            u = d.unknown.scalar()                          # = d.unknown()
+            U = d.unknown.vector(2, order=2)                # = d.unknown(value_shape=(2,), order=2)
+            S = d.unknown.matrix(2, 2, symmetric=True)      # 3 stored values per node, a 2x2 in expressions
+
+        In ``jno.fem`` the unknown is the trial function and ``u.test()`` its test function (same space,
+        shape, order and symmetry), so the pair cannot be mismatched::
+
+            u = d.unknown(); v = u.test()
+            jno.fem([inner(grad(u), grad(v)) - f * v, u(xb, yb) - 0.0]).solve()
+
+        For ``jno.fdm`` it is a *valued* P1 nodal field whose DOFs are the unknown, so it supports
+        strong-form derivatives (``ui.xx``); that needs ``order=1``, a nodal (``"Lagrange"``) space, a real
+        field and full storage. Any other combination is an FEM-only unknown, and ``jno.fdm`` refuses it.
         """
+        return _UnknownNamespace(self)
+
+    def _make_unknown(self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False):
+        """Build an unknown -- see :attr:`unknown`."""
+        if self.__dict__.get("_lazy_plan") is not None:
+            _ = self.mesh
+        trial, _test = self.variational_symbols(
+            value_shape=value_shape,
+            names=(name, f"v_{name}"),
+            order=order,
+            complex=complex,
+            space=space,
+            symmetric=symmetric,
+        )
+        nodal_p1 = int(order) == 1 and str(space) == "Lagrange" and not complex and not symmetric
+        if not nodal_p1:
+            # FEM-only: there is no valued P1 nodal field behind it. Mark it so jno.fdm can say why it
+            # cannot solve for it, instead of reporting that it found no unknown at all.
+            for part in (trial.real, trial.imag) if complex else (trial,):
+                part._fem_only_unknown = True
+            return trial
         from ..architectures.models import parameter
 
-        sym = TrialFunction(name=name, value_shape=value_shape, order=1)
-        sym._domain = self  # so parameter() sizes a P1 nodal field to this mesh's DOFs
-        return parameter(sym)
+        u = parameter(trial)  # a valued P1 nodal field sized to this mesh (jno.fdm solves for its values)
+        # In jno.fem the same object IS the trial function: the assembler lowers it onto this symbol.
+        u.model._unknown_symbol = trial
+        return u
 
     def _register_variational_sample(
         self,

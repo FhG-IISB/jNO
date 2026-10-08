@@ -36,6 +36,8 @@ sampling, and tensor tags.
       members:
         - __init__
         - variable
+        - unknown
+        - fem_symbols
         - sample
         - summary
         - tag
@@ -46,6 +48,33 @@ sampling, and tensor tags.
         - polygon
         - export
         - plot_mesh
+
+### The unknown — `d.unknown`
+
+`d.unknown(...)` is the field you solve for, the same object for `jno.fem`, `jno.fdm` and a PINN
+residual; the shape namespace spells the common cases:
+
+```python
+u = d.unknown()                                  # scalar, P1 — also d.unknown.scalar()
+U = d.unknown.vector(2, order=2)                 # value_shape=(2,), P2
+S = d.unknown.matrix(2, 2, symmetric=True)       # 3 stored values per node, a 2x2 in every expression
+E = d.unknown.vector(3, space="N1E")             # an edge-element field
+v = u.test()                                     # FEM: its test function (same space, shape, order)
+```
+
+Keyword options: `name=`, `order=`, `space=`, `complex=` (and `symmetric=` on `matrix`). In `jno.fem` the
+unknown is the trial function and `u.test()` its test function; the result is bit-identical to the same
+problem written with `u, v = d.fem_symbols(...)`, which keeps working. `jno.fdm` solves for the values of
+a real P1 nodal unknown with full storage; any other combination (`order=2`, a non-nodal space,
+`complex=True`, `symmetric=True`) is FEM-only and `jno.fdm` refuses it.
+
+::: jno.domain.domain_class._UnknownNamespace
+    options:
+      show_root_heading: false
+      members:
+        - scalar
+        - vector
+        - matrix
 
 ### `jno.domain.csg`
 
