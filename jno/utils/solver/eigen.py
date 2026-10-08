@@ -27,6 +27,23 @@ import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
 
 
+class ShiftInvertNotConverged(RuntimeError):
+    """``jno.solve.eigs(sigma=...)`` / ``FEM.eigs(sigma=...)`` did not reach its residual gate.
+
+    Raised instead of returning NaN whenever the residual is a concrete value -- an eager call, and
+    also ``jax.grad`` without ``jit`` (the sweeps run under ``stop_gradient``). Under ``jit``/``vmap``
+    the residual is a tracer and nothing can be raised; the result is NaN-poisoned there instead. The
+    message says which of the two causes it was: the sweep budget (``maxiter=``) ran out, or
+    ``K - sigma*M`` is singular to working precision (sigma sits on an eigenvalue), detected by one
+    probe solve on the failure path. Attributes ``sigma``, ``k``, ``sweeps``, ``residual``, ``tol``
+    carry the numbers. A ``RuntimeError``, so a generic solver-failure handler catches it.
+    """
+
+    def __init__(self, message, *, sigma, k, sweeps, residual, tol):
+        super().__init__(message)
+        self.sigma, self.k, self.sweeps, self.residual, self.tol = sigma, k, sweeps, residual, tol
+
+
 def _as_dense(A):
     if A is None:
         return None
@@ -754,9 +771,10 @@ def shift_invert_geneigh(
     convergence gate is the caller's quantity — the λ-space relative residual ``‖Kx − λMx‖`` of the
     ``k`` wanted pairs, normalized by their spectrum scale — never a θ-space proxy, whose mapping
     back is amplified by ``‖K−σM‖/|θ|`` (from ``Kx − λMx = −(K−σM)(Cx−θx)/θ``). An exhausted budget
-    NaN-poisons rather than returning a quietly under-converged interior spectrum. A shift that
-    lands ON an eigenvalue makes ``K − σM`` singular; the inner factorization then yields garbage
-    that fails the same gate — perturb σ off the eigenvalue.
+    never returns a quietly under-converged interior spectrum, and neither does a shift that lands ON
+    an eigenvalue (``K − σM`` singular, the inner solves garbage): a call outside ``jit``/``vmap`` raises
+    :class:`ShiftInvertNotConverged`, saying which of the two it was; only under ``jit``/``vmap``,
+    where nothing can be raised, does the result come back NaN-poisoned instead.
 
     Args:
         K: **assembled** symmetric operator (BCOO or dense — the shifted operator is factorized, so
@@ -772,7 +790,8 @@ def shift_invert_geneigh(
 
     Returns:
         ``(λ, X)`` — the ``k`` eigenvalues nearest σ (sorted by ``|λ − σ|``), M-orthonormal
-        eigenvectors, NaN-poisoned if the final original-pencil residual gate fails. Eigenvalues are
+        eigenvectors. If the final original-pencil residual gate fails: raises
+        :class:`ShiftInvertNotConverged` (outside ``jit``/``vmap``), NaN-poisoned under them. Eigenvalues are
         differentiable through the Rayleigh quotient at the frozen eigenvectors, like the LOBPCG
         path; eigenvectors carry no gradient.
     """
@@ -913,10 +932,46 @@ def shift_invert_geneigh(
     _i, V, res, _l = jax.lax.stop_gradient(jax.lax.while_loop(lambda s: (s[0] < maxiter) & (s[2] > tol), sweep, init))
     X = V[:, :k]
 
-    # Differentiable readout + honesty gate on the ORIGINAL pencil: the Rayleigh quotient at the
-    # frozen eigenvectors carries ∂λ/∂θ; a budget exhausted past ``tol`` — or the NaN residuals a
-    # singular shift produces — NaN-poisons rather than returning a quietly wrong interior spectrum
-    # (``res <= tol`` is False for NaN).
+    # Honesty gate on the ORIGINAL pencil. With a concrete residual (eager, or grad without jit), a
+    # budget exhausted past ``tol`` -- or a singular shift -- raises by name: a NaN array is easy to pass
+    # on unread. Under jit/vmap the residual is a tracer and nothing can be raised, so the result is
+    # NaN-poisoned instead (``res <= tol`` is False for NaN) -- never a quietly wrong interior spectrum.
+    if not isinstance(res, jax.core.Tracer) and not bool(res <= tol):
+        r, sweeps = float(res), int(_i)
+        # Which cause? One probe solve against K - σM, on this failure path only. A shift on an
+        # eigenvalue does not always give NaN: the LU can return FINITE garbage (measured on a Dirichlet
+        # Laplacian with σ = λ₁ to the last bit: probe residual 3.5e-2, |x|/|b| 6e13), which a NaN test
+        # alone would blame on the budget. Away from the spectrum the probe solves to ~1e-15.
+        # (stop_gradient: under a plain jax.grad the operator carries a tangent, the probe must not.)
+        probe = jax.random.normal(jax.random.PRNGKey(seed + 1), (n,), dtype=dt)
+        xp = inner(probe)
+        probe_res = float(
+            jax.lax.stop_gradient(jnp.linalg.norm(LinearOperator(A_sig).mv(xp) - probe) / jnp.linalg.norm(probe))
+        )
+        if not (jnp.isfinite(res) and probe_res <= 1e-6):
+            why = (
+                f"an inner solve against K - {sigma}*M has relative residual {probe_res:.1e}: the matrix is "
+                f"singular to working precision, i.e. sigma={sigma} sits on (or within roundoff of) an "
+                "eigenvalue. Move sigma slightly off the eigenvalue -- the modes nearest it stay dominant."
+            )
+            if inner_solve is not None:
+                why += " (Or the inner solver passed as linear= does not solve it to 1e-6; try jno.solve.lu().)"
+        else:
+            why = (
+                f"after {sweeps} sweep(s) (maxiter={maxiter}) the relative residual is {r:.2e} > tol={tol:.1e}. "
+                f"Raise maxiter=, loosen tol=, or move sigma: convergence is slow when the k-th and (k+1)-th "
+                "eigenvalues are almost equally far from sigma."
+            )
+        raise ShiftInvertNotConverged(
+            f"jno.solve.eigs(sigma={sigma}, k={k}): shift-invert did not converge -- {why}",
+            sigma=sigma,
+            k=k,
+            sweeps=sweeps,
+            residual=r,
+            tol=tol,
+        )
+
+    # Differentiable readout: the Rayleigh quotient at the frozen eigenvectors carries ∂λ/∂θ.
     KX = _blockmv(Kop, X)
     MX = _blockmv(Mop_full, X) if M is not None else X
     lam = jnp.sum(X * KX, axis=0) / jnp.sum(X * MX, axis=0)

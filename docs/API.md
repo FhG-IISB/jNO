@@ -328,11 +328,14 @@ quotient, which gives that derivative exactly without differentiating through th
 tolerance can never be silently ignored by the dense path. Do not set `tol` near machine precision: on
 an ill-conditioned pencil the residual floors well above it (≈`4.4e-8` on a singular all-Neumann
 Laplacian with `cond(K) ≈ 2e16`), and a tolerance below that floor burns the budget and
-**NaN-poisons** the result — which is the deliberate contract for an exhausted budget, never a quietly
-under-converged spectrum. The shift-invert gate measures the **original pencil's** residual of the `k`
-returned pairs (a θ-space gate would flatter it), and a shift landing exactly ON an eigenvalue makes
-`K − σM` singular — the garbage its factorization produces fails the same gate; perturb σ off the
-eigenvalue.
+**NaN-poisons** the LOBPCG result — which is the deliberate contract for an exhausted budget, never a
+quietly under-converged spectrum. The shift-invert gate measures the **original pencil's** residual of
+the `k` returned pairs (a θ-space gate would flatter it), and a shift landing exactly ON an eigenvalue
+makes `K − σM` singular — the garbage its factorization produces fails the same gate; perturb σ off
+the eigenvalue. A shift-invert call that fails its gate **raises** `ShiftInvertNotConverged` (in
+`jno.utils.solver.eigen`, a `RuntimeError`) naming the cause — exhausted budget or singular shift —
+rather than returning NaN (also under a plain `jax.grad`); only under `jit`/`vmap`, where nothing can
+be raised, is its result NaN-poisoned instead.
 
 ### Singular values — `jno.solve.svd`
 

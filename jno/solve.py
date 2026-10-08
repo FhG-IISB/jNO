@@ -1033,9 +1033,11 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
     transformation is its own preconditioner. The Rayleigh-Ritz runs in the **M-inner product**, so the
     consistent (non-lumped) mass matrix of an ordinary FEM form is handled directly. ``tol``/``maxiter``
     tune the iterative paths (defaults ``1e-6`` / ``200``) and are rejected on the dense path, so a
-    tolerance can never be silently ignored. If the budget is exhausted before ``tol`` — or a shift
-    lands on an eigenvalue and the inner factorization degenerates — the result is **NaN-poisoned**
-    rather than silently under-converged — jNO never fails silently.
+    tolerance can never be silently ignored. If the budget is exhausted before ``tol`` the LOBPCG
+    result is **NaN-poisoned** rather than silently under-converged. The shift-invert path **raises**
+    ``ShiftInvertNotConverged`` (from :mod:`jno.utils.solver.eigen`, a ``RuntimeError``) instead -- for
+    an exhausted budget, and for a shift on an eigenvalue whose inner factorization degenerates -- and
+    NaN-poisons only under ``jit``/``vmap``, where nothing can be raised. jNO never fails silently.
 
     **Differentiable** on both paths: ``∂λ/∂θ`` for **simple** eigenvalues (degenerate/crossing
     eigenvalues make the derivative ill-defined — use the trace of the cluster). The dense path

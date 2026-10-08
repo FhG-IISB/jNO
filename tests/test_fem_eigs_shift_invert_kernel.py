@@ -117,3 +117,73 @@ def test_cube_cavity_shift_invert_below_the_first_mode():
     K, mass = _cavity(3, 1, 0.35)
     lam, _X = K.eigs(mass=mass, k=4, sigma=10.0)
     _check(lam, _analytic_nearest(3, 10.0, 4), rtol=0.1)
+
+
+# --------------------------------------------------------------------------------------------------
+# No NaN is ever handed back by an eager call: a failed gate raises by name
+# --------------------------------------------------------------------------------------------------
+
+
+def test_an_exhausted_budget_raises_by_name_not_nan():
+    from jno.utils.solver.eigen import ShiftInvertNotConverged
+
+    K, mass = _cavity(2, 1, 0.1)
+    with pytest.raises(ShiftInvertNotConverged, match=r"maxiter=1\b") as info:
+        K.eigs(mass=mass, k=3, sigma=5.0, maxiter=1)
+    assert info.value.sweeps == 1 and info.value.residual > info.value.tol
+    assert isinstance(info.value, RuntimeError)  # catchable as the generic solver failure too
+
+
+def test_shift_invert_never_returns_nan_silently():
+    """Across shifts on both sides of the kernel, near-ties and exactly ON a discrete eigenvalue, an
+    eager call either returns a finite spectrum or raises ShiftInvertNotConverged -- a NaN array is
+    never the answer."""
+    from jno.utils.solver.eigen import ShiftInvertNotConverged
+
+    K, mass = _cavity(2, 1, 0.1)
+    lam_ref, _ = K.eigs(mass=mass, k=2, sigma=9.0)
+    on_eigenvalue = float(np.max(np.asarray(lam_ref)))  # a discrete eigenvalue, to the last bit
+    raised = []
+    for sigma in (0.5, 2.0, 5.0, 9.0, 9.87, 14.8, 19.7, 25.0, 40.0, on_eigenvalue):
+        for k in (1, 3, 6):
+            try:
+                lam, X = K.eigs(mass=mass, k=k, sigma=sigma)
+            except ShiftInvertNotConverged as err:
+                raised.append((sigma, k, str(err)))
+                continue
+            assert np.all(np.isfinite(np.asarray(lam))) and np.all(np.isfinite(np.asarray(X))), (sigma, k)
+    # only the singular shift may fail, and it must say so
+    assert {s for s, _k, _m in raised} <= {on_eigenvalue}, raised
+    assert all("singular" in m for _s, _k, m in raised)
+
+
+def test_under_jit_a_failed_gate_is_nan_poisoned(monkeypatch):
+    """Under ``jit`` the residual is a tracer and nothing can be raised: the documented fallback is a
+    NaN-poisoned result (never a finite, unconverged one). A plain ``jax.grad`` still raises -- the sweeps
+    run under ``stop_gradient``, so the residual stays concrete."""
+    import jax.experimental.sparse as jsp
+
+    import jno.utils.solver.eigen as eigen
+
+    K, mass = _cavity(2, 1, 0.1)
+    seen = {}
+    real = eigen.shift_invert_geneigh
+
+    def capture(Kr, Mr, k, sigma, **kw):  # the reduced (PEC-eliminated) pencil FEM.eigs hands over
+        seen["K"], seen["M"] = Kr, Mr
+        return real(Kr, Mr, k, sigma, **kw)
+
+    monkeypatch.setattr(eigen, "shift_invert_geneigh", capture)
+    lam_ok, _ = K.eigs(mass=mass, k=3, sigma=5.0)
+    Kr, Mr = seen["K"], seen["M"]
+
+    def run(scale, maxiter):
+        Ks = jsp.BCOO((scale * Kr.data, Kr.indices), shape=Kr.shape)
+        return real(Ks, Mr, 3, 5.0, maxiter=maxiter)[0]
+
+    assert np.isnan(np.asarray(jax.jit(lambda s: run(s, 1))(1.0))).all()
+    with pytest.raises(eigen.ShiftInvertNotConverged):
+        jax.grad(lambda s: run(s, 1)[0])(1.0)
+    np.testing.assert_allclose(
+        np.sort(np.asarray(jax.jit(lambda s: run(s, 200))(1.0))), np.sort(np.asarray(lam_ok)), rtol=1e-8, atol=1e-10
+    )
