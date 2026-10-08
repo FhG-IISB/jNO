@@ -1,3 +1,4 @@
+import builtins
 import warnings
 from pathlib import Path
 from typing import List, Union
@@ -361,8 +362,12 @@ def concat(items, axis: int = -1) -> FunctionCall:
         if all(a.shape[:-1] == ref for a in expanded[1:]):
             return jnp.concatenate(expanded, axis=-1)
 
-        # Fallback: align ranks and only broadcast singleton dimensions.
-        max_ndim = max(a.ndim for a in expanded)
+        # Fallback: align ranks and only broadcast singleton dimensions. This is where a bare number
+        # meets a per-point operand (``vector(1.0, x)``): the number is (1,), the coordinate (N, 1).
+        # ``builtins.max``, not ``max``: this module rebinds ``max`` to the trace reduction
+        # ``jno.np.max``, which here built a trace node into the reshape shape -- and JAX's formatter
+        # for that invalid shape then iterated the node forever (``__getitem__`` never ends).
+        max_ndim = builtins.max(a.ndim for a in expanded)
         aligned = []
         for a in expanded:
             if a.ndim < max_ndim:
@@ -405,6 +410,8 @@ def vector(*components):
         n    = jno.np.vector(nx, ny)          # 2-D normal as VectorView
         flux = jno.np.vector(jx, jy, jz)      # 3-D current density
         prob = jno.np.vector(x * p, y * p)    # OU drift flux
+        e1   = jno.np.vector(1.0, 0.0, 0.0)    # a constant vector
+        g    = jno.np.vector(1.0, 0.0, x)      # numbers broadcast over the points like `1.0 + 0.0*x`
     """
     from .trace.views import VectorView
 
