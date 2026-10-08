@@ -1046,6 +1046,7 @@ def assemble_fem_nonnodal(
 
                 def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r):
                     per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
+                    _ctx_c = _with_cell_size(ctx, meas, xq)
                     vol_vars = tuple(
                         (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
                         for name in runtime_parameter_tags
@@ -1056,7 +1057,7 @@ def assemble_fem_nonnodal(
                         "field_index": field_index,
                         "tag": "fem_gauss",
                         "surface": False,
-                        "domain_context": ctx,
+                        "domain_context": _ctx_c,
                         "temporal_tags": (),
                         "runtime_parameter_tags": runtime_parameter_tags,
                         "region_mask_names": _rn,
@@ -1460,6 +1461,7 @@ def assemble_fem_nonnodal(
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
                 cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
                 per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
+                _ctx_c = _with_cell_size(ctx, meas, xq)
                 vol_vars = tuple(
                     (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
                     for name in runtime_parameter_tags
@@ -1470,7 +1472,7 @@ def assemble_fem_nonnodal(
                     "field_index": field_index,
                     "tag": "fem_gauss",
                     "surface": False,
-                    "domain_context": ctx,
+                    "domain_context": _ctx_c,
                     "temporal_tags": (),
                     "runtime_parameter_tags": runtime_parameter_tags,
                     "region_mask_names": rnames,
@@ -2047,6 +2049,16 @@ def _legacy_natural(bare, field_index, spaces) -> bool:
             fi = field_index.get(next(iter(fk))) if fk else None
             return fi is not None and spaces[fi] == "RT"
     return False
+
+
+def _with_cell_size(ctx, meas, xq):
+    """``ctx`` with the ``dom.cell_size`` symbol resolved for one cell: ``|det J|^(1/dim)`` at every
+    quadrature point, the same isotropic size the nodal assembler packs. Only when the form reads it --
+    otherwise its ``-1`` placeholder (or nothing) would stand in for h without a word."""
+    if "cell_size" not in ctx:
+        return ctx
+    dim = xq.shape[-1]
+    return {**ctx, "cell_size": jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (xq.shape[0], 1))}
 
 
 def _build_general_surface(
