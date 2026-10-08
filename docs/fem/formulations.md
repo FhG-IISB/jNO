@@ -73,6 +73,42 @@ nonlinear `S + |S|²S = F`, a transient decay) the answers agree to round-off wi
 native 2-D/3-D Lagrange assembler — a 1-D domain, a VPINN, periodic ties, a complex field or a mix with a
 non-nodal family raise.
 
+### Constant unknowns — one value, solved for
+
+`U = d.unknown.scalar(constant=True)` is **one** number over the whole domain (`d.unknown.vector(n,
+constant=True)` one vector, `d.unknown.matrix(n, m, constant=True)` one matrix), solved for together with
+the fields. Everything about it follows from its basis function being the constant one:
+
+* its trial `U` is seen identically by every element, so `U * inner(n, v)` on a boundary is a traction of
+  unknown magnitude;
+* its test function `W = U.test()` is one everywhere, so a weak term carrying it is an **integral row** —
+  `(uin[0] - Q / H) * W` on an inlet says `∫ u·e_x ds = Q`, and `ui * W` over the volume says `∫ u dΩ = 0`;
+* `u(region) - U` ties a field to it on a region **exactly** (see [Boundary conditions](boundary-conditions.md#tying-a-region-to-a-constant-uregion-u)),
+  and `U - g` pins it.
+
+A channel driven at a prescribed flow rate, with the inlet pressure as the unknown:
+
+```python
+u = d.unknown.vector(2, order=2); p = d.unknown.scalar(name="p")
+P = d.unknown.scalar(constant=True, name="P_in")
+v, q, W = u.test(), p.test(), P.test()
+fem = jno.fem([inner(grad(u), grad(v)) - p * div(v), -q * div(u),
+               P * (-vin[0]),                  # inlet traction -P n, n = (-1, 0)
+               (uin[0] - Q / H) * W,           # its equation: the flow rate through the inlet
+               u(xw, yw) - 0.0, u(xi, yi)[1] - 0.0])
+sol = fem.solve(linear=jno.solve.lu())       # a bordered saddle system: a direct solver
+P_in = sol[fem.blocks[fem.block_index(P)]]   # = 12 Q L / H³ (Poiseuille), to round-off
+```
+
+Constants are assembled as the **last** blocks, after every field. A constant whose only equation is a
+`W`-row has no diagonal entry, so the system is a saddle and wants a direct solver (`jno.fem` warns
+otherwise); a tied or pinned constant does not. Verified in `tests/test_fem_constant_unknown.py`: the
+floating boundary value with a prescribed total flux and the flow-rate channel are exact to round-off, the
+tie with a pinned `U` reproduces the uniform Dirichlet condition (bit-identical on the linear path), a box
+`U.bounds(lo, hi)` holds when active, a mean-value multiplier enforces `∫ u = 0` exactly, and the
+gradient of a loss in `U` through a runtime parameter matches the closed form. Scope: the native 2-D/3-D
+Lagrange assembler; see the [limitations](limitations.md).
+
 ### Reading a multifield solution back
 
 A coupled solve returns **one flat vector**, so the `fem` object carries the handles that say which

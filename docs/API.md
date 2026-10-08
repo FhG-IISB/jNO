@@ -62,7 +62,9 @@ E = d.unknown.vector(3, space="N1E")             # an edge-element field
 v = u.test()                                     # FEM: its test function (same space, shape, order)
 ```
 
-Keyword options: `name=`, `order=`, `space=`, `complex=` (and `symmetric=` on `matrix`). In `jno.fem` the
+Keyword options: `name=`, `order=`, `space=`, `complex=` (and `symmetric=` on `matrix`), and
+`constant=True` for ONE value (vector, matrix) over the whole domain — see
+[constant unknowns](fem/formulations.md#constant-unknowns-one-value-solved-for). In `jno.fem` the
 unknown is the trial function and `u.test()` its test function; the result is bit-identical to the same
 problem written with `u, v = d.fem_symbols(...)`, which keeps working. `jno.fdm` solves for the values of
 a real P1 nodal unknown with full storage; any other combination (`order=2`, a non-nodal space,

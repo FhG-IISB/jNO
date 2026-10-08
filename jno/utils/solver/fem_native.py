@@ -325,6 +325,38 @@ def _lagrange_simplex(dim: int, degree: int, quad_degree: Any = None, cell_type:
     return builder(degree, quad_degree)
 
 
+class _ConstantSpec:
+    """The element of a CONSTANT field (``domain.unknown(..., constant=True)``): one basis function equal to
+    one on every cell, with zero gradient and Hessian. It borrows the quadrature rule of the mesh element it
+    is assembled beside, so every field still integrates on one shared rule."""
+
+    def __init__(self, base):
+        nq = int(np.asarray(base.quad_points).shape[0])
+        self.quad_points = base.quad_points
+        self.quad_weights = base.quad_weights
+        self.ref_values = np.ones((nq, 1, 1))
+        dim = int(np.asarray(base.ref_grads).shape[-1])
+        self.ref_grads = np.zeros((nq, 1, 1, dim))
+        self.ref_hess = np.zeros((nq, 1, dim, dim))
+        for name in ("degree", "dim"):
+            if hasattr(base, name):
+                setattr(self, name, getattr(base, name))
+
+
+def _constant_face_table(table):
+    """A facet table for a constant field: the same facet rule, a single basis value of one, zero gradient."""
+    if table is None:
+        return None
+    phi, dphi, qp, tangs, w = table
+    return (
+        jnp.ones(phi.shape[:2] + (1,), phi.dtype),
+        jnp.zeros(dphi.shape[:2] + (1,) + dphi.shape[3:], dphi.dtype),
+        qp,
+        tangs,
+        w,
+    )
+
+
 def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
     """Essential values as float64, refusing a genuinely complex one instead of dropping its imaginary part.
 
@@ -1136,6 +1168,35 @@ def assemble_fem_native(
                     field_index[f["field_key"]] = len(fields)
                     fields.append(f)
 
+    # A CONSTANT unknown (``domain.unknown(..., constant=True)``) may appear only on a boundary -- an inlet
+    # pressure that multiplies a traction and carries a flow-rate equation there -- so its field is
+    # collected from the boundary terms too. (A mesh field still has to appear in a volume term.)
+    for _exprs in boundary_terms.values():
+        for bare in _exprs:
+            for _, sub in _split_additive_terms(domain, bare):
+                fs, _ = _infer_fields(_lower_statefield_to_trial(sub, {}))
+                for f in fs:
+                    if f.get("constant") and f["field_key"] not in field_index:
+                        field_index[f["field_key"]] = len(fields)
+                        fields.append(f)
+    # ...and a constant that appears only in a tie `u(region) - U` or a pin `U - g` (handed over by jno.fem,
+    # consumed here so an auxiliary assembly on the same domain never sees it).
+    for _U in domain.__dict__.pop("_fem_tied_constants", None) or ():
+        for f in _infer_fields(_U)[0]:
+            if f["field_key"] not in field_index:
+                field_index[f["field_key"]] = len(fields)
+                fields.append(f)
+    # Constants go LAST: their block is the border of the system, and field 0 must be a mesh field (it
+    # supplies `fem.points` and, on a curved or tensor-product cell, the geometry).
+    if any(f.get("constant") for f in fields):
+        fields = [f for f in fields if not f.get("constant")] + [f for f in fields if f.get("constant")]
+        field_index = {f["field_key"]: i for i, f in enumerate(fields)}
+        if fields[0].get("constant"):
+            raise ValueError(
+                "jno.fem: every unknown in this form is a constant (constant=True) -- a constant is solved for "
+                "together with a field on the mesh, not on its own."
+            )
+
     if not fields:
         raise ValueError("assemble_fem_native: no trial fields found in volume_terms.")
 
@@ -1182,7 +1243,23 @@ def assemble_fem_native(
     # Per-field mesh data
     # -------------------------------------------------------------------------
 
-    mesh_data = [_get_mesh(domain, dim, f["order"]) for f in fields]
+    mesh_data = [_get_mesh(domain, dim, 1 if f.get("constant") else f["order"]) for f in fields]
+    # A constant field has ONE node, shared by every cell: its connectivity is a column of zeros, so the
+    # ordinary scatter sums every cell's contribution into it -- which is what makes its test function's
+    # rows integrals over the whole region, and its trial a value seen identically by every element. The
+    # node's coordinate is the mesh centroid; it locates nothing (``fem.field_points`` reports it).
+    mesh_data = [
+        (
+            md[0],
+            md[1],
+            np.mean(np.asarray(md[0]), axis=0, keepdims=True),
+            np.zeros((np.asarray(md[1]).shape[0], 1), np.int64),
+        )
+        if f.get("constant")
+        else md
+        for f, md in zip(fields, mesh_data)
+    ]
+    _const_f = [bool(f.get("constant")) for f in fields]
 
     def _pad_for_cover(md, blk):
         """A cover field's DOF nodes are the mesh nodes repeated ``blk = 1+M`` times.
@@ -1268,6 +1345,7 @@ def assemble_fem_native(
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
     domain._fem_native_field_shapes = [tuple(f["value_shape"]) for f in fields]
+    domain._fem_native_field_constant = [bool(f.get("constant")) for f in fields]
     domain._fem_native_field_vecs = [int(f["vec"]) for f in fields]  # stored values per node (symmetric: n(n+1)/2)
 
     # -------------------------------------------------------------------------
@@ -1286,7 +1364,8 @@ def assemble_fem_native(
         # has to happen where the enrichment is known. Without it the mass matrix silently
         # under-integrates and only a convergence study would notice.
         _qd = max(_qd, 2 * (1 + COVER_DEGREE))
-    specs = [_lagrange_simplex(dim, f["order"], _qd, cell_type=_cell_type) for f in fields]
+    specs = [_lagrange_simplex(dim, 1 if f.get("constant") else f["order"], _qd, cell_type=_cell_type) for f in fields]
+    specs = [_ConstantSpec(s) if c else s for s, c in zip(specs, _const_f)]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)
@@ -1730,7 +1809,12 @@ def assemble_fem_native(
     # it unpackable-None. These are REFERENCE-space tables -- shape (n_faces, n_q, n_dof) per element
     # order -- so the cost is independent of the mesh size and paid once at build.
     face_tables_per_field = (
-        [_build_face_tables(f["order"], quad_degree, dim, _cell_type) for f in fields]
+        [
+            _constant_face_table(_build_face_tables(1, quad_degree, dim, _cell_type))
+            if f.get("constant")
+            else _build_face_tables(f["order"], quad_degree, dim, _cell_type)
+            for f in fields
+        ]
         if not _refuse_tensor_product_surface(_cell_type)
         else [None] * len(fields)
     )
@@ -4201,6 +4285,8 @@ def assemble_fem_native(
         then expanded to the ``1+M`` slots it owns. A Dirichlet condition therefore reaches the
         value and its covers alike -- which is what :func:`_cover_g` then tells apart, giving the
         covers zero rather than ``g``."""
+        if _const_f[fidx]:
+            return [0]  # a constant's one node: `U - g` pins it whatever region the term names
         real = _boundary_node_ids_real(fidx, region)
         blk = _cblk[fidx]
         if blk == 1:

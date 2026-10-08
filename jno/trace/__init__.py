@@ -4517,12 +4517,15 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange", symmetric=False):
+    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
         # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
         # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
         self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -4731,6 +4734,7 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
                 order=self.order,
                 space=self.space,
                 symmetric=self.__dict__.get("symmetric", False),
+                constant=self.__dict__.get("_is_constant", False),
             )
             t.field_key = self.field_key
             if "_domain" in self.__dict__:
@@ -5451,12 +5455,15 @@ class TestFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange", symmetric=False):
+    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
         # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
         # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
         self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()

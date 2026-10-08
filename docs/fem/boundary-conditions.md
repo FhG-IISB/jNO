@@ -271,6 +271,26 @@ complex, 1-D, non-nodal elements and the VPINN path never publish the assembler 
 say so. Where it is unavailable the equivalent is `sum(fem.eval(F * phi, sol))`: a Lagrange basis is a
 partition of unity, so summing the weak term `F·φ` over every DOF is the same integral.
 
+### Tying a region to a constant — `u(region) - U`
+
+With `U = d.unknown.scalar(constant=True)`, the term `u(xr, yr) - U` makes every DOF of `u` on the region
+**the same unknown** as `U` — a uniform value whose magnitude is solved for: a floating conductor, a rigid
+plug leaving a channel, an electrode at an unknown potential. `u(xr, yr)[i] - U` ties one component, and
+`u(xr, yr) - U` with a vector constant ties a vector field component by component.
+
+It is exact, not a penalty: the tied DOFs are eliminated by a prolongation `u = P ũ`, the way a periodic tie
+is, and their equations are **summed** into U's row. That sum is the virtual work of the constraint, so the
+equation for `U` is "the net flux (force, current) through the region equals what the form applies there":
+a Neumann term on the region becomes U's equation without being written twice. On `-Δu = 1` with `u = U`
+on the right edge and `-(Q/H) * v` there, `U = Q/H + 1/2` comes out exactly.
+
+`U - g` pins the constant (a one-DOF Dirichlet row), and then the tie reproduces the hand-built
+`u(xr, yr) - g`. `U.bounds(lo, hi)` bounds it, and through the tie every tied DOF (a tied DOF without a
+bound of its own takes U's). A DOF on the region that also carries a Dirichlet value keeps it — the
+prescribed value wins over the tie, as on a periodic face. Scope: steady linear and nonlinear forms on the
+native 2-D/3-D Lagrange assembler; a tie together with a periodic tie, a slip condition or a hanging-node
+mesh raises (two prolongations would have to be composed), and so does a transient form.
+
 ### Tying two boundaries — `u(A) - u(B)`
 
 A term that names two boundary regions and carries no test function is a **tie**: it identifies the

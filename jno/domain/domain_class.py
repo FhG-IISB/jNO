@@ -397,23 +397,34 @@ class _UnknownNamespace:
     def __init__(self, domain):
         self._domain = domain
 
-    def __call__(self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False):
+    def __call__(
+        self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+    ):
         return self._domain._make_unknown(
-            value_shape=value_shape, name=name, order=order, space=space, complex=complex, symmetric=symmetric
+            value_shape=value_shape,
+            name=name,
+            order=order,
+            space=space,
+            complex=complex,
+            symmetric=symmetric,
+            constant=constant,
         )
 
-    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False):
-        """A scalar unknown, ``value_shape=()``."""
-        return self(value_shape=(), name=name, order=order, space=space, complex=complex)
+    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+        """A scalar unknown, ``value_shape=()``. ``constant=True``: ONE value over the whole domain."""
+        return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant)
 
-    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False):
-        """A vector unknown with ``n`` components, ``value_shape=(n,)``."""
-        return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex)
+    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+        """A vector unknown with ``n`` components, ``value_shape=(n,)``. ``constant=True``: one vector."""
+        return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant)
 
-    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False):
+    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False):
         """An ``n x m`` matrix unknown. ``symmetric=True`` (square only) stores the ``n(n+1)/2`` upper-triangle
-        values per node while the symbol behaves as the full matrix in every expression."""
-        return self(value_shape=(int(n), int(m)), name=name, order=order, complex=complex, symmetric=symmetric)
+        values per node while the symbol behaves as the full matrix in every expression. ``constant=True``:
+        one matrix over the whole domain."""
+        return self(
+            value_shape=(int(n), int(m)), name=name, order=order, complex=complex, symmetric=symmetric, constant=constant
+        )
 
 
 class domain(MeshIOMixin):
@@ -1894,16 +1905,35 @@ class domain(MeshIOMixin):
             u = d.unknown(); v = u.test()
             jno.fem([inner(grad(u), grad(v)) - f * v, u(xb, yb) - 0.0]).solve()
 
+        ``constant=True`` makes it ONE value (vector, matrix) over the whole domain, solved for with the
+        fields: ``U = d.unknown.scalar(constant=True)``; ``u(xr, yr) - U`` ties a field to it on a region
+        exactly, ``U - g`` pins it, and a weak term carrying ``U.test()`` is an integral row (``jno.fem`` only).
+
         For ``jno.fdm`` it is a *valued* P1 nodal field whose DOFs are the unknown, so it supports
         strong-form derivatives (``ui.xx``); that needs ``order=1``, a nodal (``"Lagrange"``) space, a real
         field and full storage. Any other combination is an FEM-only unknown, and ``jno.fdm`` refuses it.
         """
         return _UnknownNamespace(self)
 
-    def _make_unknown(self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False):
+    def _make_unknown(
+        self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+    ):
         """Build an unknown -- see :attr:`unknown`."""
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
+        if constant:
+            # ONE value (vector, matrix) over the whole domain, solved for with the fields. It has no element,
+            # so `order`/`space` do not apply; it is an FEM unknown (jno.fdm has no global unknowns).
+            if complex or str(space) != "Lagrange" or int(order) != 1:
+                raise NotImplementedError(
+                    "domain.unknown(..., constant=True) is one real value over the domain; it takes no order=, "
+                    "space= or complex=."
+                )
+            trial = TrialFunction(name=name, value_shape=value_shape, symmetric=symmetric, constant=True)
+            trial._domain = self
+            trial._fem_only_unknown = True
+            trial.test()  # pair it now, so `U.test()` is one stable symbol
+            return trial
         trial, _test = self.variational_symbols(
             value_shape=value_shape,
             names=(name, f"v_{name}"),

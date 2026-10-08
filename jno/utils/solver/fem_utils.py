@@ -429,6 +429,11 @@ def _is_symmetric_field(node) -> bool:
     return bool(getattr(node, "__dict__", {}).get("symmetric", False))
 
 
+def _is_constant_field(node) -> bool:
+    """True for a constant unknown (``domain.unknown(..., constant=True)``): one value over the domain."""
+    return bool(getattr(node, "__dict__", {}).get("_is_constant", False))
+
+
 def _field_num_components(node) -> int:
     """Number of values STORED per node for ``node``'s field: ``n(n+1)/2`` for a symmetric ``n x n`` matrix,
     the product of ``value_shape`` otherwise."""
@@ -574,6 +579,7 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
                         "value_shape": vs,
                         "vec": _field_num_components(node),
                         "symmetric": _is_symmetric_field(node),
+                        "constant": _is_constant_field(node),
                         "order": int(getattr(node, "order", 1)),
                         "space": str(getattr(node, "space", "Lagrange")),
                     }
@@ -583,6 +589,9 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
             walk(child)
 
     walk(expr)
+    if any(f["constant"] for f in fields):  # constants last -- the same order the native assembler uses
+        fields = [f for f in fields if not f["constant"]] + [f for f in fields if f["constant"]]
+        seen = {f["field_key"]: i for i, f in enumerate(fields)}
     return fields, dict(seen)
 
 
