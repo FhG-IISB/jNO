@@ -1493,13 +1493,16 @@ def _check_constant_field_scope(domain: Any, constraints: List[Any], is_vpinn: b
         )
 
 
-def _build_constant_tie_reduction(fem_obj: Any, ties: List[Any], prescribed: List[int]) -> dict:
+def _build_constant_tie_reduction(fem_obj: Any, ties: List[Any], prescribed: List[int], slip: Optional[dict] = None) -> dict:
     """The prolongation ``u = P ũ`` that makes each tied DOF the constant's DOF.
 
     One global selection over the whole (multi-field) vector -- a tie crosses field blocks, which the
     per-field periodic layout cannot express -- in the single-block periodic format, so the whole
     reduce / solve / prolong / restrict path is reused. A tied DOF that is also prescribed by a Dirichlet
-    condition keeps its own row (the prescribed value wins), exactly as on a periodic face."""
+    condition keeps its own row (the prescribed value wins), exactly as on a periodic face.
+
+    With ``slip`` (a slip reduction from :func:`_build_slip_reduction`) the result is the composition
+    ``P_slip · P_tie``; see :func:`_compose_slip_and_constant_ties`."""
     import jax.experimental.sparse as jsparse
 
     n = int(fem_obj.dofs)
@@ -1530,6 +1533,8 @@ def _build_constant_tie_reduction(fem_obj: Any, ties: List[Any], prescribed: Lis
             "jno.fem: a tie `u(region) - U` matched no free DOF -- the region is empty on this field's nodes, "
             "or every node on it is already prescribed by a Dirichlet condition."
         )
+    if slip is not None:
+        return _compose_slip_and_constant_ties(slip, main_of, n)
     sec = np.zeros(n, dtype=bool)
     sec[list(main_of)] = True
     kept = np.flatnonzero(~sec)
@@ -1541,6 +1546,84 @@ def _build_constant_tie_reduction(fem_obj: Any, ties: List[Any], prescribed: Lis
         cols[d] = col[m]
     P = jsparse.BCOO((jnp.ones(n), jnp.asarray(np.stack([rows, cols], axis=1), dtype=jnp.int32)), shape=(n, int(kept.size)))
     return {"P": P, "kept_nodes": kept, "vec": 1, "is_selection": True, "coupling": "constant_tie"}
+
+
+def _compose_slip_and_constant_ties(slip: dict, main_of: Dict[int, int], n: int) -> dict:
+    """``u = P_slip P_tie ũ``: the slip elimination first, then the tie on the slip-reduced vector.
+
+    The tie is a selection on DOFs the slip leaves alone, so it is restated in the slip-reduced numbering
+    and the two prolongations multiply. That needs every tied DOF and every constant to pass through the
+    slip untouched: its row of ``P_slip`` is one unit entry, alone in its column. A node on both the slip
+    surface and a tied region would have its normal component eliminated twice -- by the slip, in terms of
+    its tangential components, and by the tie, to the constant -- so the composition is refused there
+    rather than silently picking one.
+
+    The composed ``P`` is weighted (the slip rows), so it takes the general, non-selection reduction path,
+    exactly as a slip alone does."""
+    import jax.experimental.sparse as jsparse
+    import scipy.sparse as sp
+
+    if "slip_runtime" in slip:
+        raise NotImplementedError(
+            "jno.fem: a tie to a constant together with a slip surface that moves with runtime (trainable) "
+            "coordinates is not supported -- the moving slip prolongation is rebuilt per solve, and the tie "
+            "would have to be recomposed with it. Keep the slip surface's vertices out of the trainable region."
+        )
+    if "blocks" in slip:
+        Ps_b = slip["P_blockdiag"]
+        off_f = np.asarray(slip["off_full"], dtype=np.int64)
+        kept_s = np.concatenate([off_f[i] + np.asarray(b["kept"], dtype=np.int64) for i, b in enumerate(slip["blocks"])])
+    else:
+        Ps_b = slip["P"]
+        kept_s = np.asarray(slip["kept_nodes"], dtype=np.int64)
+    idx = np.asarray(Ps_b.indices)
+    Ps = sp.coo_matrix((np.asarray(Ps_b.data, dtype=float), (idx[:, 0], idx[:, 1])), shape=Ps_b.shape).tocsr()
+    Ps.sum_duplicates()
+    Ps.eliminate_zeros()  # a structural zero (an axis-aligned wall's off-axis weight) is not a coupling
+    n_s = int(Ps.shape[1])
+    row_nnz = np.diff(Ps.indptr)
+    col_nnz = np.bincount(Ps.indices, minlength=n_s)
+
+    def _col(d: int, what: str) -> int:
+        s, e = Ps.indptr[d], Ps.indptr[d + 1]
+        j = int(Ps.indices[s]) if e - s == 1 else -1
+        if j < 0 or Ps.data[s] != 1.0 or col_nnz[j] != 1:
+            raise NotImplementedError(
+                f"jno.fem: {what} (DOF {d}) sits on a slip surface `n·u = 0`. A node that is both slipping and "
+                "tied to a constant would be eliminated twice, and composing the two constraints on one node is "
+                "not implemented. Keep the tied region off the slip surface (or drop the slip on those nodes)."
+            )
+        return j
+
+    if int(Ps.shape[0]) != n or row_nnz.size != n:
+        raise ValueError("jno.fem internal: the slip prolongation does not span the assembled system.")
+    main_s = {_col(d, "a DOF tied to a constant"): _col(m, "a constant unknown") for d, m in main_of.items()}
+    sec = np.zeros(n_s, dtype=bool)
+    sec[list(main_s)] = True
+    kept_t = np.flatnonzero(~sec)
+    col = -np.ones(n_s, dtype=np.int64)
+    col[kept_t] = np.arange(kept_t.size)
+    cols = col.copy()
+    for d, m in main_s.items():
+        cols[d] = col[m]
+    Pt = sp.csr_matrix((np.ones(n_s), (np.arange(n_s), cols)), shape=(n_s, int(kept_t.size)))
+    Pc = (Ps @ Pt).tocoo()
+    P = jsparse.BCOO(
+        (jnp.asarray(Pc.data, dtype=jnp.float64), jnp.asarray(np.stack([Pc.row, Pc.col], axis=1), dtype=jnp.int32)),
+        shape=(n, int(kept_t.size)),
+    )
+    return {
+        "P": P,
+        "P_node": P,
+        "kept_nodes": kept_s[kept_t],
+        "n_full": n,
+        "n_red": int(kept_t.size),
+        "vec": 1,
+        "is_selection": False,
+        "is_bloch": False,
+        "coupling": "constant_tie",
+        "with_slip": True,
+    }
 
 
 def _check_symmetric_field_scope(domain: Any, constraints: List[Any], periodic_ties: List[Any], is_vpinn: bool) -> None:
@@ -6920,18 +7003,25 @@ def _fem_impl(
             _check_bounds_under_reduction(fem_obj, _hp, "hanging-node constraint")
             return _fuse_complex_steady(fem_obj)
         if const_ties:
-            if slip_bcs:
-                raise NotImplementedError(
-                    "jno.fem: a tie to a constant together with a slip condition composes two prolongations; "
-                    "that composition is not implemented. Impose the slip weakly, `c*(n·u)*(n·v)`."
-                )
             if fem_obj._mode not in ("linear", "nonlinear"):
                 raise NotImplementedError(
                     f"jno.fem: a tie to a constant (`u(region) - U`) is wired on steady linear and nonlinear "
                     f"forms; this one assembled as {fem_obj._mode!r}."
                 )
             _dpairs_c, _tvdofs_c = _prescribed_dofs(domain)
-            periodic = _build_constant_tie_reduction(fem_obj, const_ties, [d for d, _g in _dpairs_c] + _tvdofs_c)
+            _slip_c = None
+            if slip_bcs:
+                # The constant scope is the native assembler, which stashed its cells (see the slip branch below).
+                _slip_c = _build_slip_reduction(
+                    domain,
+                    slip_bcs,
+                    fem_obj,
+                    getattr(domain, "_fem_native_assembly_cells", None),
+                    int(getattr(domain, "_fem_native_assembly_order", 1)),
+                )
+            periodic = _build_constant_tie_reduction(
+                fem_obj, const_ties, [d for d, _g in _dpairs_c] + _tvdofs_c, slip=_slip_c
+            )
             periodic = _annotate_reduced_dirichlet(periodic, _dpairs_c, _tvdofs_c)
             fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
             fem_obj._periodic = periodic

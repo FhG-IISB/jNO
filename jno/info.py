@@ -375,7 +375,14 @@ def _info_fem(f, deep: bool) -> Info:
         form.append(("time window", f"[{getattr(f, 't0', '?')}, {getattr(f, 't1', '?')}]"))
     _per = getattr(f, "_periodic", None)
     if isinstance(_per, dict) and _per.get("coupling") == "constant_tie":
-        form.append(("tied to a constant", "yes — the tied DOFs are eliminated, solved in the reduced space"))
+        form.append(
+            (
+                "tied to a constant",
+                "yes — the tied DOFs are eliminated"
+                + (" after the slip `n·u = 0` (P_slip · P_tie)" if _per.get("with_slip") else "")
+                + ", solved in the reduced space",
+            )
+        )
     elif _per is not None:
         form.append(("periodic", "yes — solved in the reduced space, then prolonged"))
     rpe = getattr(getattr(f, "_op", None), "runtime_parameter_exprs", None)

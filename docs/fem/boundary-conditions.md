@@ -287,9 +287,19 @@ on the right edge and `-(Q/H) * v` there, `U = Q/H + 1/2` comes out exactly.
 `U - g` pins the constant (a one-DOF Dirichlet row), and then the tie reproduces the hand-built
 `u(xr, yr) - g`. `U.bounds(lo, hi)` bounds it, and through the tie every tied DOF (a tied DOF without a
 bound of its own takes U's). A DOF on the region that also carries a Dirichlet value keeps it — the
-prescribed value wins over the tie, as on a periodic face. Scope: steady linear and nonlinear forms on the
-native 2-D/3-D Lagrange assembler; a tie together with a periodic tie, a slip condition or a hanging-node
-mesh raises (two prolongations would have to be composed), and so does a transient form.
+prescribed value wins over the tie, as on a periodic face.
+
+A tie composes with an exact slip condition `n·u = 0`: the slip is eliminated first, and the tie is a
+selection on what the slip leaves (`u = P_slip P_tie ũ`). A node may carry both when they constrain
+different components, e.g. an axis-aligned wall's normal component by the slip and the other component by the
+tie. A node whose tied component is also the one the slip eliminates (a whole-vector tie on a slip node,
+for instance at a corner) is refused: it would be eliminated twice. Tie the region without those nodes.
+`U.bounds(lo, hi)` together with a slip raises, as a bound with a slip alone does (the slip rows are
+weighted).
+
+Scope: steady linear and nonlinear forms on the native 2-D/3-D Lagrange assembler; a tie together with a
+periodic tie, a slip surface that moves with trainable coordinates, or a hanging-node mesh raises (two
+prolongations would have to be composed), and so does a transient form.
 
 ### Tying two boundaries — `u(A) - u(B)`
 
