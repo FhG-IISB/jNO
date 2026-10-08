@@ -233,3 +233,20 @@ def test_across_names_a_real_boundary_region():
     A, v = d.fem_symbols(names=("A", "v"))
     with pytest.raises(ValueError, match="not a boundary region"):
         A.across("nowhere", domain=d)
+
+
+@pytest.mark.parametrize("family,degree", [("N1E", 1), ("N1E", 2), ("N2E", 2), ("RT", 2), ("Lagrange", 3)])
+def test_basis_at_points_batch_matches_per_cell(family, degree):
+    """The batched across-pairing basis equals the per-cell evaluation it replaced."""
+    from jno.utils.solver.fem_dofmap import basis_at_points, basis_at_points_batch, build_dofmap
+
+    rng = np.random.default_rng(0)
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    P = np.asarray(d.mesh.points)[:, :3]
+    C = np.asarray(d.mesh.cells_dict["tetra"])
+    dm = build_dofmap(C, family, degree)
+    cs = rng.integers(0, len(C), 40)
+    lam = rng.dirichlet(np.ones(4), 40)
+    X = np.einsum("nk,nkd->nd", lam, P[C[cs]])
+    ref = np.stack([basis_at_points(dm, P, C, int(c), X[i : i + 1])[0] for i, c in enumerate(cs)])
+    np.testing.assert_allclose(basis_at_points_batch(dm, P, C, cs, X), ref, rtol=0, atol=1e-12)

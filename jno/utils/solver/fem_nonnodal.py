@@ -2061,7 +2061,7 @@ def _build_general_surface(
 
     from ..._fem import _walk
     from .fem_1d import _line_quadrature
-    from .fem_dofmap import _reference_topology, basis_at_points, facet_outward_normals, facet_owners
+    from .fem_dofmap import _reference_topology, basis_at_points_batch, facet_outward_normals, facet_owners
     from .fem_utils import _lower_statefield_to_trial, _test_field_index
     from .weak_form import _apply_sign, _split_additive_terms
 
@@ -2184,10 +2184,7 @@ def _build_general_surface(
                 phi = np.ones((len(cB), 1, 1))
             else:
                 dmB = dofmaps.get(fi) or dofmap_for("Lagrange", 1)
-                phi = np.zeros((len(cB), dmB.ndof_local, dmB.element.value_size))
-                for cc in np.unique(cB):  # one tabulation per main cell
-                    sel = np.flatnonzero(cB == cc)
-                    phi[sel] = basis_at_points(dmB, P, np.asarray(cells), int(cc), Xp[sel])
+                phi = basis_at_points_batch(dmB, P, np.asarray(cells), cB, Xp)
                 dofs = offs[fi] + dmB.cell_dofs[cB]
             nq = X.shape[1]
             across[key] = (
