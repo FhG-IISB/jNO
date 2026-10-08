@@ -986,7 +986,13 @@ class Placeholder:
 
     @property
     def T(self) -> FunctionCall:
-        return FunctionCall(lambda x: x.T, [self], "transpose", True)
+        """The transpose over the LAST TWO axes (the matrix axes); a 0-/1-D value is returned as is.
+
+        The array ``.T`` reverses every axis, which is the transpose only for a plain 2-D array. In a trace
+        the leading axes are points (and, at assembly, quadrature points and test DOFs), so on a field of
+        2x2 tensors -- ``grad(u).T`` -- reversing them all produced a ``(2, 2, n)`` array: a broadcast error
+        at best, and for ``n = 2`` a silently wrong number. For a 2-D array both readings agree."""
+        return FunctionCall(lambda x: jnp.swapaxes(x, -1, -2) if jnp.ndim(x) >= 2 else x, [self], "transpose", True)
 
     def eval(self, domain=None):
         """Eagerly evaluate this node and return the array — no ``jno.core`` boilerplate.
