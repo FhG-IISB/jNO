@@ -208,6 +208,28 @@ problem repeats**.
     finite, plausible-looking vector. jNO checks (the refinement residual for cuDSS, the
     perturbed-pivot count for PARDISO) and **raises** instead.
 
+    Host **SuperLU** (`backend="host"`, and the default `lu()` / `newton(direct=True)` on the CPU, which
+    is JAX's `spsolve` calling scipy) fails in three different ways, depending on pivoting luck:
+
+    - it **aborts** ("failed to factorize matrix at line 413 in file …/dpanel_bmod.c", after a burst
+      of BLAS "On entry to DTRSV parameter number 6 had an illegal value" lines printed from C, which
+      jNO cannot suppress). `fem.solve` turns this into a `RuntimeError` naming a *singular /
+      structurally rank-deficient operator*, its size, SuperLU's own message and the same hints the
+      cuDSS error gives. Measured on a three-field u–p–s saddle with continuous P1 stress (a
+      known-incompatible space, singular by construction) at 3334 DOFs.
+    - `splu` (`backend="host"`) reports *Factor is exactly singular*. That is named the same way, with
+      the exact matrix size.
+    - JAX's `spsolve` answers an exactly singular matrix with **NaN**. The Newton verdict then reports
+      a *non-finite residual* and points at a singular tangent, not at `max_steps`.
+
+    The same form at 2582 DOFs or fewer factors **without complaint** and returns a finite answer
+    that is wrong in the null space. Nothing per-solve detects that, because detecting it would cost a
+    residual product on every solve. Inside a Newton solve the convergence verdict catches it only if
+    the wrong null-space component also stops the residual from falling. A consistent singular system
+    can still converge, with an arbitrary null-space component. Outside Newton, check `‖Ax − b‖`
+    yourself, or use cuDSS or PARDISO, which check.
+    Naming the error costs nothing on a successful solve, because it runs only on the failure path.
+
 ### Batched solves and operator storage — `jno.setup(lu_stack=, matvec_format=)`
 
 Every `lu` backend has a `vmap` rule, so `jax.jacrev` / `jax.jacfwd` through a solve and a `vmap` over

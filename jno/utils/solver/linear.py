@@ -351,6 +351,54 @@ def _symmetrized_kind_and_values(values, order, orderT, pat):
 # 165k saddle whose refinement landed at 1.4e-6 -- four orders clear of the singular signature, and a
 # perfectly usable inexact-Newton step -- was rejected as SINGULAR.
 _SINGULAR_REL = 1e-4
+
+#: What to check when a direct factorization finds the operator singular -- one text for every backend.
+SINGULAR_HINTS = (
+    "Check for an unconstrained mode (a pure-Neumann problem with no gauge term, a floating region, or a "
+    "saddle system whose constraint block has an empty row), or a mixed formulation whose field spaces "
+    "are not compatible (not inf-sup stable), which leaves a whole family of modes undetermined."
+)
+
+#: What host SuperLU (scipy) says when it cannot factorize: an internal ABORT on a rank-deficient panel
+#: (``failed to factorize matrix at line ... dpanel_bmod.c``, preceded by BLAS "illegal value" lines
+#: printed from C) or, from ``splu``, ``Factor is exactly singular``.
+_SUPERLU_FAILURES = ("failed to factorize matrix", "Factor is exactly singular")
+
+#: The fixed phrase every SuperLU singular error below carries, so a caller can recognise it after JAX
+#: has wrapped it into a callback error.
+SUPERLU_SINGULAR_PHRASE = "singular / structurally rank-deficient operator"
+
+
+def superlu_singular_message(shape, detail, *, known_size=True):
+    """The named error for a host SuperLU factorization that failed: what happened, the size, the hints.
+
+    ``known_size=False`` when the size is the caller's best knowledge (the system ``fem.solve`` solves)
+    rather than the factorized matrix itself, which JAX's own ``spsolve`` callback does not report."""
+    what = (
+        f"the {shape[0]}x{shape[1]} operator"
+        if known_size
+        else f"the operator (the solved system is {shape[0]}x{shape[1]})"
+    )
+    return (
+        f"host SuperLU could not factorize {what}: a {SUPERLU_SINGULAR_PHRASE} (SuperLU said: "
+        f"{detail.strip()!r}). The sparse-direct solve has no answer to give. {SINGULAR_HINTS}"
+    )
+
+
+def superlu_failure_detail(text: str):
+    """The SuperLU failure line inside ``text`` (an exception message, possibly a JAX-wrapped callback
+    traceback), or ``None`` when ``text`` is not a SuperLU factorization failure.
+
+    Only SuperLU's OWN message counts -- a line that starts with it, after any ``RuntimeError:`` prefix.
+    A jNO error that quotes it (``jno.precond.ilu`` names the empty rows behind "Factor is exactly
+    singular") is already more specific than this one and must not be replaced by it."""
+    for line in reversed(str(text).splitlines()):
+        msg = line.split("RuntimeError:", 1)[-1].strip()
+        if msg.startswith(_SUPERLU_FAILURES):
+            return msg
+    return None
+
+
 _CLEAN_REL = 1e-8
 _REFINE_TARGET = 1e-10
 _REFINE_MAX = 50  # a backstop; the contraction test below is what decides
@@ -449,8 +497,7 @@ def _cudss_check_factorization(solver, Ag, bg, cp, shape):
             f"cuDSS factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it replaced {npivots} "
             f"pivot(s) and {why}, leaving relative residual {rel:.2e}. cuDSS reports this through "
             f"neither an exception nor a NaN, so jNO checks it -- the returned vector would have been "
-            f"finite and wrong. Check for an unconstrained mode (a pure-Neumann problem with no gauge "
-            f"term, a floating region, or a saddle system whose constraint block has an empty row)."
+            f"finite and wrong. {SINGULAR_HINTS}"
         )
     if rel > _CLEAN_REL and not _warned_perturbed:
         _warned_perturbed = True
@@ -854,8 +901,7 @@ def _pardiso_check_factorization(solver, A, b, np, shape):
             f"MKL PARDISO factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it perturbed "
             f"{perturbed} pivot(s) and the solution has relative residual {rel:.2e}. PARDISO reports "
             f"this through neither an exception nor a NaN, so jNO checks it -- the returned vector "
-            f"would have been finite and wrong. Check for an unconstrained mode (a pure-Neumann "
-            f"problem with no gauge term, a floating region, or a constraint block with an empty row)."
+            f"would have been finite and wrong. {SINGULAR_HINTS}"
         )
 
 
@@ -1038,16 +1084,27 @@ def host_lu_solve(A, b, *, reuse: bool = True):
         # unreclaimable RSS per Newton iteration. Measured on a 4-field melt pool, 13,278 DOFs, 200
         # steps: cached OOM-kills a 62 GB machine, uncached peaks at 2.08 GB, and the two answers
         # agree to ten significant figures.
+        def _splu(mat):
+            # A singular operator fails INSIDE SuperLU, with a message that names neither the matrix nor
+            # the cause; name both. Only the failure path pays anything.
+            try:
+                return _spla.splu(mat)
+            except RuntimeError as exc:
+                detail = superlu_failure_detail(str(exc))
+                if detail is None:
+                    raise
+                raise RuntimeError(superlu_singular_message(shape, detail)) from exc
+
         if not reuse:
             mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
-            lu = _spla.splu(mat)
+            lu = _splu(mat)
             out = _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
             del lu, mat
             return out
         lu = _FACTOR_CACHE.get(key)
         if lu is None:
             mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
-            lu = _spla.splu(mat)
+            lu = _splu(mat)
             _FACTOR_CACHE[key] = lu
             if len(_FACTOR_CACHE) > _FACTOR_CACHE_MAX:
                 _FACTOR_CACHE.popitem(last=False)

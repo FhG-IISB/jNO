@@ -2471,7 +2471,10 @@ class FEM:
             try:
                 result = _run()
             except Exception as exc:
-                _record(exc)
+                named = self._name_factorization_failure(exc)
+                _record(named or exc)
+                if named is not None:
+                    raise named from exc
                 raise
             _record()
             if "jaxamg" in _sys.modules:  # AmgX solver-cache summary, only if jaxamg is in play
@@ -2489,7 +2492,14 @@ class FEM:
             # CONCRETE result -- under an outer jit/grad/vmap the solve returns a tracer, nothing has
             # run, and there is nothing to drain (the limitation is documented in docs/solvers.md).
             if not any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(result)):
-                jax.block_until_ready(result)
+                try:
+                    jax.block_until_ready(result)  # an asynchronous failure surfaces here
+                except Exception as exc:
+                    named = self._name_factorization_failure(exc)
+                    if named is None:
+                        raise
+                    _record(named)
+                    raise named from exc
                 raise_if_gate_failed()
             return result
 
@@ -3159,6 +3169,36 @@ class FEM:
         if kwargs.get("values") and self._mode == "nonlinear":
             self._record_values_verdict(out, kwargs, nonlinear, judge=_jno_driver)
         return out
+
+    def _name_factorization_failure(self, exc):
+        """A named ``RuntimeError`` for a host SuperLU factorization that failed inside this solve, else None.
+
+        On the CPU the sparse-direct solve (``jno.solve.lu()``, ``newton(direct=True)``) is JAX's
+        ``spsolve``, whose callback runs scipy's SuperLU. A singular or structurally rank-deficient
+        operator makes SuperLU abort ("failed to factorize matrix at line ... dpanel_bmod.c"), which
+        reaches the caller wrapped in a JAX callback error that names neither the matrix nor the cause.
+        Called only on the failure path, so a successful solve pays nothing for it.
+        """
+        from .utils.solver.linear import (
+            SUPERLU_SINGULAR_PHRASE,
+            superlu_failure_detail,
+            superlu_singular_message,
+        )
+
+        text = str(exc)
+        if SUPERLU_SINGULAR_PHRASE in text:  # `lu(backend="host")` already named it, with the exact size
+            line = next(ln for ln in reversed(text.splitlines()) if SUPERLU_SINGULAR_PHRASE in ln)
+            return RuntimeError(line.split("RuntimeError:", 1)[-1].strip())
+        detail = superlu_failure_detail(text)
+        if detail is None:
+            return None
+        n = int(self.dofs)
+        per = getattr(self, "_periodic", None)
+        if per is not None:
+            from .utils.solver.fem_utils import _periodic_blocks
+
+            n = int(_periodic_blocks(per)[2][-1])  # the REDUCED system is the one factorized
+        return RuntimeError(superlu_singular_message((n, n), detail, known_size=False))
 
     def _record_values_verdict(self, out, kwargs, nonlinear, *, judge=True):
         """Judge a ``fem.solve(param=value)`` solve, write it to :attr:`stats`, and raise if it stalled.
