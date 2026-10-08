@@ -339,3 +339,14 @@ def test_a_node_both_slipping_and_tied_is_refused():
                 u(xo, yo) - U,
             ]
         )
+
+
+def test_a_tied_nonlinear_solve_reports_its_convergence():
+    """The reduced solve of a tie returns its array and records fem.stats['nonlinear'] -- returned lazily, it
+    ran only when evaluated, after the stats were written (stats['nonlinear'] was None)."""
+    fem, U = _floating(0.8, nonlinear=True)
+    out = fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-12, atol=1e-13))
+    assert not isinstance(out, jno.trace.Placeholder)
+    st = fem.stats["nonlinear"]
+    assert st is not None and st.get("converged", True)
+    np.testing.assert_allclose(np.asarray(out)[fem.blocks[fem.block_index(U)]], [0.8 / H + 0.5], atol=1e-12)

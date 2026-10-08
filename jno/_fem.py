@@ -3512,8 +3512,10 @@ class FEM:
             # `np.asarray(fem.solve(...))` silently produced a 0-d OBJECT array that only blew up later
             # inside the next residual call. A PERIODIC tie deliberately stays lazy — its `FunctionCall`
             # is what flows into `crux` for an inverse problem, and evaluating it here breaks that
-            # (measured: test_periodic_nonlinear_reaction_diffusion).
-            if periodic.get("coupling") == "slip" and not getattr(self._op, "is_parametric", False):
+            # (measured: test_periodic_nonlinear_reaction_diffusion). A tie to a CONSTANT is a boundary
+            # condition like a slip, and returned lazily it ran only when the caller evaluated it -- after
+            # `fem.stats` had been recorded, so stats["nonlinear"] was None and the convergence verdict lost.
+            if periodic.get("coupling") in ("slip", "constant_tie") and not getattr(self._op, "is_parametric", False):
                 return _out.fn()
             return _out
         if self._mode == "nonlinear" and not getattr(self._op, "is_parametric", False):
