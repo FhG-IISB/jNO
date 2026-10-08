@@ -260,7 +260,9 @@ def _foil_2d_hybrid(order, f, Ht, Hb, Hd=0.5e-3, L=1e-3):
     t = T_FOIL
     c11p, c12p = c11 - 1 / (MU0 * t), c12 + 1 / (MU0 * t)
     d = jno.domain.csg.from_regions(
-        {"top": box(0, t / 2, L, Hd), "cu": box(0, -t / 2, L, t / 2), "bot": box(0, -Hd, L, -t / 2)}, mesh_size=2e-4, time=None
+        {"top": box(0, t / 2, L, Hd), "cu": box(0, -t / 2, L, t / 2), "bot": box(0, -Hd, L, -t / 2)},
+        mesh_size=2e-4,
+        time=None,
     )
     e = 1e-9
     d.tag("ztop", lambda x, y: np.abs(y - Hd) < e)
