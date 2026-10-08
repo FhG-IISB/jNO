@@ -1427,10 +1427,10 @@ def solve_network(
                     ),
                     shape=(ne, ne),
                 ).tocsr()
-                _LU_HOLDER["lu"] = _host_or_device_lu(sp.bmat([[zblk, -AT], [CI, Cp]], format="csc"))
+                _LU_HOLDER["lu"] = _factor_preconditioner(sp.bmat([[zblk, -AT], [CI, Cp]], format="csc"))
                 _LU_HOLDER["kind"] = "whole"
             else:  # a plain lattice: the Schur complement of the diagonal, which is what suits it
-                _LU_HOLDER["lu"] = _host_or_device_lu((CI @ sp.diags(1.0 / zdn) @ AT + Cp).tocsc())
+                _LU_HOLDER["lu"] = _factor_preconditioner((CI @ sp.diags(1.0 / zdn) @ AT + Cp).tocsc())
                 _LU_HOLDER["kind"] = "schur"
             _LU_HOLDER["key"] = ckey
             _LU_HOLDER["base"] = None  # set by the first solve this factorisation serves
@@ -1446,10 +1446,21 @@ def solve_network(
         def _token_jvp(primals, tangents):
             return _token(*primals), jnp.zeros(())  # a constant token; the refusal is on _precond
 
+        # On a GPU, the preconditioner applies INSIDE the compiled solve (cuDSS as an XLA custom call,
+        # see cudss_ffi): the factorisation is still built on the host, once per solve, but each GMRES
+        # iteration no longer stops the stream for a host round trip.
+        from . import cudss_ffi
+
+        _ffi = cudss_ffi.available() and cdtype == jnp.complex128
+
         def _precond(r):
+            if _ffi:
+                return cudss_ffi.solve(r, _FFI_SLOT)
             return jax.pure_callback(_holder_solve, shape_out, r)
 
         def _precond_t(r):
+            if _ffi:
+                return cudss_ffi.solve(r, _FFI_SLOT + 1)
             return jax.pure_callback(_holder_solve_t, shape_out, r)
 
         def M_apply(x, w_, zd, Rc_, cz_):
@@ -3210,6 +3221,30 @@ class _DeviceLU:
             if f is not None:
                 f[0].free()
         self._fwd = self._bwd = None
+
+
+_FFI_SLOT = 1  # the device slots the current preconditioner occupies: this and the next (its transpose)
+
+
+def _factor_preconditioner(M):
+    """Factorise the preconditioner matrix wherever its applies will run.
+
+    With the cuDSS custom call available the factorisation goes into the device slots the compiled
+    solve reads -- ``B`` and ``B^T`` of the equilibrated matrix -- and the holder records only that
+    it is there. Otherwise it is a host factorisation the callbacks apply (`_host_or_device_lu`).
+    """
+    from . import cudss_ffi
+
+    if cudss_ffi.available():
+        old = _LU_HOLDER.get("lu")
+        if old is not None and hasattr(old, "free"):
+            old.free()
+        B, r, c = cudss_ffi.equilibrate(M)
+        cudss_ffi.factor(_FFI_SLOT, B, r, c)
+        # A^T x = b with B = R A C:  x = r * (B^T)^-1 (c * b), so the transpose swaps the scalings
+        cudss_ffi.factor(_FFI_SLOT + 1, B.T.tocsr(), c, r)
+        return "device-slot"
+    return _host_or_device_lu(M)
 
 
 def _host_or_device_lu(M):

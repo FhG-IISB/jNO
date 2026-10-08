@@ -29,7 +29,7 @@ def _counted():
     Wrapped at jNO's own seam rather than at scipy's: on a GPU with cuDSS the factorisation never
     reaches `splu`, and a counter there would read zero whatever the cache did."""
     calls = {"n": 0}
-    real = P._host_or_device_lu
+    real = P._factor_preconditioner
 
     def counting(*a, **k):
         calls["n"] += 1
@@ -52,12 +52,12 @@ def test_repeating_the_same_solve_does_not_refactorise():
     b = _built()
     b.solve().R.block_until_ready()  # warm compile and prime the holder
     calls, real, counting = _counted()
-    P._host_or_device_lu = counting
+    P._factor_preconditioner = counting
     try:
         for _ in range(4):
             b.solve().R.block_until_ready()
     finally:
-        P._host_or_device_lu = real
+        P._factor_preconditioner = real
     assert calls["n"] == 0, f"{calls['n']} factorisations for four identical solves"
 
 
@@ -66,11 +66,11 @@ def test_a_changed_conductivity_DOES_refactorise():
     b = _built()
     b.solve(sigma={"bar": SIG}).R.block_until_ready()
     calls, real, counting = _counted()
-    P._host_or_device_lu = counting
+    P._factor_preconditioner = counting
     try:
         b.solve(sigma={"bar": 0.5 * SIG}).R.block_until_ready()
     finally:
-        P._host_or_device_lu = real
+        P._factor_preconditioner = real
     assert calls["n"] >= 1, "a different conductivity reused a factorisation built for another one"
 
 
@@ -92,11 +92,11 @@ def test_a_frequency_sweep_refactorises_per_frequency():
     b2 = _built(pitch=0.002, freq=1e4)  # one cell through the thickness: legal at any frequency
     b2.solve().R.block_until_ready()
     calls, real, counting = _counted()
-    P._host_or_device_lu = counting
+    P._factor_preconditioner = counting
     try:
         b.solve().R.block_until_ready()  # back to the DC network: its key is no longer the holder's
     finally:
-        P._host_or_device_lu = real
+        P._factor_preconditioner = real
     assert calls["n"] >= 1, "a one-entry cache served a matrix built at another frequency"
 
 
@@ -104,13 +104,13 @@ def test_a_failed_factorisation_leaves_no_key_claiming_success():
     """If the factorisation raises, the holder must not keep a key that would skip the rebuild next time."""
     b = _built()
     b.solve().R.block_until_ready()
-    real = P._host_or_device_lu
-    P._host_or_device_lu = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    real = P._factor_preconditioner
+    P._factor_preconditioner = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
     try:
         with pytest.raises(Exception):
             b.solve(sigma={"bar": 0.25 * SIG}).R.block_until_ready()
     finally:
-        P._host_or_device_lu = real
+        P._factor_preconditioner = real
     assert P._LU_HOLDER.get("key") is None
     # and the next real solve still works rather than reusing a corpse
     assert np.isfinite(float(np.real(b.solve(sigma={"bar": 0.25 * SIG}).R)))

@@ -138,7 +138,7 @@ where = ["."]
 include = ["jno*"]
 
 [tool.setuptools.package-data]
-jno = ["py.typed"]
+jno = ["py.typed", "_ext/*.cu"]
 
 [tool.uv.workspace]
 members = [
