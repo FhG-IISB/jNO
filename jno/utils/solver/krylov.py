@@ -178,6 +178,99 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
     return x
 
 
+def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, restart=64, maxiter=1000, check_every=8):
+    """Restarted, right-preconditioned GMRES that asks the host only every ``check_every`` steps.
+
+    Y. Saad & M. H. Schultz, *GMRES*, SIAM J. Sci. Stat. Comput. 7(3), 1986, with right
+    preconditioning (Saad, *Iterative Methods for Sparse Linear Systems*, 2nd ed., Alg. 9.5).
+
+    Why it exists: on a GPU every data-dependent ``lax.while_loop`` copies its predicate to the host
+    on every trip, which drains the stream. ``jax.scipy.sparse.linalg.gmres`` has several such loops
+    per Arnoldi step (the step loop and the Gram-Schmidt re-orthogonalisation), so a GMRES whose
+    matvec is many small kernels spends much of its time with the device idle -- measured on a
+    welded PEEC network, ~230 ms idle in a 485 ms gradient step. Here the Arnoldi steps run in
+    blocks of ``check_every`` inside a ``fori_loop`` of fixed trip count, which XLA runs without a
+    predicate copy, and convergence is read once per block. The price is at most
+    ``check_every - 1`` steps past convergence.
+
+    Right preconditioning, so the residual the least-squares problem minimises IS ``b - A x`` and
+    ``tol`` means ``||b - A x|| <= tol ||b||``. Each restart re-forms the true residual, so an
+    Arnoldi estimate that has drifted cannot end the solve. Orthogonalisation is CGS2, vectorised
+    over the whole fixed-shape basis (unbuilt rows are zero, so they contribute nothing).
+    """
+    M = M or _ident
+    b = jnp.asarray(b)
+    n = b.shape[0]
+    m = int(min(restart, n))
+    k = int(max(1, min(check_every, m)))
+    m = -(-m // k) * k  # whole blocks
+    dt = b.dtype
+    x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
+    tiny = _tiny_of(dt)
+    tol = _effective_tol(tol, dt)
+    tol_abs = tol * jnp.maximum(jnp.linalg.norm(b), tiny)
+    max_cycles = -(-int(maxiter) // m)
+    cols = jnp.arange(m)
+
+    def lsq(H, beta, j):
+        # min || beta e_1 - H y || over the first j columns. Unbuilt columns become e_{c+1}: they
+        # sit in rows the built ones never touch, so the problem decouples, stays full rank, and
+        # their y entries come out zero. A column built after a breakdown is all zero and is
+        # treated the same way.
+        fill = jnp.zeros((m + 1, m), dt).at[cols + 1, cols].set(1.0)
+        built = (cols < j) & jnp.any(H != 0, axis=0)
+        Hm = jnp.where(built[None, :], H, fill)
+        g = jnp.zeros((m + 1,), dt).at[0].set(beta)
+        Q, R = jnp.linalg.qr(Hm)
+        y = jax.scipy.linalg.solve_triangular(R, jnp.conj(Q.T) @ g, lower=False)
+        return y, jnp.linalg.norm(g - Hm @ y)
+
+    def arnoldi(i, carry):
+        V, H, j = carry
+        w = matvec(M(V[j]))
+        # HERMITIAN inner products (see fgmres); rows past j are still zero, so no mask is needed
+        h = jnp.conj(V) @ w
+        w = w - h @ V
+        h2 = jnp.conj(V) @ w
+        w = w - h2 @ V
+        h = h + h2
+        hn = jnp.linalg.norm(w)
+        # a breakdown (an invariant subspace) leaves a zero row: later steps then build zeros, and
+        # the least-squares residual is already at the floor, so the block ends the cycle
+        V = V.at[j + 1].set(jnp.where(hn > tiny, w / jnp.maximum(hn, tiny), 0.0))
+        H = H.at[:, j].set(h.at[j + 1].set(hn))
+        return V, H, j + 1
+
+    def cycle(state):
+        x, r, c = state
+        beta = jnp.linalg.norm(r)
+        V = jnp.zeros((m + 1, n), dt).at[0].set(r / jnp.maximum(beta, tiny))
+        H = jnp.zeros((m + 1, m), dt)
+
+        def block(s):
+            V, H, j, _ = s
+            V, H, j = jax.lax.fori_loop(0, k, arnoldi, (V, H, j))
+            return V, H, j, lsq(H, beta, j)[1]
+
+        def more(s):
+            return (s[2] < m) & (s[3] > tol_abs)
+
+        V, H, j, _ = jax.lax.while_loop(more, block, (V, H, 0, beta))
+        y, _ = lsq(H, beta, j)
+        x = x + M(y @ V[:m])
+        return x, b - matvec(x), c + 1
+
+    def go(state):
+        _, r, c = state
+        return (jnp.linalg.norm(r) > tol_abs) & (c < max_cycles)
+
+    x, _, _ = jax.lax.while_loop(go, cycle, (x0, b - matvec(x0), 0))
+    return x
+
+
+__all__.append("gmres_chunked")
+
+
 # ---------------------------------------------------------------------------
 # MINRES
 # ---------------------------------------------------------------------------

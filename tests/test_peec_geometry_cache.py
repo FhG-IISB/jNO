@@ -127,13 +127,13 @@ def test_the_krylov_subspace_is_chosen_by_structure():
     lat = _lattice()
     fil, sg = _welded()
     seen = {}
-    orig = P.jax.scipy.sparse.linalg.gmres
+    orig = P.gmres_chunked
 
     def spy(*a, **k):
         seen.setdefault("restart", k.get("restart"))
         return orig(*a, **k)
 
-    P.jax.scipy.sparse.linalg.gmres = spy
+    P.gmres_chunked = spy
     try:
         seen.clear()
         _port(lat, jnp.full(int(np.asarray(lat.length).size), SIG))
@@ -142,7 +142,7 @@ def test_the_krylov_subspace_is_chosen_by_structure():
         _port(fil, sg)
         welded_rs = seen.get("restart")
     finally:
-        P.jax.scipy.sparse.linalg.gmres = orig
+        P.gmres_chunked = orig
     # `_RS = min(restart, ne + nn)`, and these test networks are small enough to be clamped -- the
     # claim under test is that the two DIFFER by structure, not the exact value on a toy problem.
     assert lattice_rs == 16, lattice_rs

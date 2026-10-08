@@ -31,6 +31,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from .kernel import bar_self, internal_impedance, slab_transfer_impedance, wire_self
+from .krylov import gmres_chunked
 
 __all__ = [
     "Filaments",
@@ -1540,10 +1541,11 @@ def solve_network(
                 # for the transposed operator at all -- so the tangent system looked far harder than
                 # the primal and the gradient came back wrong without any of it being reported. Here
                 # the adjoint gets P^T, and converges like the primal does.
+                # `gmres_chunked`, not jax's: that one reads a loop predicate back to the host
+                # several times per Arnoldi step, and on a GPU each read drains the stream. Same
+                # restart, same budget (jax counts `maxiter` in restarts).
                 def _gm(P):
-                    return lambda op, r: jax.scipy.sparse.linalg.gmres(
-                        op, r, M=P, tol=float(tol), atol=0.0, restart=_RS, maxiter=400
-                    )[0]
+                    return lambda op, r: gmres_chunked(op, r, M=P, tol=float(tol), restart=_RS, maxiter=400 * _RS)
 
                 return jax.lax.custom_linear_solve(
                     lambda v: M_apply(v, w_, zd, Rc_, cz_),

@@ -290,7 +290,13 @@ def test_the_matrix_free_gradient_is_exact_at_the_default_restart():
     fd = (float(port_r(1.0 + h, True)) - float(port_r(1.0 - h, True))) / (2 * h)
     g = float(jax.grad(lambda s: port_r(s, True))(1.0))
     assert fd < 0  # more conductive, less resistive -- so a sign error is visible
-    assert abs(g / fd - 1) < 1e-6
+    # FD of two tol=1e-8 solves carries solver noise -- measured 3e-5 on CPU, 6e-4 on a GPU, where the
+    # preconditioner's reductions are not bit-reproducible -- so it only checks sign and magnitude;
+    # EXACT is against the dense solve's gradient.
+    assert abs(g / fd - 1) < 1e-2
+    with jax.default_device(jax.devices("cpu")[0]):  # the dense oracle is n^2 -- too big for a small GPU
+        g_dense = float(jax.grad(lambda s: port_r(s, False))(1.0))
+    assert abs(g / g_dense - 1) < 1e-6
 
 
 def test_the_dense_and_matrix_free_gradients_agree():
