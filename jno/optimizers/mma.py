@@ -311,11 +311,16 @@ class MMACallback(_Callback):
         self._n_constraints = int(kw["n_constraints"])
         lids = [lid for lid, _ in self._blocks]
 
-        def _losses(sub, rest, context, rng):
+        def _losses(sub, rest, context, rng, rows):
             trainable = {**rest, **sub}
             full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
             residuals = compiled_fn(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
-            return jnp.stack([jnp.mean(r) for r in residuals])
+            # Only the asked-for rows are reduced, so whatever the others need -- the objective's own
+            # solve, typically the expensive part of the model -- is dead code and is dropped when
+            # this compiles. Stacking every row and pulling back a zero cotangent does NOT drop it:
+            # the zero is a computed array, so the adjoint solve runs on it and needs the forward one.
+            # Measured on an inductance design: the field solve re-ran every step, 190 ms of 550 ms.
+            return jnp.stack([jnp.mean(residuals[i]) for i in rows])
 
         # `rowwise_jacobian`, not `jacrev`: `jacrev` vmaps its pullback across the output rows, which
         # through a `fem.solve()` batches the adjoint `spsolve`s into block-diagonal systems (one
@@ -338,7 +343,14 @@ class MMACallback(_Callback):
             compiled_fn_ineq = ineq_fn
             losses_fn, rows = _ineq_losses, list(range(len(self._ineq)))
         else:
-            losses_fn, rows = _losses, list(self._ineq)
+            # Reduce only the inequality rows, so the objective's own solve is dead code in the Jacobian
+            # (see `_losses`); the stacked rows are then numbered 0..n-1.
+            _ineq_rows = list(self._ineq)
+
+            def losses_fn(sub, rest, context, rng):
+                return _losses(sub, rest, context, rng, _ineq_rows)
+
+            rows = list(range(len(_ineq_rows)))
 
         def jac(trainable, context, rng):
             sub = {lid: trainable[lid] for lid in lids}
