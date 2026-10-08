@@ -344,6 +344,38 @@ def gate_suspended():
 _GATE_FAILURES: list = []
 
 
+class UnconvergedSolveWarning(RuntimeWarning):
+    """A Krylov solve returned without reaching the tolerance it was asked for (but under the hard gate)."""
+
+
+def gate_rtol_for(tol) -> float:
+    """The WARNING level for a solve that was asked for relative tolerance ``tol``.
+
+    The fixed hard gate ``_GATE_RTOL`` alone let a Krylov solve asked for 1e-8 leave on its step cap at
+    1.8e-5 and pass in silence -- measured on a degree-2 eddy-current solve, the result was 1.7 % off.
+    It cannot simply follow the request and raise, because a consistent SINGULAR system (Stokes with
+    its pressure constant, an ungauged curl-curl) floors its residual at round-off far above any tight
+    tolerance however long the solve runs, and those solutions are right. So between this level -- 100x
+    the request, never tighter than 1e-12 -- and the hard gate the solve WARNS, naming the tolerance it
+    missed; above the hard gate it still raises."""
+    if tol is None or not np.isfinite(tol) or tol <= 0:
+        return _GATE_RTOL
+    return float(min(_GATE_RTOL, max(100.0 * float(tol), 1e-12)))
+
+
+def _warn_unconverged(rel: float, who: str, side: str, soft: float):
+    import warnings
+
+    warnings.warn(
+        f"{who} ({side}) stopped at relative residual {rel:.1e}, short of the {soft / 100:g} it was asked "
+        f"for (warning level {soft:g}): it most likely hit its iteration cap. The result is kept -- on a "
+        "consistent singular system the residual floors and the solution can still be right -- but check "
+        "it, or raise maxiter / improve the preconditioner.",
+        UnconvergedSolveWarning,
+        stacklevel=3,
+    )
+
+
 def _gate_message(rel: float, who: str, side: str) -> str:
     advice = (
         "The problem may be singular/ill-posed or need a preconditioner: try jno.solve.lu(), a "
@@ -359,7 +391,7 @@ def _gate_message(rel: float, who: str, side: str) -> str:
     return f"{who} did not solve the system: relative residual {rel:.1e} against a {_GATE_RTOL:g} gate. {advice}"
 
 
-def _record_unconverged(rel, who: str, side: str):
+def _record_unconverged(rel, who: str, side: str, soft: float = None):
     """Callback side of a TRACED gate: record FIRST, then raise.
 
     Both, because neither alone is enough. Raising from inside a ``jax.debug.callback`` propagates in
@@ -379,6 +411,8 @@ def _record_unconverged(rel, who: str, side: str):
     """
     rel = float(rel)
     if np.isfinite(rel) and rel <= _GATE_RTOL:
+        if soft is not None and rel > soft:
+            _warn_unconverged(rel, who, side, soft)
         return
     msg = _gate_message(rel, who, side)
     _GATE_FAILURES.append(msg)
@@ -404,15 +438,17 @@ def raise_if_gate_failed():
     raise RuntimeError(msgs[0] + extra)
 
 
-def _raise_unconverged(rel, who: str, side: str):
+def _raise_unconverged(rel, who: str, side: str, soft: float = None):
     """Host side of an EAGER gate -- raises directly, since a concrete call has a caller to raise to."""
     rel = float(rel)
     if np.isfinite(rel) and rel <= _GATE_RTOL:
+        if soft is not None and rel > soft:
+            _warn_unconverged(rel, who, side, soft)
         return
     raise RuntimeError(_gate_message(rel, who, side))
 
 
-def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
+def residual_gate(mv, b, x, who: str, *, side: str = "forward", rtol: float = None):
     """Refuse a linear solve that did not converge -- **under a trace as well as eagerly**.
 
     ``_maybe_residual_check`` below is concrete-only, and every iterative solve in the library runs
@@ -443,13 +479,15 @@ def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
     bn = jnp.linalg.norm(b)
     rel = jnp.linalg.norm(b - mv(x)) / jnp.where(bn > 0, bn, 1.0)
     rel = jnp.where(bn > 0, rel, 0.0)
+    soft = None if rtol is None else float(rtol)  # warning level from gate_rtol_for; the hard gate is fixed
     if not isinstance(rel, jax.core.Tracer):
-        _raise_unconverged(rel, who, side)
+        _raise_unconverged(rel, who, side, soft)
         return x
+    ok = rel <= (_GATE_RTOL if soft is None else soft)
     jax.lax.cond(
-        jnp.isfinite(rel) & (rel <= _GATE_RTOL),
+        jnp.isfinite(rel) & ok,
         lambda _r: None,
-        lambda r: jax.debug.callback(_record_unconverged, r, who, side),
+        lambda r: jax.debug.callback(_record_unconverged, r, who, side, soft),
         rel,
     )
     return x
