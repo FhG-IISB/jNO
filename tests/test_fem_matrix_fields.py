@@ -140,19 +140,19 @@ def test_single_entry_dirichlet_leaves_the_others_free():
 
 
 def test_vector_dirichlet_beyond_three_components():
-    """A 4-component vector field pins component 3 -- the old parser stopped at 'z'."""
+    """A 4-component vector field pins component 3 -- the old parser stopped at 'z'. Every component is
+    pinned: an unpinned one is a pure-Neumann Laplace block, singular (the GPU LU says so; the host LU
+    returned a value for it anyway)."""
     d = _square()
     x, y = d.variable("interior", split=True)[:2]
     xl, yl = d.variable("left", split=True)[:2]
     u, v = d.fem_symbols(value_shape=(4,), names=("u", "v"))
     ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
-    fem = jno.fem(
-        [inner(J.jacobian(u, [x, y]), J.jacobian(v, [x, y]), n_contract=2), u(xl, yl)[3] - 2.0, u(xl, yl)[0] - 1.0]
-    )
+    pins = [u(xl, yl)[k] - g for k, g in enumerate((1.0, -1.0, 0.5, 2.0))]
+    fem = jno.fem([inner(J.jacobian(u, [x, y]), J.jacobian(v, [x, y]), n_contract=2), *pins])
     U = np.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 4)
     del ui, vi
-    np.testing.assert_allclose(U[:, 3], 2.0, atol=1e-12)
-    np.testing.assert_allclose(U[:, 0], 1.0, atol=1e-12)
+    np.testing.assert_allclose(U, np.broadcast_to([1.0, -1.0, 0.5, 2.0], U.shape), atol=1e-12)
 
 
 def test_matrix_row_is_not_a_dirichlet_component():

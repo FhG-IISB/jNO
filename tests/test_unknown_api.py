@@ -225,10 +225,16 @@ CASES = {
 
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_unknown_is_bit_identical_to_fem_symbols(case):
+    """Bit-identical on the CPU. On a GPU the scatter-add reductions run in no fixed order, so the SAME
+    fem_symbols build solved twice already differs in the last bits (measured: 5e-17 to 2e-44 here, 1.8e-7
+    through an iterative solve before full_matrix_p1 was made direct) -- the comparison there is to round-off."""
     a = np.asarray(CASES[case]("symbols"))
     b = np.asarray(CASES[case]("unknown"))
     assert a.shape == b.shape
-    assert np.array_equal(a, b), np.max(np.abs(a - b))
+    if jax.default_backend() == "cpu":
+        assert np.array_equal(a, b), np.max(np.abs(a - b))
+    else:
+        np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-14 * max(1.0, float(np.max(np.abs(a)))))
 
 
 def test_the_namespace_spells_the_shape():
