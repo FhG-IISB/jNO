@@ -2102,8 +2102,12 @@ class domain(MeshIOMixin):
             dim = int(self.dimension)
             mask = np.asarray(where(*(pts64[:, i] for i in range(dim)))).reshape(-1).astype(bool)
             full = self._boundary_regions.get("boundary", None)
-            if full is not None:
-                mask &= _vmapped(full.contains).astype(bool)
+            if full is not None and mask.any():
+                # the boundary test is the costly part (point vs every boundary facet): run it only on
+                # the points the predicate already accepts
+                hit = np.flatnonzero(mask)
+                pts, n = pts[hit], int(hit.size)
+                mask[hit] = _vmapped(full.contains).astype(bool)
             return mask
 
         num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1

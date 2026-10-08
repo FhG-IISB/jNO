@@ -2343,41 +2343,37 @@ def _n1e_surface_precompute(domain, top, quad_degree, spaces, dim, dofmaps=None)
     return fidx, cells, fc, fqp, fqw, face_rv, signs, cell_dofs, dm
 
 
-def _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs, dm=None):
-    """Per boundary face ``bf``: the physical H(curl) basis (nqf, n_dof, 3), the OUTWARD unit normal, the
-    face measure |detJ_face| (= 2·area), and the physical quad points (nqf, 3). Covariant-Piola push with
-    the same cell Jacobian and DOF orientation (±1 signs, or the degree-k transform ``B``) the volume
-    assembly uses."""
-    from .fem_elements import piola_covariant
+def _n1e_face_geometry_batch(bfs, cells, fc, pts_np, face_rv, fqp, signs, dm=None):
+    """Per boundary face in ``bfs``: the physical H(curl) basis ``(n, nqf, n_dof, 3)``, the OUTWARD unit
+    normal ``(n, 3)``, the face measure |detJ_face| (= 2·area) ``(n,)`` and the physical quad points
+    ``(n, nqf, 3)``, with the owner cells ``(n,)``. Covariant-Piola push with the same cell Jacobian and DOF
+    orientation (±1 signs, or the degree-k transform ``B``) the volume assembly uses."""
     from .fem_facets import _LOCAL_FACES_TET
 
-    c, f = int(fc.parent_cell[bf]), int(fc.local_face[bf])
-    cverts = pts_np[cells[c]]  # (4, 3)
-    J = np.stack([cverts[k] - cverts[0] for k in (1, 2, 3)], axis=1)
-    detJ = float(np.linalg.det(J))
+    c = np.asarray(fc.parent_cell)[bfs].astype(np.int64)
+    f = np.asarray(fc.local_face)[bfs].astype(np.int64)
+    cverts = np.asarray(pts_np)[np.asarray(cells)[c]]  # (n, 4, 3)
+    J = np.stack([cverts[:, k] - cverts[:, 0] for k in (1, 2, 3)], axis=2)
+    rv = np.asarray(face_rv)[f]  # (n, nqf, n_dof, 3)
     if signs is not None:
-        phi = np.asarray(piola_covariant(jnp.asarray(face_rv[f]), None, jnp.asarray(J), detJ, jnp.asarray(signs[c]))[0])
+        rv_c = rv * np.asarray(signs)[c][:, None, :, None]
     else:
-        rv_c = np.einsum("ij,qjv->qiv", dm.cell_transform_np(c), face_rv[f])
-        phi = np.einsum("ji,qnj->qni", np.linalg.inv(J), rv_c)
-    lv = list(_LOCAL_FACES_TET[f][:3])
-    P = cverts[lv]  # physical face vertices (same local order as the reference map)
-    nrm = np.cross(P[1] - P[0], P[2] - P[0])
-    measure = float(np.linalg.norm(nrm))  # = 2·area = |det of the face map|
-    nhat = nrm / measure
-    opp = cverts[next(i for i in range(4) if i not in lv)]  # 4th vertex → orient outward
-    if np.dot(nhat, P[0] - opp) < 0:
-        nhat = -nhat
-    b0, b1 = fqp[:, 0:1], fqp[:, 1:2]
-    xq = (1.0 - b0 - b1) * P[0] + b0 * P[1] + b1 * P[2]  # physical quad points (for a spatial coeff/source)
+        rv_c = np.array(rv)
+        for d_, blk in dm.blocks.items():
+            for k, idx in enumerate(dm.entity_dofs[d_]):
+                Bk = blk[k][np.asarray(dm.orient[d_])[c, k].astype(np.int64)]  # (n, nd, nd)
+                rv_c[:, :, idx] = np.einsum("nij,nqjv->nqiv", Bk, rv[:, :, idx])
+    phi = np.einsum("nji,nqaj->nqai", np.linalg.inv(J), rv_c)
+    lv = np.asarray([list(_LOCAL_FACES_TET[k][:3]) for k in range(4)])[f]  # (n, 3)
+    P = np.take_along_axis(cverts, lv[:, :, None], axis=1)  # physical face vertices, reference order
+    nrm = np.cross(P[:, 1] - P[:, 0], P[:, 2] - P[:, 0])
+    measure = np.linalg.norm(nrm, axis=1)  # = 2·area = |det of the face map|
+    nhat = nrm / measure[:, None]
+    opp = cverts[np.arange(len(c)), 6 - lv.sum(axis=1)]  # the 4th vertex (local ids sum to 6) → outward
+    nhat = np.where((np.einsum("ni,ni->n", nhat, P[:, 0] - opp) < 0)[:, None], -nhat, nhat)
+    b0, b1 = np.asarray(fqp)[:, 0:1], np.asarray(fqp)[:, 1:2]
+    xq = (1.0 - b0 - b1)[None] * P[:, None, 0] + b0[None] * P[:, None, 1] + b1[None] * P[:, None, 2]
     return c, phi, nhat, measure, xq
-
-
-def _n1e_region_faces(fc, region_nodes):
-    """Yield the boundary-face indices whose vertices all lie in the region."""
-    for bf in range(fc.n_bfaces):
-        if all(int(v) in region_nodes for v in fc.face_nodes[bf]):
-            yield bf
 
 
 def _bcast_surface_vals(vals, n, nq, comp=None):
@@ -2421,23 +2417,26 @@ def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_deg
     fqw = np.asarray(fqw)
     groups = {}  # id(coeff node) -> [node, gdofs[], tens[], xq[], measure[]]  (insertion-ordered)
     for region, nodes in terms.items():
-        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
-        for bf in _n1e_region_faces(fc, region_nodes):
-            c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs, dm)
-            if kind == "mass":
-                pn = phi @ nhat  # (nqf, 6) normal component
-                tens = np.einsum("qai,qbi->qab", phi, phi) - np.einsum("qa,qb->qab", pn, pn)
-            else:
-                tens = np.cross(phi, nhat)  # (nqf, 6, 3) = φ_a × n (the authored `v.vector.cross(nvec)`)
-            gdofs = np.asarray(offs[fidx] + cell_edges[c], dtype=np.int64)
-            for node in nodes:
-                g = groups.setdefault(id(node), [node, [], [], [], []])
-                g[1].append(gdofs)
-                g[2].append(np.asarray(tens))
-                g[3].append(np.asarray(xq))
-                g[4].append(float(measure))
+        rmask = np.zeros(len(pts_np), dtype=bool)
+        rmask[np.asarray(list(_region_node_ids(domain, region)), dtype=np.int64)] = True
+        bfs = np.flatnonzero(rmask[np.asarray(fc.face_nodes)[: fc.n_bfaces]].all(axis=1))
+        if bfs.size == 0:
+            continue
+        c, phi, nhat, measure, xq = _n1e_face_geometry_batch(bfs, cells, fc, pts_np, face_rv, fqp, signs, dm)
+        if kind == "mass":
+            pn = np.einsum("nqai,ni->nqa", phi, nhat)  # normal component
+            tens = np.einsum("nqai,nqbi->nqab", phi, phi) - np.einsum("nqa,nqb->nqab", pn, pn)
+        else:
+            tens = np.cross(phi, nhat[:, None, None, :])  # φ_a × n (the authored `v.vector.cross(nvec)`)
+        gdofs = np.asarray(offs[fidx] + np.asarray(cell_edges)[c], dtype=np.int64)
+        for node in nodes:
+            g = groups.setdefault(id(node), [node, [], [], [], []])
+            g[1].append(gdofs)
+            g[2].append(tens)
+            g[3].append(xq)
+            g[4].append(measure)
     out = [
-        (node, np.stack(gd), np.stack(tn), np.stack(xq), np.asarray(ms, dtype=float))
+        (node, np.concatenate(gd), np.concatenate(tn), np.concatenate(xq), np.concatenate(ms).astype(float))
         for node, gd, tn, xq, ms in groups.values()
     ]
     return out, fqw
