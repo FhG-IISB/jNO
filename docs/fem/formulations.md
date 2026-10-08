@@ -36,6 +36,32 @@
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`).
 
+### Matrix-valued fields
+
+A field may be a matrix: `S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"))` (or `(3, 3)` in 3-D)
+carries `n·m` values per node, stored row-major, so entry `(i, j)` is component `i·m + j`. On a bound view
+`Si = S.bind(x=x, y=y)` it behaves as a matrix in every expression: `Si @ L`, `L @ Si`, a constant
+`W @ Si`, `Si.T`, `jno.np.trace(Si)`, `inner(Si, Ti, n_contract=2)`, an entry `Si[0, 1]`, a row `Si[0]`,
+and the derivatives `Si.x` (a matrix) and `jno.np.jacobian(S, [x, y])` (shape `(n, m, dim)`). The test
+function is the same: `Ti[0, 1]`, `trace(Ti)` and `Ti.x` are what they say.
+
+```python
+S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), order=2)
+Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
+W = jno.np.array([[0.0, g / 2], [-g / 2, 0.0]])          # spin of u = (g y, 0)
+D = jno.np.array([[0.0, g / 2], [g / 2, 0.0]])           # rate of deformation
+transport = lambda A: g * y * A.x                        # (u·∇)A
+R = transport(Si) - (W @ Si - Si @ W) - 2 * G * D        # Jaumann rate = 2G D
+fem = jno.fem([inner(R, Ti + tau * transport(Ti), n_contract=2),   # SUPG-tested
+               S(xl, yl) - 0.0])                                    # stress-free inflow
+```
+
+This is the Eulerian form of the simple-shear test of Dienes (1979): the computed stress converges to
+`s_xy = G sin(gt)`, `s_xx = -s_yy = G(1 - cos gt)` with `t = x/(g y)` (`tests/test_fem_matrix_fields.py`,
+which also checks the L2 projection, a componentwise Laplace in 2-D and 3-D at P1 and P2, and an inflow
+profile carried unchanged — all nodally exact). Dirichlet data on a matrix field is described in
+[Boundary conditions](boundary-conditions.md#components-and-derivatives-ui-vs-ux).
+
 ### Reading a multifield solution back
 
 A coupled solve returns **one flat vector**, so the `fem` object carries the handles that say which

@@ -1488,6 +1488,41 @@ class MatrixView(_DelegatesToPlaceholder):
         """Swap last two dimensions → MatrixView."""
         return MatrixView(FunctionCall(lambda x: x.swapaxes(-2, -1), [self._expr], "transpose"))
 
+    @property
+    def T(self) -> "MatrixView":
+        """``A.T`` — the transpose over the two matrix axes (the last two), like :meth:`transpose`.
+
+        A field's leading axes are points (and test DOFs), so the array ``.T`` that reverses every axis
+        would be wrong here."""
+        return self.transpose()
+
+    def __getitem__(self, key):
+        """``A[i, j]`` → ScalarView of entry ``(i, j)``; ``A[i]`` → VectorView of row ``i``.
+
+        Indices address the matrix axes (the last two), as for a vector view; ``A[..., i, j]`` is the same
+        entry spelled explicitly. Any other key indexes the underlying expression, so a mistake there is
+        the array's own error rather than a silent reinterpretation."""
+        keys = key if isinstance(key, tuple) else (key,)
+        if keys and keys[0] is Ellipsis:
+            keys = keys[1:]
+        if len(keys) == 2 and all(isinstance(k, int) for k in keys):
+            out = ScalarView(self._expr[(Ellipsis,) + tuple(keys)])
+        elif len(keys) == 1 and isinstance(keys[0], int):
+            out = VectorView(self._expr[(Ellipsis, keys[0], slice(None))])
+        else:
+            out = None
+        if out is not None:
+            # Keep a bound view's coordinates, as a vector component does, so `S.bind(x=x, y=y)[0, 1].x`
+            # and a per-entry Dirichlet `S(region)[0, 1] - g` both still see the binding.
+            cv = getattr(self, "_coord_vars", None)
+            if cv:
+                return _with_scheme(out.bind(**cv), getattr(self, "_bind_scheme", None))
+            return out
+        raise TypeError(
+            f"{type(self).__name__}[{key!r}]: a matrix view is indexed by an entry `A[i, j]` or a row `A[i]` "
+            "(integers). Index the underlying expression (`A.expr[...]`) for anything else."
+        )
+
     def log(self) -> "MatrixView":
         """Matrix logarithm ``logm(A)`` via eigendecomposition (symmetric / SPD), with a gradient that
         stays finite at repeated eigenvalues (Daleckiĭ–Kreĭn form) → MatrixView."""
@@ -1651,6 +1686,10 @@ class MatrixView(_DelegatesToPlaceholder):
                 )
             )
         return MatrixView(FunctionCall(lambda a, b: a @ b, [self._expr, _unwrap(other)], "matmul"))
+
+    def __rmatmul__(self, other):
+        """``B @ A`` with a constant (array) or an expression on the left → MatrixView."""
+        return MatrixView(FunctionCall(lambda a, b: a @ b, [_unwrap(other), self._expr], "matmul"))
 
 
 # ---------------------------------------------------------------------------

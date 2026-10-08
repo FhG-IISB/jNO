@@ -407,11 +407,50 @@ def _drop_scalar_component_axis(grad_list):
     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
 
-def _expand_test_shape_vals(shape_vals, n_comp):
+def _component_basis(n_comp, value_shape, dtype):
+    """The one-hot basis of a field's components, ``(n_comp, *value_shape)``.
+
+    A test function of a field with ``n_comp`` components is ``n_comp`` basis functions per node, the
+    ``c``-th carrying a one in component ``c`` (row-major over ``value_shape``) and zeros elsewhere. For a
+    vector field this is ``eye(n)``; for a matrix field ``(n, m)`` it is ``eye(n*m)`` reshaped to
+    ``(n*m, n, m)``, so a contraction over the value axes (``inner(S, T, 2)``, ``trace(T)``, ``T[..., i, j]``)
+    leaves the DOF-component axis, exactly as it does for a vector."""
+    vs = tuple(value_shape or ())
+    if not vs:
+        vs = (n_comp,)
+    return jnp.reshape(jnp.eye(n_comp, dtype=dtype), (n_comp,) + vs)
+
+
+def _flat_component_index(field, ints):
+    """The flat (row-major) component a getitem key selects on a nodal field.
+
+    A vector field takes one index, ``u[..., i]``. A matrix field takes one per axis, ``S[..., i, j]`` ->
+    ``i * m + j``, which is where component ``(i, j)`` sits in the node-major DOF layout. A key with fewer
+    indices than the field has axes selects a slice (a row of a matrix), not one component, so it raises
+    rather than silently reading the last index alone."""
+    vs = tuple(getattr(field, "value_shape", ()) or ())
+    ints = [int(k) for k in ints]
+    if len(vs) <= 1:
+        return ints[-1]
+    if len(ints) != len(vs):
+        raise IndexError(
+            f"jno.fem: a field with value_shape={vs} needs {len(vs)} indices to select one component "
+            f"(e.g. S[{', '.join(['0'] * len(vs))}]); got {len(ints)}. A row of a matrix field is not a single "
+            "component -- differentiate the components one at a time."
+        )
+    flat = 0
+    for k, n in zip(ints, vs):
+        if not -n <= k < n:
+            raise IndexError(f"jno.fem: index {k} is out of range for an axis of length {n} (value_shape={vs}).")
+        flat = flat * n + (k % n)
+    return flat
+
+
+def _expand_test_shape_vals(shape_vals, n_comp, value_shape=None):
     if n_comp == 1:
         return shape_vals
-    eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
-    return shape_vals[:, :, None, None] * eye[None, None, :, :]
+    basis = _component_basis(n_comp, value_shape, shape_vals.dtype)  # (n_comp, *value_shape)
+    return shape_vals.reshape(shape_vals.shape + (1,) * basis.ndim) * basis[None, None]
 
 
 def _infer_trial_metadata(expr) -> Dict[str, Any]:
@@ -1393,8 +1432,9 @@ def _eval_integrand(domain, node, local):
         if _field_space(local, node) != "Lagrange":
             # non-nodal: shape_vals is already the per-DOF *physical* basis (n_quad, n_dof, *value)
             return shape_vals
-        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
-        return _expand_test_shape_vals(shape_vals, n_comp)
+        value_shape = getattr(node, "value_shape", ())
+        n_comp = _value_shape_num_components(value_shape)
+        return _expand_test_shape_vals(shape_vals, n_comp, value_shape)
 
     if isinstance(node, TrialFunction):
         vals, _, cell_sol = _field_data(local, node)
@@ -1520,12 +1560,12 @@ def _eval_integrand(domain, node, local):
                 # pick the requested directions -> (n_quad, n_dof, n_comp[, len(dims)]). trace() then gives div.
                 g = jnp.stack([grads[..., d] for d in dims], axis=-1)
                 return g[..., 0] if len(dims) == 1 else g
-            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
+            value_shape = getattr(node.target, "value_shape", ())
+            n_comp = _value_shape_num_components(value_shape)
             if n_comp == 1:
                 comps = [grads[..., dim0] for dim0 in dims]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
-            eye = jnp.eye(n_comp, dtype=grads.dtype)
-            comps = [grads[..., dim0][:, :, None, None] * eye[None, None, :, :] for dim0 in dims]
+            comps = [_expand_test_shape_vals(grads[..., dim0], n_comp, value_shape) for dim0 in dims]
             if len(comps) == 1:
                 return comps[0]
             return jnp.stack(comps, axis=-1)
@@ -1592,7 +1632,7 @@ def _eval_integrand(domain, node, local):
                 #                                                       column ``i`` (node-major ravel)
                 # A scalar field (n_comp == 1) takes the whole-field shapes, so ``u[0]`` on a scalar is
                 # the field itself rather than a differently-shaped twin.
-                comp = ints[-1]
+                comp = _flat_component_index(field, ints)
                 n_comp = _value_shape_num_components(getattr(field, "value_shape", ()))
                 if not 0 <= comp < n_comp:
                     raise IndexError(
@@ -1696,8 +1736,7 @@ def _eval_integrand(domain, node, local):
             if is_test:
                 if n_comp == 1:
                     return lap
-                eye = jnp.eye(n_comp, dtype=lap.dtype)
-                return lap[:, :, None, None] * eye[None, None, :, :]  # (n_quad, n_dof, n_comp, n_comp)
+                return _expand_test_shape_vals(lap, n_comp, value_shape)  # (n_quad, n_dof, n_comp, *value_shape)
             # ``cell_sol`` is (n_local, vec), so this contracts every component at once: (n_quad, vec).
             # A scalar field keeps its historical phantom (n_quad, 1); a vector one gets Delta u itself.
             flat = jnp.sum(lap[:, :, None] * cell_sol[None, :, :], axis=1)
@@ -1705,8 +1744,9 @@ def _eval_integrand(domain, node, local):
         if is_test:
             if n_comp == 1:
                 return hsub  # (n_quad, n_dof, L, L) per-DOF Hessian (e.g. inner(hessian(u), hessian(v)))
-            eye = jnp.eye(n_comp, dtype=hsub.dtype)
-            return hsub[:, :, None, None, :, :] * eye[None, None, :, :, None, None]
+            basis = _component_basis(n_comp, value_shape, hsub.dtype)  # (n_comp, *value_shape)
+            nb = basis.ndim
+            return hsub.reshape(hsub.shape[:2] + (1,) * nb + hsub.shape[2:]) * basis.reshape((1, 1) + basis.shape + (1, 1))
         h = jnp.einsum("qnij,nc->qcij", hsub, cell_sol)  # (n_quad, vec, L, L)
         if len(value_shape) == 0:
             return h[:, 0]  # (n_quad, L, L) trial Hessian -- scalar carries no component axis

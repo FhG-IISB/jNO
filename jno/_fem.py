@@ -1312,6 +1312,23 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
     return f"solve: {mode} · {_lin()}"
 
 
+def _field_num_components(constraint: Any) -> int:
+    """Number of components of the trial field a constraint names (``1`` for a scalar)."""
+    trials = [n for n in _walk(_bare(constraint)) if isinstance(n, TrialFunction)]
+    vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+    return int(np.prod(vs)) if vs else 1
+
+
+def _component_key(comp: int, constraint: Any) -> Any:
+    """The key a per-component Dirichlet value is stored under: ``"x"/"y"/"z"`` for a vector of up to three
+    components (the historical spelling every consumer reads), the flat integer index otherwise -- a matrix
+    entry or a vector's fourth component has no axis name, and naming entry ``(0, 1)`` of a matrix "y" would
+    mislabel it. Every consumer accepts both (``_normalize_dirichlet_value``)."""
+    trials = [n for n in _walk(_bare(constraint)) if isinstance(n, TrialFunction)]
+    vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+    return _COMPONENT_NAMES[comp] if len(vs) <= 1 and comp in _COMPONENT_NAMES else int(comp)
+
+
 def _component_index_of(node: Any) -> Optional[int]:
     """If ``node`` is a single component of the trial (``u[..., i]``), return ``i``.
 
@@ -1323,6 +1340,20 @@ def _component_index_of(node: Any) -> Optional[int]:
         args = getattr(node, "args", None) or []
         if len(args) == 1 and _contains(args[0], TrialFunction):
             ints = [k for k in node.getitem_key if isinstance(k, int)]
+            trials = [n for n in _walk(args[0]) if isinstance(n, TrialFunction)]
+            vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+            if len(vs) >= 2:
+                # A matrix field: one index per axis, flattened row-major -- `S(region)[i, j]` is component
+                # `i * m + j` of the node-major layout. A row `S(region)[i]` is not one component.
+                if len(ints) != len(vs) or any(isinstance(k, slice) for k in node.getitem_key):
+                    raise ValueError(
+                        f"jno.fem: a Dirichlet condition on one entry of a field with value_shape={vs} names "
+                        f"every index, e.g. `S(region)[0, 1] - g`; got the key {node.getitem_key!r}. Pin the "
+                        "whole tensor with `S(region) - G`, or one entry at a time."
+                    )
+                from .utils.solver.fem_utils import _flat_component_index
+
+                return _flat_component_index(trials[0], ints)
             if len(ints) == 1:
                 return ints[0]
     return None
@@ -6823,9 +6854,11 @@ def _fem_impl(
                 dirichlet_values[region] = value
                 classification.append(f"dirichlet@{region}")
             else:  # one component (roller/symmetry): u(region)[i] - g
-                if comp not in _COMPONENT_NAMES:
+                _n_comp = _field_num_components(c)
+                if not 0 <= comp < _n_comp:
                     raise ValueError(
-                        f"jno.fem: Dirichlet component index {comp} out of range (vector components are 0..2)."
+                        f"jno.fem: Dirichlet component index {comp} is out of range for a field with "
+                        f"{_n_comp} component(s)."
                     )
                 if dirichlet_style.get(style_key) == "all":
                     raise ValueError(
@@ -6835,9 +6868,10 @@ def _fem_impl(
                 dirichlet_style[style_key] = "per_component"
                 current = dirichlet_values.get(region)
                 current = dict(current) if isinstance(current, dict) else {}
-                current[_COMPONENT_NAMES[comp]] = value
+                _key = _component_key(comp, c)
+                current[_key] = value
                 dirichlet_values[region] = current
-                classification.append(f"dirichlet@{region}[{_COMPONENT_NAMES[comp]}]")
+                classification.append(f"dirichlet@{region}[{_key}]")
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
@@ -7857,7 +7891,8 @@ def _assemble_multifield(
         else:
             current = region_values.get(region)
             current = dict(current) if isinstance(current, dict) else {}
-            current[_COMPONENT_NAMES[comp]] = value
+            _rank = len(tuple(fields[fidx].get("value_shape", ()) or ()))
+            current[_COMPONENT_NAMES[comp] if _rank <= 1 and comp in _COMPONENT_NAMES else int(comp)] = value
             region_values[region] = current
     domain._fem_dirichlet_by_field = by_field
 

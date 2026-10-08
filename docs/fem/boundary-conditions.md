@@ -187,6 +187,14 @@ A **vector wall value** clamps every component at once: `u(xb, yb) - (1.0, -0.5)
 on a vector field is the same number on every component, and `u(xb, yb)[i] - g` clamps one component
 and wants a scalar `g`; a vector there raises. Pinned in `tests/test_fem_vector_dirichlet_values.py`.
 
+A **matrix field** (`value_shape=(n, m)`) takes the same two forms: `S(xb, yb) - G` pins every entry, with
+`G` a matrix — a constant, `jno.np.identity(2)`, or one built from coordinates with
+`jno.np.stack([jno.np.stack([a, b], axis=-1), jno.np.stack([c, d], axis=-1)], axis=-2)` — and
+`S.bind(x=xb, y=yb)[i, j] - g` pins one entry. A row `S(...)[i]` is not one entry and raises. A vector
+field with more than three components pins any of them, `u(xb, yb)[3] - g`; `fem.classification` labels
+those entries, and every matrix entry, by their flat index (`dirichlet@left[2]` is entry `(1, 0)` of a
+2×2 field), not by an axis name.
+
 !!! warning "Fixed: a vector wall value used to keep only its first component"
     Until this was fixed, `u(xb, yb) - (1.0, -0.5)` imposed `(1.0, 1.0)` — silently, steady and
     transient alike — and a vector `g(x, t)` wrote the wrong values. Examples that only used `(0, 0)`
