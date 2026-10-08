@@ -4523,14 +4523,20 @@ def assemble_fem_native(
             if _field_vals is not None:
                 gs = _real_dirichlet_values(np.asarray(_field_vals)[nids], region).astype(float)
             elif value_node is not None:
-                raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))))
+                # A matrix field's value (`g(z) * M`) is evaluated point by point: in a batch the
+                # coordinates are (n, 1) columns, which do not broadcast against an n x n matrix (see
+                # `_eval_value_node_at`). Its per-point result is then always (n_nodes, n*n).
+                _pw = comp is None and len(tuple(fields[fidx].get("value_shape") or ())) >= 2
+                _pw = _pw and len(nids) > 0
+                raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), pointwise=_pw)))
                 _real_dirichlet_values(raw, region)  # refuse a complex g before any cast drops Im(g)
                 # Does the result scale with the number of points? A CONSTANT profile returns the
                 # same thing for any batch -- including a constant VECTOR like (gx, gy), whose size
                 # can coincide with the node count -- so shape alone cannot tell. One extra
-                # single-point evaluation settles it and costs nothing.
-                one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
-                if raw.shape == one.shape or len(nids) == 0:
+                # single-point evaluation settles it and costs nothing. (A pointwise evaluation always
+                # scales, so it never needs the test.)
+                one = None if _pw else np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
+                if (not _pw and raw.shape == one.shape) or len(nids) == 0:
                     const = np.real(one).reshape(-1).astype(float)  # constant over the region: (n_values,)
                     gs = np.broadcast_to(const, (len(nids), const.size))
                 else:

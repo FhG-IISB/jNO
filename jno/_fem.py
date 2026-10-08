@@ -1651,7 +1651,7 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None) -> Any:
+def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -1666,6 +1666,12 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     ``t`` is the time a **temporal** Variable reads (an initial condition passes the start time). A time
     Variable has its own tag, so without ``t`` it would be handed the spatial points and read the x column;
     a value that mentions time with no ``t`` given therefore raises instead.
+
+    ``pointwise=True`` evaluates the expression one point at a time (vmapped), so the result is
+    ``(n_points, *value_shape)`` flattened. A batch evaluation hands every coordinate in as an ``(n, 1)``
+    column, which broadcasts correctly against a scalar or a vector but not against a matrix: ``g(z) * M``
+    with ``M`` 3 x 3 fails for most ``n`` -- and for ``n = 3`` silently returns one 3 x 3 that then reads as
+    a constant. A matrix-valued condition therefore needs this.
     """
     from .trace_evaluator import TraceEvaluator
 
@@ -1702,6 +1708,16 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
                 elif (nn := _neural_coefficient_name(nd)) in params:  # trainable network: its live module
                     mod = params[nn]
             table[m.layer_id] = mod
+    if pointwise:
+
+        def _at(p):
+            ctx = {tag: p[None, :] for tag in tags}
+            for tag in temporal:
+                ctx[tag] = jnp.full((1, 1), t, dtype=pts.dtype)
+            return jnp.asarray(TraceEvaluator(table).evaluate(value_node, context=ctx))
+
+        vals = jax.vmap(_at)(pts)
+        return jnp.reshape(vals, (-1,))
     context = {tag: pts for tag in tags}
     for tag in temporal:
         context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)

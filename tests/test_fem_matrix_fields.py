@@ -416,3 +416,25 @@ def test_a_matrix_unknown_squared_is_nonlinear():
     A = J.array([[2.0, 1.0], [0.0, 1.0]])
     assert jno.fem([inner(A @ Si - J.array(F), Ti, n_contract=2)])._mode == "linear"
 
+
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_a_position_dependent_tensor_dirichlet_value(symmetric):
+    """S = (1 + y) M on every edge, -Δ S = 0 inside: the exact S = (1 + y) M is linear, so P1 holds it to
+    round-off. Each edge of the n = 2 grid has three nodes: the batch evaluation used to multiply a (3, 1)
+    coordinate column by M, which raises for this 2 x 2 M and, for a 3 x 3 one, returned a single matrix
+    that was read as a constant. Evaluated point by point, it is the value at each node."""
+    M = np.array([[1.0, 0.4], [0.4, -0.5]]) if symmetric else np.array([[1.0, 0.4], [-0.3, -0.5]])
+    d = _square(n=2)
+    x, y = d.variable("interior", split=True)[:2]
+    S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), symmetric=symmetric)
+    terms = [inner(J.jacobian(S, [x, y]), J.jacobian(T, [x, y]), n_contract=3)]
+    for edge in ("left", "right", "bottom", "top"):
+        xe, ye = d.variable(edge, split=True)[:2]
+        terms.append(S(xe, ye) - (1.0 + ye) * J.array(M))
+    fem = jno.fem(terms)
+    U = np.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, *((3,) if symmetric else (2, 2)))
+    P = np.asarray(fem.points)
+    want = (1.0 + P[:, 1])[:, None, None] * M
+    if symmetric:
+        want = want[:, [0, 0, 1], [0, 1, 1]]
+    np.testing.assert_allclose(U, want, atol=1e-12)
