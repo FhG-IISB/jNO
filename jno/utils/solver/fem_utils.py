@@ -984,6 +984,49 @@ def _broadcast_ok(s1, s2) -> bool:
     return True
 
 
+#: Node types whose value varies over the quadrature points (or with the solution). A subtree with none of
+#: them is a CONSTANT: it carries value axes only, no quadrature axis.
+_VARYING_NODES = (
+    Variable,
+    TrialFunction,
+    TestFunction,
+    StateField,
+    ModelCall,
+    FrozenField,
+    HistoryRef,
+    Cellwise,
+    RegionMask,
+    TagMask,
+    Tracker,
+    OperationCall,
+    DiffSlot,
+)
+
+
+def _scalar_times_constant_matrix(a, b, left, right):
+    """``s * M`` with ``s`` a per-point scalar and ``M`` a constant matrix: ``(n_quad, *M.shape)``.
+
+    A per-point scalar is laid out ``(n_quad, 1)`` (its historical phantom axis) or ``(n_quad,)``, and a
+    constant matrix has no quadrature axis at all. At equal rank :func:`_prefix_align` leaves them alone and
+    plain broadcasting fails (``(14, 1) * (3, 3)``); at rank 1 it pads the scalar to ``(n_quad, 1)``, with
+    the same result. Worse, both SUCCEED when ``n_quad`` equals the matrix's row count (three quadrature
+    points times a 3 x 3 matrix) and return a 3 x 3 that is no longer per point. Shape alone cannot tell a constant from a per-point array, so the trace decides: the matrix side
+    must contain no varying node. ``tr(A) / 3 * I`` (a deviator) is the case that needs it."""
+    a, b = jnp.asarray(a), jnp.asarray(b)
+    for s_, m_, s_node, m_node, flip in ((a, b, left, right, False), (b, a, right, left, True)):
+        if (
+            (s_.ndim == 1 or (s_.ndim == 2 and s_.shape[-1] == 1))  # (n_quad,) or (n_quad, 1): one value per point
+            and m_.ndim == 2
+            and min(m_.shape) > 1
+            and not contains_node_type(m_node, _VARYING_NODES)
+            and contains_node_type(s_node, _VARYING_NODES)
+        ):
+            s2 = s_.reshape(s_.shape[:1] + (1, 1))
+            m2 = m_[None]
+            return (m2, s2) if flip else (s2, m2)
+    return a, b
+
+
 def _prefix_align(a, b):
     """Broadcast-align two kernel quantities for an elementwise op.
 
@@ -1817,6 +1860,7 @@ def _eval_integrand(domain, node, local):
     if isinstance(node, BinaryOp):
         a = _eval_integrand(domain, node.left, local)
         b = _eval_integrand(domain, node.right, local)
+        a, b = _scalar_times_constant_matrix(a, b, node.left, node.right)
         a, b = _prefix_align(a, b)
         if node.op == "+":
             return a + b

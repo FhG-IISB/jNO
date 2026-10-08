@@ -438,3 +438,35 @@ def test_a_position_dependent_tensor_dirichlet_value(symmetric):
     if symmetric:
         want = want[:, [0, 0, 1], [0, 1, 1]]
     np.testing.assert_allclose(U, want, atol=1e-12)
+
+
+@pytest.mark.parametrize("nonlinear", [False, True])
+def test_a_per_point_scalar_times_a_constant_matrix(nonlinear):
+    """`s(x) * M` with M a constant 3 x 3, on a 2-D mesh (a 3 x 3 field there is legitimate: a stress with an
+    out-of-plane component). Per point, a scalar is (n_quad,) or (n_quad, 1) and M has no quadrature axis,
+    so the product used to fail to broadcast -- or, with as many quadrature points as M has rows, silently
+    returned a 3 x 3. Oracles: the L2 projection of (1 + x + 2y) M is that field (P1 holds it), and
+    S + c tr(S) I = F with F built from S0 = (1 + x) M returns S0, which exercises `tr(S) * I`, the
+    deviator's scalar-times-identity, on the Newton path."""
+    d = _square()
+    x, y = d.variable("interior", split=True)[:2]
+    S, T = d.fem_symbols(value_shape=(3, 3), names=("S", "T"))
+    Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
+    M = np.array([[1.0, 0.4, 0.0], [-0.3, -0.5, 0.2], [0.1, 0.0, 0.7]])
+    I3 = J.array(np.eye(3))
+    P = None
+    if not nonlinear:
+        fem = jno.fem([inner(Si - (1.0 + x + 2.0 * y) * J.array(M), Ti, n_contract=2)])
+        U = np.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 3, 3)
+        P = np.asarray(fem.points)
+        want = (1.0 + P[:, 0] + 2.0 * P[:, 1])[:, None, None] * M
+    else:
+        c = 0.3
+        S0 = (1.0 + x) * J.array(M)
+        F = S0 + c * J.trace(S0) * J.trace(S0) * I3
+        fem = jno.fem([inner(Si + c * J.trace(Si) * J.trace(Si) * I3 - F, Ti, n_contract=2)])
+        assert fem._mode == "nonlinear"
+        U = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-13, atol=1e-14))).reshape(-1, 3, 3)
+        P = np.asarray(fem.points)
+        want = (1.0 + P[:, 0])[:, None, None] * M
+    np.testing.assert_allclose(U, want, atol=1e-11)
