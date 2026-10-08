@@ -2742,6 +2742,11 @@ class domain(MeshIOMixin):
             if _rs is not None and len(_rs):
                 blocks.append(_rs)
                 owners.append(str(region))
+                _mrs = _rs.mean(axis=1)
+                if np.asarray(where(*[_mrs[:, i] for i in range(dim)])).reshape(-1).astype(bool).any():
+                    # the nodal assemblers walk boundary facets only: `jno.fem` routes forms on such a
+                    # tag to the non-nodal path, which integrates interior facets
+                    self.__dict__.setdefault("_interior_face_tags", set()).add(name)
         _bo = [(np.asarray(b), o) for b, o in zip(blocks, owners) if b is not None and len(b)]
         blocks, owners = [b for b, _ in _bo], [o for _, o in _bo]
         # Every block must be the same kind of facet to stack: they are, on the single-cell-type mesh
