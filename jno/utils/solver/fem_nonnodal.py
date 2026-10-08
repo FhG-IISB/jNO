@@ -1046,7 +1046,7 @@ def assemble_fem_nonnodal(
 
                 def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r):
                     per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
-                    _ctx_c = _with_cell_size(ctx, meas, xq)
+                    _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _p is None else _p)[cells_j[c]])
                     vol_vars = tuple(
                         (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
                         for name in runtime_parameter_tags
@@ -1461,7 +1461,7 @@ def assemble_fem_nonnodal(
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
                 cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
                 per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
-                _ctx_c = _with_cell_size(ctx, meas, xq)
+                _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _pts_dyn is None else _pts_dyn)[cells_j[c]])
                 vol_vars = tuple(
                     (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
                     for name in runtime_parameter_tags
@@ -2051,14 +2051,25 @@ def _legacy_natural(bare, field_index, spaces) -> bool:
     return False
 
 
-def _with_cell_size(ctx, meas, xq):
-    """``ctx`` with the ``dom.cell_size`` symbol resolved for one cell: ``|det J|^(1/dim)`` at every
-    quadrature point, the same isotropic size the nodal assembler packs. Only when the form reads it --
-    otherwise its ``-1`` placeholder (or nothing) would stand in for h without a word."""
-    if "cell_size" not in ctx:
+def _with_cell_size(ctx, meas, xq, verts=None):
+    """``ctx`` with the cell-geometry symbols resolved for one cell, as the nodal assembler packs them:
+    ``dom.cell_size`` = ``|det J|^(1/dim)`` and ``dom.cell_metric`` = ``G = J^-T J^-1`` at every quadrature
+    point. Only those the form reads -- otherwise their placeholders would stand in for h / G without a
+    word. ``verts`` are the cell's vertex coordinates (needed for ``G``; affine simplices)."""
+    want_h, want_g = "cell_size" in ctx, "cell_metric" in ctx
+    if not (want_h or want_g):
         return ctx
-    dim = xq.shape[-1]
-    return {**ctx, "cell_size": jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (xq.shape[0], 1))}
+    nq, dim = xq.shape[0], xq.shape[-1]
+    out = dict(ctx)
+    if want_h:
+        out["cell_size"] = jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (nq, 1))
+    if want_g:
+        if verts is None:
+            raise NotImplementedError("dom.cell_metric on this non-nodal path needs the cell's vertices.")
+        J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)
+        K = jnp.linalg.inv(J)
+        out["cell_metric"] = jnp.broadcast_to(K.T @ K, (nq, dim, dim))
+    return out
 
 
 def _build_general_surface(

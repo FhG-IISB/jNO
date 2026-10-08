@@ -335,3 +335,25 @@ def test_load_on_a_body_face_inside_the_mesh_is_not_dropped(order):
     c = d.variable("ftop", split=True)
     b = np.asarray(jno.fem([u.bind(x=x, y=y) * v.bind(x=x, y=y), 1.0 * v.bind(x=c[0], y=c[1])]).b).reshape(-1)
     np.testing.assert_allclose(abs(b.sum()), 1.0, rtol=1e-12)
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_cell_metric_resolves_on_the_nonnodal_path(k):
+    """``dom.cell_metric`` (G = J^-T J^-1) in an N1E form is resolved per cell, as on the nodal path. For the
+    constant field u = x̂, ∫ trace(G) |u|^2 = Σ_K |K| trace(G_K) -- trace(G) is what sees a thin cell's
+    small direction, which an isotropic h cannot."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E", order=k)
+    x, y, z = d.variable("interior", split=True)[:3]
+    ui, vi = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    G = d.cell_metric
+    trG = jno.np.trace(G)
+    M = _dense(jno.fem([inner(ui, vi)]).A)
+    MG = _dense(jno.fem([trG * inner(ui, vi)]).A)
+    a = np.linalg.solve(M, np.asarray(jno.fem([inner(ui, vi) - (1.0 * vi[0] + 0.0 * vi[1])]).b).reshape(-1))
+    P = np.asarray(d.mesh.points)
+    C = np.asarray(d.mesh.cells_dict["tetra"])
+    J = np.stack([P[C[:, j]] - P[C[:, 0]] for j in (1, 2, 3)], axis=2)
+    Ki = np.linalg.inv(J)
+    tr = np.einsum("nij,nij->n", Ki, Ki)  # trace(K^T K)
+    np.testing.assert_allclose(a @ MG @ a, np.sum(np.abs(np.linalg.det(J)) / 6 * tr), rtol=1e-10)
