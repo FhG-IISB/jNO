@@ -3707,6 +3707,16 @@ def _component_keeps_axis(expr) -> bool:
     return True
 
 
+def _check_symmetric_shape(value_shape, symmetric) -> bool:
+    """``symmetric=True`` is meaningful for a square matrix field only; anything else is refused."""
+    symmetric = bool(symmetric)
+    if symmetric and not (len(value_shape) == 2 and int(value_shape[0]) == int(value_shape[1])):
+        raise ValueError(
+            f"symmetric=True needs a square matrix field, value_shape=(n, n); got value_shape={tuple(value_shape)}."
+        )
+    return symmetric
+
+
 class _FieldComponentIndex:
     """``field[i]`` is the i-th COMPONENT — the mixin that makes one spelling mean one thing.
 
@@ -4455,9 +4465,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange", symmetric=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -4467,8 +4480,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)
@@ -5360,9 +5377,12 @@ class TestFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange", symmetric=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -5371,8 +5391,12 @@ class TestFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)

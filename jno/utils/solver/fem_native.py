@@ -783,7 +783,28 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
-def _dirichlet_value_columns(gs, vt, comp, region):
+def _symmetric_ic_values(raw, n, n_nodes):
+    """A whole-field initial value of a symmetric ``n x n`` field -> its stored upper triangle.
+
+    ``raw`` is flat: one constant, one ``n x n`` matrix, or one matrix per node (it is already stored-size
+    when the user wrote the ``n(n+1)/2`` values themselves). An asymmetric matrix is refused when the value
+    is concrete; a traced one (a trainable initial state) is read by its upper triangle."""
+    nn2 = n * n
+    if raw.size not in (nn2, n_nodes * nn2):
+        return raw
+    full = raw.reshape(-1, n, n)
+    if not isinstance(full, jax.core.Tracer):
+        f = np.asarray(full)
+        gap = float(np.max(np.abs(f - np.swapaxes(f, -1, -2)))) if f.size else 0.0
+        if gap > 1e-12 * max(1.0, float(np.max(np.abs(f)))):
+            raise ValueError(
+                f"jno.fem: the initial value of a symmetric=True field is not symmetric (max |G - G^T| = {gap:.3g})."
+            )
+    iu, ju = np.triu_indices(n)
+    return full[:, iu, ju].reshape(-1)
+
+
+def _dirichlet_value_columns(gs, vt, comp, region, field=None):
     """A Dirichlet value table ``(n_nodes, n_values)`` checked against the clamped components.
 
     ``n_values`` must be 1 (a scalar, the same on every clamped component) or, for an all-component clamp
@@ -793,6 +814,22 @@ def _dirichlet_value_columns(gs, vt, comp, region):
     n_values = gs.shape[1] if gs.ndim == 2 else 1
     if n_values == 1:
         return gs.reshape(-1)
+    if field is not None and field.get("symmetric") and comp is None:
+        n = int(tuple(field["value_shape"])[0])
+        if n_values == n * n:
+            # A full n x n value on a symmetric field: it must BE symmetric, and its upper triangle is what is
+            # stored. Imposing an asymmetric value would silently keep half of it, so it is refused.
+            full = np.asarray(gs, dtype=float).reshape(-1, n, n)
+            gap = float(np.max(np.abs(full - np.swapaxes(full, -1, -2)))) if full.size else 0.0
+            scale = max(1.0, float(np.max(np.abs(full)))) if full.size else 1.0
+            if gap > 1e-12 * scale:
+                raise ValueError(
+                    f"jno.fem: the Dirichlet value on {region!r} is not symmetric (max |G - G^T| = {gap:.3g}), but the "
+                    "field was declared symmetric=True, which stores one value per symmetric pair. Prescribe a "
+                    "symmetric value, or declare the field without symmetric=True."
+                )
+            iu, ju = np.triu_indices(n)
+            return full[:, iu, ju]
     if comp is None and n_values == vt:
         return gs
     what = f"component {int(comp)} (`u(...)[{int(comp)}] - g`)" if comp is not None else f"a {vt}-component field"
@@ -876,7 +913,8 @@ def _seeded_piece(piece):
         proxies = {}
         for n in tests.values():
             pr = _Trial(name="seed", value_shape=getattr(n, "value_shape", ()), order=getattr(n, "order", 1),
-                        space=getattr(n, "space", "Lagrange"))  # fmt: skip
+                        space=getattr(n, "space", "Lagrange"),
+                        symmetric=n.__dict__.get("symmetric", False))  # fmt: skip
             pr.field_key = _SEED_KEY
             proxies[n] = pr
         res = (_substitute(piece, proxies), tuple(tests.values()))
@@ -1230,6 +1268,7 @@ def assemble_fem_native(
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
     domain._fem_native_field_shapes = [tuple(f["value_shape"]) for f in fields]
+    domain._fem_native_field_vecs = [int(f["vec"]) for f in fields]  # stored values per node (symmetric: n(n+1)/2)
 
     # -------------------------------------------------------------------------
     # Element specs and JAX constants
@@ -4380,7 +4419,7 @@ def assemble_fem_native(
                     gs = np.real(raw).reshape(len(nids), -1).astype(float)  # (n_nodes, n_values)
                 # EVERY component, not the first one broadcast to all: `u(wall) - (1.0, -0.5)` on a vector
                 # field used to impose (1.0, 1.0) -- silently, steady and transient alike.
-                gs = _dirichlet_value_columns(gs, vt, comp, region)
+                gs = _dirichlet_value_columns(gs, vt, comp, region, fields[fidx])
             elif callable(value):
                 gs = np.array([float(_real_dirichlet_values(value(p), region)) for p in pts], dtype=float)
             else:
@@ -4599,7 +4638,7 @@ def assemble_fem_native(
                 p = pts_all[nid]
                 if value_node is not None:
                     gv = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None]))).reshape(1, -1)
-                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region)).reshape(-1)
+                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region, fields[fidx])).reshape(-1)
                 elif callable(value):
                     gv = np.array([float(value(p))])
                 else:
@@ -4761,6 +4800,8 @@ def assemble_fem_native(
                 raw = jnp.reshape(
                     jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params, t=t0)), (-1,)
                 )
+                if comp is None and fields[fidx].get("symmetric"):
+                    raw = _symmetric_ic_values(raw, int(tuple(fields[fidx]["value_shape"])[0]), nn)
                 if comp is not None:
                     # Per-component IC (e.g. ``u(initial)[0] - g0``): set just component ``comp`` at every
                     # node of the field. ``raw`` is the per-node value (or a single constant to broadcast).

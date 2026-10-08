@@ -1717,7 +1717,9 @@ class domain(MeshIOMixin):
 
         return [loc_fns, vec_ids, val_fns]
 
-    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange"):
+    def variational_symbols(
+        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False
+    ):
         """
         Return generic variational symbols.
 
@@ -1735,6 +1737,10 @@ class domain(MeshIOMixin):
             (3,)  -> 3D vector
         names : tuple[str, str]
             Names of the trial and test symbols.
+        symmetric : bool, default=False
+            For a square matrix field ``value_shape=(n, n)``: store only the upper triangle,
+            ``n(n+1)/2`` values per node (``xx, xy, yy`` in 2-D). The symbol still behaves as the full
+            ``n x n`` matrix in every expression, and its test function is the symmetric one.
 
         Returns
         -------
@@ -1759,6 +1765,10 @@ class domain(MeshIOMixin):
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
         trial_name, test_name = names
+        if symmetric and space != "Lagrange":
+            raise NotImplementedError(f"symmetric=True is wired for nodal Lagrange fields only, not space={space!r}.")
+        if symmetric and complex:
+            raise NotImplementedError("symmetric=True is not wired for a complex field; declare it real, or full.")
         if complex:
             # A complex field is carried as TWO real fields (re, im) — the FEM-friendly
             # representation. The user writes the weak form with ordinary complex algebra
@@ -1781,8 +1791,8 @@ class domain(MeshIOMixin):
                 # touching a complex field to the real-equivalent block path.
                 _s._complex_field_member = True
             return (ComplexPair(re_tr, im_tr), ComplexPair(re_te, im_te))
-        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order, space=space)
-        test = TestFunction(name=test_name, value_shape=value_shape, order=order, space=space)
+        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order, space=space, symmetric=symmetric)
+        test = TestFunction(name=test_name, value_shape=value_shape, order=order, space=space, symmetric=symmetric)
         test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
         # Carry the owning domain so a consumer can recover the mesh / FE space from a
         # symbol alone -- e.g. jno.np.parameter(phi) sizing a field parameter to the
@@ -1791,7 +1801,7 @@ class domain(MeshIOMixin):
         test._domain = self
         return (trial, test)
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange"):
+    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False):
         """
         Backward-compatible alias for variational_symbols().
 
@@ -1819,7 +1829,9 @@ class domain(MeshIOMixin):
             weak = curl(E) * curl(v) - k2 * E.dot(v) - J.dot(v)   # `*` = complex product
             fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
         """
-        return self.variational_symbols(value_shape=value_shape, names=names, order=order, complex=complex, space=space)
+        return self.variational_symbols(
+            value_shape=value_shape, names=names, order=order, complex=complex, space=space, symmetric=symmetric
+        )
 
     def test_function(self, value_shape=(), name="phi", order=1):
         """Return only the weak-form test function.

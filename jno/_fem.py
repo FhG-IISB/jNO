@@ -879,7 +879,7 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
     if pts is None or offs is None or cells_all is None:
         return []  # a route that does not publish per-field DOF coordinates; nothing to check against
 
-    from .utils.solver.fem_utils import _cell_region_mask, _value_shape_num_components
+    from .utils.solver.fem_utils import _cell_region_mask
 
     _dp, _tv = _prescribed_dofs(domain)
     pinned = {int(d) for d, _g in _dp} | {int(d) for d in _tv}
@@ -906,7 +906,7 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
                     reached |= np.asarray(bm, dtype=bool)
         except LookupError:
             continue  # unresolvable region: stay quiet rather than report a DOF as dead on a guess
-        vec = int(_value_shape_num_components(fem_obj._field_value_shape(i)))
+        vec = int(fem_obj._field_vec(i))
         base = int(offs[i])
         dead = [base + int(nd) * vec + c for nd in np.flatnonzero(~reached) for c in range(vec)]
         dead = [dd for dd in dead if dd not in pinned]
@@ -1317,6 +1317,38 @@ def _field_num_components(constraint: Any) -> int:
     trials = [n for n in _walk(_bare(constraint)) if isinstance(n, TrialFunction)]
     vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
     return int(np.prod(vs)) if vs else 1
+
+
+def _check_symmetric_field_scope(domain: Any, constraints: List[Any], periodic_ties: List[Any], is_vpinn: bool) -> None:
+    """A ``symmetric=True`` matrix field is wired on the native 2-D/3-D Lagrange assembler only.
+
+    Its storage (``n(n+1)/2`` values per node) is read by that assembler, its Dirichlet path and its block
+    layout. The other routes size a field from ``value_shape`` alone and would lay out ``n*n`` values, so they
+    are refused here rather than left to fail with a shape error -- or, worse, to succeed on a wrong layout."""
+    syms = [
+        n
+        for c in constraints
+        for n in _walk(_bare(c))
+        if isinstance(n, (TrialFunction, TestFunction)) and n.__dict__.get("symmetric", False)
+    ]
+    if not syms:
+        return
+    where = None
+    if getattr(domain, "dimension", None) not in (2, 3):
+        where = f"a {getattr(domain, 'dimension', '?')}-D domain"
+    elif is_vpinn:
+        where = "a VPINN (network trial)"
+    elif periodic_ties:
+        where = "a form with periodic ties"
+    elif _trial_spaces(constraints) - {"Lagrange"}:
+        where = "a form mixing in a non-nodal element family"
+    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+        where = "a complex form"
+    if where is not None:
+        raise NotImplementedError(
+            f"jno.fem: a symmetric=True matrix field is supported on the native 2-D/3-D Lagrange assembler only, "
+            f"not on {where}. Declare the field without symmetric=True (full n x n storage) there."
+        )
 
 
 def _component_key(comp: int, constraint: Any) -> Any:
@@ -3832,7 +3864,6 @@ class FEM:
         ``component`` picks one component of a vector field (``None`` = all of them). Returns a plain
         ``numpy`` int array, so it indexes a solution or a residual directly.
         """
-        from .utils.solver.fem_utils import _value_shape_num_components
 
         idx = field if isinstance(field, int) else self.block_index(field)
         pts = self.field_points
@@ -3850,7 +3881,7 @@ class FEM:
                 "finer than the mesh, or a region on a different field's nodes, is the usual cause."
             )
         offs = self.offsets
-        vec = int(_value_shape_num_components(self._field_value_shape(idx)))
+        vec = int(self._field_vec(idx))
         base = int(offs[idx]) if offs is not None else 0
         comps = range(vec) if component is None else [int(component)]
         return np.concatenate([base + nodes * vec + c for c in comps])
@@ -3915,7 +3946,6 @@ class FEM:
                 f"fem.export: the solution has {int(arr.size)} entries but this problem has {int(offs[-1])} "
                 "DOFs. Pass the solve's own output, not a slice of it."
             )
-        from .utils.solver.fem_utils import _value_shape_num_components
 
         names = _field_names(self._constraints or [])
         # the assembler's field order -- what `offsets` indexes. `_trial_field_keys` is trace-walk
@@ -3936,7 +3966,7 @@ class FEM:
                     f"fem.export: no meshio cell type for a {dim}-D element with {int(cells_i.shape[1])} "
                     "nodes. Export the mesh with `d.export_vtk()` and the field separately."
                 )
-            vec = int(_value_shape_num_components(self._field_value_shape(i)))
+            vec = int(self._field_vec(i))
             block = arr[int(offs[i]) : int(offs[i + 1])].reshape(-1, vec)
             nm = names.get(keys[i], f"field{i}") if i < len(keys) else f"field{i}"
             out = save_path if n_fields == 1 else f"{root}.{nm}{ext}"
@@ -3947,6 +3977,15 @@ class FEM:
             )
             written.append(out)
         return written
+
+    def _field_vec(self, idx):
+        """Values stored per node in block ``idx`` (``n(n+1)/2`` for a symmetric ``n x n`` field)."""
+        from .utils.solver.fem_utils import _value_shape_num_components
+
+        vecs = getattr(self, "_block_vecs", None)
+        if vecs and idx < len(vecs):
+            return int(vecs[idx])
+        return int(_value_shape_num_components(self._field_value_shape(idx)))
 
     def _field_value_shape(self, idx):
         """The ``value_shape`` of block ``idx`` — from the assembler's own field list."""
@@ -6413,6 +6452,7 @@ def _fem_impl(
     _weak_has_real_trial = any(_contains(c, TestFunction) and _contains(c, TrialFunction) for c in constraints)
     is_vpinn = _has_network and not _weak_has_real_trial
     has_neural_coeff = _has_network and not is_vpinn
+    _check_symmetric_field_scope(domain, constraints, periodic_ties, is_vpinn)
 
     if has_neural_coeff:
         # A network in a trial-only (essential) constraint is a trainable *essential value*, NOT an
@@ -6503,6 +6543,7 @@ def _fem_impl(
         fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
         fem_obj._term_functional_factory = getattr(domain, "_fem_native_term_functional", None)
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
+        fem_obj._block_vecs = list(getattr(domain, "_fem_native_field_vecs", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
         fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)

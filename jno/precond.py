@@ -1712,7 +1712,8 @@ def _symbols_for_block(fem, idx, *, value_shape=(), tag="aux"):
     blocks = fem.blocks
     n_blk = int(blocks[idx].stop - blocks[idx].start)
     own_shape = tuple(getattr(fem, "_block_value_shapes", ()) or ())[idx]
-    n_scalar = n_blk // max(1, _value_shape_components(own_shape))
+    _vec_of = getattr(fem, "_field_vec", None)  # stored values per node (n(n+1)/2 for a symmetric field)
+    n_scalar = n_blk // max(1, int(_vec_of(idx)) if _vec_of is not None else _value_shape_components(own_shape))
     coords = dom.variable("interior", split=True)
     axes = ("x", "y", "z")[: int(dom.dimension)]
     want = n_scalar * max(1, _value_shape_components(value_shape))

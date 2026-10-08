@@ -410,6 +410,9 @@ def _info_fem(f, deep: bool) -> Info:
     for i in range(max(0, len(offs) - 1)):
         name = labels[i] if i < len(labels) else f"block {i}"
         vs = f" · value_shape {tuple(shapes[i])}" if i < len(shapes) and shapes[i] else ""
+        _vecs = list(getattr(f, "_block_vecs", None) or [])
+        if vs and i < len(_vecs) and len(tuple(shapes[i])) == 2 and _vecs[i] < int(np.prod(shapes[i])):
+            vs += f" (symmetric, {_vecs[i]} stored per node)"
         od = f" · P{orders[i]}" if i < len(orders) else ""
         blocks.append((name, f"dofs {offs[i]}:{offs[i + 1]}  ({_fmt_n(offs[i + 1] - offs[i])}){vs}{od}"))
 

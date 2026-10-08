@@ -62,6 +62,17 @@ which also checks the L2 projection, a componentwise Laplace in 2-D and 3-D at P
 profile carried unchanged — all nodally exact). Dirichlet data on a matrix field is described in
 [Boundary conditions](boundary-conditions.md#components-and-derivatives-ui-vs-ux).
 
+**Symmetric storage.** `fem_symbols(value_shape=(n, n), symmetric=True)` stores the upper triangle only,
+`n(n+1)/2` values per node, in the order `xx, xy, yy` (2-D) or `xx, xy, xz, yy, yz, zz` (3-D) — so a 2-D
+stress costs 3 DOFs per node instead of 4, a 3-D one 6 instead of 9. Nothing else changes: the symbol is the
+full `n×n` matrix in every expression (`S @ W`, `S.T`, `trace`, `inner`, `S[1, 0]` is `S[0, 1]`, `S.x`), and
+its test function is the symmetric one, so the equations are the symmetric part of the full-storage ones.
+On a problem whose full-storage solution is symmetric (the Jaumann shear above, a tensor Laplace, a
+nonlinear `S + |S|²S = F`, a transient decay) the answers agree to round-off with 3/4 of the DOFs
+(`tests/test_fem_matrix_fields.py`). The solution vector holds the stored values, node-major. Scope: the
+native 2-D/3-D Lagrange assembler — a 1-D domain, a VPINN, periodic ties, a complex field or a mix with a
+non-nodal family raise.
+
 ### Reading a multifield solution back
 
 A coupled solve returns **one flat vector**, so the `fem` object carries the handles that say which

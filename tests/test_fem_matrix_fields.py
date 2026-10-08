@@ -245,3 +245,151 @@ def test_jaumann_simple_shear_converges():
     e4, e8 = _jaumann_error(4), _jaumann_error(8)
     assert e8 < 2e-3
     assert e4 / e8 > 4.0  # at least second order
+
+
+# ---------------------------------------------------------------------------------------------------------
+# symmetric=True: n(n+1)/2 stored values per node, the full matrix in every expression
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _jaumann(n, symmetric, g=1.0, G=1.0):
+    d = jno.shape.rect(0.0, 0.5, 1.0, 1.0).structured(n=n).domain(compute_mesh_connectivity=False)
+    d.tag("inflow", lambda x, y: x < 1e-9)
+    x, y = d.variable("interior", split=True)[:2]
+    xl, yl = d.variable("inflow", split=True)[:2]
+    S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), order=2, symmetric=symmetric)
+    Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
+    L = J.array([[0.0, g], [0.0, 0.0]])  # grad u for u = (g y, 0)
+    D, W = (L + L.T) / 2, (L - L.T) / 2
+    transport = lambda A: g * y * A.x  # noqa: E731
+    R = transport(Si) - (W @ Si - Si @ W) - 2 * G * D
+    tau = (0.5 / n) / (2 * g)
+    fem = jno.fem([inner(R, Ti + tau * transport(Ti), n_contract=2), S(xl, yl) - 0.0])
+    U = np.asarray(fem.solve(linear=jno.solve.lu()))
+    return fem, U
+
+
+def _unpack2(U):
+    """Stored (xx, xy, yy) -> full 2x2 per node."""
+    s = U.reshape(-1, 3)
+    return np.stack([s[:, 0], s[:, 1], s[:, 1], s[:, 2]], -1).reshape(-1, 2, 2)
+
+
+def test_symmetric_jaumann_matches_full_storage_with_fewer_dofs():
+    fem_f, U_f = _jaumann(6, symmetric=False)
+    fem_s, U_s = _jaumann(6, symmetric=True)
+    n_nodes = np.asarray(fem_f.points).shape[0]
+    assert fem_f.dofs == 4 * n_nodes and fem_s.dofs == 3 * n_nodes
+    np.testing.assert_allclose(_unpack2(U_s), U_f.reshape(-1, 2, 2), atol=1e-12)
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_symmetric_laplace_and_per_entry_dirichlet(order):
+    """Whole-tensor and per-entry Dirichlet land on the stored values; S[1, 0] and S[0, 1] are one value."""
+    d = _square()
+    x, y = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), order=order, symmetric=True)
+    ex = (
+        (lambda X, Y: (1 + X, 2 * Y, 2 * Y, 3 + 0 * X))
+        if order == 1
+        else (lambda X, Y: (X * X - Y * Y, X * Y, X * Y, 3 + X))
+    )
+    lap = inner(J.jacobian(S, [x, y]), J.jacobian(T, [x, y]), n_contract=3)
+    P = None
+    for bcs in (
+        [S(xb, yb) - mat2(*ex(xb, yb))],
+        [
+            S.bind(x=xb, y=yb)[0, 0] - ex(xb, yb)[0],
+            S.bind(x=xb, y=yb)[1, 0] - ex(xb, yb)[2],
+            S.bind(x=xb, y=yb)[1, 1] - ex(xb, yb)[3],
+        ],
+    ):
+        fem = jno.fem([lap] + bcs)
+        U = np.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 3)
+        P = np.asarray(fem.points)
+        E = np.stack(ex(P[:, 0], P[:, 1]), -1)[:, [0, 1, 3]]
+        assert fem.dofs == 3 * P.shape[0]
+        np.testing.assert_allclose(U, E, atol=1e-11)
+
+
+def test_symmetric_3d():
+    d = jno.domain(jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5))
+    x, y, z = d.variable("interior", split=True)[:3]
+    xb, yb, zb = d.variable("boundary", split=True)[:3]
+    out = {}
+    for sym in (False, True):
+        S, T = d.fem_symbols(value_shape=(3, 3), names=("S", "T"), symmetric=sym)
+        xs = (xb, yb, zb)
+        rows = [[float(i + j) + xs[(i + j) % 3] for j in range(3)] for i in range(3)]  # symmetric, harmonic
+        G = J.stack([J.stack(r, axis=-1) for r in rows], axis=-2)
+        fem = jno.fem([inner(J.jacobian(S, [x, y, z]), J.jacobian(T, [x, y, z]), n_contract=3), S(xb, yb, zb) - G])
+        out[sym] = (fem.dofs, np.asarray(fem.solve(linear=jno.solve.lu())), np.asarray(fem.points))
+    (nf, Uf, P), (ns, Us, _) = out[False], out[True]
+    assert nf == 9 * P.shape[0] and ns == 6 * P.shape[0]
+    iu, ju = np.triu_indices(3)
+    np.testing.assert_allclose(Us.reshape(-1, 6), Uf.reshape(-1, 3, 3)[:, iu, ju], atol=1e-10)
+    E = np.stack([np.stack([i + j + P[:, (i + j) % 3] for j in range(3)], -1) for i in range(3)], -2)
+    np.testing.assert_allclose(Uf.reshape(-1, 3, 3), E, atol=1e-10)
+
+
+def test_symmetric_refuses_an_asymmetric_wall_value():
+    d = _square()
+    x, y = d.variable("interior", split=True)[:2]
+    xl, yl = d.variable("left", split=True)[:2]
+    S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), symmetric=True)
+    Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
+    with pytest.raises(ValueError, match="not symmetric"):
+        jno.fem([inner(Si, Ti, n_contract=2) - J.trace(Ti), S(xl, yl) - mat2(1.0 + 0 * yl, yl, 0 * yl, 1.0 + 0 * yl)])
+
+
+def test_symmetric_needs_a_square_matrix():
+    d = _square()
+    with pytest.raises(ValueError, match="square matrix"):
+        d.fem_symbols(value_shape=(2,), symmetric=True)
+    with pytest.raises(ValueError, match="square matrix"):
+        d.fem_symbols(value_shape=(2, 3), symmetric=True)
+
+
+def test_symmetric_nonlinear_matches_full():
+    """A form nonlinear in S (S + |S|^2 S = F, pointwise): the Newton path sees the same matrix either way."""
+    out = {}
+    for sym in (False, True):
+        d = _square()
+        x, y = d.variable("interior", split=True)[:2]
+        S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), symmetric=sym)
+        Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
+        F = mat2(1 + x, y, y, 2 + 0 * x)
+        fem = jno.fem([inner(Si + inner(Si, Si, n_contract=2) * Si - F, Ti, n_contract=2)])
+        out[sym] = np.asarray(fem.solve(nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-13)))
+    np.testing.assert_allclose(_unpack2(out[True]), out[False].reshape(-1, 2, 2), atol=1e-10)
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_matrix_transient_decay_with_initial_tensor(symmetric):
+    """S_t + S = 0, S(0) = S0: Crank-Nicolson multiplies by r = (1 - dt/2)/(1 + dt/2) each step, exactly."""
+    n_t = 21
+    d = jno.shape.rect(0, 0, 1, 1).structured(n=3).domain(time=(0.0, 1.0, n_t))
+    S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), symmetric=symmetric)
+    V = d.variable("interior", split=True)
+    Sb, Tb = S.bind(x=V[0], y=V[1], t=V[2]), T.bind(x=V[0], y=V[1], t=V[2])
+    ci = d.variable("initial", split=True)
+    one = 1.0 + 0 * ci[0]
+    fem = jno.fem(
+        [inner(Sb.t, Tb, n_contract=2) + inner(Sb, Tb, n_contract=2), S(*ci) - mat2(one, 2 * one, 2 * one, 3 * one)]
+    )
+    traj = np.asarray(fem.solve(time=jno.solve.theta(0.5)).fn())
+    dt = 1.0 / (n_t - 1)
+    r = (1 - dt / 2) / (1 + dt / 2)
+    stored = [1.0, 2.0, 3.0] if symmetric else [1.0, 2.0, 2.0, 3.0]
+    np.testing.assert_allclose(
+        traj[-1].reshape(-1, len(stored)), np.broadcast_to(np.array(stored) * r ** (n_t - 1), (16, len(stored))), rtol=1e-10
+    )
+
+
+def test_symmetric_outside_the_native_assembler_is_refused():
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.25))
+    (x,) = d.variable("interior", split=True)[:1]
+    S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), symmetric=True)
+    with pytest.raises(NotImplementedError, match="native 2-D/3-D Lagrange"):
+        jno.fem([inner(S.bind(x=x), T.bind(x=x), n_contract=2) - J.trace(T.bind(x=x))])

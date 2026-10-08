@@ -194,6 +194,8 @@ A **matrix field** (`value_shape=(n, m)`) takes the same two forms: `S(xb, yb) -
 field with more than three components pins any of them, `u(xb, yb)[3] - g`; `fem.classification` labels
 those entries, and every matrix entry, by their flat index (`dirichlet@left[2]` is entry `(1, 0)` of a
 2×2 field), not by an axis name.
+On a `symmetric=True` field the whole-tensor value must be symmetric — an asymmetric one raises rather than
+keeping half of it — and `S[0, 1]` and `S[1, 0]` name the same stored value.
 
 !!! warning "Fixed: a vector wall value used to keep only its first component"
     Until this was fixed, `u(xb, yb) - (1.0, -0.5)` imposed `(1.0, 1.0)` — silently, steady and
