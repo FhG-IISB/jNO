@@ -405,23 +405,32 @@ def _append_iterations(k, broke, who: str, side: str):
     LAST_LINEAR_STATS.append(entry)
 
 
-_ITERATIONS_SUSPENDED = False
+from jax._src import config as _jax_config  # noqa: E402 -- a jit-keyed config state (see below)
+
+#: Whether a solve TRACED now records its iteration count (one host callback per solve). OFF by default and
+#: switched on by ``fem.solve`` only around an eager, steady, non-adaptive solve -- so a march's compiled
+#: step, a deferred node evaluated under ``jno.core``, and a solver called directly carry no callback.
+#: A JAX config state with ``include_in_jit_key``: the switch is part of every jit cache key, so a program
+#: compiled with the callback is never reused where recording is off (a plain Python flag would be baked
+#: into whichever trace happened first and leak into the other context through the cache).
+_RECORD_ITERATIONS = _jax_config.bool_state(
+    "jno_record_linear_iterations",
+    False,
+    "jNO: record Krylov iteration counts for fem.stats (set by fem.solve; not a user option).",
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
 
 
-@contextlib.contextmanager
+def iterations_recorded(on: bool = True):
+    """Context manager: solves traced inside record (``on``) or do not record their iteration counts."""
+    return _RECORD_ITERATIONS(bool(on))
+
+
 def iterations_suspended():
-    """No iteration counts are recorded for solves TRACED inside this block: a march.
-
-    A march's step is a compiled loop body, and jNO keeps host callbacks out of it -- a nonlinear march
-    would otherwise call back once per Newton step per time step. Its per-step record is
-    ``fem.stats["march"]`` instead. A trace-time switch: a step compiled here carries no callback at all."""
-    global _ITERATIONS_SUSPENDED
-    prev = _ITERATIONS_SUSPENDED
-    _ITERATIONS_SUSPENDED = True
-    try:
-        yield
-    finally:
-        _ITERATIONS_SUSPENDED = prev
+    """No iteration counts for solves traced inside: a march (its step makes no host call; its record is
+    ``fem.stats["march"]``). Recording is off by default; this keeps a march off even inside a recording solve."""
+    return _RECORD_ITERATIONS(False)
 
 
 def record_iterations(k, who: str, *, side: str = "forward", broke=None):
@@ -434,7 +443,7 @@ def record_iterations(k, who: str, *, side: str = "forward", broke=None):
 
     Cost: the callback is a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU) per solve, measured on the default
     Jacobi-BiCGStab -- +7-11% on a 790-DOF solve, unmeasurable (1.000x) at 46,691 DOFs."""
-    if _GATE_SUSPENDED or _ITERATIONS_SUSPENDED:
+    if _GATE_SUSPENDED or not _RECORD_ITERATIONS.value:
         return
     if k is None:
         # Still at RUN time: this is usually called while a solve is traced, and a solve traced (the

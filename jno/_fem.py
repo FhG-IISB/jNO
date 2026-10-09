@@ -2513,8 +2513,22 @@ class FEM:
                     # to the failing step, which is what the user needs next to that error.
                     self._stats["error"] = f"{type(error).__name__}: {str(error).splitlines()[0][:200]}"
 
+            # Krylov iteration counts (fem.stats["linear_iterations"]) are recorded for an eager, steady,
+            # non-adaptive solve only: a march's compiled step makes no host call, and a deferred node is
+            # evaluated later, outside this solve. The switch is jit-keyed (see `solver_api.iterations_recorded`).
+            from .utils.solver.solver_api import iterations_recorded
+
+            _steady = (
+                self._mode in ("linear", "nonlinear", "complex")
+                and adapt is None
+                and tau is None
+                and not getattr(self._op, "history_specs", None)
+                and not getattr(self._op, "surface_history_specs", None)
+                and not getattr(self, "_geometry", None)
+            )
             try:
-                result = _run()
+                with iterations_recorded(_steady):
+                    result = _run()
             except Exception as exc:
                 _record(exc)
                 raise

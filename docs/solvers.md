@@ -1156,8 +1156,9 @@ fem.stats["linear_iterations"]
 solves' when a gradient ran any. `breakdown: True` flags a BiCGStab that stopped on one. The default
 solve, `cg`, `bicgstab`, `minres`, `fgmres`, `cocg`, `chebyshev`, the matrix-free Newton's inner
 BiCGStab and the assembled-tangent Krylov all report. Upstream restarted `gmres` exposes no count and is
-listed under `uncounted`; a direct factorisation reports `None`. A march records no per-step Krylov
-counts — its compiled step makes no host call; `fem.stats["march"]` is its record.
+listed under `uncounted`; a direct factorisation reports `None`. Counts are recorded for an eager,
+steady, non-adaptive solve. A march records none per step — its compiled step makes no host call, and
+`fem.stats["march"]` is its record — and neither does a deferred node evaluated later under `jno.core`.
 
 `cg` and `bicgstab` are `jax.scipy`'s own loops, keeping the iteration count they discard: the same
 arithmetic (`x` identical on CPU, within 1e-10 on GPU from reduction order) and the same time. The count
