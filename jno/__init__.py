@@ -8,7 +8,7 @@ jNO: Physics-Informed Neural Operators.
 
 import sys
 
-from . import bayesian, fn, litho, lora, optimizers, precond, solve, trackers
+from . import bayesian, fn, litho, lora, optimizers, precond, rom, solve, trackers
 from . import jnp_ops as np
 from ._fem import Coupling, derived, fem, lag
 from .architectures.models import nn, parameter
@@ -160,6 +160,7 @@ __all__ = [
     "fem",
     "fdm",
     "fd",
+    "rom",
     "rcwa",
     "Rcwa",
     "RcwaError",

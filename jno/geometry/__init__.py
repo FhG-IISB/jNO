@@ -6,6 +6,7 @@ the single geometry entry that consolidates the mesh-backed and (Shapely) polygo
 """
 
 from .path import Path
+from .raster import cell_fractions
 from .shape import Selector, Shape, shape
 
-__all__ = ["shape", "Shape", "Selector", "Path"]
+__all__ = ["shape", "Shape", "Selector", "Path", "cell_fractions"]

@@ -1305,6 +1305,69 @@ def transfer_solution(
     return out
 
 
+def interpolation_matrix(
+    source_domain: Any, points: Any, *, fill: Any = "nearest", tol: float = 1e-9, k: int = 32, format: str = "scipy"
+):
+    r"""The P1 interpolation OPERATOR of a simplicial mesh at arbitrary points, as a sparse matrix.
+
+    ``P`` has shape ``(n_points, n_vertices)`` and ``D+1`` non-zeros per row (the barycentric weights of the
+    containing simplex), so that ``P @ u`` is the piecewise-linear field ``u`` evaluated at ``points`` -- for one
+    field or for a whole ``(n_vertices, m)`` block (a reduced basis, a snapshot set) in one product.
+    :func:`transfer_solution` answers the same question for ONE target mesh and returns values; this returns the
+    reusable linear map, which is what a fixed map applied to many fields needs (mapping POD modes between
+    geometries, pulling snapshots onto a reference configuration, projecting onto a coarser mesh). ``P.T`` is the
+    adjoint (scatter) map.
+
+    Parameters
+    ----------
+    source_domain
+        Meshed 1-D/2-D/3-D simplicial ``jno`` domain, or ``(points, cells)`` arrays.
+    points
+        ``(Q, D)`` query points.
+    fill
+        Points outside the mesh: ``"nearest"`` (default) projects onto the nearest simplex, ``"error"`` raises,
+        a float makes that row zero (``P @ u`` then gives 0 there; add the constant yourself).
+    tol, k
+        As in :func:`transfer_solution`.
+    format
+        ``"scipy"`` (``scipy.sparse.csr_matrix``, host) or ``"bcoo"`` (``jax.experimental.sparse.BCOO``, device).
+    """
+    import scipy.sparse as sp
+
+    if isinstance(source_domain, (tuple, list)) and len(source_domain) == 2:
+        src_pts, src_cells = (np.asarray(a) for a in source_domain)
+        dim = src_cells.shape[1] - 1
+        src_pts = src_pts[:, :dim].astype(np.float64)
+    else:
+        dim = int(source_domain.dimension)
+        key = {1: "line", 2: "triangle"}.get(dim, "tetra")
+        mesh = source_domain.built_mesh if hasattr(source_domain, "built_mesh") else source_domain.mesh
+        src_pts = np.asarray(mesh.points)[:, :dim].astype(np.float64)
+        src_cells = np.asarray(mesh.cells_dict[key])
+    src_cells = src_cells.astype(np.int64)
+    qpts = np.asarray(points, np.float64)[:, :dim]
+    if fill not in ("nearest", "error") and not isinstance(fill, (int, float)):
+        raise ValueError(f"fill must be 'nearest', 'error', or a numeric constant; got {fill!r}.")
+    idx, weights, inside = _locate_barycentric(src_pts, src_cells, qpts, tol=tol, k=k)
+    n_out = int((~inside).sum())
+    if n_out and fill == "error":
+        raise ValueError(f"interpolation_matrix: {n_out}/{len(qpts)} points fall outside the source mesh.")
+    if isinstance(fill, (int, float)) and n_out:
+        weights = np.where(inside[:, None], weights, 0.0)
+    rows = np.repeat(np.arange(len(qpts)), idx.shape[1])
+    P = sp.csr_matrix(
+        (np.asarray(weights, np.float64).ravel(), (rows, np.asarray(idx).ravel())), shape=(len(qpts), len(src_pts))
+    )
+    P.eliminate_zeros()
+    if format == "scipy":
+        return P
+    if format == "bcoo":
+        from jax.experimental import sparse as jsp
+
+        return jsp.BCOO.from_scipy_sparse(P)
+    raise ValueError(f"format must be 'scipy' or 'bcoo', got {format!r}")
+
+
 def _tabulate_lagrange_at(dim: int, order: int, xi: np.ndarray) -> np.ndarray:
     """The Lagrange P{order} simplex basis tabulated at reference coordinates ``xi`` ``(Q, dim)`` ->
     ``(Q, n_dof)``. Uses the SAME :func:`fem_lagrange._lagrange_basix` builder as the assembler, so the
