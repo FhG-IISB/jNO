@@ -7,10 +7,9 @@ reshape target, JAX formatted the shape error by iterating the node, and that ne
 hang inside ``jno.fem`` instead of an assembled load. The workaround was ``d.e + 0*x``.
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 import jno
 from jno.jnp_ops import concat
@@ -58,7 +57,7 @@ def test_region_coefficient_component_of_a_vector_load(tmp_path):
     def load(E):
         return np.asarray(jno.fem([inner(A, V) - inner(E, V)]).b).reshape(-1)
 
-    b_bare = load(vec(0.0 * x, d.e, 0.0 * x))                  # used to hang here
-    b_broadcast = load(vec(0.0 * x, d.e + 0.0 * x, 0.0 * x))   # the old workaround
+    b_bare = load(vec(0.0 * x, d.e, 0.0 * x))  # used to hang here
+    b_broadcast = load(vec(0.0 * x, d.e + 0.0 * x, 0.0 * x))  # the old workaround
     np.testing.assert_allclose(b_bare, b_broadcast, rtol=0, atol=1e-14)
     assert np.abs(b_bare).max() > 0.0
