@@ -2059,7 +2059,7 @@ class domain(MeshIOMixin):
             return None
         return lambda p: region.contains(p)
 
-    def tag_node_mask(self, tag, points):
+    def tag_node_mask(self, tag, points, *, closure: bool = False):
         """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
 
         The companion to :meth:`_make_tag_location_fn`, and the one an assembler should use when it
@@ -2073,6 +2073,12 @@ class domain(MeshIOMixin):
         Only the *user* predicate moves off the JAX path. The boundary restriction it is intersected
         with stays where it was -- a tolerance-based proximity test against the region's own points,
         which float32 cannot break.
+
+        ``closure=True`` adds every vertex of the boundary facets the tag selected -- what a FACET-based
+        use needs (the non-nodal path pins a facet's edge/face DOFs when all its vertices are in the
+        tag). The default is the predicate at the vertices, which is what a NODE-based use means: a
+        nodal Dirichlet value or tie can exclude a corner with a vertex predicate, and the closure would
+        put it back.
 
         Returns ``None`` when the tag is unknown, matching ``_make_tag_location_fn``.
         """
@@ -2112,6 +2118,23 @@ class domain(MeshIOMixin):
                 hit = np.flatnonzero(mask)
                 pts, n = pts[hit], int(hit.size)
                 mask[hit] = _vmapped(full.contains).astype(bool)
+            # ...and, for a FACET-based use (`closure=True`), every vertex of the facets the tag SELECTED.
+            # The tag picks its facets by the predicate at facet centroids, but a node test re-asks it at
+            # the vertices, and the two can disagree: on a curved wall the centroids sit inside the surface
+            # by the chord sagitta, and a predicate written to keep a neighbouring plane out ("not on
+            # z = 0") drops the vertices where the wall MEETS that plane. Every edge touching that junction
+            # then went unpinned in silence -- measured on a mirror-cell eddy problem in a cylindrical can:
+            # L 8 % high. A NODE-based use keeps the vertex predicate, which is how a nodal value or tie
+            # excludes a corner on purpose.
+            reg = self._boundary_regions.get(tag) if closure else None
+            fac = None if reg is None else getattr(reg, "facets", None)
+            if fac is not None and len(fac):
+                from scipy.spatial import cKDTree
+
+                fv = np.unique(np.asarray(fac, dtype=np.float64).reshape(-1, np.asarray(fac).shape[-1])[:, :dim], axis=0)
+                span = float(np.ptp(pts64[:, :dim])) if len(pts64) else 1.0
+                d_, _i = cKDTree(fv).query(pts64[:, :dim], distance_upper_bound=1e-12 * max(span, 1e-30) + 1e-300)
+                mask |= np.isfinite(d_)
             return mask
 
         num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
@@ -2742,6 +2765,11 @@ class domain(MeshIOMixin):
             if _rs is not None and len(_rs):
                 blocks.append(_rs)
                 owners.append(str(region))
+                _mrs = _rs.mean(axis=1)
+                if np.asarray(where(*[_mrs[:, i] for i in range(dim)])).reshape(-1).astype(bool).any():
+                    # the nodal assemblers walk boundary facets only: `jno.fem` routes forms on such a
+                    # tag to the non-nodal path, which integrates interior facets
+                    self.__dict__.setdefault("_interior_face_tags", set()).add(name)
         _bo = [(np.asarray(b), o) for b, o in zip(blocks, owners) if b is not None and len(b)]
         blocks, owners = [b for b, _ in _bo], [o for _, o in _bo]
         # Every block must be the same kind of facet to stack: they are, on the single-cell-type mesh

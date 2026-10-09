@@ -1046,6 +1046,7 @@ def assemble_fem_nonnodal(
 
                 def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r):
                     per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
+                    _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _p is None else _p)[cells_j[c]])
                     vol_vars = tuple(
                         (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
                         for name in runtime_parameter_tags
@@ -1056,7 +1057,7 @@ def assemble_fem_nonnodal(
                         "field_index": field_index,
                         "tag": "fem_gauss",
                         "surface": False,
-                        "domain_context": ctx,
+                        "domain_context": _ctx_c,
                         "temporal_tags": (),
                         "runtime_parameter_tags": runtime_parameter_tags,
                         "region_mask_names": _rn,
@@ -1460,6 +1461,7 @@ def assemble_fem_nonnodal(
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
                 cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
                 per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
+                _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _pts_dyn is None else _pts_dyn)[cells_j[c]])
                 vol_vars = tuple(
                     (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
                     for name in runtime_parameter_tags
@@ -1470,7 +1472,7 @@ def assemble_fem_nonnodal(
                     "field_index": field_index,
                     "tag": "fem_gauss",
                     "surface": False,
-                    "domain_context": ctx,
+                    "domain_context": _ctx_c,
                     "temporal_tags": (),
                     "runtime_parameter_tags": runtime_parameter_tags,
                     "region_mask_names": rnames,
@@ -2049,6 +2051,27 @@ def _legacy_natural(bare, field_index, spaces) -> bool:
     return False
 
 
+def _with_cell_size(ctx, meas, xq, verts=None):
+    """``ctx`` with the cell-geometry symbols resolved for one cell, as the nodal assembler packs them:
+    ``dom.cell_size`` = ``|det J|^(1/dim)`` and ``dom.cell_metric`` = ``G = J^-T J^-1`` at every quadrature
+    point. Only those the form reads -- otherwise their placeholders would stand in for h / G without a
+    word. ``verts`` are the cell's vertex coordinates (needed for ``G``; affine simplices)."""
+    want_h, want_g = "cell_size" in ctx, "cell_metric" in ctx
+    if not (want_h or want_g):
+        return ctx
+    nq, dim = xq.shape[0], xq.shape[-1]
+    out = dict(ctx)
+    if want_h:
+        out["cell_size"] = jnp.broadcast_to(jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (nq, 1))
+    if want_g:
+        if verts is None:
+            raise NotImplementedError("dom.cell_metric on this non-nodal path needs the cell's vertices.")
+        J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)
+        K = jnp.linalg.inv(J)
+        out["cell_metric"] = jnp.broadcast_to(K.T @ K, (nq, dim, dim))
+    return out
+
+
 def _build_general_surface(
     gsurf_terms, domain, dim, cell_name, cells, spaces, field_index, dofmaps, offs, quad_degree, dofmap_for, tabulate
 ):
@@ -2103,7 +2126,7 @@ def _build_general_surface(
     }
 
     def _region_facets(region):
-        mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+        mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
         if mask is None:
             raise ValueError(f"jno.fem (non-nodal): boundary region {region!r} has no location function.")
         mask = np.asarray(mask, dtype=bool).reshape(-1)
@@ -2606,7 +2629,7 @@ def _rt_pressure_load_general(b, pd_node, fidx, region, dm, domain, pts_np, cell
     from ..._fem import _eval_value_node_at
     from .fem_dofmap import facet_owners
 
-    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
     if mask is None:
         raise ValueError(f"jno.fem (non-nodal): natural-BC region {region!r} has no location function.")
     mask = np.asarray(mask, dtype=bool).reshape(-1)
@@ -3086,7 +3109,7 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
         region_trace_entities,
     )
 
-    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
     if mask is None:
         raise ValueError(f"jno.fem (non-nodal): essential region {region!r} has no location function.")
     mask = np.asarray(mask, dtype=bool).reshape(-1)
