@@ -2471,7 +2471,10 @@ class FEM:
             try:
                 result = _run()
             except Exception as exc:
-                _record(exc)
+                named = self._name_factorization_failure(exc)
+                _record(named or exc)
+                if named is not None:
+                    raise named from exc
                 raise
             _record()
             if "jaxamg" in _sys.modules:  # AmgX solver-cache summary, only if jaxamg is in play
@@ -2489,7 +2492,14 @@ class FEM:
             # CONCRETE result -- under an outer jit/grad/vmap the solve returns a tracer, nothing has
             # run, and there is nothing to drain (the limitation is documented in docs/solvers.md).
             if not any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(result)):
-                jax.block_until_ready(result)
+                try:
+                    jax.block_until_ready(result)  # an asynchronous failure surfaces here
+                except Exception as exc:
+                    named = self._name_factorization_failure(exc)
+                    if named is None:
+                        raise
+                    _record(named)
+                    raise named from exc
                 raise_if_gate_failed()
             return result
 
@@ -2903,6 +2913,10 @@ class FEM:
         # it root-finds the min-map instead of the bare residual. Done here, once, so the same wrapper
         # serves the plain steady solve and every step of the history march below, and composes with any
         # `nonlinear=` slot the caller picked. ----
+        # Whether a parametric solve's verdict may RAISE (see `_record_values_verdict`): only for jNO's own
+        # drivers, whose tolerances the verdict knows. A user `solve_fn=` carries its own tolerances, and a
+        # box-constrained solve root-finds the min-map, not the residual the verdict re-evaluates.
+        _jno_driver = (solve_fn is None or from_slots) and not getattr(self, "_bound_specs", None)
         if getattr(self, "_bound_specs", None):
             solve_fn = self._bounded_solve_fn(solve_fn)
 
@@ -3119,7 +3133,8 @@ class FEM:
 
             _out = self._op.solve(solve_fn=_reduced, **kwargs)
             if kwargs.get("values"):
-                self._record_values_verdict(_out, kwargs, nonlinear)  # see that method: jit hides the guard
+                # see that method: jit hides the guard
+                self._record_values_verdict(_out, kwargs, nonlinear, judge=_jno_driver)
             # A SLIP reduction returns the array, matching the non-reduced steady-nonlinear branch below:
             # it is a boundary condition, not a training construct, and leaving it lazy meant
             # `np.asarray(fem.solve(...))` silently produced a 0-d OBJECT array that only blew up later
@@ -3152,11 +3167,41 @@ class FEM:
             return self._op.solve(solve_fn, **kwargs).fn()
         out = self._op.solve(solve_fn, **kwargs)
         if kwargs.get("values") and self._mode == "nonlinear":
-            self._record_values_verdict(out, kwargs, nonlinear)
+            self._record_values_verdict(out, kwargs, nonlinear, judge=_jno_driver)
         return out
 
-    def _record_values_verdict(self, out, kwargs, nonlinear):
-        """Judge a ``fem.solve(param=value)`` solve and write it to :attr:`stats`.
+    def _name_factorization_failure(self, exc):
+        """A named ``RuntimeError`` for a host SuperLU factorization that failed inside this solve, else None.
+
+        On the CPU the sparse-direct solve (``jno.solve.lu()``, ``newton(direct=True)``) is JAX's
+        ``spsolve``, whose callback runs scipy's SuperLU. A singular or structurally rank-deficient
+        operator makes SuperLU abort ("failed to factorize matrix at line ... dpanel_bmod.c"), which
+        reaches the caller wrapped in a JAX callback error that names neither the matrix nor the cause.
+        Called only on the failure path, so a successful solve pays nothing for it.
+        """
+        from .utils.solver.linear import (
+            SUPERLU_SINGULAR_PHRASE,
+            superlu_failure_detail,
+            superlu_singular_message,
+        )
+
+        text = str(exc)
+        if SUPERLU_SINGULAR_PHRASE in text:  # `lu(backend="host")` already named it, with the exact size
+            line = next(ln for ln in reversed(text.splitlines()) if SUPERLU_SINGULAR_PHRASE in ln)
+            return RuntimeError(line.split("RuntimeError:", 1)[-1].strip())
+        detail = superlu_failure_detail(text)
+        if detail is None:
+            return None
+        n = int(self.dofs)
+        per = getattr(self, "_periodic", None)
+        if per is not None:
+            from .utils.solver.fem_utils import _periodic_blocks
+
+            n = int(_periodic_blocks(per)[2][-1])  # the REDUCED system is the one factorized
+        return RuntimeError(superlu_singular_message((n, n), detail, known_size=False))
+
+    def _record_values_verdict(self, out, kwargs, nonlinear, *, judge=True):
+        """Judge a ``fem.solve(param=value)`` solve, write it to :attr:`stats`, and raise if it stalled.
 
         That solve is jitted -- which is how it avoids re-staging for every value -- and the driver's
         own convergence check self-disables under a trace, so without this it returns with NO verdict
@@ -3164,6 +3209,12 @@ class FEM:
         the residual the solver actually worked on: the REDUCED one on a reduced system, because the
         full residual of a constrained problem keeps the constraint's reaction, which is physical and
         stays O(1) however well converged the solve is.
+
+        A failed verdict RAISES, exactly as the driver's own check does on an eager solve. It used to be
+        recorded only (``fem.stats["nonlinear"]["converged"] = False``), so a stalled Newton -- a 3-D
+        rolling model warm-started from a different problem, residual 1e-1 against a 1e-10 tolerance --
+        came back as an ordinary-looking field. ``judge=False`` (a user ``solve_fn=`` or a box-constrained
+        solve, whose tolerances or residual the verdict does not know) records without raising.
         """
         from .utils.solver.slip_runtime import bind_periodic
         from .utils.solver.solver_api import record_nonlinear_verdict
@@ -3189,7 +3240,21 @@ class FEM:
             u = restrict_state_periodic(per, u)
             if u0.shape[0] != u.shape[0]:
                 u0 = restrict_state_periodic(per, u0)
-        record_nonlinear_verdict(res_at, u, u0, nonlinear, getattr(nonlinear, "name", None) or "newton")
+        who = getattr(nonlinear, "name", None) or "newton"
+        r_end, bound, ok = record_nonlinear_verdict(res_at, u, u0, nonlinear, who)
+        if ok is False and judge:
+            cfg = getattr(nonlinear, "config", None) or {}
+            traits = getattr(nonlinear, "traits", None) or {}
+            rtol, atol = float(traits.get("rtol", 1e-8)), float(traits.get("atol", 1e-8))
+            cap = f" in max_steps={cfg['max_steps']}" if "max_steps" in cfg else ""
+            raise RuntimeError(
+                f"fem.solve({', '.join(f'{k}=...' for k in vals)}): {who} did not converge{cap}: residual norm "
+                f"{r_end:.3e} against the tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, "
+                f"rtol={rtol:g}){' on the reduced system' if per is not None else ''}. The last iterate is "
+                "NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
+                "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0 (a nearby "
+                "solved parameter value, e.g. fem.solve(continuation=...))."
+            )
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
