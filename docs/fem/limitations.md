@@ -103,8 +103,11 @@ path is unaffected.
     any other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g`
     through the solve's / each step's `custom_root` (nonlinear / transient).
 
-    Refused loudly: a value that is **both** parametric and t/τ-dependent (`u(top) - g*tau`). Train
-    the amplitude through a Neumann / body term instead. A parametric wall **beside** a τ-ramped one
+    A value that is **both** parametric and t/τ-dependent is held at each step's t/τ WITH the runtime
+    parameters, on a first-order transient and on a τ load-path march (`u(top)[1] - g*tau`,
+    displacement control with a trainable grip). Refused loudly on a second-order (`u.tt`) form, whose
+    block evaluates the value and its rate without them: train that amplitude through a Neumann / body
+    term instead. A parametric wall **beside** a τ-ramped one
     (`u(left) - g` with `u(right) - delta*tau`) is fine on the load path: both are held at every step.
     A t/τ-dependent essential value needs steps to be held at: on a steady form that reads no step
     history (`.i(k)`), and so does not march its `domain(tau=...)` grid, it is refused, with or without
