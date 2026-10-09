@@ -719,15 +719,17 @@ class PolygonDomain(domain):
         return self
 
     def _register_tag_boundary_region(self, name, where, region=None):
-        # `region=` (a d.tag restriction to one body) only arises on a multi-body shape.regions
-        # domain, which does not take this polygon path; accepted so the signatures match.
         """Polygon override: promote a *pure-boundary* ``domain.tag(name, where)`` to a normals-bearing
         boundary tag. The base method records the selected boundary facets as a region (so a Dirichlet
         term binds there); here we additionally register those facets as boundary segments via
         :meth:`add_boundary_segments`, so ``variable(name, normals=True)`` returns outward normals
         (oriented by the polygon interior, just like the built-in ``left``/``right``/``top``/``bottom``
         edge tags). A 2-D region that merely touches the boundary stays an interior sampling region."""
-        super()._register_tag_boundary_region(name, where)
+        super()._register_tag_boundary_region(name, where, region)
+        if region is not None:
+            # a body-owned tag (`region=`): its facets may lie inside the mesh (the body's surface), so it
+            # is not a polygon boundary segment -- the base registration is the whole story
+            return
         region = self._boundary_regions.get(name)
         edges = None if region is None else getattr(region, "edges", None)
         if edges is None or len(np.asarray(edges)) == 0:

@@ -119,6 +119,9 @@ fem  = jno.fem([adv*vi + nu*(ui.x*vi.x + ui.y*vi.y) - f*vi
                 + tau * adv * (beta[0]*vi.x + beta[1]*vi.y), u(xb, yb) - 0.0])
 ```
 
+A component of `jno.np.vector` may be a bare number next to per-point expressions: `jno.np.vector(1.0, 0.0, x)`
+broadcasts the numbers over the points and is exactly `jno.np.vector(1.0 + 0.0*x, 0.0*x, x)`.
+
 ## Coefficients & the escape hatch
 
 | You want | Write |

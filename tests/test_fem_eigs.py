@@ -383,16 +383,15 @@ def test_eigs_sigma_small_pencil_takes_the_dense_path():
 
 def test_eigs_sigma_on_an_eigenvalue_fails_loud():
     """σ exactly ON a discrete eigenvalue makes K − σM singular. The inner factorization degenerates
-    and the original-pencil residual gate must poison (or the factorization itself raise) — never a
-    silently wrong interior spectrum."""
+    and the original-pencil residual gate must RAISE by name (eagerly; it used to hand back a NaN
+    array) — never a silently wrong interior spectrum, never a NaN to be passed on unread."""
+    from jno.utils.solver.eigen import ShiftInvertNotConverged
+
     d, K, mass = _dirichlet_box(0.1)
     lam_all, _ = K.eigs(mass=mass, k=1)
     sig = float(np.asarray(lam_all)[0])  # the exact discrete λ₁
-    try:
-        lam, _X = K.eigs(mass=mass, k=2, sigma=sig)
-    except Exception:
-        return  # a loud factorization failure is an acceptable outcome
-    assert np.isnan(np.asarray(lam)).any(), "a singular shift must poison, not return a spectrum"
+    with pytest.raises(ShiftInvertNotConverged, match="singular"):
+        K.eigs(mass=mass, k=2, sigma=sig)
 
 
 def test_eigs_sigma_argument_guards():

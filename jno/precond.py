@@ -525,6 +525,7 @@ class _Hypre(_Spec):
         pc.setOperators(mat)
         pc.setType("hypre")
         pc.setHYPREType(self.kind)
+        _hypre_high_order = False
         if self.kind == "ams":
             # AMS needs the H(curl) structure: the discrete gradient and the node coordinates. jNO
             # already builds the gradient for its own AMS, from the same topology.
@@ -547,12 +548,44 @@ class _Hypre(_Spec):
                     "the field: jno.precond.triangular((u, jno.precond.hypre(kind='ams')), (p, ...))."
                 )
             pc.setHYPREDiscreteGradient(PETSc.Mat().createAIJ(size=Gs.shape, csr=(Gs.indptr, Gs.indices, Gs.data)))
-            pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
-            pc.setCoordinates(pts)
+            _topo = fem.domain._fem_nonnodal_topology
+            if _topo.get("lowest_order_n1e", True):
+                pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
+                pc.setCoordinates(pts)
+            else:
+                # Degree k: G maps P_m (not the vertices) into the edge space, so vertex coordinates no
+                # longer describe the auxiliary space. hypre takes the vector interpolation Π instead
+                # (HYPRE_AMSSetInterpolations), node-interleaved, column 3j + a <- component a of node j.
+                # ONLY the full Π: petsc4py 3.25 corrupts the heap when handed the per-component list
+                # (measured: `malloc(): invalid size` inside setHYPRESetInterpolations), and the
+                # component-wise cycles (cycle_type >= 10, PETSc's default 13) need exactly those, so
+                # they crash in hypre_AMSSetup. The full-Π cycle (cycle_type 1) is therefore the default
+                # here; an explicit cycle_type option still wins.
+                from .utils.solver.ams import nodal_vector_interpolation
+
+                def _petsc(M):
+                    mi, md = np.asarray(M.indices), np.asarray(M.data)
+                    Ms = sp.csr_matrix((md, (mi[:, 0], mi[:, 1])), shape=tuple(int(x) for x in M.shape))
+                    return Ms, PETSc.Mat().createAIJ(size=Ms.shape, csr=(Ms.indptr, Ms.indices, Ms.data))
+
+                blocks = [_petsc(P) for P in nodal_vector_interpolation(_topo)]
+                dim = len(blocks)
+                full = sp.hstack([b_[0] for b_ in blocks]).tocsc()
+                nL = blocks[0][0].shape[1]
+                inter = np.arange(dim * nL).reshape(dim, nL).T.reshape(-1)  # column 3j + a <- block a, node j
+                full = full[:, inter].tocsr()
+                full_m = PETSc.Mat().createAIJ(size=full.shape, csr=(full.indptr, full.indices, full.data))
+                pc.setHYPRESetInterpolations(dim, None, None, full_m, None)
+                _hypre_high_order = True
         opts = PETSc.Options()
         for k, v in self.options.items():
             opts.setValue(f"pc_hypre_{self.kind}_{k}", v)
-        pc.setFromOptions()
+        if self.kind == "ams" and _hypre_high_order and "cycle_type" not in self.options:
+            opts.setValue("pc_hypre_ams_cycle_type", 1)  # the full-Π cycle; see above
+            pc.setFromOptions()
+            opts.delValue("pc_hypre_ams_cycle_type")  # the options DB is global: do not leak it into later PCs
+        else:
+            pc.setFromOptions()
         pc.setUp()
 
         xv, bv = mat.createVecRight(), mat.createVecLeft()
