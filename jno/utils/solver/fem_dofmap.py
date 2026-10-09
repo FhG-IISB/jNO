@@ -243,6 +243,23 @@ class DofMap:
     signs: Optional[np.ndarray] = None  # (n_cells, ndof_local) when B is diagonal ±1
     element: object = field(default=None, repr=False)
 
+    # ---- pickling ------------------------------------------------------------------------------
+    # A non-nodal build leaves its maps on the domain (`_fem_nonnodal_topology`), and `element` is a
+    # basix C++ object that does not pickle -- so `jno.save` of any domain a degree-k form had been
+    # built on failed with "cannot pickle 'basix._basixcpp.FiniteElement_float64'". The element is a
+    # pure function of (family, cell, degree): drop it on the way out, rebuild it on the way in. The
+    # cached device tables `_jt` are rebuilt on first use as well.
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["element"] = None
+        state.pop("_jt", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.element is None:
+            self.element = basix_element(self.family, self.cell, self.degree)
+
     # ---- per-cell transform -------------------------------------------------------------------
     @property
     def is_diagonal(self) -> bool:

@@ -188,6 +188,25 @@ def _vec(fs):
     return jno.np.vector(*fs)
 
 
+def test_a_domain_with_degree_k_maps_survives_save_and_load(tmp_path):
+    """A non-nodal build leaves its DOF maps on the domain, and each carries a basix element (a C++ object
+    that does not pickle). `jno.save` of such a domain used to fail; the element is now rebuilt on load,
+    and the reloaded maps are the same -- numbering and per-cell basis transforms alike."""
+    d = _domain(2, 0.4)
+    u, v, ui, vi, (x, y) = _bound(d, 2, "N1E", 2)
+    jno.fem([inner(ui, vi) + ui.curl() * vi.curl() - (y * vi[0] - x * vi[1])])
+    dm = d._fem_nonnodal_topology["dofmap"]
+
+    jno.save(d, str(tmp_path / "dom.pkl"))
+    d2 = jno.load(str(tmp_path / "dom.pkl"), expected_type=jno.domain)
+    dm2 = d2._fem_nonnodal_topology["dofmap"]
+    assert dm2.element is not None and dm2.element.dim == dm.element.dim
+    assert np.array_equal(dm2.cell_dofs, dm.cell_dofs)
+    for c in range(dm.cell_dofs.shape[0]):
+        assert np.array_equal(dm2.cell_transform_np(c), dm.cell_transform_np(c))
+    assert np.array_equal(np.asarray(dm2.cell_transform(3)), np.asarray(dm.cell_transform(3)))
+
+
 # ------------------------------------------------------------------------------------------------
 # reproduction, convergence, spectrum, traces
 # ------------------------------------------------------------------------------------------------
