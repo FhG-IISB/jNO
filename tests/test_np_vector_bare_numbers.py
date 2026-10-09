@@ -93,6 +93,12 @@ def _n1e_projection(tdim, components, k):
     return val, P, sol
 
 
+def _same_solution(a, b):
+    """Two solves of the same system: equal to round-off (bit for bit on CPU, not always on GPU)."""
+    a, b = np.asarray(a), np.asarray(b)
+    np.testing.assert_allclose(a, b, rtol=0, atol=1e-12 * max(np.abs(b).max(), 1.0))
+
+
 @pytest.mark.parametrize(
     "tdim, k, bare, broadcast, exact",
     [
@@ -118,7 +124,9 @@ def _n1e_projection(tdim, components, k):
 def test_bare_number_component_builds_and_solves_like_the_broadcast_spelling(tdim, k, bare, broadcast, exact):
     val_b, P, sol_b = _n1e_projection(tdim, bare, k)
     val_w, _, sol_w = _n1e_projection(tdim, broadcast, k)
-    np.testing.assert_array_equal(sol_b, sol_w)  # the same linear system, bit for bit
+    # The same linear system: bit for bit on CPU; on GPU the iterative solve's reductions may round
+    # differently between two runs, so compare at round-off (measured: 2e-18 on a field of size 0.4).
+    _same_solution(sol_b, sol_w)
     np.testing.assert_allclose(val_b, exact(P), atol=1e-7)  # the analytic field, to the BiCGStab tolerance
 
 
@@ -139,5 +147,5 @@ def test_bare_number_in_a_vector_dirichlet_value_lagrange_laplace():
 
     P, sol_b = solve(lambda x: (1.0, x))
     _, sol_w = solve(lambda x: (1.0 + 0.0 * x, x))
-    np.testing.assert_array_equal(sol_b, sol_w)
+    _same_solution(sol_b, sol_w)
     np.testing.assert_allclose(sol_b, np.stack([np.ones(len(P)), P[:, 0]], -1), atol=1e-7)
