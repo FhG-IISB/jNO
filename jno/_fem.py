@@ -1982,8 +1982,8 @@ class FEM:
         ``None`` before any solve. Afterwards a dict with ``mode``, ``dofs``, ``wall_s`` (dispatch
         time of the solve call — JAX is async; block on the result for compute time), the ``linear``
         and ``precond`` slot reprs, ``nonlinear`` (driver name, final residual norm against its
-        bound, step count where the driver runs its loop eagerly — ``newton_direct`` reports steps,
-        the traced-loop drivers report ``None``), and ``amgx_cache`` (AmgX solver-cache occupancy)
+        bound, step count — every driver reports it: ``newton_direct`` from its forward loop, ``newton_krylov`` and
+        ``staggered`` as an auxiliary output of their ``custom_root``), and ``amgx_cache`` (AmgX solver-cache occupancy)
         when jaxamg served the solve. Populated on eager paths; a solve wrapped whole in
         ``jit``/``vmap``/``grad`` records the slots but no residuals — the same concrete-only
         self-disabling as the convergence guards.
