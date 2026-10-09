@@ -45,7 +45,7 @@ def _roll_buffer(buf, nv):
     return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
 
 
-def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
+def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, checkpoint=None):
     """March ``fem`` over its domain's pseudo-time grid and return the ``(n_steps, n_dofs)`` trajectory.
 
     ``solve_fn`` (if given) is a nonlinear solver ``(residual_fn, u0) -> u`` — e.g. the one composed from
@@ -64,8 +64,16 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
     and returns the trajectory array; every runtime parameter must be named. Without them a parametric form
     returns the differentiable trace node that ``crux`` resolves. (The values used to be dropped, and the
     march ran at the parameters' STORED values -- a silently wrong answer.)
+
+    ``checkpoint`` (``fem.solve(checkpoint=jno.solve.checkpoint(path))``) runs the fixed-grid march as a
+    host loop of compiled chunks, writing the trajectory and the carry to disk after each one and resuming
+    an interrupted run -- see :func:`_march`. A forward run only: it is refused where the march must stay
+    one differentiable scan (a parametric trace node) and on the legs with their own loops (adaptive,
+    arc-length, contact).
     """
     op = fem._op
+    if checkpoint is not None:
+        _refuse_checkpoint_leg(fem, path, contact, values)
     if values is not None:
         from ...trace import check_runtime_values
 
@@ -251,9 +259,62 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
             r_start = jnp.linalg.norm(jnp.asarray(root_fn(u_ref)))
             return (u, new_buffers, new_sbuffers), (u, r_end, r_start)
 
+        from .march_checkpoint import claim
+
+        spec = claim("load-path march")
+        if spec is not None:
+            return _march_checkpointed(spec, step, (u0, buffers0, sbuffers0), _grid, _frames, param_args)
         _final, (traj, r_end, r_start) = lax.scan(step, (u0, buffers0, sbuffers0), (_grid, _frames))
         _check_march_converged(r_end, r_start, _grid, solve_fn, states=traj)
         return traj  # (n_steps, n_dofs)
+
+    def _march_checkpointed(spec, step, carry, _grid, _frames, param_args):
+        """The same march as one ``lax.scan``, run as chunks of ``spec.every`` steps with the trajectory and
+        the carry written to disk after each -- so a killed run resumes from its last chunk.
+
+        Bit-identical to the single scan (the step is the same compiled function; a scan of k steps then k
+        more is a scan of 2k). What it gives up is reverse-mode differentiation, which is why it only runs
+        on concrete values (:func:`_refuse_checkpoint_leg`). Each chunk is judged BEFORE it is written, so
+        a diverged step raises instead of becoming the state a resume would continue from."""
+        import re
+
+        from .march_checkpoint import FixedMarchCheckpoint, carry_meta, digest, pack_carry, unpack_carry
+
+        n = int(_grid.shape[0])
+        meta = {
+            "grid": digest(np.asarray(_grid)),
+            "n_dofs": n_dofs,
+            "dtype": str(np.dtype(dtype)),
+            "every": int(spec.every),
+            "carry": carry_meta(carry),
+            # function reprs carry their address, which changes every process
+            "solver": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(solve_fn)),
+            "problem": digest(*jax.tree_util.tree_leaves(param_args), *jax.tree_util.tree_leaves(_frames)),
+        }
+        ck = FixedMarchCheckpoint(spec, kind="load-path", meta=meta, shape=(n, n_dofs), dtype=dtype)
+        r_end, r_start = np.zeros(n), np.zeros(n)
+        start, same = 0, True
+        if ck.resumed is not None:
+            start = int(ck.resumed["step"])
+            carry = unpack_carry(carry, ck.resumed)
+            r_end[:start], r_start[:start] = ck.resumed["r_end"][:start], ck.resumed["r_start"][:start]
+            same = bool(ck.resumed["same"])
+        run = jax.jit(lambda c, g, f: lax.scan(step, c, (g, f)))
+        first = None if start == 0 else np.asarray(ck.frames[0])
+        for a in range(start, n, int(spec.every)):
+            b = min(n, a + int(spec.every))
+            carry, (traj, re_, rs_) = run(carry, _grid[a:b], {k: v[a:b] for k, v in _frames.items()})
+            traj = np.asarray(traj)
+            ck.frames[a:b] = traj
+            r_end[a:b], r_start[a:b] = np.asarray(re_), np.asarray(rs_)
+            first = traj[0] if first is None else first
+            same = same and bool(np.all(traj == first))
+            # Judge before writing: a non-root must not become the state a resume continues from. The
+            # "returned its initial state" test needs the WHOLE march, so it waits for the last chunk.
+            _check_march_converged(r_end[:b], r_start[:b], np.asarray(_grid)[:b], solve_fn, unchanged=False)
+            ck.save(b, {**pack_carry(carry), "r_end": r_end, "r_start": r_start, "same": np.asarray(same)})
+        _check_march_converged(r_end, r_start, np.asarray(_grid), solve_fn, unchanged=same)
+        return ck.finish(n)
 
     # ---- ADAPTIVE load stepping (`fem.solve(tau=jno.solve.adaptive(limit=...))`) --------------------
     # Pilot -> freeze -> replay. The pilot marches EAGERLY with rejection to discover a step schedule
@@ -443,6 +504,14 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
             tau_pts=tau_pts,
             dtype=dtype,
         )
+
+    def _with_checkpoint(driver, *a, **k):
+        # A `checkpoint=` must be claimed by the march that runs, or it raises (never an empty directory).
+        from .march_checkpoint import requested
+
+        with requested(checkpoint, "this load-path march"):
+            return driver(*a, **k)
+
     if path is not None:
         if _is_explicit_schedule(path):
             # `tau=<array>`: replay a schedule the caller already has — from an earlier pilot
@@ -463,9 +532,9 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
             _driver = _run_explicit
             exprs = getattr(op, "runtime_parameter_exprs", {}) or {}
             if not exprs:
-                return _driver({})
+                return _with_checkpoint(_driver, {})
             if values is not None:
-                return _driver(values)
+                return _with_checkpoint(_driver, values)
             from ...trace import FunctionCall
 
             _names = list(exprs)
@@ -505,11 +574,11 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
     if not exprs:
         # Non-parametric: the answer is an array, nothing will differentiate it, so the adaptive path
         # keeps the states its pilot already solved rather than marching them a second time.
-        return _driver({}, replay=False) if _is_adaptive else _driver({})
+        return _with_checkpoint(_driver, {}, replay=False) if _is_adaptive else _with_checkpoint(_driver, {})
     if values is not None:
         # Named values are concrete, so the adaptive pilot can accept or reject steps with them -- this is
         # the forward run the refusal below asks for -- and nothing will differentiate the array returned.
-        return _driver(values, replay=False) if _is_adaptive else _driver(values)
+        return _with_checkpoint(_driver, values, replay=False) if _is_adaptive else _with_checkpoint(_driver, values)
     from ...trace import FunctionCall
 
     names = list(exprs)
@@ -532,6 +601,34 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None):
             "`tau=<array>` also accepts any non-uniform grid you choose."
         )
     return FunctionCall(lambda *values: _march(dict(zip(names, values))), params, name="fem_history_march")
+
+
+def _refuse_checkpoint_leg(fem, path, contact, values):
+    """Refuse ``checkpoint=`` on the load-path legs that cannot write themselves down.
+
+    The fixed-grid march and an explicit ``tau=<schedule>`` run one compiled scan, which checkpointing
+    splits into host chunks. The adaptive pilot, arc-length and the contact loop each run their OWN loop,
+    and a parametric form returns a trace node whose march must stay one scan for its adjoint."""
+    leg = None
+    if contact is not None:
+        leg = "a per-step contact search (`contact=`)"
+    elif _is_arclength(path):
+        leg = "arc-length (`tau=jno.solve.arclength(...)`)"
+    elif path is not None and not _is_explicit_schedule(path):
+        leg = "adaptive load stepping (`tau=jno.solve.adaptive(...)`)"
+    if leg is not None:
+        raise NotImplementedError(
+            f"fem.solve(checkpoint=): not wired for {leg}, which runs its own loop. Checkpointing is wired for "
+            "the fixed `domain(tau=...)` grid and an explicit `tau=<schedule>`; use one of those, or drop "
+            "checkpoint=."
+        )
+    if getattr(fem._op, "runtime_parameter_exprs", None) and values is None:
+        raise NotImplementedError(
+            "fem.solve(checkpoint=): this form carries a runtime parameter, so fem.solve() returns a "
+            "differentiable trace node whose march must stay ONE lax.scan for its adjoint -- a checkpointed "
+            "march is a host loop of chunks and cannot be differentiated. Checkpoint a forward run at named "
+            "values instead: `fem.solve(<param>=value, checkpoint=...)`."
+        )
 
 
 def _refuse_unreduced_routes(fem, path):

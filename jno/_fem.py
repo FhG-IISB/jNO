@@ -2755,6 +2755,29 @@ class FEM:
                 checkpoint=checkpoint,
                 **kwargs,
             )
+        if checkpoint is not None:
+            # `checkpoint=` writes a MARCH down as it runs. The moving-mesh driver above consumes it; below,
+            # the transient stepper and the load-path march do. Everything else used to accept it and drop
+            # it -- a run returned its answer and left the directory empty, which is exactly the run a
+            # checkpoint exists to save. Refuse those up front.
+            _marches = (
+                self._mode == "transient"
+                or getattr(self._op, "history_specs", None)
+                or getattr(self._op, "surface_history_specs", None)
+            )
+            if adapt is not None:
+                raise NotImplementedError(
+                    "fem.solve(adapt=..., checkpoint=...): checkpointing an adaptive march is wired for the "
+                    "MOVING-MESH driver (a geometry term `coord.d(t) - velocity` with adapt=jno.solve.remesh(...)). "
+                    "A fixed-mesh adapt= rebuilds the problem between segments and does not write itself down. "
+                    "Drop one of the two."
+                )
+            if not _marches:
+                raise ValueError(
+                    f"fem.solve(checkpoint=): this is a {self._mode!r} solve, so there is no march to write down. "
+                    "checkpoint= applies to a transient (`u.t`) march, a load-path march (`.i(k)` with "
+                    "`domain(tau=...)`), or a moving mesh."
+                )
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
             # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
@@ -2929,7 +2952,12 @@ class FEM:
             from .utils.solver.history_march import run_history_march
 
             return run_history_march(
-                self, solve_fn if from_slots else solve_fn, path=tau, contact=contact, values=kwargs.get("values")
+                self,
+                solve_fn if from_slots else solve_fn,
+                path=tau,
+                contact=contact,
+                values=kwargs.get("values"),
+                checkpoint=checkpoint,
             )
         if tau is not None:
             raise ValueError(
@@ -3149,7 +3177,9 @@ class FEM:
             # the steady linear / nonlinear branches above do — and as the complex transient did before its
             # Re/Im legs were fused into one block. (A *real* transient stays lazy; that asymmetry predates
             # the fusion and is a separate call to make, not something a refactor should change silently.)
-            return self._op.solve(solve_fn, **kwargs).fn()
+            return self._op.solve(solve_fn, checkpoint=checkpoint, **kwargs).fn()
+        if self._mode == "transient":
+            kwargs = {**kwargs, "checkpoint": checkpoint}
         out = self._op.solve(solve_fn, **kwargs)
         if kwargs.get("values") and self._mode == "nonlinear":
             self._record_values_verdict(out, kwargs, nonlinear)

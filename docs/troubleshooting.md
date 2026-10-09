@@ -118,10 +118,11 @@ The two things worth checking first, because neither can raise:
   measure are the only two limits in `jno.fem` that are silent; every other one raises. See
   [Limits](fem/limitations.md).
 
-## A long adaptive march runs out of memory, or dies and loses everything
+## A long march runs out of memory, or dies and loses everything
 
 Pass `checkpoint=jno.solve.checkpoint(path)` to write frames to disk as they are produced; a killed run
-then resumes from its last chunk. If memory still grows per rebuild, `JNO_MARCH_MEMDEBUG=1` prints what
+then resumes from its last chunk. It works on a transient (`u.t`) march, a load-path (`tau`) march and an
+adaptive moving mesh, and it cannot be combined with differentiating the march. If memory still grows per rebuild, `JNO_MARCH_MEMDEBUG=1` prints what
 holds it (RSS, live JAX buffers by shape, Python heap, `domain.context`). See
 [a march that survives being killed](fem/geometry.md#a-march-that-survives-being-killed-checkpoint).
 

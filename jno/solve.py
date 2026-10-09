@@ -1210,29 +1210,44 @@ def checkpoint(
     keep: str = "last",
     resume: bool = True,
 ) -> CheckpointSpec:
-    """**Checkpoint a moving-mesh march** to disk: ``fem.solve(adapt=..., checkpoint=...)``.
+    """**Checkpoint a march** to disk: ``fem.solve(checkpoint=...)``.
 
     A march holds every frame in memory and returns them only when ``solve()`` returns, so a run
     that dies -- OOM, a kill, a power cut -- yields **nothing**, however far it got. This writes
     frames to ``path`` as they are produced and records what the march needs to restart, so a dead
-    run costs the last partial chunk instead of everything.
+    run costs the last partial chunk instead of everything. Three marches write themselves down:
 
-    The restart is not new machinery: a topology rebuild already re-enters the march with
-    ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``. That tuple is the
-    checkpoint; this only writes it down.
+    - a **transient** (``u.t``) march, with a built-in scheme -- the default theta, or ``time=``
+      ``theta`` / ``bdf2`` / ``sdirk`` / ``rosenbrock`` / ``exponential``;
+    - a **load-path** march (``.i(k)`` with ``domain(tau=...)``), on its fixed grid or an explicit
+      ``tau=<schedule>``;
+    - a **moving mesh** (a geometry term) with ``adapt=jno.solve.remesh(...)``. Its restart is the
+      tuple a topology rebuild already re-enters the march with,
+      ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``.
 
-    ``every`` -- steps between writes. A write also happens at every rebuild, which is where the
+    The fixed-mesh marches (transient, load path) are compiled loops, and checkpointing runs them as a
+    host loop of compiled chunks of ``every`` steps instead. The arithmetic is the same -- the transient
+    trajectory is bit-identical, the load path agrees to round-off (2.8e-17 measured) -- but a chain of
+    scans is not one scan, so **a checkpointed march cannot be differentiated**: under ``jit`` / ``grad`` /
+    ``jno.core`` it raises. Checkpoint the forward run (``fem.solve(<param>=value, checkpoint=...)``) and
+    differentiate without it. (Unrelated to ``jax.checkpoint``, which is gradient rematerialisation.)
+
+    Every other solve refuses ``checkpoint=`` rather than accept it and write nothing: a steady solve, an
+    adaptive time step, a sharded or ``solve_fn=`` integrator, adaptive / arc-length / contact load
+    stepping, and a fixed-mesh ``adapt=``.
+
+    ``every`` -- steps between writes. A moving mesh also writes at every rebuild, which is where the
     field layout changes and therefore where a restart has to begin anyway.
 
-    ``keep`` -- ``"last"`` (default) flushes each chunk and **drops it from memory**; the returned
-    trajectory loads frames from disk on demand, so a march no longer has to fit in RAM. ``"all"``
-    keeps everything resident as before, and checkpoints purely for crash-resilience.
+    ``keep`` -- ``"last"`` (default) **drops written frames from memory**: a moving mesh's trajectory
+    loads them from disk on demand, and a fixed-mesh march returns its frames as a ``numpy.memmap`` of
+    ``<path>/frames.npy``. ``"all"`` keeps everything resident, and checkpoints purely for
+    crash-resilience.
 
-    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over.
-    A finished run (``complete`` in its manifest) is never resumed; delete the directory to redo it.
-
-    Note this is about the TRAJECTORY, not the solver's working set: per-step memory is already flat
-    (measured: 752 steps added 2 MB). What grows a long adaptive march is the rebuild path.
+    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over. A finished
+    run (``complete`` in its manifest) is never resumed; delete the directory to redo it. A fixed-mesh
+    store records what identifies its march (grid, sizes, scheme, initial state, parameters, operators),
+    and resuming a DIFFERENT march into it raises instead of splicing the two together.
 
     Example::
 
@@ -1241,6 +1256,7 @@ def checkpoint(
             adapt=jno.solve.remesh(alpha=1.2, every=1),
             checkpoint=jno.solve.checkpoint("runs/ball", every=500),
         )
+        u = fem_heat.solve(checkpoint=jno.solve.checkpoint("runs/heat", every=200)).fn()  # transient
 
     Returns:
         CheckpointSpec: pass as ``fem.solve(checkpoint=...)``.
