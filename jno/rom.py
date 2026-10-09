@@ -213,15 +213,36 @@ class Galerkin:
         tol: Optional[float] = 1e-4,
         k_max: int = 64,
         window: int = 2,
+        jit: bool = False,
     ) -> ReducedResult:
         """Reduced solve on the first ``m`` basis columns.
 
         ``enrich=k``: exactly k Jacobi-Krylov blocks ``D^-1 (B - A u_h), D^-1 A (...), ...`` (fixed cost).
         Otherwise (default) error-controlled: add ``D^-1 (B - A u_h)`` of the CURRENT reduced answer, orthonormalised
         against the span, re-solve, and stop when ``max_i (C_ii - C_ii[-window]) / C_ii < tol`` or after ``k_max``
-        steps. ``tol=None`` with ``enrich=None`` is the plain Galerkin answer."""
+        steps. ``tol=None`` with ``enrich=None`` is the plain Galerkin answer.
+
+        ``jit=True`` runs the error-controlled loop as ONE compiled ``lax.while_loop`` on fixed-size buffers
+        (``m + k_max * r`` columns, unused ones masked): no per-step dispatch or host sync, no recompilation when the
+        basis grows, but every step works on the padded size. Same answer as the eager loop (default) to round-off;
+        which is faster depends on the device (padding costs on CPU, dispatch costs on GPU) -- measure."""
         jnp = self.jnp
         m = m or self.m
+        if jit and not enrich and tol is not None:
+            C, c, k, q, W = _adaptive(
+                self.A,
+                self.B,
+                self.dinv,
+                self.W[:, :m],
+                self.AW[:, :m],
+                self.G[:m, :m],
+                self.R[:m],
+                float(tol),
+                int(k_max),
+                int(window),
+            )
+            k = int(k)
+            return ReducedResult(np.asarray(C), c[: m + k * self.B.shape[1]], k, float(q), W[:, : m + k * self.B.shape[1]])
         W, AW, G, R = self.W[:, :m], self.AW[:, :m], self.G[:m, :m], self.R[:m]
         if enrich:
             Z = self.dinv[:, None] * (self.B - AW @ jnp.linalg.solve(G, R))
@@ -252,3 +273,87 @@ class Galerkin:
             R = jnp.concatenate([R, Z.T @ self.B], 0)
             W, AW = jnp.concatenate([W, Z], 1), jnp.concatenate([AW, AZ], 1)
             k += 1
+
+
+def _adaptive_impl(A, B, dinv, W0, AW0, G0, R0, tol, k_max, window):
+    """Error-controlled enrichment on fixed-size buffers (see Galerkin.solve). Column block j >= 0 of the enrichment
+    lives at m + j r ... m + (j+1) r; blocks not yet filled are zero in W, AW, G, R, with 1 on the diagonal of G so the
+    padded system stays regular (their coefficients are exactly 0)."""
+    import jax
+    import jax.numpy as jnp
+
+    n, m = W0.shape
+    r = B.shape[1]
+    P = m + k_max * r
+    W = jnp.zeros((n, P), W0.dtype).at[:, :m].set(W0)
+    AW = jnp.zeros((n, P), W0.dtype).at[:, :m].set(AW0)
+    G = jnp.zeros((P, P), W0.dtype).at[:m, :m].set(G0)
+    R = jnp.zeros((P, r), W0.dtype).at[:m].set(R0)
+    hist = jnp.zeros((k_max + 1, r), W0.dtype)
+    used0 = jnp.arange(P) < m
+
+    def reduced(G, R, used):
+        Gp = jnp.where(used[:, None] & used[None, :], G, 0.0) + jnp.diag(jnp.where(used, 0.0, 1.0))
+        c = jnp.linalg.solve(Gp, R)
+        return c, R.T @ c
+
+    def cond(st):
+        return ~st["done"]
+
+    def body(st):
+        k, W, AW, G, R, hist, used = st["k"], st["W"], st["AW"], st["G"], st["R"], st["hist"], st["used"]
+        c, C = reduced(G, R, used)
+        d = jnp.diag(C)
+        hist = hist.at[k].set(d)
+        prev = hist[jnp.maximum(k - window, 0)]
+        q = jnp.where(k >= window, jnp.max((d - prev) / d), jnp.inf)
+        done = (q < tol) | (k >= k_max)
+
+        def enrich(args):
+            W, AW, G, R, used = args
+            Z = dinv[:, None] * (B - AW @ c)
+            for _ in range(2):
+                Z = Z - W @ (W.T @ Z)
+            Z = jnp.linalg.qr(Z)[0]
+            AZ = A @ Z
+            s0 = m + k * r
+            W = jax.lax.dynamic_update_slice(W, Z, (0, s0))
+            col = AW.T @ Z  # (P, r): couplings with the existing span
+            G = jax.lax.dynamic_update_slice(G, col, (0, s0))
+            G = jax.lax.dynamic_update_slice(G, col.T, (s0, 0))
+            G = jax.lax.dynamic_update_slice(G, Z.T @ AZ, (s0, s0))
+            AW = jax.lax.dynamic_update_slice(AW, AZ, (0, s0))
+            R = jax.lax.dynamic_update_slice(R, Z.T @ B, (s0, 0))
+            used = used | ((jnp.arange(P) >= s0) & (jnp.arange(P) < s0 + r))
+            return W, AW, G, R, used
+
+        W, AW, G, R, used = jax.lax.cond(done, lambda a: a, enrich, (W, AW, G, R, used))
+        return dict(k=jnp.where(done, k, k + 1), W=W, AW=AW, G=G, R=R, hist=hist, used=used, done=done, C=C, c=c, q=q)
+
+    st = dict(
+        k=jnp.asarray(0),
+        W=W,
+        AW=AW,
+        G=G,
+        R=R,
+        hist=hist,
+        used=used0,
+        done=jnp.asarray(False),
+        C=jnp.zeros((r, r), W0.dtype),
+        c=jnp.zeros((P, r), W0.dtype),
+        q=jnp.asarray(jnp.inf, W0.dtype),
+    )
+    st = jax.lax.while_loop(cond, body, st)
+    return st["C"], st["c"], st["k"], st["q"], st["W"]
+
+
+_ADAPTIVE_JIT = None
+
+
+def _adaptive(A, B, dinv, W0, AW0, G0, R0, tol, k_max, window):
+    global _ADAPTIVE_JIT
+    if _ADAPTIVE_JIT is None:
+        import jax
+
+        _ADAPTIVE_JIT = jax.jit(_adaptive_impl, static_argnames=("k_max", "window"))
+    return _ADAPTIVE_JIT(A, B, dinv, W0, AW0, G0, R0, tol, k_max=k_max, window=window)
