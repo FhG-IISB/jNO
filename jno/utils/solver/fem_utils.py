@@ -407,11 +407,109 @@ def _drop_scalar_component_axis(grad_list):
     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
 
-def _expand_test_shape_vals(shape_vals, n_comp):
+def _component_basis(n_comp, value_shape, dtype, symmetric=False):
+    """The one-hot basis of a field's components, ``(n_comp, *value_shape)``.
+
+    A test function of a field with ``n_comp`` components is ``n_comp`` basis functions per node, the
+    ``c``-th carrying a one in component ``c`` (row-major over ``value_shape``) and zeros elsewhere. For a
+    vector field this is ``eye(n)``; for a matrix field ``(n, m)`` it is ``eye(n*m)`` reshaped to
+    ``(n*m, n, m)``, so a contraction over the value axes (``inner(S, T, 2)``, ``trace(T)``, ``T[..., i, j]``)
+    leaves the DOF-component axis, exactly as it does for a vector."""
+    vs = tuple(value_shape or ())
+    if symmetric:
+        return _symmetric_basis(vs[0], dtype)  # (n(n+1)/2, n, n)
+    if not vs:
+        vs = (n_comp,)
+    return jnp.reshape(jnp.eye(n_comp, dtype=dtype), (n_comp,) + vs)
+
+
+def _is_symmetric_field(node) -> bool:
+    """True for a square matrix field stored by its upper triangle (``symmetric=True``). Read from the
+    instance dict: a trace node synthesises unknown attributes into nodes, so ``getattr`` would lie."""
+    return bool(getattr(node, "__dict__", {}).get("symmetric", False))
+
+
+def _is_constant_field(node) -> bool:
+    """True for a constant unknown (``domain.unknown(..., constant=True)``): one value over the domain."""
+    return bool(getattr(node, "__dict__", {}).get("_is_constant", False))
+
+
+def _field_num_components(node) -> int:
+    """Number of values STORED per node for ``node``'s field: ``n(n+1)/2`` for a symmetric ``n x n`` matrix,
+    the product of ``value_shape`` otherwise."""
+    vs = tuple(getattr(node, "value_shape", ()) or ())
+    if _is_symmetric_field(node):
+        n = int(vs[0])
+        return n * (n + 1) // 2
+    return _value_shape_num_components(vs)
+
+
+def _symmetric_basis(n, dtype=None):
+    """``E`` of shape ``(n(n+1)/2, n, n)``: stored value ``c`` (upper triangle, row-major -- ``xx, xy, yy`` in
+    2-D, ``xx, xy, xz, yy, yz, zz`` in 3-D) is entry ``(i, j)`` AND ``(j, i)`` of the full matrix. The full
+    matrix is ``sum_c s_c E_c``; a test function's ``c``-th basis matrix is ``E_c`` itself, so testing with it
+    is testing with the symmetric part -- the Galerkin choice for a symmetric unknown."""
+    iu, ju = np.triu_indices(int(n))
+    E = np.zeros((iu.size, n, n))
+    E[np.arange(iu.size), iu, ju] = 1.0
+    E[np.arange(iu.size), ju, iu] = 1.0
+    return jnp.asarray(E, dtype=dtype)
+
+
+def _symmetric_storage_index(n, i, j) -> int:
+    """Stored index of entry ``(i, j)`` of a symmetric ``n x n`` field (the upper-triangle slot of the pair)."""
+    i, j = (i, j) if i <= j else (j, i)
+    return int(i * n - i * (i - 1) // 2 + (j - i))
+
+
+def _unpack_components(flat, node, axis=1):
+    """The stored components on ``axis`` of ``flat`` -> the field's ``value_shape`` in their place.
+
+    A full field reshapes; a symmetric one expands its ``n(n+1)/2`` stored values to the full ``n x n``
+    matrix through :func:`_symmetric_basis`, so every expression downstream sees an ordinary matrix."""
+    vs = tuple(getattr(node, "value_shape", ()) or ())
+    axis = axis % flat.ndim
+    moved = jnp.moveaxis(flat, axis, -1)
+    if _is_symmetric_field(node):
+        out = jnp.tensordot(moved, _symmetric_basis(vs[0], moved.dtype), axes=([-1], [0]))  # (..., n, n)
+    else:
+        out = jnp.reshape(moved, moved.shape[:-1] + vs)
+    nv = len(vs)
+    return jnp.moveaxis(out, list(range(out.ndim - nv, out.ndim)), list(range(axis, axis + nv)))
+
+
+def _flat_component_index(field, ints):
+    """The flat (row-major) component a getitem key selects on a nodal field.
+
+    A vector field takes one index, ``u[..., i]``. A matrix field takes one per axis, ``S[..., i, j]`` ->
+    ``i * m + j``, which is where component ``(i, j)`` sits in the node-major DOF layout. A key with fewer
+    indices than the field has axes selects a slice (a row of a matrix), not one component, so it raises
+    rather than silently reading the last index alone."""
+    vs = tuple(getattr(field, "value_shape", ()) or ())
+    ints = [int(k) for k in ints]
+    if len(vs) <= 1:
+        return ints[-1]
+    if len(ints) != len(vs):
+        raise IndexError(
+            f"jno.fem: a field with value_shape={vs} needs {len(vs)} indices to select one component "
+            f"(e.g. S[{', '.join(['0'] * len(vs))}]); got {len(ints)}. A row of a matrix field is not a single "
+            "component -- differentiate the components one at a time."
+        )
+    flat = 0
+    for k, n in zip(ints, vs):
+        if not -n <= k < n:
+            raise IndexError(f"jno.fem: index {k} is out of range for an axis of length {n} (value_shape={vs}).")
+        flat = flat * n + (k % n)
+    if _is_symmetric_field(field):
+        return _symmetric_storage_index(vs[0], ints[0] % vs[0], ints[1] % vs[1])
+    return flat
+
+
+def _expand_test_shape_vals(shape_vals, n_comp, value_shape=None, symmetric=False):
     if n_comp == 1:
         return shape_vals
-    eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
-    return shape_vals[:, :, None, None] * eye[None, None, :, :]
+    basis = _component_basis(n_comp, value_shape, shape_vals.dtype, symmetric)  # (n_comp, *value_shape)
+    return shape_vals.reshape(shape_vals.shape + (1,) * basis.ndim) * basis[None, None]
 
 
 def _infer_trial_metadata(expr) -> Dict[str, Any]:
@@ -446,7 +544,7 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
 
     trial = unique_trials[0] if unique_trials else None
     value_shape = getattr(trial, "value_shape", ()) if trial is not None else ()
-    vec = _value_shape_num_components(value_shape)
+    vec = _field_num_components(trial) if trial is not None else 1
 
     return {
         "trial": trial,
@@ -479,7 +577,9 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
                     {
                         "field_key": key,
                         "value_shape": vs,
-                        "vec": _value_shape_num_components(vs),
+                        "vec": _field_num_components(node),
+                        "symmetric": _is_symmetric_field(node),
+                        "constant": _is_constant_field(node),
                         "order": int(getattr(node, "order", 1)),
                         "space": str(getattr(node, "space", "Lagrange")),
                     }
@@ -489,6 +589,9 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
             walk(child)
 
     walk(expr)
+    if any(f["constant"] for f in fields):  # constants last -- the same order the native assembler uses
+        fields = [f for f in fields if not f["constant"]] + [f for f in fields if f["constant"]]
+        seen = {f["field_key"]: i for i, f in enumerate(fields)}
     return fields, dict(seen)
 
 
@@ -879,6 +982,49 @@ def _broadcast_ok(s1, s2) -> bool:
         if x != y and x != 1 and y != 1:
             return False
     return True
+
+
+#: Node types whose value varies over the quadrature points (or with the solution). A subtree with none of
+#: them is a CONSTANT: it carries value axes only, no quadrature axis.
+_VARYING_NODES = (
+    Variable,
+    TrialFunction,
+    TestFunction,
+    StateField,
+    ModelCall,
+    FrozenField,
+    HistoryRef,
+    Cellwise,
+    RegionMask,
+    TagMask,
+    Tracker,
+    OperationCall,
+    DiffSlot,
+)
+
+
+def _scalar_times_constant_matrix(a, b, left, right):
+    """``s * M`` with ``s`` a per-point scalar and ``M`` a constant matrix: ``(n_quad, *M.shape)``.
+
+    A per-point scalar is laid out ``(n_quad, 1)`` (its historical phantom axis) or ``(n_quad,)``, and a
+    constant matrix has no quadrature axis at all. At equal rank :func:`_prefix_align` leaves them alone and
+    plain broadcasting fails (``(14, 1) * (3, 3)``); at rank 1 it pads the scalar to ``(n_quad, 1)``, with
+    the same result. Worse, both SUCCEED when ``n_quad`` equals the matrix's row count (three quadrature
+    points times a 3 x 3 matrix) and return a 3 x 3 that is no longer per point. Shape alone cannot tell a constant from a per-point array, so the trace decides: the matrix side
+    must contain no varying node. ``tr(A) / 3 * I`` (a deviator) is the case that needs it."""
+    a, b = jnp.asarray(a), jnp.asarray(b)
+    for s_, m_, s_node, m_node, flip in ((a, b, left, right, False), (b, a, right, left, True)):
+        if (
+            (s_.ndim == 1 or (s_.ndim == 2 and s_.shape[-1] == 1))  # (n_quad,) or (n_quad, 1): one value per point
+            and m_.ndim == 2
+            and min(m_.shape) > 1
+            and not contains_node_type(m_node, _VARYING_NODES)
+            and contains_node_type(s_node, _VARYING_NODES)
+        ):
+            s2 = s_.reshape(s_.shape[:1] + (1, 1))
+            m2 = m_[None]
+            return (m2, s2) if flip else (s2, m2)
+    return a, b
 
 
 def _prefix_align(a, b):
@@ -1393,8 +1539,9 @@ def _eval_integrand(domain, node, local):
         if _field_space(local, node) != "Lagrange":
             # non-nodal: shape_vals is already the per-DOF *physical* basis (n_quad, n_dof, *value)
             return shape_vals
-        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
-        return _expand_test_shape_vals(shape_vals, n_comp)
+        value_shape = getattr(node, "value_shape", ())
+        n_comp = _field_num_components(node)
+        return _expand_test_shape_vals(shape_vals, n_comp, value_shape, _is_symmetric_field(node))
 
     if isinstance(node, TrialFunction):
         vals, _, cell_sol = _field_data(local, node)
@@ -1414,7 +1561,7 @@ def _eval_integrand(domain, node, local):
             # ``maximum(H.i(-1), u)`` silently became ``(n_quad, n_quad)`` and the state readout then
             # produced a buffer of the wrong rank. Squeeze here, at the one place the axis is created.
             return flat_interp[..., 0]
-        return _reshape_components_last(flat_interp, value_shape)
+        return _unpack_components(flat_interp, node, axis=-1)
 
     if isinstance(node, DiffSlot):
         # The hole a `Diff` differentiates through: its value is injected by the branch below.
@@ -1500,7 +1647,7 @@ def _eval_integrand(domain, node, local):
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:
             return flat_interp
-        return _reshape_components_last(flat_interp, value_shape)
+        return _unpack_components(flat_interp, node, axis=-1)
 
     if isinstance(node, Jacobian):
         dims = []
@@ -1520,12 +1667,13 @@ def _eval_integrand(domain, node, local):
                 # pick the requested directions -> (n_quad, n_dof, n_comp[, len(dims)]). trace() then gives div.
                 g = jnp.stack([grads[..., d] for d in dims], axis=-1)
                 return g[..., 0] if len(dims) == 1 else g
-            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
+            value_shape = getattr(node.target, "value_shape", ())
+            n_comp = _field_num_components(node.target)
             if n_comp == 1:
                 comps = [grads[..., dim0] for dim0 in dims]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
-            eye = jnp.eye(n_comp, dtype=grads.dtype)
-            comps = [grads[..., dim0][:, :, None, None] * eye[None, None, :, :] for dim0 in dims]
+            sym = _is_symmetric_field(node.target)
+            comps = [_expand_test_shape_vals(grads[..., dim0], n_comp, value_shape, sym) for dim0 in dims]
             if len(comps) == 1:
                 return comps[0]
             return jnp.stack(comps, axis=-1)
@@ -1542,9 +1690,7 @@ def _eval_integrand(domain, node, local):
             if len(value_shape) == 0:
                 return _drop_scalar_component_axis(grad_list)
             flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
-            if len(dims) == 1:
-                return _reshape_components_last(flat, value_shape)
-            return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
+            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape[, len(dims)])
 
         if isinstance(node.target, TrialFunction):
             _, grads, cell_sol = _field_data(local, node.target)
@@ -1558,9 +1704,7 @@ def _eval_integrand(domain, node, local):
             if len(value_shape) == 0:
                 return _drop_scalar_component_axis(grad_list)
             flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
-            if len(dims) == 1:
-                return _reshape_components_last(flat, value_shape)
-            return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
+            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape[, len(dims)])
 
         # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``.
         # For a NON-NODAL field the value-component cannot be differentiated directly, but
@@ -1592,8 +1736,8 @@ def _eval_integrand(domain, node, local):
                 #                                                       column ``i`` (node-major ravel)
                 # A scalar field (n_comp == 1) takes the whole-field shapes, so ``u[0]`` on a scalar is
                 # the field itself rather than a differently-shaped twin.
-                comp = ints[-1]
-                n_comp = _value_shape_num_components(getattr(field, "value_shape", ()))
+                comp = _flat_component_index(field, ints)
+                n_comp = _field_num_components(field)
                 if not 0 <= comp < n_comp:
                     raise IndexError(
                         f"jno.fem: component {comp} is out of range for a field with "
@@ -1665,7 +1809,8 @@ def _eval_integrand(domain, node, local):
         if _field_space(local, node.target) != "Lagrange":
             raise NotImplementedError("Second derivatives are assembled for nodal Lagrange fields only.")
         value_shape = getattr(node.target, "value_shape", ())
-        n_comp = _value_shape_num_components(value_shape)
+        n_comp = _field_num_components(node.target)
+        sym = _is_symmetric_field(node.target)
         _, _, cell_sol = _field_data(local, node.target)
         # The C1 families (Hermite / Argyris / Morley) present themselves to this evaluator AS Lagrange --
         # their M(cell) DOF-transform is baked into the shape data, so the guard above does not exclude them
@@ -1696,25 +1841,26 @@ def _eval_integrand(domain, node, local):
             if is_test:
                 if n_comp == 1:
                     return lap
-                eye = jnp.eye(n_comp, dtype=lap.dtype)
-                return lap[:, :, None, None] * eye[None, None, :, :]  # (n_quad, n_dof, n_comp, n_comp)
+                return _expand_test_shape_vals(lap, n_comp, value_shape, sym)  # (n_quad, n_dof, n_comp, *value_shape)
             # ``cell_sol`` is (n_local, vec), so this contracts every component at once: (n_quad, vec).
             # A scalar field keeps its historical phantom (n_quad, 1); a vector one gets Delta u itself.
             flat = jnp.sum(lap[:, :, None] * cell_sol[None, :, :], axis=1)
-            return flat if len(value_shape) == 0 else _reshape_components_last(flat, value_shape)
+            return flat if len(value_shape) == 0 else _unpack_components(flat, node.target, axis=-1)
         if is_test:
             if n_comp == 1:
                 return hsub  # (n_quad, n_dof, L, L) per-DOF Hessian (e.g. inner(hessian(u), hessian(v)))
-            eye = jnp.eye(n_comp, dtype=hsub.dtype)
-            return hsub[:, :, None, None, :, :] * eye[None, None, :, :, None, None]
+            basis = _component_basis(n_comp, value_shape, hsub.dtype, sym)  # (n_comp, *value_shape)
+            nb = basis.ndim
+            return hsub.reshape(hsub.shape[:2] + (1,) * nb + hsub.shape[2:]) * basis.reshape((1, 1) + basis.shape + (1, 1))
         h = jnp.einsum("qnij,nc->qcij", hsub, cell_sol)  # (n_quad, vec, L, L)
         if len(value_shape) == 0:
             return h[:, 0]  # (n_quad, L, L) trial Hessian -- scalar carries no component axis
-        return jnp.reshape(h, h.shape[:1] + tuple(value_shape) + h.shape[2:])
+        return _unpack_components(h, node.target, axis=1)  # (n_quad, *value_shape, L, L)
 
     if isinstance(node, BinaryOp):
         a = _eval_integrand(domain, node.left, local)
         b = _eval_integrand(domain, node.right, local)
+        a, b = _scalar_times_constant_matrix(a, b, node.left, node.right)
         a, b = _prefix_align(a, b)
         if node.op == "+":
             return a + b

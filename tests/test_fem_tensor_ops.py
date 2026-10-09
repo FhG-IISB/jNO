@@ -116,3 +116,10 @@ def test_an_explicit_axes_argument_is_still_honoured():
     """The one in-repo caller passes (0, 2, 1) to work around the old default; that must keep working."""
     got = _evaluate(lambda u, ax: inner_(transpose(grad(u, ax), (0, 2, 1)), grad(u, ax), n_contract=2))
     assert got == pytest.approx(0.0, abs=1e-10), f"explicit axes should also give tr(g@g) = 0, got {got}"
+
+
+def test_the_T_attribute_is_the_same_transpose():
+    """``grad(u).T`` -- the spelling a user writes for ``Lᵀ`` -- reversed every axis, turning an ``(n_q, 2, 2)``
+    field into ``(2, 2, n_q)``. It must be the tensor transpose: g^T:g = tr(g@g) = 0, g^T:g^T = 1."""
+    assert _evaluate(lambda u, ax: inner_(grad(u, ax).T, grad(u, ax), n_contract=2)) == pytest.approx(0.0, abs=1e-10)
+    assert _evaluate(lambda u, ax: inner_(grad(u, ax).T, grad(u, ax).T, n_contract=2)) == pytest.approx(1.0, rel=1e-10)

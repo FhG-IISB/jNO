@@ -370,6 +370,57 @@ def _bare(obj: Any):
     return obj.expr if _is_view(obj) else obj
 
 
+def _unknown_symbol_of(node: Any) -> Any:
+    """The trial symbol a ``domain.unknown()`` field stands for in a weak form, or ``None``.
+
+    ``domain.unknown()`` is a valued nodal field (``jno.fdm`` solves for its values); the model it wraps
+    records the ``TrialFunction`` it was built from. Read from the instance dict on purpose: a plain
+    ``jno.np.parameter`` coefficient has no such entry and stays a coefficient."""
+    if isinstance(node, ModelCall):
+        return getattr(node.model, "__dict__", {}).get("_unknown_symbol")
+    return None
+
+
+def _lower_unknowns(obj: Any) -> Any:
+    """Replace every ``domain.unknown()`` field in a term (or a list of terms) by its trial symbol.
+
+    One object serves FEM and FDM: ``jno.fdm`` consumes the unknown's values, ``jno.fem`` its symbol.
+    The substitution happens once, at the door, so every classification site downstream sees an ordinary
+    ``TrialFunction`` -- exactly what ``fem_symbols`` would have produced. A view's bound coordinates (the
+    region of ``u(xb, yb) - g``) are carried over to the rewritten term."""
+    from .trace import substitute
+
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_lower_unknowns(o) for o in obj)
+    sym = _unknown_symbol_of(_bare(obj))
+    if sym is not None:
+        return sym
+    bare = _bare(obj)
+    if not isinstance(bare, Placeholder):
+        return obj
+    from .trace import Jacobian, TemporalDerivative
+
+    nodes = list(_walk(bare))
+    mapping = {n: _unknown_symbol_of(n) for n in nodes if _unknown_symbol_of(n) is not None}
+    if not mapping:
+        return obj
+    for n in nodes:
+        # A nodal field's `.t` is the strong-form TemporalDerivative (a cross-step difference for jno.fdm);
+        # the weak-form time derivative of a trial is a Jacobian in the time coordinate, which is what the
+        # fem_symbols view builds and what the transient classifier looks for.
+        if isinstance(n, TemporalDerivative) and any(_unknown_symbol_of(m) is not None for m in _walk(n.target)):
+            mapping[n] = Jacobian(_lower_unknowns(n.target), [n.time_var])
+    out = substitute(bare, mapping)
+    if _is_view(obj):
+        cv = getattr(obj, "_coord_vars", None)
+        if cv and "_coord_vars" not in getattr(out, "__dict__", {}):
+            out._coord_vars = dict(cv)
+        tie = getattr(obj, "_periodic_tie", None)  # `u(A) - u(B)`: the view is where the two regions survive
+        if tie is not None:
+            out._periodic_tie = tie
+    return out
+
+
 def _walk(node: Any):
     """Yield every node in a Placeholder tree (deduplicated by id)."""
     from .utils.solver.solver_helper import iter_placeholder_children
@@ -634,6 +685,9 @@ def _saddle_block_positions(fem_obj: "FEM", domain: Any, volume_terms: List[Any]
         for n in _walk(_bare(c)):
             if isinstance(n, TrialFunction):
                 names.setdefault(getattr(n, "field_key", None), getattr(n, "name", None))
+    # A constant tied to a field (`u(region) - U`) or pinned (`U - g`) has a diagonal after all: the tie sums
+    # the tied DOFs' rows into its row, the pin is a unit row.
+    occupied |= {(k, k) for k in getattr(fem_obj, "_constant_closed_keys", ())}
     out = []
     for i, k in enumerate(keys):
         if (k, k) in occupied:
@@ -879,15 +933,18 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
     if pts is None or offs is None or cells_all is None:
         return []  # a route that does not publish per-field DOF coordinates; nothing to check against
 
-    from .utils.solver.fem_utils import _cell_region_mask, _value_shape_num_components
+    from .utils.solver.fem_utils import _cell_region_mask
 
     _dp, _tv = _prescribed_dofs(domain)
     pinned = {int(d) for d, _g in _dp} | {int(d) for d in _tv}
+    _const_blocks = list(getattr(fem_obj, "_block_constant", None) or [])
     out: List[Tuple[int, List[Any], int]] = []
     for i, key in enumerate(field_keys):
         spec = by_key.get(key)
         if spec is None or any(r is None for _sp, r in spec) or i >= len(cells_all) or i >= len(pts):
             continue
+        if i < len(_const_blocks) and _const_blocks[i]:
+            continue  # a constant's one DOF is reached by any term on any region -- its rows are integrals
         pts_i, cells_i = np.asarray(pts[i]), np.asarray(cells_all[i])
         reached = np.zeros(len(pts_i), dtype=bool)
         try:
@@ -906,7 +963,7 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
                     reached |= np.asarray(bm, dtype=bool)
         except LookupError:
             continue  # unresolvable region: stay quiet rather than report a DOF as dead on a guess
-        vec = int(_value_shape_num_components(fem_obj._field_value_shape(i)))
+        vec = int(fem_obj._field_vec(i))
         base = int(offs[i])
         dead = [base + int(nd) * vec + c for nd in np.flatnonzero(~reached) for c in range(vec)]
         dead = [dd for dd in dead if dd not in pinned]
@@ -1312,6 +1369,307 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
     return f"solve: {mode} · {_lin()}"
 
 
+def _field_num_components(constraint: Any) -> int:
+    """Number of components of the trial field a constraint names (``1`` for a scalar)."""
+    trials = [n for n in _walk(_bare(constraint)) if isinstance(n, TrialFunction)]
+    vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+    return int(np.prod(vs)) if vs else 1
+
+
+def _is_constant_trial(node: Any) -> bool:
+    """A constant unknown's trial symbol (``domain.unknown(..., constant=True)``)."""
+    return isinstance(node, TrialFunction) and bool(node.__dict__.get("_is_constant", False))
+
+
+def _constant_side(node: Any) -> Optional[Tuple[Any, Optional[int]]]:
+    """``(constant trial, component or None)`` if ``node`` is a bare constant ``U`` or one entry ``U[k]``."""
+    node = _bare(node)
+    if _is_constant_trial(node):
+        return node, None
+    if getattr(node, "_name", None) == "getitem" and len(getattr(node, "args", None) or []) == 1:
+        tgt = _bare(node.args[0])
+        if _is_constant_trial(tgt):
+            from .utils.solver.fem_utils import _flat_component_index
+
+            ints = [k for k in node.getitem_key if isinstance(k, int)]
+            return tgt, _flat_component_index(tgt, ints)
+    return None
+
+
+def _constant_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Optional[int], Any, Optional[int]]]:
+    """Recognise a tie of a field to a constant, ``u(region) - U`` or ``u(region)[i] - U`` (also ``U[k]``).
+
+    Returns ``(field_key, region, comp, constant_trial, constant_comp)``, or ``None`` for anything else.
+    The tie makes every DOF of ``u`` (component ``i``) on the region the SAME unknown as ``U``: it is
+    eliminated exactly, ``u = P ũ`` with the tied rows summed into U's row -- no penalty, and the reaction
+    the tie carries is the virtual work of the constrained DOFs, as it is for a periodic tie."""
+    bare = _bare(constraint)
+    if getattr(bare, "op", None) != "-" or _contains(bare, TestFunction):
+        return None
+    left, right = bare.left, bare.right
+    for field_side, const_side in ((left, right), (right, left)):
+        cs = _constant_side(const_side)
+        if cs is None:
+            continue
+        trials = [n for n in _walk(_bare(field_side)) if isinstance(n, TrialFunction)]
+        if not trials or any(_is_constant_trial(t) for t in trials):
+            return None
+        comp = _component_index_of(_bare(field_side))
+        if not (isinstance(_bare(field_side), TrialFunction) or comp is not None):
+            raise ValueError(
+                "jno.fem: a tie to a constant must be `u(region) - U` or `u(region)[i] - U` -- affine in the "
+                f"field, with the constant alone on the other side. Got: {field_side!r}."
+            )
+        U, ucomp = cs
+        field = trials[0]
+        n_field = _field_num_components(constraint) if comp is None else 1
+        n_const = U.num_components if ucomp is None else 1
+        if comp is None and ucomp is None and tuple(field.value_shape) != tuple(U.value_shape):
+            raise ValueError(
+                f"jno.fem: `u(region) - U` ties every component, so u and U need the same value shape; got "
+                f"{tuple(field.value_shape)} and {tuple(U.value_shape)}. Tie one component, `u(region)[i] - U`."
+            )
+        if n_field != n_const and not (comp is None and ucomp is None):
+            raise ValueError(
+                f"jno.fem: the tie `u(region){'' if comp is None else f'[{comp}]'} - U{'' if ucomp is None else f'[{ucomp}]'}` "
+                f"pairs {n_field} field component(s) with {n_const} constant value(s)."
+            )
+        support, region = _region_and_support(constraint, domain)  # U carries no coordinates
+        if support not in ("boundary", "volume") or region == "volume":
+            raise ValueError(
+                "jno.fem: a tie to a constant names a region of the field -- bind the field to a boundary or a "
+                f"named sub-region, `u(xb, yb) - U`; got support {support!r}, region {region!r}."
+            )
+        return getattr(field, "field_key", field.op_id), region, comp, U, ucomp
+    return None
+
+
+def _constant_pin_spec(constraint: Any) -> Optional[Tuple[Any, Optional[int], Any]]:
+    """``U - value`` (or ``U[k] - value``): an essential value for a constant unknown. ``(trial, comp, value)``."""
+    bare = _bare(constraint)
+    if _contains(bare, TestFunction):
+        return None
+    trials = [n for n in _walk(bare) if isinstance(n, TrialFunction)]
+    if trials and all(_is_constant_trial(t) for t in trials) and getattr(bare, "op", "-") not in ("-", None):
+        raise ValueError(
+            "jno.fem: an essential value of a constant unknown is written `U - g` (or `U[k] - g`); got "
+            f"{bare!r}. A test-free term in constants alone has no other meaning."
+        )
+    if getattr(bare, "op", None) != "-":
+        return None
+    for const_side, value in ((bare.left, bare.right), (bare.right, bare.left)):
+        cs = _constant_side(const_side)
+        if cs is None:
+            continue
+        if _contains(value, TrialFunction):
+            return None
+        if any(isinstance(n, Variable) for n in _walk(_bare(value))):
+            raise ValueError(
+                "jno.fem: the value of a constant unknown, `U - g`, must not depend on position -- U is one "
+                "number over the whole domain."
+            )
+        return cs[0], cs[1], value
+    return None
+
+
+def _check_constant_field_scope(domain: Any, constraints: List[Any], is_vpinn: bool) -> None:
+    """A constant unknown is wired on the native 2-D/3-D Lagrange assembler only -- the same scope as a
+    symmetric field, and for the same reason: that assembler is the one that knows its one-node layout."""
+    if not any(_is_constant_trial(n) for c in constraints for n in _walk(_bare(c))):
+        return
+    where = None
+    if getattr(domain, "dimension", None) not in (2, 3):
+        where = f"a {getattr(domain, 'dimension', '?')}-D domain"
+    elif is_vpinn:
+        where = "a VPINN (network trial)"
+    elif _trial_spaces(constraints) - {"Lagrange"}:
+        where = "a form mixing in a non-nodal element family"
+    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+        where = "a complex form"
+    if where is not None:
+        raise NotImplementedError(
+            f"jno.fem: a constant unknown (constant=True) is supported on the native 2-D/3-D Lagrange assembler "
+            f"only, not on {where}."
+        )
+
+
+def _build_constant_tie_reduction(
+    fem_obj: Any, ties: List[Any], prescribed: List[int], slip: Optional[dict] = None
+) -> dict:
+    """The prolongation ``u = P ũ`` that makes each tied DOF the constant's DOF.
+
+    One global selection over the whole (multi-field) vector -- a tie crosses field blocks, which the
+    per-field periodic layout cannot express -- in the single-block periodic format, so the whole
+    reduce / solve / prolong / restrict path is reused. A tied DOF that is also prescribed by a Dirichlet
+    condition keeps its own row (the prescribed value wins), exactly as on a periodic face.
+
+    With ``slip`` (a slip reduction from :func:`_build_slip_reduction`) the result is the composition
+    ``P_slip · P_tie``; see :func:`_compose_slip_and_constant_ties`."""
+    import jax.experimental.sparse as jsparse
+
+    n = int(fem_obj.dofs)
+    keys = list(getattr(fem_obj, "_block_field_keys", None) or [])
+    offs = list(fem_obj.offsets)
+    pres = {int(d) for d in prescribed}
+    main_of: Dict[int, int] = {}
+    for fk, region, comp, U, ucomp in ties:
+        if fk not in keys or U.field_key not in keys:
+            raise ValueError("jno.fem internal: a tie names a field that is not part of the assembled system.")
+        fi, ui = keys.index(fk), keys.index(U.field_key)
+        comps = [comp] if comp is not None else list(range(fem_obj._field_vec(fi)))
+        for j, c in enumerate(comps):
+            uc = ucomp if ucomp is not None else (0 if comp is not None else j)
+            main = int(offs[ui]) + int(uc)
+            for d in np.asarray(fem_obj.region_dofs(region, field=fi, component=c)).reshape(-1):
+                d = int(d)
+                if d in pres:
+                    continue
+                if d in main_of and main_of[d] != main:
+                    raise ValueError(
+                        f"jno.fem: DOF {d} is tied to two different constants (regions overlap). A value cannot "
+                        "equal two independent unknowns; tie it once."
+                    )
+                main_of[d] = main
+    if not main_of:
+        raise ValueError(
+            "jno.fem: a tie `u(region) - U` matched no free DOF -- the region is empty on this field's nodes, "
+            "or every node on it is already prescribed by a Dirichlet condition."
+        )
+    if slip is not None:
+        return _compose_slip_and_constant_ties(slip, main_of, n)
+    sec = np.zeros(n, dtype=bool)
+    sec[list(main_of)] = True
+    kept = np.flatnonzero(~sec)
+    col = -np.ones(n, dtype=np.int64)
+    col[kept] = np.arange(kept.size)
+    rows = np.arange(n)
+    cols = col.copy()
+    for d, m in main_of.items():
+        cols[d] = col[m]
+    P = jsparse.BCOO((jnp.ones(n), jnp.asarray(np.stack([rows, cols], axis=1), dtype=jnp.int32)), shape=(n, int(kept.size)))
+    return {"P": P, "kept_nodes": kept, "vec": 1, "is_selection": True, "coupling": "constant_tie"}
+
+
+def _compose_slip_and_constant_ties(slip: dict, main_of: Dict[int, int], n: int) -> dict:
+    """``u = P_slip P_tie ũ``: the slip elimination first, then the tie on the slip-reduced vector.
+
+    The tie is a selection on DOFs the slip leaves alone, so it is restated in the slip-reduced numbering
+    and the two prolongations multiply. That needs every tied DOF and every constant to pass through the
+    slip untouched: its row of ``P_slip`` is one unit entry, alone in its column. A node on both the slip
+    surface and a tied region would have its normal component eliminated twice -- by the slip, in terms of
+    its tangential components, and by the tie, to the constant -- so the composition is refused there
+    rather than silently picking one.
+
+    The composed ``P`` is weighted (the slip rows), so it takes the general, non-selection reduction path,
+    exactly as a slip alone does."""
+    import jax.experimental.sparse as jsparse
+    import scipy.sparse as sp
+
+    if "slip_runtime" in slip:
+        raise NotImplementedError(
+            "jno.fem: a tie to a constant together with a slip surface that moves with runtime (trainable) "
+            "coordinates is not supported -- the moving slip prolongation is rebuilt per solve, and the tie "
+            "would have to be recomposed with it. Keep the slip surface's vertices out of the trainable region."
+        )
+    if "blocks" in slip:
+        Ps_b = slip["P_blockdiag"]
+        off_f = np.asarray(slip["off_full"], dtype=np.int64)
+        kept_s = np.concatenate([off_f[i] + np.asarray(b["kept"], dtype=np.int64) for i, b in enumerate(slip["blocks"])])
+    else:
+        Ps_b = slip["P"]
+        kept_s = np.asarray(slip["kept_nodes"], dtype=np.int64)
+    idx = np.asarray(Ps_b.indices)
+    Ps = sp.coo_matrix((np.asarray(Ps_b.data, dtype=float), (idx[:, 0], idx[:, 1])), shape=Ps_b.shape).tocsr()
+    Ps.sum_duplicates()
+    Ps.eliminate_zeros()  # a structural zero (an axis-aligned wall's off-axis weight) is not a coupling
+    n_s = int(Ps.shape[1])
+    row_nnz = np.diff(Ps.indptr)
+    col_nnz = np.bincount(Ps.indices, minlength=n_s)
+
+    def _col(d: int, what: str) -> int:
+        s, e = Ps.indptr[d], Ps.indptr[d + 1]
+        j = int(Ps.indices[s]) if e - s == 1 else -1
+        if j < 0 or Ps.data[s] != 1.0 or col_nnz[j] != 1:
+            raise NotImplementedError(
+                f"jno.fem: {what} (DOF {d}) sits on a slip surface `n·u = 0`. A node that is both slipping and "
+                "tied to a constant would be eliminated twice, and composing the two constraints on one node is "
+                "not implemented. Keep the tied region off the slip surface (or drop the slip on those nodes)."
+            )
+        return j
+
+    if int(Ps.shape[0]) != n or row_nnz.size != n:
+        raise ValueError("jno.fem internal: the slip prolongation does not span the assembled system.")
+    main_s = {_col(d, "a DOF tied to a constant"): _col(m, "a constant unknown") for d, m in main_of.items()}
+    sec = np.zeros(n_s, dtype=bool)
+    sec[list(main_s)] = True
+    kept_t = np.flatnonzero(~sec)
+    col = -np.ones(n_s, dtype=np.int64)
+    col[kept_t] = np.arange(kept_t.size)
+    cols = col.copy()
+    for d, m in main_s.items():
+        cols[d] = col[m]
+    Pt = sp.csr_matrix((np.ones(n_s), (np.arange(n_s), cols)), shape=(n_s, int(kept_t.size)))
+    Pc = (Ps @ Pt).tocoo()
+    P = jsparse.BCOO(
+        (jnp.asarray(Pc.data, dtype=jnp.float64), jnp.asarray(np.stack([Pc.row, Pc.col], axis=1), dtype=jnp.int32)),
+        shape=(n, int(kept_t.size)),
+    )
+    return {
+        "P": P,
+        "P_node": P,
+        "kept_nodes": kept_s[kept_t],
+        "n_full": n,
+        "n_red": int(kept_t.size),
+        "vec": 1,
+        "is_selection": False,
+        "is_bloch": False,
+        "coupling": "constant_tie",
+        "with_slip": True,
+    }
+
+
+def _check_symmetric_field_scope(domain: Any, constraints: List[Any], periodic_ties: List[Any], is_vpinn: bool) -> None:
+    """A ``symmetric=True`` matrix field is wired on the native 2-D/3-D Lagrange assembler only.
+
+    Its storage (``n(n+1)/2`` values per node) is read by that assembler, its Dirichlet path and its block
+    layout. The other routes size a field from ``value_shape`` alone and would lay out ``n*n`` values, so they
+    are refused here rather than left to fail with a shape error -- or, worse, to succeed on a wrong layout."""
+    syms = [
+        n
+        for c in constraints
+        for n in _walk(_bare(c))
+        if isinstance(n, (TrialFunction, TestFunction)) and n.__dict__.get("symmetric", False)
+    ]
+    if not syms:
+        return
+    where = None
+    if getattr(domain, "dimension", None) not in (2, 3):
+        where = f"a {getattr(domain, 'dimension', '?')}-D domain"
+    elif is_vpinn:
+        where = "a VPINN (network trial)"
+    elif periodic_ties:
+        where = "a form with periodic ties"
+    elif _trial_spaces(constraints) - {"Lagrange"}:
+        where = "a form mixing in a non-nodal element family"
+    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+        where = "a complex form"
+    if where is not None:
+        raise NotImplementedError(
+            f"jno.fem: a symmetric=True matrix field is supported on the native 2-D/3-D Lagrange assembler only, "
+            f"not on {where}. Declare the field without symmetric=True (full n x n storage) there."
+        )
+
+
+def _component_key(comp: int, constraint: Any) -> Any:
+    """The key a per-component Dirichlet value is stored under: ``"x"/"y"/"z"`` for a vector of up to three
+    components (the historical spelling every consumer reads), the flat integer index otherwise -- a matrix
+    entry or a vector's fourth component has no axis name, and naming entry ``(0, 1)`` of a matrix "y" would
+    mislabel it. Every consumer accepts both (``_normalize_dirichlet_value``)."""
+    trials = [n for n in _walk(_bare(constraint)) if isinstance(n, TrialFunction)]
+    vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+    return _COMPONENT_NAMES[comp] if len(vs) <= 1 and comp in _COMPONENT_NAMES else int(comp)
+
+
 def _component_index_of(node: Any) -> Optional[int]:
     """If ``node`` is a single component of the trial (``u[..., i]``), return ``i``.
 
@@ -1323,6 +1681,20 @@ def _component_index_of(node: Any) -> Optional[int]:
         args = getattr(node, "args", None) or []
         if len(args) == 1 and _contains(args[0], TrialFunction):
             ints = [k for k in node.getitem_key if isinstance(k, int)]
+            trials = [n for n in _walk(args[0]) if isinstance(n, TrialFunction)]
+            vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+            if len(vs) >= 2:
+                # A matrix field: one index per axis, flattened row-major -- `S(region)[i, j]` is component
+                # `i * m + j` of the node-major layout. A row `S(region)[i]` is not one component.
+                if len(ints) != len(vs) or any(isinstance(k, slice) for k in node.getitem_key):
+                    raise ValueError(
+                        f"jno.fem: a Dirichlet condition on one entry of a field with value_shape={vs} names "
+                        f"every index, e.g. `S(region)[0, 1] - g`; got the key {node.getitem_key!r}. Pin the "
+                        "whole tensor with `S(region) - G`, or one entry at a time."
+                    )
+                from .utils.solver.fem_utils import _flat_component_index
+
+                return _flat_component_index(trials[0], ints)
             if len(ints) == 1:
                 return ints[0]
     return None
@@ -1364,7 +1736,7 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None) -> Any:
+def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -1379,6 +1751,12 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     ``t`` is the time a **temporal** Variable reads (an initial condition passes the start time). A time
     Variable has its own tag, so without ``t`` it would be handed the spatial points and read the x column;
     a value that mentions time with no ``t`` given therefore raises instead.
+
+    ``pointwise=True`` evaluates the expression one point at a time (vmapped), so the result is
+    ``(n_points, *value_shape)`` flattened. A batch evaluation hands every coordinate in as an ``(n, 1)``
+    column, which broadcasts correctly against a scalar or a vector but not against a matrix: ``g(z) * M``
+    with ``M`` 3 x 3 fails for most ``n`` -- and for ``n = 3`` silently returns one 3 x 3 that then reads as
+    a constant. A matrix-valued condition therefore needs this.
     """
     from .trace_evaluator import TraceEvaluator
 
@@ -1415,6 +1793,16 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
                 elif (nn := _neural_coefficient_name(nd)) in params:  # trainable network: its live module
                     mod = params[nn]
             table[m.layer_id] = mod
+    if pointwise:
+
+        def _at(p):
+            ctx = {tag: p[None, :] for tag in tags}
+            for tag in temporal:
+                ctx[tag] = jnp.full((1, 1), t, dtype=pts.dtype)
+            return jnp.asarray(TraceEvaluator(table).evaluate(value_node, context=ctx))
+
+        vals = jax.vmap(_at)(pts)
+        return jnp.reshape(vals, (-1,))
     context = {tag: pts for tag in tags}
     for tag in temporal:
         context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
@@ -2039,6 +2427,7 @@ class FEM:
         :attr:`offsets` — the field order is first appearance in the ``jno.fem`` constraints."""
         if isinstance(field, int):
             return field
+        field = _lower_unknowns(field)  # a `domain.unknown()` field resolves through its trial symbol
         # the native assembler records the keys in assembly (= offsets) order — snapshotted onto
         # this FEM at finalize time (the domain attribute is overwritten by any later assembly on
         # the same domain, e.g. an auxiliary jno.precond.form); the constraint-walk order is only
@@ -3125,8 +3514,10 @@ class FEM:
             # `np.asarray(fem.solve(...))` silently produced a 0-d OBJECT array that only blew up later
             # inside the next residual call. A PERIODIC tie deliberately stays lazy — its `FunctionCall`
             # is what flows into `crux` for an inverse problem, and evaluating it here breaks that
-            # (measured: test_periodic_nonlinear_reaction_diffusion).
-            if periodic.get("coupling") == "slip" and not getattr(self._op, "is_parametric", False):
+            # (measured: test_periodic_nonlinear_reaction_diffusion). A tie to a CONSTANT is a boundary
+            # condition like a slip, and returned lazily it ran only when the caller evaluated it -- after
+            # `fem.stats` had been recorded, so stats["nonlinear"] was None and the convergence verdict lost.
+            if periodic.get("coupling") in ("slip", "constant_tie") and not getattr(self._op, "is_parametric", False):
                 return _out.fn()
             return _out
         if self._mode == "nonlinear" and not getattr(self._op, "is_parametric", False):
@@ -3633,7 +4024,7 @@ class FEM:
         """
         from .utils.solver.solver_helper import contains_node_type
 
-        terms = list(term) if isinstance(term, (list, tuple)) else [term]
+        terms = _lower_unknowns(list(term) if isinstance(term, (list, tuple)) else [term])
         bares = [getattr(t, "expr", t) for t in terms]
         weak = [contains_node_type(b, TestFunction) for b in bares]
         if any(weak) and not all(weak):
@@ -3801,7 +4192,6 @@ class FEM:
         ``component`` picks one component of a vector field (``None`` = all of them). Returns a plain
         ``numpy`` int array, so it indexes a solution or a residual directly.
         """
-        from .utils.solver.fem_utils import _value_shape_num_components
 
         idx = field if isinstance(field, int) else self.block_index(field)
         pts = self.field_points
@@ -3819,7 +4209,7 @@ class FEM:
                 "finer than the mesh, or a region on a different field's nodes, is the usual cause."
             )
         offs = self.offsets
-        vec = int(_value_shape_num_components(self._field_value_shape(idx)))
+        vec = int(self._field_vec(idx))
         base = int(offs[idx]) if offs is not None else 0
         comps = range(vec) if component is None else [int(component)]
         return np.concatenate([base + nodes * vec + c for c in comps])
@@ -3884,7 +4274,6 @@ class FEM:
                 f"fem.export: the solution has {int(arr.size)} entries but this problem has {int(offs[-1])} "
                 "DOFs. Pass the solve's own output, not a slice of it."
             )
-        from .utils.solver.fem_utils import _value_shape_num_components
 
         names = _field_names(self._constraints or [])
         # the assembler's field order -- what `offsets` indexes. `_trial_field_keys` is trace-walk
@@ -3905,7 +4294,7 @@ class FEM:
                     f"fem.export: no meshio cell type for a {dim}-D element with {int(cells_i.shape[1])} "
                     "nodes. Export the mesh with `d.export_vtk()` and the field separately."
                 )
-            vec = int(_value_shape_num_components(self._field_value_shape(i)))
+            vec = int(self._field_vec(i))
             block = arr[int(offs[i]) : int(offs[i + 1])].reshape(-1, vec)
             nm = names.get(keys[i], f"field{i}") if i < len(keys) else f"field{i}"
             out = save_path if n_fields == 1 else f"{root}.{nm}{ext}"
@@ -3916,6 +4305,15 @@ class FEM:
             )
             written.append(out)
         return written
+
+    def _field_vec(self, idx):
+        """Values stored per node in block ``idx`` (``n(n+1)/2`` for a symmetric ``n x n`` field)."""
+        from .utils.solver.fem_utils import _value_shape_num_components
+
+        vecs = getattr(self, "_block_vecs", None)
+        if vecs and idx < len(vecs):
+            return int(vecs[idx])
+        return int(_value_shape_num_components(self._field_value_shape(idx)))
 
     def _field_value_shape(self, idx):
         """The ``value_shape`` of block ``idx`` — from the assembler's own field list."""
@@ -5708,7 +6106,12 @@ def _check_bounds_under_reduction(fem_obj: Any, periodic: Any, kind: str) -> Non
     lo, hi = fem_obj._resolve_bounds(jnp.zeros((int(fem_obj.dofs),)))
     for side, full in (("lower", np.asarray(lo)), ("upper", np.asarray(hi))):
         kept = np.asarray(restrict_state_periodic(periodic, jnp.asarray(full)))
-        bad = np.flatnonzero(~np.isclose(full, kept[main], rtol=1e-12, atol=1e-12))
+        disagree = ~np.isclose(full, kept[main], rtol=1e-12, atol=1e-12)
+        if periodic.get("coupling") == "constant_tie":
+            # A DOF tied to a constant with no bound of its own takes the constant's: u_s = U, so U's box
+            # bounds it exactly. Only a bound declared on BOTH sides can conflict.
+            disagree &= np.isfinite(full)
+        bad = np.flatnonzero(disagree)
         if bad.size:
             d = int(bad[0])
             raise ValueError(
@@ -6107,6 +6510,11 @@ def _refuse_point_indexing(constraints: Any) -> None:
                 )
 
 
+#: Domains whose `_fem_tied_constants` hand-over was set by the build in progress; `fem()` clears them on
+#: exit so a build that raised before assembling cannot leak a constant into a later, unrelated assembly.
+_TIED_CONSTANT_DOMAINS: List[Any] = []
+
+
 def fem(
     constraints: Any,
     *,
@@ -6129,7 +6537,7 @@ def fem(
     try:
         with _host_assembly_scope():
             out = _fem_impl(
-                constraints,
+                _lower_unknowns(list(constraints) if isinstance(constraints, tuple) else constraints),
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )
@@ -6144,6 +6552,8 @@ def fem(
         return out
     finally:
         _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0] = prev, prev_consumed
+        while _TIED_CONSTANT_DOMAINS:
+            _TIED_CONSTANT_DOMAINS.pop().__dict__.pop("_fem_tied_constants", None)
 
 
 def _is_volume_region(domain, name: str) -> bool:
@@ -6290,6 +6700,32 @@ def _fem_impl(
         spec = _periodic_tie_spec(c, domain)
         (periodic_ties.append(spec) if spec is not None else core_constraints.append(c))
     constraints = core_constraints
+    # Ties of a field to a constant unknown (`u(region) - U`) reduce the system by a prolongation like a
+    # periodic tie; a constant's own essential value (`U - g`) is a one-DOF Dirichlet row. Both are peeled
+    # off before classification -- neither names a region the classifier could read.
+    const_ties: List[Any] = []
+    const_pins: List[Any] = []
+    _rest: List[Any] = []
+    for c in constraints:
+        spec = _constant_tie_spec(c, domain)
+        if spec is not None:
+            const_ties.append(spec)
+            continue
+        pin = _constant_pin_spec(c)
+        if pin is not None:
+            const_pins.append(pin)
+            continue
+        _rest.append(c)
+    constraints = _rest
+    # A constant that appears ONLY in a tie or a pin has no weak term to be found in; the assembler takes it
+    # from here (read once, by the next native assembly -- see `assemble_fem_native`).
+    domain._fem_tied_constants = [t[3] for t in const_ties] + [p[0] for p in const_pins]
+    _TIED_CONSTANT_DOMAINS.append(domain)  # `fem()` clears the hand-over however this build ends
+    if const_ties and periodic_ties:
+        raise NotImplementedError(
+            "jno.fem: a tie to a constant (`u(region) - U`) together with a periodic tie composes two "
+            "prolongations; that composition is not implemented."
+        )
     if periodic_ties and not constraints:
         raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
     # Gauge pins lower to a one-node Dirichlet at a vertex off every tied face (see `_lower_gauge_pin`).
@@ -6382,6 +6818,8 @@ def _fem_impl(
     _weak_has_real_trial = any(_contains(c, TestFunction) and _contains(c, TrialFunction) for c in constraints)
     is_vpinn = _has_network and not _weak_has_real_trial
     has_neural_coeff = _has_network and not is_vpinn
+    _check_symmetric_field_scope(domain, constraints, periodic_ties, is_vpinn)
+    _check_constant_field_scope(domain, constraints, is_vpinn)
 
     if has_neural_coeff:
         # A network in a trial-only (essential) constraint is a trainable *essential value*, NOT an
@@ -6459,6 +6897,7 @@ def _fem_impl(
         multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
         fem_obj._term_source = (domain, volume_terms)
         fem_obj._constraints = _orig_constraints
+        fem_obj._constant_closed_keys = {t[3].field_key for t in const_ties} | {pn[0].field_key for pn in const_pins}
         fem_obj._fem_kwargs = _orig_fem_kwargs
         fem_obj._geometry = list(_geometry)  # `coord.d(t) - v` terms: the mesh-motion driver reads these
         fem_obj._mesh_velocity = _mesh_velocity_node  # `coord.d(t)` in a weak form; the driver feeds it
@@ -6472,6 +6911,8 @@ def _fem_impl(
         fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
         fem_obj._term_functional_factory = getattr(domain, "_fem_native_term_functional", None)
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
+        fem_obj._block_vecs = list(getattr(domain, "_fem_native_field_vecs", None) or ())
+        fem_obj._block_constant = list(getattr(domain, "_fem_native_field_constant", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
         fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)
@@ -6523,8 +6964,8 @@ def _fem_impl(
             # reduction and reaches `reduce_matrix_periodic` / `B(P)` with no branch of its own.
             from .utils.solver.fem_refine import hanging_prolongation
 
-            if periodic_ties or slip_bcs:
-                _other = "a periodic or tied interface" if periodic_ties else "a slip condition `n·u = 0`"
+            if periodic_ties or slip_bcs or const_ties:
+                _other = "a periodic or tied interface" if (periodic_ties or const_ties) else "a slip condition `n·u = 0`"
                 raise NotImplementedError(
                     f"jno.fem: a locally refined (hanging-node) mesh combined with {_other} composes two "
                     "prolongations, and their order changes the answer. Refine away from those faces, or "
@@ -6564,6 +7005,31 @@ def _fem_impl(
             fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, _hp)
             fem_obj._periodic = _hp
             _check_bounds_under_reduction(fem_obj, _hp, "hanging-node constraint")
+            return _fuse_complex_steady(fem_obj)
+        if const_ties:
+            if fem_obj._mode not in ("linear", "nonlinear"):
+                raise NotImplementedError(
+                    f"jno.fem: a tie to a constant (`u(region) - U`) is wired on steady linear and nonlinear "
+                    f"forms; this one assembled as {fem_obj._mode!r}."
+                )
+            _dpairs_c, _tvdofs_c = _prescribed_dofs(domain)
+            _slip_c = None
+            if slip_bcs:
+                # The constant scope is the native assembler, which stashed its cells (see the slip branch below).
+                _slip_c = _build_slip_reduction(
+                    domain,
+                    slip_bcs,
+                    fem_obj,
+                    getattr(domain, "_fem_native_assembly_cells", None),
+                    int(getattr(domain, "_fem_native_assembly_order", 1)),
+                )
+            periodic = _build_constant_tie_reduction(
+                fem_obj, const_ties, [d for d, _g in _dpairs_c] + _tvdofs_c, slip=_slip_c
+            )
+            periodic = _annotate_reduced_dirichlet(periodic, _dpairs_c, _tvdofs_c)
+            fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
+            fem_obj._periodic = periodic
+            _check_bounds_under_reduction(fem_obj, periodic, "tie to a constant")
             return _fuse_complex_steady(fem_obj)
         if not periodic_ties and not slip_bcs:
             return _fuse_complex_steady(fem_obj)
@@ -6823,9 +7289,11 @@ def _fem_impl(
                 dirichlet_values[region] = value
                 classification.append(f"dirichlet@{region}")
             else:  # one component (roller/symmetry): u(region)[i] - g
-                if comp not in _COMPONENT_NAMES:
+                _n_comp = _field_num_components(c)
+                if not 0 <= comp < _n_comp:
                     raise ValueError(
-                        f"jno.fem: Dirichlet component index {comp} out of range (vector components are 0..2)."
+                        f"jno.fem: Dirichlet component index {comp} is out of range for a field with "
+                        f"{_n_comp} component(s)."
                     )
                 if dirichlet_style.get(style_key) == "all":
                     raise ValueError(
@@ -6835,9 +7303,10 @@ def _fem_impl(
                 dirichlet_style[style_key] = "per_component"
                 current = dirichlet_values.get(region)
                 current = dict(current) if isinstance(current, dict) else {}
-                current[_COMPONENT_NAMES[comp]] = value
+                _key = _component_key(comp, c)
+                current[_key] = value
                 dirichlet_values[region] = current
-                classification.append(f"dirichlet@{region}[{_COMPONENT_NAMES[comp]}]")
+                classification.append(f"dirichlet@{region}[{_key}]")
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
@@ -6849,6 +7318,12 @@ def _fem_impl(
     classification.extend(f"slip@{spec[1]}" for spec in slip_bcs)
 
     _check_movable_bc_nodes(domain, dirichlet_raw, boundary_terms)
+    for U, ucomp, value_node in const_pins:
+        # One DOF: the native assembler resolves any region of a constant field to its single node.
+        _vn = _bare(value_node)
+        dirichlet_raw.append((U.field_key, "__constant__", ucomp, _value_from_node(_vn), _vn))
+        classification.append(f"dirichlet@{U.name}" + ("" if ucomp is None else f"[{ucomp}]"))
+    classification.extend(f"tie@{region}->{U.name}" for _fk, region, _c, U, _uc in const_ties)
 
     if is_vpinn and multifield:
         # Single-field is a real boundary, not a guard: the network-trial lowering wraps ONE primary
@@ -7857,7 +8332,8 @@ def _assemble_multifield(
         else:
             current = region_values.get(region)
             current = dict(current) if isinstance(current, dict) else {}
-            current[_COMPONENT_NAMES[comp]] = value
+            _rank = len(tuple(fields[fidx].get("value_shape", ()) or ()))
+            current[_COMPONENT_NAMES[comp] if _rank <= 1 and comp in _COMPONENT_NAMES else int(comp)] = value
             region_values[region] = current
     domain._fem_dirichlet_by_field = by_field
 

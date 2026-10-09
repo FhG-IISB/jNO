@@ -986,7 +986,13 @@ class Placeholder:
 
     @property
     def T(self) -> FunctionCall:
-        return FunctionCall(lambda x: x.T, [self], "transpose", True)
+        """The transpose over the LAST TWO axes (the matrix axes); a 0-/1-D value is returned as is.
+
+        The array ``.T`` reverses every axis, which is the transpose only for a plain 2-D array. In a trace
+        the leading axes are points (and, at assembly, quadrature points and test DOFs), so on a field of
+        2x2 tensors -- ``grad(u).T`` -- reversing them all produced a ``(2, 2, n)`` array: a broadcast error
+        at best, and for ``n = 2`` a silently wrong number. For a 2-D array both readings agree."""
+        return FunctionCall(lambda x: jnp.swapaxes(x, -1, -2) if jnp.ndim(x) >= 2 else x, [self], "transpose", True)
 
     def eval(self, domain=None):
         """Eagerly evaluate this node and return the array — no ``jno.core`` boilerplate.
@@ -3253,6 +3259,12 @@ class ModelCall(Placeholder):
         (not a lexical spatial partial), so the strong form reads identically to the weak form
         (``ui.t - nu*(ui.d2(x) + ui.d2(y))``)."""
         if getattr(self.model, "_fem_field", None) == "node":
+            sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+            rank = len(getattr(sym, "value_shape", ()) or ()) if sym is not None else 0
+            if rank == 1:  # a vector unknown binds as the vector view, as its fem trial does (`ui[0]`, `ui.div()`)
+                return self.vector.partials(**named_vars)
+            if rank == 2:  # a matrix unknown as the matrix view (`Si[0, 1]`, `Si.T`, `Si @ W`)
+                return self.matrix.partials(**named_vars)
             return self.field.partials(**named_vars)
         return self.scalar.partials(**named_vars)
 
@@ -3269,6 +3281,38 @@ class ModelCall(Placeholder):
             binding.update(named)
             return self.partials(**binding)
         return super().__call__(*coords, **named)
+
+    # ── an unknown from ``domain.unknown()``: the FEM side of the same field ─────────────
+
+    def _unknown_symbol_or_raise(self, what: str):
+        sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+        if sym is None:
+            raise TypeError(
+                f"{what} is defined for an unknown from `domain.unknown(...)` only; this is a "
+                f"{type(self.model).__name__} output, not an unknown."
+            )
+        return sym
+
+    def test(self) -> "TestFunction":
+        """The FEM **test function** of this unknown (``domain.unknown()``): ``v = u.test()``. In ``jno.fem``
+        the unknown is the trial function and ``v`` its test function -- same space, shape and order."""
+        return self._unknown_symbol_or_raise("u.test()").test()
+
+    def pin(self, value=0.0, mean=False):
+        """Gauge pin of this unknown's constant null space -- see :meth:`TrialFunction.pin`."""
+        return self._unknown_symbol_or_raise("u.pin()").pin(value, mean=mean)
+
+    def dn(self, *coords, **named):
+        """Normal derivative on a boundary region -- see :meth:`TrialFunction.dn`."""
+        return self._unknown_symbol_or_raise("u.dn()").dn(*coords, **named)
+
+    def gap(self, secondary: str, main, *, domain):
+        """Contact gap -- see :meth:`TrialFunction.gap`."""
+        return self._unknown_symbol_or_raise("u.gap()").gap(secondary, main, domain=domain)
+
+    def slide(self, secondary: str, main, *, domain):
+        """Tangential slide -- see :meth:`TrialFunction.slide`."""
+        return self._unknown_symbol_or_raise("u.slide()").slide(secondary, main, domain=domain)
 
     # ── proxied helpers (delegate to Model) ─────────────
 
@@ -3707,6 +3751,16 @@ def _component_keeps_axis(expr) -> bool:
     return True
 
 
+def _check_symmetric_shape(value_shape, symmetric) -> bool:
+    """``symmetric=True`` is meaningful for a square matrix field only; anything else is refused."""
+    symmetric = bool(symmetric)
+    if symmetric and not (len(value_shape) == 2 and int(value_shape[0]) == int(value_shape[1])):
+        raise ValueError(
+            f"symmetric=True needs a square matrix field, value_shape=(n, n); got value_shape={tuple(value_shape)}."
+        )
+    return symmetric
+
+
 class _FieldComponentIndex:
     """``field[i]`` is the i-th COMPONENT — the mixin that makes one spelling mean one thing.
 
@@ -3723,6 +3777,14 @@ class _FieldComponentIndex:
     from it — the per-component Dirichlet spec and the component-gradient branch of the assembler —
     are unaffected.
     """
+
+    @property
+    def T(self):
+        """A matrix field's transpose swaps its two VALUE axes. The array ``.T`` would reverse every axis,
+        and at assembly the leading ones are quadrature points (and test DOFs)."""
+        if len(tuple(getattr(self, "value_shape", ()) or ())) == 2:
+            return FunctionCall(lambda x: jnp.swapaxes(x, -1, -2), [self], "transpose")
+        return Placeholder.T.fget(self)
 
     def __getitem__(self, key):
         keys = key if isinstance(key, tuple) else (key,)
@@ -4455,9 +4517,15 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -4467,8 +4535,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)
@@ -4648,6 +4720,29 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
             dom.context[key] = _np.zeros((1, _dim))
         return Variable(tag=key, dim=[0, _dim], domain=dom, axis="spatial")
+
+    def test(self) -> "TestFunction":
+        """This field's **test function**: same space, value shape, order, symmetry and field.
+
+        ``v = u.test()`` is derived from the unknown, so the pair cannot be mismatched. Repeated calls
+        return the same symbol (the one ``fem_symbols`` paired it with, if it came from there)."""
+        t = self.__dict__.get("_test")
+        if t is None:
+            t = TestFunction(
+                name=f"v_{self.name}",
+                value_shape=self.value_shape,
+                order=self.order,
+                space=self.space,
+                symmetric=self.__dict__.get("symmetric", False),
+                constant=self.__dict__.get("_is_constant", False),
+            )
+            t.field_key = self.field_key
+            if "_domain" in self.__dict__:
+                t._domain = self._domain
+            if self.__dict__.get("_complex_field_member", False):
+                t._complex_field_member = True
+            self._test = t
+        return t
 
     def pin(self, value=0.0, mean=False):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
@@ -5360,9 +5455,15 @@ class TestFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -5371,8 +5472,12 @@ class TestFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)

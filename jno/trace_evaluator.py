@@ -1717,8 +1717,10 @@ class TraceEvaluator:
                     comps = [dN[..., dim_idx] for dim_idx in requested_dims]
                     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
-                eye = jnp.eye(n_comp, dtype=dN.dtype)
-                comps = [dN[..., dim_idx][:, :, None, None] * eye[None, None, :, :] for dim_idx in requested_dims]
+                eye = jnp.eye(n_comp, dtype=dN.dtype).reshape((n_comp,) + tuple(value_shape))  # one-hot per component
+                comps = [
+                    dN[..., dim_idx].reshape(dN.shape[:2] + (1,) * eye.ndim) * eye[None, None] for dim_idx in requested_dims
+                ]
 
                 # one derivative:
                 #   (Nq_total, nloc, basis_comp, phys_comp)
@@ -1747,8 +1749,11 @@ class TraceEvaluator:
                     comps = [dN_face[..., dim_idx] for dim_idx in requested_dims]
                     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
-                eye = jnp.eye(n_comp, dtype=dN_face.dtype)
-                comps = [dN_face[..., dim_idx][:, :, None, None] * eye[None, None, :, :] for dim_idx in requested_dims]
+                eye = jnp.eye(n_comp, dtype=dN_face.dtype).reshape((n_comp,) + tuple(value_shape))
+                comps = [
+                    dN_face[..., dim_idx].reshape(dN_face.shape[:2] + (1,) * eye.ndim) * eye[None, None]
+                    for dim_idx in requested_dims
+                ]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
             raise ValueError(f"Unknown active support '{support}'")
@@ -2731,8 +2736,9 @@ class TraceEvaluator:
         if n_comp == 1:
             return shape_vals
 
-        eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
-        return shape_vals[:, :, None, None] * eye[None, None, :, :]
+        # one-hot per component, (n_comp, *value_shape): eye(n) for a vector, eye(n*m) reshaped for a matrix
+        eye = jnp.eye(n_comp, dtype=shape_vals.dtype).reshape((n_comp,) + tuple(value_shape))
+        return shape_vals.reshape(shape_vals.shape[:2] + (1,) * eye.ndim) * eye[None, None]
 
     @staticmethod
     def _normalize_value_coeff(coeff, n_q_total):

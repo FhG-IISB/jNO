@@ -325,6 +325,38 @@ def _lagrange_simplex(dim: int, degree: int, quad_degree: Any = None, cell_type:
     return builder(degree, quad_degree)
 
 
+class _ConstantSpec:
+    """The element of a CONSTANT field (``domain.unknown(..., constant=True)``): one basis function equal to
+    one on every cell, with zero gradient and Hessian. It borrows the quadrature rule of the mesh element it
+    is assembled beside, so every field still integrates on one shared rule."""
+
+    def __init__(self, base):
+        nq = int(np.asarray(base.quad_points).shape[0])
+        self.quad_points = base.quad_points
+        self.quad_weights = base.quad_weights
+        self.ref_values = np.ones((nq, 1, 1))
+        dim = int(np.asarray(base.ref_grads).shape[-1])
+        self.ref_grads = np.zeros((nq, 1, 1, dim))
+        self.ref_hess = np.zeros((nq, 1, dim, dim))
+        for name in ("degree", "dim"):
+            if hasattr(base, name):
+                setattr(self, name, getattr(base, name))
+
+
+def _constant_face_table(table):
+    """A facet table for a constant field: the same facet rule, a single basis value of one, zero gradient."""
+    if table is None:
+        return None
+    phi, dphi, qp, tangs, w = table
+    return (
+        jnp.ones(phi.shape[:2] + (1,), phi.dtype),
+        jnp.zeros(dphi.shape[:2] + (1,) + dphi.shape[3:], dphi.dtype),
+        qp,
+        tangs,
+        w,
+    )
+
+
 def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
     """Essential values as float64, refusing a genuinely complex one instead of dropping its imaginary part.
 
@@ -783,7 +815,60 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
-def _dirichlet_value_columns(gs, vt, comp, region):
+def _symmetric_ic_values(raw, n, n_nodes):
+    """A whole-field initial value of a symmetric ``n x n`` field -> its stored upper triangle.
+
+    ``raw`` is flat: one constant, one ``n x n`` matrix, or one matrix per node (it is already stored-size
+    when the user wrote the ``n(n+1)/2`` values themselves). An asymmetric matrix is refused when the value
+    is concrete; a traced one (a trainable initial state) is read by its upper triangle."""
+    nn2 = n * n
+    if raw.size not in (nn2, n_nodes * nn2):
+        return raw
+    full = raw.reshape(-1, n, n)
+    if not isinstance(full, jax.core.Tracer):
+        f = np.asarray(full)
+        gap = float(np.max(np.abs(f - np.swapaxes(f, -1, -2)))) if f.size else 0.0
+        if gap > 1e-12 * max(1.0, float(np.max(np.abs(f)))):
+            raise ValueError(
+                f"jno.fem: the initial value of a symmetric=True field is not symmetric (max |G - G^T| = {gap:.3g})."
+            )
+    iu, ju = np.triu_indices(n)
+    return full[:, iu, ju].reshape(-1)
+
+
+def _unique_dirichlet_pairs(pairs):
+    """One ``(dof, value)`` pair per DOF; the LAST condition in the term list wins.
+
+    A node on two Dirichlet regions (the corner where ``left`` meets ``bottom``) is named by both. Every
+    consumer assumes one pair per DOF: the elimination appends one unit-diagonal triplet per pair and BCOO
+    sums duplicates, so a corner node's row became ``2 s u = s g`` -- the corner solved to HALF its value,
+    silently (measured: ``u = 1 + y`` on all four edges of a square gave 0.5 and 1.0 at the corners, against
+    1 and 2). Two DIFFERENT values at one DOF (a lid-driven cavity's top corners: lid 1, wall 0) are a
+    genuine ambiguity in the problem statement; the later condition is kept and the count is logged."""
+    if not pairs:
+        return pairs
+    keep: Dict[int, Any] = {}
+    clash = 0
+    for d, g in pairs:
+        d = int(d)
+        if d in keep:
+            try:
+                if abs(float(keep[d]) - float(g)) > 1e-12 * max(1.0, abs(float(g))):
+                    clash += 1
+            except Exception:  # a traced (net-valued) value: no concrete comparison, the later one wins
+                pass
+        keep[d] = g
+    if clash:
+        from ..logger import get_logger
+
+        get_logger().warning(
+            f"jno.fem: {clash} DOF(s) are prescribed by two Dirichlet conditions with DIFFERENT values (nodes "
+            "shared by two regions, e.g. corners). The condition written LATER in the term list is imposed there."
+        )
+    return list(keep.items())
+
+
+def _dirichlet_value_columns(gs, vt, comp, region, field=None):
     """A Dirichlet value table ``(n_nodes, n_values)`` checked against the clamped components.
 
     ``n_values`` must be 1 (a scalar, the same on every clamped component) or, for an all-component clamp
@@ -793,6 +878,22 @@ def _dirichlet_value_columns(gs, vt, comp, region):
     n_values = gs.shape[1] if gs.ndim == 2 else 1
     if n_values == 1:
         return gs.reshape(-1)
+    if field is not None and field.get("symmetric") and comp is None:
+        n = int(tuple(field["value_shape"])[0])
+        if n_values == n * n:
+            # A full n x n value on a symmetric field: it must BE symmetric, and its upper triangle is what is
+            # stored. Imposing an asymmetric value would silently keep half of it, so it is refused.
+            full = np.asarray(gs, dtype=float).reshape(-1, n, n)
+            gap = float(np.max(np.abs(full - np.swapaxes(full, -1, -2)))) if full.size else 0.0
+            scale = max(1.0, float(np.max(np.abs(full)))) if full.size else 1.0
+            if gap > 1e-12 * scale:
+                raise ValueError(
+                    f"jno.fem: the Dirichlet value on {region!r} is not symmetric (max |G - G^T| = {gap:.3g}), but the "
+                    "field was declared symmetric=True, which stores one value per symmetric pair. Prescribe a "
+                    "symmetric value, or declare the field without symmetric=True."
+                )
+            iu, ju = np.triu_indices(n)
+            return full[:, iu, ju]
     if comp is None and n_values == vt:
         return gs
     what = f"component {int(comp)} (`u(...)[{int(comp)}] - g`)" if comp is not None else f"a {vt}-component field"
@@ -876,7 +977,8 @@ def _seeded_piece(piece):
         proxies = {}
         for n in tests.values():
             pr = _Trial(name="seed", value_shape=getattr(n, "value_shape", ()), order=getattr(n, "order", 1),
-                        space=getattr(n, "space", "Lagrange"))  # fmt: skip
+                        space=getattr(n, "space", "Lagrange"),
+                        symmetric=n.__dict__.get("symmetric", False))  # fmt: skip
             pr.field_key = _SEED_KEY
             proxies[n] = pr
         res = (_substitute(piece, proxies), tuple(tests.values()))
@@ -1098,6 +1200,35 @@ def assemble_fem_native(
                     field_index[f["field_key"]] = len(fields)
                     fields.append(f)
 
+    # A CONSTANT unknown (``domain.unknown(..., constant=True)``) may appear only on a boundary -- an inlet
+    # pressure that multiplies a traction and carries a flow-rate equation there -- so its field is
+    # collected from the boundary terms too. (A mesh field still has to appear in a volume term.)
+    for _exprs in boundary_terms.values():
+        for bare in _exprs:
+            for _, sub in _split_additive_terms(domain, bare):
+                fs, _ = _infer_fields(_lower_statefield_to_trial(sub, {}))
+                for f in fs:
+                    if f.get("constant") and f["field_key"] not in field_index:
+                        field_index[f["field_key"]] = len(fields)
+                        fields.append(f)
+    # ...and a constant that appears only in a tie `u(region) - U` or a pin `U - g` (handed over by jno.fem,
+    # consumed here so an auxiliary assembly on the same domain never sees it).
+    for _U in domain.__dict__.pop("_fem_tied_constants", None) or ():
+        for f in _infer_fields(_U)[0]:
+            if f["field_key"] not in field_index:
+                field_index[f["field_key"]] = len(fields)
+                fields.append(f)
+    # Constants go LAST: their block is the border of the system, and field 0 must be a mesh field (it
+    # supplies `fem.points` and, on a curved or tensor-product cell, the geometry).
+    if any(f.get("constant") for f in fields):
+        fields = [f for f in fields if not f.get("constant")] + [f for f in fields if f.get("constant")]
+        field_index = {f["field_key"]: i for i, f in enumerate(fields)}
+        if fields[0].get("constant"):
+            raise ValueError(
+                "jno.fem: every unknown in this form is a constant (constant=True) -- a constant is solved for "
+                "together with a field on the mesh, not on its own."
+            )
+
     if not fields:
         raise ValueError("assemble_fem_native: no trial fields found in volume_terms.")
 
@@ -1144,7 +1275,23 @@ def assemble_fem_native(
     # Per-field mesh data
     # -------------------------------------------------------------------------
 
-    mesh_data = [_get_mesh(domain, dim, f["order"]) for f in fields]
+    mesh_data = [_get_mesh(domain, dim, 1 if f.get("constant") else f["order"]) for f in fields]
+    # A constant field has ONE node, shared by every cell: its connectivity is a column of zeros, so the
+    # ordinary scatter sums every cell's contribution into it -- which is what makes its test function's
+    # rows integrals over the whole region, and its trial a value seen identically by every element. The
+    # node's coordinate is the mesh centroid; it locates nothing (``fem.field_points`` reports it).
+    mesh_data = [
+        (
+            md[0],
+            md[1],
+            np.mean(np.asarray(md[0]), axis=0, keepdims=True),
+            np.zeros((np.asarray(md[1]).shape[0], 1), np.int64),
+        )
+        if f.get("constant")
+        else md
+        for f, md in zip(fields, mesh_data)
+    ]
+    _const_f = [bool(f.get("constant")) for f in fields]
 
     def _pad_for_cover(md, blk):
         """A cover field's DOF nodes are the mesh nodes repeated ``blk = 1+M`` times.
@@ -1230,6 +1377,8 @@ def assemble_fem_native(
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
     domain._fem_native_field_shapes = [tuple(f["value_shape"]) for f in fields]
+    domain._fem_native_field_constant = [bool(f.get("constant")) for f in fields]
+    domain._fem_native_field_vecs = [int(f["vec"]) for f in fields]  # stored values per node (symmetric: n(n+1)/2)
 
     # -------------------------------------------------------------------------
     # Element specs and JAX constants
@@ -1247,7 +1396,8 @@ def assemble_fem_native(
         # has to happen where the enrichment is known. Without it the mass matrix silently
         # under-integrates and only a convergence study would notice.
         _qd = max(_qd, 2 * (1 + COVER_DEGREE))
-    specs = [_lagrange_simplex(dim, f["order"], _qd, cell_type=_cell_type) for f in fields]
+    specs = [_lagrange_simplex(dim, 1 if f.get("constant") else f["order"], _qd, cell_type=_cell_type) for f in fields]
+    specs = [_ConstantSpec(s) if c else s for s, c in zip(specs, _const_f)]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)
@@ -1691,7 +1841,12 @@ def assemble_fem_native(
     # it unpackable-None. These are REFERENCE-space tables -- shape (n_faces, n_q, n_dof) per element
     # order -- so the cost is independent of the mesh size and paid once at build.
     face_tables_per_field = (
-        [_build_face_tables(f["order"], quad_degree, dim, _cell_type) for f in fields]
+        [
+            _constant_face_table(_build_face_tables(1, quad_degree, dim, _cell_type))
+            if f.get("constant")
+            else _build_face_tables(f["order"], quad_degree, dim, _cell_type)
+            for f in fields
+        ]
         if not _refuse_tensor_product_surface(_cell_type)
         else [None] * len(fields)
     )
@@ -4162,6 +4317,8 @@ def assemble_fem_native(
         then expanded to the ``1+M`` slots it owns. A Dirichlet condition therefore reaches the
         value and its covers alike -- which is what :func:`_cover_g` then tells apart, giving the
         covers zero rather than ``g``."""
+        if _const_f[fidx]:
+            return [0]  # a constant's one node: `U - g` pins it whatever region the term names
         real = _boundary_node_ids_real(fidx, region)
         blk = _cblk[fidx]
         if blk == 1:
@@ -4366,21 +4523,27 @@ def assemble_fem_native(
             if _field_vals is not None:
                 gs = _real_dirichlet_values(np.asarray(_field_vals)[nids], region).astype(float)
             elif value_node is not None:
-                raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))))
+                # A matrix field's value (`g(z) * M`) is evaluated point by point: in a batch the
+                # coordinates are (n, 1) columns, which do not broadcast against an n x n matrix (see
+                # `_eval_value_node_at`). Its per-point result is then always (n_nodes, n*n).
+                _pw = comp is None and len(tuple(fields[fidx].get("value_shape") or ())) >= 2
+                _pw = _pw and len(nids) > 0
+                raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), pointwise=_pw)))
                 _real_dirichlet_values(raw, region)  # refuse a complex g before any cast drops Im(g)
                 # Does the result scale with the number of points? A CONSTANT profile returns the
                 # same thing for any batch -- including a constant VECTOR like (gx, gy), whose size
                 # can coincide with the node count -- so shape alone cannot tell. One extra
-                # single-point evaluation settles it and costs nothing.
-                one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
-                if raw.shape == one.shape or len(nids) == 0:
+                # single-point evaluation settles it and costs nothing. (A pointwise evaluation always
+                # scales, so it never needs the test.)
+                one = None if _pw else np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
+                if (not _pw and raw.shape == one.shape) or len(nids) == 0:
                     const = np.real(one).reshape(-1).astype(float)  # constant over the region: (n_values,)
                     gs = np.broadcast_to(const, (len(nids), const.size))
                 else:
                     gs = np.real(raw).reshape(len(nids), -1).astype(float)  # (n_nodes, n_values)
                 # EVERY component, not the first one broadcast to all: `u(wall) - (1.0, -0.5)` on a vector
                 # field used to impose (1.0, 1.0) -- silently, steady and transient alike.
-                gs = _dirichlet_value_columns(gs, vt, comp, region)
+                gs = _dirichlet_value_columns(gs, vt, comp, region, fields[fidx])
             elif callable(value):
                 gs = np.array([float(_real_dirichlet_values(value(p), region)) for p in pts], dtype=float)
             else:
@@ -4400,6 +4563,7 @@ def assemble_fem_native(
         domain._fem_native_dirichlet_args_dofs = args_dofs
         _mask_cover_pins(pairs)
         _gauge_cover_modes(pairs)
+        pairs[:] = _unique_dirichlet_pairs(pairs)  # in place: the stash above is this same list
         return pairs
 
     def _cover_g(fidx, nid, g):
@@ -4599,7 +4763,7 @@ def assemble_fem_native(
                 p = pts_all[nid]
                 if value_node is not None:
                     gv = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None]))).reshape(1, -1)
-                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region)).reshape(-1)
+                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region, fields[fidx])).reshape(-1)
                 elif callable(value):
                     gv = np.array([float(value(p))])
                 else:
@@ -4761,6 +4925,8 @@ def assemble_fem_native(
                 raw = jnp.reshape(
                     jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params, t=t0)), (-1,)
                 )
+                if comp is None and fields[fidx].get("symmetric"):
+                    raw = _symmetric_ic_values(raw, int(tuple(fields[fidx]["value_shape"])[0]), nn)
                 if comp is not None:
                     # Per-component IC (e.g. ``u(initial)[0] - g0``): set just component ``comp`` at every
                     # node of the field. ``raw`` is the per-node value (or a single constant to broadcast).
