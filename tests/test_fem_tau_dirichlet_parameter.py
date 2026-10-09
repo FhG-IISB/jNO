@@ -6,9 +6,9 @@ the combination: the parametric one would hold the value constant in τ (un-ramp
 one would freeze ``g`` at its stored value (un-training it). The march's residual is called with
 ``(u, args, τ)``, so the ramp is now evaluated at the step's τ WITH the runtime args.
 
-Oracles: the march at ``g`` equals its twin with ``g`` written as a constant; the grip holds ``g*τ_k`` on
-every step; the gradient in ``g`` matches central differences; and ``jno.core`` recovers ``g`` from the
-trajectory it produced.
+Oracles: the march at ``g`` equals its twin with ``g`` written as a constant (bit for bit on CPU, to
+round-off on GPU); the grip holds ``g*τ_k`` on every step; the gradient in ``g`` matches central
+differences; and ``jno.core`` recovers ``g`` from the trajectory it produced.
 """
 
 from __future__ import annotations
@@ -72,7 +72,8 @@ def test_the_march_equals_its_constant_amplitude_twin_and_holds_the_grip():
     ys = np.asarray(fem.solve(g=jnp.array([G])))
     twin = np.asarray(_plate(G)[1].solve())
     assert np.abs(twin).max() > 0.5 * G
-    assert np.array_equal(ys, twin)
+    # The same march: bit-identical on CPU, round-off on GPU (the parametric one compiles differently).
+    assert np.abs(ys - twin).max() <= 1e-12 * np.abs(twin).max()
 
     pts = np.asarray(fem.points)
     top = np.flatnonzero(pts[:, 1] > 1 - 1e-9)
