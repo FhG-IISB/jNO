@@ -2059,7 +2059,7 @@ class domain(MeshIOMixin):
             return None
         return lambda p: region.contains(p)
 
-    def tag_node_mask(self, tag, points):
+    def tag_node_mask(self, tag, points, *, closure: bool = False):
         """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
 
         The companion to :meth:`_make_tag_location_fn`, and the one an assembler should use when it
@@ -2073,6 +2073,12 @@ class domain(MeshIOMixin):
         Only the *user* predicate moves off the JAX path. The boundary restriction it is intersected
         with stays where it was -- a tolerance-based proximity test against the region's own points,
         which float32 cannot break.
+
+        ``closure=True`` adds every vertex of the boundary facets the tag selected -- what a FACET-based
+        use needs (the non-nodal path pins a facet's edge/face DOFs when all its vertices are in the
+        tag). The default is the predicate at the vertices, which is what a NODE-based use means: a
+        nodal Dirichlet value or tie can exclude a corner with a vertex predicate, and the closure would
+        put it back.
 
         Returns ``None`` when the tag is unknown, matching ``_make_tag_location_fn``.
         """
@@ -2112,14 +2118,15 @@ class domain(MeshIOMixin):
                 hit = np.flatnonzero(mask)
                 pts, n = pts[hit], int(hit.size)
                 mask[hit] = _vmapped(full.contains).astype(bool)
-            # ...and every vertex of the facets the tag SELECTED. The tag picks its facets by the
-            # predicate at facet centroids, but a node test re-asks it at the vertices, and the two can
-            # disagree: on a curved wall the centroids sit inside the surface by the chord sagitta, and a
-            # predicate written to keep a neighbouring plane out ("not on z = 0") drops the vertices where
-            # the wall MEETS that plane. Every edge touching that junction then went unpinned in silence --
-            # measured on a mirror-cell eddy problem in a cylindrical can: L 8 % high. The closure of the
-            # selected facets is what the tag means.
-            reg = self._boundary_regions.get(tag)
+            # ...and, for a FACET-based use (`closure=True`), every vertex of the facets the tag SELECTED.
+            # The tag picks its facets by the predicate at facet centroids, but a node test re-asks it at
+            # the vertices, and the two can disagree: on a curved wall the centroids sit inside the surface
+            # by the chord sagitta, and a predicate written to keep a neighbouring plane out ("not on
+            # z = 0") drops the vertices where the wall MEETS that plane. Every edge touching that junction
+            # then went unpinned in silence -- measured on a mirror-cell eddy problem in a cylindrical can:
+            # L 8 % high. A NODE-based use keeps the vertex predicate, which is how a nodal value or tie
+            # excludes a corner on purpose.
+            reg = self._boundary_regions.get(tag) if closure else None
             fac = None if reg is None else getattr(reg, "facets", None)
             if fac is not None and len(fac):
                 from scipy.spatial import cKDTree

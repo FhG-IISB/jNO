@@ -2126,7 +2126,7 @@ def _build_general_surface(
     }
 
     def _region_facets(region):
-        mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+        mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
         if mask is None:
             raise ValueError(f"jno.fem (non-nodal): boundary region {region!r} has no location function.")
         mask = np.asarray(mask, dtype=bool).reshape(-1)
@@ -2629,7 +2629,7 @@ def _rt_pressure_load_general(b, pd_node, fidx, region, dm, domain, pts_np, cell
     from ..._fem import _eval_value_node_at
     from .fem_dofmap import facet_owners
 
-    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
     if mask is None:
         raise ValueError(f"jno.fem (non-nodal): natural-BC region {region!r} has no location function.")
     mask = np.asarray(mask, dtype=bool).reshape(-1)
@@ -3109,7 +3109,7 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
         region_trace_entities,
     )
 
-    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
     if mask is None:
         raise ValueError(f"jno.fem (non-nodal): essential region {region!r} has no location function.")
     mask = np.asarray(mask, dtype=bool).reshape(-1)
