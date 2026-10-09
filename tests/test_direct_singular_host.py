@@ -33,6 +33,13 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
+# The DEFAULT sparse-direct solve is SuperLU only on the CPU; on a GPU it is cuSolver, which raises its own
+# "Singular matrix in linear solve" (loud, but not this message). These two tests pin the CPU path.
+_on_cpu = pytest.mark.skipif(
+    jax.default_backend() != "cpu", reason="the default sparse-direct solve is SuperLU only on the CPU backend"
+)
+
+
 def _cubic():
     d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=4).domain()
     u, v = d.fem_symbols(names=("u", "v"), order=1)
@@ -60,6 +67,7 @@ def test_host_lu_is_unaffected_on_a_regular_tangent():
     np.testing.assert_allclose(got, 1.0, atol=1e-9)
 
 
+@_on_cpu
 def test_default_direct_newton_blames_the_singular_tangent_not_max_steps():
     """JAX's spsolve answers an exactly singular matrix with NaN; the verdict must say so."""
     fem = _cubic()
@@ -69,6 +77,7 @@ def test_default_direct_newton_blames_the_singular_tangent_not_max_steps():
     np.testing.assert_allclose(_newton(fem, np.full(fem.dofs, 0.5)), 1.0, atol=1e-9)
 
 
+@_on_cpu
 def test_a_superlu_breakdown_inside_jax_spsolve_is_named(monkeypatch):
     """SuperLU's internal ABORT on a rank-deficient panel. It is a matter of pivoting luck which singular
     matrix aborts rather than returns NaN or a finite wrong answer (measured: a 3334-DOF three-field
