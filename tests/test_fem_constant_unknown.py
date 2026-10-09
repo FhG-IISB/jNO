@@ -230,7 +230,6 @@ def test_a_tie_on_a_transient_form_is_refused():
         jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xr, yr) - U, U - 1.0, u(*ci) - 0.0])
 
 
-
 def _tilted_strip(theta, *, slip_reaches_outlet=False):
     """The strip [0, 1] x [0, H] turned by ``theta``, tagged in its own frame (s along, η across). The slip
     walls stop short of the inlet corners (a slip node carrying a Dirichlet value on a tilted wall is a

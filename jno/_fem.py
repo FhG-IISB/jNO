@@ -1493,7 +1493,9 @@ def _check_constant_field_scope(domain: Any, constraints: List[Any], is_vpinn: b
         )
 
 
-def _build_constant_tie_reduction(fem_obj: Any, ties: List[Any], prescribed: List[int], slip: Optional[dict] = None) -> dict:
+def _build_constant_tie_reduction(
+    fem_obj: Any, ties: List[Any], prescribed: List[int], slip: Optional[dict] = None
+) -> dict:
     """The prolongation ``u = P ũ`` that makes each tied DOF the constant's DOF.
 
     One global selection over the whole (multi-field) vector -- a tie crosses field blocks, which the
