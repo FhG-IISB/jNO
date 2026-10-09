@@ -236,13 +236,14 @@ def dense() -> LinearSolver:
 
 
 def _unit_scaled(M, b):
-    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for ``jax.scipy.sparse.linalg.gmres``.
+    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for a left-preconditioned GMRES.
 
-    JAX's GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below ``tol·‖b‖``, an
-    UNpreconditioned norm. A preconditioner far from unit scale moves that test by its scale: with Jacobi
-    on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of 1.5e-4 read as 7.5e-9
-    and was returned without a single iteration. A constant multiple of ``M`` leaves the Krylov iterates
-    unchanged and puts both norms on the same scale, so ``tol`` means what it says."""
+    Left-preconditioned GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below
+    ``tol·‖b‖``, an UNpreconditioned norm. A preconditioner far from unit scale moves that test by its
+    scale: with Jacobi on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of
+    1.5e-4 read as 7.5e-9 and was returned without a single iteration. A constant multiple of ``M``
+    leaves the Krylov iterates unchanged and puts both norms on the same scale, so ``tol`` means what
+    it says."""
     Mb = jnp.linalg.norm(M(b))
     scale = jnp.where(Mb > 0, jnp.linalg.norm(b) / jnp.where(Mb > 0, Mb, 1.0), 1.0)
     return lambda r: scale * M(r)
@@ -263,14 +264,28 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
             from .utils.solver.krylov import flexible_cg
 
             raw = lambda mv, rhs, M, x0: flexible_cg(mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000)  # noqa: E731
-        else:
-            from .utils.solver.krylov import gmres as _scaled_gmres
+        elif name == "gmres":
+            # Ours, not jax's: jax's batched GMRES finishes every restart cycle whatever the residual
+            # (30 preconditioner applies where 3 suffice, under a multigrid M), and its incremental one
+            # reads a loop predicate back to the host several times per step, which on a GPU drains
+            # the stream each time. `gmres_chunked` checks every few steps. Left-preconditioned with
+            # M rescaled, so it stops on the same quantity jax's did and `tol` keeps its meaning.
+            from .utils.solver.krylov import gmres_chunked
 
-            method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
+            restart = fixed["restart"]
 
             def raw(mv, rhs, M, x0):
-                if name == "gmres" and M is not None:
+                if M is not None:
                     M = _unit_scaled(M, rhs)
+                # `maxiter` counts restart cycles, as it does for jax's (whose default is 10 n of them)
+                cycles = maxiter if maxiter is not None else 10 * rhs.shape[0]
+                return gmres_chunked(
+                    mv, rhs, M=M, x0=x0, tol=tol, atol=atol, restart=restart, maxiter=cycles * restart, side="left"
+                )
+        else:
+            method = getattr(jax.scipy.sparse.linalg, name)
+
+            def raw(mv, rhs, M, x0):
                 return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
@@ -300,11 +315,12 @@ def bicgstab(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = 2
 
 
 def gmres(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = None, restart: int = 30) -> LinearSolver:
-    """Restarted GMRES (``jax.scipy.sparse.linalg.gmres``) -- non-symmetric systems where
-    BiCGStab's erratic convergence hurts; memory grows with ``restart``. For an *iterative*
+    """Restarted GMRES (:func:`jno.utils.solver.krylov.gmres_chunked`) --
+    non-symmetric systems where BiCGStab's erratic convergence hurts; memory grows with ``restart``.
+    Stops on the preconditioned residual, as JAX's GMRES does. For an *iterative*
     (e.g. multigrid-with-tolerance) preconditioner a flexible variant (FGMRES) is required --
     planned; see ``plans/fem-solver-api.md``."""
-    return _krylov("gmres", tol, atol, maxiter, restart=restart, solve_method="batched")
+    return _krylov("gmres", tol, atol, maxiter, restart=restart)
 
 
 def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str):

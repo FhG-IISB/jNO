@@ -178,8 +178,8 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
     return x
 
 
-def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, restart=64, maxiter=1000, check_every=8):
-    """Restarted, right-preconditioned GMRES that asks the host only every ``check_every`` steps.
+def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, restart=64, maxiter=1000, check_every=8, side="right"):
+    """Restarted, preconditioned GMRES that asks the host only every ``check_every`` steps.
 
     Y. Saad & M. H. Schultz, *GMRES*, SIAM J. Sci. Stat. Comput. 7(3), 1986, with right
     preconditioning (Saad, *Iterative Methods for Sparse Linear Systems*, 2nd ed., Alg. 9.5).
@@ -193,13 +193,21 @@ def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, restart=64, maxiter=1
     predicate copy, and convergence is read once per block. The price is at most
     ``check_every - 1`` steps past convergence.
 
-    Right preconditioning, so the residual the least-squares problem minimises IS ``b - A x`` and
-    ``tol`` means ``||b - A x|| <= tol ||b||``. Each restart re-forms the true residual, so an
-    Arnoldi estimate that has drifted cannot end the solve. Orthogonalisation is CGS2, vectorised
+    ``side="right"`` (Saad Alg. 9.5): the residual the least-squares problem minimises IS ``b - A x``
+    and ``tol`` means ``||b - A x|| <= max(tol ||b||, atol)``. ``side="left"`` (Alg. 9.4) measures
+    ``||M (b - A x)||`` instead, which is what ``jax.scipy.sparse.linalg.gmres`` stops on: for a good
+    ``M`` on an ill-conditioned ``A`` it tracks the ERROR far more closely than the true residual does.
+    Each restart re-forms the residual from ``x``, so an Arnoldi estimate that has drifted cannot end
+    the solve. Orthogonalisation is CGS2, vectorised
     over the whole fixed-shape basis (unbuilt rows are zero, so they contribute nothing).
     """
     M = M or _ident
+    if side not in ("left", "right"):
+        raise ValueError(f"gmres_chunked: side must be 'left' or 'right', got {side!r}")
+    right = side == "right"
+    op = (lambda v: matvec(M(v))) if right else (lambda v: M(matvec(v)))
     b = jnp.asarray(b)
+    resid = (lambda x: b - matvec(x)) if right else (lambda x: M(b - matvec(x)))
     n = b.shape[0]
     m = int(min(restart, n))
     k = int(max(1, min(check_every, m)))
@@ -208,7 +216,7 @@ def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, restart=64, maxiter=1
     x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
     tiny = _tiny_of(dt)
     tol = _effective_tol(tol, dt)
-    tol_abs = tol * jnp.maximum(jnp.linalg.norm(b), tiny)
+    tol_abs = jnp.maximum(tol * jnp.maximum(jnp.linalg.norm(b), tiny), atol)
     max_cycles = -(-int(maxiter) // m)
     cols = jnp.arange(m)
 
@@ -227,7 +235,7 @@ def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, restart=64, maxiter=1
 
     def arnoldi(i, carry):
         V, H, j = carry
-        w = matvec(M(V[j]))
+        w = op(V[j])
         # HERMITIAN inner products (see fgmres); rows past j are still zero, so no mask is needed
         h = jnp.conj(V) @ w
         w = w - h @ V
@@ -257,14 +265,15 @@ def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, restart=64, maxiter=1
 
         V, H, j, _ = jax.lax.while_loop(more, block, (V, H, 0, beta))
         y, _ = lsq(H, beta, j)
-        x = x + M(y @ V[:m])
-        return x, b - matvec(x), c + 1
+        dx = y @ V[:m]
+        x = x + (M(dx) if right else dx)
+        return x, resid(x), c + 1
 
     def go(state):
         _, r, c = state
         return (jnp.linalg.norm(r) > tol_abs) & (c < max_cycles)
 
-    x, _, _ = jax.lax.while_loop(go, cycle, (x0, b - matvec(x0), 0))
+    x, _, _ = jax.lax.while_loop(go, cycle, (x0, resid(x0), 0))
     return x
 
 
