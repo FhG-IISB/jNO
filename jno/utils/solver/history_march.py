@@ -234,6 +234,12 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
         return u, new_buffers, new_sbuffers
 
     def _march(param_args, grid=None):
+        from .solver_api import iterations_suspended
+
+        with iterations_suspended():  # a march step carries no host callback (fem.stats["march"] instead)
+            return _march_body(param_args, grid)
+
+    def _march_body(param_args, grid=None):
         """Run the whole load path as one ``lax.scan`` given the resolved runtime-parameter values
         (empty for a non-parametric forward march). Reverse-mode differentiable w.r.t. those values —
         the per-step ``newton_krylov`` is ``custom_root`` and the readout/roll are pure JAX.
@@ -465,7 +471,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
                 "domain's declared `domain(tau=...)` grid. Declare the grid you want and march it."
             )
         if values is not None:
-            return _march_eager_contact(contact, values)  # concrete values: the search can run
+            return _suspended(_march_eager_contact, contact, values)  # concrete values: the search can run
         if getattr(op, "runtime_parameter_exprs", {}):
             raise NotImplementedError(
                 "fem.solve(tau=..., contact=...) on a form carrying a runtime parameter is not wired: "
@@ -473,7 +479,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
                 "it tracers. Run the march forward at the values you want: `fem.solve(contact=..., "
                 "<name>=<value>)`."
             )
-        return _march_eager_contact(contact, {})
+        return _suspended(_march_eager_contact, contact, {})
 
     if _is_arclength(path):
         if path_frames:
@@ -491,7 +497,8 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
             )
         from .arclength import march_arclength
 
-        return march_arclength(
+        return _suspended(
+            march_arclength,
             fem,
             path,
             solve_fn=solve_fn,
@@ -508,8 +515,9 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
     def _with_checkpoint(driver, *a, **k):
         # A `checkpoint=` must be claimed by the march that runs, or it raises (never an empty directory).
         from .march_checkpoint import requested
+        from .solver_api import iterations_suspended
 
-        with requested(checkpoint, "this load-path march"):
+        with requested(checkpoint, "this load-path march"), iterations_suspended():
             return driver(*a, **k)
 
     if path is not None:
@@ -601,6 +609,14 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
             "`tau=<array>` also accepts any non-uniform grid you choose."
         )
     return FunctionCall(lambda *values: _march(dict(zip(names, values))), params, name="fem_history_march")
+
+
+def _suspended(fn, *a, **k):
+    """``fn(*a, **k)`` with linear-iteration recording off: a march leg (see ``iterations_suspended``)."""
+    from .solver_api import iterations_suspended
+
+    with iterations_suspended():
+        return fn(*a, **k)
 
 
 def _refuse_checkpoint_leg(fem, path, contact, values):

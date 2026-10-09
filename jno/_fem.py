@@ -132,11 +132,51 @@ def _residual_check(A, b, u, who):
 def _bicgstab_jacobi(A, b, tol, maxiter):
     """The default steady-linear iteration, compiled. Split out of :func:`_solve_linear_matrix_free`
     so the Krylov loop is one XLA program while the convergence check stays eager -- see there."""
-    from .utils.solver.linear import jacobi, sparse_matvec
-
     # `sparse_matvec`, not `lambda v: A @ v`: BCOO's matvec re-derives its row/column index arrays on
     # every call and XLA does not hoist that out of the loop -- 1.5x per iteration at 1M dofs.
-    return jax.scipy.sparse.linalg.bicgstab(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))[0]
+    # `bicgstab_counted` is jax.scipy's loop keeping the iteration count it discards (fem.stats, #104).
+    from .utils.solver.krylov import bicgstab_counted
+    from .utils.solver.linear import jacobi, sparse_matvec
+
+    x, k, broke = bicgstab_counted(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
+    return x, k, broke
+
+
+def _counted_bicgstab_jacobi(A, b, tol, maxiter, who, side):
+    """:func:`_bicgstab_jacobi` with its iteration count recorded for ``fem.stats``; returns ``x``."""
+    from .utils.solver.solver_api import record_iterations
+
+    x, k, broke = _bicgstab_jacobi(A, b, tol, maxiter)
+    record_iterations(k, who, side=side, broke=broke)
+    return x
+
+
+def _summarise_linear_iterations(records):
+    """``fem.stats["linear_iterations"]``: the Krylov iteration counts of a solve's linear solves (#104).
+
+    ``None`` when no counted linear solve ran (a direct factorisation, a deferred node not yet evaluated).
+    Otherwise ``solves`` (how many), ``iterations`` (each forward solve's count, in the order they finished --
+    for a Newton driver, one per Newton step), ``total``, ``max``, and ``transpose`` (the adjoint solves'
+    counts, when a gradient ran any). Solves whose count is unavailable are listed under ``uncounted``."""
+    if not records:
+        return None
+    fwd = [r for r in records if r["side"] == "forward" and isinstance(r["iterations"], int)]
+    rev = [r for r in records if r["side"] == "transpose" and isinstance(r["iterations"], int)]
+    out = {
+        "solves": len(records),
+        "iterations": [r["iterations"] for r in fwd],
+        "total": sum(r["iterations"] for r in fwd),
+        "max": max((r["iterations"] for r in fwd), default=None),
+        "by": sorted({r["who"] for r in records}),
+    }
+    if rev:
+        out["transpose"] = [r["iterations"] for r in rev]
+    other = [r for r in records if not isinstance(r["iterations"], int)]
+    if other:
+        out["uncounted"] = other
+    if any(r.get("breakdown") for r in records):
+        out["breakdown"] = True
+    return out
 
 
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
@@ -215,8 +255,12 @@ def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
     who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
     AT = A.T
     mv, mvT = sparse_matvec(A), sparse_matvec(A, transpose=True)  # no re-conversion of A.T
-    fwd = lambda _mv, rhs: residual_gate(mv, rhs, _bicgstab_jacobi(A, rhs, tol, maxiter), who, side="forward")
-    rev = lambda _mv, rhs: residual_gate(mvT, rhs, _bicgstab_jacobi(AT, rhs, tol, maxiter), who, side="transpose")
+    fwd = lambda _mv, rhs: residual_gate(
+        mv, rhs, _counted_bicgstab_jacobi(A, rhs, tol, maxiter, who, "forward"), who, side="forward"
+    )  # noqa: E501
+    rev = lambda _mv, rhs: residual_gate(
+        mvT, rhs, _counted_bicgstab_jacobi(AT, rhs, tol, maxiter, who, "transpose"), who, side="transpose"
+    )  # noqa: E501
     return jax.lax.custom_linear_solve(mv, b, fwd, transpose_solve=rev)
 
 
@@ -2433,9 +2477,10 @@ class FEM:
 
             from .utils.solver.history_march import LAST_MARCH_STATS
             from .utils.solver.newton_krylov import LAST_NEWTON_STATS
-            from .utils.solver.solver_api import clear_gate_failures, raise_if_gate_failed
+            from .utils.solver.solver_api import LAST_LINEAR_STATS, clear_gate_failures, raise_if_gate_failed
 
             LAST_NEWTON_STATS.clear()
+            LAST_LINEAR_STATS.clear()
             LAST_MARCH_STATS.clear()
             clear_gate_failures()  # so this solve cannot be blamed for an earlier one's failure
             t0 = _time.perf_counter()
@@ -2490,6 +2535,8 @@ class FEM:
             # run, and there is nothing to drain (the limitation is documented in docs/solvers.md).
             if not any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(result)):
                 jax.block_until_ready(result)
+                # The counts arrive through the solves' callbacks, so they are complete only now.
+                self._stats["linear_iterations"] = _summarise_linear_iterations(LAST_LINEAR_STATS)
                 raise_if_gate_failed()
             return result
 

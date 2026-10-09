@@ -129,5 +129,6 @@ holds it (RSS, live JAX buffers by shape, Python heap, `domain.context`). See
 ## Where the message is not enough
 
 `fem.stats` reports what the solver actually did — mode, DOFs, the slot reprs, the nonlinear driver's
-final residual against its bound, and whether it converged. `fem.solve(profile=True)` says where the
+final residual against its bound, whether it converged, and how many Krylov iterations each linear solve
+took. `fem.solve(profile=True)` says where the
 time went. Both are on [Diagnostics](solvers.md#diagnostics-what-the-solver-actually-did).

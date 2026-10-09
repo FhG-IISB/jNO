@@ -385,6 +385,73 @@ def _record_unconverged(rel, who: str, side: str):
     raise RuntimeError(msg)
 
 
+#: Krylov iteration counts of the linear solves the last ``fem.solve`` ran, in the order they finished:
+#: ``[{"who", "side", "iterations"}, ...]`` (#104). ``iterations`` is ``None`` for a solver whose loop does not
+#: expose a count (upstream ``jax.scipy`` GMRES), and an entry carries ``"breakdown": True`` when BiCGStab
+#: stopped on one. Written by :func:`record_iterations` -- one host callback per solve, never per iteration --
+#: and read by ``fem.stats`` once the result is concrete.
+LAST_LINEAR_STATS: list = []
+
+
+def _append_uncounted(_dummy, who: str, side: str):
+    LAST_LINEAR_STATS.append({"who": who, "side": side, "iterations": None, "note": "not counted"})
+
+
+def _append_iterations(k, broke, who: str, side: str):
+    k = np.asarray(k)
+    entry = {"who": who, "side": side, "iterations": int(k) if k.ndim == 0 else k.astype(int).tolist()}
+    if broke is not None and bool(np.any(np.asarray(broke))):
+        entry["breakdown"] = True
+    LAST_LINEAR_STATS.append(entry)
+
+
+_ITERATIONS_SUSPENDED = False
+
+
+@contextlib.contextmanager
+def iterations_suspended():
+    """No iteration counts are recorded for solves TRACED inside this block: a march.
+
+    A march's step is a compiled loop body, and jNO keeps host callbacks out of it -- a nonlinear march
+    would otherwise call back once per Newton step per time step. Its per-step record is
+    ``fem.stats["march"]`` instead. A trace-time switch: a step compiled here carries no callback at all."""
+    global _ITERATIONS_SUSPENDED
+    prev = _ITERATIONS_SUSPENDED
+    _ITERATIONS_SUSPENDED = True
+    try:
+        yield
+    finally:
+        _ITERATIONS_SUSPENDED = prev
+
+
+def record_iterations(k, who: str, *, side: str = "forward", broke=None):
+    """Record a linear solve's iteration count ``k`` for ``fem.stats`` -- eagerly, or from inside a trace.
+
+    A traced count reaches the host through one ``jax.debug.callback`` per solve: the solve's ``x``-only
+    return contract is untouched, and the loop itself carries nothing new. ``k=None`` records a solve whose
+    count is not available, so its absence is reported rather than silently omitted. Suspended (like the
+    residual gate) inside a preconditioner application, which is an inner iteration, not a solve.
+
+    Cost: the callback is a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU) per solve, measured on the default
+    Jacobi-BiCGStab -- +7-11% on a 790-DOF solve, unmeasurable (1.000x) at 46,691 DOFs."""
+    if _GATE_SUSPENDED or _ITERATIONS_SUSPENDED:
+        return
+    if k is None:
+        # Still at RUN time: this is usually called while a solve is traced, and a solve traced (the
+        # transpose of a custom_linear_solve) is not a solve run, nor is a cached program re-traced.
+        from jax._src import core as _core
+
+        if _core.trace_state_clean():
+            _append_uncounted(None, who, side)
+        else:
+            jax.debug.callback(_append_uncounted, jnp.zeros(()), who, side)
+        return
+    if not any(isinstance(v, jax.core.Tracer) for v in (k, broke)):
+        _append_iterations(k, broke, who, side)
+        return
+    jax.debug.callback(_append_iterations, k, broke, who, side)
+
+
 def clear_gate_failures():
     """Drop anything recorded by an earlier solve, so a drain cannot report a stale failure."""
     _GATE_FAILURES.clear()

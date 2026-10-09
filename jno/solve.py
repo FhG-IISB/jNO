@@ -261,16 +261,31 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
             # (float32 FSAI, 3-D elasticity), silently. Flexible CG is robust to that at no extra products.
             from .utils.solver.krylov import flexible_cg
 
-            raw = lambda mv, rhs, M, x0: flexible_cg(mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000)  # noqa: E731
+            raw = _counting(
+                lambda mv, rhs, M, x0: flexible_cg(
+                    mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000, return_iters=True
+                ),
+                "jno.solve.cg (flexible)",
+            )
+        elif name in ("cg", "bicgstab"):
+            # jax.scipy's own loops, keeping the iteration count they discard (fem.stats, #104).
+            from .utils.solver.krylov import bicgstab_counted, cg_counted
+
+            method = cg_counted if name == "cg" else bicgstab_counted
+            raw = _counting(
+                lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M),
+                f"jno.solve.{name}",
+            )
         else:
             from .utils.solver.krylov import gmres as _scaled_gmres
+            from .utils.solver.solver_api import record_iterations
 
-            method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
-
-            def raw(mv, rhs, M, x0):
-                if name == "gmres" and M is not None:
+            def raw(mv, rhs, M, x0, _side="forward"):
+                if M is not None:
                     M = _unit_scaled(M, rhs)
-                return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+                # Upstream restarted GMRES exposes no count; say so in fem.stats rather than omit it.
+                record_iterations(None, f"jno.solve.{name}", side=_side)
+                return _scaled_gmres(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
@@ -306,6 +321,30 @@ def gmres(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = None
     return _krylov("gmres", tol, atol, maxiter, restart=restart, solve_method="batched")
 
 
+def _raw_on(raw, mv, rhs, M, x0, side):
+    """Call a raw iteration, labelled with the side it solves when it records (:func:`_counting`); a raw
+    handed to :func:`_firewalled` from elsewhere takes no label."""
+    import inspect
+
+    if "_side" in inspect.signature(raw).parameters:
+        return raw(mv, rhs, M=M, x0=x0, _side=side)
+    return raw(mv, rhs, M=M, x0=x0)
+
+
+def _counting(counted, who: str):
+    """A raw ``(mv, rhs, M, x0) -> x`` iteration from one returning ``(x, k[, broke])``, recording ``k`` for
+    ``fem.stats`` (#104). ``_side`` tells the firewall's transpose solve apart from the forward one."""
+
+    def raw(mv, rhs, M, x0, _side="forward"):
+        from .utils.solver.solver_api import record_iterations
+
+        out = counted(mv, rhs, M, x0)
+        record_iterations(out[1], who, side=_side, broke=out[2] if len(out) > 2 else None)
+        return out[0]
+
+    return raw
+
+
 def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str):
     """Run a raw (non-differentiable) iteration inside ``lax.custom_linear_solve``.
 
@@ -319,7 +358,10 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
 
     fwd = lambda _mv, rhs: residual_gate(op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward")
     if symmetric:
-        rev = fwd
+        # custom_linear_solve runs the SAME solve for the transpose; label it as such in fem.stats.
+        rev = lambda _mv, rhs: residual_gate(  # noqa: E731
+            op.mv, rhs, _raw_on(raw, op.mv, rhs, M, x0, "transpose"), f"jno.solve.{name}", side="transpose"
+        )
     else:
         # The reverse pass solves A^T y = v and MUST be preconditioned by M^T, not M: a
         # preconditioner never changes the converged solution, but for a non-symmetric M
@@ -334,7 +376,7 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
         # no-op under tracers besides. A Krylov iteration that leaves on its step cap returns its last
         # iterate silently, so a broken adjoint arrived as a perfectly plausible gradient.
         rev = lambda _mv, rhs: residual_gate(
-            op.T.mv, rhs, raw(op.T.mv, rhs, M=M_T, x0=None), f"jno.solve.{name}", side="transpose"
+            op.T.mv, rhs, _raw_on(raw, op.T.mv, rhs, M_T, None, "transpose"), f"jno.solve.{name}", side="transpose"
         )
     return jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
 
@@ -349,7 +391,10 @@ def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> Line
     def _fn(op: LinearOperator, b, *, M, x0):
         from .utils.solver.krylov import fgmres as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter, return_iters=True),
+            "jno.solve.fgmres",
+        )
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres")
 
     return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter))
@@ -365,7 +410,10 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     def _fn(op: LinearOperator, b, *, M, x0):
         from .utils.solver.krylov import minres as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True),
+            "jno.solve.minres",
+        )
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
 
     return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
@@ -387,7 +435,10 @@ def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     def _fn(op: LinearOperator, b, *, M, x0):
         from .utils.solver.krylov import cocg as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True),
+            "jno.solve.cocg",
+        )
         # symmetric=True means A == A^T, which is exactly COCG's precondition — so
         # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg")
@@ -430,7 +481,12 @@ def chebyshev(
             safety=safety,
             lmin_ratio=lmin_ratio,
         )
-        raw = lambda mv, rhs, M, x0: chebyshev_iteration(mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: chebyshev_iteration(
+                mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True
+            ),
+            "jno.solve.chebyshev",
+        )
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="chebyshev")
 
     # `jit: False` -- `spectrum_bounds` measures the spectrum and then branches on what it measured

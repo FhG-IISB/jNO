@@ -1124,9 +1124,8 @@ are logged as `WARNING: gmsh: …`.
 After any `fem.solve()`, `fem.stats` reports what happened
 without changing the solve's return: `mode`, `dofs`, `wall_s` (dispatch time — JAX is async; block on
 the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (driver, final residual
-norm against its bound, converged flag, and the step count where the driver runs its forward loop
-eagerly — `newton_direct` reports steps; the drivers whose loop lives inside `custom_root` report
-`None`), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
+norm against its bound, converged flag, and the step count — every driver reports it), `linear_iterations`
+(below), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
 wrapped whole in `jit`/`vmap`/`grad` records the slots but no residuals — reporting needs a concrete
 value. The *convergence check* below is not so limited: it fires under a transform too.
 
@@ -1141,6 +1140,29 @@ fem.stats
 `solve_index` counts solves on the form (the first one includes tracing and compilation), and a solve
 that **raised** still writes `fem.stats`, with an `error` entry. It used to leave the previous solve's
 stats in place, and those would read as this solve's.
+
+### Krylov iterations — `fem.stats["linear_iterations"]`
+
+How many iterations each linear solve took — the number that says whether a preconditioner works:
+
+```python
+fem.solve(nonlinear=jno.solve.newton(direct=False))
+fem.stats["linear_iterations"]
+# {'solves': 4, 'iterations': [52, 62, 59, 54], 'total': 227, 'max': 62,
+#  'by': ['the newton_krylov inner BiCGStab']}          # one count per Newton step
+```
+
+`iterations` lists each forward solve's count in the order they finished, and `transpose` the adjoint
+solves' when a gradient ran any. `breakdown: True` flags a BiCGStab that stopped on one. The default
+solve, `cg`, `bicgstab`, `minres`, `fgmres`, `cocg`, `chebyshev`, the matrix-free Newton's inner
+BiCGStab and the assembled-tangent Krylov all report. Upstream restarted `gmres` exposes no count and is
+listed under `uncounted`; a direct factorisation reports `None`. A march records no per-step Krylov
+counts — its compiled step makes no host call; `fem.stats["march"]` is its record.
+
+`cg` and `bicgstab` are `jax.scipy`'s own loops, keeping the iteration count they discard: the same
+arithmetic (`x` identical on CPU, within 1e-10 on GPU from reduction order) and the same time. The count
+reaches the host through one callback per solve, a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU): +7–11 % on a
+790-DOF solve, unmeasurable at 46,691 DOFs.
 
 ### A march records every step — `fem.stats["march"]`
 

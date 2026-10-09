@@ -695,6 +695,7 @@ class SemidiscreteTimeBlock:
         """
         from ...trace import FunctionCall  # lazy: avoid an import cycle with jno.trace
         from .march_checkpoint import refuse_traced, requested
+        from .solver_api import iterations_suspended
 
         if solve_fn is None:
             solve_fn = _default_transient_integrate
@@ -714,7 +715,7 @@ class SemidiscreteTimeBlock:
             LAST_MARCH_STATS.clear()
             _t_eval = _time.perf_counter()
             refuse_traced(checkpoint, values)
-            with requested(checkpoint, "this transient solve"):
+            with requested(checkpoint, "this transient solve"), iterations_suspended():
                 ys = solve_fn(self, dict(zip(names, values)), save_ts)
             if not isinstance(ys, jax.core.Tracer):
                 # An EAGER evaluation (`.fn()`): record what it did for `fem.stats["march"]`. Under
