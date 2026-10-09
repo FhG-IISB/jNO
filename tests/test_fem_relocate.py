@@ -658,15 +658,30 @@ def test_relocation_improves_element_quality_at_any_order_and_shape(order, shape
 L_SHAPE_R = [(0, 0), (1, 0), (1, 0.5), (0.5, 0.5), (0.5, 1), (0, 1)]
 
 
+_EPS = 1e-9
+
+
+def _l_interior(x, y):
+    """The L-shape's INTERIOR vertices: off the outer box AND off the two re-entrant (notch) edges.
+
+    The notch edges lie strictly inside (0, 1)^2, so a box test alone frees them -- and freeing both axes
+    of a boundary vertex lets relocation RESHAPE THE DOMAIN. Measured: with them free, the energy descent
+    grew the domain into the notch and pushed the discrete energy 36% above the converged L-shape's,
+    which a Galerkin solution on the fixed domain cannot do."""
+    eps = _EPS  # NOT a default argument: `where=` reads the predicate's arity as the dimension
+    on_notch = ((abs(y - 0.5) < eps) & (x > 0.5 - eps)) | ((abs(x - 0.5) < eps) & (y > 0.5 - eps))
+    return (x > eps) & (x < 1 - eps) & (y > eps) & (y < 1 - eps) & ~on_notch
+
+
 def _corner_problem(movable, size=0.12):
-    """Poisson on an L-shape: a FIXED singularity at the re-entrant corner, nothing moving."""
+    """Poisson -lap u = 1 on an L-shape, u = 0 on the boundary: a FIXED singularity at the re-entrant
+    corner, nothing moving. The load is a constant, so P1 quadrature integrates it exactly."""
     d = jno.shape.polygon(L_SHAPE_R, size=size).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     if movable:
-        eps = 1e-9
-        xm, ym, _ = d.variable("mov", where=lambda x, y: (x > eps) & (x < 1 - eps) & (y > eps) & (y < 1 - eps), split=True)
+        xm, ym, _ = d.variable("mov", where=_l_interior, split=True)
         xm.trainable(name="ix")
         ym.trainable(name="iy")
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
@@ -683,45 +698,93 @@ def _dirichlet_energy_of(d, sol):
     return float(_dirichlet_energy_jax(pts, jnp.asarray(np.asarray(sol).reshape(-1)), cells, 2))
 
 
-def test_energy_descent_cuts_the_error_at_fixed_dofs_on_a_fixed_singularity():
-    """The measurement that lived only in a tutorial, which is how issue #109 survived three releases.
+def _energy_error(d, sol, e_ref):
+    """The energy-norm error ``|u - u_h|_E^2 = E(u) - E(u_h)``. With a load and a homogeneous wall,
+    ``E(u_h) = (f, u_h)`` approaches ``E(u)`` FROM BELOW, so the error is ``E_ref - E_h`` -- positive.
+    (These tests used to score ``E_h - E_ref``: a negative number that grew more negative as the error
+    grew, so a relocation that made the answer 6x worse passed ``err < 0.75 * err0``.)"""
+    return e_ref - _dirichlet_energy_of(d, sol)
 
-    Relocation must improve the ANSWER at a fixed node count. For a Ritz method
-    ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so the Dirichlet energy against a fine reference IS the
-    energy-norm error, and `objective="energy"` descends exactly it. Measured: 4.459e-03 -> 1.991e-03,
-    a 55% cut at +0 DOFs, where the default monitor objective gives -12% on this problem.
+
+def test_energy_descent_cuts_the_error_at_fixed_dofs_on_a_fixed_singularity():
+    """Relocation must improve the ANSWER at a fixed node count, on a fixed domain.
+
+    ``objective="energy"`` descends the Ritz functional ``J = 1/2 a(u,u) - (f,u)``, and Galerkin
+    orthogonality gives ``J(u_h) - J(u) = 1/2 |u - u_h|_E^2``: lowering ``J`` IS lowering the error. Measured
+    on this problem: 6.210e-04 -> 4.721e-04 (0.76x). The previous objective -- the bare Dirichlet energy
+    ``a(u_h, u_h)``, which with a load is ``-2 J`` -- made the same error 6x WORSE (3.740e-03), and the
+    inverted sign above hid it (#114).
     """
     d_ref, fem_ref = _corner_problem(False, size=0.03)
     e_ref = _dirichlet_energy_of(d_ref, fem_ref.solve())
 
     d0, fem0 = _corner_problem(False)
-    err0 = _dirichlet_energy_of(d0, fem0.solve()) - e_ref
+    err0 = _energy_error(d0, fem0.solve(), e_ref)
+    assert err0 > 0, "the reference must bound the coarse run from above, or it is not a reference"
 
     d, fem = _corner_problem(True)
     n0 = len(d.mesh.points)
+    on_boundary = ~_l_interior(*np.asarray(d.mesh.points)[:, :2].T)
+    wall0 = np.asarray(d.mesh.points)[on_boundary].copy()
     sol = fem.solve(adapt=jno.solve.relocate(objective="energy", max_iters=60, lr=3e-3))
-    err = _dirichlet_energy_of(fem.domain, sol) - e_ref
+    err = _energy_error(fem.domain, sol, e_ref)
 
     assert len(fem.domain.mesh.points) == n0, "r-adaptivity must not change the node count"
-    assert err < 0.75 * err0, f"energy descent did not cut the error at fixed DOFs: {err:.3e} vs {err0:.3e}"
+    assert np.array_equal(np.asarray(fem.domain.mesh.points)[on_boundary], wall0), "the domain moved"
+    assert 0 < err < 0.85 * err0, f"energy descent did not cut the error at fixed DOFs: {err:.3e} vs {err0:.3e}"
 
 
-def test_the_two_objectives_each_win_on_their_own_problem():
-    """Neither objective dominates, which is why both exist and why the default is a judgement call.
-
-    On a FIXED singularity the energy is the error norm and descending it wins. On an UNDER-RESOLVED
-    FRONT the energy can be lowered by under-resolving the layer -- measured at 10.7x worse than uniform
-    when it was the default, which is what motivated the switch. The monitor targets resolution instead.
-    Pinning both directions means neither can be silently dropped again.
-    """
+def test_the_energy_objective_beats_the_monitor_on_a_fixed_singularity():
+    """On a fixed singularity the energy is the error norm and descending it wins; the arclength monitor
+    targets resolution and here makes the error WORSE (measured 8.1e-04 against 4.7e-04, from 6.2e-04)."""
     d_ref, fem_ref = _corner_problem(False, size=0.03)
     e_ref = _dirichlet_energy_of(d_ref, fem_ref.solve())
     out = {}
     for obj in ("energy", "equidistribution"):
         d, fem = _corner_problem(True)
         sol = fem.solve(adapt=jno.solve.relocate(objective=obj, max_iters=60, lr=3e-3))
-        out[obj] = _dirichlet_energy_of(fem.domain, sol) - e_ref
-    assert out["energy"] < out["equidistribution"], f"on a fixed singularity the energy objective must win: {out}"
+        out[obj] = _energy_error(fem.domain, sol, e_ref)
+    assert 0 < out["energy"] < out["equidistribution"], f"on a fixed singularity the energy objective must win: {out}"
+
+
+def test_without_a_load_the_ritz_functional_is_the_dirichlet_energy():
+    """``2 J = a(u, u) - 2 (f, u)`` reduces to the Dirichlet energy ``a(u, u)`` when there is no load -- the
+    objective ``"energy"`` always descended, so source-free problems are unchanged."""
+    d = jno.shape.polygon(L_SHAPE_R, size=0.2).domain()
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xm, ym, _ = d.variable("mov", where=_l_interior, split=True)
+    xm.trainable(name="ix")
+    ym.trainable(name="iy")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - (xb * xb - yb * yb)])
+    fem.solve(adapt=jno.solve.relocate(objective="energy", max_iters=1))
+    h0 = fem.adapt_history[0]
+    assert h0["energy"] > 0.1
+    assert abs(h0["objective"] - h0["energy"]) < 1e-10 * h0["energy"], h0
+
+
+@pytest.mark.parametrize("kind", ["nonlinear", "advection", "transient"])
+def test_the_energy_objective_refuses_a_form_with_no_ritz_minimum(kind):
+    d = jno.shape.polygon(L_SHAPE_R, size=0.2).domain(**({"time": (0.0, 0.1, 3)} if kind == "transient" else {}))
+    u, phi = d.fem_symbols()
+    xi, yi, *ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xm, ym, _ = d.variable("mov", where=_l_interior, split=True)
+    xm.trainable(name="ix")
+    ym.trainable(name="iy")
+    bind = {"x": xi, "y": yi, **({"t": ti[0]} if kind == "transient" else {})}
+    ui, vi = u.bind(**bind), phi.bind(**bind)
+    lap = ui.x * vi.x + ui.y * vi.y - 1.0 * vi
+    terms = {
+        "nonlinear": lambda: [(1.0 + ui * ui) * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0],
+        "advection": lambda: [lap + 3.0 * ui.x * vi, u(xb, yb) - 0.0],
+        "transient": lambda: [ui.t * vi + lap, u(xb, yb) - 0.0, u(*d.variable("initial", split=True)[:2]) - 0.0],
+    }[kind]()
+    fem = jno.fem(terms)
+    with pytest.raises(NotImplementedError, match="Ritz functional"):
+        fem.solve(adapt=jno.solve.relocate(objective="energy", max_iters=2))
 
 
 def test_the_objective_is_reachable_from_the_public_slot_and_validated():

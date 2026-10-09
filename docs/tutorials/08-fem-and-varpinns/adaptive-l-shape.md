@@ -39,20 +39,21 @@ one error-versus-DOF axis.](/jNO/assets/adaptive_l_shape.png)
 p reaches **3.1× lower error than h with 56 % of the DOFs**, and composing the two beats either alone.
 
 !!! warning "The r row is worse than the start, and the objective is why"
-    Relocation descends a *mesh functional*, and which one is valid depends on the problem. The Ritz
-    functional is $J(v)=\tfrac12 a(v,v)-(f,v)$, and it is $J$ that satisfies
-    $J_h-J_\text{exact}=\tfrac12\|u-u_h\|_E^2$. With **no** source, $J=E$ — so `objective="energy"`
-    descends the error, and on the classic singular-mode L-shape it cuts that error by 55 % at fixed
-    DOFs. **This** problem has a source, so $J_h=-E_h$ at the discrete solution: minimising the error
-    means *maximising* $E$, and descending it walks away from the solution while flattening elements,
-    which is the cheapest way to lower $\int|\nabla u|^2$. Measured: $E$ duly fell 0.12252 → 0.10788,
-    the true error rose 3.6×, and the mesh's smallest angle collapsed **40.8° → 3.2°**.
+    Relocation descends a *mesh functional*, and the default one — arclength equidistribution — targets
+    **resolution**, not this error. It keeps the mesh sane (smallest angle 40.8° → 31.8°) and does not
+    help here.
 
-    The tutorial therefore uses the default (arclength equidistribution), which targets resolution and
-    keeps the mesh sane — smallest angle 40.8° → 31.8°. It still does not *help* here: the error rises
-    monotonically from the very first iteration at every step size tested, so this problem is simply
-    not r's regime. An assert now fails if relocation ever costs more than 40 % of the smallest angle,
-    because "not tangled" is far too low a bar to catch this.
+    `objective="energy"` descends the **Ritz functional** $J(v)=\tfrac12 a(v,v)-(f,v)$ instead. Galerkin
+    orthogonality gives $J_h-J_\text{exact}=\tfrac12\|u-u_h\|_E^2$, so lowering $J_h$ lowers the error
+    itself: on this problem it cuts it to **0.70×** at fixed DOFs (smallest angle 42.7° → 28.1°), against
+    1.43× for the default. That needs the bump integrated accurately, `jno.fem(..., quad_degree=4)`. At
+    the default degree $J_h$ is computed with the quadrated load, and the descent lowered it by moving
+    vertices so the quadrature over-counted the bump. It landed *above* the converged energy, an
+    improvement that exists only in the quadrature.
+
+    (Until #114 `objective="energy"` descended $a(u_h,u_h)$ whatever the load. With a source that is
+    $-2J_h$, so it walked away from the solution: the true error rose 3.6× and the smallest angle fell to
+    3.2°.)
 
 ## Where each method spent its DOFs
 

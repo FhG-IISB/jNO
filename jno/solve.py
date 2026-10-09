@@ -1515,17 +1515,21 @@ def relocate(
 
         - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
           and wins where a feature is under-resolved or moving.
-        - ``"energy"`` descends the **FE Dirichlet energy**, and it is the error norm **only on a
-          SOURCE-FREE problem**. The Ritz functional is ``J(v) = 1/2 a(v,v) - (f,v)``, and it is ``J`` that
-          satisfies ``J_h - J_exact = 1/2 ||u - u_h||_E^2``. With no body load ``J = E``, so descending the
-          energy descends the error -- that is the L-shape column below. Add a source and ``J_h = -E_h`` at
-          the discrete solution, so minimising the error means **maximising** ``E``: descending it walks
-          away from the solution, and squashing elements is the cheapest way to lower ``∫|∇u|²``. Measured
-          on an L-shape driven by a compact bump: the optimiser duly cut ``E`` from 0.12252 to 0.10788
-          while the true error ROSE 3.6x and the mesh's smallest angle collapsed 40.8° -> 3.2°. Until this
-          is fixed, use the default on any problem carrying a source or reaction term. For a Ritz method
-          ``E_h - E_exact = 1/2 ||u - u_h||_E^2`` (source-free), so there the energy *is* the error norm and
-          descending it minimises the error directly.
+        - ``"energy"`` descends the **Ritz functional** ``J(u_h) = 1/2 a(u_h, u_h) - l(u_h)`` of the form's own
+          weak terms. Galerkin orthogonality makes ``J(u_h) - J(u) = 1/2 ||u - u_h||_E^2``, so lowering it lowers
+          the **energy-norm error** directly. With no load it is the Dirichlet energy (up to the factor 2).
+          Measured on ``-lap u = 1`` on an L-shape: the error fell to 0.76x at fixed DOFs, where the default
+          raised it to 1.31x. (It used to descend ``a(u_h, u_h)`` whatever the load; with a source that is
+          ``-2 J``, and it made the same error 6x WORSE -- #114.) It exists only for a **linear, symmetric,
+          single-field steady** form and is refused by name otherwise (nonlinear, transient, complex,
+          coupled/saddle, advective).
+
+          **Integrate the load accurately.** ``J`` is the DISCRETE functional, with the load at the form's
+          quadrature, and moving vertices changes that quadrature's error too. On a smooth bump source at the
+          default degree the descent lowered ``J`` by inflating the quadrated load, and landed ABOVE the
+          converged energy -- an "improvement" that was a quadrature artifact. ``jno.fem(..., quad_degree=4)``
+          removed it (error 0.70x, measured; 8 gives the same). A load the quadrature integrates exactly
+          (constant / polynomial of the right degree) is safe at any degree.
         - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
 
         **Or a weak-form expression**, when the mesh has a job the three functionals cannot state. They are
