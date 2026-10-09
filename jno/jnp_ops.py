@@ -1,3 +1,4 @@
+import builtins
 import warnings
 from pathlib import Path
 from typing import List, Union
@@ -362,7 +363,10 @@ def concat(items, axis: int = -1) -> FunctionCall:
             return jnp.concatenate(expanded, axis=-1)
 
         # Fallback: align ranks and only broadcast singleton dimensions.
-        max_ndim = max(a.ndim for a in expanded)
+        # builtins.max: this module defines its own ``max`` (a trace reduction, below), and the bare name
+        # built a trace node here -- a reshape to a node-valued shape, whose error message JAX then
+        # formatted by iterating the node, which never ends (a silent hang, not an error).
+        max_ndim = builtins.max(a.ndim for a in expanded)
         aligned = []
         for a in expanded:
             if a.ndim < max_ndim:
