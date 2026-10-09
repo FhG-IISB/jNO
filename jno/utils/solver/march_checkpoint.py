@@ -264,7 +264,8 @@ def load(path: str):
 # steps by (residual history), written atomically after the frames it refers to.
 #
 # These marches are compiled loops. Checkpointing runs them as a HOST loop over chunks of ``every``
-# steps instead -- bit-identical arithmetic (a scan of k steps then k more IS a scan of 2k), but a chain
+# steps instead -- the same arithmetic (a scan of k steps then k more IS a scan of 2k; bit-identical on CPU,
+# within 1 ulp on GPU, where the chunk compiles to other shapes), but a chain
 # of scans is not one scan, so reverse-mode differentiation through a checkpointed march is refused
 # (:func:`refuse_traced`) rather than handed a gradient for a different program.
 

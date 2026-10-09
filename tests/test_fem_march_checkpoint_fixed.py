@@ -7,8 +7,9 @@ dropped it -- the directory stayed empty, which is exactly the failure checkpoin
 Checkpointing runs these compiled loops as a host loop of chunks of ``every`` steps, writing the frames
 (one ``.npy`` memory map) and the loop carry after each chunk. Oracles:
 
-* **same answer** -- the transient trajectory is bit-identical to the unchecked march; the load path agrees
-  to round-off (its single scan and the chunked one are compiled separately, measured 2.8e-17).
+* **same answer** -- the trajectory agrees with the unchecked march to round-off: bit-identical for a
+  transient on CPU, within 1 ulp on GPU (2.2e-16), and 2.8e-17 for the load path. The chunks compile to
+  different shapes than the single scan, so the reductions may round differently.
 * **a killed run resumes** -- a run stopped after its second write continues from that write: only the
   remaining chunks are written again, and the result is the reference.
 * **fail loud** -- every path that cannot write itself down raises instead of leaving the directory empty:
@@ -91,6 +92,12 @@ def _kill_after(monkeypatch, n_writes):
     monkeypatch.setattr(mc.FixedMarchCheckpoint, "save", save)
 
 
+def _same(a, b):
+    """Equal to round-off: the chunked march compiles to other shapes than the single scan (1 ulp on GPU)."""
+    a, b = np.asarray(a), np.asarray(b)
+    return a.shape == b.shape and np.abs(a - b).max() <= 4 * np.finfo(float).eps * max(np.abs(b).max(), 1.0)
+
+
 def _record_writes(monkeypatch):
     orig, seen = mc.FixedMarchCheckpoint.save, []
 
@@ -107,17 +114,17 @@ def _record_writes(monkeypatch):
 # ---------------------------------------------------------------------------------------------------
 
 
-def test_a_checkpointed_transient_is_bit_identical_and_on_disk(tmp_path):
+def test_a_checkpointed_transient_matches_and_is_on_disk(tmp_path):
     ref = np.asarray(_heat().solve().fn())
     got = _heat().solve(checkpoint=jno.solve.checkpoint(str(tmp_path), every=6)).fn()
     assert isinstance(got, np.memmap), "keep='last' returns the store's memory map, not a copy in RAM"
-    assert np.array_equal(np.asarray(got), ref)
+    assert _same(got, ref)
     man = json.loads((tmp_path / "manifest.json").read_text())
     assert man["complete"] and man["step"] == 20 and man["kind"] == "transient"
-    assert np.array_equal(np.load(tmp_path / "frames.npy"), ref)
+    assert _same(np.load(tmp_path / "frames.npy"), ref)
 
     kept = _heat().solve(checkpoint=jno.solve.checkpoint(str(tmp_path / "all"), every=6, keep="all")).fn()
-    assert type(kept) is np.ndarray and np.array_equal(kept, ref)
+    assert type(kept) is np.ndarray and _same(kept, ref)
 
 
 @pytest.mark.parametrize("reaction", [0.0, 5.0], ids=["linear", "nonlinear"])
@@ -134,13 +141,13 @@ def test_a_killed_transient_resumes_from_its_last_write(tmp_path, monkeypatch, r
     got = np.asarray(_heat(reaction=reaction).solve(checkpoint=spec).fn())
     # It RESUMED: a fresh start would write at 6 and 12 again and still return the reference.
     assert writes == [18, 20], f"expected only the remaining chunks to be written, got writes at {writes}"
-    assert np.array_equal(got, ref)
+    assert _same(got, ref)
 
 
 def test_bdf2_checkpoints_too(tmp_path):
     ref = np.asarray(_heat().solve(time=jno.solve.bdf2()).fn())
     got = np.asarray(_heat().solve(time=jno.solve.bdf2(), checkpoint=jno.solve.checkpoint(str(tmp_path), every=5)).fn())
-    assert np.array_equal(got, ref)
+    assert _same(got, ref)
 
 
 def test_a_finished_run_starts_over_and_resume_false_ignores_a_partial_one(tmp_path, monkeypatch):

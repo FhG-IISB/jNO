@@ -272,8 +272,8 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
         """The same march as one ``lax.scan``, run as chunks of ``spec.every`` steps with the trajectory and
         the carry written to disk after each -- so a killed run resumes from its last chunk.
 
-        Bit-identical to the single scan (the step is the same compiled function; a scan of k steps then k
-        more is a scan of 2k). What it gives up is reverse-mode differentiation, which is why it only runs
+        The same arithmetic as the single scan (a scan of k steps then k more is a scan of 2k), equal to
+        round-off -- 2.8e-17 measured, since the chunk compiles to other shapes. What it gives up is reverse-mode differentiation, which is why it only runs
         on concrete values (:func:`_refuse_checkpoint_leg`). Each chunk is judged BEFORE it is written, so
         a diverged step raises instead of becoming the state a resume would continue from."""
         import re

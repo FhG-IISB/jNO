@@ -1227,7 +1227,7 @@ def checkpoint(
 
     The fixed-mesh marches (transient, load path) are compiled loops, and checkpointing runs them as a
     host loop of compiled chunks of ``every`` steps instead. The arithmetic is the same -- the transient
-    trajectory is bit-identical, the load path agrees to round-off (2.8e-17 measured) -- but a chain of
+    trajectory is bit-identical on CPU and within 1 ulp on GPU, the load path agrees to round-off (2.8e-17) -- but a chain of
     scans is not one scan, so **a checkpointed march cannot be differentiated**: under ``jit`` / ``grad`` /
     ``jno.core`` it raises. Checkpoint the forward run (``fem.solve(<param>=value, checkpoint=...)``) and
     differentiate without it. (Unrelated to ``jax.checkpoint``, which is gradient rematerialisation.)

@@ -584,8 +584,8 @@ u = fem.solve(checkpoint=jno.solve.checkpoint("runs/plate", every=50))         #
 
 Those marches are compiled loops, and checkpointing runs them as a host loop of chunks of `every` steps,
 writing the frames to one `frames.npy` memory map and the loop carry to `latest.npz` after each chunk.
-The transient trajectory is bit-identical to the unchecked march; the load path agrees to round-off
-(2.8e-17 measured). With `keep="last"` the result is a `numpy.memmap` of the frames on disk. A store
+The transient trajectory is bit-identical to the unchecked march on CPU and within 1 ulp on GPU (the
+chunks compile to other shapes than the single scan); the load path agrees to round-off (2.8e-17). With `keep="last"` the result is a `numpy.memmap` of the frames on disk. A store
 records what identifies its march (grid, sizes, scheme, initial state, parameters, operators), so
 resuming a different problem into it raises instead of splicing the two.
 
