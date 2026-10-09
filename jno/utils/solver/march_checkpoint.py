@@ -32,6 +32,8 @@ rectangular array to stack into.
 
 from __future__ import annotations
 
+import contextvars as _contextvars
+import hashlib as _hashlib
 import json
 import os
 from collections.abc import Sequence
@@ -249,3 +251,216 @@ def load(path: str):
             "domain": (z["dom_points"], z["dom_cells"]) if "dom_points" in z.files else None,
         }
     return man, resume, cols
+
+
+# ------------------------------------------------------------------------------------------------
+# Fixed-mesh marches: a plain transient (`u.t`) and a pseudo-time load path (`domain(tau=...)`).
+# ------------------------------------------------------------------------------------------------
+#
+# Their frames all share one shape, so they are stored as ONE `.npy` memory map rather than per-chunk
+# files: the march writes rows into it, the OS pages them out, and with ``keep="last"`` the returned
+# trajectory IS that map -- frames read from disk on demand. ``latest.npz`` holds what the march needs
+# to continue: the compiled loop's carry at the last written step, plus whatever the march judges its
+# steps by (residual history), written atomically after the frames it refers to.
+#
+# These marches are compiled loops. Checkpointing runs them as a HOST loop over chunks of ``every``
+# steps instead -- the same arithmetic (a scan of k steps then k more IS a scan of 2k; bit-identical on CPU,
+# within 1 ulp on GPU, where the chunk compiles to other shapes), but a chain
+# of scans is not one scan, so reverse-mode differentiation through a checkpointed march is refused
+# (:func:`refuse_traced`) rather than handed a gradient for a different program.
+
+
+def digest(*arrays) -> str:
+    """A short content hash of ``arrays`` -- how a resume recognises the march that wrote a store."""
+    h = _hashlib.sha1()
+    for a in arrays:
+        try:
+            a = np.ascontiguousarray(np.asarray(a))
+        except Exception:  # noqa: BLE001 - not array-like (a pytree's static leaf): hash what it says it is
+            a = np.asarray(repr(a))
+        if a.dtype == object:
+            h.update(repr(a.tolist()).encode())
+            continue
+        h.update(str((a.shape, a.dtype.str)).encode())
+        h.update(a.tobytes())
+    return h.hexdigest()[:16]
+
+
+class _Request:
+    __slots__ = ("spec", "claimed_by")
+
+    def __init__(self, spec: CheckpointSpec):
+        self.spec, self.claimed_by = spec, None
+
+
+_ACTIVE: _contextvars.ContextVar = _contextvars.ContextVar("jno_march_checkpoint", default=None)
+
+
+class requested:
+    """``with requested(spec): ...`` -- a ``fem.solve(checkpoint=...)`` waiting for its march to claim it.
+
+    A march that can write itself down calls :func:`claim`; on exit, a request NOBODY claimed raises, so a
+    path that cannot checkpoint (a traced evaluation, a sharded or user-supplied integrator, a scheme with
+    its own loop) can never return a trajectory while the directory stays empty."""
+
+    def __init__(self, spec: CheckpointSpec | None, what: str):
+        self.req = None if spec is None else _Request(spec)
+        self.what = what
+
+    def __enter__(self):
+        self._tok = _ACTIVE.set(self.req)
+        return self.req
+
+    def __exit__(self, et, ev, tb):
+        _ACTIVE.reset(self._tok)
+        if et is None and self.req is not None and self.req.claimed_by is None:
+            raise NotImplementedError(
+                f"fem.solve(checkpoint=): {self.what} did not run through a march that can checkpoint, so "
+                "nothing would have been written. Checkpointing is wired for the built-in schemes evaluated "
+                "eagerly (`fem.solve(...).fn()` or a fixed `time=` scheme: theta / bdf2 / sdirk / rosenbrock / "
+                "exponential) and for the fixed-grid `tau` load path. It is not wired for a sharded march, a "
+                "`solve_fn=` integrator of your own, an adaptive time step, or an evaluation under "
+                "jit/grad/jno.core. Drop checkpoint=, or run the march eagerly with a built-in scheme."
+            )
+        return False
+
+
+def claim(who: str) -> CheckpointSpec | None:
+    """The active request's spec, claimed for ``who``; ``None`` when no checkpoint was asked for.
+
+    A second claim in one solve raises: it means the solve runs as SEVERAL marches (a preconditioner
+    refreshed between chunks, a pilot and a replay), and one store cannot hold more than one of them."""
+    req = _ACTIVE.get()
+    if req is None:
+        return None
+    if req.claimed_by is not None:
+        raise NotImplementedError(
+            f"fem.solve(checkpoint=): this solve runs more than one march ({req.claimed_by!r}, then {who!r}) "
+            "-- e.g. a preconditioner refreshed between chunks -- and one checkpoint store holds one march. "
+            "Drop checkpoint= for this configuration."
+        )
+    req.claimed_by = who
+    return req.spec
+
+
+def refuse_traced(spec: CheckpointSpec | None, values) -> None:
+    """Raise when a checkpointed march would run under a trace (``jit`` / ``grad`` / ``jno.core``).
+
+    A checkpointed march is a host loop of compiled chunks: it cannot run on tracers, and a chain of scans
+    is not the single scan whose adjoint jNO differentiates. Say so instead of writing nothing."""
+    if spec is None:
+        return
+    import jax
+    from jax._src import core as _core
+
+    traced = not _core.trace_state_clean() or any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(values))
+    if traced:
+        raise NotImplementedError(
+            "fem.solve(checkpoint=): the march is being evaluated under a trace (jit / grad / jno.core), "
+            "and a checkpointed march is a HOST loop over compiled chunks -- it can neither run on tracers "
+            "nor be reverse-mode differentiated (a chain of scans is not the one scan whose adjoint jNO "
+            "builds). Checkpoint the forward run instead: `fem.solve(<param>=value, checkpoint=...)`, or "
+            "drop checkpoint= to differentiate."
+        )
+
+
+class FixedMarchCheckpoint:
+    """Writer + reader for a fixed-mesh march's checkpoint directory.
+
+    LAYOUT on disk::
+
+        <path>/
+          manifest.json   kind, meta (what the march IS), step (last written), complete
+          frames.npy      (n_frames, n_dofs) -- the trajectory, a memory map filled as the march runs
+          latest.npz      the loop carry at ``step`` and the march's residual history
+
+    ``meta`` identifies the march (grid, sizes, carry structure). Resuming into a store whose meta differs
+    raises rather than splicing two different problems' frames together.
+    """
+
+    def __init__(self, spec: CheckpointSpec, *, kind: str, meta: dict, shape: tuple, dtype):
+        self.spec, self.kind = spec, kind
+        self.dir = os.path.abspath(os.path.expanduser(spec.path))
+        os.makedirs(self.dir, exist_ok=True)
+        self.meta = json.loads(json.dumps(meta))  # what a manifest round-trip will hand back
+        self.resumed: dict | None = None
+        man_path = os.path.join(self.dir, "manifest.json")
+        frames_path = os.path.join(self.dir, "frames.npy")
+        old = None
+        if os.path.exists(man_path):
+            with open(man_path) as fh:
+                old = json.load(fh)
+            if old.get("kind") != kind:
+                raise ValueError(
+                    f"fem.solve(checkpoint=): {self.dir} holds a {old.get('kind', 'moving-mesh')!r} checkpoint, "
+                    f"and this is a {kind!r} march. Point checkpoint= at a fresh directory."
+                )
+        if old is not None and spec.resume and not old.get("complete", False) and int(old.get("step", 0)) > 0:
+            if old.get("meta") != self.meta:
+                diff = sorted(
+                    k for k in set(self.meta) | set(old.get("meta", {})) if self.meta.get(k) != old["meta"].get(k)
+                )
+                raise ValueError(
+                    f"fem.solve(checkpoint=): {self.dir} holds an unfinished run of a DIFFERENT march (differs in "
+                    f"{diff}), and resuming would splice its frames onto this one. Delete the directory, point "
+                    "checkpoint= elsewhere, or pass resume=False to start over."
+                )
+            with np.load(os.path.join(self.dir, "latest.npz"), allow_pickle=False) as z:
+                self.resumed = {k: z[k] for k in z.files}
+            self.resumed["step"] = np.asarray(int(old["step"]))  # the step the carry is AT (from the manifest)
+            self.frames = np.lib.format.open_memmap(frames_path, mode="r+")
+        else:
+            self.frames = np.lib.format.open_memmap(frames_path, mode="w+", dtype=np.dtype(dtype), shape=tuple(shape))
+            self._write_manifest(step=0, complete=False)
+
+    def save(self, step: int, payload: dict) -> None:
+        """Persist the frames written so far, then the carry at ``step``, then the manifest naming it.
+
+        The order is the crash contract: a manifest never names a step whose carry or frames are not on
+        disk, so a kill at any instant leaves a store that resumes from an earlier, consistent step."""
+        self.frames.flush()
+        tmp = os.path.join(self.dir, "latest.tmp.npz")
+        np.savez(tmp, **{k: np.asarray(v) for k, v in payload.items()})
+        os.replace(tmp, os.path.join(self.dir, "latest.npz"))
+        self._write_manifest(step=int(step), complete=False)
+
+    def finish(self, step: int):
+        """Mark the run complete and return the trajectory: the memory map (``keep="last"``), or a copy in RAM."""
+        self.frames.flush()
+        self._write_manifest(step=int(step), complete=True)
+        return self.frames if self.spec.keep == "last" else np.array(self.frames)
+
+    def _write_manifest(self, *, step: int, complete: bool) -> None:
+        man = {"kind": self.kind, "meta": self.meta, "step": int(step), "complete": bool(complete)}
+        tmp = os.path.join(self.dir, "manifest.json.tmp")
+        with open(tmp, "w") as fh:
+            json.dump(man, fh, indent=1)
+        os.replace(tmp, os.path.join(self.dir, "manifest.json"))
+
+
+def carry_meta(carry) -> dict:
+    """The structure of a loop carry -- leaf shapes and dtypes, in order -- for a store's ``meta``.
+
+    Not the tree's own description: its dict keys include ids minted afresh each time a form is built
+    (a state field's key), so the same march rebuilt in a new process would never match its own store."""
+    import jax
+
+    leaves = jax.tree_util.tree_leaves(carry)
+    return {"leaves": [[list(np.shape(x)), str(np.asarray(x).dtype)] for x in leaves]}
+
+
+def pack_carry(carry, prefix: str = "carry") -> dict:
+    """The carry's leaves as ``{prefix_i: host array}``."""
+    import jax
+
+    return {f"{prefix}_{i}": np.asarray(x) for i, x in enumerate(jax.tree_util.tree_leaves(carry))}
+
+
+def unpack_carry(template, stored: dict, prefix: str = "carry"):
+    """Rebuild a carry shaped like ``template`` from :func:`pack_carry`'s arrays (device arrays, template dtypes)."""
+    import jax
+    import jax.numpy as jnp
+
+    leaves, tree = jax.tree_util.tree_flatten(template)
+    new = [jnp.asarray(stored[f"{prefix}_{i}"], dtype=jnp.asarray(x).dtype) for i, x in enumerate(leaves)]
+    return jax.tree_util.tree_unflatten(tree, new)

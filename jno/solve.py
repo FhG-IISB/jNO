@@ -261,16 +261,31 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
             # (float32 FSAI, 3-D elasticity), silently. Flexible CG is robust to that at no extra products.
             from .utils.solver.krylov import flexible_cg
 
-            raw = lambda mv, rhs, M, x0: flexible_cg(mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000)  # noqa: E731
+            raw = _counting(
+                lambda mv, rhs, M, x0: flexible_cg(
+                    mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000, return_iters=True
+                ),
+                "jno.solve.cg (flexible)",
+            )
+        elif name in ("cg", "bicgstab"):
+            # jax.scipy's own loops, keeping the iteration count they discard (fem.stats, #104).
+            from .utils.solver.krylov import bicgstab_counted, cg_counted
+
+            method = cg_counted if name == "cg" else bicgstab_counted
+            raw = _counting(
+                lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M),
+                f"jno.solve.{name}",
+            )
         else:
             from .utils.solver.krylov import gmres as _scaled_gmres
+            from .utils.solver.solver_api import record_iterations
 
-            method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
-
-            def raw(mv, rhs, M, x0):
-                if name == "gmres" and M is not None:
+            def raw(mv, rhs, M, x0, _side="forward"):
+                if M is not None:
                     M = _unit_scaled(M, rhs)
-                return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+                # Upstream restarted GMRES exposes no count; say so in fem.stats rather than omit it.
+                record_iterations(None, f"jno.solve.{name}", side=_side)
+                return _scaled_gmres(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
@@ -306,6 +321,30 @@ def gmres(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = None
     return _krylov("gmres", tol, atol, maxiter, restart=restart, solve_method="batched")
 
 
+def _raw_on(raw, mv, rhs, M, x0, side):
+    """Call a raw iteration, labelled with the side it solves when it records (:func:`_counting`); a raw
+    handed to :func:`_firewalled` from elsewhere takes no label."""
+    import inspect
+
+    if "_side" in inspect.signature(raw).parameters:
+        return raw(mv, rhs, M=M, x0=x0, _side=side)
+    return raw(mv, rhs, M=M, x0=x0)
+
+
+def _counting(counted, who: str):
+    """A raw ``(mv, rhs, M, x0) -> x`` iteration from one returning ``(x, k[, broke])``, recording ``k`` for
+    ``fem.stats`` (#104). ``_side`` tells the firewall's transpose solve apart from the forward one."""
+
+    def raw(mv, rhs, M, x0, _side="forward"):
+        from .utils.solver.solver_api import record_iterations
+
+        out = counted(mv, rhs, M, x0)
+        record_iterations(out[1], who, side=_side, broke=out[2] if len(out) > 2 else None)
+        return out[0]
+
+    return raw
+
+
 def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str):
     """Run a raw (non-differentiable) iteration inside ``lax.custom_linear_solve``.
 
@@ -319,7 +358,10 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
 
     fwd = lambda _mv, rhs: residual_gate(op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward")
     if symmetric:
-        rev = fwd
+        # custom_linear_solve runs the SAME solve for the transpose; label it as such in fem.stats.
+        rev = lambda _mv, rhs: residual_gate(  # noqa: E731
+            op.mv, rhs, _raw_on(raw, op.mv, rhs, M, x0, "transpose"), f"jno.solve.{name}", side="transpose"
+        )
     else:
         # The reverse pass solves A^T y = v and MUST be preconditioned by M^T, not M: a
         # preconditioner never changes the converged solution, but for a non-symmetric M
@@ -334,7 +376,7 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
         # no-op under tracers besides. A Krylov iteration that leaves on its step cap returns its last
         # iterate silently, so a broken adjoint arrived as a perfectly plausible gradient.
         rev = lambda _mv, rhs: residual_gate(
-            op.T.mv, rhs, raw(op.T.mv, rhs, M=M_T, x0=None), f"jno.solve.{name}", side="transpose"
+            op.T.mv, rhs, _raw_on(raw, op.T.mv, rhs, M_T, None, "transpose"), f"jno.solve.{name}", side="transpose"
         )
     return jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
 
@@ -349,7 +391,10 @@ def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> Line
     def _fn(op: LinearOperator, b, *, M, x0):
         from .utils.solver.krylov import fgmres as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter, return_iters=True),
+            "jno.solve.fgmres",
+        )
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres")
 
     return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter))
@@ -365,7 +410,10 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     def _fn(op: LinearOperator, b, *, M, x0):
         from .utils.solver.krylov import minres as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True),
+            "jno.solve.minres",
+        )
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
 
     return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
@@ -387,7 +435,10 @@ def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     def _fn(op: LinearOperator, b, *, M, x0):
         from .utils.solver.krylov import cocg as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True),
+            "jno.solve.cocg",
+        )
         # symmetric=True means A == A^T, which is exactly COCG's precondition — so
         # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg")
@@ -430,7 +481,12 @@ def chebyshev(
             safety=safety,
             lmin_ratio=lmin_ratio,
         )
-        raw = lambda mv, rhs, M, x0: chebyshev_iteration(mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: chebyshev_iteration(
+                mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True
+            ),
+            "jno.solve.chebyshev",
+        )
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="chebyshev")
 
     # `jit: False` -- `spectrum_bounds` measures the spectrum and then branches on what it measured
@@ -1210,29 +1266,44 @@ def checkpoint(
     keep: str = "last",
     resume: bool = True,
 ) -> CheckpointSpec:
-    """**Checkpoint a moving-mesh march** to disk: ``fem.solve(adapt=..., checkpoint=...)``.
+    """**Checkpoint a march** to disk: ``fem.solve(checkpoint=...)``.
 
     A march holds every frame in memory and returns them only when ``solve()`` returns, so a run
     that dies -- OOM, a kill, a power cut -- yields **nothing**, however far it got. This writes
     frames to ``path`` as they are produced and records what the march needs to restart, so a dead
-    run costs the last partial chunk instead of everything.
+    run costs the last partial chunk instead of everything. Three marches write themselves down:
 
-    The restart is not new machinery: a topology rebuild already re-enters the march with
-    ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``. That tuple is the
-    checkpoint; this only writes it down.
+    - a **transient** (``u.t``) march, with a built-in scheme -- the default theta, or ``time=``
+      ``theta`` / ``bdf2`` / ``sdirk`` / ``rosenbrock`` / ``exponential``;
+    - a **load-path** march (``.i(k)`` with ``domain(tau=...)``), on its fixed grid or an explicit
+      ``tau=<schedule>``;
+    - a **moving mesh** (a geometry term) with ``adapt=jno.solve.remesh(...)``. Its restart is the
+      tuple a topology rebuild already re-enters the march with,
+      ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``.
 
-    ``every`` -- steps between writes. A write also happens at every rebuild, which is where the
+    The fixed-mesh marches (transient, load path) are compiled loops, and checkpointing runs them as a
+    host loop of compiled chunks of ``every`` steps instead. The arithmetic is the same -- the transient
+    trajectory is bit-identical on CPU and within 1 ulp on GPU, the load path agrees to round-off (2.8e-17) -- but a chain of
+    scans is not one scan, so **a checkpointed march cannot be differentiated**: under ``jit`` / ``grad`` /
+    ``jno.core`` it raises. Checkpoint the forward run (``fem.solve(<param>=value, checkpoint=...)``) and
+    differentiate without it. (Unrelated to ``jax.checkpoint``, which is gradient rematerialisation.)
+
+    Every other solve refuses ``checkpoint=`` rather than accept it and write nothing: a steady solve, an
+    adaptive time step, a sharded or ``solve_fn=`` integrator, adaptive / arc-length / contact load
+    stepping, and a fixed-mesh ``adapt=``.
+
+    ``every`` -- steps between writes. A moving mesh also writes at every rebuild, which is where the
     field layout changes and therefore where a restart has to begin anyway.
 
-    ``keep`` -- ``"last"`` (default) flushes each chunk and **drops it from memory**; the returned
-    trajectory loads frames from disk on demand, so a march no longer has to fit in RAM. ``"all"``
-    keeps everything resident as before, and checkpoints purely for crash-resilience.
+    ``keep`` -- ``"last"`` (default) **drops written frames from memory**: a moving mesh's trajectory
+    loads them from disk on demand, and a fixed-mesh march returns its frames as a ``numpy.memmap`` of
+    ``<path>/frames.npy``. ``"all"`` keeps everything resident, and checkpoints purely for
+    crash-resilience.
 
-    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over.
-    A finished run (``complete`` in its manifest) is never resumed; delete the directory to redo it.
-
-    Note this is about the TRAJECTORY, not the solver's working set: per-step memory is already flat
-    (measured: 752 steps added 2 MB). What grows a long adaptive march is the rebuild path.
+    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over. A finished
+    run (``complete`` in its manifest) is never resumed; delete the directory to redo it. A fixed-mesh
+    store records what identifies its march (grid, sizes, scheme, initial state, parameters, operators),
+    and resuming a DIFFERENT march into it raises instead of splicing the two together.
 
     Example::
 
@@ -1241,6 +1312,7 @@ def checkpoint(
             adapt=jno.solve.remesh(alpha=1.2, every=1),
             checkpoint=jno.solve.checkpoint("runs/ball", every=500),
         )
+        u = fem_heat.solve(checkpoint=jno.solve.checkpoint("runs/heat", every=200)).fn()  # transient
 
     Returns:
         CheckpointSpec: pass as ``fem.solve(checkpoint=...)``.
@@ -1499,17 +1571,21 @@ def relocate(
 
         - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
           and wins where a feature is under-resolved or moving.
-        - ``"energy"`` descends the **FE Dirichlet energy**, and it is the error norm **only on a
-          SOURCE-FREE problem**. The Ritz functional is ``J(v) = 1/2 a(v,v) - (f,v)``, and it is ``J`` that
-          satisfies ``J_h - J_exact = 1/2 ||u - u_h||_E^2``. With no body load ``J = E``, so descending the
-          energy descends the error -- that is the L-shape column below. Add a source and ``J_h = -E_h`` at
-          the discrete solution, so minimising the error means **maximising** ``E``: descending it walks
-          away from the solution, and squashing elements is the cheapest way to lower ``∫|∇u|²``. Measured
-          on an L-shape driven by a compact bump: the optimiser duly cut ``E`` from 0.12252 to 0.10788
-          while the true error ROSE 3.6x and the mesh's smallest angle collapsed 40.8° -> 3.2°. Until this
-          is fixed, use the default on any problem carrying a source or reaction term. For a Ritz method
-          ``E_h - E_exact = 1/2 ||u - u_h||_E^2`` (source-free), so there the energy *is* the error norm and
-          descending it minimises the error directly.
+        - ``"energy"`` descends the **Ritz functional** ``J(u_h) = 1/2 a(u_h, u_h) - l(u_h)`` of the form's own
+          weak terms. Galerkin orthogonality makes ``J(u_h) - J(u) = 1/2 ||u - u_h||_E^2``, so lowering it lowers
+          the **energy-norm error** directly. With no load it is the Dirichlet energy (up to the factor 2).
+          Measured on ``-lap u = 1`` on an L-shape: the error fell to 0.76x at fixed DOFs, where the default
+          raised it to 1.31x. (It used to descend ``a(u_h, u_h)`` whatever the load; with a source that is
+          ``-2 J``, and it made the same error 6x WORSE -- #114.) It exists only for a **linear, symmetric,
+          single-field steady** form and is refused by name otherwise (nonlinear, transient, complex,
+          coupled/saddle, advective).
+
+          **Integrate the load accurately.** ``J`` is the DISCRETE functional, with the load at the form's
+          quadrature, and moving vertices changes that quadrature's error too. On a smooth bump source at the
+          default degree the descent lowered ``J`` by inflating the quadrated load, and landed ABOVE the
+          converged energy -- an "improvement" that was a quadrature artifact. ``jno.fem(..., quad_degree=4)``
+          removed it (error 0.70x, measured; 8 gives the same). A load the quadrature integrates exactly
+          (constant / polynomial of the right degree) is safe at any degree.
         - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
 
         **Or a weak-form expression**, when the mesh has a job the three functionals cannot state. They are

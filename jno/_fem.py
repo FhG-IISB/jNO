@@ -132,11 +132,51 @@ def _residual_check(A, b, u, who):
 def _bicgstab_jacobi(A, b, tol, maxiter):
     """The default steady-linear iteration, compiled. Split out of :func:`_solve_linear_matrix_free`
     so the Krylov loop is one XLA program while the convergence check stays eager -- see there."""
-    from .utils.solver.linear import jacobi, sparse_matvec
-
     # `sparse_matvec`, not `lambda v: A @ v`: BCOO's matvec re-derives its row/column index arrays on
     # every call and XLA does not hoist that out of the loop -- 1.5x per iteration at 1M dofs.
-    return jax.scipy.sparse.linalg.bicgstab(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))[0]
+    # `bicgstab_counted` is jax.scipy's loop keeping the iteration count it discards (fem.stats, #104).
+    from .utils.solver.krylov import bicgstab_counted
+    from .utils.solver.linear import jacobi, sparse_matvec
+
+    x, k, broke = bicgstab_counted(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
+    return x, k, broke
+
+
+def _counted_bicgstab_jacobi(A, b, tol, maxiter, who, side):
+    """:func:`_bicgstab_jacobi` with its iteration count recorded for ``fem.stats``; returns ``x``."""
+    from .utils.solver.solver_api import record_iterations
+
+    x, k, broke = _bicgstab_jacobi(A, b, tol, maxiter)
+    record_iterations(k, who, side=side, broke=broke)
+    return x
+
+
+def _summarise_linear_iterations(records):
+    """``fem.stats["linear_iterations"]``: the Krylov iteration counts of a solve's linear solves (#104).
+
+    ``None`` when no counted linear solve ran (a direct factorisation, a deferred node not yet evaluated).
+    Otherwise ``solves`` (how many), ``iterations`` (each forward solve's count, in the order they finished --
+    for a Newton driver, one per Newton step), ``total``, ``max``, and ``transpose`` (the adjoint solves'
+    counts, when a gradient ran any). Solves whose count is unavailable are listed under ``uncounted``."""
+    if not records:
+        return None
+    fwd = [r for r in records if r["side"] == "forward" and isinstance(r["iterations"], int)]
+    rev = [r for r in records if r["side"] == "transpose" and isinstance(r["iterations"], int)]
+    out = {
+        "solves": len(records),
+        "iterations": [r["iterations"] for r in fwd],
+        "total": sum(r["iterations"] for r in fwd),
+        "max": max((r["iterations"] for r in fwd), default=None),
+        "by": sorted({r["who"] for r in records}),
+    }
+    if rev:
+        out["transpose"] = [r["iterations"] for r in rev]
+    other = [r for r in records if not isinstance(r["iterations"], int)]
+    if other:
+        out["uncounted"] = other
+    if any(r.get("breakdown") for r in records):
+        out["breakdown"] = True
+    return out
 
 
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
@@ -215,8 +255,12 @@ def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
     who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
     AT = A.T
     mv, mvT = sparse_matvec(A), sparse_matvec(A, transpose=True)  # no re-conversion of A.T
-    fwd = lambda _mv, rhs: residual_gate(mv, rhs, _bicgstab_jacobi(A, rhs, tol, maxiter), who, side="forward")
-    rev = lambda _mv, rhs: residual_gate(mvT, rhs, _bicgstab_jacobi(AT, rhs, tol, maxiter), who, side="transpose")
+    fwd = lambda _mv, rhs: residual_gate(
+        mv, rhs, _counted_bicgstab_jacobi(A, rhs, tol, maxiter, who, "forward"), who, side="forward"
+    )  # noqa: E501
+    rev = lambda _mv, rhs: residual_gate(
+        mvT, rhs, _counted_bicgstab_jacobi(AT, rhs, tol, maxiter, who, "transpose"), who, side="transpose"
+    )  # noqa: E501
     return jax.lax.custom_linear_solve(mv, b, fwd, transpose_solve=rev)
 
 
@@ -1982,8 +2026,8 @@ class FEM:
         ``None`` before any solve. Afterwards a dict with ``mode``, ``dofs``, ``wall_s`` (dispatch
         time of the solve call — JAX is async; block on the result for compute time), the ``linear``
         and ``precond`` slot reprs, ``nonlinear`` (driver name, final residual norm against its
-        bound, step count where the driver runs its loop eagerly — ``newton_direct`` reports steps,
-        the traced-loop drivers report ``None``), and ``amgx_cache`` (AmgX solver-cache occupancy)
+        bound, step count — every driver reports it: ``newton_direct`` from its forward loop, ``newton_krylov`` and
+        ``staggered`` as an auxiliary output of their ``custom_root``), and ``amgx_cache`` (AmgX solver-cache occupancy)
         when jaxamg served the solve. Populated on eager paths; a solve wrapped whole in
         ``jit``/``vmap``/``grad`` records the slots but no residuals — the same concrete-only
         self-disabling as the convergence guards.
@@ -2433,9 +2477,10 @@ class FEM:
 
             from .utils.solver.history_march import LAST_MARCH_STATS
             from .utils.solver.newton_krylov import LAST_NEWTON_STATS
-            from .utils.solver.solver_api import clear_gate_failures, raise_if_gate_failed
+            from .utils.solver.solver_api import LAST_LINEAR_STATS, clear_gate_failures, raise_if_gate_failed
 
             LAST_NEWTON_STATS.clear()
+            LAST_LINEAR_STATS.clear()
             LAST_MARCH_STATS.clear()
             clear_gate_failures()  # so this solve cannot be blamed for an earlier one's failure
             t0 = _time.perf_counter()
@@ -2468,8 +2513,22 @@ class FEM:
                     # to the failing step, which is what the user needs next to that error.
                     self._stats["error"] = f"{type(error).__name__}: {str(error).splitlines()[0][:200]}"
 
+            # Krylov iteration counts (fem.stats["linear_iterations"]) are recorded for an eager, steady,
+            # non-adaptive solve only: a march's compiled step makes no host call, and a deferred node is
+            # evaluated later, outside this solve. The switch is jit-keyed (see `solver_api.iterations_recorded`).
+            from .utils.solver.solver_api import iterations_recorded
+
+            _steady = (
+                self._mode in ("linear", "nonlinear", "complex")
+                and adapt is None
+                and tau is None
+                and not getattr(self._op, "history_specs", None)
+                and not getattr(self._op, "surface_history_specs", None)
+                and not getattr(self, "_geometry", None)
+            )
             try:
-                result = _run()
+                with iterations_recorded(_steady):
+                    result = _run()
             except Exception as exc:
                 _record(exc)
                 raise
@@ -2490,6 +2549,8 @@ class FEM:
             # run, and there is nothing to drain (the limitation is documented in docs/solvers.md).
             if not any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(result)):
                 jax.block_until_ready(result)
+                # The counts arrive through the solves' callbacks, so they are complete only now.
+                self._stats["linear_iterations"] = _summarise_linear_iterations(LAST_LINEAR_STATS)
                 raise_if_gate_failed()
             return result
 
@@ -2755,6 +2816,29 @@ class FEM:
                 checkpoint=checkpoint,
                 **kwargs,
             )
+        if checkpoint is not None:
+            # `checkpoint=` writes a MARCH down as it runs. The moving-mesh driver above consumes it; below,
+            # the transient stepper and the load-path march do. Everything else used to accept it and drop
+            # it -- a run returned its answer and left the directory empty, which is exactly the run a
+            # checkpoint exists to save. Refuse those up front.
+            _marches = (
+                self._mode == "transient"
+                or getattr(self._op, "history_specs", None)
+                or getattr(self._op, "surface_history_specs", None)
+            )
+            if adapt is not None:
+                raise NotImplementedError(
+                    "fem.solve(adapt=..., checkpoint=...): checkpointing an adaptive march is wired for the "
+                    "MOVING-MESH driver (a geometry term `coord.d(t) - velocity` with adapt=jno.solve.remesh(...)). "
+                    "A fixed-mesh adapt= rebuilds the problem between segments and does not write itself down. "
+                    "Drop one of the two."
+                )
+            if not _marches:
+                raise ValueError(
+                    f"fem.solve(checkpoint=): this is a {self._mode!r} solve, so there is no march to write down. "
+                    "checkpoint= applies to a transient (`u.t`) march, a load-path march (`.i(k)` with "
+                    "`domain(tau=...)`), or a moving mesh."
+                )
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
             # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
@@ -2929,7 +3013,12 @@ class FEM:
             from .utils.solver.history_march import run_history_march
 
             return run_history_march(
-                self, solve_fn if from_slots else solve_fn, path=tau, contact=contact, values=kwargs.get("values")
+                self,
+                solve_fn if from_slots else solve_fn,
+                path=tau,
+                contact=contact,
+                values=kwargs.get("values"),
+                checkpoint=checkpoint,
             )
         if tau is not None:
             raise ValueError(
@@ -3149,7 +3238,9 @@ class FEM:
             # the steady linear / nonlinear branches above do — and as the complex transient did before its
             # Re/Im legs were fused into one block. (A *real* transient stays lazy; that asymmetry predates
             # the fusion and is a separate call to make, not something a refactor should change silently.)
-            return self._op.solve(solve_fn, **kwargs).fn()
+            return self._op.solve(solve_fn, checkpoint=checkpoint, **kwargs).fn()
+        if self._mode == "transient":
+            kwargs = {**kwargs, "checkpoint": checkpoint}
         out = self._op.solve(solve_fn, **kwargs)
         if kwargs.get("values") and self._mode == "nonlinear":
             self._record_values_verdict(out, kwargs, nonlinear)

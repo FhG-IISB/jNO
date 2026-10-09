@@ -656,7 +656,7 @@ class SemidiscreteTimeBlock:
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
         return _default_step_solve(step_op, rhs, u, d, krylov=(self.metadata or {}).get("krylov"))
 
-    def solve(self, solve_fn=None, *, save_ts=None, values=None):
+    def solve(self, solve_fn=None, *, save_ts=None, values=None, checkpoint=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
         trace node (mirrors :meth:`FemLinearSystem.solve` for the steady case).
 
@@ -687,9 +687,15 @@ class SemidiscreteTimeBlock:
         the device -- and the trajectory comes back as a HOST NumPy array (see :func:`_march_to_host`). Under
         ``jit``/``grad`` the march stays one ``lax.scan``, and the result a traced array.
 
+        ``checkpoint`` (a :func:`jno.solve.checkpoint` spec) writes the march to disk as it runs and resumes
+        an interrupted one; see :func:`_march_to_host`. It needs an EAGER evaluation through a built-in
+        scheme, and raises under ``jit``/``grad`` or on a path that cannot write itself down.
+
         Enable x64 (``jax_enable_x64``); the assembly is float64.
         """
         from ...trace import FunctionCall  # lazy: avoid an import cycle with jno.trace
+        from .march_checkpoint import refuse_traced, requested
+        from .solver_api import iterations_suspended
 
         if solve_fn is None:
             solve_fn = _default_transient_integrate
@@ -708,7 +714,9 @@ class SemidiscreteTimeBlock:
 
             LAST_MARCH_STATS.clear()
             _t_eval = _time.perf_counter()
-            ys = solve_fn(self, dict(zip(names, values)), save_ts)
+            refuse_traced(checkpoint, values)
+            with requested(checkpoint, "this transient solve"), iterations_suspended():
+                ys = solve_fn(self, dict(zip(names, values)), save_ts)
             if not isinstance(ys, jax.core.Tracer):
                 # An EAGER evaluation (`.fn()`): record what it did for `fem.stats["march"]`. Under
                 # jno.core / jit this is a tracer and nothing is recorded -- a step inside the
@@ -1459,6 +1467,11 @@ def _march_to_host(
     # The device's budget in states (`_offload_chunk`: all of them where the device is the host memory).
     chunks, n_slots = _frame_chunks(n, needed, _offload_chunk(n, n_dofs, dtype))
     judged = judge is not None
+    ck = _open_transient_checkpoint(block, args, config, carry0, grid_np, save, n_dofs, dtype)
+    if ck is not None:
+        # Every chunk boundary is a step the march can restart from, so no chunk may exceed `every`.
+        ev = int(ck.spec.every)
+        chunks = [(a + s, min(b, a + s + ev)) for a, b in chunks for s in range(0, b - a, ev)]
 
     def chunk_march(ext, grid, slots, compare, args):
         step = make_step(args, grid[0])
@@ -1475,7 +1488,9 @@ def _march_to_host(
 
         return jax.lax.scan(jax.checkpoint(body), ext, (grid[1:], slots, compare))
 
-    out = np.empty((save.size, n_dofs), dtype=np.dtype(dtype))
+    # Checkpointed: the frames land in the store's memory map, so every landed row is already on its way
+    # to disk and the march never holds the trajectory in RAM.
+    out = ck.frames if ck is not None else np.empty((save.size, n_dofs), dtype=np.dtype(dtype))
     landed = []  # (rows, device arrays, how to make the frames on the host) whose host copy is under way
 
     def _ship(rows, fr):
@@ -1511,15 +1526,30 @@ def _march_to_host(
         return _resample_trajectory(states, jnp.asarray(ts_local, dtype), ts, dtype)
 
     t_prev = float(grid_np[0])
-    rows = np.flatnonzero(save <= t_prev)
-    if rows.size:
-        pts = jnp.stack([jnp.asarray(p, dtype) for p in prefix_states])
-        _ship(rows, _sample(pts, np.asarray(prefix_ts, dtype=float), rows))
-    prev = jnp.asarray(prefix_states[-1], dtype)
-    carry = carry0
-    run = None if cache else jax.jit(lambda e, g, sl, cm: chunk_march(e, g, sl, cm, args))
     res, res_dev, flags = [], None, []
+    start = 0  # steps already done: nonzero only when resuming a checkpoint
+    if ck is not None and ck.resumed is not None:
+        # Continue from the stored carry. Its frames (every save time up to the stored step) are already in
+        # the map, and its residual history is restored so the verdict still judges EVERY step of the march.
+        from .march_checkpoint import unpack_carry
+
+        start = int(ck.resumed["step"])
+        carry = unpack_carry(carry0, ck.resumed)
+        t_prev = float(grid_np[start])
+        if judged:
+            res = [tuple(ck.resumed[f"res_{i}"] for i in range(int(ck.resumed["n_res"])))]
+            flags = [bool(ck.resumed["same"])]
+    else:
+        rows = np.flatnonzero(save <= t_prev)
+        if rows.size:
+            pts = jnp.stack([jnp.asarray(p, dtype) for p in prefix_states])
+            _ship(rows, _sample(pts, np.asarray(prefix_ts, dtype=float), rows))
+        carry = carry0
+    prev = state_of(carry) if start else jnp.asarray(prefix_states[-1], dtype)
+    run = None if cache else jax.jit(lambda e, g, sl, cm: chunk_march(e, g, sl, cm, args))
     for ci, (a, b) in enumerate(chunks):
+        if b <= start:
+            continue  # written by the run this one resumes
         mine = needed[(needed > a) & (needed <= b)]  # global step indices this chunk keeps
         slots = np.full((b - a,), n_slots, dtype=np.int32)  # the scratch row
         slots[mine - a - 1] = np.arange(mine.size, dtype=np.int32)
@@ -1549,14 +1579,72 @@ def _march_to_host(
                 judge(*_stack_residuals(res), int(a), False, None)
             res_dev = r
             flags.append(same)
+        if ck is not None:
+            # Judge THIS chunk before writing it down: a diverged step must raise, not become the state a
+            # resume continues from. (The un-checkpointed march judges one chunk behind, to overlap.)
+            if judged:
+                res.append(tuple(np.asarray(x) for x in res_dev))
+                res_dev = None
+                judge(*_stack_residuals(res), int(b), False, None)
+                flags = [all(bool(np.asarray(f)) for f in flags)]
+            ck.save(b, _transient_payload(carry, res, flags))
         prev = state_of(carry)
         t_prev = float(grid_np[b])
         del buf
     _land()
     if judged:
-        res.append(tuple(np.asarray(x) for x in res_dev))
+        if res_dev is not None:
+            res.append(tuple(np.asarray(x) for x in res_dev))
         judge(*_stack_residuals(res), n, True, bool(all(bool(np.asarray(f)) for f in flags)))
-    return out
+    return ck.finish(n) if ck is not None else out
+
+
+def _transient_payload(carry, res, flags):
+    """What a checkpointed transient march writes at a chunk boundary: the carry, and the residual history
+    its verdict judges every step by."""
+    import numpy as np
+
+    from .march_checkpoint import pack_carry
+
+    payload = pack_carry(carry)
+    hist = _stack_residuals(res) if res else ()
+    payload.update({f"res_{i}": h for i, h in enumerate(hist)})
+    payload["n_res"] = np.asarray(len(hist))
+    payload["same"] = np.asarray(all(bool(np.asarray(f)) for f in flags))
+    return payload
+
+
+def _open_transient_checkpoint(block, args, config, carry0, grid_np, save, n_dofs, dtype):
+    """The store for this march when ``fem.solve(checkpoint=...)`` asked for one, else ``None``.
+
+    ``meta`` is what a resume must agree on before it may continue a store: the grid and save times, the
+    sizes, the carry's structure, the scheme configuration, and a hash of what fixes the answer -- the
+    initial carry, the parameter values and the assembled operators. A store from any other march raises
+    instead of having its frames spliced onto this one."""
+    import re
+
+    import jax
+    import numpy as np
+
+    from .march_checkpoint import FixedMarchCheckpoint, carry_meta, claim, digest
+
+    spec = claim("transient march")
+    if spec is None:
+        return None
+    ops = [getattr(block, k, None) for k in ("M", "A", "c")]
+    ops = [getattr(o, "data", o) for o in ops if o is not None and not callable(o)]
+    meta = {
+        "grid": digest(grid_np),
+        "save": digest(save),
+        "n_dofs": int(n_dofs),
+        "dtype": str(np.dtype(dtype)),
+        "every": int(spec.every),
+        "carry": carry_meta(carry0),
+        # function reprs carry their address, which changes every process
+        "config": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(config)),
+        "problem": digest(*jax.tree_util.tree_leaves(carry0), *jax.tree_util.tree_leaves(args), *ops),
+    }
+    return FixedMarchCheckpoint(spec, kind="transient", meta=meta, shape=(save.size, n_dofs), dtype=dtype)
 
 
 def _sample_host(states, ts_local, ts):
