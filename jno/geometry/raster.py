@@ -26,7 +26,7 @@ import warnings
 
 import numpy as np
 
-__all__ = ["cell_fractions", "rect_boxes", "union_boxes", "closing_boxes", "outline_segments", "tri_box_area"]
+__all__ = ["cell_fractions", "CellMesh", "rect_boxes", "union_boxes", "closing_boxes", "outline_segments", "tri_box_area"]
 
 
 # ---------------------------------------------------------------------------------------------------- input forms
@@ -196,23 +196,41 @@ class _Locator:
         self.maxw = float((self.hi[:, 0] - self.lo[:, 0]).max()) if len(T) else 0.0
 
     def pairs(self, boxes, eps=0.0):
-        """All (cell, box) pairs whose bounding boxes overlap (closed with eps)."""
+        """All (cell, box) pairs whose bounding boxes overlap (closed with eps). The sweep runs over the cells
+        that overlap the bounding box of ALL boxes, so large far-field cells do not widen every search window."""
+        boxes = np.asarray(boxes, float).reshape(-1, 4)
+        if not len(boxes):
+            return np.zeros(0, np.int64), np.zeros(0, np.int64)
+        X0, Y0 = boxes[:, 0].min() - eps, boxes[:, 1].min() - eps
+        X1, Y1 = boxes[:, 2].max() + eps, boxes[:, 3].max() + eps
+        sub = np.nonzero((self.hi[:, 0] >= X0) & (self.lo[:, 0] <= X1) & (self.hi[:, 1] >= Y0) & (self.lo[:, 1] <= Y1))[0]
+        lo, hi = self.lo[sub], self.hi[sub]
+        order = np.argsort(lo[:, 0])
+        lo_sorted = lo[order, 0]
+        maxw = float((hi[:, 0] - lo[:, 0]).max()) if len(sub) else 0.0
         cs, bs = [], []
         for k, (x0, y0, x1, y1) in enumerate(boxes):
-            i0 = np.searchsorted(self.lo_sorted, x0 - eps - self.maxw, "left")
-            i1 = np.searchsorted(self.lo_sorted, x1 + eps, "right")
-            c = self.order[i0:i1]
-            c = c[
-                (self.hi[c, 0] >= x0 - eps)
-                & (self.lo[c, 0] <= x1 + eps)
-                & (self.hi[c, 1] >= y0 - eps)
-                & (self.lo[c, 1] <= y1 + eps)
-            ]
-            cs.append(c)
+            i0 = np.searchsorted(lo_sorted, x0 - eps - maxw, "left")
+            i1 = np.searchsorted(lo_sorted, x1 + eps, "right")
+            c = order[i0:i1]
+            c = c[(hi[c, 0] >= x0 - eps) & (lo[c, 0] <= x1 + eps) & (hi[c, 1] >= y0 - eps) & (lo[c, 1] <= y1 + eps)]
+            cs.append(sub[c])
             bs.append(np.full(len(c), k))
-        if not cs:
-            return np.zeros(0, np.int64), np.zeros(0, np.int64)
         return np.concatenate(cs), np.concatenate(bs)
+
+
+class CellMesh:
+    """A triangle mesh prepared once for repeated :func:`cell_fractions` calls (vertices, areas, search index).
+    Pass it instead of the domain when rasterising many regions on the same mesh."""
+
+    def __init__(self, mesh):
+        pts, tris = _mesh_arrays(mesh)
+        self.T = pts[tris]
+        T = self.T
+        self.area = 0.5 * np.abs(
+            (T[:, 1, 0] - T[:, 0, 0]) * (T[:, 2, 1] - T[:, 0, 1]) - (T[:, 2, 0] - T[:, 0, 0]) * (T[:, 1, 1] - T[:, 0, 1])
+        )
+        self.loc = _Locator(T)
 
 
 # ------------------------------------------------------------------------------------------------- public entry
@@ -224,7 +242,8 @@ def cell_fractions(
     Parameters
     ----------
     mesh
-        A meshed 2-D ``jno.domain`` or ``(points (N, 2), triangles (C, 3))``.
+        A meshed 2-D ``jno.domain``, ``(points (N, 2), triangles (C, 3))``, or a :class:`CellMesh` (prepared
+        once, for many calls on the same mesh).
     region
         A 2-D ``jno.shape`` (exact when built from ``shape.rect`` with ``|``/``-``/``&``/``regions``), or an
         ``(n, 4)`` array of boxes [x0, y0, x1, y1] read as their union.
@@ -241,11 +260,8 @@ def cell_fractions(
 
     Returns ``frac (C,)`` in [0, 1] (exactly 0 / 1 within 1e-12), or ``(frac, nx2)`` with ``normals=True``.
     """
-    pts, tris = _mesh_arrays(mesh)
-    T = pts[tris]
-    area = 0.5 * np.abs(
-        (T[:, 1, 0] - T[:, 0, 0]) * (T[:, 2, 1] - T[:, 0, 1]) - (T[:, 2, 0] - T[:, 0, 0]) * (T[:, 1, 1] - T[:, 0, 1])
-    )
+    cm = mesh if isinstance(mesh, CellMesh) else CellMesh(mesh)
+    T, area, loc = cm.T, cm.area, cm.loc
     boxes = rect_boxes(region)
     if boxes is None:
         if close or normals:
@@ -258,11 +274,19 @@ def cell_fractions(
         return _fractions_quadrature(T, region, levels)
     if close:
         boxes = closing_boxes(boxes, close)
-    loc = _Locator(T)
     frac = np.zeros(len(T))
     if len(boxes):
         c, b = loc.pairs(boxes)
-        np.add.at(frac, c, tri_box_area(T[c], boxes[b]))
+        bb = boxes[b]
+        full = (
+            (loc.lo[c, 0] >= bb[:, 0])
+            & (loc.hi[c, 0] <= bb[:, 2])
+            & (loc.lo[c, 1] >= bb[:, 1])
+            & (loc.hi[c, 1] <= bb[:, 3])
+        )  # cell inside the box: no clipping
+        np.add.at(frac, c[full], area[c[full]])
+        cut = ~full
+        np.add.at(frac, c[cut], tri_box_area(T[c[cut]], bb[cut]))
     frac = frac / area
     frac = np.where(frac < 1e-12, 0.0, np.where(frac > 1.0 - 1e-12, 1.0, frac))  # round-off at full/empty cells
     if not normals:
