@@ -191,8 +191,11 @@ class PEECSolution:
         pot=None,
         pads=None,
         mag=(None, None, None, None, ()),
+        lp_apply=None,
     ):
         self._vol, self._owner, self._names = vol, owner, tuple(names)
+        #: the partial-inductance apply the solve itself used, so `L` does not build it again
+        self._lp_apply = lp_apply
         #: nodal potentials, and the node set each terminal owns -- what `voltage` reads. Kept
         #: because an OPEN terminal carries no current, so `current`/`Z` say nothing about it: the
         #: induced voltage on a transformer's unloaded secondary is only in `phi`.
@@ -292,7 +295,9 @@ class PEECSolution:
         structured = structured and not graded
 
         if structured:
-            ap = (welded_apply if welded else lattice_apply)(f, lambda r: 1.0 / r, mu_scale=scale)
+            ap = self._lp_apply
+            if ap is None:
+                ap = (welded_apply if welded else lattice_apply)(f, lambda r: 1.0 / r, mu_scale=scale)
 
             def _energy(x):
                 return jnp.vdot(x, ap(x)).real
@@ -1451,6 +1456,7 @@ class BuiltPEEC:
             drive.append(inj[a])
             port.append(g / inj[a])
         from .utils.solver.kernel import internal_impedance
+        from .utils.solver.peec import last_lp_apply as _last_lp
 
         # the SURFACE resistance, so the Joule readout matches the solve rather than a DC restatement
         w = 2 * np.pi * float(self.freq[0])
@@ -1493,6 +1499,7 @@ class BuiltPEEC:
             # the pads AFTER `weights=` was applied, so `voltage` reads the terminal the solve saw
             pads=nodes,
             mag=mag_break,
+            lp_apply=_last_lp(fil, MU0),
         )
         drive = jnp.stack([jnp.asarray(x) for x in drive])
         sol._port_current = drive[0] if self._scalar_freq else drive

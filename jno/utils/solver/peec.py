@@ -692,6 +692,27 @@ def _check(value, fn, *args, on=None):
 #: recycled underneath it, and the operator it keeps is the largest thing here -- two is plenty for a
 #: sweep over one network, and a third would cost more memory than the rebuild it saves.
 _GEOM_CACHE: dict = {}
+_LAST_LP: dict = {}
+
+
+def last_lp_apply(fil, mu0):
+    """The partial-inductance apply the last :func:`solve_network` on ``fil`` used, TAKEN (removed).
+
+    The solution's energy readout `I^H Lp I` needs exactly that operator once more. Building it again
+    is cheap on a plain lattice and is not on a welded one: the dense wire-lattice cross block was
+    13-14 s of a 48 s forward solve on a 54,866-element module, and the readout sits in the
+    differentiated graph, so every reverse pass paid it too. `_geom_cached` cannot help there -- a
+    traced geometry is deliberately never cached -- so the solve hands its apply over instead.
+
+    Taken, not kept: the entry is popped by the caller that owns the solution, so a closure over one
+    trace's values never outlives it in a module-level table.
+    """
+    hit = _LAST_LP.pop(id(fil), None)
+    if hit is None or hit[0] is not fil or hit[1] != float(mu0):
+        return None
+    return hit[2]
+
+
 _GEOM_CACHE_MAX = 2
 
 
@@ -947,6 +968,9 @@ def solve_network(
             ),
         )
         Z = None
+        # handed to the solution, so its energy readout `I^H Lp I` reuses this apply instead of building
+        # it again -- see `last_lp_apply`
+        _LAST_LP[id(fil)] = (fil, float(mu0), lp_apply)
     else:
         Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
         Z = jnp.diag(R.astype(complex)) + 1j * float(omega) * Lp
