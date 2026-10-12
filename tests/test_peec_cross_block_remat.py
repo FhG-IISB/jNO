@@ -13,11 +13,21 @@ Each chunk is now rematerialised in the backward pass, so what is saved is what 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax._src.ad_checkpoint import saved_residuals  # public only as print_saved_residuals in jax 0.10
 
 from jno.utils.solver.peec import cross_block
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 NA, NB, SA, SB = 40, 3000, 4, 12  # elements and sub-points per element on each side
 
