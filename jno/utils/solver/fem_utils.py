@@ -4866,7 +4866,7 @@ def _elem_run(fn, chunk, scatter):
     if chunk is None:
         return jax.vmap(fn), (), chunk
     c = int(chunk)
-    return (lambda *a: jax.lax.map(lambda z: fn(*z), a, batch_size=c)), (), chunk
+    return (lambda *a: jax.lax.map(jax.checkpoint(lambda z: fn(*z)), a, batch_size=c)), (), chunk
 
 
 def _spec_key(spec, lifted):
@@ -5298,14 +5298,18 @@ def _chunked_scatter(fn, xs, c, out, index):
     Nothing is padded. Padding used to concatenate a filler tail onto every input -- a full copy of each,
     the index block included: on a 24^3 P1/P1 Navier-Stokes tangent that was 81 MiB of index copies (the
     one-int32-per-raw-triplet scatter map) in the compiled march, for 7 filler cells. The overlap costs at
-    most one chunk of element work, which the filler tail cost too."""
+    most one chunk of element work, which the filler tail cost too.
+
+    Each chunk's element kernel is wrapped in ``jax.checkpoint``: under reverse mode a scan otherwise
+    stacks every chunk's residuals, so chunking bounded the FORWARD intermediates but not the
+    backward's. With the remat the backward holds one chunk's intermediates at a time."""
     n = xs[0].shape[0]
     nb = -(-n // c)
     if nb * c == n:
         blocks = tuple(x.reshape((nb, c) + x.shape[1:]) for x in xs) + (index.reshape((nb, c) + index.shape[1:]),)
 
         def body(acc, blk):
-            r = jax.vmap(fn)(*blk[:-1])
+            r = jax.vmap(jax.checkpoint(fn))(*blk[:-1])
             return acc.at[blk[-1].reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
         return jax.lax.scan(body, out, blocks)[0]
@@ -5316,7 +5320,7 @@ def _chunked_scatter(fn, xs, c, out, index):
         idx = jax.lax.dynamic_slice_in_dim(index, start, c)
         fresh = (start + jnp.arange(c)) >= i * c  # cells the previous chunk has not already added
         idx = jnp.where(fresh.reshape((c,) + (1,) * (idx.ndim - 1)), idx, out.shape[0])
-        r = jax.vmap(fn)(*blk)
+        r = jax.vmap(jax.checkpoint(fn))(*blk)
         return acc.at[idx.reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
     return jax.lax.scan(body_slid, out, jnp.arange(nb))[0]
@@ -5392,7 +5396,7 @@ def elem_map(fn, xs, chunk, *, scatter=None):
         run, arrays = jax.vmap(fn), xs
     else:
         c = int(chunk)
-        run, arrays = (lambda *a: jax.lax.map(lambda z: fn(*z), a, batch_size=c)), xs
+        run, arrays = (lambda *a: jax.lax.map(jax.checkpoint(lambda z: fn(*z)), a, batch_size=c)), xs
 
     fp = _bake_fingerprint(fn, chunk)
     if fp is None:  # traced or unpinnable: jit anyway (inlined under a trace), just do not cache
