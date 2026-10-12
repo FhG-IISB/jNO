@@ -2964,6 +2964,29 @@ def _sub_slice(fil, lo, hi):
     return np.flatnonzero(m), grp[m] - lo, int(hi - lo)
 
 
+@functools.partial(jax.checkpoint, static_argnums=(5, 6))
+def _cross_chunk(A, Ma, B, Mb, Gb, nb, g):
+    """One (chunk_a, chunk_b) pair block of :func:`cross_block`, contracted over its ``b`` elements.
+
+    Rematerialised under reverse mode. The chunking bounds the forward pass only: a gradient in a
+    welded wire's SHAPE otherwise saves every chunk's distances and kernel for the backward pass, and
+    the memory is the whole pair count again -- 30 GB and the OOM killer on a 54,866-element module
+    with 12 traced wires. Recomputing the block costs one more kernel evaluation per chunk in the
+    backward pass; what is saved is the inputs.
+    """
+    # r^2 by expansion rather than a (chunk_a, chunk_b, 3) displacement: only the DISTANCE is wanted,
+    # so the third axis is pure overhead -- three quarters of this term's memory for nothing, and a
+    # matmul is quicker than a broadcast subtract besides. Both sides are centred on the chunk first:
+    # the cancellation in |a|^2 + |b|^2 - 2a.b is set by the coordinate MAGNITUDE, and centring makes
+    # that the chunk's own extent instead of the model's distance from the origin.
+    c = 0.5 * (A.mean(0) + B.mean(0))
+    A, B = A - c, B - c
+    r2 = (A * A).sum(1)[:, None] + (B * B).sum(1)[None, :] - 2.0 * (A @ B.T)
+    r = jnp.sqrt(jnp.clip(r2, 1e-300))
+    sub = (Ma @ Mb.T) * g(r)  # (chunk_a, chunk_b)
+    return jax.ops.segment_sum(sub.T, Gb, num_segments=nb).T  # contract b
+
+
 def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, chunk=2048, budget=32_000_000):
     """The ELEMENT-level coupling ``Lp_ab``, built once — ``(na, nb)``, dense.
 
@@ -3008,19 +3031,7 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
         # of machine, which is what put this solve on the OOM killer's list.
         for lo2 in range(0, pb.shape[0], cb):
             hi2 = min(lo2 + cb, pb.shape[0])
-            # r^2 by expansion rather than a (chunk_a, chunk_b, 3) displacement: only the DISTANCE
-            # is wanted, so the third axis is pure overhead -- three quarters of this term's memory
-            # for nothing, and a matmul is quicker than a broadcast subtract besides. Both sides are
-            # centred on the chunk first: the cancellation in |a|^2 + |b|^2 - 2a.b is set by the
-            # coordinate MAGNITUDE, and centring makes that the chunk's own extent instead of the
-            # model's distance from the origin.
-            A, B = pa[lo:hi], pb[lo2:hi2]
-            c = 0.5 * (A.mean(0) + B.mean(0))
-            A, B = A - c, B - c
-            r2 = (A * A).sum(1)[:, None] + (B * B).sum(1)[None, :] - 2.0 * (A @ B.T)
-            r = jnp.sqrt(jnp.clip(r2, 1e-300))
-            sub = (ma[lo:hi] @ mb[lo2:hi2].T) * g(r)  # (chunk_a, chunk_b)
-            part = jax.ops.segment_sum(sub.T, gb[lo2:hi2], num_segments=nb).T  # contract b
+            part = _cross_chunk(pa[lo:hi], ma[lo:hi], pb[lo2:hi2], mb[lo2:hi2], gb[lo2:hi2], nb, g)
             acc = part if acc is None else acc + part
         part = jax.ops.segment_sum(acc, ga[lo:hi], num_segments=na)  # then a, once per a-chunk
         out = part if out is None else out + part
