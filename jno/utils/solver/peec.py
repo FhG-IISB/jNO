@@ -3038,6 +3038,94 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
     return scale * out
 
 
+# Near radius of the wire-lattice coupling, in units of the two elements' radii (None: exact everywhere).
+# See `cross_block_nearfar`; `welded_apply` uses it for every cross block it builds directly.
+_CROSS_REACH = None
+_CROSS_KNEAR = 4096
+
+
+def _element_table(grp, n):
+    """``(n, q)`` sub-point indices per element, padded with ``-1`` to the largest count, and its mask.
+
+    Host work on the GROUP array, which is structure and always concrete; the positions it indexes may
+    be traced.
+    """
+    grp = np.asarray(grp)
+    order = np.argsort(grp, kind="stable")
+    counts = np.bincount(grp, minlength=n)
+    q = int(counts.max())
+    start = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    rank = np.arange(len(grp)) - np.repeat(start, counts)
+    tab = -np.ones((n, q), dtype=np.int64)
+    tab[grp[order], rank] = order
+    return tab, tab >= 0
+
+
+def _gather_sub(arr, tab, mask):
+    a = jnp.asarray(arr)
+    out = a[np.where(mask, tab, 0)]
+    return jnp.where(jnp.asarray(mask)[..., None], out, 0.0)
+
+
+@functools.partial(jax.checkpoint, static_argnums=(10, 11, 12))
+def _nearfar_rows(Ap, Am, Pa, Ma, ra, Bp, Bm, Pb, Mb, rb, g, reach, knear):
+    """Rows ``Lp_ab[i, :]`` for one chunk of ``a`` elements: one-point everywhere, exact near."""
+    d = jnp.sqrt(jnp.clip(((Pa[:, None, :] - Pb[None, :, :]) ** 2).sum(-1), 1e-300))  # (ca, nb)
+    K = (Ma @ Mb.T) * g(d)
+    lim = reach * (ra[:, None] + rb[None, :])
+    k = min(knear, Pb.shape[0])
+    _negd, j = jax.lax.top_k(-(d / lim), k)  # the k elements nearest in units of the near radius
+    near = jnp.take_along_axis(d < lim, j, axis=1)  # (ca, k)
+    # loud, not silent: if even the k-th candidate is near, the near set was cut short -- a NaN block
+    truncated = jnp.any(near[:, -1]) if k < Pb.shape[0] else False
+    Bpj, Bmj = Bp[j], Bm[j]  # (ca, k, qb, 3)
+    r = jnp.sqrt(jnp.clip(((Ap[:, None, :, None, :] - Bpj[:, :, None, :, :]) ** 2).sum(-1), 1e-300))
+    exact = jnp.einsum("apx,akqx,akpq->ak", Am, Bmj, g(r))
+    one = jnp.take_along_axis(K, j, axis=1)
+    corr = jnp.where(near, exact - one, 0.0)
+    K = K.at[jnp.arange(K.shape[0])[:, None], j].add(corr)
+    return jnp.where(truncated, jnp.nan, K)
+
+
+def cross_block_nearfar(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, reach=3.0, knear=1024, chunk=64):
+    """:func:`cross_block` with the far field on ONE point per element.
+
+    Two elements further apart than ``reach`` times the sum of their radii (largest sub-point distance
+    from the centroid) couple through their total moments at their centroids; nearer pairs keep the
+    full sub-point double sum. On a welded module almost every wire-lattice pair is far -- a bond wire
+    against a whole board and its plane -- and the exact block spends ~10^9 kernel evaluations on
+    pairs the one-point rule already resolves, so this is where a welded solve's time went.
+
+    The near set is found per ``a`` element as its ``knear`` nearest ``b`` elements (fixed size, so it
+    compiles and differentiates). If the ``knear``-th is still near, the set was cut short and the
+    whole block is NaN -- raise ``knear`` -- rather than quietly missing near pairs.
+
+    Accuracy is the one-point rule's at the near radius, O((r/d)^2) per far pair; see
+    ``test_peec_cross_block_nearfar.py`` for the measured error against the exact block.
+    """
+    if na > nb:  # chunk over the THIN side (the wire), whichever argument it arrived as
+        return cross_block_nearfar(pos_b, mom_b, grp_b, nb, pos_a, mom_a, grp_a, na, g, scale, reach, knear, chunk).T
+    tab_a, mk_a = _element_table(grp_a, na)
+    tab_b, mk_b = _element_table(grp_b, nb)
+    Ap, Am = _gather_sub(pos_a, tab_a, mk_a), _gather_sub(mom_a, tab_a, mk_a)
+    Bp, Bm = _gather_sub(pos_b, tab_b, mk_b), _gather_sub(mom_b, tab_b, mk_b)
+    cnt_a = jnp.asarray(mk_a.sum(1), dtype=Ap.dtype)[:, None]
+    cnt_b = jnp.asarray(mk_b.sum(1), dtype=Bp.dtype)[:, None]
+    Pa, Pb = Ap.sum(1) / cnt_a, Bp.sum(1) / cnt_b
+    Ma, Mb = Am.sum(1), Bm.sum(1)
+    ra = jnp.max(jnp.where(jnp.asarray(mk_a), jnp.sqrt(((Ap - Pa[:, None, :]) ** 2).sum(-1)), 0.0), axis=1)
+    rb = jnp.max(jnp.where(jnp.asarray(mk_b), jnp.sqrt(((Bp - Pb[:, None, :]) ** 2).sum(-1)), 0.0), axis=1)
+    rows = []
+    for lo in range(0, na, chunk):
+        hi = min(lo + chunk, na)
+        rows.append(
+            _nearfar_rows(
+                Ap[lo:hi], Am[lo:hi], Pa[lo:hi], Ma[lo:hi], ra[lo:hi], Bp, Bm, Pb, Mb, rb, g, float(reach), int(knear)
+            )
+        )
+    return scale * jnp.concatenate(rows, axis=0)
+
+
 def _hier_apply(fil: Filaments, g, mu_scale, operator):
     """``apply(cur)`` for a lattice with no translation invariance -- a GRADED grid.
 
@@ -3155,7 +3243,11 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
                     hmat(hm, pi, mi, None, g, scale=mu_scale, b=(pj, mj), transpose=True),
                 )
             else:
-                K = cross_block(
+                K = (
+                    cross_block
+                    if _CROSS_REACH is None
+                    else functools.partial(cross_block_nearfar, reach=_CROSS_REACH, knear=_CROSS_KNEAR)
+                )(
                     jnp.asarray(fil.pos)[ri],
                     jnp.asarray(fil.mom)[ri],
                     gi,
