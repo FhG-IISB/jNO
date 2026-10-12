@@ -144,4 +144,8 @@ def solve(b, slot: int):
     """``x = c * B^{-1} (r * b)`` for the factorisation in ``slot`` -- an XLA op, usable under jit."""
     import jax
 
-    return jax.ffi.ffi_call("jno_cudss_solve", jax.ShapeDtypeStruct(b.shape, b.dtype))(b, slot=np.int64(slot))
+    # "sequential": a batch (jax.vmap over a vjp -- several adjoints of one solve) is solved one
+    # right-hand side after another against the same factorisation; the kernel takes one vector
+    return jax.ffi.ffi_call("jno_cudss_solve", jax.ShapeDtypeStruct(b.shape[-1:], b.dtype), vmap_method="sequential")(
+        b, slot=np.int64(slot)
+    )

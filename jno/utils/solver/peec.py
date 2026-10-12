@@ -1497,12 +1497,12 @@ def solve_network(
         def _precond(r):
             if _ffi:
                 return cudss_ffi.solve(r, _FFI_SLOT)
-            return jax.pure_callback(_holder_solve, shape_out, r)
+            return jax.pure_callback(_holder_solve, shape_out, r, vmap_method="expand_dims")
 
         def _precond_t(r):
             if _ffi:
                 return cudss_ffi.solve(r, _FFI_SLOT + 1)
-            return jax.pure_callback(_holder_solve_t, shape_out, r)
+            return jax.pure_callback(_holder_solve_t, shape_out, r, vmap_method="expand_dims")
 
         def M_apply(x, w_, zd, Rc_, cz_):
             cur, phi = x[:ne], x[ne : ne + nn]
@@ -3418,7 +3418,7 @@ def _holder_solve(r):
     nothing here is reentrant.
     """
     _LU_HOLDER["applies"] = _LU_HOLDER.get("applies", 0) + 1  # what a stale factorisation is judged by
-    return _LU_HOLDER["lu"].solve(np.asarray(r)).astype(r.dtype)
+    return _batched_lu(r, "N")
 
 
 def _holder_solve_t(r):
@@ -3429,7 +3429,22 @@ def _holder_solve_t(r):
     transpose, not the conjugate one, because that is the convention jax's linear transpose uses.
     """
     _LU_HOLDER["applies"] = _LU_HOLDER.get("applies", 0) + 1
-    return _LU_HOLDER["lu"].solve(np.asarray(r), trans="T").astype(r.dtype)
+    return _batched_lu(r, "T")
+
+
+def _batched_lu(r, trans):
+    """The held factorisation applied to ``r`` -- one vector, or a BATCH of them in its leading axes.
+
+    A batch arrives when the solve is vmapped (`jax.vmap` over a vjp, `jax.jacrev`: several readouts
+    of one solve, one adjoint each). The callbacks are declared ``vmap_method="expand_dims"``, so the
+    batch comes as leading axes and goes to SuperLU as extra right-hand sides of the same factors --
+    one host call per GMRES iteration for all of them, rather than one per vector.
+    """
+    x = np.asarray(r)
+    n = x.shape[-1]
+    rhs = x.reshape(-1, n).T
+    out = _LU_HOLDER["lu"].solve(np.ascontiguousarray(rhs), trans=trans)
+    return np.ascontiguousarray(out.T).reshape(x.shape).astype(x.dtype)
 
 
 def _bcoo(val, row, col, shape):
