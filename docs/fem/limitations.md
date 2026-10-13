@@ -45,6 +45,7 @@ path is unaffected.
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
 | `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
+| Coefficient fields on an element space (`e.bind(...).freeze(values)` or `jno.np.parameter(e)` with `e` an N1E / N2E / RT / DG / P_k symbol) | **volume** terms of the non-nodal assembler (a form with such an unknown): value and gradient (`.curl`, `.d(x)`) of a frozen field, value of a parameter. Not in boundary terms, not on the nodal Lagrange or 1-D assembler (P0 / P1 fields only there) | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
 | **Curved-boundary geometry** | straight-sided **by default**; `shape.curved()` is the fix | **silent** |
 | **Axisymmetric vector forms** | the `2πr` measure is wrong for vectors | **silent** |

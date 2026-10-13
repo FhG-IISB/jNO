@@ -80,6 +80,21 @@ def _fem_field_kind(node):
     return getattr(node.model, "_fem_field", None)
 
 
+def refuse_space_field_parameters(exprs, where: str) -> None:
+    """Raise for a field parameter on an element space (``jno.np.parameter(<N1E / RT / P_k symbol>)``)
+    reaching an assembler that only gathers P0 (per cell) and P1 (per vertex) fields: there its values
+    would be read at vertex ids, which is silently wrong."""
+    bad = sorted(n for n, e in exprs.items() if _fem_field_kind(e) == "space")
+    if bad:
+        spaces = sorted({f"{e.model._fem_space[0]}{e.model._fem_space[1]}" for n, e in exprs.items() if n in bad})
+        raise NotImplementedError(
+            f"jno.fem ({where}): the field parameter(s) {bad} live on the element space(s) {spaces}; this "
+            "assembler takes P0 (one value per cell) and P1 (one value per vertex) field parameters only. "
+            "Coefficients on any element space are evaluated by the non-nodal assembler (a form with an "
+            "N1E / N2E / RT / DG / P_k unknown), or use a P0 / P1 symbol here."
+        )
+
+
 def _contains_fem_field_parameter(node) -> bool:
     """Recursively detect a FEM field parameter in one trace subtree."""
     if _is_fem_field_parameter(node):

@@ -1214,6 +1214,51 @@ def _frozen_cell_values(local, node):
     return table[node.frozen_id]
 
 
+def _coef_slot(local, key, what):
+    """The field slot of a coefficient field on its own element space (a frozen N1E / RT / P_k / DG field or
+    such a field parameter): ``{shape_vals, shape_grads, cell_sol, space}`` with the KNOWN cell values as
+    ``cell_sol``, built by the non-nodal assembler (``local["coef_fields"]``). Raises where it is absent."""
+    table = local.get("coef_fields")
+    if not table or key not in table:
+        raise NotImplementedError(
+            f"jno.fem: {what} lives on its own element space (N1E / N2E / RT / DG / P_k), which is evaluated "
+            "in VOLUME terms of the non-nodal assembler (a form with such an unknown). This assembly path "
+            "(a boundary term, or the nodal Lagrange / 1-D assembler) does not thread it."
+        )
+    return table[key]
+
+
+def _slot_value(slot, value_shape):
+    """A field's value at the quad points from its slot -- the TrialFunction rule, slot data in place of the
+    live solution."""
+    vals, cell_sol = slot["shape_vals"], slot["cell_sol"]
+    if slot["space"] != "Lagrange":
+        return jnp.einsum("qn,n->q", vals, cell_sol) if vals.ndim == 2 else jnp.einsum("qnc,n->qc", vals, cell_sol)
+    flat = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
+    return flat[..., 0] if len(value_shape) == 0 else _reshape_components_last(flat, value_shape)
+
+
+def _slot_gradient(slot, value_shape, dims):
+    """d(field)/d(x_dims) at the quad points from its slot -- the TrialFunction rule."""
+    grads, cell_sol = slot["shape_grads"], slot["cell_sol"]
+    if slot["space"] != "Lagrange":
+        g = jnp.stack([grads[..., d] for d in dims], axis=-1)
+        contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
+        return contracted[..., 0] if len(dims) == 1 else contracted
+    grad_list = [jnp.sum(grads[:, :, d : d + 1] * cell_sol[None, :, :], axis=1) for d in dims]
+    if len(value_shape) == 0:
+        return _drop_scalar_component_axis(grad_list)
+    flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
+    if len(dims) == 1:
+        return _reshape_components_last(flat, value_shape)
+    return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
+
+
+def _is_space_frozen(node) -> bool:
+    """A frozen field on its own element space (anything but P1 Lagrange): evaluated from a coefficient slot."""
+    return isinstance(node, FrozenField) and not (str(node.space).upper() == "LAGRANGE" and int(node.order) == 1)
+
+
 def _field_hess(local, node):
     """Physical shape-function Hessian ``(n_quad, n_dof, dim, dim)`` for ``node``'s field, or ``None`` if
     its element does not tabulate second derivatives (only nodal Lagrange does). Mirrors :func:`_field_data`."""
@@ -1641,6 +1686,9 @@ def _eval_integrand(domain, node, local):
         return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)
 
     if isinstance(node, FrozenField):
+        if _is_space_frozen(node):
+            slot = _coef_slot(local, ("frozen", node.frozen_id), f"the frozen {node.space} field {node.name}")
+            return _slot_value(slot, getattr(node, "value_shape", ()))
         # KNOWN field: interpolate its frozen nodal slice at the quad points, exactly like the
         # TrialFunction value branch but with frozen values instead of the live cell solution.
         if _field_space(local, node) != "Lagrange":
@@ -1682,6 +1730,9 @@ def _eval_integrand(domain, node, local):
                 return comps[0]
             return jnp.stack(comps, axis=-1)
 
+        if _is_space_frozen(node.target):
+            slot = _coef_slot(local, ("frozen", node.target.frozen_id), f"the frozen {node.target.space} field")
+            return _slot_gradient(slot, getattr(node.target, "value_shape", ()), dims)
         if isinstance(node.target, FrozenField):
             # gradient of a KNOWN field: contract the SAME physical shape gradients with the frozen
             # nodal slice instead of the live cell solution (byte-identical to the TrialFunction case).
@@ -1738,6 +1789,15 @@ def _eval_integrand(domain, node, local):
                 if isinstance(field, TestFunction):
                     return g  # per-DOF directional derivative of the component
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
+            if ints and _is_space_frozen(field):  # a known coefficient field: its slot, the trial rule
+                comp = ints[-1]
+                slot = _coef_slot(local, ("frozen", field.frozen_id), f"the frozen {field.space} field")
+                if slot["space"] != "Lagrange":
+                    gc = slot["shape_grads"][:, :, comp, :]
+                    g = jnp.stack([gc[..., d] for d in dims], axis=-1)
+                    return jnp.einsum("qn...,n->q...", g[..., 0] if len(dims) == 1 else g, slot["cell_sol"])
+                comps = [jnp.sum(slot["shape_grads"][..., d] * slot["cell_sol"][None, :, comp], axis=1) for d in dims]
+                return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
             if ints and isinstance(field, (TrialFunction, TestFunction)):
                 # Lagrange component gradient. Conventions match the whole-field branches exactly, so
                 # component and whole-field spellings mix freely in one term:
@@ -1899,6 +1959,10 @@ def _eval_integrand(domain, node, local):
             return _eval_frozen_coefficient(domain, node.model, local)
         if _is_runtime_scalar_parameter(node):
             name = _parameter_name(node)
+            _space = getattr(node.model, "_fem_space", None)
+            if _space is not None:  # a field parameter on its own element space (N1E / RT / P_k / DG)
+                slot = _coef_slot(local, ("param", name), f"the field parameter {name!r}")
+                return _slot_value(slot, _space[2] if _space[0] in ("Lagrange", "DG") else ())
             val = _runtime_parameter_value_from_internal_vars(local, name)
             if val is None:
                 raise KeyError(
