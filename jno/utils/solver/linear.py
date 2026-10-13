@@ -715,6 +715,139 @@ def cudss_lu_solve(A, b):
     )
 
 
+#: cuDSS LDL^T plans (device slots) for the in-program symmetric path, keyed on (owner, pattern, kind); each
+#: entry a list, so a program that solves the same pattern twice gets a slot per solve (see `_ldl_plan`).
+_LDL_PLANS: dict = {}
+
+
+def _symmetric_pattern(rows, cols) -> bool:
+    """True if the (row, col) set of a COO pattern equals its transpose (duplicates allowed)."""
+    import numpy as np
+
+    n = int(max(rows.max(initial=0), cols.max(initial=0))) + 1
+    a = np.unique(rows.astype(np.int64) * n + cols)
+    return bool(np.array_equal(a, np.unique(cols.astype(np.int64) * n + rows)))
+
+
+def _symmetric_values(data, rows, cols, complex_n) -> bool:
+    """True if the matrix (``R + jI`` read off a fused block when ``complex_n`` is set) equals its transpose
+    to round-off. Concrete values only."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    v = np.asarray(data)
+    if complex_n is None:
+        M = sp.coo_matrix((v, (rows, cols))).tocsr()
+    else:
+        n = int(complex_n)
+        tl, bl = (rows < n) & (cols < n), (rows >= n) & (cols < n)
+        M = sp.coo_matrix(
+            (np.concatenate([v[tl], 1j * v[bl]]), (np.concatenate([rows[tl], rows[bl] - n]), np.concatenate([cols[tl], cols[bl]]))),
+            shape=(n, n),
+        ).tocsr()
+    scale = abs(M).max() if M.nnz else 0.0
+    return bool(M.nnz == 0 or abs(M - M.T).max() <= 1e-12 * scale)
+
+
+def _current_trace(x):
+    """The JAX trace a value belongs to (``None`` for a concrete array)."""
+    return getattr(x, "_trace", None) if isinstance(x, jax.core.Tracer) else None
+
+
+def _ldl_plan(owner, rows, cols, n, complex_values, trace):
+    """A cuDSS slot for this pattern. A slot holds ONE factorisation per program (the adjoint reuses it), so a
+    second solve of the same pattern inside the same trace gets a slot of its own instead of overwriting the
+    first one's factors between its forward and its adjoint (which would return a wrong gradient silently)."""
+    import hashlib
+    import weakref
+
+    import numpy as np
+
+    from . import cudss_sym as cs
+
+    h = hashlib.sha1(np.ascontiguousarray(rows).tobytes() + np.ascontiguousarray(cols).tobytes()).hexdigest()
+    key = (id(owner), h, int(n), bool(complex_values))
+    pool = _LDL_PLANS.setdefault(key, [])
+    for entry in pool:
+        last = entry["trace"]
+        used_here = trace is not None and last is not None and last() is trace
+        if not used_here:
+            try:
+                entry["trace"] = weakref.ref(trace) if trace is not None else None
+            except TypeError:
+                entry["trace"] = None
+            return entry["plan"]
+    with jax.ensure_compile_time_eval():  # the plan's index arrays are constants, never tracers of this trace
+        plan = cs.plan(rows, cols, n, complex_values=complex_values)
+    try:
+        ref = weakref.ref(trace) if trace is not None else None
+    except TypeError:
+        ref = None
+    pool.append({"plan": plan, "trace": ref})
+    return plan
+
+
+def cudss_ldl_solve(A, b, context=None):
+    """Symmetric (LDL^T) solve on cuDSS INSIDE the compiled program, or ``None`` where it does not apply.
+
+    ``A x = b`` for a BCOO ``A`` whose pattern is symmetric, factored by :mod:`cudss_sym` (XLA custom calls:
+    no host round trip, so ``jax.jit(jax.grad(...))`` runs assembly, factorisation, solve and adjoint on the
+    GPU). A fused complex system -- the real-equivalent block ``[[R, -I], [I, R]]`` jNO builds for a complex
+    form, flagged by ``context["complex_n"]`` -- is solved as the complex SYMMETRIC ``n x n`` matrix
+    ``R + jI``: half the unknowns of the block, LDL^T instead of LU.
+
+    Under a trace the pattern is not a concrete array, so it comes from ``context["pattern"]`` (the FEM's
+    operator pattern, from one compiled evaluation); a mismatch in size raises. Symmetric VALUES cannot be
+    checked under a trace: the residual of the block is (one matvec, :func:`residual_gate`), so an operator
+    that is not symmetric raises instead of returning the solution of its symmetric part. ``None`` (no GPU
+    extension, no pattern, a non-symmetric pattern) leaves the caller on its general path.
+    """
+    import numpy as np
+
+    from . import cudss_sym as cs
+    from .solver_api import residual_gate
+
+    if not cs.available():
+        return None
+    ctx = context or {}
+    if isinstance(A.indices, jax.core.Tracer):
+        pat = ctx.get("pattern")
+        if pat is None:
+            return None
+        if tuple(pat.shape) != tuple(A.indices.shape):
+            raise RuntimeError(
+                f"jno.solve.lu(backend='cudss'): the operator's pattern has {A.indices.shape[0]} entries under this "
+                f"trace and {pat.shape[0]} in the FEM's compiled pattern; refusing to factor values against the "
+                "wrong pattern."
+            )
+        idx = np.asarray(pat)
+    else:
+        idx = np.asarray(A.indices)
+    rows, cols, m = idx[:, 0], idx[:, 1], int(A.shape[0])
+    trace = _current_trace(A.data)
+    b = jnp.asarray(b).reshape(-1)
+    cn = ctx.get("complex_n")
+    if cn is not None and m == 2 * int(cn):
+        n = int(cn)
+        tl, bl = (rows < n) & (cols < n), (rows >= n) & (cols < n)
+        if not (_symmetric_pattern(rows[tl], cols[tl]) and (not bl.any() or _symmetric_pattern(rows[bl] - n, cols[bl]))):
+            return None
+        if not isinstance(A.data, jax.core.Tracer) and not _symmetric_values(A.data, rows, cols, n):
+            return None  # concrete values, not symmetric: the general LU path solves it
+        plan = _ldl_plan(ctx.get("owner"), rows % n, cols % n, n, True, trace)
+        weight = jnp.asarray(np.where(tl, 1.0 + 0j, np.where(bl, 1j, 0j)))
+        xc = cs.solve(plan, A.data * weight, b[:n] + 1j * b[n:])
+        x = jnp.concatenate([xc.real, xc.imag])
+    else:
+        if not _symmetric_pattern(rows, cols):
+            return None
+        if not isinstance(A.data, jax.core.Tracer) and not _symmetric_values(A.data, rows, cols, None):
+            return None
+        plan = _ldl_plan(ctx.get("owner"), rows, cols, m, False, trace)
+        x = cs.solve(plan, A.data, b)
+    return residual_gate(lambda v: A @ v, b, x, "lu(backend='cudss') [LDL^T]", rtol=1e-6)
+
+
 def _pardiso_available() -> bool:
     """True when pypardiso imports AND exposes the private phase hooks this backend drives."""
     try:

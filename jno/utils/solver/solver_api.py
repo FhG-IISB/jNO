@@ -1353,6 +1353,10 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
                 x0=x0_flat,
             )
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+        if fem is not None and getattr(linear, "traits", {}).get("solver_context"):
+            # what a direct solver may know beyond the values: the operator's pattern (concrete, for a
+            # factorisation planned inside a trace) and whether it is a fused complex block
+            op.solver_context = fem._linear_solver_context()
         return linear(op, rhs, M=M, x0=x0_flat)
 
     if not _compilable(linear, precond):
