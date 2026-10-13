@@ -114,3 +114,21 @@ def test_cpu_samples_and_attribution(tmp_path, monkeypatch):
     assert by["jno/assemble"]["cycles"] == 1000 and by["jno/assemble"]["fp64_256b"] == 100003
     assert by["library"]["cycles"] == 2000 + 63
     assert syms["jno/assemble"][("multiply_reduce_fusion.3", "fp64_scalar")] == 100003
+
+
+def test_verdicts_follow_the_rungs():
+    K = prof.Kernel
+    mk = lambda stage, ms, n, adj=False: K("op", "k", f"jit(f)/jvp(jno/{stage[4:]})/x", stage, adj, ms * 1e6 / n, n)
+    r = prof.Result(
+        "x",
+        {"sizes": dict(cells=1000, nodes=250, nnz=20000, n=2000, nrhs=1, complex=False)},
+        {},
+        [mk("jno/factor", 100, 10), mk("jno/assemble", 50, 10000), mk("jno/solve", 20, 10), mk("jno/readout", 0.5, 5)],
+        [],
+        [{"backend": "cudss_ffi", "lu_nnz": 100000}],
+    )
+    v = r.verdicts({"jno/solve": (18.0, None, 10), "jno/factor": (30.0, None, 10)})
+    assert v["jno/assemble"].startswith("launch-bound")  # 10,000 launches x 4 us = 40 ms of 50
+    assert v["jno/factor"].startswith("x3.3 above the roof")  # 100 / 30
+    assert "reformulate" in v["jno/solve"] or "at the roof" in v["jno/solve"]  # 20 / 18 < 1.5
+    assert v["jno/readout"].startswith("negligible")

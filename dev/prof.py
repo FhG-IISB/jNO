@@ -129,6 +129,42 @@ class Result:
             out["jno/solve"] = 2 * 2 * nrhs * lu * w / pk["dram_B_s"] * 1e3
         return out
 
+    def verdicts(self, kernel_bounds=None, launch_s: float = 4e-6):
+        """One line per stage from the rungs: where the time can go and what would recover it.
+        `kernel_bounds`: {stage: (kernel_bound_ms, _, n_profiled_launches)} as `figures.bounds_from_kernels` gives."""
+        ib = self.intrinsic_bounds()
+        out = {}
+        total = sum(a["forward_ms"] + a["adjoint_ms"] for a in self.by_stage().values())
+        for s, a in self.by_stage().items():
+            m = a["forward_ms"] + a["adjoint_ms"]
+            floor = a["launches"] * launch_s * 1e3
+            if total > 0 and m < 0.02 * total:
+                out[s] = f"negligible ({100 * m / total:.1f} % of the device time)"
+                continue
+            kb = None
+            if kernel_bounds and s in kernel_bounds and kernel_bounds[s][0]:
+                kb = kernel_bounds[s][0]
+                if len(kernel_bounds[s]) > 2 and kernel_bounds[s][2]:
+                    kb *= a["launches"] / kernel_bounds[s][2]
+            i = ib.get(s)
+            if m <= 0:
+                out[s] = "-"
+            elif floor > 0.5 * m:
+                out[s] = f"launch-bound ({a['launches']:,} launches): fuse or batch, not a kernel"
+            elif kb and m / kb < 1.5 and (not i or kb / i < 3):
+                out[s] = "at the roof: leave it"
+            elif kb and m / kb < 1.5 and i:
+                out[s] = f"kernels at the roof, x{kb / i:.0f} above the minimal work: reformulate (fewer passes, less data)"
+            elif kb and m / kb >= 1.5:
+                out[s] = f"x{m / kb:.1f} above the roof at its own intensity: a better kernel" + (
+                    f" (and x{kb / i:.0f} of algorithm above that)" if i and kb / i >= 3 else ""
+                )
+            elif i:
+                out[s] = f"x{m / i:.0f} above the minimal work; run dev/kernels.py on it to split kernel from algorithm"
+            else:
+                out[s] = "no bound known (pass sizes=, run dev/kernels.py)"
+        return out
+
     # ── aggregation ────────────────────────────────────────────────────────────────────────────────────
     def by_stage(self):
         """{stage: {"forward_ms", "adjoint_ms", "launches", "kernels": [Kernel...]}} sorted by total time."""
@@ -184,6 +220,15 @@ class Result:
                     f"  {s:28s} {a['forward_ms']:8.1f} {a['adjoint_ms']:8.1f} {a['launches']:9,d} {mtxt:>14s} {itxt:>11s}  "
                     f"{top.hlo_op} ({top.duration_ns * top.count / 1e6:.1f} ms, occ {top.occupancy_pct:.0f} %)"
                 )
+            try:
+                from dev.figures import bounds_from_kernels
+
+                kb = bounds_from_kernels(os.path.join(RUNS, self.label))
+            except Exception:  # noqa: BLE001
+                kb = {}
+            lines.append("  verdicts:")
+            for s, v in self.verdicts(kb).items():
+                lines.append(f"    {s:24s} {v}")
             h2d = [m for m in self.memcpys if m.kind != "D2D"]
             if h2d:
                 lines.append(

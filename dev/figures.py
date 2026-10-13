@@ -40,7 +40,7 @@ def _stage_colors(stages):
     return {s: (hs.CYCLE[i] if i < 4 else hs.MUTED) for i, s in enumerate(stages)}
 
 
-def ladder(res, bounds=None, ax=None):
+def ladder(res, bounds=None, ax=None, verdict=None):
     """Per stage: measured time (filled), the launch floor (hollow square, estimate) and, when `bounds` gives
     them ({stage: (kernel_bound_ms, intrinsic_ms)}), the roof bounds. Sorted by measured time."""
     agg = res.by_stage()
@@ -49,7 +49,7 @@ def ladder(res, bounds=None, ax=None):
     if ax is None:
         H = 1.1 + 0.4 * len(stages)
         fig = plt.figure(figsize=(6.69, H), layout="none")
-        ax = fig.add_axes([0.24, 0.5 / H, 0.52, 1 - 1.05 / H])
+        ax = fig.add_axes([0.24, 0.5 / H, 0.42, 1 - 1.05 / H])
     y = np.arange(len(stages))[::-1]
     lo = np.inf
     for yi, s in zip(y, stages):
@@ -76,6 +76,18 @@ def ladder(res, bounds=None, ax=None):
         elif ib:
             txt = f"- / x{m / ib:.0f}   " + txt
         ax.text(m * 1.3, yi, txt, va="center", ha="left", fontsize=8, color=hs.INK)
+        if verdict and s in verdict:
+            ax.text(
+                1.02,
+                yi,
+                verdict[s].split(":")[0],
+                transform=ax.get_yaxis_transform(),
+                va="center",
+                ha="left",
+                fontsize=7,
+                color=hs.MUTED,
+                clip_on=False,
+            )
     ax.yaxis.set_major_locator(mt.FixedLocator(list(y)))
     ax.set_yticklabels(stages)
     ax.set_ylim(-0.6, len(stages) - 0.4)
@@ -330,7 +342,7 @@ def all_figures(res, out_dir, bounds=None):
             s: (kb.get(s, (None, None, None))[0], ib.get(s), kb.get(s, (None, None, None))[2]) for s in set(kb) | set(ib)
         } or None
     for name, f in (
-        ("headroom_ladder", lambda: ladder(res, bounds)),
+        ("headroom_ladder", lambda: ladder(res, bounds, verdict=res.verdicts(bounds_from_kernels(out_dir)))),
         ("icicle", lambda: icicle(res)),
         ("launch_spectrum", lambda: spectrum(res)),
         ("bind_strip", lambda: bind_strip(out_dir)),
