@@ -3670,6 +3670,11 @@ class FEM:
         whole volume and tagged boundary regions only, and steady native-Lagrange problems only. Where it
         is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
         partition of unity.
+
+        On a **non-nodal** form (N1E / N2E / RT / DG, alone or mixed with Lagrange) the test-free integrand is
+        integrated over the whole volume, real or complex, with coefficient fields of any space — e.g. the
+        current through an impressed field ``E`` of an eddy-current form,
+        ``I = (sigma * inner(E - 1j*w*A, E)).integrate(fem)``. Boundary integrands are not wired there.
         """
         return self._eval_at(term, u, 0.0, args=args)
 
@@ -3802,7 +3807,15 @@ class FEM:
                 )
             return sol
         self._functional_solver = solver
-        self._functional_sol = sol = self.solve() if solver is None else self.solve(solver)
+        from .utils.solver.solver_api import LinearSolver
+
+        if solver is None:
+            sol = self.solve()
+        elif isinstance(solver, LinearSolver):  # a `jno.solve.*` spec fills the linear slot, with this FEM as context
+            sol = self.solve(linear=solver)
+        else:
+            sol = self.solve(solver)
+        self._functional_sol = sol
         return sol
 
     def _functional_fn(self, terms, bares):
@@ -3814,11 +3827,10 @@ class FEM:
         factory = getattr(self, "_term_functional_factory", None)
         if factory is None:
             raise NotImplementedError(
-                "fem.eval: a test-free integrand is integrated only through the native Lagrange assembler "
-                "on a STEADY problem, which is the only route that publishes the functional. Not wired "
-                "for: transient, complex, 1-D, non-nodal (Argyris/Morley/edge) elements, and the VPINN "
-                "path. Assemble the equivalent weak term `F * phi` and sum it instead — a Lagrange basis "
-                "is a partition of unity, so that is the same integral."
+                "fem.eval: a test-free integrand is integrated on STEADY problems of the native Lagrange "
+                "and the non-nodal assemblers, which publish the functional. Not wired for: transient, "
+                "1-D, and the VPINN path. On a Lagrange form, assemble the equivalent weak term `F * phi` "
+                "and sum it instead — a Lagrange basis is a partition of unity, so that is the same integral."
             )
         vol, surf = [], {}
         for t, bare in zip(terms, bares):

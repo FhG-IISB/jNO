@@ -44,6 +44,7 @@ def _form(nonsymmetric=False):
     if nonsymmetric:
         terms = terms + 0.3j * A[0] * V[1]  # an off-diagonal tensor: not symmetric (curl A . V would be)
     fem = jno.fem([terms, u.vector.cross(d.variable("boundary", normals=True))])
+    fem._probe = {"A": A, "k": k}  # for the functional test
     return fem, len(d.mesh.cells_dict["tetra"])
 
 
@@ -87,3 +88,25 @@ def test_values_that_are_not_symmetric():
         from jno.utils.solver.solver_api import raise_if_gate_failed
 
         raise_if_gate_failed()
+
+
+def test_integrate_with_the_cudss_solver_takes_the_ldl_path(monkeypatch):
+    """`expr.integrate(fem, solver=lu(backend="cudss"))` fills the linear slot with the FEM as context, so the
+    functional's shared solve is the in-program LDL^T one (and agrees with host LU)"""
+    import jno.utils.solver.linear as L
+
+    fem, nc = _form()
+    calls = []
+    orig = L.cudss_ldl_solve
+    monkeypatch.setattr(L, "cudss_ldl_solve", lambda *a, **k: calls.append(1) or orig(*a, **k))
+    A, k = fem._probe["A"], fem._probe["k"]
+    k.initialize(jax.nn.initializers.constant(1.0))
+    vals = []
+    for backend in ("cudss", "host"):
+        fem._functional_sol = None
+        node = (k * inner(A, A)).integrate(fem, solver=jno.solve.lu(backend=backend))
+        F = jno.fn(lambda i: jnp.real(i), [node], name="F")
+        crux = jno.core([F], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+        vals.append(float(np.asarray(crux.eval([F])).reshape(-1)[0]))
+    assert calls, "the LDL^T path was not taken"
+    np.testing.assert_allclose(vals[0], vals[1], rtol=1e-9)

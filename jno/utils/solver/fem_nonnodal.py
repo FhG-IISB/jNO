@@ -169,6 +169,9 @@ def assemble_fem_nonnodal(
     # happen to agree it worked by luck; where the block SIZES also agree it would have been a
     # silently wrong preconditioner rather than a shape error.
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
+    # the functional behind `fem.eval(F, u)` / `F.integrate(fem)` (steady forms publish it below); cleared
+    # first so a functional left on the domain by an earlier assembly is never picked up for this one
+    domain._fem_native_term_functional = None
 
     spaces = [f["space"] for f in fields]
     if any(s not in ("RT", "N1E", "N2E", "P0", "DG", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
@@ -2048,6 +2051,79 @@ def assemble_fem_nonnodal(
         return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
 
     residual = _make_residual(volume_terms, with_gsurf=True)
+
+    def _make_functional(terms, bterms=None):
+        """``F(u_flat, t, args) -> ()``: the integral of TEST-FREE expressions over the volume, on the quadrature
+        and the field / coefficient slots the residual uses (so ``∫ a(u, u) = u . R_a(u)`` exactly). Complex
+        solutions and coefficients integrate as they assemble. Differentiable in ``u_flat``, the runtime
+        parameters and trainable coordinates. Volume only: a boundary integrand is refused."""
+        if bterms:
+            raise NotImplementedError(
+                f"fem.eval / expr.integrate(fem) on a non-nodal form: boundary integrands ({sorted(bterms)}) are "
+                "not wired; only volume integrals are. Integrate a volume expression instead."
+            )
+        typed = [
+            (_lower_statefield_to_trial(bare, {}), tuple(sorted(_collect_region_mask_names(bare)))) for bare in terms
+        ]
+
+        def functional(u_flat, t=0.0, args=None):
+            u_blocks = [u_flat[offs[i] : offs[i + 1]] for i in range(len(fields))]
+            _a = args or {}
+            rt_scalar = {
+                name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=jnp.real(u_flat).dtype), (-1,))[:1]
+                for name in runtime_parameter_tags
+                if name not in _field_param_names
+            }
+            field_vals = {
+                name: _field_array(name, _a.get(name, _param_zeros(name)), jnp.real(u_flat).dtype)
+                for name in _field_param_names
+            }
+            _nt = neural_local_table(_neural, args)
+            _p = _apply_coord_params(pts, _a)
+            out = 0.0  # promotes to the integrand's dtype (a complex coefficient on a real solution stays complex)
+            for expr, rnames in typed:
+
+                def _cell(c, e=expr, _rn=rnames):
+                    per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
+                    vol_vars = tuple(
+                        (_gather_param(n_, field_vals[n_], c) if n_ in _field_param_names else rt_scalar[n_])
+                        for n_ in runtime_parameter_tags
+                    )
+                    local = {
+                        "physical_quad_points": xq,
+                        "fields": per,
+                        "field_index": field_index,
+                        "tag": "fem_gauss",
+                        "surface": False,
+                        "domain_context": _with_cell_size(ctx, meas, xq, (pts if _p is None else _p)[cells_j[c]]),
+                        "temporal_tags": (),
+                        "runtime_parameter_tags": runtime_parameter_tags,
+                        "region_mask_names": _rn,
+                        "volume_vars": vol_vars + _cell_masks(c, _rn),
+                    }
+                    if _field_param_names or _frozen_gathered:
+                        local["shape_vals"] = p1_shape_vals
+                    if _frozen_gathered:
+                        local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+                    if _coef_specs:
+                        local["coef_fields"] = _coef_slots(c, field_vals, _p)
+                    if _nt is not None:
+                        local["neural_coefficients"] = _nt
+                    val = _integrate_term(domain, e, local, qw * meas)
+                    if val.shape != (1,):
+                        raise ValueError(
+                            f"fem.eval / expr.integrate(fem): the integrand is not a scalar per point (it integrates "
+                            f"to shape {tuple(val.shape)} per cell). Contract it, e.g. with inner(...)."
+                        )
+                    return val
+
+                per_cell = _elem_map(_cell, (jnp.arange(n_cells),), _cell_chunk_of(n_cells, 1, 1, _chunk_setting))
+                out = out + jnp.sum(per_cell)
+            return jnp.asarray(out)
+
+        return functional
+
+    domain._fem_native_term_functional = _make_functional  # (the attribute name predates the non-nodal path)
 
     def full_residual(u_flat, args=None):  # the natural BC is a constant load on the RHS: R(u) = assembled(u) - load
         return residual(u_flat, args) - nat_load
