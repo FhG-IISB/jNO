@@ -46,3 +46,31 @@ def profile_solve(run, *, label, warm=True):
     dt = time.perf_counter() - t0
     print(f"[{label}]  wall {dt * 1e3:.1f} ms  ·  Perfetto trace → {trace_dir}")
     return result
+
+
+# ── developer stage markers and backend statistics (consumed by dev/prof.py; no-ops for users) ──────────
+def stage(name: str):
+    """``jax.named_scope("jno/<name>")``: labels every traced operation of a solve stage so profilers attribute
+    kernels (forward and transpose) to it. Costs nothing at runtime: the name lives in the HLO metadata only.
+    Stages: assemble, bc, factor, solve, adjoint, readout, newton.step, time.step."""
+    return jax.named_scope(f"jno/{name}")
+
+
+_STATS = None
+
+
+def collect_stats(on: bool = True):
+    """Switch the collection of solver-backend records on (a fresh list) or off. Off by default: ``record`` is
+    then a no-op, so backends may call it freely."""
+    global _STATS
+    _STATS = [] if on else None
+
+
+def record(**rec):
+    """A factorising backend reports what it did (backend, n, nnz, factor nnz, flops, memory, phase seconds)."""
+    if _STATS is not None:
+        _STATS.append(rec)
+
+
+def stats() -> list:
+    return list(_STATS or [])

@@ -246,15 +246,22 @@ def solve(p: Plan, values, b, refactor=True, tol=1e-10, maxiter=30):
     values = values.astype(dt)
     b = b.astype(dt)
     A = jsp.BCOO((values, p.indices), shape=(n, n))
+    from ..profiling import stage
+
     if refactor:
-        vcsr = jnp.zeros(p.nnz + 1, dt).at[p.pos].add(values)[: p.nnz]
-        # the factorisation is not differentiated: the cotangent of `values` enters through the matvec below
-        token = jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(jax.lax.stop_gradient(vcsr), slot=slot)
-        _solve = lambda _matvec, rhs: _ffi_solve(p, token, rhs)
+        with stage("factor"):
+            vcsr = jnp.zeros(p.nnz + 1, dt).at[p.pos].add(values)[: p.nnz]
+            # the factorisation is not differentiated: the cotangent of `values` enters through the matvec below
+            token = jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(jax.lax.stop_gradient(vcsr), slot=slot)
+
+        def _solve(_matvec, rhs):
+            with stage("solve"):
+                return _ffi_solve(p, token, rhs)
     else:
         def _solve(matvec, rhs):
-            x, _it, rel = _refine(p, matvec, rhs, tol, maxiter)
-            return jnp.where(rel <= tol, x, jnp.nan)
+            with stage("solve"):
+                x, _it, rel = _refine(p, matvec, rhs, tol, maxiter)
+                return jnp.where(rel <= tol, x, jnp.nan)
 
     # symmetric=True: the adjoint is the plain TRANSPOSE (JAX's linear transpose does not conjugate), and A^T = A
     # holds for complex symmetric as for real symmetric -- the same solve on the same factors

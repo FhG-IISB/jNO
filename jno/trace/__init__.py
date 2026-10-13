@@ -4083,8 +4083,11 @@ class FemLinearSystem:
         return self.operator_fn is not None or self.rhs_fn is not None
 
     def evaluate(self, args=None):
-        A = self.A if self.operator_fn is None else self.operator_fn(args)
-        b = self.b if self.rhs_fn is None else self.rhs_fn(args)
+        from ..utils.profiling import stage
+
+        with stage("assemble"):
+            A = self.A if self.operator_fn is None else self.operator_fn(args)
+            b = self.b if self.rhs_fn is None else self.rhs_fn(args)
         return A, b
 
     def solve(self, solve_fn=None, *, periodic=None, values=None):

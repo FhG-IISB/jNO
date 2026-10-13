@@ -649,16 +649,19 @@ def cudss_lu_solve(A, b):
     bshape = (n,) if b.ndim == 1 else (n, int(b.shape[1]))
 
     def _call(rhs, transpose):
-        return jax.pure_callback(
-            lambda d, i, r: _vmapped_direct_solve(
-                lambda dd, ii, rr, tt: _cudss_host_solve(dd, ii, rr, shape, tt), d, i, r, len(bshape), transpose
-            ),
-            jax.ShapeDtypeStruct(bshape, rhs.dtype),
-            A.data,
-            A.indices,
-            rhs,
-            vmap_method="expand_dims",
-        )
+        from ..profiling import stage
+
+        with stage("solve"):
+            return jax.pure_callback(
+                lambda d, i, r: _vmapped_direct_solve(
+                    lambda dd, ii, rr, tt: _cudss_host_solve(dd, ii, rr, shape, tt), d, i, r, len(bshape), transpose
+                ),
+                jax.ShapeDtypeStruct(bshape, rhs.dtype),
+                A.data,
+                A.indices,
+                rhs,
+                vmap_method="expand_dims",
+            )
 
     return jax.lax.custom_linear_solve(
         lambda x: A @ x,
@@ -1056,16 +1059,19 @@ def pardiso_lu_solve(A, b):
     bshape = (n,) if b.ndim == 1 else (n, int(b.shape[1]))
 
     def _call(rhs, transpose):
-        return jax.pure_callback(
-            lambda d, i, r: _vmapped_direct_solve(
-                lambda dd, ii, rr, tt: _pardiso_host_solve(dd, ii, rr, shape, tt), d, i, r, len(bshape), transpose
-            ),
-            jax.ShapeDtypeStruct(bshape, rhs.dtype),
-            A.data,
-            A.indices,
-            rhs,
-            vmap_method="expand_dims",
-        )
+        from ..profiling import stage
+
+        with stage("solve"):
+            return jax.pure_callback(
+                lambda d, i, r: _vmapped_direct_solve(
+                    lambda dd, ii, rr, tt: _pardiso_host_solve(dd, ii, rr, shape, tt), d, i, r, len(bshape), transpose
+                ),
+                jax.ShapeDtypeStruct(bshape, rhs.dtype),
+                A.data,
+                A.indices,
+                rhs,
+                vmap_method="expand_dims",
+            )
 
     return jax.lax.custom_linear_solve(
         lambda x: A @ x,
@@ -1205,14 +1211,17 @@ def host_lu_solve(A, b, *, reuse: bool = True):
         return _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
 
     def _call(rhs, transpose):
-        return jax.pure_callback(
-            lambda d, i, r: _vmapped_direct_solve(_host_solve, d, i, r, 1, transpose),
-            jax.ShapeDtypeStruct((n,), rhs.dtype),
-            A.data,
-            A.indices,
-            rhs,
-            vmap_method="expand_dims",
-        )
+        from ..profiling import stage
+
+        with stage("solve"):
+            return jax.pure_callback(
+                lambda d, i, r: _vmapped_direct_solve(_host_solve, d, i, r, 1, transpose),
+                jax.ShapeDtypeStruct((n,), rhs.dtype),
+                A.data,
+                A.indices,
+                rhs,
+                vmap_method="expand_dims",
+            )
 
     return jax.lax.custom_linear_solve(
         lambda x: A @ x,
