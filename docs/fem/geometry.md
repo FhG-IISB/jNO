@@ -574,8 +574,29 @@ The restart state is the one a rebuild already re-enters the march with, plus th
 segment starts on. Trajectories are bit-identical with and without checkpointing, including across
 rebuilds (600 and 1,400 steps on a melt ball; `max |Δstate| = max |Δpoints| = 0`).
 
-`checkpoint=` needs `adapt=`, and is refused otherwise. A plain march is one compiled `lax.scan` with no
-host-side boundary to write at; extending it would cost end-to-end reverse-mode differentiation (#141).
+The same `checkpoint=` writes down the fixed-mesh marches too: a transient (`u.t`) march with a built-in
+scheme, and a load-path march (`.i(k)` with `domain(tau=...)`).
+
+```python
+u = fem.solve(checkpoint=jno.solve.checkpoint("runs/heat", every=200)).fn()   # u.t march
+u = fem.solve(checkpoint=jno.solve.checkpoint("runs/plate", every=50))         # tau load path
+```
+
+Those marches are compiled loops, and checkpointing runs them as a host loop of chunks of `every` steps,
+writing the frames to one `frames.npy` memory map and the loop carry to `latest.npz` after each chunk.
+The transient trajectory is bit-identical to the unchecked march on CPU and within 1 ulp on GPU (the
+chunks compile to other shapes than the single scan); the load path agrees to round-off (2.8e-17). With `keep="last"` the result is a `numpy.memmap` of the frames on disk. A store
+records what identifies its march (grid, sizes, scheme, initial state, parameters, operators), so
+resuming a different problem into it raises instead of splicing the two.
+
+!!! warning "A checkpointed march is not differentiable"
+    A chain of scans is not the single scan whose adjoint jNO builds, so `checkpoint=` raises under
+    `jit` / `grad` / `jno.core`. Checkpoint the forward run at named values
+    (`fem.solve(k=2.0, checkpoint=...)`) and differentiate without it.
+
+Every solve that cannot write itself down refuses `checkpoint=` rather than run and leave the directory
+empty: a steady solve, an adaptive time step, a sharded or `solve_fn=` integrator, adaptive / arc-length /
+contact load stepping, and a moving mesh without `adapt=` (one compiled scan, with no boundary to write at).
 
 Two memory leaks in the rebuild path were fixed with it:
 

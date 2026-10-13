@@ -3131,8 +3131,8 @@ class AdaptSpec:
     """Relocation only: which mesh functional
     to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
     equidistribution defect of an arclength monitor; ``"huang"`` is :func:`_huang_ea_jax`, Huang's
-    equidistribution+alignment functional with the same (isotropic) monitor; ``"energy"`` is the FE
-    Dirichlet energy.
+    equidistribution+alignment functional with the same (isotropic) monitor; ``"energy"`` is the form's
+    Ritz functional ``a(u,u) - 2 l(u)`` (:func:`_ritz_weak_terms`), the energy-norm error up to a constant.
 
     It may instead be a **weak-form expression**, assembled exactly as ``criterion=`` is (same test
     symbol and region recovery) and summed to a scalar. The three strings are mesh-QUALITY functionals
@@ -3615,6 +3615,57 @@ def _walk_trials(constraint):
 
     go(getattr(constraint, "expr", constraint))
     return seen
+
+
+def _ritz_weak_terms(fem: Any, mode: str, vals0: dict) -> list:
+    """The weak terms whose Ritz functional ``objective="energy"`` descends -- validated, or a named refusal.
+
+    For a linear, symmetric, single-field form ``a(u, v) = l(v)`` the Ritz functional
+    ``J(v) = 1/2 a(v, v) - l(v)`` is minimised by ``u`` (Ciarlet, *The Finite Element Method for Elliptic
+    Problems*, 1978, §1.1), and Galerkin orthogonality ``a(u - u_h, v_h) = 0`` turns that into
+    ``J(u_h) - J(u) = 1/2 ||u - u_h||_E^2`` -- so lowering ``J(u_h)`` over meshes lowers the energy-norm
+    error. The objective is ``2 J(u_h) = u . (R(u_h) + R(0))`` with ``R`` the free
+    residual of the form's own weak terms -- with no load it is ``a(u_h, u_h)``, the Dirichlet energy this
+    objective used to descend unconditionally (#114: with a source, ``J(u_h) = -1/2 a(u_h, u_h)``, and
+    descending ``a(u_h, u_h)`` walked AWAY from the solution -- the true error rose 6x on an L-shape).
+
+    Refused by name where no minimum exists: a nonlinear or transient form (no Ritz functional), a
+    complex one (no real energy to minimise), several fields (typically a saddle point, where ``J`` has no
+    minimum), and a non-symmetric operator (advection; detected with one bilinear-symmetry probe)."""
+    import jax.numpy as jnp
+
+    from ...trace import TestFunction
+    from .solver_helper import contains_node_type
+
+    def _refuse(why):
+        raise NotImplementedError(
+            f"relocate(objective='energy') descends the Ritz functional 1/2 a(u,u) - l(u), which is the "
+            f"energy-norm error only for a LINEAR, SYMMETRIC, single-field steady form; {why}. Use the default "
+            "objective ('equidistribution'), 'huang', or a weak-form expression objective."
+        )
+
+    if mode != "linear":
+        _refuse(f"this form is {mode!r}")
+    if getattr(fem, "_complex_n", None) is not None or getattr(fem, "is_complex", False):
+        _refuse("this form is complex")
+    off = getattr(fem, "offsets", None)
+    if off is not None and len(off) > 2:
+        _refuse(f"this form has {len(off) - 1} fields (a coupled form is typically a saddle point, with no minimum)")
+    terms = [
+        t for t in (getattr(fem, "_constraints", None) or []) if contains_node_type(getattr(t, "expr", t), TestFunction)
+    ]
+    if not terms:
+        _refuse("no weak term carrying a test function was found")
+    # Symmetry: a(x, y) == a(y, x) for two probe vectors, with a(x, y) = x . (R(y) - R(0)).
+    n = int(fem.dofs)
+    rng = np.random.default_rng(0)
+    x, y = (jnp.asarray(rng.standard_normal(n)) for _ in range(2))
+    r0 = jnp.asarray(fem.eval(terms, jnp.zeros(n), args=vals0)).reshape(-1)
+    ax_y = float(jnp.vdot(x, jnp.asarray(fem.eval(terms, y, args=vals0)).reshape(-1) - r0))
+    ay_x = float(jnp.vdot(y, jnp.asarray(fem.eval(terms, x, args=vals0)).reshape(-1) - r0))
+    if abs(ax_y - ay_x) > 1e-8 * max(abs(ax_y), abs(ay_x), 1e-300):
+        _refuse(f"its operator is not symmetric (a(x,y) = {ax_y:.6e} vs a(y,x) = {ay_x:.6e} on a probe pair)")
+    return terms
 
 
 def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
@@ -4513,6 +4564,13 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         _obj_weak, _ = _criterion_weak_terms(fem, _obj_expr, _fidx)
     if spec.relocate_method not in ("descent", "monge_ampere"):
         raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
+    # `objective="energy"` descends the RITZ functional of the form's own weak terms (#114), checked here
+    # once -- before any descent -- for the conditions under which it has a minimum at all.
+    _ritz_terms = (
+        _ritz_weak_terms(fem, mode, {sp["name"]: jnp.asarray(pts0[sp["ids"], sp["axis"]]) for sp in coord_specs})
+        if spec.objective == "energy"
+        else None
+    )
 
     def _block_defect(u, pts, bounds):
         """Mesh functional summed over every solution block — the mirror of :func:`_block_energy`, so a
@@ -4522,13 +4580,18 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         d_ = 0.0
         for i in range(len(bounds) - 1):
             bf = _vertex_values(u[bounds[i] : bounds[i + 1]], i)
-            if spec.objective == "energy":
-                d_ = d_ + _dirichlet_energy_jax(pts, bf, cells_j, dim)
-            elif spec.objective == "huang":
+            if spec.objective == "huang":  # ("energy" never reaches here: it is the Ritz functional, `_ritz`)
                 d_ = d_ + _huang_ea_jax(pts, pts0_j, bf, cells_j, dim)
             else:
                 d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
         return d_
+
+    def _ritz(u, vals):
+        """``2 J(u) = a(u, u) - 2 l(u) = u . (R(u) + R(0))``, with ``R`` the form's FREE residual (no essential
+        elimination) assembled on the moved geometry -- differentiable in the vertices through ``args``."""
+        r_u = jnp.asarray(fem.eval(_ritz_terms, u, args=vals)).reshape(-1)
+        r_0 = jnp.asarray(fem.eval(_ritz_terms, jnp.zeros_like(u), args=vals)).reshape(-1)
+        return jnp.vdot(u, r_u + r_0)
 
     def _objective(vals):
         """What relocation descends -- :attr:`AdaptSpec.objective`. The FE energy is *also* computed and
@@ -4536,7 +4599,9 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         u = _solve_at(vals)
         pts = _scatter(vals)
         bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
-        if _obj_expr is not None:
+        if _ritz_terms is not None:
+            obj = _ritz(u, vals)
+        elif _obj_expr is not None:
             # `fem.eval` gives the term tested against every basis function, `int g phi_i`. Summing over
             # i is `int g (sum_i phi_i)` = `int g` exactly, because a Lagrange basis is a partition of
             # unity -- so this is the integral of the objective, not a mesh-dependent proxy for it.
@@ -4583,7 +4648,8 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
             m = _arclength_monitor_jax(bf, sg_j, meas_j, wsum_j, cells_j2, n_local, dim)
             disp = _monge_ampere_displacement(m, ops, cells, dim, n_relax=spec.ma_relax, dt=spec.ma_dt)
-            return disp, _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+            obj = _ritz(u, vals) if _ritz_terms is not None else _block_defect(u, pts, bounds)
+            return disp, obj, _block_energy(u, pts, bounds)
 
         # `max_iters` MOVES need `max_iters + 1` evaluations, so each history entry's ``objective`` is the
         # objective OF its own ``points`` rather than of the mesh one round earlier.
