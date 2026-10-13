@@ -2141,6 +2141,11 @@ class Constraint(Placeholder):
     def __init__(self, expr: Placeholder, bound: float = 0.0, sense: str = "le"):
         if sense not in ("le", "ge"):
             raise ValueError(f"Constraint: sense must be 'le' or 'ge', got {sense!r}.")
+        from .views import _VIEW_TYPES
+
+        # a typed view (u.scalar, or an expression of frozen fields that stays a view) is its Placeholder here,
+        # as in jno.np.* and jno.core.eval: the evaluator has no handler for the view wrapper
+        expr = expr._expr if isinstance(expr, _VIEW_TYPES) else expr
         self.expr = expr
         self.bound = bound
         self.sense = sense
@@ -4958,7 +4963,11 @@ class FrozenField(Placeholder):
         # VALUES FROM THE TRACE: `u.bind(...).freeze(fem.solve())` -- the solution of a form, known to any
         # expression read after the solve (and differentiable through it). A solve of a form with several
         # fields is sliced to this field's block. Read today by `expr.integrate(domain)`.
-        _node = values._expr if (not isinstance(values, Placeholder) and isinstance(getattr(values, "_expr", None), Placeholder)) else values
+        _node = (
+            values._expr
+            if (not isinstance(values, Placeholder) and isinstance(getattr(values, "_expr", None), Placeholder))
+            else values
+        )
         self.values_node, self.values_block = None, None
         if isinstance(_node, Placeholder):
             self.values_node = _node
