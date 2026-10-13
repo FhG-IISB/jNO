@@ -324,22 +324,31 @@ def assemble_fem_nonnodal(
         return tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
 
     _field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
-    # A P0 ("cell") field parameter has no gather on this path: `_field_param_names` is used below as
-    # if every field parameter were P1 VERTEX data (`_fv[name][cells_j[c]]`, interpolated with
-    # `p1_shape_vals`). Handing it a per-cell array reads the values at vertex ids -- wrong numbers,
-    # out-of-range indices clamped by JAX, and no error. Refuse it, and name what does work here.
+    # Field parameters come in two kinds, gathered differently (as in `fem_native`): a P1 ("node") field is
+    # this cell's VERTEX values, interpolated to the quad points with `p1_shape_vals`; a P0 ("cell") field is
+    # ONE value per element -- the design density of topology optimisation -- gathered by cell index and
+    # broadcast over the quad points (width 1 -> the evaluator's scalar branch). Gathering a P0 array at
+    # vertex ids would read the wrong cells' values and JAX would clamp the out-of-range ids silently.
     from .parametric_helpers import _fem_field_kind
 
-    _cell_param_names = sorted(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "cell")
-    if _cell_param_names:
-        raise NotImplementedError(
-            f"jno.fem (non-nodal): the P0 (per-cell) field parameter(s) {_cell_param_names} are not "
-            "wired on this assembler -- only nodal P1 field parameters are, and a per-cell array would "
-            "be gathered at VERTEX indices and silently give the wrong coefficient. For a per-region "
-            'material use d._by_region({"steel": 16.0, ...}) (or d.attach), which is one value per cell '
-            "and is threaded through the per-cell region masks; for a smooth field, use a P1 "
-            "(Lagrange) parameter."
-        )
+    _cell_param_names = frozenset(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "cell")
+
+    def _param_zeros(name, dtype=jnp.float64):
+        """placeholder for a field parameter absent from `args`: one zero per cell (P0) or per vertex (P1)"""
+        return jnp.zeros((n_cells if name in _cell_param_names else n_verts,), dtype)
+
+    def _field_array(name, value, dtype):
+        """a field parameter's global array, its length checked against its kind (static under jit)"""
+        arr = jnp.reshape(jnp.asarray(value, dtype=dtype), (-1,))
+        want = n_cells if name in _cell_param_names else n_verts
+        if arr.shape[0] != want:
+            kind = "P0: one value per cell" if name in _cell_param_names else "P1: one value per mesh vertex"
+            raise ValueError(f"jno.fem: the field parameter {name!r} got {arr.shape[0]} values; it needs {want} ({kind}).")
+        return arr
+
+    def _gather_param(name, vals, c):
+        """cell c's slice of a field parameter: P0 -> its single value, P1 -> its vertex values"""
+        return jnp.reshape(vals[c], (1,)) if name in _cell_param_names else vals[cells_j[c]]
 
     # Neural coefficients (``jno.nn.wrap(net)`` in the weak form) on a non-nodal element: like the native
     # path, the network is re-evaluated at the quad points and its weights ride the runtime ``args`` as a
@@ -952,7 +961,7 @@ def assemble_fem_nonnodal(
         for key, (_dofs, phiB) in g["across"].items():
             dctx[key] = jnp.einsum("qj,qjv->qv", lbs[key], phiB[f])
         vol_vars = tuple(
-            (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
+            (_gather_param(name, field_vals[name], c) if name in _field_param_names else rt_scalar[name])
             for name in runtime_parameter_tags
         )
         local = {
@@ -1037,13 +1046,14 @@ def assemble_fem_nonnodal(
             # (gathered at `cells_j[c]`), which the evaluator interpolates with the P1 `shape_vals` supplied in
             # `local`. A parameter absent from `args` packs a zero placeholder (right width per kind).
             _a = args or {}
-            _zero_field = jnp.zeros((n_verts,), dtype=u_flat.dtype)
             rt_scalar = {
                 name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=u_flat.dtype), (-1,))[:1]
                 for name in runtime_parameter_tags
                 if name not in _field_param_names
             }
-            field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=u_flat.dtype) for name in _field_param_names}
+            field_vals = {
+                name: _field_array(name, _a.get(name, _param_zeros(name)), u_flat.dtype) for name in _field_param_names
+            }
             R = jnp.zeros(total, dtype=jnp.result_type(u_flat.dtype, np.complex64) if _cx_form else u_flat.dtype)
             _nt = neural_local_table(_neural, args)  # once per call, not per (term × cell) inside `_cell`
             # Scatter trainable coordinates once per residual evaluation, not per (term x cell).
@@ -1056,7 +1066,7 @@ def assemble_fem_nonnodal(
                     per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
                     _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _p is None else _p)[cells_j[c]])
                     vol_vars = tuple(
-                        (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
+                        (_gather_param(name, _fv[name], c) if name in _field_param_names else _sc[name])
                         for name in runtime_parameter_tags
                     )
                     local = {
@@ -1351,7 +1361,6 @@ def assemble_fem_nonnodal(
 
         _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
         _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
-        _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
         _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # u=0: the LINEAR default
         # TERMS SHARING A TEST FIELD are one GROUP: their element blocks have identical (row, col)
         # layout, so they are summed at the element level and emit ONE pattern block -- the old
@@ -1460,7 +1469,7 @@ def assemble_fem_nonnodal(
                 if name not in _field_param_names
             }
             field_vals = {
-                name: jnp.asarray(_a.get(name, _asm_zero_field), dtype=zeros.dtype) for name in _field_param_names
+                name: _field_array(name, _a.get(name, _param_zeros(name)), zeros.dtype) for name in _field_param_names
             }
             _nt = neural_local_table(_neural, args)
             _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
@@ -1471,7 +1480,7 @@ def assemble_fem_nonnodal(
                 per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
                 _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _pts_dyn is None else _pts_dyn)[cells_j[c]])
                 vol_vars = tuple(
-                    (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
+                    (_gather_param(name, field_vals[name], c) if name in _field_param_names else rt_scalar[name])
                     for name in runtime_parameter_tags
                 )
                 local = {
@@ -1746,7 +1755,7 @@ def assemble_fem_nonnodal(
             else:
                 # re-form A_aug/forcing from the runtime args each step; the θ=½ stepper differentiates through
                 # its own scan (no stepper change), exactly like the native second-order parametric path.
-                _ph = {nm: (jnp.zeros((n_verts,)) if nm in _field_param_names else 0.0) for nm in runtime_parameter_tags}
+                _ph = {nm: (_param_zeros(nm) if nm in _field_param_names else 0.0) for nm in runtime_parameter_tags}
                 _ph.update({nm: _neural_models[nm].module for nm in neural_param_names})
                 c_dir = jnp.zeros((2 * n,), zeros.dtype) if dd is None else jnp.zeros((2 * n,), zeros.dtype).at[dd].set(dg)
                 block = SemidiscreteTimeBlock(
@@ -1994,9 +2003,9 @@ def assemble_fem_nonnodal(
                 A, b = _apply_dirichlet_symmetric(A, jnp.asarray(b), pins)
             return A, b
 
-        # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_verts,),
+        # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_cells,) or (n_verts,),
         # a neural coefficient rides its stored module)
-        _ph = {n: (jnp.zeros((n_verts,)) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
+        _ph = {n: (_param_zeros(n) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
         _ph.update({n: _neural_models[n].module for n in neural_param_names})
         # a coordinate parameter's placeholder is the CURRENT node positions, not zeros: `.A` / `.b`
         # must describe the mesh as it stands, and zeros would collapse those vertices onto the origin.
