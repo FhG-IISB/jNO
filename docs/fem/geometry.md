@@ -695,6 +695,22 @@ inheriting the centroid classification.
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
 
+### `domain.mask` — a field's values on one region
+
+`d.mask(name)` is a boolean mask over the mesh nodes: every node of the region's cells, read
+from the mesh's own cell labels. Use it to evaluate a solution on one part:
+
+```python
+T = fem.solve()
+core = d.mask("core")
+T[core].mean(), T[core].max()
+```
+
+A node on an interface belongs to both regions, and on a curved mesh the mid-side nodes are included.
+It works for the parts of a `jno.shape` plan and for the named volumes of a loaded mesh, and raises
+`KeyError` listing the mesh's regions for any other name. Boundary tags go through
+`domain.tag_node_mask` instead.
+
 ---
 
 ## Axisymmetric (bodies of revolution)
