@@ -34,7 +34,7 @@ def _stats(plan):
 
 
 def test_release_frees_the_extra_slots_and_they_still_work():
-    from test_solve_cudss_ldl import _form
+    from tests.test_solve_cudss_ldl import _form
 
     fem, nc = _form()
     lu = jno.solve.lu(backend="cudss")
@@ -55,7 +55,7 @@ def test_release_frees_the_extra_slots_and_they_still_work():
 
 def test_core_releases_between_programs():
     """jno.core.eval runs one program per expression and frees the extra slots after each"""
-    from test_solve_cudss_ldl import _form
+    from tests.test_solve_cudss_ldl import _form
 
     fem, nc = _form()
     A, k = fem._probe["A"], fem._probe["k"]
