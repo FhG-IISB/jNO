@@ -4160,6 +4160,8 @@ class FemLinearSystem:
         if values is None:
             node = FunctionCall(_solve, params, name="fem_solve")
             node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            if periodic is None:  # a shared factorisation needs the operator as assembled (trace_evaluator)
+                node._solve_fls, node._solve_recombine, node._solve_fn = self, None, solve_fn
             return node
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at

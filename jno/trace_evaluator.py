@@ -534,12 +534,12 @@ class TraceEvaluator:
         # form in an MMA gradient: out of device memory). Scoped to the outermost call, like the caches above.
         outer = not getattr(self, "_in_evaluate", False)
         if outer:
-            self._in_evaluate, self._per_eval_memo = True, {}
+            self._in_evaluate, self._per_eval_memo, self._per_eval_roots = True, {}, [expr]
         try:
             return self._dispatch(expr, ctx)
         finally:
             if outer:
-                self._in_evaluate, self._per_eval_memo = False, {}
+                self._in_evaluate, self._per_eval_memo, self._per_eval_roots = False, {}, []
 
     # ------------------------------------------------------------------
     # Shape tracing — walk the expression tree and record output shapes
@@ -765,6 +765,11 @@ class TraceEvaluator:
                 hit = memo.get(id(expr))
                 if hit is not None and hit[0] is expr:
                     return hit[1]
+                if getattr(expr, "_solve_fls", None) is not None:
+                    from .utils.solver.shared_solve import solve_shared
+
+                    if solve_shared(self, expr, ctx, memo):  # solved with the solves that share its operator
+                        return memo[id(expr)][1]
                 out = self._dispatch_uncached(expr, ctx)
                 memo[id(expr)] = (expr, out)
                 return out

@@ -2431,6 +2431,7 @@ class FEM:
                 # ... and with its FEM, so orchestration (the tune `sequence` axis) can find the operator
                 # behind a constraint without a side channel. Lazy nodes only: a concrete array needs none.
                 result._fem_ref = self
+                result._linear_spec = linear  # the solver it was asked to use: forms share a factorisation only on one spec
             return result
 
         def _run_with_stats():
@@ -3063,6 +3064,8 @@ class FEM:
             _rc = _complex_recombine(self._complex_n)
             node = FunctionCall(lambda *v, _f=_node.fn: _rc(_f(*v)), _node.args, name="fem_complex_solve")
             node._per_evaluation = True
+            node._solve_fls, node._solve_recombine = self._op, _rc  # for a shared factorisation (trace_evaluator)
+            node._solve_fn = getattr(_node, "_solve_fn", None)
             return node
         if self._mode == "nonlinear" and self._periodic is not None:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
@@ -3198,6 +3201,26 @@ class FEM:
             if u0.shape[0] != u.shape[0]:
                 u0 = restrict_state_periodic(per, u0)
         record_nonlinear_verdict(res_at, u, u0, nonlinear, getattr(nonlinear, "name", None) or "newton")
+
+    def _operator_key(self):
+        """A structural key of this form's operator (load summands left out; cached), for sharing one
+        factorisation between forms that differ only in their load -- see `utils/solver/operator_key.py`.
+        ``None`` where the solve does not take the assembled operator as it is (a periodic reduction)."""
+        if getattr(self, "_op_key_cache", None) is not None:
+            return self._op_key_cache[0]
+        key = None
+        if self._mode == "linear" and (self._periodic_2n if self._complex_n is not None else self._periodic) is None:
+            from .utils.solver.operator_key import operator_key
+
+            try:
+                key = operator_key(
+                    self.domain, list(self._constraints or []),
+                    extra=(self._mode, self._complex_n, repr(sorted((self._fem_kwargs or {}).items()))),
+                )
+            except Exception:  # noqa: BLE001 -- a form the key cannot describe is simply never shared
+                key = None
+        self._op_key_cache = (key,)
+        return key
 
     def _linear_solver_context(self):
         """What a direct solver may know about the steady linear operator beyond its values (cached):

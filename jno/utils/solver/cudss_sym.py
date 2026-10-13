@@ -167,7 +167,10 @@ def _ffi_solve(p: Plan, token, rhs):
 
     sol = "jno_cudsz_solve" if p.complex else "jno_cudsd_solve"
     r2 = rhs.reshape(p.n, -1).T                             # (k, n): each right-hand side contiguous
-    x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype))(token, r2, slot=np.int64(p.slot))
+    # vmap over right-hand sides (a block of loads on one matrix: shared factorisations, jacrev): the solve runs
+    # once per batch entry on the SAME factors. The factorisation has no batching rule on purpose: a batch of
+    # matrices would refactor one slot over and over and every solve would see the last.
+    x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype), vmap_method="sequential")(token, r2, slot=np.int64(p.slot))
     return x.T.reshape(rhs.shape)
 
 

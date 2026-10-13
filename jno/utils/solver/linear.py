@@ -797,7 +797,8 @@ def cudss_ldl_solve(A, b, context=None):
         idx = np.asarray(A.indices)
     rows, cols, m = idx[:, 0], idx[:, 1], int(A.shape[0])
     trace = _current_trace(A.data)
-    b = jnp.asarray(b).reshape(-1)
+    b = jnp.asarray(b)
+    b = b if b.ndim == 2 else b.reshape(-1)  # (m,) or a block (m, k): k right-hand sides on one factorisation
     cn = ctx.get("complex_n")
     if cn is not None and m == 2 * int(cn):
         n = int(cn)
