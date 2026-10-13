@@ -320,6 +320,9 @@ def _param_context(volume_terms, boundary_terms):
         _collect_runtime_parameter_exprs(bare, exprs)
     tags: Tuple[str, ...] = tuple(sorted(exprs))
     fields = frozenset(n for n, e in exprs.items() if _is_fem_field_parameter(e))
+    from .parametric_helpers import refuse_space_field_parameters
+
+    refuse_space_field_parameters(exprs, "1-D")
     slots = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=tags)
     return tags, fields, slots, neural_operator_exprs(exprs, slots)
 

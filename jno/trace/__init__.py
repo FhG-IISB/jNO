@@ -4773,6 +4773,12 @@ class FrozenField(Placeholder):
     """A field whose DOFs are *pinned* to a known nodal vector ``values`` (e.g. a
     precomputed FE solution), produced by ``u.bind(...).freeze(values)``.
 
+    ``values`` holds one entry per DOF of the source's space: per node (times the value_shape) for
+    Lagrange, per cell for P0, and for N1E / N2E / RT one per DOF (edge circulations, face fluxes: the basis
+    carries the vector). On a non-nodal form a frozen field of ANY of these spaces is a coefficient,
+    evaluated with its space's own basis and Piola map (value and gradient), whether or not the space is
+    among the solved unknowns.
+
     It carries the source field's identity (``field_key`` / ``value_shape`` / ``order``
     / ``space``) so the kernel finds the right basis, and interpolates ``values`` at the
     quadrature points -- its value and its gradient ``.x`` / ``.y`` are therefore concrete
@@ -4798,7 +4804,10 @@ class FrozenField(Placeholder):
         _v = jnp.asarray(values)
         # scalar field: a flat global nodal vector (n_nodes,); VECTOR field: (n_nodes, vec) so the assembler
         # gathers each cell's per-node vec-vectors (the kernel interpolates either). value_shape is set above.
-        self.values = _v.reshape(-1) if self.num_components == 1 else _v.reshape(-1, self.num_components)
+        # An H(curl)/H(div) field (N1E, N2E, RT) carries ONE value per DOF (edge circulations, face fluxes):
+        # its vector value comes from the basis, not from per-node components, so it stays flat.
+        _per_dof = self.space.upper() in ("N1E", "N2E", "RT") or self.num_components == 1
+        self.values = _v.reshape(-1) if _per_dof else _v.reshape(-1, self.num_components)
         self.frozen_id = _next_op_id()  # kernel gather-table key
         # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
         # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
