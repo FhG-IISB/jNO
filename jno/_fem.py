@@ -5873,9 +5873,11 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     A_i_fn, b_i_fn = _parts(op_i)
     n = int(jnp.shape(b_r_fn(None))[0])
     rpe: dict = {}
+    shapes: dict = {}  # runtime inputs without a parameter model (coordinates, coupled solutions): their shapes
     for leg in (op_r, op_i):
         if isinstance(leg, _FLS):
             rpe.update(getattr(leg, "runtime_parameter_exprs", None) or {})
+            shapes.update((getattr(leg, "metadata", None) or {}).get("runtime_value_shapes") or {})
 
     blk = lambda a: _complex_block_bcoo(A_r_fn(a), A_i_fn(a), n)  # noqa: E731
     rhs = lambda a: jnp.concatenate([b_r_fn(a), b_i_fn(a)])  # noqa: E731
@@ -5886,7 +5888,7 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
             operator_fn=blk,
             rhs_fn=rhs,
             runtime_parameter_exprs=rpe,
-            metadata={"complex": True},
+            metadata={"complex": True, **({"runtime_value_shapes": shapes} if shapes else {})},
         )
     else:
         fused = (blk(None), rhs(None))

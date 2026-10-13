@@ -98,3 +98,35 @@ def test_an_eager_solve_without_the_coupled_value_says_how():
     d, filt, eddy, energy, k, nc = _chain()
     with pytest.raises(ValueError, match="frozen to another form"):
         eddy.operator.evaluate({})
+
+
+def test_a_complex_form_takes_a_coupled_coefficient():
+    """a complex (eddy-current) form is fused into its real 2n block at build time, which evaluates the
+    operator once with no runtime values; the coupled field takes its default there, and the jno.core value
+    still equals the two explicit solves"""
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).sized(0.5).domain()
+    c = d.variable("interior", split=True)
+    x, y, z = c[0], c[1], c[2]
+    rf, q = d.fem_symbols(names=("rf", "q"))
+    _r0, s = d.fem_symbols(space="P0", names=("r0", "s0"))
+    k = jno.np.parameter(s, name="k")
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(0.8))
+    RF, Q = rf.bind(x=x, y=y, z=z), q.bind(x=x, y=y, z=z)
+    grad = lambda f: jno.np.grad(f, [x, y, z])  # noqa: E731
+    filt = jno.fem([0.1**2 * inner(grad(RF), grad(Q)) + RF * Q - k * Q])
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    A, V = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    curl = lambda f: f.vector.curl(x, y, z)  # noqa: E731
+    J = jno.np.vector(1.0 + 0.0 * x, y, 0.0 * x)
+    rho = rf.bind(x=x, y=y, z=z).freeze(filt.solve(linear=HOST))
+    eddy = jno.fem([inner(curl(u), curl(v)) + (0.2 + 2j * rho) * inner(A, V) - inner(J, V)])
+    energy = inner(A, A)
+    node = energy.integrate(eddy, solver=HOST)
+    F = jno.fn(lambda i: jnp.real(i), [node], name="F")
+    got = float(np.asarray(jno.core([F], domain=jno.domain.from_array({"_": np.zeros((1, 1))})).eval([F])).reshape(-1)[0])
+    nc = len(d.mesh.cells_dict["tetra"])
+    name = next(n for n in eddy.operator.runtime_parameter_exprs if n.startswith("frozen_solution_"))
+    rfv = filt.solve(linear=HOST, k=jnp.full(nc, 0.8))
+    a = eddy.solve(linear=HOST, **{name: rfv})
+    np.testing.assert_allclose(got, float(jnp.real(eddy.eval(energy, a, args={name: rfv}))), rtol=1e-10)

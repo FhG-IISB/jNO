@@ -682,6 +682,14 @@ def assemble_fem_nonnodal(
         a_ = args or {}
         for f, n in _frozen_solved.items():
             nm = _solved_name[f]
+            if args is None:
+                # NO runtime values at all: the build-time default operator (its size, the static legs of a
+                # complex form) -- the same zeros an absent runtime parameter packs. A call that passes values
+                # but leaves this one out is still refused below.
+                v = jnp.zeros((_solved_len(f),), jnp.float64)
+                blk = n.values_block
+                out[("frozen", f)] = v if blk is None else v[blk[0] : blk[1]]
+                continue
             if nm not in a_:
                 raise ValueError(
                     f"jno.fem: this form reads {n.name}, frozen to another form's solve, whose solution was not "
@@ -1175,7 +1183,7 @@ def assemble_fem_nonnodal(
             # The steady linear operator is built FROM this residual (jacfwd -> A, -residual(0) -> b),
             # so without this the shape derivative is lost before `assemble` is ever reached.
             _pts_r = _apply_coord_params(pts, _a)
-            _fz = _frozen_vals_at(_a)
+            _fz = _frozen_vals_at(args)
             for coeff, tfi, rnames in typed:
 
                 def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r, _fz=_fz):
@@ -1591,7 +1599,7 @@ def assemble_fem_nonnodal(
             }
             _nt = neural_local_table(_neural, args)
             _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
-            _fz_a = _frozen_vals_at(_a)
+            _fz_a = _frozen_vals_at(args)
 
             def _elem_res(c, la, coeff, tfi, rnames):
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
@@ -2111,7 +2119,7 @@ def assemble_fem_nonnodal(
             }
             _nt = neural_local_table(_neural, args)
             _p = _apply_coord_params(pts, _a)
-            _fv_call = {**_frozen_vals_at(_a), **{k_: v_ for k_, v_ in f_vals.items() if k_ not in _coef_frozen_vals}}
+            _fv_call = {**_frozen_vals_at(args), **{k_: v_ for k_, v_ in f_vals.items() if k_ not in _coef_frozen_vals}}
             out = 0.0  # promotes to the integrand's dtype (a complex coefficient on a real solution stays complex)
             for expr, rnames in typed:
 
