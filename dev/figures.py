@@ -18,9 +18,10 @@ LAUNCH_S = 4e-6  # per-launch floor used for the launch-bound estimate (hollow m
 PEAK = {"fp64_flop_s": 46 * 2 * 2 * 1.725e9, "dram_B_s": 448e9}
 
 
-def bounds_from_kernels(run_dir, peak=PEAK):
-    """{stage: (kernel_bound_ms, None, n_profiled_launches)} from the ncu passes of a run: the roof at each kernel's
-    MEASURED intensity, summed over the profiled launches (the ladder scales to one call by the launch count)."""
+def bounds_from_kernels(run_dir, res=None, peak=PEAK):
+    """{stage: (kernel_bound_ms, None, n_profiled_launches, fp64_flop_per_call)} from the ncu passes of a run: the
+    roof at each kernel's MEASURED intensity. ncu may have profiled only some kernel kinds and several calls; with
+    `res` the bound is scaled to one call by the trace's time share of the profiled kinds, else by launch count."""
     import glob
     import json
 
@@ -31,8 +32,20 @@ def bounds_from_kernels(run_dir, peak=PEAK):
         recs = [r for r in d["kernels"] if "fp64_flop" in r and "dram_B" in r]
         if not recs:
             continue
-        t = sum(max(r["fp64_flop"] / peak["fp64_flop_s"], r["dram_B"] / peak["dram_B_s"]) for r in recs)
-        out[d["stage"]] = (t * 1e3, None, len(recs))
+        t = sum(max(r["fp64_flop"] / peak["fp64_flop_s"], r["dram_B"] / peak["dram_B_s"]) for r in recs) * 1e3
+        flops = sum(r["fp64_flop"] for r in recs)
+        scale = None
+        if res is not None:
+            kinds = {r["kernel"].split("(")[0] for r in recs}
+            ks = [k for k in res.kernels if k.stage == d["stage"]]
+            t_stage = sum(k.duration_ns * k.count for k in ks)
+            t_prof = sum(k.duration_ns * k.count for k in ks if k.name in kinds or k.hlo_op.replace(".", "_") in kinds)
+            t_ncu = sum(r.get("time_ns", 0) for r in recs)
+            if t_prof > 0 and t_ncu > 0:
+                scale = (t_stage / t_prof) * (t_prof / t_ncu)  # calls profiled -> one call, then the unprofiled kinds
+        if scale is None:
+            scale = 1.0
+        out[d["stage"]] = (t * scale, None, len(recs), flops * scale, scale)
     return out
 
 
@@ -59,8 +72,6 @@ def ladder(res, bounds=None, ax=None, verdict=None):
         floor = a["launches"] * LAUNCH_S * 1e3
         b = (bounds or {}).get(s, (None, None))
         kb, ib = b[0], b[1]
-        if kb and len(b) > 2 and b[2] and a["launches"]:
-            kb *= a["launches"] / b[2]
         lo = min(lo, floor, *(v for v in (kb, ib) if v))
         if ib:
             ax.plot([ib, kb or m], [yi, yi], color=hs.MUTED, lw=0.8, ls=(0, (2, 2)), zorder=1)
@@ -340,13 +351,14 @@ def bind_strip(run_dir, ax=None, top: int = 12):
 def all_figures(res, out_dir, bounds=None):
     hs.apply("paper")
     if bounds is None:
-        kb = bounds_from_kernels(out_dir)
-        ib = res.intrinsic_bounds()
-        bounds = {
-            s: (kb.get(s, (None, None, None))[0], ib.get(s), kb.get(s, (None, None, None))[2]) for s in set(kb) | set(ib)
-        } or None
+        kb = bounds_from_kernels(out_dir, res)
+        ib = res.intrinsic_bounds(measured_flops={s: v[3] for s, v in kb.items()})
+        bounds = {s: (kb.get(s, (None,))[0], ib.get(s), None) for s in set(kb) | set(ib)} or None
     for name, f in (
-        ("headroom_ladder", lambda: ladder(res, bounds, verdict=res.verdicts(bounds_from_kernels(out_dir)))),
+        (
+            "headroom_ladder",
+            lambda: ladder(res, bounds, verdict=res.verdicts(kb, measured_flops={s: v[3] for s, v in kb.items()})),
+        ),
         ("icicle", lambda: icicle(res)),
         ("launch_spectrum", lambda: spectrum(res)),
         ("bind_strip", lambda: bind_strip(out_dir)),

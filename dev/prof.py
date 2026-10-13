@@ -103,7 +103,7 @@ class Result:
     trace_dir: str | None = None
 
     # ── bounds ────────────────────────────────────────────────────────────────────────────────────────
-    def intrinsic_bounds(self, peak=None):
+    def intrinsic_bounds(self, peak=None, measured_flops=None):
         """{stage: ms} the minimal work of each stage at the card's peak, from `meta["sizes"]` and the backend records.
         assemble: read the mesh and write the triplets once, the adjoint reads them and writes a gradient (x2);
         factor: sum_j nnz(L_j)^2 flops approximated as nnz(L)^2 / n (a lower bound for a balanced profile), at
@@ -123,16 +123,23 @@ class Result:
             mesh_B = cells * 4 * 4 + (nodes or cells // 5) * 3 * 8  # connectivity (int32) + coordinates
             trip_B = nnz * (w + 8)  # value + packed index
             out["jno/assemble"] = 2 * (mesh_B + trip_B) / pk["dram_B_s"] * 1e3
+        # the quadrature's own flops are not known a priori: where ncu measured them, the floor is at least those
+        # flops at peak (the measured count, so an algorithm doing fewer flops can still beat it)
+        self._flop_floor = {}
+        for s, f in (measured_flops or {}).items():
+            if f and f / pk["fp64_flop_s"] * 1e3 > out.get(s, 0.0):
+                out[s] = f / pk["fp64_flop_s"] * 1e3
+                self._flop_floor[s] = f
         lu = next((b.get("lu_nnz") for b in self.backend_stats if b.get("lu_nnz")), None)
         if lu and n:
             out["jno/factor"] = (lu**2 / n) / pk["fp64_flop_s"] * (4 if sz.get("complex") else 1) * 1e3
             out["jno/solve"] = 2 * 2 * nrhs * lu * w / pk["dram_B_s"] * 1e3
         return out
 
-    def verdicts(self, kernel_bounds=None, launch_s: float = 4e-6):
+    def verdicts(self, kernel_bounds=None, launch_s: float = 4e-6, measured_flops=None):
         """One line per stage from the rungs: where the time can go and what would recover it.
         `kernel_bounds`: {stage: (kernel_bound_ms, _, n_profiled_launches)} as `figures.bounds_from_kernels` gives."""
-        ib = self.intrinsic_bounds()
+        ib = self.intrinsic_bounds(measured_flops=measured_flops)
         out = {}
         total = sum(a["forward_ms"] + a["adjoint_ms"] for a in self.by_stage().values())
         for s, a in self.by_stage().items():
@@ -141,16 +148,17 @@ class Result:
             if total > 0 and m < 0.02 * total:
                 out[s] = f"negligible ({100 * m / total:.1f} % of the device time)"
                 continue
-            kb = None
-            if kernel_bounds and s in kernel_bounds and kernel_bounds[s][0]:
-                kb = kernel_bounds[s][0]
-                if len(kernel_bounds[s]) > 2 and kernel_bounds[s][2]:
-                    kb *= a["launches"] / kernel_bounds[s][2]
+            kb = kernel_bounds[s][0] if kernel_bounds and s in kernel_bounds and kernel_bounds[s][0] else None
             i = ib.get(s)
             if m <= 0:
                 out[s] = "-"
             elif floor > 0.5 * m:
                 out[s] = f"launch-bound ({a['launches']:,} launches): fuse or batch, not a kernel"
+            elif kb and m / kb < 1.5 and s in getattr(self, "_flop_floor", {}):
+                out[s] = (
+                    f"kernels at the FP64 roof; the floor is the MEASURED {self._flop_floor[s] / 1e9:.1f} GFLOP per call, "
+                    "not a minimum: only fewer flops help (single precision where it is enough, less work per element)"
+                )
             elif kb and m / kb < 1.5 and (not i or kb / i < 3):
                 out[s] = "at the roof: leave it"
             elif kb and m / kb < 1.5 and i:
@@ -207,7 +215,13 @@ class Result:
                 f"({small:,} under 20 us); memcpy {sum(m.bytes * m.count for m in self.memcpys) / 1e6:.1f} MB in "
                 f"{sum(m.count for m in self.memcpys)} copies"
             )
-            ib = self.intrinsic_bounds()
+            try:
+                from dev.figures import bounds_from_kernels as _bfk
+
+                _mf = {s: v[3] for s, v in _bfk(os.path.join(RUNS, self.label), self).items()}
+            except Exception:  # noqa: BLE001
+                _mf = {}
+            ib = self.intrinsic_bounds(measured_flops=_mf)
             lines.append(
                 f"  {'stage':28s} {'fwd ms':>8s} {'adj ms':>8s} {'launches':>9s} {'memcpy':>14s} {'x intrinsic':>11s}  top kernel"
             )
@@ -223,11 +237,12 @@ class Result:
             try:
                 from dev.figures import bounds_from_kernels
 
-                kb = bounds_from_kernels(os.path.join(RUNS, self.label))
+                kb = bounds_from_kernels(os.path.join(RUNS, self.label), self)
             except Exception:  # noqa: BLE001
                 kb = {}
+            mf = {s: v[3] for s, v in kb.items()}
             lines.append("  verdicts:")
-            for s, v in self.verdicts(kb).items():
+            for s, v in self.verdicts(kb, measured_flops=mf).items():
                 lines.append(f"    {s:24s} {v}")
             h2d = [m for m in self.memcpys if m.kind != "D2D"]
             if h2d:
