@@ -114,6 +114,22 @@ extern "C" void jno_cudsd_free(int64_t slot) {
   }
 }
 
+// Host-side release of a slot's FACTORS: the cuDSS data (analysis, factors, workspace) is destroyed and
+// recreated empty, the sparsity and the device value buffers stay, and the slot is marked unfactored, so its
+// next factor call runs the analysis again. The slot id stays valid (compiled programs refer to it). Called
+// between programs, never while one runs: the device is synchronised first. 0 on success.
+extern "C" int jno_cudsd_release(int64_t slot) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  Slot *s = find(slot);
+  if (!s || !s->factored) return 0;
+  cudaDeviceSynchronize();
+  cudssStatus_t st = cudssDataDestroy(s->h, s->data);
+  s->data = nullptr;
+  if (st == CUDSS_STATUS_SUCCESS) st = cudssDataCreate(s->h, &s->data);
+  s->factored = false;
+  return st == CUDSS_STATUS_SUCCESS ? 0 : 1000 + (int)st;
+}
+
 // Host query after a factorisation: out[0] = nnz of the factors, out[1] = perturbed pivots,
 // out[2] = permanent device bytes, out[3] = peak device bytes (cuDSS's own estimates). 0 on success.
 extern "C" int jno_cudsd_stats(int64_t slot, int64_t *out) {
