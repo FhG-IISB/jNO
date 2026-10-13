@@ -671,6 +671,23 @@ per-region values compose for free, calibrated through `crux`. Each target must 
 (`from_regions`), a `domain.tag`, or a mesh-file region. It desugars to `sum_r RegionMask(r)·value_r`,
 inheriting the centroid classification.
 
+**Changing a value after `jno.fem` is built.** `d.<name>` reads plain values (numbers, arrays) from the
+domain when the terms are assembled, so a later `attach` reaches an existing `fem`: its next `solve()`
+re-assembles and says so in the log (`jno.fem: re-assembled, since domain.attach changed 'q' ...`). The
+mesh, and anything built on it such as an enclosure's view factors, is not rebuilt.
+
+```python
+fem = jno.fem([d.k * (ui.x*vi.x + ui.y*vi.y) - d.Q * vi, u(xb, yb) - 0.0])
+T1 = fem.solve()
+d.attach("core", Q=2.0e6)                             # a plain number: watched
+T2 = fem.solve()                                      # re-assembled with the new Q
+```
+
+A value that is itself an expression (a function of position, a `jno.fn`, a trainable parameter) is
+captured when the term is written, so re-attaching one raises at the next solve; build a new `jno.fem`
+after such a change. `d.attached(name)` returns the values as a plain mapping at the moment it is called
+and is not watched.
+
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
 

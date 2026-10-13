@@ -1476,6 +1476,27 @@ class Literal(Placeholder):
         return f"Literal({self.value})"
 
 
+class AttachedLiteral(Literal):
+    """A region's attached value inside ``d.<prop>``, read from the domain each time it is lowered.
+
+    ``domain.attach`` can change the value after the term is written; reading it here rather than
+    copying it is what lets a built ``jno.fem`` re-assemble with the new value (the fem watches the
+    property's version, see ``FEM._refresh_attachments``). Only values that resolve to a plain number or
+    array are carried this way. It prints as the ``Literal`` it stands for.
+    """
+
+    def __init__(self, domain, prop: str, target: str):
+        self._domain, self.prop, self.target = domain, prop, target
+
+    @property
+    def value(self):
+        raw = self._domain.__dict__["_region_attachments"][self.prop][self.target]
+        return jnp.asarray(self._domain._resolve_attached(raw))
+
+    def __repr__(self):
+        return f"Literal({self.value})"
+
+
 class FunctionCall(Placeholder):
     """Call to a pure function over traced args."""
 

@@ -10,6 +10,7 @@ import meshio
 import numpy as np
 
 from ..trace import (
+    AttachedLiteral,
     RegionMask,
     TagMask,
     TensorTag,
@@ -218,6 +219,18 @@ def _scalar_float(value: Any) -> float:
     return float(arr.item())
 
 
+def _is_plain_value(v) -> bool:
+    """A concrete number or array -- what an AttachedLiteral can re-read -- as opposed to an expression,
+    a trainable parameter or a traced value, which are captured as written."""
+    import jax
+
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float, complex, np.number, np.ndarray)):
+        return True
+    return isinstance(v, jax.Array) and not isinstance(v, jax.core.Tracer)
+
+
 def _masked_sum(values, mask_cls, default, *, what: str, key: str):
     """``sum_k mask_cls(k) * values[k]`` — the one desugaring behind ``_by_region`` and ``_by_tag``.
 
@@ -252,7 +265,7 @@ def _masked_sum(values, mask_cls, default, *, what: str, key: str):
         expr = term if expr is None else expr + term
     if expr is None:
         raise ValueError(f"domain.{what}: the {{{key}: value}} mapping is empty.")
-    if default is not None and default != 0:
+    if default is not None and (isinstance(default, AttachedLiteral) or default != 0):
         covered = None
         for k in values:
             m = mask_cls(str(k))
@@ -2485,8 +2498,10 @@ class domain(MeshIOMixin):
         else:
             key = str(target)
             kinds[key] = self._attachment_target_kind(key)
+        versions = self.__dict__.setdefault("_attach_versions", {})
         for prop, value in props.items():
             attached.setdefault(str(prop), {})[key] = value
+            versions[str(prop)] = versions.get(str(prop), 0) + 1  # a built jno.fem watches this
         self._check_attachment_clashes()
         return self
 
@@ -2584,6 +2599,20 @@ class domain(MeshIOMixin):
                     f"names, or split the tag."
                 )
             resolved = {t: self._resolve_attached(v) for t, v in values.items()}
+            # Plain numbers are emitted as AttachedLiteral leaves, read from the domain whenever the term
+            # is lowered, so a built `jno.fem` re-assembles with a value attached after it was written.
+            # An expression value is captured as written; the expression is marked (`_attached_snapshot`)
+            # so the fem can refuse to solve with it once the property is re-attached.
+            live = {t: AttachedLiteral(self, name, t) if _is_plain_value(v) else v for t, v in resolved.items()}
+            snapshot = not all(_is_plain_value(v) for v in resolved.values())
+            if has_default:
+                snapshot = snapshot or not _is_plain_value(self._resolve_attached(default))
+
+            def mark(e):
+                if snapshot:
+                    e._attached_snapshot = (self, name)
+                return e
+
             if declared == {"surface"}:
                 # No completeness rule on the boundary: tags are not a partition of it, and untagged
                 # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
@@ -2596,7 +2625,7 @@ class domain(MeshIOMixin):
                         f"partition of the boundary -- untagged boundary is natural (do-nothing) -- "
                         f"so a surface default has no meaning. Attach it to each tag instead."
                     )
-                return self._by_tag(resolved)
+                return mark(self._by_tag(live))
             known = set(self.__dict__.get("_shape_regions") or {})
             missing = sorted(known - set(values))
             if missing and not has_default:
@@ -2607,7 +2636,10 @@ class domain(MeshIOMixin):
                 )
             # The explicit targets already won: `default` only fills what they left, so the two
             # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
-            return self._by_region(resolved, default=self._resolve_attached(default) if has_default else None)
+            if has_default:
+                dv = self._resolve_attached(default)
+                default_live = AttachedLiteral(self, name, self._DEFAULT_TARGET) if _is_plain_value(dv) else dv
+            return mark(self._by_region(live, default=default_live if has_default else None))
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def attached(self, name: str) -> dict:

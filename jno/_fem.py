@@ -386,6 +386,27 @@ def _walk(node: Any):
             stack.append(child)
 
 
+def _attach_watch(constraints) -> list:
+    """``[(domain, prop, version, live)]``: the attached properties these terms read through ``d.<prop>``,
+    with the version each had when the terms were assembled. ``live`` is False for a property whose
+    value is an expression the terms captured (``d.<prop>`` marks it with ``_attached_snapshot``)."""
+    from .trace import AttachedLiteral
+
+    found: dict = {}
+    for c in constraints if isinstance(constraints, (list, tuple)) else [constraints]:
+        for n in _walk(getattr(c, "_expr", c)):
+            snap = getattr(n, "_attached_snapshot", None)
+            if isinstance(n, AttachedLiteral):
+                key = (id(n._domain), n.prop)
+                found[key] = (n._domain, found.get(key, (None, True))[1])
+            if snap is not None:
+                found[(id(snap[0]), snap[1])] = (snap[0], False)
+    return [
+        (dom, prop, (dom.__dict__.get("_attach_versions") or {}).get(prop, 0), live)
+        for (_i, prop), (dom, live) in found.items()
+    ]
+
+
 def _spatial_coord_vars(constraint: Any) -> List[Variable]:
     """Spatial coordinate Variables relevant to a constraint.
 
@@ -1932,6 +1953,7 @@ class FEM:
         fem.operator`` keeps unpacking cleanly and silently binds ``op_i`` to the LOAD VECTOR. It
         does not raise; it just means something else. That is what broke ``jno.rcwa`` and made a
         test report a missing imaginary part that was there all along."""
+        self._refresh_attachments()
         return self._op
 
     @property
@@ -2122,6 +2144,7 @@ class FEM:
 
     def solve(self, *args, **kwargs):
         """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature."""
+        self._refresh_attachments()
         import time as _time
 
         from .utils.logger import get_logger
@@ -3383,6 +3406,7 @@ class FEM:
             lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())
             lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)   # the 4 modes nearest λ = 60
         """
+        self._refresh_attachments()
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
         _reject_source_terms(self, "FEM.eigs")
@@ -3503,6 +3527,33 @@ class FEM:
         """The shapely geometry of :attr:`region`, or ``None`` — used by ``jno.core([...])`` coupling."""
         return self._dd_region()[1]
 
+    def _refresh_attachments(self):
+        """Re-assemble if a property these terms read was re-attached since the last assembly.
+
+        ``d.<prop>`` reads plain values from the domain when the terms are lowered, so rebuilding from the
+        stored terms picks up the new value; the mesh and anything built on it (an enclosure's view
+        factors) are not touched. A property whose value is an expression was captured when the term was
+        written and cannot be re-read: that refuses instead of solving with the old value."""
+        watch = self.__dict__.get("_attach_watch")
+        if not watch:
+            return
+        changed = [(p, live) for dom, p, v, live in watch if (dom.__dict__.get("_attach_versions") or {}).get(p, 0) != v]
+        if not changed:
+            return
+        frozen = sorted({p for p, live in changed if not live})
+        if frozen:
+            raise ValueError(
+                f"jno.fem: {frozen[0]!r} was re-attached after this fem was built, but its value is an "
+                f"expression, which the terms captured when they were written, so the new value cannot reach "
+                f"this fem. Build a new one after the attach: jno.fem([...])."
+            )
+        new = fem(self._constraints, **self.__dict__.get("_rebuild_kwargs", self._fem_kwargs))
+        self.__dict__.update(new.__dict__)
+        from .utils.logger import get_logger
+
+        names = ", ".join(repr(p) for p in sorted({p for p, _ in changed}))
+        get_logger().info(f"jno.fem: re-assembled, since domain.attach changed {names} after the last assembly.")
+
     def _as_whole_mesh(self):
         """Rebuild this region-tagged FEM with WHOLE-MESH assembly (no ``RegionMask``) while keeping its
         region label. A region-local matrix can't reconcile an overlapping-Schwarz band (its artificial
@@ -3558,6 +3609,7 @@ class FEM:
 
         The linear branch never densifies — ``A`` stays the assembled BCOO, so this is ``O(nnz)``.
         """
+        self._refresh_attachments()
         if self._mode == "linear":
 
             def _linear_residual(u, args=None):
@@ -3623,6 +3675,7 @@ class FEM:
         is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
         partition of unity.
         """
+        self._refresh_attachments()
         return self._eval_at(term, u, 0.0, args=args)
 
     def _eval_at(self, term, u, t_eval, *, args=None):
@@ -4157,6 +4210,7 @@ class FEM:
         """Jacobian callable for a custom solver, returning a dense ``(n_dofs, n_dofs)`` JAX
         array — ``jacobian(u)`` (steady nonlinear) or ``jacobian(u, t)`` (transient). Use
         ``fem.operator`` for the raw sparse (BCOO) form on large problems."""
+        self._refresh_attachments()
         if self._mode == "nonlinear":
             j = self._op.jacobian
             return lambda u: _as_dense(j(u))
@@ -6133,6 +6187,8 @@ def fem(
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )
+        out._attach_watch = _attach_watch(constraints)
+        out._rebuild_kwargs = {"quad_degree": quad_degree, "chunk": chunk, "_dd_overlap": _dd_overlap}
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
             # Refuse rather than ignore: the 1-D and non-nodal assemblers have their own element
             # loops and none of them chunk, so an explicit request there would quietly do nothing.
