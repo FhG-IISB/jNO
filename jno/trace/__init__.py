@@ -4743,6 +4743,7 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
                 t._complex_field_member = True
             self._test = t
         return t
+
     def across(self, main: str, *, domain):
         """The trace of this field on the tagged boundary face ``main``, as a symbol usable in a weak
         term integrated on ANOTHER face -- the non-local ingredient of a two-face (thin-layer) condition.
