@@ -1,6 +1,8 @@
 """Differentiable, GPU-resident symmetric direct solve: cuDSS LDL^T as XLA custom calls.
 
-``solve(plan, values, b)`` factors the symmetric matrix whose (COO) values are the device array ``values``
+``solve(plan, values, b)`` factors the symmetric matrix -- real symmetric indefinite, or complex SYMMETRIC
+(A^T = A, not Hermitian: an eddy-current operator nu curl curl + j w sigma) -- whose (COO) values are the device
+array ``values``
 and solves ``A x = b`` for one or several right-hand sides, all inside the compiled program: no host
 callback, so ``jax.jit(jax.value_and_grad(f))`` runs the assembly, the factorisation, the solves and the
 adjoint on the GPU. Reverse mode goes through :func:`jax.lax.custom_linear_solve` (A^T = A, so the adjoint
@@ -8,6 +10,8 @@ is the same solve with the cotangent as right-hand side, on the SAME factors); t
 is -lambda_i x_j on the pattern, plain JAX.
 
     plan = cudss_sym.plan(rows, cols, n)          # once: the sparsity (numpy, concrete), registers a slot
+    plan = cudss_sym.plan(rows, cols, n, complex_values=True)   # complex symmetric: half the unknowns of the
+                                                  # real-equivalent 2n block, ~half its factor flops and memory
     x = cudss_sym.solve(plan, values, b)          # under jit / grad; b (n,) or (n, k)
 
 Rules of the design:
@@ -76,11 +80,13 @@ def _load():
                 raise RuntimeError("nvcc failed:\n" + r.stderr[-3000:])
             tmp.replace(so)
         lib = ctypes.cdll.LoadLibrary(str(so))
-        lib.jno_cudsd_create.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p]
+        lib.jno_cudsd_create.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         lib.jno_cudsd_create.restype = ctypes.c_int
         lib.jno_cudsd_free.argtypes = [ctypes.c_int64]
-        jax.ffi.register_ffi_target("jno_cudsd_factor", jax.ffi.pycapsule(lib.jno_cudsd_factor), platform="CUDA")
-        jax.ffi.register_ffi_target("jno_cudsd_solve", jax.ffi.pycapsule(lib.jno_cudsd_solve), platform="CUDA")
+        lib.jno_cudsd_stats.argtypes = [ctypes.c_int64, ctypes.c_void_p]
+        lib.jno_cudsd_stats.restype = ctypes.c_int
+        for name in ("jno_cudsd_factor", "jno_cudsd_solve", "jno_cudsz_factor", "jno_cudsz_solve"):
+            jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, name)), platform="CUDA")
         _LIB = lib
     except RuntimeError:
         raise
@@ -96,7 +102,7 @@ def available() -> bool:
 class Plan:
     """The fixed sparsity of one symmetric matrix and the device slot that holds its factors."""
 
-    def __init__(self, rows, cols, n):
+    def __init__(self, rows, cols, n, complex_values=False):
         lib = _load()
         if lib is None:
             raise RuntimeError("jno: the cuDSS symmetric solve is not available (needs a GPU, nvcc and nvidia-cudss).")
@@ -112,12 +118,20 @@ class Plan:
         pos[up] = inv.astype(np.int32)
         ptr = np.searchsorted(uniq // self.n, np.arange(self.n + 1)).astype(np.int32)
         idx = (uniq % self.n).astype(np.int32)
+        self.complex = bool(complex_values)
         self.slot = next(_SLOTS)
-        st = lib.jno_cudsd_create(self.slot, self.n, self.nnz, ptr.ctypes.data, idx.ctypes.data)
+        st = lib.jno_cudsd_create(self.slot, self.n, self.nnz, ptr.ctypes.data, idx.ctypes.data, int(self.complex))
         if st != 0:
             raise RuntimeError(f"jno: cuDSS slot creation failed (status {st}).")
         self.pos = jnp.asarray(pos)
         self.indices = jnp.asarray(np.stack([rows, cols], 1).astype(np.int32))
+
+    def stats(self) -> dict:
+        """After a factorisation: nnz of the factors, perturbed pivots, cuDSS's device-memory estimates (bytes)."""
+        out = np.zeros(4, np.int64)
+        if _load().jno_cudsd_stats(self.slot, out.ctypes.data) != 0:
+            return {}
+        return {"lu_nnz": int(out[0]), "npivots": int(out[1]), "device_permanent": int(out[2]), "device_peak": int(out[3])}
 
     def __del__(self):
         try:
@@ -128,8 +142,8 @@ class Plan:
             pass
 
 
-def plan(rows, cols, n) -> Plan:
-    return Plan(rows, cols, n)
+def plan(rows, cols, n, complex_values=False) -> Plan:
+    return Plan(rows, cols, n, complex_values)
 
 
 def solve(p: Plan, values, b):
@@ -139,16 +153,22 @@ def solve(p: Plan, values, b):
     import jax.numpy as jnp
 
     n, slot = p.n, np.int64(p.slot)
-    vcsr = jnp.zeros(p.nnz + 1, values.dtype).at[p.pos].add(values)[: p.nnz]
+    dt = jnp.complex128 if p.complex else jnp.float64
+    fac, sol = ("jno_cudsz_factor", "jno_cudsz_solve") if p.complex else ("jno_cudsd_factor", "jno_cudsd_solve")
+    values = values.astype(dt)
+    b = b.astype(dt)
+    vcsr = jnp.zeros(p.nnz + 1, dt).at[p.pos].add(values)[: p.nnz]
     # the factorisation is not differentiated: the cotangent of `values` enters through the matvec below
-    token = jax.ffi.ffi_call("jno_cudsd_factor", jax.ShapeDtypeStruct((1,), jnp.int32))(
+    token = jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(
         jax.lax.stop_gradient(vcsr), slot=slot
     )
     A = jsp.BCOO((values, p.indices), shape=(n, n))
 
     def _solve(_matvec, rhs):
         r2 = rhs.reshape(n, -1).T                           # (k, n): each right-hand side contiguous
-        x = jax.ffi.ffi_call("jno_cudsd_solve", jax.ShapeDtypeStruct(r2.shape, r2.dtype))(token, r2, slot=slot)
+        x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype))(token, r2, slot=slot)
         return x.T.reshape(rhs.shape)
 
+    # symmetric=True: the adjoint is the plain TRANSPOSE (JAX's linear transpose does not conjugate), and A^T = A
+    # holds for complex symmetric as for real symmetric -- the same solve on the same factors
     return jax.lax.custom_linear_solve(lambda x: A @ x, b, _solve, symmetric=True)
