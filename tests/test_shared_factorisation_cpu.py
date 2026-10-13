@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 
 import jno
+from jno.utils.solver.linear import _pardiso_available
 
 inner = jno.np.inner
 
@@ -57,14 +58,17 @@ def test_three_loads_are_solved_as_one_block(monkeypatch, linear):
     np.testing.assert_allclose(got, want, rtol=1e-8)
 
 
-def test_the_gradient_through_a_shared_group_is_that_of_separate_solves(monkeypatch):
+@pytest.mark.parametrize("backend", ["host", "pardiso"])
+def test_the_gradient_through_a_shared_group_is_that_of_separate_solves(monkeypatch, backend):
+    if backend == "pardiso" and not _pardiso_available():
+        pytest.skip("needs pypardiso (MKL)")
     import equinox as eqx
 
     import jno.utils.solver.shared_solve as S
     from jno.trace_compiler import TraceCompiler
 
     def grads():
-        F, crux = _three_loads(jno.solve.lu(backend="host"))
+        F, crux = _three_loads(jno.solve.lu(backend=backend))
         fn = TraceCompiler.compile_traced_expression(F, crux.all_ops)
         params, static = eqx.partition(eqx.tree_inference(crux._unwrapped_models), eqx.is_inexact_array)
         g = jax.grad(lambda p: jnp.sum(fn(eqx.combine(p, static), crux.domain_data.context)))(params)
@@ -76,3 +80,21 @@ def test_the_gradient_through_a_shared_group_is_that_of_separate_solves(monkeypa
     for a, b in zip(shared, alone):
         np.testing.assert_allclose(a, b, rtol=1e-8, atol=1e-12 * (np.abs(b).max() + 1e-300))
     assert any(np.abs(b).max() > 0 for b in alone)
+
+
+@pytest.mark.skipif(not _pardiso_available(), reason="needs pypardiso (MKL)")
+def test_pardiso_factors_the_group_once(monkeypatch):
+    """PARDISO gets the group's block of right-hand sides in ONE call (one factorisation), not one per load"""
+    import jno.utils.solver.linear as L
+
+    calls = []
+    orig = L._pardiso_host_solve
+    monkeypatch.setattr(L, "_pardiso_host_solve", lambda d, i, r, shape, t: calls.append(np.shape(r)) or orig(d, i, r, shape, t))
+    F, crux = _three_loads(jno.solve.lu(backend="pardiso"))
+    got = np.asarray(crux.eval([F])).reshape(-1)
+    assert len(calls) == 1 and calls[0][-1] == 3, f"expected one PARDISO call with a block of 3: {calls}"
+    import jno.utils.solver.shared_solve as S
+
+    monkeypatch.setattr(S, "solve_shared", lambda *a, **kw: False)
+    F2, crux2 = _three_loads(jno.solve.lu(backend="pardiso"))
+    np.testing.assert_allclose(got, np.asarray(crux2.eval([F2])).reshape(-1), rtol=1e-8)
