@@ -284,7 +284,9 @@ def _dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], vec: int) -> 
                 g = float(value(p)) if callable(value) else float(value)
                 for comp in range(vec):
                     pairs.append((nid * vec + comp, g))
-    return pairs
+    from .fem_utils import merge_dirichlet_pairs
+
+    return merge_dirichlet_pairs(pairs, describe=lambda dof: f"node {dof // vec} at x = {float(pts[dof // vec][0]):.6g}")
 
 
 # --------------------------------------------------------------------------

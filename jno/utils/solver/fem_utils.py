@@ -4327,6 +4327,32 @@ def bcoo_identity_rows(A, mask):
     return jsparse.BCOO((jnp.concatenate([data, m]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
 
 
+def merge_dirichlet_pairs(pairs, describe=lambda dof: f"DOF {dof}"):
+    """``(dof, value)`` pairs with each DOF listed once.
+
+    Two Dirichlet conditions whose regions meet -- ``right`` and ``top`` at a corner -- both list the
+    shared node. Every consumer treats the list as one row per entry: :func:`bcoo_set_unit_diag` sums
+    duplicate unit diagonals while the load keeps the last value, so a node listed twice was solved as
+    ``2 u = g``. Equal values (to rounding) are kept once; different values have no right answer and
+    raise, naming the node (``describe(dof)``) and both values.
+    """
+    out, at = [], {}
+    for dof, g in pairs:
+        dof = int(dof)
+        if dof not in at:
+            at[dof] = len(out)
+            out.append((dof, g))
+            continue
+        g0 = out[at[dof]][1]
+        if not np.isclose(float(g), float(g0), rtol=1e-10, atol=1e-12):
+            raise ValueError(
+                f"Two Dirichlet conditions fix the same node, {describe(dof)}, to different values: "
+                f"{float(g0)!r} and {float(g)!r}. Where two boundary regions meet, give both conditions the "
+                f"same value at the shared node, or leave the node out of one of the regions."
+            )
+    return out
+
+
 def bcoo_set_unit_diag(A, dofs):
     """Append unit-diagonal triplets ``(d, d, 1)`` for ``d in dofs`` to a BCOO ``A`` (after the rows
     were zeroed, this makes ``A[d, d] == 1`` exactly — duplicate indices are summed)."""

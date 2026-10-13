@@ -88,6 +88,7 @@ from .fem_utils import (
     compress_eager,
     compress_plan,
     elem_map,
+    merge_dirichlet_pairs,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .sharding import element_mesh as _element_mesh
@@ -4297,6 +4298,13 @@ def assemble_fem_native(
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         return [int(n) for n in bnodes]
 
+    def _describe_dof(dof):
+        """'node <i> at (x, y)' for a global DOF, for error messages."""
+        f = max(i for i in range(len(vecs)) if offs[i] <= dof)
+        nid, c = divmod(dof - offs[f], vecs[f])
+        xy = ", ".join(f"{float(v):.6g}" for v in np.asarray(pts_f_all[f])[nid])
+        return f"node {nid} at ({xy})" + (f", component {c}" if vecs[f] > 1 else "")
+
     def _build_dirichlet_pairs() -> List[Tuple[int, float]]:
         from ..._fem import _eval_value_node_at, _is_temporal_value_node
         from ...trace import ModelCall
@@ -4391,6 +4399,8 @@ def assemble_fem_native(
                 for c in comps_range:
                     g = gs[k] if gs.ndim == 1 else gs[k, c if gs.shape[1] > 1 else 0]
                     pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g)))
+        # A node where two conditions' regions meet (a corner shared by two edges) is listed by both.
+        pairs = merge_dirichlet_pairs(pairs, describe=_describe_dof)
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
         # The time-varying entries ride a companion stash: the caller writes g(x_d, t) (and, for a

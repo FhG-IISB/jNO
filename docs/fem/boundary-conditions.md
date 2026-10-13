@@ -16,6 +16,11 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+Dirichlet conditions on regions that meet share their common nodes — `u(xr, yr) - 1` and
+`u(xt, yt) - 1` on `right` and `top` both list the corner. A shared node is pinned once when the
+values agree there; when they differ, `jno.fem` raises and names the node and both values, since no
+choice between them is right.
+
 #### Time-varying Dirichlet data — `g(x, t)`
 
 On a transient form `g` may depend on time too: write it with the boundary variable's `t`. Nothing is
