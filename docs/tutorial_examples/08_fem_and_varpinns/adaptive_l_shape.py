@@ -163,14 +163,12 @@ E_h, n_h = energy(fem_h, stiff_h, solve_fn(fem_h.A, fem_h.b)), active_dofs(d_h, 
 pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_dict["triangle"])
 
 # (2) r -- RELOCATE a fixed node set, down a mesh functional, through the differentiable solve.
-#     NOT `objective="energy"` here, and the reason is this problem's source term. The Ritz functional
-#     is J(v) = 1/2 a(v,v) - (f,v); with no load J = E and descending the energy descends the error,
-#     which is what the classic L-shape wants. With a load, J_h = -E_h at the discrete solution, so
-#     minimising the error means MAXIMISING E -- and descending it walks away from the solution while
-#     flattening elements, which is the cheapest way to lower the integral of |grad u|^2. Measured
-#     here: E fell 0.12252 -> 0.10788 exactly as asked, the true error rose 3.6x, and the smallest
-#     angle in the mesh collapsed from 40.8 degrees to 3.2. The default (arclength equidistribution)
-#     targets resolution instead and keeps the mesh sane.
+#     The default objective (arclength equidistribution) targets RESOLUTION, not this error, and here
+#     it does not help (measured 1.43x the coarse error). `objective="energy"` descends the Ritz
+#     functional J = 1/2 a(u,u) - (f,u) instead, whose discrete value is the energy-norm error up to a
+#     constant, and it cuts that error to 0.70x at fixed DOFs -- but only with the bump integrated
+#     accurately, `jno.fem(..., quad_degree=4)`. At the default degree the descent lowers J by inflating
+#     the QUADRATURE of the bump rather than the accuracy of u, and lands above the converged energy.
 d_r, fem_r, stiff_r = build(H, movable=True)
 pts_r0 = np.asarray(d_r.mesh.points)[:, :2].copy()  # coarse start, for the animation
 sol_r = np.asarray(fem_r.solve(solve_fn, adapt=jno.solve.relocate(max_iters=30, lr=5e-4))).reshape(-1)

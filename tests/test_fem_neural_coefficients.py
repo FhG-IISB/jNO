@@ -1165,8 +1165,28 @@ def test_transient_nonnodal_mass_net_guard():
 def test_nonnodal_trainable_net_in_host_assembled_boundary_term_guard():
     """On a non-nodal element a *trainable* net in a HOST-ASSEMBLED natural-BC (RT pressure / plate moment)
     boundary term fails loud — that load is baked non-differentiably. (The N1E tangential-trace impedance /
-    incident SURFACE BC now IS neural-differentiable — see test_fem_nedelec_impedance; only these
-    host-assembled families are not, so the guard is now narrow and names the case.)"""
+    incident SURFACE BC and a general boundary integrand such as a Hermite Neumann load ARE
+    neural-differentiable — see test_nonnodal_trainable_net_in_general_boundary_term_differentiates; only
+    these host-assembled families are not, so the guard is narrow and names the case.)"""
+    from jno.jnp_ops import grad, inner, trace
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.5)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+    ui, vi, pp, qq = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    vb = v.bind(x=xb, y=yb)
+    divu, divv = trace(grad(ui, [xi, yi])), trace(grad(vi, [xi, yi]))
+    net = _mlp_net(key=22)
+    with pytest.raises(NotImplementedError, match="host-assembled|natural-BC|neural coefficient"):
+        jno.fem([inner(ui, vi) - pp * divv, qq * divu, net(xb, yb) * (vb[0] * nx + vb[1] * ny)], quad_degree=4)
+
+
+def test_nonnodal_trainable_net_in_general_boundary_term_differentiates():
+    """A trainable net in a Hermite Neumann load ``net(x) * v`` takes the general boundary-integrand path,
+    which re-evaluates the net per args: the system is parametric, a constant net reproduces the scalar
+    load exactly, and d(solve)/d(weight) matches a central finite difference."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
     xi, yi, _ = d.variable("interior", split=True)
     xr, yr, _ = d.variable("right", split=True)
@@ -1174,9 +1194,24 @@ def test_nonnodal_trainable_net_in_host_assembled_boundary_term_guard():
     u, phi = d.fem_symbols(space="Hermite")
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     wr = phi.bind(x=xr, y=yr)
-    net = _mlp_net(key=22)
-    with pytest.raises(NotImplementedError, match="host-assembled|natural-BC|neural coefficient"):
-        jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, net(xr, yr) * wr, u(xl, yl) - 0.0])
+    net = _const_net(0.7)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, net(xr, yr) * wr, u(xl, yl) - 0.0])
+    fem_ref = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, (0.7 + 0.0 * xr) * wr, u(xl, yl) - 0.0])
+
+    (name,) = fem.operator.runtime_parameter_exprs
+    _, b = fem.operator.evaluate({name: net.module})
+    assert np.abs(np.asarray(b).reshape(-1) - np.asarray(fem_ref.b).reshape(-1)).max() < 1e-12
+
+    def total(c):
+        A, b = fem.operator.evaluate({name: _Const(c=c)})
+        A = A.todense() if hasattr(A, "todense") else A  # traced: _dense() would leave jax via np.asarray
+        return jnp.sum(jnp.linalg.solve(jnp.asarray(A), jnp.asarray(b).reshape(-1)))
+
+    g = float(jax.grad(total)(jnp.asarray(0.7)))
+    h = 1e-5
+    fd = float((total(jnp.asarray(0.7 + h)) - total(jnp.asarray(0.7 - h))) / (2 * h))
+    assert abs(g) > 1e-3, "the boundary net's gradient vanished: its load was baked, not re-assembled"
+    assert abs(g - fd) < 1e-6 * abs(fd), f"boundary-net gradient {g:.10e} vs finite difference {fd:.10e}"
 
 
 # ==========================================================================

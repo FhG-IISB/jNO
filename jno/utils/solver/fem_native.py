@@ -1569,8 +1569,10 @@ def assemble_fem_native(
     # identify). Not an args-dependent row of the kind above -- its held value changes every step -- so it
     # stays in the time-varying stash, whose held value `_tv_hold(t, args)` is evaluated at the time the
     # step's residual/forcing is called at WITH the runtime args. Its exprs only have to reach
-    # `runtime_parameter_exprs` so the solve node hands them over. That is the first-order transient;
-    # the τ load-path march and the second-order (u_tt) block evaluate g(x, t) without args and refuse.
+    # `runtime_parameter_exprs` so the solve node hands them over. That is the first-order transient and
+    # the τ load-path march (`u(top)[1] - g*tau`: displacement control with a trainable grip amplitude,
+    # #103), whose residual is called with (u, args, τ). The second-order (u_tt) block evaluates g(x, t)
+    # and its ġ on the augmented system without args, and refuses.
     _tv_param_exprs: Dict[str, Any] = {}
     _first_order_transient = (
         not tv_dirichlet_external
@@ -1583,6 +1585,7 @@ def assemble_fem_native(
             )
         )
     )
+    _tv_args_ok = _first_order_transient or (_is_march and not tv_dirichlet_external)
     for _i, (_fk, _rg, _comp, _val, _vnode) in enumerate(dirichlet_raw):
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is None or _is_neural_coefficient(_vn):
@@ -1600,18 +1603,18 @@ def assemble_fem_native(
             from ..._fem import _is_temporal_value_node as _is_tv
 
             if _is_tv(_vnode):
-                if _first_order_transient:
+                if _tv_args_ok:
                     _tv_param_exprs.update(_found)  # held value re-formed per (t, args); see above
                     continue
-                # `u(top) - g * tau` on the load path, or g(x, t) on a u_tt block: those consumers evaluate
-                # the value at the step's τ/t only. The parametric branch would hold it constant in τ
-                # (silently un-ramping the load); the temporal one would freeze the parameter at its
-                # stored value (silently un-training it). Neither is right, so refuse.
+                # g(x, t) on a u_tt block: that consumer evaluates the value (and its ġ) at the step's t
+                # only. The parametric branch would hold it constant in t (silently un-ramping the load);
+                # the temporal one would freeze the parameter at its stored value (silently un-training
+                # it). Neither is right, so refuse.
                 raise NotImplementedError(
                     f"jno.fem: the essential value on {_rg!r} is BOTH runtime-parametric "
-                    f"({sorted(_found)}) and time/τ-dependent. That is supported on a first-order transient "
-                    "(`u.t`), not on a τ load-path march or a second-order (`u.tt`) form. There, train the "
-                    "amplitude through a Neumann/body term written as a function of τ/t, or fix one of the two."
+                    f"({sorted(_found)}) and time-dependent. That is supported on a first-order transient "
+                    "(`u.t`) and on a τ load-path march, not on a second-order (`u.tt`) form. There, train "
+                    "the amplitude through a Neumann/body term written as a function of t, or fix one of the two."
                 )
             _dir_param_exprs.update(_found)
             _dir_param_rows.add(_i)
@@ -5253,10 +5256,12 @@ def assemble_fem_native(
 
                     _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
 
-                    def _tv_hold(t):
+                    def _tv_hold(t, args=None):
+                        # `args` substitutes a trainable amplitude in the value (`u(top)[1] - g*tau`), so the
+                        # held value -- and the march built on it -- stays differentiable in it (#103).
                         return jnp.concatenate(
                             [
-                                jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,))
+                                jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t, params=args)), (-1,))
                                 for _d, n, c in _tv_dirichlet
                             ]
                         )
@@ -5268,7 +5273,7 @@ def assemble_fem_native(
                     if _b is not None:
                         u = u.at[_b].set(jnp.asarray(_base_hold(args)).astype(u.dtype))
                     if _t is not None:
-                        u = u.at[_t].set(_tv_hold(t).astype(u.dtype))
+                        u = u.at[_t].set(_tv_hold(t, args).astype(u.dtype))
                     return u
 
                 def res_p(u, args=None, t=0.0, _b=_bd, _t=_tvd):
@@ -5277,7 +5282,7 @@ def assemble_fem_native(
                     if _b is not None:
                         R = R.at[_b].set(u[_b] - _base_hold(args))
                     if _t is not None:
-                        R = R.at[_t].set(u[_t] - _tv_hold(t))
+                        R = R.at[_t].set(u[_t] - _tv_hold(t, args))
                     return R
 
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
