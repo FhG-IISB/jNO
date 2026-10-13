@@ -198,7 +198,7 @@ class Result:
         return "\n".join(lines)
 
     def save(self, out_dir=None, figures=True):
-        if os.environ.get("JNO_PROF_NCU") == "1":
+        if os.environ.get("JNO_PROF_NCU") == "1" or os.environ.get("JNO_PROF_PERF"):
             return None  # a counter run must not overwrite the profiled run
         out_dir = out_dir or os.path.join(RUNS, self.label)
         os.makedirs(out_dir, exist_ok=True)
@@ -241,9 +241,31 @@ def parse_trace(trace_dir: str, hlo_meta: dict[str, str], n_calls: int = 1):
     p = ProfileData.from_file(max(files, key=os.path.getmtime))
     kernels: dict[tuple, Kernel] = {}
     memcpys: dict[tuple, Memcpy] = {}
-    for plane in p.planes:
-        if "/device:" not in plane.name:
-            continue
+    planes = list(p.planes)
+    device = [pl for pl in planes if "/device:" in pl.name and any(True for ln in pl.lines for _ in ln.events)]
+    if not device:  # XLA:CPU: the thunks run on the Eigen worker threads, one timed event per HLO op (no stats)
+        for pl in planes:
+            if "/host:CPU" not in pl.name:
+                continue
+            for line in pl.lines:
+                if not line.name.startswith("tf_XLA"):
+                    continue
+                for e in line.events:
+                    op = e.name
+                    if op.startswith("end:") or op not in hlo_meta:
+                        continue
+                    scope = hlo_meta[op]
+                    stage, adj = _stage_of(scope)
+                    k = kernels.get((op, op))
+                    if k is None:
+                        kernels[(op, op)] = Kernel(op, op, scope, stage, adj, e.duration_ns, 1)
+                    else:
+                        k.duration_ns = (k.duration_ns * k.count + e.duration_ns) / (k.count + 1)
+                        k.count += 1
+        for k in kernels.values():
+            k.count = max(1, round(k.count / n_calls))
+        return list(kernels.values()), []
+    for plane in device:
         for line in plane.lines:
             for e in line.events:
                 st = {k: str(v) for k, v in e.stats}
@@ -368,7 +390,18 @@ def run(
     except Exception:  # noqa: BLE001
         temp_gb = arg_gb = out_gb = float("nan")
     first_s, _ = _wall(fn, *args)  # first execution (cuDSS symbolic analysis, caches, ...)
-    steady = [_wall(fn, *args)[0] for _ in range(reps)]
+    perf_events = os.environ.get("JNO_PROF_PERF")  # dev/cpu.py: record the steady-state calls with perf
+    if perf_events:
+        from dev.cpu import Recorder, perf_map
+
+        n_map = len(perf_map())
+        rec = Recorder(perf_events.split(","), os.environ.get("JNO_PROF_PERF_OUT", "perf.data")).start()
+        steady = [_wall(fn, *args)[0] for _ in range(int(os.environ.get("JNO_PROF_PERF_REPS", "20")))]
+        rec.stop()
+        print(f"perf: {n_map} compiled kernels in the map, {len(steady)} calls recorded", flush=True)
+        trace, transfer_check = False, False
+    else:
+        steady = [_wall(fn, *args)[0] for _ in range(reps)]
     guard = "not checked"
     if transfer_check:
         try:
@@ -416,7 +449,7 @@ def run(
             stats = list(backend_stats())
         except Exception as e:  # noqa: BLE001
             stats = [{"error": repr(e)}]
-    if not under_ncu:
+    if not under_ncu and not perf_events:
         os.makedirs(out_dir or os.path.join(RUNS, label), exist_ok=True)
         with open(os.path.join(out_dir or os.path.join(RUNS, label), "compiled.hlo"), "w") as fh:
             fh.write(hlo_text)

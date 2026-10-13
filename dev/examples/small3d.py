@@ -24,6 +24,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--size", type=float, default=0.12, help="mesh size on the unit cube (0.12 -> ~4 k tets)")
 ap.add_argument("--label", default="small3d")
 ap.add_argument("--reps", type=int, default=3)
+ap.add_argument("--cpu", action="store_true", help="PARDISO on the host (run with JAX_PLATFORMS=cpu) instead of cuDSS")
 a = ap.parse_args()
 
 d = jno.shape.box(0, 0, 0, 1, 1, 1, size=a.size).name("box").attach(k=1.0).domain()
@@ -39,13 +40,15 @@ n_tets = int(len(d.mesh.cells_dict["tetra"]))
 x0 = jnp.asarray(P[:, 0])
 A0, b0 = jax.jit(lambda x: op.evaluate({"X": x}))(x0)
 n = A0.shape[0]
-plan = cs.plan(np.asarray(A0.indices[:, 0]), np.asarray(A0.indices[:, 1]), n)
+plan = None if a.cpu else cs.plan(np.asarray(A0.indices[:, 0]), np.asarray(A0.indices[:, 1]), n)
 print(f"{n_tets:,} tets, {n:,} DOFs -> {a.label}", flush=True)
+if a.cpu:
+    from jno.utils.solver.linear import pardiso_lu_solve
 
 
 def compliance(x):
     A, b = op.evaluate({"X": x})
-    uu = cs.solve(plan, A.data, b)
+    uu = pardiso_lu_solve(A, b) if a.cpu else cs.solve(plan, A.data, b)
     with jax.named_scope("jno/readout"):
         return jnp.dot(uu, b)
 
@@ -58,7 +61,7 @@ r = prof.run(
     x0,
     label=a.label,
     reps=a.reps,
-    backend_stats=lambda: _p.stats() + [dict(backend="cudss_ffi", n=plan.n, **plan.stats())],
+    backend_stats=lambda: _p.stats() + ([] if a.cpu else [dict(backend="cudss_ffi", n=plan.n, **plan.stats())]),
     sizes=dict(cells=n_tets, nodes=len(P), nnz=int(A0.nse), n=n, nrhs=1, complex=False),
 )
 print(r.table())

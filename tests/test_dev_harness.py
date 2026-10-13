@@ -90,3 +90,27 @@ def test_intrinsic_bounds_from_sizes_and_backend_record():
     assert b["jno/factor"] == pytest.approx(100000**2 / 2000 / 1e9 * 4 * 1e3)
     assert b["jno/solve"] == pytest.approx(2 * 2 * 3 * 100000 * 16 / 1e9 * 1e3)
     assert prof.Result("y", {"sizes": {}}, {}, [], [], []).intrinsic_bounds(pk) == {}
+
+
+def test_cpu_samples_and_attribution(tmp_path, monkeypatch):
+    from dev import cpu
+
+    script = (
+        "    100003      cpu_core/fp_arith_inst_retired.scalar_double/:      7975fda9eb85 multiply_reduce_fusion.3\n"
+        "    100003      cpu_core/fp_arith_inst_retired.256b_packed_double/:      7975fda9eb90 multiply_reduce_fusion.3\n"
+        "        63                             cpu_core/cycles/:  ffffffffa9283d92 __perf_event_task_sched_in\n"
+        "      1000                             cpu_core/cycles/:  00007975fda9eb85 multiply_reduce_fusion.3\n"
+        "      2000                             cpu_core/cycles/:  00007975fdaa0000 dgemm_\n"
+        "garbage line\n"
+    )
+    monkeypatch.setattr(
+        cpu.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": script, "returncode": 0, "stderr": ""})()
+    )
+    agg = cpu.samples("perf.data")
+    assert agg[("fp_arith_inst_retired.scalar_double", "multiply_reduce_fusion.3")] == 100003
+    assert agg[("cycles", "dgemm_")] == 2000
+    meta = {"multiply_reduce_fusion.3": "jit(f)/transpose(jvp(jno/assemble))/mul"}
+    by, syms = cpu.attribute(agg, meta, ["cycles", "fp64_scalar", "fp64_256b"])
+    assert by["jno/assemble"]["cycles"] == 1000 and by["jno/assemble"]["fp64_256b"] == 100003
+    assert by["library"]["cycles"] == 2000 + 63
+    assert syms["jno/assemble"][("multiply_reduce_fusion.3", "fp64_scalar")] == 100003
