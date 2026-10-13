@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mt
@@ -70,24 +71,27 @@ def ladder(res, bounds=None, ax=None, verdict=None):
             ax.plot(ib, yi, hs.MARKERS[2], color=hs.GREEN, ms=4.5, mec="white", mew=0.5, zorder=3)
         ax.plot(floor, yi, hs.MARKERS[1], color=hs.MUTED, ms=4, mfc="white", mew=0.6, zorder=2)
         ax.plot(m, yi, hs.MARKERS[0], color=hs.ORANGE, ms=4.5, mec="white", mew=0.5, zorder=3)
-        txt = f"{m:.1f} ms, {a['launches']:,} launches"
+        txt = ""
         if kb:
-            txt = f"x{m / kb:.1f}" + (f" / x{m / ib:.0f}" if ib else "") + "   " + txt
+            txt = f"x{m / kb:.1f}" + (f" / x{m / ib:.0f}" if ib else "")
         elif ib:
-            txt = f"- / x{m / ib:.0f}   " + txt
-        ax.text(m * 1.3, yi, txt, va="center", ha="left", fontsize=8, color=hs.INK)
+            txt = f"- / x{m / ib:.0f}"
+        if txt:
+            ax.text(m * 1.3, yi, txt, va="center", ha="left", fontsize=8, color=hs.INK)
+        margin = f"{m:.1f} ms, {a['launches']:,} launches"
         if verdict and s in verdict:
-            ax.text(
-                1.02,
-                yi,
-                verdict[s].split(":")[0],
-                transform=ax.get_yaxis_transform(),
-                va="center",
-                ha="left",
-                fontsize=7,
-                color=hs.MUTED,
-                clip_on=False,
-            )
+            margin += "  ·  " + re.split(r"[:;(]", verdict[s])[0].strip()
+        ax.text(
+            1.02,
+            yi,
+            margin,
+            transform=ax.get_yaxis_transform(),
+            va="center",
+            ha="left",
+            fontsize=7,
+            color=hs.MUTED,
+            clip_on=False,
+        )
     ax.yaxis.set_major_locator(mt.FixedLocator(list(y)))
     ax.set_yticklabels(stages)
     ax.set_ylim(-0.6, len(stages) - 0.4)
