@@ -58,9 +58,10 @@ def solve_shared(evaluator, node, ctx, memo) -> bool:
     """Solve ``node`` together with every solve of the current evaluation that shares its operator and solver;
     fill the memo for all of them. ``False`` (nothing done) when it has no partner.
 
-    Any solver: the in-program cuDSS LDL^T path takes the block of right-hand sides in one call (one
-    factorisation, forward and adjoint); any other solver gets the columns one by one on the same matrix (host
-    SuperLU reuses its cached factorisation; others factor per column, as separate solves would)."""
+    Any solver: the in-program cuDSS LDL^T path, PARDISO and the nvmath cuDSS LU take the block of right-hand
+    sides in one call (one factorisation, forward and adjoint); any other solver gets the columns one by one on
+    the same matrix (host SuperLU reuses its cached factorisation; cuSolver and Krylov solve per column, as
+    separate solves would)."""
     import jax.numpy as jnp
 
     from .solver_api import residual_gate
@@ -96,6 +97,12 @@ def solve_shared(evaluator, node, ctx, memo) -> bool:
         from .linear import cudss_ldl_solve
 
         X = cudss_ldl_solve(A0, B, members[0]._fem_ref._linear_solver_context())
+    if X is None and getattr(spec, "name", None) in ("lu-pardiso", "lu-cudss"):
+        # PARDISO and the nvmath cuDSS LU take a block of right-hand sides in one call: one factorisation
+        # (their adjoint is the same block call with the cotangents)
+        from .linear import cudss_lu_solve, pardiso_lu_solve
+
+        X = {"lu-pardiso": pardiso_lu_solve, "lu-cudss": cudss_lu_solve}[spec.name](A0, B)
     if X is None:
         # any other solver: column by column on the SAME matrix. Not `jax.vmap` over the solve: JAX's sparse
         # matvec (bcoo_dot_general) inside custom_linear_solve gets its cotangent shape wrong under vmap + grad
