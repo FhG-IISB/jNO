@@ -36,6 +36,79 @@
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`).
 
+### Matrix-valued fields
+
+A field may be a matrix: `S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"))` (or `(3, 3)` in 3-D)
+carries `n·m` values per node, stored row-major, so entry `(i, j)` is component `i·m + j`. On a bound view
+`Si = S.bind(x=x, y=y)` it behaves as a matrix in every expression: `Si @ L`, `L @ Si`, a constant
+`W @ Si`, `Si.T`, `jno.np.trace(Si)`, `inner(Si, Ti, n_contract=2)`, an entry `Si[0, 1]`, a row `Si[0]`,
+and the derivatives `Si.x` (a matrix) and `jno.np.jacobian(S, [x, y])` (shape `(n, m, dim)`). The test
+function is the same: `Ti[0, 1]`, `trace(Ti)` and `Ti.x` are what they say.
+
+```python
+S, T = d.fem_symbols(value_shape=(2, 2), names=("S", "T"), order=2)
+Si, Ti = S.bind(x=x, y=y), T.bind(x=x, y=y)
+W = jno.np.array([[0.0, g / 2], [-g / 2, 0.0]])          # spin of u = (g y, 0)
+D = jno.np.array([[0.0, g / 2], [g / 2, 0.0]])           # rate of deformation
+transport = lambda A: g * y * A.x                        # (u·∇)A
+R = transport(Si) - (W @ Si - Si @ W) - 2 * G * D        # Jaumann rate = 2G D
+fem = jno.fem([inner(R, Ti + tau * transport(Ti), n_contract=2),   # SUPG-tested
+               S(xl, yl) - 0.0])                                    # stress-free inflow
+```
+
+This is the Eulerian form of the simple-shear test of Dienes (1979): the computed stress converges to
+`s_xy = G sin(gt)`, `s_xx = -s_yy = G(1 - cos gt)` with `t = x/(g y)` (`tests/test_fem_matrix_fields.py`,
+which also checks the L2 projection, a componentwise Laplace in 2-D and 3-D at P1 and P2, and an inflow
+profile carried unchanged — all nodally exact). Dirichlet data on a matrix field is described in
+[Boundary conditions](boundary-conditions.md#components-and-derivatives-ui-vs-ux).
+
+**Symmetric storage.** `fem_symbols(value_shape=(n, n), symmetric=True)` stores the upper triangle only,
+`n(n+1)/2` values per node, in the order `xx, xy, yy` (2-D) or `xx, xy, xz, yy, yz, zz` (3-D) — so a 2-D
+stress costs 3 DOFs per node instead of 4, a 3-D one 6 instead of 9. Nothing else changes: the symbol is the
+full `n×n` matrix in every expression (`S @ W`, `S.T`, `trace`, `inner`, `S[1, 0]` is `S[0, 1]`, `S.x`), and
+its test function is the symmetric one, so the equations are the symmetric part of the full-storage ones.
+On a problem whose full-storage solution is symmetric (the Jaumann shear above, a tensor Laplace, a
+nonlinear `S + |S|²S = F`, a transient decay) the answers agree to round-off with 3/4 of the DOFs
+(`tests/test_fem_matrix_fields.py`). The solution vector holds the stored values, node-major. Scope: the
+native 2-D/3-D Lagrange assembler — a 1-D domain, a VPINN, periodic ties, a complex field or a mix with a
+non-nodal family raise.
+
+### Constant unknowns — one value, solved for
+
+`U = d.unknown.scalar(constant=True)` is **one** number over the whole domain (`d.unknown.vector(n,
+constant=True)` one vector, `d.unknown.matrix(n, m, constant=True)` one matrix), solved for together with
+the fields. Everything about it follows from its basis function being the constant one:
+
+* its trial `U` is seen identically by every element, so `U * inner(n, v)` on a boundary is a traction of
+  unknown magnitude;
+* its test function `W = U.test()` is one everywhere, so a weak term carrying it is an **integral row** —
+  `(uin[0] - Q / H) * W` on an inlet says `∫ u·e_x ds = Q`, and `ui * W` over the volume says `∫ u dΩ = 0`;
+* `u(region) - U` ties a field to it on a region **exactly** (see [Boundary conditions](boundary-conditions.md#tying-a-region-to-a-constant-uregion-u)),
+  and `U - g` pins it.
+
+A channel driven at a prescribed flow rate, with the inlet pressure as the unknown:
+
+```python
+u = d.unknown.vector(2, order=2); p = d.unknown.scalar(name="p")
+P = d.unknown.scalar(constant=True, name="P_in")
+v, q, W = u.test(), p.test(), P.test()
+fem = jno.fem([inner(grad(u), grad(v)) - p * div(v), -q * div(u),
+               P * (-vin[0]),                  # inlet traction -P n, n = (-1, 0)
+               (uin[0] - Q / H) * W,           # its equation: the flow rate through the inlet
+               u(xw, yw) - 0.0, u(xi, yi)[1] - 0.0])
+sol = fem.solve(linear=jno.solve.lu())       # a bordered saddle system: a direct solver
+P_in = sol[fem.blocks[fem.block_index(P)]]   # = 12 Q L / H³ (Poiseuille), to round-off
+```
+
+Constants are assembled as the **last** blocks, after every field. A constant whose only equation is a
+`W`-row has no diagonal entry, so the system is a saddle and wants a direct solver (`jno.fem` warns
+otherwise); a tied or pinned constant does not. Verified in `tests/test_fem_constant_unknown.py`: the
+floating boundary value with a prescribed total flux and the flow-rate channel are exact to round-off, the
+tie with a pinned `U` reproduces the uniform Dirichlet condition (bit-identical on the linear path), a box
+`U.bounds(lo, hi)` holds when active, a mean-value multiplier enforces `∫ u = 0` exactly, and the
+gradient of a loss in `U` through a runtime parameter matches the closed form. Scope: the native 2-D/3-D
+Lagrange assembler; see the [limitations](limitations.md).
+
 ### Reading a multifield solution back
 
 A coupled solve returns **one flat vector**, so the `fem` object carries the handles that say which
