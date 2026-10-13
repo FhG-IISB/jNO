@@ -287,7 +287,7 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
                 record_iterations(None, f"jno.solve.{name}", side=_side)
                 return _scaled_gmres(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name, tol=None if atol else tol)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
@@ -345,7 +345,7 @@ def _counting(counted, who: str):
     return raw
 
 
-def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str):
+def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str, tol=None):
     """Run a raw (non-differentiable) iteration inside ``lax.custom_linear_solve``.
 
     The differentiability firewall: gradients w.r.t. ``b`` and anything the matvec closes over
@@ -354,13 +354,18 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
     on ``A^T`` (on ``A`` itself when ``symmetric``), reusing ``M`` (legitimate: a preconditioner
     only affects convergence speed, never the converged solution).
     """
-    from .utils.solver.solver_api import residual_gate
+    from .utils.solver.solver_api import gate_rtol_for, residual_gate
 
-    fwd = lambda _mv, rhs: residual_gate(op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward")
+    # the gate follows the tolerance the solve was asked for (gate_rtol_for): a fixed 1e-4 gate let a
+    # solve asked for 1e-8 stop on its step cap at 1.8e-5 and return a 1.7 %-wrong answer without a word
+    g = gate_rtol_for(tol)
+    fwd = lambda _mv, rhs: residual_gate(
+        op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward", rtol=g
+    )
     if symmetric:
         # custom_linear_solve runs the SAME solve for the transpose; label it as such in fem.stats.
         rev = lambda _mv, rhs: residual_gate(  # noqa: E731
-            op.mv, rhs, _raw_on(raw, op.mv, rhs, M, x0, "transpose"), f"jno.solve.{name}", side="transpose"
+            op.mv, rhs, _raw_on(raw, op.mv, rhs, M, x0, "transpose"), f"jno.solve.{name}", side="transpose", rtol=g
         )
     else:
         # The reverse pass solves A^T y = v and MUST be preconditioned by M^T, not M: a
@@ -376,7 +381,7 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
         # no-op under tracers besides. A Krylov iteration that leaves on its step cap returns its last
         # iterate silently, so a broken adjoint arrived as a perfectly plausible gradient.
         rev = lambda _mv, rhs: residual_gate(
-            op.T.mv, rhs, _raw_on(raw, op.T.mv, rhs, M_T, None, "transpose"), f"jno.solve.{name}", side="transpose"
+            op.T.mv, rhs, _raw_on(raw, op.T.mv, rhs, M_T, None, "transpose"), f"jno.solve.{name}", side="transpose", rtol=g
         )
     return jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
 
@@ -395,7 +400,7 @@ def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> Line
             lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter, return_iters=True),
             "jno.solve.fgmres",
         )
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres")
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres", tol=tol)
 
     return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter))
 
@@ -414,7 +419,7 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
             lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True),
             "jno.solve.minres",
         )
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres", tol=tol)
 
     return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
 
@@ -441,7 +446,7 @@ def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
         )
         # symmetric=True means A == A^T, which is exactly COCG's precondition — so
         # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg")
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg", tol=tol)
 
     return LinearSolver(_fn, name="cocg", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
 
