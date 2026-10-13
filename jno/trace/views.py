@@ -376,9 +376,9 @@ class ScalarView(_DelegatesToPlaceholder):
         """
         return ScalarView(new_expr)
 
-    def integrate(self, **kwargs) -> "ScalarView":
+    def integrate(self, *args, **kwargs) -> "ScalarView":
         """Integrate the underlying scalar, preserving the ScalarView type."""
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "ScalarView":
@@ -685,9 +685,9 @@ class VectorView(_DelegatesToPlaceholder):
         underlying Placeholder must carry that layout. See :class:`ComplexVectorView`."""
         return ComplexVectorView(self._expr)
 
-    def integrate(self, **kwargs) -> "VectorView":
+    def integrate(self, *args, **kwargs) -> "VectorView":
         """Component-wise integral, preserving VectorView type."""
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "VectorView":
@@ -956,9 +956,9 @@ class ComplexView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return ComplexView(new_expr)
 
-    def integrate(self, **kwargs) -> "ComplexView":
+    def integrate(self, *args, **kwargs) -> "ComplexView":
         """Component-wise integral of the [re, im] split, preserving ComplexView."""
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "ComplexView":
@@ -1138,8 +1138,8 @@ class ComplexVectorView(_DelegatesToPlaceholder):
     def stop_gradient(self) -> "ComplexVectorView":
         return self._rewrap(self._expr.stop_gradient)
 
-    def integrate(self, **kwargs) -> "ComplexVectorView":
-        return self._rewrap(self._expr.integrate(**kwargs))
+    def integrate(self, *args, **kwargs) -> "ComplexVectorView":
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     def d(self, v, scheme: str | None = None) -> "ComplexVectorView":
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
@@ -1415,14 +1415,14 @@ class MatrixView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return MatrixView(new_expr)
 
-    def integrate(self, **kwargs) -> "MatrixView":
+    def integrate(self, *args, **kwargs) -> "MatrixView":
         """Element-wise integral of each matrix component over the integration
         domain (not a matrix-algebra integral) — MatrixView preserved.
 
         Useful for things like the spatial average of an anisotropic
         diffusivity field.  Each ``[i, j]`` entry is integrated independently.
         """
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "MatrixView":
@@ -1732,11 +1732,11 @@ class VoigtView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return VoigtView(new_expr)
 
-    def integrate(self, **kwargs) -> "VoigtView":
+    def integrate(self, *args, **kwargs) -> "VoigtView":
         """Component-wise integral over the Voigt-packed tensor — VoigtView
         preserved; each Voigt slot is integrated independently.
         """
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "VoigtView":

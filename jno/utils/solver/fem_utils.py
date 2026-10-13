@@ -1104,9 +1104,14 @@ def _slot_gradient(slot, value_shape, dims):
     return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
 
 
-def _is_space_frozen(node) -> bool:
-    """A frozen field on its own element space (anything but P1 Lagrange): evaluated from a coefficient slot."""
-    return isinstance(node, FrozenField) and not (str(node.space).upper() == "LAGRANGE" and int(node.order) == 1)
+def _is_space_frozen(node, local=None) -> bool:
+    """A frozen field evaluated from a coefficient slot: one on its own element space (anything but P1
+    Lagrange), or any frozen field the caller put a slot in for (an integral over a domain does, for all)."""
+    if not isinstance(node, FrozenField):
+        return False
+    if local is not None and ("frozen", node.frozen_id) in (local.get("coef_fields") or {}):
+        return True
+    return not (str(node.space).upper() == "LAGRANGE" and int(node.order) == 1)
 
 
 def _field_hess(local, node):
@@ -1535,7 +1540,7 @@ def _eval_integrand(domain, node, local):
         return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)
 
     if isinstance(node, FrozenField):
-        if _is_space_frozen(node):
+        if _is_space_frozen(node, local):
             slot = _coef_slot(local, ("frozen", node.frozen_id), f"the frozen {node.space} field {node.name}")
             return _slot_value(slot, getattr(node, "value_shape", ()))
         # KNOWN field: interpolate its frozen nodal slice at the quad points, exactly like the
@@ -1578,7 +1583,7 @@ def _eval_integrand(domain, node, local):
                 return comps[0]
             return jnp.stack(comps, axis=-1)
 
-        if _is_space_frozen(node.target):
+        if _is_space_frozen(node.target, local):
             slot = _coef_slot(local, ("frozen", node.target.frozen_id), f"the frozen {node.target.space} field")
             return _slot_gradient(slot, getattr(node.target, "value_shape", ()), dims)
         if isinstance(node.target, FrozenField):
@@ -1635,7 +1640,7 @@ def _eval_integrand(domain, node, local):
                 if isinstance(field, TestFunction):
                     return g  # per-DOF directional derivative of the component
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
-            if ints and _is_space_frozen(field):  # a known coefficient field: its slot, the trial rule
+            if ints and _is_space_frozen(field, local):  # a known coefficient field: its slot, the trial rule
                 comp = ints[-1]
                 slot = _coef_slot(local, ("frozen", field.frozen_id), f"the frozen {field.space} field")
                 if slot["space"] != "Lagrange":

@@ -106,3 +106,18 @@ def test_boundary_integrand_is_refused():
     xb, yb, zb = cb[0], cb[1], cb[2]
     with pytest.raises(NotImplementedError, match="boundary"):
         fem.eval(inner(u.bind(x=xb, y=yb, z=zb), u.bind(x=xb, y=yb, z=zb)), a)
+
+
+def test_a_view_integrand_takes_the_fem():
+    """`.integrate(fem)` on a view (here a frozen P0 field makes the integrand a ScalarView) forwards the FEM,
+    like the bare expression; it used to accept keyword arguments only"""
+    d, xyz, u, v, A, V, E, curl, k, h, nc = _setup()
+    r, _s = d.fem_symbols(space="P0", names=("r0", "s0"))
+    half = r.bind(x=xyz[0], y=xyz[1], z=xyz[2]).freeze(np.full(nc, 0.5))
+    fem = jno.fem([inner(curl(u), curl(v)) + inner(A, V) - inner(E, V)])
+    integrand = half * inner(A, A)
+    node = integrand.integrate(fem, solver=jno.solve.lu(backend="host"))
+    F = jno.fn(lambda i: i, [node], name="F")
+    crux = jno.core([F], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    a = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
+    np.testing.assert_allclose(float(np.asarray(crux.eval([F])).reshape(-1)[0]), 0.5 * float(fem.eval(inner(A, A), a)), rtol=1e-10)

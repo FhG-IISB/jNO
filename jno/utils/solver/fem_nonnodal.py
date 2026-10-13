@@ -488,12 +488,7 @@ def assemble_fem_nonnodal(
     # --- quadrature for the polynomial degree in play. Degree 1 keeps the caller's rule untouched (the
     # lowest-order operators stay bit-identical); degree k needs the mass (degree 2k) exact plus room
     # for a coefficient, so the rule is raised to 2k + 2 when the caller's is lower. ---
-    def _coef_family(space, order):
-        """(family, degree) of a coefficient field's element, as `build_dofmap` names it"""
-        sp = str(space).upper()
-        if sp == "P0":
-            return "DG", 0
-        return {"LAGRANGE": "Lagrange", "DG": "DG"}.get(sp, sp), int(order)
+    from .fem_known import element_of as _coef_family
 
     # key -> (family, degree, value_shape) of every coefficient field on its own element space
     _coef_elems = {("param", n): tuple(_rt_param_exprs[n].model._fem_space) for n in _space_param_names}
@@ -565,6 +560,7 @@ def assemble_fem_nonnodal(
     # The per-cell transform tables, built HERE (eagerly) and held as plain tuples so `elem_map` lifts
     # their mesh-sized orientation arrays out of the compiled kernel rather than baking them in.
     from .fem_dofmap import transform_from_tables as _B_of
+    from .fem_known import coefficient_slot, coefficient_spec
 
     dm_tables = {i: (dm_.jax_tables(), int(dm_.ndof_local)) for i, dm_ in dofmaps.items() if not dm_.is_diagonal}
 
@@ -632,73 +628,38 @@ def assemble_fem_nonnodal(
     # `_coef_slots` pushes the basis forward exactly as `_cell_fields` does for an unknown of that space and
     # hands the evaluator a field slot with the KNOWN cell values in place of the solution, so the value
     # and the gradient of the coefficient follow the unknowns' conventions. ---
-    _coef_specs = {}
     _qp_np = np.asarray(ref_spec.quad_points)
-    for _key, (_fam, _k, _vs) in _coef_elems.items():
-        _dmc = _dofmap_for(_fam, _k)
-        _tab = _dmc.element.tabulate(1, _qp_np)
-        _edge = _fam in _EDGE_FAMILIES
-        _ncomp = 1 if _edge else int(np.prod(_vs)) if _vs else 1
-        if _edge:
-            _ref = (jnp.asarray(_tab[0]), jnp.asarray(np.stack([_tab[1 + a] for a in range(dim)], axis=-1)))
-            _pf = (piola_contravariant, piola_contravariant_grad) if _fam == "RT" else (piola_covariant, piola_covariant_grad)
-        else:
-            _ref = (jnp.asarray(_tab[0][..., 0]), jnp.asarray(np.stack([_tab[1 + a][..., 0] for a in range(dim)], axis=-1)))
-            _pf = None
-        _coef_specs[_key] = {
-            "fam": _fam,
-            "k": _k,
-            "vs": _vs,
-            "ncomp": _ncomp,
-            "n_vals": int(_dmc.n_dofs) * _ncomp,
-            "cdofs": jnp.asarray(_dmc.cell_dofs, dtype=jnp.int32),
-            "ref": _ref,
-            "piola": _pf,
-            "signs": jnp.asarray(_dmc.signs) if (_edge and _dmc.is_diagonal) else None,
-            "tables": None if _dmc.is_diagonal else (_dmc.jax_tables(), int(_dmc.ndof_local)),
-        }
-    _coef_frozen_vals = {}
-    for _f, _n in _frozen_space.items():
-        _sp = _coef_specs[("frozen", _f)]
-        _v = jnp.reshape(jnp.asarray(_n.values), (-1,))
-        if _v.shape[0] != _sp["n_vals"]:
-            raise ValueError(
-                f"jno.fem (non-nodal): a frozen {_sp['fam']}{_sp['k']} field coefficient needs one value per DOF of "
-                f"its space ({_sp['n_vals']}" + (f" = DOFs x {_sp['ncomp']} components" if _sp["ncomp"] > 1 else "")
-                + f"); got {_v.shape[0]}."
-            )
-        _coef_frozen_vals[("frozen", _f)] = _v
 
-    def _coef_slots(c, param_vals, pts_dyn):
+    def _coef_spec(fam, k, vs):
+        """DOF map, reference basis at the volume quadrature and Piola map of one coefficient element"""
+        return coefficient_spec(fam, k, vs, _dofmap_for(fam, k), _qp_np, dim)
+
+    def _frozen_coef_values(node, sp):
+        v = jnp.reshape(jnp.asarray(node.values), (-1,))
+        if v.shape[0] != sp["n_vals"]:
+            raise ValueError(
+                f"jno.fem (non-nodal): a frozen {sp['fam']}{sp['k']} field coefficient needs one value per DOF of "
+                f"its space ({sp['n_vals']}" + (f" = DOFs x {sp['ncomp']} components" if sp["ncomp"] > 1 else "")
+                + f"); got {v.shape[0]}."
+            )
+        return v
+
+    _coef_specs = {key: _coef_spec(*elem) for key, elem in _coef_elems.items()}
+    _coef_frozen_vals = {("frozen", f): _frozen_coef_values(n, _coef_specs[("frozen", f)]) for f, n in _frozen_space.items()}
+
+    def _coef_slots(c, param_vals, pts_dyn, specs=None, frozen_vals=None):
         """This cell's coefficient-field slots ``{key: field slot}`` (the `_cell_fields` dict layout)."""
-        if not _coef_specs:
+        specs = _coef_specs if specs is None else specs
+        frozen_vals = _coef_frozen_vals if frozen_vals is None else frozen_vals
+        if not specs:
             return None
         verts = (pts if pts_dyn is None else pts_dyn)[cells_j[c]]
         J = jnp.stack([verts[k_] - verts[0] for k_ in range(1, dim + 1)], axis=1)
         detJ = small_det(J)
-        out = {}
-        for key, sp in _coef_specs.items():
-            g = _coef_frozen_vals[key] if key[0] == "frozen" else param_vals[key[1]]
-            loc = sp["cdofs"][c]
-            cv = g[loc] if sp["ncomp"] == 1 else jnp.reshape(g, (-1, sp["ncomp"]))[loc]
-            rv, rg = sp["ref"]
-            if sp["tables"] is not None:  # degree k: the per-cell DOF transform mixes each entity's DOFs
-                Bc = _B_of(sp["tables"][0], sp["tables"][1], c)
-                rv = jnp.einsum("ij,qj...->qi...", Bc, rv)
-                rg = jnp.einsum("ij,qj...->qi...", Bc, rg)
-            if sp["piola"] is not None:  # H(curl) / H(div): Piola map with the orientation signs
-                sg = sp["signs"][c] if sp["signs"] is not None else jnp.ones((rv.shape[1],), rv.dtype)
-                pf, pgf = sp["piola"]
-                phi, _d = pf(rv, jnp.zeros(rv.shape[:2], rv.dtype), J, detJ, sg)
-                out[key] = {"shape_vals": phi, "shape_grads": pgf(rg, J, detJ, sg), "cell_sol": cv, "space": sp["fam"]}
-            else:  # Lagrange / DG: scalar basis, the isoparametric chain rule for the gradient
-                out[key] = {
-                    "shape_vals": rv,
-                    "shape_grads": rg @ small_inv(J),
-                    "cell_sol": cv[:, None] if cv.ndim == 1 else cv,
-                    "space": "Lagrange",
-                }
-        return out
+        return {
+            key: coefficient_slot(sp, frozen_vals[key] if key[0] == "frozen" else param_vals[key[1]], c, J, detJ)
+            for key, sp in specs.items()
+        }
 
     # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris/Morley need it for the global
     # id + orientation of their edge-normal DOFs (Hermite, pure-vertex, does not).
@@ -2065,6 +2026,26 @@ def assemble_fem_nonnodal(
         typed = [
             (_lower_statefield_to_trial(bare, {}), tuple(sorted(_collect_region_mask_names(bare)))) for bare in terms
         ]
+        # known fields the INTEGRAND reads but the form does not (a mask, a weight, a source field read back):
+        # their slots / vertex gathers are built here, for this functional only
+        _extra = {f_: n_ for f_, n_ in _collect_frozen_fields(list(terms)).items() if f_ not in _frozen_all}
+        f_specs, f_vals, f_gath = dict(_coef_specs), dict(_coef_frozen_vals), dict(_frozen_gathered)
+        for f_, n_ in _extra.items():
+            if str(n_.space).upper() == "LAGRANGE" and int(n_.order) == 1:
+                fv = jnp.asarray(n_.values)
+                if fv.shape[0] != n_verts:
+                    raise ValueError(
+                        f"fem.eval / expr.integrate(fem): a frozen P1 field needs one value per mesh vertex ({n_verts}); "
+                        f"got {fv.shape[0]}."
+                    )
+                f_gath[f_] = fv[cells_j].reshape(n_cells, cells_j.shape[1], 1) if fv.ndim == 1 else fv[cells_j]
+            else:
+                key = ("frozen", f_)
+                f_specs[key] = _coef_spec(*(_coef_family(n_.space, n_.order) + (tuple(n_.value_shape),)))
+                f_vals[key] = _frozen_coef_values(n_, f_specs[key])
+
+        _b0 = 1.0 - qp[:, 0] - qp[:, 1] - (qp[:, 2] if dim == 3 else 0.0)
+        _p1_tab = jnp.stack([_b0, qp[:, 0], qp[:, 1]] + ([qp[:, 2]] if dim == 3 else []), axis=1)
 
         def functional(u_flat, t=0.0, args=None):
             u_blocks = [u_flat[offs[i] : offs[i + 1]] for i in range(len(fields))]
@@ -2101,12 +2082,12 @@ def assemble_fem_nonnodal(
                         "region_mask_names": _rn,
                         "volume_vars": vol_vars + _cell_masks(c, _rn),
                     }
-                    if _field_param_names or _frozen_gathered:
-                        local["shape_vals"] = p1_shape_vals
-                    if _frozen_gathered:
-                        local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
-                    if _coef_specs:
-                        local["coef_fields"] = _coef_slots(c, field_vals, _p)
+                    if _field_param_names or f_gath:
+                        local["shape_vals"] = p1_shape_vals if p1_shape_vals is not None else _p1_tab
+                    if f_gath:
+                        local["frozen_fields"] = {fid: g[c] for fid, g in f_gath.items()}
+                    if f_specs:
+                        local["coef_fields"] = _coef_slots(c, field_vals, _p, f_specs, f_vals)
                     if _nt is not None:
                         local["neural_coefficients"] = _nt
                     val = _integrate_term(domain, e, local, qw * meas)

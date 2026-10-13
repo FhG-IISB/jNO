@@ -2449,6 +2449,42 @@ class domain(MeshIOMixin):
         self._region_attachments = attached
         self._attachment_kind = kinds
 
+    def _integral_node(self, expr, solver=None):
+        """``expr.integrate(d)``: the integral over this domain's volume of an expression of KNOWN fields --
+        frozen data, frozen solutions (``u.bind(...).freeze(fem.solve())``, any number of forms), parameters,
+        coordinates, region masks -- as a differentiable scalar node for ``jno.core``::
+
+            Phi = [phi.bind(x=x, y=y).freeze(f.solve()) for f in fems]
+            C01 = (eps * inner(grad(Phi[0]), grad(Phi[1]))).integrate(d)      # C_01 = ∫ ε ∇φ_0 · ∇φ_1
+
+        Each field is evaluated with its own element (any space); the rule is the simplex quadrature of
+        degree 2k for fields of degree k. Whole volume only; the mesh is static (no trainable coordinates).
+        An expression with an unknown (trial / test function) is a form, not this: integrate it over its
+        form with ``expr.integrate(fem)``."""
+        from ..trace import FunctionCall
+        from ..utils.solver.fem_known import domain_functional
+
+        if solver is not None:
+            raise TypeError(
+                "expr.integrate(domain, solver=...): an integral over a domain runs no solve; pick the solver "
+                "where the solution is made, `u.freeze(fem.solve(linear=...))`."
+            )
+        from .._fem import _region_and_support, _retag_coords_for_quadrature
+
+        bare = getattr(expr, "expr", expr)
+        try:
+            support, region = _region_and_support(expr, self, integrand=True)
+        except Exception:  # noqa: BLE001  -- an integrand of frozen fields alone names no coordinate region
+            support, region = "volume", "volume"
+        if support != "volume" or region != "volume":
+            raise NotImplementedError(
+                f"expr.integrate(domain): over the whole volume only; this integrand lives on {region!r}."
+            )
+        _retag_coords_for_quadrature(expr, "volume", "volume")
+        fn, inputs = domain_functional(self, bare)
+        keys = [k for k, _n in inputs]
+        return FunctionCall(lambda *vals: fn(dict(zip(keys, vals))), [n for _k, n in inputs], name="domain_integral")
+
     def attach(self, target: str | None = None, **props):
         """Declare material properties on an existing **region or boundary tag**, after the domain is built.
 
