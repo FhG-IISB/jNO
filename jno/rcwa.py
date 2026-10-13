@@ -1535,6 +1535,11 @@ def _source_dof_coords(domain, n_dof):
     pts = np.asarray(domain.points)
     if n_dof == len(pts):
         return pts  # nodal (scalar Helmholtz)
+    _topo = getattr(domain, "_fem_nonnodal_topology", None) or {}
+    _dm = _topo.get("dofmap")
+    if _dm is not None and int(_dm.n_dofs) == n_dof and _dm.degree > 1:
+        # a degree-k H(curl) field: each DOF sits on an edge, face or cell -- use that entity's centroid
+        return _dm.dof_entity_centroids(pts[:, : _dm.tdim])
     from jno.utils.solver.fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES, build_edge_topology
 
     dim = getattr(domain, "dimension", 3)
@@ -1544,7 +1549,7 @@ def _source_dof_coords(domain, n_dof):
         return pts[np.asarray(topo.edge_vertices)].mean(axis=1)
     raise RcwaError(
         f"cannot map the {n_dof} forcing DOFs to coordinates (mesh has {len(pts)} vertices, "
-        f"{topo.n_edges} edges); RCWA source-face detection supports nodal (Lagrange) and N1E fields."
+        f"{topo.n_edges} edges); RCWA source-face detection supports nodal (Lagrange) and N1E (any degree) fields."
     )
 
 

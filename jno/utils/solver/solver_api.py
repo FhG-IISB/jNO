@@ -385,6 +385,82 @@ def _record_unconverged(rel, who: str, side: str):
     raise RuntimeError(msg)
 
 
+#: Krylov iteration counts of the linear solves the last ``fem.solve`` ran, in the order they finished:
+#: ``[{"who", "side", "iterations"}, ...]`` (#104). ``iterations`` is ``None`` for a solver whose loop does not
+#: expose a count (upstream ``jax.scipy`` GMRES), and an entry carries ``"breakdown": True`` when BiCGStab
+#: stopped on one. Written by :func:`record_iterations` -- one host callback per solve, never per iteration --
+#: and read by ``fem.stats`` once the result is concrete.
+LAST_LINEAR_STATS: list = []
+
+
+def _append_uncounted(_dummy, who: str, side: str):
+    LAST_LINEAR_STATS.append({"who": who, "side": side, "iterations": None, "note": "not counted"})
+
+
+def _append_iterations(k, broke, who: str, side: str):
+    k = np.asarray(k)
+    entry = {"who": who, "side": side, "iterations": int(k) if k.ndim == 0 else k.astype(int).tolist()}
+    if broke is not None and bool(np.any(np.asarray(broke))):
+        entry["breakdown"] = True
+    LAST_LINEAR_STATS.append(entry)
+
+
+from jax._src import config as _jax_config  # noqa: E402 -- a jit-keyed config state (see below)
+
+#: Whether a solve TRACED now records its iteration count (one host callback per solve). OFF by default and
+#: switched on by ``fem.solve`` only around an eager, steady, non-adaptive solve -- so a march's compiled
+#: step, a deferred node evaluated under ``jno.core``, and a solver called directly carry no callback.
+#: A JAX config state with ``include_in_jit_key``: the switch is part of every jit cache key, so a program
+#: compiled with the callback is never reused where recording is off (a plain Python flag would be baked
+#: into whichever trace happened first and leak into the other context through the cache).
+_RECORD_ITERATIONS = _jax_config.bool_state(
+    "jno_record_linear_iterations",
+    False,
+    "jNO: record Krylov iteration counts for fem.stats (set by fem.solve; not a user option).",
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
+
+
+def iterations_recorded(on: bool = True):
+    """Context manager: solves traced inside record (``on``) or do not record their iteration counts."""
+    return _RECORD_ITERATIONS(bool(on))
+
+
+def iterations_suspended():
+    """No iteration counts for solves traced inside: a march (its step makes no host call; its record is
+    ``fem.stats["march"]``). Recording is off by default; this keeps a march off even inside a recording solve."""
+    return _RECORD_ITERATIONS(False)
+
+
+def record_iterations(k, who: str, *, side: str = "forward", broke=None):
+    """Record a linear solve's iteration count ``k`` for ``fem.stats`` -- eagerly, or from inside a trace.
+
+    A traced count reaches the host through one ``jax.debug.callback`` per solve: the solve's ``x``-only
+    return contract is untouched, and the loop itself carries nothing new. ``k=None`` records a solve whose
+    count is not available, so its absence is reported rather than silently omitted. Suspended (like the
+    residual gate) inside a preconditioner application, which is an inner iteration, not a solve.
+
+    Cost: the callback is a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU) per solve, measured on the default
+    Jacobi-BiCGStab -- +7-11% on a 790-DOF solve, unmeasurable (1.000x) at 46,691 DOFs."""
+    if _GATE_SUSPENDED or not _RECORD_ITERATIONS.value:
+        return
+    if k is None:
+        # Still at RUN time: this is usually called while a solve is traced, and a solve traced (the
+        # transpose of a custom_linear_solve) is not a solve run, nor is a cached program re-traced.
+        from jax._src import core as _core
+
+        if _core.trace_state_clean():
+            _append_uncounted(None, who, side)
+        else:
+            jax.debug.callback(_append_uncounted, jnp.zeros(()), who, side)
+        return
+    if not any(isinstance(v, jax.core.Tracer) for v in (k, broke)):
+        _append_iterations(k, broke, who, side)
+        return
+    jax.debug.callback(_append_iterations, k, broke, who, side)
+
+
 def clear_gate_failures():
     """Drop anything recorded by an earlier solve, so a drain cannot report a stale failure."""
     _GATE_FAILURES.clear()

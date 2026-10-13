@@ -341,8 +341,8 @@ def _bisect_slope(f, x, delta, *, atol, rtol, max_iters, dtype):
     return jnp.where(s0 * s1 > 0.0, jnp.ones((), dtype), lam)
 
 
-def bicgstab(matvec, b, *, tol=1e-10, maxit=2000):
-    """Matrix-free BiCGStab; returns ``x`` solving ``matvec(x) = b`` (general matrices)."""
+def bicgstab(matvec, b, *, tol=1e-10, maxit=2000, return_iters=False):
+    """Matrix-free BiCGStab; returns ``x`` solving ``matvec(x) = b`` (general matrices), or ``(x, k)``."""
     bnorm = jnp.linalg.norm(b)
 
     def cond(s):
@@ -385,8 +385,8 @@ def bicgstab(matvec, b, *, tol=1e-10, maxit=2000):
     one = jnp.array(1.0, b.dtype)
     x0 = jnp.zeros_like(b)
     state = (x0, b - matvec(x0), b, one, one, one, z, z, 0)
-    x, *_ = jax.lax.while_loop(cond, body, state)
-    return x
+    x, *_, k = jax.lax.while_loop(cond, body, state)
+    return (x, k) if return_iters else x
 
 
 def _gated(solve, who: str, side: str):
@@ -416,10 +416,17 @@ def _linsolve(matvec, b, *, tol, maxit, gate_forward=True):
 
     ``gate_forward=False`` for the solve that produces a NEWTON STEP: see :func:`_step_and_tangent`.
     The transpose is gated either way -- it is only ever a gradient."""
-    solve = lambda mv, rhs: bicgstab(mv, rhs, tol=tol, maxit=maxit)
+    from .solver_api import record_iterations
+
     who = "the newton_krylov inner BiCGStab"
+
+    def solve(mv, rhs, _side="forward"):
+        x, k = bicgstab(mv, rhs, tol=tol, maxit=maxit, return_iters=True)
+        record_iterations(k, who, side=_side)  # one per Newton step: the count fem.stats reports (#104)
+        return x
+
     fwd = _gated(solve, who, "forward") if gate_forward else solve
-    rescued = lambda mv, rhs: _with_gmres_rescue(mv, rhs, bicgstab(mv, rhs, tol=tol, maxit=maxit), tol=tol)
+    rescued = lambda mv, rhs: _with_gmres_rescue(mv, rhs, solve(mv, rhs, "transpose"), tol=tol)
     return jax.lax.custom_linear_solve(matvec, b, fwd, transpose_solve=_gated(rescued, who, "transpose"))
 
 
@@ -650,18 +657,19 @@ def assembled_krylov_solve(tol=1e-10, maxit=2000):
     def solve(J, b, rtol=None):
         """``rtol`` (traced allowed) overrides ``tol`` for this solve -- an inexact-Newton forcing term."""
         from ..._fem import _bicgstab_jacobi
+        from .krylov import bicgstab_counted
         from .krylov import gmres as _scaled_gmres
         from .linear import jacobi, sparse_matvec
+        from .solver_api import record_iterations
 
         b = jnp.asarray(b).reshape(-1)
         if rtol is None:
             tol_ = float(tol)
-            x = _bicgstab_jacobi(J, b, tol_, int(maxit))
+            x, k, broke = _bicgstab_jacobi(J, b, tol_, int(maxit))
         else:  # a traced forcing term cannot be the compiled helper's STATIC tolerance; same iteration
             tol_ = rtol
-            x = jax.scipy.sparse.linalg.bicgstab(sparse_matvec(J), b, tol=tol_, atol=0.0, maxiter=int(maxit), M=jacobi(J))[
-                0
-            ]
+            x, k, broke = bicgstab_counted(sparse_matvec(J), b, tol=tol_, atol=0.0, maxiter=int(maxit), M=jacobi(J))
+        record_iterations(k, "assembled_krylov_solve (Jacobi BiCGStab)", broke=broke)
         mv = sparse_matvec(J)
         eps = float(jnp.finfo(b.dtype).eps)
         r_rel = jnp.linalg.norm(mv(x) - b) / jnp.maximum(jnp.linalg.norm(b), eps)

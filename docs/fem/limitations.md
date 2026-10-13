@@ -39,7 +39,7 @@ path is unaffected.
 | `symmetric=True` matrix fields | native 2-D/3-D Lagrange only — not 1-D, VPINN, periodic ties, complex, or mixed with a non-nodal family; a time-varying whole-tensor Dirichlet value is not mapped to the stored values (write it per entry); an asymmetric whole-tensor value is refused | raises |
 | Constant unknowns (`constant=True`) | native 2-D/3-D Lagrange only; a tie `u(region) - U` on steady linear/nonlinear forms only, and not together with a periodic tie, a moving slip surface, a node that both slips and is tied in the same component, or a hanging-node mesh; `U - g` takes a value that does not depend on position; `jno.fdm` has no constants | raises |
 | `d.unknown(...)` in `jno.fdm` | a real P1 nodal unknown with full storage; `order=2`, a non-nodal `space=`, `complex=True`, `symmetric=True` or `constant=True` make it FEM-only | raises |
-| Adapting a moving mesh | `relocate` fails on two separate bodies (use `alpha`); `enrich()` (p) is not wired; `checkpoint=` needs `adapt=`; runtime connectivity is affine-simplex only | raises |
+| Adapting a moving mesh | `relocate` fails on two separate bodies (use `alpha`); `enrich()` (p) is not wired; `checkpoint=` on a moving mesh needs `adapt=`, and a checkpointed march cannot be differentiated; runtime connectivity is affine-simplex only | raises |
 | Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
 | FEM functionals (`fem.eval(F, u)` with a test-free `F`, `expr.integrate(fem)`) | steady, native Lagrange; the whole volume or a tagged boundary region — not a sub-region; not transient, complex, 1-D, non-nodal or VPINN (use `sum(fem.eval(F * phi, u))` there) | raises |
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
@@ -106,8 +106,11 @@ path is unaffected.
     any other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g`
     through the solve's / each step's `custom_root` (nonlinear / transient).
 
-    Refused loudly: a value that is **both** parametric and t/τ-dependent (`u(top) - g*tau`). Train
-    the amplitude through a Neumann / body term instead. A parametric wall **beside** a τ-ramped one
+    A value that is **both** parametric and t/τ-dependent is held at each step's t/τ WITH the runtime
+    parameters, on a first-order transient and on a τ load-path march (`u(top)[1] - g*tau`,
+    displacement control with a trainable grip). Refused loudly on a second-order (`u.tt`) form, whose
+    block evaluates the value and its rate without them: train that amplitude through a Neumann / body
+    term instead. A parametric wall **beside** a τ-ramped one
     (`u(left) - g` with `u(right) - delta*tau`) is fine on the load path: both are held at every step.
     A t/τ-dependent essential value needs steps to be held at: on a steady form that reads no step
     history (`.i(k)`), and so does not march its `domain(tau=...)` grid, it is refused, with or without
