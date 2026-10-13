@@ -606,6 +606,11 @@ def one_sweep(monkeypatch):
     import jno.utils.solver.newton_krylov as nk
 
     monkeypatch.setattr(nk, "_convergence_check", lambda f0, u0, u, **k: u)
+    # A parametric solve is jitted and judged afterwards, outside the driver; one sweep is not a root
+    # either, so that verdict (which raises) is switched off too.
+    import jno.utils.solver.solver_api as sa
+
+    monkeypatch.setattr(sa, "record_nonlinear_verdict", lambda *a, **k: (None, None, None))
 
     def run(fem, fields, **kw):
         out = fem.solve(nonlinear=jno.solve.staggered(fields, max_sweeps=1, over_relax=OMEGA), **kw)

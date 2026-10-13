@@ -53,7 +53,23 @@ def _judge(rn, bound, *, rtol, atol, max_steps, who, steps, factorizations=None)
     )
     if factorizations is not None:
         LAST_NEWTON_STATS["factorizations"] = int(factorizations)
-    if not math.isfinite(rn) or rn > bound:
+    if not math.isfinite(rn):
+        # A NaN residual ends the loop at once (`nan > bound` is False), so "raise max_steps" would be the
+        # wrong advice. On a sparse-direct path the usual source is a singular tangent: JAX's sparse LU
+        # (SuperLU on the CPU) answers an exactly singular operator with NaN instead of raising.
+        from .linear import SINGULAR_HINTS
+
+        after = "" if steps is None else f" after {steps} step(s)"
+        raise RuntimeError(
+            f"{who} did not converge: it produced a non-finite residual ({rn}){after}, so the iterate is "
+            "NOT a root. On a "
+            "sparse-direct Newton (newton(direct=True), linear=jno.solve.lu()) the usual cause is a "
+            "singular tangent: the sparse LU returns NaN for an exactly singular operator. A tangent can "
+            f"be singular at the start alone (a term like u**3 at u0 = 0): then start from a better x0. "
+            f"Otherwise: {SINGULAR_HINTS} A residual that is itself non-finite (a log or a division "
+            "at the iterate) gives the same symptom."
+        )
+    if rn > bound:
         raise RuntimeError(
             f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
             f"tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, rtol={rtol:g}). The last "
