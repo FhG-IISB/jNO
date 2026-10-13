@@ -155,6 +155,13 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--dry", action="store_true", help="only print the estimate and the command")
     ap.add_argument("--reparse", action="store_true", help="parse the saved kernels_<stage>.csv instead of running")
+    ap.add_argument(
+        "--deep",
+        default=None,
+        metavar="KERNEL_REGEX",
+        help="ONE kernel (name regex) with ncu's full section set: warp stalls, instruction mix, memory "
+        "chart, occupancy limiters, SASS hot spots; written as kernels_<stage>_deep.csv/.json",
+    )
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--" not in argv:
         ap.error("give the program to run after --")
@@ -181,7 +188,11 @@ def main(argv=None):
     # solve) need the NVTX range of their stage.
     names = sorted({k["name"] for k in ks})
     xla_named = all("::" not in n and "<" not in n for n in names)
-    if xla_named:
+    if a.deep:
+        rep += "_deep"
+        ncu = ["ncu", "-k", "regex:" + a.deep, "--set", "full", "--csv", "--page", "raw", "-c", str(a.launches or 2)]
+        groups = ["deep"]
+    elif xla_named:
         ncu = [
             "ncu",
             "-k",
@@ -221,8 +232,98 @@ def main(argv=None):
         raise SystemExit(f"ncu failed ({r.returncode}) after {dt:.0f} s:\n{r.stderr[-2000:]}")
     with open(rep + ".csv", "w") as fh:
         fh.write(r.stdout[r.stdout.index('"ID"') :])
-    recs = parse_csv(r.stdout)
+    recs = parse_csv(r.stdout) if not a.deep else parse_deep(r.stdout)
+    if a.deep:
+        with open(rep + ".json", "w") as fh:
+            json.dump({"stage": a.stage, "kernel": a.deep, "wall_s": dt, "launches": recs}, fh, indent=1)
+        print(f"{len(recs)} launches with the full set in {dt:.0f} s -> {rep}.json", flush=True)
+        print(deep_summary(recs))
+        return
     _write(rep, a.stage, groups, recs, dt)
+
+
+DEEP = {  # metric -> short name; the full set's columns that answer "why is this kernel where it is"
+    "gpu__time_duration.sum": "time",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": "sm_pct",
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed": "mem_pct",
+    "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active": "fp64_pipe_pct",
+    "sm__inst_executed_pipe_fp64.avg.pct_of_peak_sustained_active": "fp64_issue_pct",
+    "sm__inst_executed_pipe_alu.avg.pct_of_peak_sustained_active": "alu_pct",
+    "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active": "lsu_pct",
+    "sm__warps_active.avg.pct_of_peak_sustained_active": "occupancy_pct",
+    "sm__maximum_warps_per_active_cycle_pct": "occupancy_theoretical_pct",
+    "launch__registers_per_thread": "regs",
+    "launch__shared_mem_per_block_static": "smem_static_B",
+    "launch__shared_mem_per_block_dynamic": "smem_dynamic_B",
+    "launch__occupancy_limit_registers": "occ_limit_regs",
+    "launch__occupancy_limit_shared_mem": "occ_limit_smem",
+    "launch__occupancy_limit_warps": "occ_limit_warps",
+    "smsp__average_warp_latency_per_inst_issued.ratio": "cycles_per_issue",
+    "smsp__issue_active.avg.pct_of_peak_sustained_active": "issue_active_pct",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum": "smem_bank_conflicts",
+    "l1tex__t_sector_hit_rate.pct": "l1_hit_pct",
+    "lts__t_sector_hit_rate.pct": "l2_hit_pct",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": "dram_pct",
+    "l1tex__throughput.avg.pct_of_peak_sustained_active": "l1_pct",
+    "lts__throughput.avg.pct_of_peak_sustained_elapsed": "l2_pct",
+    "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct": "global_ld_efficiency_pct",
+    "smsp__thread_inst_executed_per_inst_executed.ratio": "threads_per_inst",
+    "sm__sass_thread_inst_executed_op_dfma_pred_on.sum": "dfma",
+}
+STALL_PREFIX = "smsp__average_warps_issue_stalled_"  # ..._per_issue_active.ratio: warps stalled per issue, by reason
+
+
+def parse_deep(text: str):
+    """One record per launch from the full set: the DEEP metrics plus every warp-stall reason (per issue)."""
+    rows = list(csv.reader(io.StringIO(text[text.index('"ID"') :])))
+    hdr, units = rows[0], rows[1]
+    out = []
+    for r in rows[2:]:
+        if not r or not r[0]:
+            continue
+        rec = {"id": int(r[0]), "kernel": r[hdr.index("Kernel Name")], "stalls": {}}
+        for i, (h, v) in enumerate(zip(hdr, r)):
+            v = v.replace(",", "")
+            if h in DEEP:
+                try:
+                    rec[DEEP[h]] = float(v) * (
+                        UNIT.get(units[i], 1.0) if DEEP[h] in ("time", "smem_static_B", "smem_dynamic_B") else 1.0
+                    )
+                except ValueError:
+                    rec[DEEP[h]] = v
+            elif h.startswith(STALL_PREFIX) and h.endswith("_per_issue_active.ratio"):
+                try:
+                    rec["stalls"][h[len(STALL_PREFIX) : -len("_per_issue_active.ratio")]] = float(v)
+                except ValueError:
+                    pass
+        out.append(rec)
+    return out
+
+
+def deep_summary(recs) -> str:
+    lines = []
+    for rec in recs:
+        g = lambda k, f="{:.0f}": f.format(rec[k]) if isinstance(rec.get(k), float) else "?"
+        lines.append(f"  {rec['kernel'][:70]}  {rec.get('time', 0) * 1e3:.1f} ms")
+        lines.append(
+            f"    SM {g('sm_pct')} %, memory {g('mem_pct')} %, FP64 pipe {g('fp64_pipe_pct')} % (issue {g('fp64_issue_pct')} %), "
+            f"ALU {g('alu_pct')} %, LSU {g('lsu_pct')} %; issue slots active {g('issue_active_pct')} %, "
+            f"{g('cycles_per_issue', '{:.1f}')} cycles per issued instruction per warp"
+        )
+        lines.append(
+            f"    occupancy {g('occupancy_pct')} % of a theoretical {g('occupancy_theoretical_pct')} %: limits regs {g('occ_limit_regs')}, "
+            f"smem {g('occ_limit_smem')}, warps {g('occ_limit_warps')} (blocks/SM); {g('regs')} regs/thread, "
+            f"smem {rec.get('smem_static_B', 0) + rec.get('smem_dynamic_B', 0):.0f} B/block"
+        )
+        lines.append(
+            f"    L1 hit {g('l1_hit_pct')} %, L2 hit {g('l2_hit_pct')} %, L1 {g('l1_pct')} % / L2 {g('l2_pct')} % / DRAM {g('dram_pct')} % of peak; "
+            f"global loads {g('global_ld_efficiency_pct')} % of fetched bytes used; smem bank conflicts {g('smem_bank_conflicts', '{:.3g}')}; "
+            f"{g('threads_per_inst', '{:.1f}')} of 32 threads active per instruction"
+        )
+        st = sorted(rec["stalls"].items(), key=lambda kv: -kv[1])
+        tot = sum(v for _, v in st) or 1.0
+        lines.append("    warp stalls per issue: " + ", ".join(f"{k} {v:.1f} ({100 * v / tot:.0f} %)" for k, v in st[:7]))
+    return "\n".join(lines)
 
 
 def _write(rep, stage, groups, recs, dt):
