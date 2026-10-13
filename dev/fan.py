@@ -36,6 +36,7 @@ def load(run_dir, x_key="cells"):
     return dict(
         x=x,
         label=d["label"],
+        launches=sum(k["count"] for k in d["kernels"]),
         stages=stages,
         total_ms=float(np.median(d["l0"]["steady_s"]) * 1e3),
         pool_gb=d["l0"]["pool_peak_gb"],
@@ -133,6 +134,14 @@ def main(argv=None):
     with open(os.path.join(out_dir, "fan.json"), "w") as fh:
         json.dump(out, fh, indent=1)
     print(f"{len(runs)} runs, x = {[r['x'] for r in sorted(runs, key=lambda r: r['x'])]}")
+    big = max(runs, key=lambda r: r["x"])
+    floor_ms = big["launches"] * 4e-3
+    if floor_ms > 0.3 * big["total_ms"]:
+        print(
+            f"  NOTE: the largest run is launch-dominated ({big['launches']:,} launches, floor ~{floor_ms:.1f} ms of "
+            f"{big['total_ms']:.1f} ms): the exponents are below their asymptotic values; sweep larger sizes"
+        )
+        out["launch_dominated"] = True
     for s, v in out["stages"].items():
         print(f"  {s:20s} ~ n^{v['exponent']:.2f}" + (f", {v['ms_at_target']:.0f} ms at {a.target:g}" if a.target else ""))
     for k, v in out["memory"].items():

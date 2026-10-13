@@ -144,12 +144,6 @@ def parse_csv(text: str):
     return recs
 
 
-def from_report(rep: str):
-    """Parse an existing .ncu-rep (no rerun)."""
-    r = subprocess.run(["ncu", "--import", rep, "--csv", "--page", "raw"], capture_output=True, text=True)
-    return parse_csv(r.stdout)
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run", help="dev/runs/<label> of a profiled run (its run.json picks the kernels)")
@@ -160,7 +154,7 @@ def main(argv=None):
     ap.add_argument("--budget", type=float, default=120.0, help="refuse an estimated replay above this many seconds")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--dry", action="store_true", help="only print the estimate and the command")
-    ap.add_argument("--reparse", action="store_true", help="parse the existing .ncu-rep of this stage instead of running")
+    ap.add_argument("--reparse", action="store_true", help="parse the saved kernels_<stage>.csv instead of running")
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--" not in argv:
         ap.error("give the program to run after --")
@@ -170,7 +164,8 @@ def main(argv=None):
     tag = a.stage.replace("/", "_")
     rep = os.path.join(a.run, f"kernels_{tag}")
     if a.reparse:
-        recs = from_report(rep + ".ncu-rep")
+        with open(rep + ".csv") as fh:
+            recs = parse_csv(fh.read())
         _write(rep, a.stage, groups, recs, float("nan"))
         return
     ks, n, passes, est = estimate(os.path.join(a.run, "run.json"), a.stage, groups, a.top, a.launches)
@@ -178,22 +173,9 @@ def main(argv=None):
     if est > a.budget and not a.force:
         raise SystemExit(f"above the budget of {a.budget:.0f} s: use --top, --launches, fewer --metrics, or --force")
     metrics = ",".join(m for g in groups for m, _ in METRICS[g])
-    ncu = [
-        "ncu",
-        "--nvtx",
-        "--nvtx-include",
-        nvtx_regex(a.stage),
-        "--metrics",
-        metrics,
-        "--csv",
-        "--page",
-        "raw",
-        "--import-sass",
-        "0",
-        "-f",
-        "-o",
-        rep,
-    ]
+    # no report file (-o): with --nvtx a report grows by tens of MB per launch (XLA registers thousands of NVTX
+    # strings); the CSV on stdout is all the harness needs and is kept as kernels_<stage>.csv
+    ncu = ["ncu", "--nvtx", "--nvtx-include", nvtx_regex(a.stage), "--metrics", metrics, "--csv", "--page", "raw"]
     if a.launches:
         ncu += ["-c", str(a.launches)]
     if a.top:  # select the kinds by kernel name regex
@@ -215,6 +197,8 @@ def main(argv=None):
     )
     if r.returncode != 0 and '"ID"' not in r.stdout:
         raise SystemExit(f"ncu failed ({r.returncode}) after {dt:.0f} s:\n{r.stderr[-2000:]}")
+    with open(rep + ".csv", "w") as fh:
+        fh.write(r.stdout[r.stdout.index('"ID"') :])
     recs = parse_csv(r.stdout)
     _write(rep, a.stage, groups, recs, dt)
 
