@@ -663,6 +663,11 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_
             # one factorization it needs is the fast one, and every Arnoldi step reuses it.
             Ms = Bs if Bs is not None else sp.identity(n, format="csr", dtype=As.dtype)
             opinv = _arnoldi_opinv((As - sigma * Ms).tocoo(), backend, np, spla)
+        # A fixed start vector: without one ARPACK draws its own, from a seed that advances with every
+        # call in the process, so the same solve could fail (ARPACK error 1 on a defective spectrum,
+        # seen on CI only) depending on what ran before it. Random, not ones(n): a constant vector is
+        # an exact eigenvector of many FEM operators and would leave the rest of the spectrum unseen.
+        v0 = np.random.default_rng(0).standard_normal(n).astype(As.dtype)
         try:
             lam, V = spla.eigs(
                 As,
@@ -670,6 +675,7 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_
                 M=Bs,
                 sigma=sigma,
                 which="LM" if sigma is not None else _which_code(which),
+                v0=v0,
                 tol=tol,
                 maxiter=maxiter,
                 OPinv=opinv,
