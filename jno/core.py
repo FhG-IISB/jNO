@@ -538,6 +538,17 @@ def _extract_user_name(orig_expr) -> str | None:
     return None
 
 
+
+def _release_idle_solver_memory() -> None:
+    """Between two compiled programs: free the factors of the extra cuDSS slots a program left behind (a form
+    solved more than once in it). Each solve keeps its factors for its own adjoint, so inside a program they
+    are needed; after it they only pile up, across the gradient, a hook's Jacobian and an evaluation, until the
+    card runs out (measured: 12 slots on two forms in one MMA step). A no-op unless that path was used."""
+    from .utils.solver import linear as _lin
+
+    if _lin._LDL_PLANS:
+        _lin.release_idle_ldl()
+
 class core:
     """core solver using traced operations."""
 
@@ -4463,6 +4474,7 @@ class core:
                                 _micro_grads,
                             )
                         _acc_total = _acc_total + float(jax.device_get(_micro_loss)) * _inv_accum
+                        _release_idle_solver_memory()
                         _acc_losses = _acc_losses + _micro_indiv * _inv_accum
 
                     # Apply on_before_update hooks to accumulated gradients.
@@ -4509,6 +4521,7 @@ class core:
                     if _has_before_update_hooks:
                         # Split path: grad → on_before_update hooks → apply.
                         _hgrads, self.rng, total_loss, individual_losses = jit_hook_grad(trainable, self.rng, context)
+                        _release_idle_solver_memory()
                         for _cb in callbacks:
                             if type(_cb).on_before_update is not _Callback.on_before_update:
                                 _modified = _cb.on_before_update(
@@ -4522,6 +4535,7 @@ class core:
                                 )
                                 if _modified is not None:
                                     _hgrads = _modified
+                        _release_idle_solver_memory()  # a hook may have run programs of its own (MMA's Jacobian)
                         trainable, opt_states = jit_hook_apply(trainable, opt_states, _hgrads, epoch_jnp, prev_losses)
                         epoch_jnp = epoch_jnp + jnp.asarray(1, dtype=epoch_jnp.dtype)
                         _step_bayesian_info: Dict[str, Dict[str, jnp.ndarray]] = {}
@@ -5503,7 +5517,9 @@ class core:
                 # inside the compiled function and must remain a static Python int
                 # for XLA to reuse the compiled kernel across calls.
                 op_entry[min_consecutive] = eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive))
-            return op_entry[min_consecutive](_models, ctx, batchsize=None, key=key)
+            out = op_entry[min_consecutive](_models, ctx, batchsize=None, key=key)
+            _release_idle_solver_memory()  # one program per expression: free what it left behind
+            return out
 
         if samples == "point":
             results = [_point_eval(op) for op in operation]

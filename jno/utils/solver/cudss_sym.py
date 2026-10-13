@@ -88,6 +88,8 @@ def _load():
         lib.jno_cudsd_create.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         lib.jno_cudsd_create.restype = ctypes.c_int
         lib.jno_cudsd_free.argtypes = [ctypes.c_int64]
+        lib.jno_cudsd_release.argtypes = [ctypes.c_int64]
+        lib.jno_cudsd_release.restype = ctypes.c_int
         lib.jno_cudsd_stats.argtypes = [ctypes.c_int64, ctypes.c_void_p]
         lib.jno_cudsd_stats.restype = ctypes.c_int
         for name in ("jno_cudsd_factor", "jno_cudsd_solve", "jno_cudsz_factor", "jno_cudsz_solve"):
@@ -137,6 +139,14 @@ class Plan:
         if _load().jno_cudsd_stats(self.slot, out.ctypes.data) != 0:
             return {}
         return {"lu_nnz": int(out[0]), "npivots": int(out[1]), "device_permanent": int(out[2]), "device_peak": int(out[3])}
+
+    def release(self) -> None:
+        """Free this slot's factors (cuDSS analysis + factor memory) between programs; the sparsity and the slot
+        id stay, so a compiled program that uses the slot again re-runs the analysis and works unchanged. Call it
+        only when no program using the slot is running (it synchronises the device)."""
+        st = _load().jno_cudsd_release(self.slot)
+        if st != 0:
+            raise RuntimeError(f"jno: cuDSS slot release failed (status {st}).")
 
     def __del__(self):
         try:

@@ -740,6 +740,22 @@ def _ldl_plan(owner, rows, cols, n, complex_values, trace):
     return plan
 
 
+def release_idle_ldl() -> int:
+    """Free the factors of every EXTRA cuDSS slot of the in-program LDL^T path; returns how many.
+
+    A form keeps its first slot's factors: it is refactored in place by the next program, so its memory is
+    reused, not grown. The extra slots exist because a program solved the same form more than once (each
+    solve must keep its factors for its own adjoint); after that program their factors are dead weight, and
+    they accumulate across programs of different structure (an evaluation, a gradient, a Jacobian) until the
+    card runs out. Call between programs; jno.core does after each optimisation step and evaluation."""
+    n = 0
+    for pool in _LDL_PLANS.values():
+        for entry in pool[1:]:
+            entry["plan"].release()
+            n += 1
+    return n
+
+
 def cudss_ldl_solve(A, b, context=None):
     """Symmetric (LDL^T) solve on cuDSS INSIDE the compiled program, or ``None`` where it does not apply.
 
