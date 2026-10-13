@@ -116,3 +116,23 @@ def test_refusals():
     v = d.fem_symbols(names=("p", "q"))[1].bind(x=xi, y=yi)
     with pytest.raises(NotImplementedError, match="frozen to a solve"):
         jno.fem([inner(grad(phi.bind(x=xi, y=yi)), grad(v)) - frozen * v]).operator
+
+
+def test_shared_solves_are_evaluated_once_per_evaluation(monkeypatch):
+    """an expression that refers to the same integral (and so the same solves) several times assembles each form
+    as often as one reference does: solve and integral nodes are combined per evaluation"""
+    import jno.trace as T
+
+    d, phi, (xi, yi), fems, grad = _two_conductors()
+    Phi = [phi.bind(x=xi, y=yi).freeze(f.solve(linear=HOST)) for f in fems]
+    c01 = (inner(grad(Phi[0]), grad(Phi[1]))).integrate(d)
+    calls = []
+    orig = T.FemLinearSystem.evaluate
+    monkeypatch.setattr(T.FemLinearSystem, "evaluate", lambda self, args=None: calls.append(1) or orig(self, args))
+    crux = jno.core([c01], domain=_empty())
+    crux.eval([c01])
+    once = len(calls)
+    calls.clear()
+    many = 2.0 * c01 - c01 * c01 + jno.np.stack([c01, c01])[1]
+    crux.eval([many])
+    assert len(calls) == once, f"{len(calls)} assemblies for one expression with 4 references, {once} for one"

@@ -4221,7 +4221,9 @@ class FemLinearSystem:
             return solve_fn(A, b)
 
         if values is None:
-            return FunctionCall(_solve, params, name="fem_solve")
+            node = FunctionCall(_solve, params, name="fem_solve")
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            return node
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
@@ -4394,7 +4396,9 @@ class FemResidualOperator:
             return solve_fn(residual_fn, u0, **_xa(args))
 
         if values is None:
-            return FunctionCall(_solve, params, name="fem_solve")
+            node = FunctionCall(_solve, params, name="fem_solve")
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            return node
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
         check_runtime_values(names, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the

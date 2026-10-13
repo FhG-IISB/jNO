@@ -3561,7 +3561,9 @@ class FEM:
             from .trace import FunctionCall
 
             _rc = _complex_recombine(self._complex_n)
-            return FunctionCall(lambda *v, _f=_node.fn: _rc(_f(*v)), _node.args, name="fem_complex_solve")
+            node = FunctionCall(lambda *v, _f=_node.fn: _rc(_f(*v)), _node.args, name="fem_complex_solve")
+            node._per_evaluation = True
+            return node
         if self._mode == "nonlinear" and self._periodic is not None:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
             # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
@@ -4339,7 +4341,9 @@ class FEM:
         def _run(u, *vals):
             return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
 
-        return FunctionCall(_run, [sol, *params], name="fem_integral")
+        node = FunctionCall(_run, [sol, *params], name="fem_integral")
+        node._per_evaluation = True  # a scalar of the parameters: evaluated once per evaluation
+        return node
 
     def _functional_solution(self, solver=None):
         """The one solve every functional over this system shares.
