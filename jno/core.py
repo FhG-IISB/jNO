@@ -1799,6 +1799,7 @@ class core:
         static,
         checkpoint_gradients=False,
         min_consecutive=1,
+        jacobian=None,
     ):
         """Build a function that computes gradients without an optimizer update.
 
@@ -1828,7 +1829,25 @@ class core:
             (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
             return grads, rng, total_loss, individual_losses
 
-        return grad_fn
+        if jacobian is None:
+            return grad_fn
+        rows, lids = list(jacobian[0]), list(jacobian[1])
+
+        def grad_jac_fn(trainable, rng, context):
+            """The objective gradient AND the constraint rows (w.r.t. the blocks ``lids``, raveled in that order)
+            from ONE forward pass: one ``jax.vjp``, then one pullback for the objective and one per row. A
+            constrained optimiser otherwise ran a second program for its Jacobian, with a second forward
+            solve -- a second factorisation of every FEM system per step."""
+            rng, step_rng = jax.random.split(rng)
+            (total_loss, losses), pullback = jax.vjp(lambda p: loss_fn(p, context, step_rng), trainable)
+            (grads,) = pullback((jnp.ones_like(total_loss), jnp.zeros_like(losses)))
+            jac = []
+            for i in rows:
+                (g_i,) = pullback((jnp.zeros_like(total_loss), jnp.zeros_like(losses).at[i].set(1.0)))
+                jac.append(jnp.concatenate([leaf.ravel() for lid in lids for leaf in jax.tree_util.tree_leaves(g_i[lid])]))
+            return grads, rng, total_loss, losses, jnp.stack(jac) if jac else jnp.zeros((0, 1))
+
+        return grad_jac_fn
 
     def make_apply_fn(
         self,
@@ -3439,6 +3458,13 @@ class core:
 
         # ── 7c. Build split grad/apply for on_before_update hooks (non-accumulation) ──
         # Not needed for the accumulation path — it already separates grad and apply.
+        _jac_requests = [
+            (cb, cb.jacobian_request()) for cb in (callbacks or []) if callable(getattr(cb, "jacobian_request", None))
+        ]
+        _jac_requests = [(cb, req) for cb, req in _jac_requests if req is not None]
+        if len(_jac_requests) > 1:  # one shared program serves one request; more fall back to their own
+            _jac_requests = []
+        _jac_cb, _jac_req = _jac_requests[0] if _jac_requests else (None, None)
         if _has_before_update_hooks and not _use_accumulation:
             _hook_grad_fn = self.make_grad_fn(
                 batchsize=effective_batchsize,
@@ -3446,6 +3472,7 @@ class core:
                 static=static,
                 checkpoint_gradients=checkpoint_gradients,
                 min_consecutive=min_consecutive,
+                jacobian=_jac_req,
             )
             _hook_apply_fn = self.make_apply_fn(
                 per_model_opts=per_model_opts,
@@ -3623,7 +3650,8 @@ class core:
                 _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
                 _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
 
-                jit_hook_grad = _cache.get("hook_grad") or jax.jit(
+                _hg_key = "hook_grad" if _jac_req is None else ("hook_grad_jac", tuple(_jac_req[0]), tuple(_jac_req[1]))
+                jit_hook_grad = _cache.get(_hg_key) or jax.jit(
                     _hook_grad_fn,
                     in_shardings=(
                         _trainable_sharding,
@@ -3635,7 +3663,8 @@ class core:
                         replicated,  # rng
                         replicated,  # total_loss
                         replicated,  # individual_losses
-                    ),
+                    )
+                    + ((replicated,) if _jac_req is not None else ()),  # constraint Jacobian rows
                 )
                 jit_hook_apply = _cache.get("hook_apply") or jax.jit(
                     _hook_apply_fn,
@@ -3653,7 +3682,7 @@ class core:
                     donate_argnums=(2,),  # donate grads buffer
                 )
                 if _step_key is not None:
-                    _cache["hook_grad"], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
+                    _cache[_hg_key], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
 
             if has_trackers:
                 jit_track = jax.jit(track_fn)
@@ -3866,7 +3895,7 @@ class core:
                     del _gw
                 elif _has_before_update_hooks:
                     for _ in range(3):
-                        _gw, _rw, _, _ = jit_hook_grad(_tw, _rw, trace_context)
+                        _gw, _rw = jit_hook_grad(_tw, _rw, trace_context)[:2]  # (+ Jacobian rows when requested)
                         _, _ow = jit_hook_apply(_tw, _ow, _gw, _ew, _pl)
                     del _gw
                 else:
@@ -4520,10 +4549,13 @@ class core:
 
                     if _has_before_update_hooks:
                         # Split path: grad → on_before_update hooks → apply.
-                        _hgrads, self.rng, total_loss, individual_losses = jit_hook_grad(trainable, self.rng, context)
+                        _hout = jit_hook_grad(trainable, self.rng, context)
+                        _hgrads, self.rng, total_loss, individual_losses = _hout[:4]
+                        _hjac = _hout[4] if len(_hout) > 4 else None
                         _release_idle_solver_memory()
                         for _cb in callbacks:
                             if type(_cb).on_before_update is not _Callback.on_before_update:
+                                _extra = {"constraint_jacobian": _hjac} if (_cb is _jac_cb and _hjac is not None) else {}
                                 _modified = _cb.on_before_update(
                                     grads=_hgrads,
                                     trainable=trainable,
@@ -4532,6 +4564,7 @@ class core:
                                     epoch=outer_epoch,
                                     total_loss=total_loss,
                                     individual_losses=individual_losses,
+                                    **_extra,
                                 )
                                 if _modified is not None:
                                     _hgrads = _modified

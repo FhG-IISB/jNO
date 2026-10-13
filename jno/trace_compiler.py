@@ -1371,8 +1371,15 @@ class TraceCompiler:
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
             evaluator = TraceEvaluator(params)
-            # One evaluator → one JAX trace → XLA sees all constraints together
-            return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
+            # One evaluator → one JAX trace → XLA sees all constraints together. One per-evaluation scope
+            # over ALL of them, too: a solve or integral node shared by the objective and a constraint is
+            # computed once for the whole list, not once per expression (the evaluator's memo is scoped to
+            # the outermost evaluate; this makes the list that outermost scope).
+            evaluator._in_evaluate, evaluator._per_eval_memo = True, {}
+            try:
+                return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
+            finally:
+                evaluator._in_evaluate, evaluator._per_eval_memo = False, {}
 
         # Collect tags from ALL expressions so batch inference is scoped.
         expr_tags = set()
