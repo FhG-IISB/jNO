@@ -2483,7 +2483,9 @@ class domain(MeshIOMixin):
         _retag_coords_for_quadrature(expr, "volume", "volume")
         fn, inputs = domain_functional(self, bare)
         keys = [k for k, _n in inputs]
-        return FunctionCall(lambda *vals: fn(dict(zip(keys, vals))), [n for _k, n in inputs], name="domain_integral")
+        node = FunctionCall(lambda *vals: fn(dict(zip(keys, vals))), [n for _k, n in inputs], name="domain_integral")
+        node._per_evaluation = True  # a scalar of its inputs: evaluated once per evaluation
+        return node
 
     def attach(self, target: str | None = None, **props):
         """Declare material properties on an existing **region or boundary tag**, after the domain is built.
