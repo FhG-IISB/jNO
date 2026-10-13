@@ -13,6 +13,26 @@ from matplotlib.patches import Rectangle
 from dev import house_style as hs
 
 LAUNCH_S = 4e-6  # per-launch floor used for the launch-bound estimate (hollow marker; an estimate, not a measurement)
+# RTX 3070 (GA104): FP64 at 1/64 of FP32 (46 SMs x 2 FP64 FMA/clk x 2 flop x 1.725 GHz boost); DRAM 448 GB/s
+PEAK = {"fp64_flop_s": 46 * 2 * 2 * 1.725e9, "dram_B_s": 448e9}
+
+
+def bounds_from_kernels(run_dir, peak=PEAK):
+    """{stage: (kernel_bound_ms, None, n_profiled_launches)} from the ncu passes of a run: the roof at each kernel's
+    MEASURED intensity, summed over the profiled launches (the ladder scales to one call by the launch count)."""
+    import glob
+    import json
+
+    out = {}
+    for f in glob.glob(os.path.join(run_dir, "kernels_*.json")):
+        with open(f) as fh:
+            d = json.load(fh)
+        recs = [r for r in d["kernels"] if "fp64_flop" in r and "dram_B" in r]
+        if not recs:
+            continue
+        t = sum(max(r["fp64_flop"] / peak["fp64_flop_s"], r["dram_B"] / peak["dram_B_s"]) for r in recs)
+        out[d["stage"]] = (t * 1e3, None, len(recs))
+    return out
 
 
 def _stage_colors(stages):
@@ -36,7 +56,10 @@ def ladder(res, bounds=None, ax=None):
         a = agg[s]
         m = a["forward_ms"] + a["adjoint_ms"]
         floor = a["launches"] * LAUNCH_S * 1e3
-        kb, ib = (bounds or {}).get(s, (None, None))
+        b = (bounds or {}).get(s, (None, None))
+        kb, ib = b[0], b[1]
+        if kb and len(b) > 2 and b[2] and a["launches"]:
+            kb *= a["launches"] / b[2]
         lo = min(lo, floor, *(v for v in (kb, ib) if v))
         if ib:
             ax.plot([ib, kb or m], [yi, yi], color=hs.MUTED, lw=0.8, ls=(0, (2, 2)), zorder=1)
@@ -208,13 +231,106 @@ def spectrum(res, ax=None):
     return fig
 
 
+def bind_strip(run_dir, ax=None, top: int = 12):
+    """Per profiled kernel kind (rows, by time): fraction-of-peak cells for SM, DRAM, FP64 pipe, L2 hit, occupancy,
+    and the measured flop/byte against the ridge. Reads every kernels_<stage>.json of the run."""
+    import glob
+    import json
+
+    rows = []
+    for f in sorted(glob.glob(os.path.join(run_dir, "kernels_*.json"))):
+        with open(f) as fh:
+            d = json.load(fh)
+        by = {}
+        for r in d["kernels"]:
+            k = r["kernel"].split("(")[0].replace("void ", "")[:34]
+            b = by.setdefault(
+                k,
+                {
+                    "stage": d["stage"],
+                    "t": 0.0,
+                    "n": 0,
+                    "f": 0.0,
+                    "B": 0.0,
+                    "sm": [],
+                    "dram": [],
+                    "fp64": [],
+                    "l2": [],
+                    "occ": [],
+                },
+            )
+            b["t"] += r.get("time_ns", 0)
+            b["n"] += 1
+            b["f"] += r.get("fp64_flop", 0)
+            b["B"] += r.get("dram_B", 0)
+            for key, src in (
+                ("sm", "sm_pct"),
+                ("dram", "dram_pct"),
+                ("fp64", "fp64_pipe_pct"),
+                ("l2", "l2_hit_pct"),
+                ("occ", "occupancy_pct"),
+            ):
+                if src in r:
+                    b[key].append(r[src])
+        rows += list(by.items())
+    rows.sort(key=lambda kb: -kb[1]["t"])
+    rows = rows[:top]
+    if not rows:
+        return None
+    cols = ["SM", "DRAM", "FP64 pipe", "L2 hit", "occupancy"]
+    avg = lambda v: np.mean(v) / 100 if v else np.nan
+    M = np.array([[avg(b["sm"]), avg(b["dram"]), avg(b["fp64"]), avg(b["l2"]), avg(b["occ"])] for _, b in rows])
+    fig = None
+    if ax is None:
+        H = 0.9 + 0.26 * len(rows)
+        fig = plt.figure(figsize=(6.69, H), layout="none")
+        ax = fig.add_axes([0.42, 0.12 / H, 0.38, 1 - 0.75 / H])
+    ax.imshow(M, cmap="viridis", vmin=0, vmax=1, aspect="auto", interpolation="nearest")
+    for i in range(M.shape[0]):
+        for j in range(M.shape[1]):
+            if not np.isnan(M[i, j]):
+                ax.text(
+                    j,
+                    i,
+                    f"{M[i, j] * 100:.0f}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color="white" if M[i, j] < 0.6 else hs.INK,
+                )
+    ax.set_xticks(range(len(cols)), cols, fontsize=8)
+    ax.xaxis.tick_top()
+    ax.set_yticks(range(len(rows)), [f"{k}  ({b['stage'][4:]}, {b['t'] / 1e6:.1f} ms)" for k, b in rows], fontsize=7)
+    ax.tick_params(length=0)
+    ax.grid(False)
+    ridge = PEAK["fp64_flop_s"] / PEAK["dram_B_s"]
+    for i, (_, b) in enumerate(rows):
+        ai = b["f"] / max(b["B"], 1)
+        ax.text(
+            len(cols) - 0.4,
+            i,
+            f"{ai:5.2f} flop/B " + ("compute" if ai > ridge else "memory"),
+            ha="left",
+            va="center",
+            fontsize=7,
+            color=hs.MUTED,
+        )
+    ax.text(len(cols) - 0.4, -0.9, f"intensity (ridge {ridge:.2f})", ha="left", va="center", fontsize=7, color=hs.MUTED)
+    return fig
+
+
 def all_figures(res, out_dir, bounds=None):
     hs.apply("paper")
+    if bounds is None:
+        bounds = bounds_from_kernels(out_dir) or None
     for name, f in (
         ("headroom_ladder", lambda: ladder(res, bounds)),
         ("icicle", lambda: icicle(res)),
         ("launch_spectrum", lambda: spectrum(res)),
+        ("bind_strip", lambda: bind_strip(out_dir)),
     ):
         fig = f()
+        if fig is None:
+            continue
         hs.save(fig, os.path.join(out_dir, name))
         plt.close(fig)

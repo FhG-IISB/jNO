@@ -86,6 +86,10 @@ class Memcpy:
     bytes: int
     duration_ns: float
     count: int = 1
+    stage: str = "other"
+    scope: str = ""
+    src: str = ""  # pageable, pinned, device
+    dst: str = ""
 
 
 @dataclasses.dataclass
@@ -140,18 +144,31 @@ class Result:
                 f"({small:,} under 20 us); memcpy {sum(m.bytes * m.count for m in self.memcpys) / 1e6:.1f} MB in "
                 f"{sum(m.count for m in self.memcpys)} copies"
             )
-            lines.append(f"  {'stage':28s} {'fwd ms':>8s} {'adj ms':>8s} {'launches':>9s}  top kernel")
+            lines.append(f"  {'stage':28s} {'fwd ms':>8s} {'adj ms':>8s} {'launches':>9s} {'memcpy':>14s}  top kernel")
             for s, a in self.by_stage().items():
                 top = max(a["kernels"], key=lambda k: k.duration_ns * k.count)
+                mc = [m for m in self.memcpys if m.stage == s]
+                mtxt = f"{sum(m.bytes * m.count for m in mc) / 1e6:.1f} MB/{sum(m.count for m in mc)}" if mc else "-"
                 lines.append(
-                    f"  {s:28s} {a['forward_ms']:8.1f} {a['adjoint_ms']:8.1f} {a['launches']:9,d}  "
+                    f"  {s:28s} {a['forward_ms']:8.1f} {a['adjoint_ms']:8.1f} {a['launches']:9,d} {mtxt:>14s}  "
                     f"{top.hlo_op} ({top.duration_ns * top.count / 1e6:.1f} ms, occ {top.occupancy_pct:.0f} %)"
+                )
+            h2d = [m for m in self.memcpys if m.kind != "D2D"]
+            if h2d:
+                lines.append(
+                    "  host<->device: "
+                    + "; ".join(
+                        f"{m.kind} {m.bytes * m.count / 1e6:.2f} MB x{m.count} ({m.src}) in {m.stage}"
+                        for m in sorted(h2d, key=lambda m: -m.bytes * m.count)[:6]
+                    )
                 )
         for b in self.backend_stats:
             lines.append(f"  backend {b}")
         return "\n".join(lines)
 
     def save(self, out_dir=None, figures=True):
+        if os.environ.get("JNO_PROF_NCU") == "1":
+            return None  # a counter run must not overwrite the profiled run
         out_dir = out_dir or os.path.join(RUNS, self.label)
         os.makedirs(out_dir, exist_ok=True)
         d = dataclasses.asdict(self)
@@ -199,19 +216,16 @@ def parse_trace(trace_dir: str, hlo_meta: dict[str, str], n_calls: int = 1):
         for line in plane.lines:
             for e in line.events:
                 st = {k: str(v) for k, v in e.stats}
-                if e.name.startswith("Memcpy") or "memcpy" in e.name.lower():
-                    kind = re.sub(r"^Memcpy", "", e.name).split("(")[0] or e.name
-                    nb = int(
-                        float(
-                            st.get(
-                                "bytes_accessed",
-                                st.get("memcpy_details", "0").split("size:")[-1].split()[0]
-                                if "size:" in st.get("memcpy_details", "")
-                                else st.get("bytes_accessed", "0"),
-                            )
-                        )
+                if e.name.startswith("Memcpy"):  # driver copies (memcpy32_post etc. are XLA kernels, counted below)
+                    kind = e.name.split("(")[0][6:]
+                    det = st.get("memcpy_details", "")
+                    g = lambda key: (re.search(key + r":(\w+)", det) or [None, ""])[1]
+                    nb = int(g("size") or 0)
+                    scope = (hlo_meta.get(st.get("hlo_op", "")) or st.get("name", "")).split(",hlo_op=")[0]
+                    stg, _ = _stage_of(scope)
+                    m = memcpys.setdefault(
+                        (kind, nb, stg), Memcpy(kind, nb, 0.0, 0, stg, scope, g("kind_src"), g("kind_dst"))
                     )
-                    m = memcpys.setdefault((kind, nb), Memcpy(kind, nb, 0.0, 0))
                     m.duration_ns += e.duration_ns
                     m.count += 1
                     continue
@@ -300,6 +314,8 @@ def run(
         time=time.strftime("%Y-%m-%d %H:%M"),
         cwd=os.getcwd(),
     )
+    under_ncu = os.environ.get("JNO_PROF_NCU") == "1"  # dev/kernels.py re-runs the script under ncu: no trace, no guard
+    trace, transfer_check, reps = (False, False, 1) if under_ncu else (trace, transfer_check, reps)
     card0 = _card_used_gb()
     if not hasattr(fn, "lower"):
         fn = jax.jit(fn)
@@ -365,6 +381,8 @@ def run(
             stats = list(backend_stats())
         except Exception as e:  # noqa: BLE001
             stats = [{"error": repr(e)}]
-    with open(os.path.join(out_dir or os.path.join(RUNS, label), "compiled.hlo"), "w") as fh:
-        fh.write(hlo_text)
+    if not under_ncu:
+        os.makedirs(out_dir or os.path.join(RUNS, label), exist_ok=True)
+        with open(os.path.join(out_dir or os.path.join(RUNS, label), "compiled.hlo"), "w") as fh:
+            fh.write(hlo_text)
     return Result(label, meta, l0, kernels, memcpys, stats, trace_dir)
