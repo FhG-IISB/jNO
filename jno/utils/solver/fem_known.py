@@ -105,7 +105,10 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
     space), coordinates and region masks -- but no unknown (no trial or test function: that is a form).
     Quadrature: the simplex rule of degree ``2 k`` (at least 2), with ``k`` the highest field degree, so a
     product of two fields of degree ``k`` is exact (times a cell-wise constant coefficient). Differentiable in
-    every input value; the mesh is the static one."""
+    every input value, and in the node positions when the domain has trainable coordinates
+    (``domain.variable(...).trainable()``): they are inputs too, keyed ``("coord", name)``, scattered into the
+    geometry before each cell's Jacobian, so ``|det J|``, the quadrature points and every pushed-forward basis
+    move with the mesh."""
     import basix
 
     from ...trace import FrozenField, TestFunction, TrialFunction
@@ -113,6 +116,7 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
     from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES, build_edge_topology
     from .fem_utils import _CHUNK_OVERRIDE, _cell_region_mask, _collect_region_mask_names, cell_chunk, elem_map
     from .fem_1d import _integrate_term
+    from .fem_nonnodal import _with_cell_size
     from .parametric_helpers import _collect_runtime_parameter_exprs, _fem_field_kind
     from .small_linalg import small_det
     from .solver_helper import contains_node_type
@@ -166,14 +170,22 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
                     f"{const_vals[key].shape[0]} values; its space has {specs[key]['n_vals']}."
                 )
     inputs += [(n, params[n]) for n in tags]
+    coords = [
+        (jnp.asarray(c["ids"], dtype=jnp.int32), int(c["axis"]), str(c["name"]))
+        for c in getattr(domain, "_trainable_coords", None) or []
+    ]
+    inputs += [(("coord", c["name"]), c["expr"]) for c in getattr(domain, "_trainable_coords", None) or []]
     rnames = tuple(sorted(_collect_region_mask_names(expr)))
     masks = [jnp.asarray(_cell_region_mask(domain, r)).reshape(-1) for r in rnames]
     ctx = getattr(domain, "context", {}) or {}
 
     def fn(values):
+        geo = pts
+        for ids, axis, name in coords:  # trainable node positions: the geometry is traced
+            geo = geo.at[ids, axis].set(jnp.asarray(values[("coord", name)], dtype=geo.dtype).reshape(-1))
         fvals = dict(const_vals)
         for key, _node in inputs:
-            if isinstance(key, tuple):
+            if isinstance(key, tuple) and key[0] == "frozen":
                 v = jnp.reshape(jnp.asarray(values[key]), (-1,))
                 blk = frozen[key[1]].values_block
                 if blk is not None:
@@ -195,7 +207,7 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
                 raise ValueError(f"expr.integrate(domain): parameter {n!r} has {pvals[n].shape[0]} values, needs {want}.")
 
         def cell(c):
-            verts = pts[cells[c]]
+            verts = geo[cells[c]]
             J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)
             detJ = small_det(J)
             vol_vars = tuple(
@@ -208,13 +220,16 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
                 else jnp.zeros((1,), pvals[n].dtype)
                 for n in tags
             )
+            xq = verts[0][None, :] + jnp.asarray(qp) @ J.T
             local = {
-                "physical_quad_points": verts[0][None, :] + jnp.asarray(qp) @ J.T,
+                "physical_quad_points": xq,
                 "fields": [],
                 "field_index": {},
                 "tag": "fem_gauss",
                 "surface": False,
-                "domain_context": ctx,
+                # `d.cell_size` / `d.cell_metric` of THIS cell, moving with the coordinates: mesh quality as an
+                # integral, e.g. the condition number sqrt(tr G tr G^-1) / dim aggregated by a p-norm
+                "domain_context": _with_cell_size(ctx, jnp.abs(detJ), xq, verts),
                 "temporal_tags": (),
                 "runtime_parameter_tags": tags,
                 "region_mask_names": rnames,
