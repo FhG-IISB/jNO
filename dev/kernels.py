@@ -175,12 +175,27 @@ def main(argv=None):
     metrics = ",".join(m for g in groups for m, _ in METRICS[g])
     # no report file (-o): with --nvtx a report grows by tens of MB per launch (XLA registers thousands of NVTX
     # strings); the CSV on stdout is all the harness needs and is kept as kernels_<stage>.csv
-    ncu = ["ncu", "--nvtx", "--nvtx-include", nvtx_regex(a.stage), "--metrics", metrics, "--csv", "--page", "raw"]
+    # XLA's own kernels (CUDA graphs off: one uniquely named kernel per HLO op) are selected by NAME, with no NVTX
+    # at all: with --nvtx ncu's working report grows by tens of MB per launch (XLA registers thousands of NVTX
+    # strings) and lands in TMPDIR. Library kernels under an FFI call (cuDSS: the same kernel names in factor and
+    # solve) need the NVTX range of their stage.
+    names = sorted({k["name"] for k in ks})
+    xla_named = all("::" not in n and "<" not in n for n in names)
+    if xla_named:
+        ncu = [
+            "ncu",
+            "-k",
+            "regex:^(" + "|".join(re.escape(n) for n in names) + ")$",
+            "--metrics",
+            metrics,
+            "--csv",
+            "--page",
+            "raw",
+        ]
+    else:
+        ncu = ["ncu", "--nvtx", "--nvtx-include", nvtx_regex(a.stage), "--metrics", metrics, "--csv", "--page", "raw"]
     if a.launches:
         ncu += ["-c", str(a.launches)]
-    if a.top:  # select the kinds by kernel name regex
-        names = sorted({re.sub(r"[._]\d+$", "", k["name"]) for k in ks})
-        ncu += ["-k", "regex:^(" + "|".join(re.escape(x) for x in names) + ")"]
     full = ncu + cmd
     print(" ".join(full), flush=True)
     if a.dry:
@@ -188,10 +203,17 @@ def main(argv=None):
     # no CUDA graphs under ncu: a kernel launched from a graph has no per-thunk NVTX range (only `command_buffer_N`),
     # so the stage filter cannot see it; no autotuning either (ncu makes XLA's candidate runs slow)
     xla_flags = os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer= --xla_gpu_autotune_level=0"
-    env = dict(os.environ, JNO_PROF_NCU="1", XLA_PYTHON_CLIENT_PREALLOCATE="false", XLA_FLAGS=xla_flags.strip())
+    tmp = os.path.join(
+        os.environ.get("JNO_PROF_SCRATCH", "/var/tmp/jobs"), "ncu-tmp"
+    )  # ncu's working report: on disk, never /tmp (RAM here)
+    os.makedirs(tmp, exist_ok=True)
+    env = dict(os.environ, JNO_PROF_NCU="1", XLA_PYTHON_CLIENT_PREALLOCATE="false", XLA_FLAGS=xla_flags.strip(), TMPDIR=tmp)
     t = time.perf_counter()
     r = subprocess.run(full, env=env, capture_output=True, text=True)
     dt = time.perf_counter() - t
+    import shutil
+
+    shutil.rmtree(tmp, ignore_errors=True)
     sys.stderr.write(
         "\n".join(line for line in r.stderr.splitlines() if "==ERROR==" in line or "==WARNING==" in line) + "\n"
     )
