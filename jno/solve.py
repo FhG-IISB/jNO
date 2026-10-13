@@ -113,6 +113,11 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             over 51 steps) and the adjoint reuses it; a Newton loop gets nothing and pays a hash.
 
             ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
+            on a COMPLEX form whose operator is complex symmetric (eddy currents: ``nu curl curl + j w
+            sigma``) it factors the ``n x n`` complex matrix with LDL^T inside the compiled program (no host
+            round trip; jit and grad run on the GPU) rather than LU on the real ``2n`` block. A pattern
+            that is not symmetric stays on LU; values that are not (only checkable after the solve, under
+            a trace) fail the residual gate. Two solves of one form in one program get a factor slot each.
             the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
             the symbolic plan from the numeric factorization and jNO caches on the SPARSITY: the plan
             survives a change of values. Measured on an RTX 3070 (fp64 at 1/64 rate -- the
@@ -179,6 +184,17 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             "cudss": cudss_lu_solve,
             "pardiso": pardiso_lu_solve,
         }[backend]
+        if op.bcoo is not None and backend == "cudss" and getattr(op, "solver_context", None):
+            # A fused COMPLEX form ([[R, -I], [I, R]]) with a symmetric R + jI: factor the n x n complex
+            # symmetric matrix (LDL^T) inside the compiled program instead of LU on the real 2n block through
+            # a host callback. None where it does not apply (no GPU extension, a non-symmetric pattern).
+            ctx = op.solver_context
+            if ctx.get("complex_n") is not None:
+                from .utils.solver.linear import cudss_ldl_solve
+
+                x = cudss_ldl_solve(op.bcoo, b, ctx)
+                if x is not None:
+                    return x
         if op.bcoo is not None:
             # Only the opted-in case changes the call: `reuse=True` is the long-standing behaviour and
             # keeps the long-standing two-argument convention, so nothing that wraps or stubs
@@ -217,6 +233,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
         "vmap": "yes",
         "multi_rhs": backend == "cudss",
         "host_kernel": None if backend == "device" else backend,
+        "solver_context": backend == "cudss",
     }
     return LinearSolver(_fn, name=name, direct=True, traits=traits)
 

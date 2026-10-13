@@ -3197,6 +3197,48 @@ class FEM:
                 u0 = restrict_state_periodic(per, u0)
         record_nonlinear_verdict(res_at, u, u0, nonlinear, getattr(nonlinear, "name", None) or "newton")
 
+    def _linear_solver_context(self):
+        """What a direct solver may know about the steady linear operator beyond its values (cached):
+        ``pattern`` -- its COO indices as a concrete array, from one COMPILED evaluation (the same program a
+        traced solve runs, so the same entry order), which lets a factorisation be planned while the values
+        are still tracers; ``complex_n`` -- the half size when the operator is a fused complex block;
+        ``owner`` -- this FEM (factor slots are per form). ``None`` where the solve does not hand over the
+        assembled operator unchanged (a periodic reduction re-forms it per call)."""
+        if getattr(self, "_solver_ctx", None) is not None:
+            return self._solver_ctx
+        if self._mode != "linear" or (self._periodic_2n if self._complex_n is not None else self._periodic) is not None:
+            return None
+        op = self._op
+        if isinstance(op, FemLinearSystem):
+            if op.operator_fn is not None:
+                names = list(op.runtime_parameter_exprs)
+                shapes = []
+                for n_ in names:
+                    mod = getattr(op.runtime_parameter_exprs[n_].model, "module", None)
+                    val = getattr(mod, "value", None)
+                    if val is None:
+                        return None  # a parameter whose shape is not known here: no planned pattern
+                    shapes.append(np.zeros(np.shape(val), np.asarray(val).dtype))
+                # The pattern of the COMPILED evaluation: it is what a traced solve sees (an eager evaluation
+                # can differ, e.g. 336 entries fewer on a 3-D N1E form). Run on a worker thread, whose JAX
+                # trace state is its own, so the result is concrete even when first asked from inside a
+                # trace (`ensure_compile_time_eval` would run the jit op by op: the EAGER pattern).
+                import concurrent.futures
+
+                _pat = lambda: np.asarray(jax.jit(lambda *v: op.evaluate(dict(zip(names, v)))[0].indices)(*shapes))  # noqa: E731
+                with concurrent.futures.ThreadPoolExecutor(1) as _ex:
+                    idx = _ex.submit(_pat).result()
+            else:
+                idx = getattr(op.A, "indices", None)
+        else:
+            idx = getattr(op[0], "indices", None)
+        if idx is None:
+            return None
+        if isinstance(idx, jax.core.Tracer):
+            return None
+        self._solver_ctx = {"pattern": np.asarray(idx), "complex_n": self._complex_n, "owner": self}
+        return self._solver_ctx
+
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
         from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
