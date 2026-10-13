@@ -198,7 +198,7 @@ problem repeats**.
     factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below
 
 ??? measured "`backend="cudss"` — NVIDIA cuDSS"
-    NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead
+    NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's block Krylov sweep needs), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead
 
 ??? measured "`backend="pardiso"` — Intel MKL PARDISO"
     Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64
@@ -1124,9 +1124,8 @@ are logged as `WARNING: gmsh: …`.
 After any `fem.solve()`, `fem.stats` reports what happened
 without changing the solve's return: `mode`, `dofs`, `wall_s` (dispatch time — JAX is async; block on
 the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (driver, final residual
-norm against its bound, converged flag, and the step count where the driver runs its forward loop
-eagerly — `newton_direct` reports steps; the drivers whose loop lives inside `custom_root` report
-`None`), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
+norm against its bound, converged flag, and the step count — every driver reports it), `linear_iterations`
+(below), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
 wrapped whole in `jit`/`vmap`/`grad` records the slots but no residuals — reporting needs a concrete
 value. The *convergence check* below is not so limited: it fires under a transform too.
 
@@ -1141,6 +1140,30 @@ fem.stats
 `solve_index` counts solves on the form (the first one includes tracing and compilation), and a solve
 that **raised** still writes `fem.stats`, with an `error` entry. It used to leave the previous solve's
 stats in place, and those would read as this solve's.
+
+### Krylov iterations — `fem.stats["linear_iterations"]`
+
+How many iterations each linear solve took — the number that says whether a preconditioner works:
+
+```python
+fem.solve(nonlinear=jno.solve.newton(direct=False))
+fem.stats["linear_iterations"]
+# {'solves': 4, 'iterations': [52, 62, 59, 54], 'total': 227, 'max': 62,
+#  'by': ['the newton_krylov inner BiCGStab']}          # one count per Newton step
+```
+
+`iterations` lists each forward solve's count in the order they finished, and `transpose` the adjoint
+solves' when a gradient ran any. `breakdown: True` flags a BiCGStab that stopped on one. The default
+solve, `cg`, `bicgstab`, `minres`, `fgmres`, `cocg`, `chebyshev`, the matrix-free Newton's inner
+BiCGStab and the assembled-tangent Krylov all report. Upstream restarted `gmres` exposes no count and is
+listed under `uncounted`; a direct factorisation reports `None`. Counts are recorded for an eager,
+steady, non-adaptive solve. A march records none per step — its compiled step makes no host call, and
+`fem.stats["march"]` is its record — and neither does a deferred node evaluated later under `jno.core`.
+
+`cg` and `bicgstab` are `jax.scipy`'s own loops, keeping the iteration count they discard: the same
+arithmetic (`x` identical on CPU, within 1e-10 on GPU from reduction order) and the same time. The count
+reaches the host through one callback per solve, a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU): +7–11 % on a
+790-DOF solve, unmeasurable at 46,691 DOFs.
 
 ### A march records every step — `fem.stats["march"]`
 
