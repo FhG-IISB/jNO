@@ -966,6 +966,10 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
             tag = tag[6:]
         return _normalize_quad_tag(tag, _bregions)
 
+    def _is_across(tag) -> bool:
+        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on
+        return isinstance(tag, str) and tag.startswith("across_")
+
     def _effective_tag(v) -> str:
         # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
         # pool ("fem_gauss" / "gauss_<tag>"); recover its original region from `_jno_region_tag` so a
@@ -978,7 +982,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
     tags = {
         _region_of(_effective_tag(v))
         for v in _spatial_coord_vars(constraint)
-        if isinstance(_effective_tag(v), str) and not _effective_tag(v).startswith("__")
+        if isinstance(_effective_tag(v), str)
+        and not _effective_tag(v).startswith("__")
+        and not _is_across(_effective_tag(v))
     }
     # The t=t0 slice is its own support; an IC residual lives here. A *velocity* IC `u.t(initial)-v0`
     # carries its region only on the temporal variable (the `.t` derivative drops the spatial bind),
@@ -1125,7 +1131,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
-            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -4598,6 +4604,11 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
     from .utils.solver.fem_utils import build_periodic_prolongation_n1e
 
     topo = domain._fem_nonnodal_topology
+    _fm = topo.get("field_dofmaps")
+    if _fm is not None and not all(sp == "N1E" and dm is not None and dm.degree == 1 for sp, dm in _fm):
+        # degree k, N2E / RT, or a MIXED system (N1E x Lagrange): one prolongation per field from its
+        # own entity map. The edge-only builder below would size every block by the edge count.
+        return _build_periodic_reduction_entities(domain, ties, offsets)
     n_edges = int(topo["n_edges"])
     vpts = np.asarray(topo["vertex_points"])
     ev = np.asarray(topo["edge_vertices"])
@@ -4628,6 +4639,68 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         "n_full": off_full[-1],
         "n_red": off_red[-1],
         "is_bloch": red["is_bloch"],
+    }
+
+
+def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
+    """Periodic (Floquet/Bloch) reduction for non-nodal fields of ANY degree -- N1E/N2E/RT of degree k
+    and the Lagrange / DG / P0 fields mixed with them -- one prolongation per FIELD from its own entity
+    DOF map (:func:`fem_dofmap.periodic_prolongation`: tie by interpolation, so orientation and phase
+    need no per-family rules). A field without facet DOFs (P0 / DG) is untouched by a tie."""
+    import jax.experimental.sparse as jsparse
+
+    from .utils.solver.fem_dofmap import build_dofmap, periodic_prolongation
+
+    topo = domain._fem_nonnodal_topology
+    vpts = np.asarray(topo["vertex_points"])
+    cells = np.asarray(topo["cells"])
+    n_verts = int(vpts.shape[0])
+    field_maps = topo.get("field_dofmaps") or []
+    masks = {}
+    for tag in {t for tie in ties for t in tie[:2]}:
+        # INCLUSIVE membership from the tag's predicate: a corner/edge vertex belongs to every face it
+        # lies on (the exclusive `tag_indices` partition would drop it from all but one, and the chained
+        # ties along periodic edges would then miss their partners).
+        m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
+        if m is None:
+            f = _face_nodes(domain, vpts, None, tag)
+            m = np.zeros(n_verts, dtype=bool)
+            if f is not None:
+                m[np.asarray(f, dtype=int).reshape(-1)] = True
+        m = np.asarray(m, dtype=bool).reshape(-1)[:n_verts]
+        if not m.any():
+            raise ValueError(f"jno.fem periodic: boundary tag {tag!r} has no mesh vertices.")
+        masks[tag] = m
+    spec = [(masks[t[0]], masks[t[1]], (t[4] if len(t) > 4 and t[4] is not None else 1.0)) for t in ties]
+    n_fields = len(offsets) - 1
+    blocks, off_full, off_red = [], [0], [0]
+    is_bloch = False
+    for i in range(n_fields):
+        n_i = int(offsets[i + 1] - offsets[i])
+        space, dm = field_maps[i] if i < len(field_maps) else ("?", None)
+        if dm is None and space == "Lagrange":
+            dm = build_dofmap(cells, "Lagrange", 1, n_verts=n_verts)
+        if dm is None or space in ("P0", "DG"):
+            if space not in ("P0", "DG"):
+                raise NotImplementedError(f"jno.fem periodic: no DOF map for the {space} field {i}.")
+            idx = np.arange(n_i)
+            P = jsparse.BCOO((jnp.ones(n_i), jnp.asarray(np.stack([idx, idx], axis=1))), shape=(n_i, n_i))
+            kept, bl = idx, False
+        else:
+            P, kept, bl = periodic_prolongation(dm, vpts, cells, spec)
+        if int(P.shape[0]) != n_i:
+            raise RuntimeError(f"jno.fem periodic: field {i} has {n_i} DOFs but its map has {int(P.shape[0])}.")
+        is_bloch = is_bloch or bl
+        blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
+        off_full.append(off_full[-1] + n_i)
+        off_red.append(off_red[-1] + int(P.shape[1]))
+    return {
+        "blocks": blocks,
+        "off_full": off_full,
+        "off_red": off_red,
+        "n_full": off_full[-1],
+        "n_red": off_red[-1],
+        "is_bloch": is_bloch,
     }
 
 
@@ -6276,7 +6349,7 @@ def _fem_impl(
     # backed) domain once with gmsh setPeriodic on the tied face pairs. No `periodic=` arg — driven purely
     # by the periodic conditions the user already authored. (Nodal fields tie by interpolation and need no
     # re-mesh, so this is gated on N1E.)
-    if "N1E" in _trial_spaces(constraints) and hasattr(domain, "_remesh_periodic"):
+    if _trial_spaces(constraints) & {"N1E", "N2E", "RT"} and hasattr(domain, "_remesh_periodic"):
         _pairs = [(s[0], s[1]) for c in constraints if (s := _periodic_tie_spec(c, domain)) is not None]
         if _pairs:
             domain._remesh_periodic(_pairs)
@@ -6597,7 +6670,7 @@ def _fem_impl(
             # Exact slip elimination. Built in the periodic dict shape so the whole reduce / solve /
             # prolong / restrict path below is reused with no new branch.
             periodic = _build_slip_reduction(domain, slip_bcs, fem_obj, cells, ele_order)
-        elif _nonnodal_topo is not None and _nonnodal_topo.get("family") == "N1E":
+        elif _nonnodal_topo is not None and _nonnodal_topo.get("family") in ("N1E", "N2E", "RT"):
             # Nédélec N1E (H(curl) edge): DOF-level edge prolongation (Floquet/Bloch, with orientation sign)
             periodic = _build_periodic_reduction_n1e(domain, periodic_ties, fem_obj.offsets)
         elif _nonnodal_topo is not None:
@@ -6966,6 +7039,16 @@ def _fem_impl(
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
     _nonnodal_families = _trial_spaces(constraints) - _NATIVE_SPACES
+    # `u.across(main)` (a two-face boundary coupling) is assembled by the non-nodal path's general
+    # boundary-integrand machinery, which also carries Lagrange fields -- so a Lagrange-only form that
+    # reads it (a 2-D A_z eddy problem with a thin-conductor two-port) is routed there too.
+    _reads_across = any(
+        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_")
+        for c in constraints
+        for n in _walk(_bare(c))
+    )
+    if _reads_across and not _nonnodal_families:
+        _nonnodal_families = {"Lagrange (across)"}
     # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
     # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
     _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}
