@@ -13,6 +13,8 @@ is -lambda_i x_j on the pattern, plain JAX.
     plan = cudss_sym.plan(rows, cols, n, complex_values=True)   # complex symmetric: half the unknowns of the
                                                   # real-equivalent 2n block, ~half its factor flops and memory
     x = cudss_sym.solve(plan, values, b)          # under jit / grad; b (n,) or (n, k)
+    x = cudss_sym.solve(plan, values, b, refactor=False)   # REUSE the slot's last factors (of a nearby matrix) as a
+                                                  # preconditioner: GMRES to `tol`, NaN if it fails
 
 Rules of the design:
   * the pattern is CONCRETE and fixed per plan (a mesh with fixed topology); values change every call;
@@ -21,6 +23,9 @@ Rules of the design:
     (a vmap over designs, a scan) would refactor the same slot between a forward and its adjoint. Use one
     plan per concurrent matrix.
   * no ``vmap`` rule: batching raises.
+  * ``refactor=False`` (an optimisation loop whose matrix moves a little per step): no factorisation; restarted
+    GMRES preconditioned by the slot's stale LDL^T, until every column's relative residual is below ``tol``. If it
+    has not converged within ``maxiter`` preconditioner solves, the result (and the gradient) is NaN: refactor.
 
 The extension is compiled on first use with ``nvcc`` against the cuDSS of the ``nvidia-cudss`` wheel and JAX's
 FFI headers (cached by source hash). :func:`available` is False without a GPU, nvcc or cuDSS.
@@ -146,28 +151,100 @@ def plan(rows, cols, n, complex_values=False) -> Plan:
     return Plan(rows, cols, n, complex_values)
 
 
-def solve(p: Plan, values, b):
-    """``x = A^{-1} b`` for the symmetric matrix with COO ``(p.indices, values)``; jit- and grad-able."""
+def _ffi_solve(p: Plan, token, rhs):
+    """M^-1 rhs on the slot's current factors; rhs (n,) or (n, k)."""
+    import jax
+
+    sol = "jno_cudsz_solve" if p.complex else "jno_cudsd_solve"
+    r2 = rhs.reshape(p.n, -1).T                             # (k, n): each right-hand side contiguous
+    x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype))(token, r2, slot=np.int64(p.slot))
+    return x.T.reshape(rhs.shape)
+
+
+def _refine(p: Plan, matvec, rhs, tol, maxiter, restart=10):
+    """Restarted GLOBAL GMRES (one Krylov space for all columns, Frobenius inner product), right-preconditioned by
+    the slot's (stale) factors M: x = M^-1 y, A M^-1 y = b. Stops when every column's TRUE relative residual is
+    below ``tol``. Returns (x, preconditioner solves, worst relative residual). Memory: restart + 1 copies of rhs."""
+    import jax
+    import jax.numpy as jnp
+
+    token = jnp.zeros((1,), jnp.int32)                      # no factorisation in this program: no dependency
+    prec = lambda r: _ffi_solve(p, token, r)
+    B = rhs.reshape(p.n, -1)
+    bn = jnp.maximum(jnp.linalg.norm(B, axis=0), jnp.finfo(jnp.float64).tiny)
+    relres = lambda R: jnp.max(jnp.linalg.norm(R, axis=0) / bn)
+    target = 0.5 * tol * jnp.min(bn)                        # ||R||_F below this -> every column below tol
+    mv = lambda X: matvec(X.reshape(rhs.shape)).reshape(B.shape)
+    pc = lambda X: prec(X.reshape(rhs.shape)).reshape(B.shape)
+    m, dot = restart, lambda U, W: jnp.vdot(U, W)
+
+    def cycle(state):
+        X, R, nsolve, _ = state
+        beta = jnp.linalg.norm(R)
+        V = jnp.zeros((m + 1,) + B.shape, B.dtype).at[0].set(R / beta)
+        H = jnp.zeros((m + 1, m), B.dtype)
+        e1 = jnp.zeros(m + 1, B.dtype).at[0].set(beta)
+
+        def arnoldi(st):
+            V, H, k, _ = st
+            W = mv(pc(V[k]))
+            mask = (jnp.arange(m + 1) <= k).astype(B.dtype)
+            for _ in range(2):                              # classical Gram-Schmidt, twice
+                h = jnp.einsum("jnk,nk->j", V.conj(), W) * mask
+                W = W - jnp.einsum("j,jnk->nk", h, V)
+                H = H.at[:, k].add(h)
+            hn = jnp.linalg.norm(W)
+            H = H.at[k + 1, k].set(hn)
+            V = V.at[k + 1].set(W / jnp.where(hn > 0, hn, 1.0))
+            y = jnp.linalg.lstsq(H, e1)[0]
+            return V, H, k + 1, jnp.linalg.norm(e1 - H @ y)
+
+        V, H, k, _ = jax.lax.while_loop(lambda st: (st[2] < m) & (st[3] > target), arnoldi, (V, H, 0, beta))
+        y = jnp.linalg.lstsq(H, e1)[0]
+        X = X + pc(jnp.einsum("j,jnk->nk", y[:m], V[:m]))
+        R = B - mv(X)
+        return X, R, nsolve + k + 1, relres(R)
+
+    X0 = jnp.zeros_like(B)
+    X, _R, it, rel = jax.lax.while_loop(lambda s: (s[3] > tol) & (s[2] < maxiter), cycle, (X0, B, 0, jnp.inf))
+    return X.reshape(rhs.shape), it, rel
+
+
+def stale_solve(p: Plan, values, b, tol=1e-10, maxiter=30):
+    """The iteration of ``solve(..., refactor=False)`` without autodiff, with its diagnostics:
+    (x, preconditioner solves, worst relative residual). Not differentiable; for choosing ``tol`` and when to refactor."""
+    import jax.experimental.sparse as jsp
+    import jax.numpy as jnp
+
+    dt = jnp.complex128 if p.complex else jnp.float64
+    A = jsp.BCOO((values.astype(dt), p.indices), shape=(p.n, p.n))
+    return _refine(p, lambda x: A @ x, b.astype(dt), tol, maxiter)
+
+
+def solve(p: Plan, values, b, refactor=True, tol=1e-10, maxiter=30):
+    """``x = A^{-1} b`` for the symmetric matrix with COO ``(p.indices, values)``; jit- and grad-able.
+
+    ``refactor=False`` reuses the slot's last factors (see the module notes): NaN where GMRES has not
+    reached ``tol`` within ``maxiter`` steps, in the solution and in the gradient."""
     import jax
     import jax.experimental.sparse as jsp
     import jax.numpy as jnp
 
     n, slot = p.n, np.int64(p.slot)
     dt = jnp.complex128 if p.complex else jnp.float64
-    fac, sol = ("jno_cudsz_factor", "jno_cudsz_solve") if p.complex else ("jno_cudsd_factor", "jno_cudsd_solve")
+    fac = "jno_cudsz_factor" if p.complex else "jno_cudsd_factor"
     values = values.astype(dt)
     b = b.astype(dt)
-    vcsr = jnp.zeros(p.nnz + 1, dt).at[p.pos].add(values)[: p.nnz]
-    # the factorisation is not differentiated: the cotangent of `values` enters through the matvec below
-    token = jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(
-        jax.lax.stop_gradient(vcsr), slot=slot
-    )
     A = jsp.BCOO((values, p.indices), shape=(n, n))
-
-    def _solve(_matvec, rhs):
-        r2 = rhs.reshape(n, -1).T                           # (k, n): each right-hand side contiguous
-        x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype))(token, r2, slot=slot)
-        return x.T.reshape(rhs.shape)
+    if refactor:
+        vcsr = jnp.zeros(p.nnz + 1, dt).at[p.pos].add(values)[: p.nnz]
+        # the factorisation is not differentiated: the cotangent of `values` enters through the matvec below
+        token = jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(jax.lax.stop_gradient(vcsr), slot=slot)
+        _solve = lambda _matvec, rhs: _ffi_solve(p, token, rhs)
+    else:
+        def _solve(matvec, rhs):
+            x, _it, rel = _refine(p, matvec, rhs, tol, maxiter)
+            return jnp.where(rel <= tol, x, jnp.nan)
 
     # symmetric=True: the adjoint is the plain TRANSPOSE (JAX's linear transpose does not conjugate), and A^T = A
     # holds for complex symmetric as for real symmetric -- the same solve on the same factors
