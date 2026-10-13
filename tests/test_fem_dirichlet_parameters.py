@@ -229,9 +229,10 @@ def test_vector_field_per_component_parametric_value():
     np.testing.assert_allclose(got, np.asarray(oracle.solve()), rtol=1e-4, atol=1e-4)
 
 
-def test_parametric_times_temporal_value_refuses_loudly():
-    """`u(top) - g*tau`: the parametric branch would un-ramp the load, the temporal branch would
-    un-train the parameter — both silently wrong, so the combination must refuse at build."""
+def test_parametric_times_temporal_value_off_the_march_refuses_loudly():
+    """`u(top) - g*tau` on a τ domain whose form reads no history: nothing marches the grid, so there is no
+    step τ to hold the ramp at. It must refuse at build. (On a march the combination is supported --
+    tests/test_fem_tau_dirichlet_parameter.py, #103.)"""
     d = jno.shape.rect(0, 0, 0.5, 1, size=0.3).domain(tau=(0.0, 1.0, 4))
     u, v = d.fem_symbols(value_shape=(2,))
     inner, grad = jno.np.inner, jno.np.grad
@@ -240,7 +241,7 @@ def test_parametric_times_temporal_value_refuses_loudly():
     cb = d.variable("bottom", where=lambda x, y: y < 1e-9, split=True)
     gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
     g = _param("g", 0.01)
-    with pytest.raises(NotImplementedError, match="BOTH runtime-parametric"):
+    with pytest.raises(NotImplementedError, match="this form has no steps"):
         jno.fem([inner(gu, gv, n_contract=2), u(*ct[:2])[1] - g * ct[-1], u(*cb[:2])[0] - 0.0, u(*cb[:2])[1] - 0.0])
 
 

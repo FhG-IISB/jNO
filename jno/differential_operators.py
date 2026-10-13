@@ -203,7 +203,7 @@ class DifferentialOperators:
         hess_full = jnp.zeros((N, 1, 1)).at[:, 0, 0].set(d2u_dx2)
 
         if var_dims is not None:
-            n_vars = int(jnp.sqrt(len(var_dims)))
+            n_vars = int(len(var_dims) ** 0.5)
             result = jnp.zeros((N, n_vars, n_vars))
             for i, vi_dim, j, vj_dim in var_dims:
                 result = result.at[:, i, j].set(hess_full[:, vi_dim, vj_dim])
@@ -621,7 +621,7 @@ class DifferentialOperators:
             Hessian, shape ``(N, n_vars, n_vars)``.
         """
         N = points.shape[0]
-        n_vars = int(jnp.sqrt(len(var_dims)))
+        n_vars = int(len(var_dims) ** 0.5)
 
         if _mesh_route(method, grid) == "fit":
             n_v = int(round(len(var_dims) ** 0.5))
@@ -1041,7 +1041,7 @@ class DifferentialOperators:
             Hessian, shape ``(N, n_vars, n_vars)``.
         """
         N = points.shape[0]
-        n_vars = int(jnp.sqrt(len(var_dims)))
+        n_vars = int(len(var_dims) ** 0.5)
 
         if _mesh_route(method, grid) == "fit":
             n_v = int(round(len(var_dims) ** 0.5))
