@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
 #include <mutex>
 #include <utility>
 
@@ -154,7 +155,9 @@ ffi::Error factor_core(cudaStream_t stream, const void *values, int64_t count, i
   cudaStreamSynchronize(s->own);  // the scratch descriptors die here
   cudssMatrixDestroy(X);
   cudssMatrixDestroy(B);
-  if (st != CUDSS_STATUS_SUCCESS) return ffi::Error::Internal("jno_cudss_sym factor: cuDSS (re)factorisation failed");
+  if (st != CUDSS_STATUS_SUCCESS)
+    return ffi::Error::Internal(std::string("jno_cudss_sym factor: cuDSS (re)factorisation failed, status ") + std::to_string((int)st) +
+                                (st == CUDSS_STATUS_ALLOC_FAILED ? " (out of device memory)" : ""));
   s->factored = true;
   cudaEventRecord(s->out, s->own);
   cudaStreamWaitEvent(stream, s->out, 0);
