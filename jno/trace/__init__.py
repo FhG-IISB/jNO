@@ -1390,6 +1390,12 @@ class Placeholder:
 
             space_time_integral = u_net(x, t).integrate().integrate(t)
 
+        **Domain integral of known fields** (``var=d`` — a domain): an expression of frozen fields (data, or
+        solutions of any number of forms frozen with ``u.bind(...).freeze(fem.solve())``), parameters and
+        coordinates, integrated over the volume with each field's own element -- so a reciprocity matrix is its
+        formula, e.g. ``C_jk = (eps * inner(grad(Phi[k]), grad(Phi[j]))).integrate(d)``. See
+        ``Domain._integral_node``.
+
         **FEM integral** (``var=fem`` — a ``jno.fem(...)`` object):
         Integrates an expression built from that FEM's own symbols over its basis, at its
         solution, returning a differentiable scalar. This is the FEM twin of the collocation
@@ -4945,13 +4951,30 @@ class FrozenField(Placeholder):
         self.space = str(getattr(source, "space", "Lagrange"))
         self.op_id = _next_op_id()
         self.field_key = source.field_key  # share the source field's shape data
+        # VALUES FROM THE TRACE: `u.bind(...).freeze(fem.solve())` -- the solution of a form, known to any
+        # expression read after the solve (and differentiable through it). A solve of a form with several
+        # fields is sliced to this field's block. Read today by `expr.integrate(domain)`.
+        _node = values._expr if (not isinstance(values, Placeholder) and isinstance(getattr(values, "_expr", None), Placeholder)) else values
+        self.values_node, self.values_block = None, None
+        if isinstance(_node, Placeholder):
+            self.values_node = _node
+            _fem = getattr(_node, "_fem_ref", None)
+            _offs = None if _fem is None else getattr(_fem, "offsets", None)
+            if _offs is not None and len(_offs) > 2:
+                _i = _fem.block_index(source)
+                self.values_block = (int(_offs[_i]), int(_offs[_i + 1]))
+            self._values = None
+            self.frozen_id = _next_op_id()
+            self._domain = domain
+            self._coord_tag = coord_tag
+            return
         _v = jnp.asarray(values)
         # scalar field: a flat global nodal vector (n_nodes,); VECTOR field: (n_nodes, vec) so the assembler
         # gathers each cell's per-node vec-vectors (the kernel interpolates either). value_shape is set above.
         # An H(curl)/H(div) field (N1E, N2E, RT) carries ONE value per DOF (edge circulations, face fluxes):
         # its vector value comes from the basis, not from per-node components, so it stays flat.
         _per_dof = self.space.upper() in ("N1E", "N2E", "RT") or self.num_components == 1
-        self.values = _v.reshape(-1) if _per_dof else _v.reshape(-1, self.num_components)
+        self._values = _v.reshape(-1) if _per_dof else _v.reshape(-1, self.num_components)
         self.frozen_id = _next_op_id()  # kernel gather-table key
         # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
         # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
@@ -4965,6 +4988,22 @@ class FrozenField(Placeholder):
         for s in self.value_shape:
             n *= int(s)
         return n
+
+    @property
+    def values(self):
+        """The known DOF values. A field frozen to a SOLVE has none until evaluation: it is read by
+        ``expr.integrate(domain)``; a form (one-way coupling) or a standalone ``.eval()`` cannot take it yet."""
+        if self.values_node is not None:
+            raise NotImplementedError(
+                f"{self.name}: a field frozen to a solve (`freeze(fem.solve())`) has its values only inside the "
+                "trace. It is read by `expr.integrate(domain)`; using it in a weak form (a one-way coupling) or "
+                "evaluating it standalone is not wired yet -- freeze a concrete solution array there."
+            )
+        return self._values
+
+    @values.setter
+    def values(self, v):
+        self._values = v
 
     def _field_view(self):
         n = len(self.value_shape)
@@ -4980,7 +5019,9 @@ class FrozenField(Placeholder):
     bind = partials
 
     def __repr__(self):
-        return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
+        if self.values_node is not None:
+            return f"FrozenField(source_key={self.field_key}, values=<solve>)"
+        return f"FrozenField(source_key={self.field_key}, ndof={self._values.shape[0]})"
 
 
 class LoadPathField(FrozenField):

@@ -53,7 +53,9 @@ def _module_call(fn: Callable, args: list = [], name: str = "", reduces_axis: Op
 
         custom = jno.fn(lambda a, b: a ** 2 + b, [u, v], name="my_op")
     """
-    return FunctionCall(fn, args, name, reduces_axis)
+    from .jnp_ops import _u  # a typed view (u.scalar, a view-valued expression) is its Placeholder, as in jno.np.*
+
+    return FunctionCall(fn, [_u(a) for a in args], name, reduces_axis)
 
 
 def _to_scalar_loss(x):
