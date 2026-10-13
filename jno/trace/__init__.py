@@ -4852,12 +4852,14 @@ class FrozenField(Placeholder):
     @property
     def values(self):
         """The known DOF values. A field frozen to a SOLVE has none until evaluation: it is read by
-        ``expr.integrate(domain)``; a form (one-way coupling) or a standalone ``.eval()`` cannot take it yet."""
+        ``expr.integrate(domain)`` and, as a runtime input (one-way coupling), by a non-nodal form; the nodal
+        Lagrange assembler and a standalone ``.eval()`` cannot take it yet."""
         if self.values_node is not None:
             raise NotImplementedError(
                 f"{self.name}: a field frozen to a solve (`freeze(fem.solve())`) has its values only inside the "
-                "trace. It is read by `expr.integrate(domain)`; using it in a weak form (a one-way coupling) or "
-                "evaluating it standalone is not wired yet -- freeze a concrete solution array there."
+                "trace. It is read by `expr.integrate(domain)` and by non-nodal forms (N1E / N2E / RT / DG / P_k "
+                "unknowns); the nodal Lagrange assembler and a standalone `.eval()` need a concrete solution "
+                "array -- freeze that there."
             )
         return self._values
 
