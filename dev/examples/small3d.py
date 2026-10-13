@@ -59,6 +59,7 @@ r = prof.run(
     label=a.label,
     reps=a.reps,
     backend_stats=lambda: _p.stats() + [dict(backend="cudss_ffi", n=plan.n, **plan.stats())],
+    sizes=dict(cells=n_tets, nodes=len(P), nnz=int(A0.nse), n=n, nrhs=1, complex=False),
 )
 print(r.table())
 print("saved", r.save())

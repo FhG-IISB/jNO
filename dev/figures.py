@@ -73,6 +73,8 @@ def ladder(res, bounds=None, ax=None):
         txt = f"{m:.1f} ms, {a['launches']:,} launches"
         if kb:
             txt = f"x{m / kb:.1f}" + (f" / x{m / ib:.0f}" if ib else "") + "   " + txt
+        elif ib:
+            txt = f"- / x{m / ib:.0f}   " + txt
         ax.text(m * 1.3, yi, txt, va="center", ha="left", fontsize=8, color=hs.INK)
     ax.yaxis.set_major_locator(mt.FixedLocator(list(y)))
     ax.set_yticklabels(stages)
@@ -322,7 +324,11 @@ def bind_strip(run_dir, ax=None, top: int = 12):
 def all_figures(res, out_dir, bounds=None):
     hs.apply("paper")
     if bounds is None:
-        bounds = bounds_from_kernels(out_dir) or None
+        kb = bounds_from_kernels(out_dir)
+        ib = res.intrinsic_bounds()
+        bounds = {
+            s: (kb.get(s, (None, None, None))[0], ib.get(s), kb.get(s, (None, None, None))[2]) for s in set(kb) | set(ib)
+        } or None
     for name, f in (
         ("headroom_ladder", lambda: ladder(res, bounds)),
         ("icicle", lambda: icicle(res)),

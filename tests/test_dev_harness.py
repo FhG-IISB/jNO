@@ -72,3 +72,21 @@ def test_parse_csv_wide_layout_units_and_derived_fields():
     assert rec["l2_hit_pct"] == pytest.approx(75.5)
     assert rec["intensity"] == pytest.approx(2500 / 2.5e6)
     assert rec["fp64_flop_per_s"] == pytest.approx(2500 / 0.5e-3)
+
+
+def test_intrinsic_bounds_from_sizes_and_backend_record():
+    r = prof.Result(
+        "x",
+        {"sizes": dict(cells=1000, nodes=250, nnz=20000, n=2000, nrhs=3, complex=True)},
+        {},
+        [],
+        [],
+        [{"backend": "cudss_ffi", "lu_nnz": 100000}],
+    )
+    pk = {"fp64_flop_s": 1e9, "dram_B_s": 1e9}
+    b = r.intrinsic_bounds(pk)
+    mesh_B, trip_B = 1000 * 16 + 250 * 24, 20000 * (16 + 8)
+    assert b["jno/assemble"] == pytest.approx(2 * (mesh_B + trip_B) / 1e9 * 1e3)
+    assert b["jno/factor"] == pytest.approx(100000**2 / 2000 / 1e9 * 4 * 1e3)
+    assert b["jno/solve"] == pytest.approx(2 * 2 * 3 * 100000 * 16 / 1e9 * 1e3)
+    assert prof.Result("y", {"sizes": {}}, {}, [], [], []).intrinsic_bounds(pk) == {}

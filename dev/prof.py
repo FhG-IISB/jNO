@@ -102,6 +102,33 @@ class Result:
     backend_stats: list[dict]
     trace_dir: str | None = None
 
+    # ── bounds ────────────────────────────────────────────────────────────────────────────────────────
+    def intrinsic_bounds(self, peak=None):
+        """{stage: ms} the minimal work of each stage at the card's peak, from `meta["sizes"]` and the backend records.
+        assemble: read the mesh and write the triplets once, the adjoint reads them and writes a gradient (x2);
+        factor: sum_j nnz(L_j)^2 flops approximated as nnz(L)^2 / n (a lower bound for a balanced profile), at
+        FP64 peak; solve: forward + backward sweep over nnz(L) per right-hand side, twice for the adjoint, at DRAM
+        peak. Stages without a formula get none (the ladder leaves the rung out)."""
+        from dev.figures import PEAK
+
+        pk = peak or PEAK
+        sz = self.meta.get("sizes") or {}
+        if not sz:
+            return {}
+        w = 16 if sz.get("complex") else 8
+        out = {}
+        nnz, n, cells, nodes = sz.get("nnz"), sz.get("n"), sz.get("cells"), sz.get("nodes")
+        nrhs = sz.get("nrhs", 1)
+        if cells and nnz:
+            mesh_B = cells * 4 * 4 + (nodes or cells // 5) * 3 * 8  # connectivity (int32) + coordinates
+            trip_B = nnz * (w + 8)  # value + packed index
+            out["jno/assemble"] = 2 * (mesh_B + trip_B) / pk["dram_B_s"] * 1e3
+        lu = next((b.get("lu_nnz") for b in self.backend_stats if b.get("lu_nnz")), None)
+        if lu and n:
+            out["jno/factor"] = (lu**2 / n) / pk["fp64_flop_s"] * (4 if sz.get("complex") else 1) * 1e3
+            out["jno/solve"] = 2 * 2 * nrhs * lu * w / pk["dram_B_s"] * 1e3
+        return out
+
     # ── aggregation ────────────────────────────────────────────────────────────────────────────────────
     def by_stage(self):
         """{stage: {"forward_ms", "adjoint_ms", "launches", "kernels": [Kernel...]}} sorted by total time."""
@@ -144,13 +171,17 @@ class Result:
                 f"({small:,} under 20 us); memcpy {sum(m.bytes * m.count for m in self.memcpys) / 1e6:.1f} MB in "
                 f"{sum(m.count for m in self.memcpys)} copies"
             )
-            lines.append(f"  {'stage':28s} {'fwd ms':>8s} {'adj ms':>8s} {'launches':>9s} {'memcpy':>14s}  top kernel")
+            ib = self.intrinsic_bounds()
+            lines.append(
+                f"  {'stage':28s} {'fwd ms':>8s} {'adj ms':>8s} {'launches':>9s} {'memcpy':>14s} {'x intrinsic':>11s}  top kernel"
+            )
             for s, a in self.by_stage().items():
                 top = max(a["kernels"], key=lambda k: k.duration_ns * k.count)
                 mc = [m for m in self.memcpys if m.stage == s]
                 mtxt = f"{sum(m.bytes * m.count for m in mc) / 1e6:.1f} MB/{sum(m.count for m in mc)}" if mc else "-"
+                itxt = f"x{(a['forward_ms'] + a['adjoint_ms']) / ib[s]:.0f}" if s in ib and ib[s] > 0 else "-"
                 lines.append(
-                    f"  {s:28s} {a['forward_ms']:8.1f} {a['adjoint_ms']:8.1f} {a['launches']:9,d} {mtxt:>14s}  "
+                    f"  {s:28s} {a['forward_ms']:8.1f} {a['adjoint_ms']:8.1f} {a['launches']:9,d} {mtxt:>14s} {itxt:>11s}  "
                     f"{top.hlo_op} ({top.duration_ns * top.count / 1e6:.1f} ms, occ {top.occupancy_pct:.0f} %)"
                 )
             h2d = [m for m in self.memcpys if m.kind != "D2D"]
@@ -293,10 +324,13 @@ def run(
     out_dir: str | None = None,
     transfer_check: bool = True,
     backend_stats=None,
+    sizes: dict | None = None,
 ) -> Result:
     """Profile one jitted callable at `args`. The first call compiles (timed apart); `reps` steady-state calls
     are timed; one more runs inside the profiler trace. `backend_stats`: a callable returning the solver
-    backends' records (default: jno.utils.profiling.stats() if jNO carries the hook)."""
+    backends' records (default: jno.utils.profiling.stats() if jNO carries the hook). `sizes`: what the
+    program is made of, for the intrinsic bounds (`intrinsic_bounds`): cells, nodes, nnz (operator entries),
+    n (unknowns), nrhs, complex (bool), dtype_bytes; factor nnz comes from the backend record (`lu_nnz`)."""
     try:
         import jno
 
@@ -313,6 +347,7 @@ def run(
         argv=sys.argv,
         time=time.strftime("%Y-%m-%d %H:%M"),
         cwd=os.getcwd(),
+        sizes=dict(sizes or {}),
     )
     under_ncu = os.environ.get("JNO_PROF_NCU") == "1"  # dev/kernels.py re-runs the script under ncu: no trace, no guard
     trace, transfer_check, reps = (False, False, 1) if under_ncu else (trace, transfer_check, reps)
