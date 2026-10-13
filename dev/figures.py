@@ -80,7 +80,7 @@ def ladder(res, bounds=None, ax=None, verdict=None):
             ax.text(m * 1.3, yi, txt, va="center", ha="left", fontsize=8, color=hs.INK)
         margin = f"{m:.1f} ms, {a['launches']:,} launches"
         if verdict and s in verdict:
-            margin += "  ·  " + re.split(r"[:;(]", verdict[s])[0].strip()
+            margin += "  |  " + re.split(r"[:;(]", verdict[s])[0].strip()
         ax.text(
             1.02,
             yi,
