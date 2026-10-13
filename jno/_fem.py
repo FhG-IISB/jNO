@@ -3774,8 +3774,12 @@ class FEM:
             if op.operator_fn is not None:
                 names = list(op.runtime_parameter_exprs)
                 shapes = []
+                known = (op.metadata or {}).get("runtime_value_shapes") or {}
                 for n_ in names:
-                    mod = getattr(op.runtime_parameter_exprs[n_].model, "module", None)
+                    if n_ in known:  # the assembler recorded it (coordinates, a field frozen to another solve)
+                        shapes.append(np.zeros(known[n_]))
+                        continue
+                    mod = getattr(getattr(op.runtime_parameter_exprs[n_], "model", None), "module", None)
                     val = getattr(mod, "value", None)
                     if val is None:
                         return None  # a parameter whose shape is not known here: no planned pattern

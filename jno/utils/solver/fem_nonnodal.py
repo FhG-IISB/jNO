@@ -466,10 +466,20 @@ def assemble_fem_nonnodal(
     # A frozen field on its OWN element space (N1E / N2E / RT of any degree, Lagrange P_k with k >= 2, DG,
     # P0) is a coefficient field: evaluated below with that space's basis and Piola map (`_coef_specs`).
     # Only a P1 Lagrange one keeps the per-vertex gather.
+    # A field frozen to a SOLVE (`u.freeze(fem1.solve())`, a one-way coupling) has no values at build time:
+    # it becomes a runtime input of this form -- its expression IS the other form's solve node, so jno.core
+    # evaluates that solve first and the gradient flows through it -- and is evaluated per cell from a
+    # coefficient slot, whatever its space.
+    _frozen_solved = {f: n for f, n in _frozen_all.items() if getattr(n, "values_node", None) is not None}
     _frozen_nodes = {
-        f: n for f, n in _frozen_all.items() if str(n.space).upper() == "LAGRANGE" and int(n.order) == 1
+        f: n
+        for f, n in _frozen_all.items()
+        if f not in _frozen_solved and str(n.space).upper() == "LAGRANGE" and int(n.order) == 1
     }
-    _frozen_space = {f: n for f, n in _frozen_all.items() if f not in _frozen_nodes}
+    _frozen_space = {f: n for f, n in _frozen_all.items() if f not in _frozen_nodes and f not in _frozen_solved}
+    _solved_name = {f: f"frozen_solution_{f}" for f in _frozen_solved}
+    for _f, _n in _frozen_solved.items():  # each solved frozen field: its solve node is a runtime input
+        _param_and_neural_exprs = {**_param_and_neural_exprs, _solved_name[_f]: _n.values_node}
     # Per-cell nodal slice, a compile-time constant (no args threading, no jacfwd tangent).
     # scalar (n_nodes,) -> (n_cell, n_local, 1); VECTOR (n_nodes, vec) -> (n_cell, n_local, vec).
     _frozen_gathered: dict = {}
@@ -493,7 +503,10 @@ def assemble_fem_nonnodal(
     # key -> (family, degree, value_shape) of every coefficient field on its own element space
     _coef_elems = {("param", n): tuple(_rt_param_exprs[n].model._fem_space) for n in _space_param_names}
     _coef_elems.update(
-        {("frozen", f): _coef_family(n.space, n.order) + (tuple(n.value_shape),) for f, n in _frozen_space.items()}
+        {
+            ("frozen", f): _coef_family(n.space, n.order) + (tuple(n.value_shape),)
+            for f, n in {**_frozen_space, **_frozen_solved}.items()
+        }
     )
     _coef_orders = [k for (_f, k, _v) in _coef_elems.values()]
     _kmax = max([o for o, s_ in zip(_orders, spaces) if s_ in _EDGE_FAMILIES + ("Lagrange", "DG")] + _coef_orders + [1])
@@ -654,6 +667,33 @@ def assemble_fem_nonnodal(
 
     _coef_specs = {key: _coef_spec(*elem) for key, elem in _coef_elems.items()}
     _coef_frozen_vals = {("frozen", f): _frozen_coef_values(n, _coef_specs[("frozen", f)]) for f, n in _frozen_space.items()}
+
+    def _solved_len(f):
+        """the length of the solve a solved frozen field arrives as (its whole system, sliced to its block)"""
+        blk = _frozen_solved[f].values_block
+        return blk[1] if blk is not None else _coef_specs[("frozen", f)]["n_vals"]
+
+    def _frozen_vals_at(args):
+        """the known values of every frozen coefficient for this call: the constant ones, plus each field
+        frozen to a solve read from ``args`` (sliced to its block, length checked)"""
+        if not _frozen_solved:
+            return _coef_frozen_vals
+        out = dict(_coef_frozen_vals)
+        a_ = args or {}
+        for f, n in _frozen_solved.items():
+            nm = _solved_name[f]
+            if nm not in a_:
+                raise ValueError(
+                    f"jno.fem: this form reads {n.name}, frozen to another form's solve, whose solution was not "
+                    "supplied. It is evaluated through jno.core (`fem.solve()` with no values, then crux); to "
+                    "solve eagerly, freeze the concrete solution array instead."
+                )
+            v = jnp.reshape(jnp.asarray(a_[nm]), (-1,))
+            if v.shape[0] != _solved_len(f):
+                raise ValueError(f"jno.fem: {n.name}: the solve has {v.shape[0]} values, expected {_solved_len(f)}.")
+            blk = n.values_block
+            out[("frozen", f)] = v if blk is None else v[blk[0] : blk[1]]
+        return out
 
     def _coef_slots(c, param_vals, pts_dyn, specs=None, frozen_vals=None):
         """This cell's coefficient-field slots ``{key: field slot}`` (the `_cell_fields` dict layout)."""
@@ -1135,9 +1175,10 @@ def assemble_fem_nonnodal(
             # The steady linear operator is built FROM this residual (jacfwd -> A, -residual(0) -> b),
             # so without this the shape derivative is lost before `assemble` is ever reached.
             _pts_r = _apply_coord_params(pts, _a)
+            _fz = _frozen_vals_at(_a)
             for coeff, tfi, rnames in typed:
 
-                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r):
+                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r, _fz=_fz):
                     per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
                     _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _p is None else _p)[cells_j[c]])
                     vol_vars = tuple(
@@ -1163,7 +1204,7 @@ def assemble_fem_nonnodal(
                     if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
                         local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
                     if _coef_specs:  # coefficient fields on their own element space
-                        local["coef_fields"] = _coef_slots(c, _fv, _p)
+                        local["coef_fields"] = _coef_slots(c, _fv, _p, None, _fz)
                     if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                         local["neural_coefficients"] = _nt
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
@@ -1550,6 +1591,7 @@ def assemble_fem_nonnodal(
             }
             _nt = neural_local_table(_neural, args)
             _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
+            _fz_a = _frozen_vals_at(_a)
 
             def _elem_res(c, la, coeff, tfi, rnames):
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
@@ -1579,7 +1621,7 @@ def assemble_fem_nonnodal(
                 if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
                     local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
                 if _coef_specs:  # coefficient fields on their own element space
-                    local["coef_fields"] = _coef_slots(c, field_vals, _pts_dyn)
+                    local["coef_fields"] = _coef_slots(c, field_vals, _pts_dyn, None, _fz_a)
                 if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                     local["neural_coefficients"] = _nt
                 return _integrate_term(domain, coeff, local, qw * meas)
@@ -2069,6 +2111,7 @@ def assemble_fem_nonnodal(
             }
             _nt = neural_local_table(_neural, args)
             _p = _apply_coord_params(pts, _a)
+            _fv_call = {**_frozen_vals_at(_a), **{k_: v_ for k_, v_ in f_vals.items() if k_ not in _coef_frozen_vals}}
             out = 0.0  # promotes to the integrand's dtype (a complex coefficient on a real solution stays complex)
             for expr, rnames in typed:
 
@@ -2095,7 +2138,7 @@ def assemble_fem_nonnodal(
                     if f_gath:
                         local["frozen_fields"] = {fid: g[c] for fid, g in f_gath.items()}
                     if f_specs:
-                        local["coef_fields"] = _coef_slots(c, field_vals, _p, f_specs, f_vals)
+                        local["coef_fields"] = _coef_slots(c, field_vals, _p, f_specs, _fv_call)
                     if _nt is not None:
                         local["neural_coefficients"] = _nt
                     val = _integrate_term(domain, e, local, qw * meas)
@@ -2162,7 +2205,7 @@ def assemble_fem_nonnodal(
     # COEFFICIENT, so it never appears in `runtime_parameter_tags`. Without it here the assembler
     # returns a static (A, b) and the shape derivative is silently zero -- which reads as a
     # converged design rather than a missing feature.
-    if runtime_parameter_tags or neural_param_names or _coord_specs:
+    if runtime_parameter_tags or neural_param_names or _coord_specs or _frozen_solved:
         from ...trace import FemLinearSystem
 
         def _assemble_at(args):
@@ -2182,6 +2225,9 @@ def assemble_fem_nonnodal(
         # a coordinate parameter's placeholder is the CURRENT node positions, not zeros: `.A` / `.b`
         # must describe the mesh as it stands, and zeros would collapse those vertices onto the origin.
         _ph.update({_nm: pts[_ids, _ax] for _ids, _ax, _nm in _coord_specs})
+        # a solved frozen field's placeholder is zeros of its solve's length: `.A` / `.b` are then the system with
+        # that coefficient at zero (the real values exist only when jno.core evaluates the other solve)
+        _ph.update({_solved_name[f]: jnp.zeros((_solved_len(f),)) for f in _frozen_solved})
         a0, b0 = _assemble_at(_ph)
         return (
             FemLinearSystem(
@@ -2190,7 +2236,9 @@ def assemble_fem_nonnodal(
                 operator_fn=lambda args=None: _assemble_at(args)[0],
                 rhs_fn=lambda args=None: _assemble_at(args)[1],
                 runtime_parameter_exprs=dict(_param_and_neural_exprs),
-                metadata={"nonaffine_operator": True},  # re-assembles at each args; no affine parameter basis
+                # re-assembles at each args (no affine parameter basis); the shape of every runtime input, for
+                # callers that need one without a value (a solver planning its factorisation)
+                metadata={"nonaffine_operator": True, "runtime_value_shapes": {k: jnp.shape(v) for k, v in _ph.items()}},
             ),
             "linear",
             offs,
