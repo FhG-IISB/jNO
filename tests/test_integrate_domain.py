@@ -136,3 +136,69 @@ def test_shared_solves_are_evaluated_once_per_evaluation(monkeypatch):
     many = 2.0 * c01 - c01 * c01 + jno.np.stack([c01, c01])[1]
     crux.eval([many])
     assert len(calls) == once, f"{len(calls)} assemblies for one expression with 4 references, {once} for one"
+
+
+def _localized_admittance():
+    """the eddy admittance of two drives whose sources sit on a few edges at x < 0.3 (a terminal's bar)"""
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).sized(0.25).domain()
+    c = d.variable("interior", split=True)
+    x, y, z = c[0], c[1], c[2]
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    e, _f = d.fem_symbols(value_shape=(3,), names=("e", "f"), space="N1E")
+    dm = build_dofmap(np.asarray(d.mesh.cells_dict["tetra"]), "N1E", 1, n_verts=len(d.mesh.points))
+    P = np.asarray(d.mesh.points)
+    ev = np.zeros((int(dm.n_dofs), 2), np.int64)
+    ev[np.asarray(dm.cell_dofs).reshape(-1)] = np.asarray(d.mesh.cells_dict["tetra"])[:, [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]].reshape(-1, 2)
+    near = (P[ev[:, 0], 0] < 0.3) & (P[ev[:, 1], 0] < 0.3)
+    H = np.random.default_rng(1).normal(size=(2, int(dm.n_dofs))) * near
+    A, V = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    curl = lambda f_: f_.vector.curl(x, y, z)  # noqa: E731
+    E = [e.bind(x=x, y=y, z=z).freeze(h) for h in H]
+    kap = jno.np.parameter((1,), name="kap")  # a runtime parameter: the solves stay lazy, inputs of the integrals
+    kap.dtype(jnp.float64)
+    kap.initialize(jax.nn.initializers.constant(1.0))
+    fems = [jno.fem([inner(curl(u), curl(v)) + 2j * 3.0 * inner(A, V) + 0.1 * kap * inner(A, V) - 3.0 * inner(Ek, V)])
+            for Ek in E]
+    Ak = [u.bind(x=x, y=y, z=z).freeze(f.solve(linear=HOST)) for f in fems]
+    return d, lambda: [(3.0 * inner(E[k] - 2j * Ak[k], E[j])).integrate(d) for j in range(2) for k in range(2)], fems
+
+
+def test_an_integral_runs_over_the_support_of_its_data_only(monkeypatch):
+    """the integrand vanishes off the cells of the known source E_j: the loop runs over those, and value and
+    gradient equal those of the loop over every cell"""
+    import jno.utils.solver.fem_known as FK
+
+    d, build, fems = _localized_admittance()
+    seen = []
+    orig = FK.cell_support
+    monkeypatch.setattr(FK, "cell_support", lambda *a: seen.append(orig(*a)) or seen[-1])
+    Y = build()
+    n_cells = len(d.mesh.cells_dict["tetra"])
+    assert all(s is not None and 0 < s.sum() < 0.5 * n_cells for s in seen), [None if s is None else int(s.sum()) for s in seen]
+    monkeypatch.setattr(FK, "cell_support", lambda *a: None)
+    Y_all = build()
+    np.testing.assert_allclose(np.array(_eval(Y)), np.array(_eval(Y_all)), rtol=1e-12)
+    sol = [jnp.asarray(f.solve(linear=HOST, kap=jnp.ones(1))) for f in fems]
+    g = lambda node: np.asarray(jax.grad(lambda a: jnp.real(node.fn(a)) + jnp.imag(node.fn(a)))(sol[1]))  # noqa: E731
+    np.testing.assert_allclose(g(Y[1]), g(Y_all[1]), rtol=1e-11, atol=1e-14)
+    assert np.abs(g(Y_all[1])).max() > 0
+
+
+def test_support_of_region_masks_sums_and_zeros():
+    """a region coefficient restricts to its region (a literal-0 default adds nothing), a sum with a term of
+    unknown support is unrestricted, a literal 0 has no support"""
+    from jno.utils.solver.fem_known import cell_support
+
+    d = (jno.shape.rect(0, 0, 1, 1).name("a") + jno.shape.rect(1, 0, 2, 1).name("b")).sized(0.25).domain()
+    d.attach("a", m=1.0).attach(m=0.0)
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    n = len(d.mesh.cells_dict["triangle"])
+    region = lambda r: np.asarray(_cell_region_mask(d, r)).reshape(-1) != 0  # noqa: E731
+    phi, _v = d.fem_symbols(names=("phi", "v"))
+    xi, yi = d.variable("interior", split=True)[:2]
+    f = phi.bind(x=xi, y=yi).freeze(np.ones(len(d.mesh.points)))
+    s = cell_support(d.m * f, n, lambda node: None, region)
+    np.testing.assert_array_equal(s, region("a"))
+    assert cell_support(d.m * f + xi, n, lambda node: None, region) is None
+    assert not cell_support(0.0 * f, n, lambda node: None, region).any()

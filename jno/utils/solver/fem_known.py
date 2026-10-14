@@ -96,6 +96,61 @@ def collect_frozen(expr) -> Dict[int, Any]:
     return found
 
 
+# FunctionCalls that vanish wherever ONE argument does (products), and those of one argument with f(0) = 0
+_PRODUCTS = {"inner", "einsum"}
+_ZERO_PRESERVING = {"getitem", "transpose", "sym", "antisym", "trace"}
+
+
+def cell_support(expr, n_cells, frozen_rows, region_cells):
+    """The cells on which ``expr`` can be nonzero (a bool array), or ``None`` when that is not known statically.
+
+    Read from the factors that are DATA: a frozen field with constant values is zero on every cell whose DOFs are
+    all zero (``frozen_rows(node)`` gives that per-cell mask), a region mask outside its region, a literal 0
+    everywhere; a product is zero where either factor is, a sum where both are. Anything this does not know (a
+    solve, a parameter, an unknown function) counts as nonzero everywhere, so the support can only be too LARGE,
+    never too small: restricting the cell loop to it never changes the integral.
+    """
+    from ...trace import BinaryOp, FrozenField, FunctionCall, Literal, RegionMask
+    from ...trace.views import _VIEW_TYPES
+
+    def union(a, b):
+        return None if a is None or b is None else a | b
+
+    def meet(a, b):
+        return b if a is None else a if b is None else a & b
+
+    def walk(n):
+        n = n._expr if isinstance(n, _VIEW_TYPES) else n
+        if isinstance(n, (int, float, complex)) or isinstance(n, Literal):
+            v = np.asarray(n.value if isinstance(n, Literal) else n)
+            return np.zeros(n_cells, bool) if v.size and not np.any(v) else None
+        if isinstance(n, RegionMask):
+            return region_cells(n.region)
+        if isinstance(n, FrozenField):
+            return frozen_rows(n) if getattr(n, "values_node", None) is None else None
+        if isinstance(n, BinaryOp):
+            if n.op == "*":
+                return meet(walk(n.left), walk(n.right))
+            if n.op == "/":
+                return walk(n.left)
+            if n.op in ("+", "-"):
+                return union(walk(n.left), walk(n.right))
+            return None
+        if isinstance(n, FunctionCall):
+            name = getattr(n, "_name", None)
+            args = [a for a in (n.args or ()) if hasattr(a, "__class__") and a.__class__.__module__.startswith("jno")]
+            if name in _PRODUCTS and args:
+                out = None
+                for a in args:
+                    out = meet(out, walk(a))
+                return out
+            if name in _ZERO_PRESERVING and len(args) == 1:
+                return walk(args[0])
+        return None
+
+    return walk(expr)
+
+
 def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
     """``(fn, inputs)``: ``fn(values) -> ()`` integrates ``expr`` over the whole volume of ``domain``;
     ``inputs`` lists ``(key, node)`` for every value it needs at evaluation time -- a frozen field whose values
@@ -179,6 +234,22 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
     masks = [jnp.asarray(_cell_region_mask(domain, r)).reshape(-1) for r in rnames]
     ctx = getattr(domain, "context", {}) or {}
 
+    # the cells the integrand can be nonzero on (a terminal current lives on its bar's cells only): the loop runs
+    # over those alone -- the integral is the same, the work and the reverse-mode memory scale with the support
+    def frozen_rows(node):
+        key = ("frozen", node.frozen_id)
+        if key not in const_vals:
+            return None
+        sp = specs[key]
+        nz = np.any(np.reshape(np.asarray(const_vals[key]), (-1, sp["ncomp"])) != 0, axis=1)
+        return np.any(nz[np.asarray(sp["cdofs"])], axis=1)
+
+    support = cell_support(expr, n_cells, frozen_rows,
+                           lambda r: np.asarray(_cell_region_mask(domain, r)).reshape(-1) != 0)
+    # an empty support still evaluates one cell (where the integrand is exactly 0): the result keeps its dtype
+    ids = np.arange(n_cells) if support is None else np.flatnonzero(support)
+    cell_ids = jnp.asarray(ids if ids.size else np.zeros(1, np.int64))
+
     def fn(values):
         geo = pts
         for ids, axis, name in coords:  # trainable node positions: the geometry is traced
@@ -245,6 +316,7 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
                 )
             return val
 
-        return jnp.sum(elem_map(cell, (jnp.arange(n_cells),), cell_chunk(n_cells, 1, 1, _CHUNK_OVERRIDE[0])))
+        n_loop = int(cell_ids.shape[0])
+        return jnp.sum(elem_map(cell, (cell_ids,), cell_chunk(n_loop, 1, 1, _CHUNK_OVERRIDE[0])))
 
     return fn, inputs
