@@ -5856,7 +5856,14 @@ def cse(expr: Placeholder) -> Placeholder:
         elif isinstance(node, FunctionCall):
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
-                node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                rebuilt = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                # keep what the call carries beyond its constructor arguments: ``getitem_key``, a solve's
+                # ``_solve_fls`` / ``_fem_ref`` / ``_linear_spec``, ``_per_evaluation``, an integral's spec --
+                # dropping them silently turned off the shared factorisation and the per-evaluation memo
+                for k, v in vars(node).items():
+                    if k not in vars(rebuilt):
+                        setattr(rebuilt, k, v)
+                node = rebuilt
         elif isinstance(node, Choice):
             new_opts = [_visit(a) if isinstance(a, Placeholder) else a for a in node.options]
             if any(n is not o for n, o in zip(new_opts, node.options)):
