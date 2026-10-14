@@ -224,6 +224,10 @@ ci-test = "pytest -x --tb=short -m 'not slow'"
 ci-test-cov = "bash .github/ci_test_per_file.sh"
 
 [tool.pixi.dependencies]
+# BLAS/LAPACK implementation behind numpy, scipy, petsc and pyamg. conda-forge's default is the
+# netlib reference BLAS (single-threaded, ~4 GFLOP/s on a 3000x3000 matmul); OpenBLAS is ~50x faster.
+# Threads: OpenBLAS uses every core unless OPENBLAS_NUM_THREADS is set.
+libblas = { version = "*", build = "*openblas" }
 pytest = ">=9.0.3,<10"
 pytest-cov = ">=5.0"
 ruff = ">=0.9.0"
