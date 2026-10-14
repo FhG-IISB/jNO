@@ -300,3 +300,14 @@ def test_the_hierarchical_structure_is_built_once_per_network(monkeypatch):
     for yy in (y0, y0 - 0.1 * mm):
         jax.jit(lambda v: jnp.real(e.solve(operator=op, geometry={"t2": (x0, v, z0, x1, y1, z1)}).L))(yy)
     assert len(calls) == n0, f"the structure was rebuilt under the trace: {len(calls)} builds for {n0} blocks"
+
+
+def test_the_near_values_in_jax_equal_the_host_ones_at_the_reference():
+    """The preconditioner's near field follows the geometry: at the reference the jax values must
+    be the host values, pair for pair."""
+    from jno.utils.solver.peec import _near_values, near_block
+
+    e, _b = _welded()
+    nr, nc, nv = near_block(e.fil, lambda r: 1.0 / r, mu_scale=1.0, reach=2.0)
+    got = np.asarray(_near_values(e.fil, nr, nc, lambda r: 1.0 / r, 1.0))
+    assert got.shape == nv.shape and np.allclose(got, nv, rtol=1e-12, atol=0)

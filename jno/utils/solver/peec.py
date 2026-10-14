@@ -1341,6 +1341,16 @@ def solve_network(
             if welded
             else (np.zeros(0, int), np.zeros(0, int), np.zeros(0))
         )
+        # The near field's VALUES follow the geometry the solve is at. The pairs are structure,
+        # chosen once on the host; their partial inductances are re-evaluated here in jax from the
+        # current `pos`/`mom` (no gradient: a preconditioner only accelerates) and handed to the
+        # factorisation as a runtime argument. Preconditioned with the REFERENCE values, a design
+        # moved by a fifth of a cell took ten times the iterations and often none converged at all.
+        nv_now = (
+            jax.lax.stop_gradient(_near_values(fil, nr, nc, lambda r: 1.0 / r, mu0 / (4.0 * jnp.pi)))
+            if (welded and geometry_host is not None and nr.size)
+            else jnp.asarray(nv, dtype=float)
+        )
         AT = Asp0.T.tocsr()
         # the dtype follows jax_enable_x64 rather than being pinned
         cdtype = jnp.complex128 if jax.config.jax_enable_x64 else jnp.complex64
@@ -1411,10 +1421,10 @@ def solve_network(
             hash(CI.data.tobytes()),
             hash(Cp.data.tobytes()),
             hash(AT.data.tobytes()),
-            hash(np.asarray(nv).tobytes()),
+            hash(np.asarray(nr).tobytes()),
         )
 
-        def _factorise(zd, w_now):
+        def _factorise(zd, w_now, nv):
             """Build and stash the preconditioner's factorisation for the CURRENT frequency.
 
             Through a callback rather than inline, because ``zd`` depends on the conductivity and is
@@ -1437,7 +1447,8 @@ def solve_network(
             # What this does NOT do is reuse a factorisation across a CHANGING conductivity, which is
             # what a design loop does every iteration. That would be a different claim -- that a
             # stale preconditioner still accelerates -- and it is not made here.
-            ckey = (_fact_static, float(w_now), hash(zdn.tobytes()))
+            nv = np.asarray(nv)
+            ckey = (_fact_static, float(w_now), hash(zdn.tobytes()), hash(nv.tobytes()))
             if _LU_HOLDER.get("key") == ckey and _LU_HOLDER.get("lu") is not None:
                 return np.zeros((), dtype=np.float64)
             # ...and a STALE one is kept while it still pays. The preconditioner only accelerates --
@@ -1451,8 +1462,14 @@ def solve_network(
             # was factorised. A larger one -- a material swapped, a projection moving a boundary --
             # can leave GMRES unable to converge inside its budget, which the residual gate then
             # reports as a failed solve.
-            zref = _LU_HOLDER.get("zd")
+            zref, nvref = _LU_HOLDER.get("zd"), _LU_HOLDER.get("nv")
             near = zref is not None and zref.shape == zdn.shape and bool(np.all(np.abs(zdn - zref) <= 0.25 * np.abs(zref)))
+            near = (
+                near
+                and nvref is not None
+                and nvref.shape == nv.shape
+                and bool(np.all(np.abs(nv - nvref) <= 0.25 * np.abs(nvref) + 1e-300))
+            )
             if (
                 near
                 and _LU_HOLDER.get("lu") is not None
@@ -1484,12 +1501,13 @@ def solve_network(
             _LU_HOLDER["key"] = ckey
             _LU_HOLDER["base"] = None  # set by the first solve this factorisation serves
             _LU_HOLDER["zd"] = zdn.copy()
+            _LU_HOLDER["nv"] = nv.copy()
             _LU_HOLDER["mark"] = _LU_HOLDER.get("applies", 0)
             return np.zeros((), dtype=np.float64)
 
         @jax.custom_jvp
-        def _token(zd, w_now):
-            return jax.pure_callback(_factorise, jax.ShapeDtypeStruct((), jnp.float64), zd, w_now)
+        def _token(zd, w_now, nv):
+            return jax.pure_callback(_factorise, jax.ShapeDtypeStruct((), jnp.float64), zd, w_now, nv)
 
         @_token.defjvp
         def _token_jvp(primals, tangents):
@@ -1579,10 +1597,10 @@ def solve_network(
         if cached is None:
 
             @jax.jit
-            def _run(rhs, w_, zd, Rc_, cz_):
+            def _run(rhs, w_, zd, Rc_, cz_, nv_):
                 # sequenced through the right-hand side so the factorisation is built before the
                 # solve that reads it, rather than relying on callback ordering
-                rhs = rhs + _token(zd, w_).astype(rhs.dtype)
+                rhs = rhs + _token(zd, w_, nv_).astype(rhs.dtype)
 
                 # OUR OWN custom_linear_solve, rather than the one inside jax's gmres. That one
                 # solves the adjoint with the FORWARD preconditioner, which is not a preconditioner
@@ -1609,7 +1627,7 @@ def solve_network(
         else:
             _run = cached
 
-        x = _run(b, jnp.asarray(w), zdiag, Rc, czc)
+        x = _run(b, jnp.asarray(w), zdiag, Rc, czc, nv_now)
         resid = jnp.linalg.norm(M_apply(x, w, zdiag, Rc, czc) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
         x = _check(resid, _converged, max(1e2 * float(tol), 1e-9), on=x)
     else:
@@ -3641,6 +3659,32 @@ def _bcoo(val, row, col, shape):
 
 #: sub-point PAIRS held at once inside `near_block`; the displacement it builds is 24 bytes each.
 _NEAR_PAIR_BUDGET = 4_000_000
+
+
+def _near_values(fil: Filaments, nr, nc, g, mu_scale=1.0, chunk: int = 4096):
+    """The values :func:`near_block` would give for the pairs ``(nr, nc)``, from ``fil``'s CURRENT
+    ``pos``/``mom``, in jax -- so a moved geometry's preconditioner sees the moved geometry. Same
+    sum, same sub-point order; checked equal to the host values at the reference."""
+    grp = np.asarray(fil.group)
+    ne = int(grp.max()) + 1
+    order = np.argsort(grp, kind="stable")
+    q = int(np.bincount(grp, minlength=ne)[0])
+    P3 = jnp.asarray(fil.pos)[order].reshape(ne, q, 3)
+    M3 = jnp.asarray(fil.mom)[order].reshape(ne, q, -1)
+    nr, nc = np.asarray(nr, dtype=int), np.asarray(nc, dtype=int)
+    n = nr.size
+    pad = (-n) % chunk
+    pr = np.concatenate([nr, np.zeros(pad, int)]).reshape(-1, chunk)
+    pc = np.concatenate([nc, np.zeros(pad, int)]).reshape(-1, chunk)
+
+    def one(ab):
+        a, b = ab
+        pa, pb, ma, mb = P3[a], P3[b], M3[a], M3[b]
+        d = pa[:, :, None, :] - pb[:, None, :, :]
+        r = jnp.sqrt(jnp.sum(d * d, -1))
+        return (jnp.einsum("pik,pjk->pij", ma, mb) * g(r)).sum((1, 2))
+
+    return mu_scale * jax.lax.map(one, (jnp.asarray(pr), jnp.asarray(pc))).reshape(-1)[:n]
 
 
 def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
