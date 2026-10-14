@@ -549,6 +549,35 @@ def _release_idle_solver_memory() -> None:
     if _lin._LDL_PLANS:
         _lin.release_idle_ldl()
 
+
+
+def _with_poisoned_gates(fn):
+    """``fn``, traced with poisoned residual gates (``solver_api.poison_gates``): a solve that fails its residual
+    check gives NaN instead of a host callback, so the compiled program can be stored in the persistent cache.
+    The caller checks every output with :func:`_raise_if_step_not_finite`."""
+    from .utils.solver.solver_api import poison_gates
+
+    @functools.wraps(fn)
+    def traced(*args, **kwargs):
+        with poison_gates():
+            return fn(*args, **kwargs)
+
+    return traced
+
+
+def _raise_if_step_not_finite(epoch, total_loss, losses, grads, jac=None):
+    """Raise when a step traced with poisoned gates returned a non-finite loss, gradient or constraint Jacobian."""
+    parts = {"loss": [total_loss, losses], "gradient": jax.tree_util.tree_leaves(grads), "constraint Jacobian": [jac]}
+    bad = [name for name, vals in parts.items() if any(v is not None and not bool(jnp.all(jnp.isfinite(v))) for v in vals)]
+    if bad:
+        raise RuntimeError(
+            f"jno.core.solve: step {epoch} gave a non-finite {', '.join(bad)}. Inside the compiled step a linear "
+            "solve that fails its residual check returns NaN (instead of calling back to the host, which would keep "
+            "the program out of the persistent compile cache), so this is a solve that did not converge, or a "
+            "genuine NaN in the problem. Evaluate the objective and constraints with crux.eval([...]) at the current "
+            "parameters to have the failing solve named, with its residual."
+        )
+
 class core:
     """core solver using traced operations."""
 
@@ -3489,13 +3518,18 @@ class core:
             _jac_requests = []
         _jac_cb, _jac_req = _jac_requests[0] if _jac_requests else (None, None)
         if _has_before_update_hooks and not _use_accumulation:
-            _hook_grad_fn = self.make_grad_fn(
-                batchsize=effective_batchsize,
-                frozen=frozen_arrays,
-                static=static,
-                checkpoint_gradients=checkpoint_gradients,
-                min_consecutive=min_consecutive,
-                jacobian=_jac_req,
+            # traced with poisoned residual gates: no host callback in the program, so JAX's persistent cache
+            # can store it (a design step can take many minutes to compile); every step's outputs are then
+            # checked for finiteness below, where a failed solve shows as NaN
+            _hook_grad_fn = _with_poisoned_gates(
+                self.make_grad_fn(
+                    batchsize=effective_batchsize,
+                    frozen=frozen_arrays,
+                    static=static,
+                    checkpoint_gradients=checkpoint_gradients,
+                    min_consecutive=min_consecutive,
+                    jacobian=_jac_req,
+                )
             )
             _hook_apply_fn = self.make_apply_fn(
                 per_model_opts=per_model_opts,
@@ -4569,6 +4603,7 @@ class core:
                         _hout = jit_hook_grad(trainable, self.rng, context)
                         _hgrads, self.rng, total_loss, individual_losses = _hout[:4]
                         _hjac = _hout[4] if len(_hout) > 4 else None
+                        _raise_if_step_not_finite(outer_epoch, total_loss, individual_losses, _hgrads, _hjac)
                         _release_idle_solver_memory()
                         for _cb in callbacks:
                             if type(_cb).on_before_update is not _Callback.on_before_update:
