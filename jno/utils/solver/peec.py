@@ -3306,7 +3306,7 @@ def _hstruct(host, key, operator, build):
     return val
 
 
-def _hier_apply(fil: Filaments, g, mu_scale, operator, host=None, key=()):
+def _hier_apply(fil: Filaments, g, mu_scale, operator, host=None, key=(), cache_on=None):
     """``apply(cur)`` for a lattice with no translation invariance -- a GRADED grid.
 
     The whole operator through one hierarchical compression, with no FFT and no dense block. This is
@@ -3322,7 +3322,9 @@ def _hier_apply(fil: Filaments, g, mu_scale, operator, host=None, key=()):
 
     src = fil if host is None else host
     mk = lambda: hbuild(src.pos, src.mom, np.asarray(src.group), g, tol=operator.tol, leaf=operator.leaf, eta=operator.eta)
-    hm = mk() if host is None else _hstruct(host, ("self",) + tuple(key), operator, mk)
+    # cached under the NETWORK the block was sliced from (`cache_on`), never the slice: a slice is a
+    # fresh object per call, and keying on it rebuilt the structure on every trace
+    hm = mk() if host is None else _hstruct(host if cache_on is None else cache_on, ("self",) + tuple(key), operator, mk)
     return hmat(hm, fil.pos, fil.mom, fil.self_g, g, scale=mu_scale)
 
 
@@ -3412,7 +3414,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
                     "peec.welded_apply: one of these parts is a GRADED lattice, which has no FFT. "
                     "Pass `operator=jno.solve.hierarchical(...)`."
                 )
-            diag.append(_hier_apply(sub, g, mu_scale, operator, host=sub_host, key=(lo, hi)))
+            diag.append(_hier_apply(sub, g, mu_scale, operator, host=sub_host, key=(lo, hi), cache_on=host))
         else:
             diag.append(lattice_apply(sub, g, mu_scale=mu_scale, quad=quad, quad_t=quad_t))
         sel.append((lo, hi, rows, gl, cnt))

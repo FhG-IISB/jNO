@@ -279,3 +279,24 @@ def test_a_crossing_design_under_a_trace_stays_finite_and_is_inactive_when_feasi
     ok = float(jax.jit(L_of)(y0 - 0.3 * mm))
     ref = float(L_of(y0 - 0.3 * mm))
     assert abs(ok - ref) <= 1e-12 * abs(ref)
+
+
+def test_the_hierarchical_structure_is_built_once_per_network(monkeypatch):
+    """An untraced solve and the traced solves after it share one structure: `hmatrix.build` runs
+    once per block, not once per trace (it was keyed on the sliced block, a fresh object per call)."""
+    import jno.utils.solver.hmatrix as HM
+    import jno.utils.solver.peec as PS
+
+    calls = []
+    real = HM.build
+    monkeypatch.setattr(HM, "build", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    PS._HSTRUCT_CACHE.clear()
+    e, b = _welded()
+    op = jno.solve.hierarchical(tol=1e-8)
+    e.solve(operator=op)
+    n0 = len(calls)
+    assert n0 >= 1
+    x0, y0, z0, x1, y1, z1 = _ext(b)
+    for yy in (y0, y0 - 0.1 * mm):
+        jax.jit(lambda v: jnp.real(e.solve(operator=op, geometry={"t2": (x0, v, z0, x1, y1, z1)}).L))(yy)
+    assert len(calls) == n0, f"the structure was rebuilt under the trace: {len(calls)} builds for {n0} blocks"
