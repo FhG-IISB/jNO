@@ -265,3 +265,17 @@ def test_the_mutual_term_derivative_matches_the_filament_closed_form():
     # and the derivative of the QUADRATURE itself is exact: AD against central differences of M_of
     fd = float((M_of(dd + hh) - M_of(dd - hh)) / (2 * hh))
     assert abs(g - fd) <= 1e-6 * abs(fd), (g, fd)
+
+
+def test_a_crossing_design_under_a_trace_stays_finite_and_is_inactive_when_feasible():
+    """An optimiser's line search visits infeasible designs. Traced, a crossing cannot raise, so a
+    cell keeps a fifth of its reference width; at a feasible design the floor must not act."""
+    a, b = _two_traces()
+    e = _net(a, b)
+    x0, y0, z0, x1, y1, z1 = _ext(b)
+    L_of = lambda yy: jnp.real(e.solve(matrix_free=False, geometry={"t2": (x0, yy, z0, x1, y1, z1)}).L)
+    bad = float(jax.jit(L_of)(1.0 * mm))  # y0 below t1's top: would cross
+    assert np.isfinite(bad)
+    ok = float(jax.jit(L_of)(y0 - 0.3 * mm))
+    ref = float(L_of(y0 - 0.3 * mm))
+    assert abs(ok - ref) <= 1e-12 * abs(ref)

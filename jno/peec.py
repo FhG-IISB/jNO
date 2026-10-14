@@ -1357,8 +1357,10 @@ class BuiltPEEC:
         structural.
 
         Guards, where a value is concrete: the lines must stay strictly increasing, and a line that
-        two solids share must be given one value. Under a trace neither can be checked; a design that
-        would cross lines needs a rebuild at that design, not a stretched one.
+        two solids share must be given one value. Under a trace neither can be checked: a cell is then
+        kept at least a fifth of its reference width (the lines after it shift), which is inactive at
+        every design that obeys the line rules and keeps an optimiser's infeasible trial points finite.
+        A design that would cross lines needs a rebuild at that design, not a stretched one.
         """
         if self._solid_info is None:
             raise ValueError("jno.peec: geometry= names a solid, but this network has no solid conductor.")
@@ -1428,6 +1430,14 @@ class BuiltPEEC:
             is_anchor = np.isin(np.arange(len(ref[a])), an)
             e_new = e[klo] + jnp.asarray(frac) * (e[khi] - e[klo])
             e = jnp.where(jnp.asarray(is_anchor), e, e_new)
+            # Under a trace a crossing cannot raise, and an optimiser's line search DOES visit designs
+            # that cross (an infeasible trial point). So every cell keeps at least a fifth of its
+            # reference width and the lines after it shift along: the solve stays finite there, and
+            # at any design that satisfies the line rules the floor is inactive, so nothing changes
+            # and the gradient is the exact one. The concrete check below still refuses by name.
+            dref = jnp.asarray(np.diff(ref[a]))
+            dnew = jnp.maximum(e[1:] - e[:-1], 0.2 * dref)
+            e_floor = e[0] + jnp.concatenate([jnp.zeros(1), jnp.cumsum(dnew)])
             if not isinstance(e, jax.core.Tracer):
                 d = np.diff(np.asarray(e))
                 if not np.all(d > 0):
@@ -1437,7 +1447,7 @@ class BuiltPEEC:
                         f"{float(np.asarray(e)[k]):.9g} and {float(np.asarray(e)[k + 1]):.9g} m -- a face crossed "
                         "another, or a cell closed. The cell counts are structure: rebuild at this design."
                     )
-            edges.append(e)
+            edges.append(e_floor)
         pos, mom, self_g, ln, area, skin, _nodes = lat["regeom"](edges)
         f = fil
         nsub1 = nsub0 + int(pos.shape[0])  # shapes are static under a trace; values are not
