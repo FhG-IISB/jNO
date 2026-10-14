@@ -75,6 +75,7 @@ import numpy as np
 import scipy.sparse as sparse
 
 from .utils.solver.peec import (
+    FacesGrid,
     Filaments,
     GradedGrid,
     bar_filaments,
@@ -1094,6 +1095,7 @@ class PEEC:
                 solid_names.append(n)
 
         parts, owners, blocks = [], [], []  # (Filaments, sigma), the shapes, and (names, resolver)
+        line_info = None
         if lines:
             # A WELDED network shares one near-field block, which is vectorised over a single
             # sub-point count. A bar samples its VOLUME (quad x quad_t^2 points) because a lattice
@@ -1150,6 +1152,15 @@ class PEEC:
             # sub-point offset per family, and a sheet family has its own.
             _sheet_freq = 0.0 if magnetic else float(np.min(np.atleast_1d(self.freq)))
             fb = bar_filaments(shs, sigma=sgs, grid_shapes=[s for s, _ in magnetic], edges=self.grid, freq=_sheet_freq)
+            # what `BuiltPEEC._with_solids` needs: the solids by name, the lattice's traced pass, and
+            # where its rows start in the welded order (lines come first)
+            solid_info = (
+                tuple(solid_names),
+                tuple(shs),
+                fb.lattice,
+                0 if line_info is None else line_info[3],
+                0 if line_info is None else line_info[4],
+            )
             blocks.append((tuple(solid_names), fb.lattice["resolve"]))
             parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)
@@ -1226,6 +1237,7 @@ class PEEC:
             tuple(magnetic_names),
             param_exprs,
             (line_geom, line_info if lines else None),
+            solid_info if solids else None,
         )
 
     def build(self) -> "BuiltPEEC":
@@ -1269,8 +1281,13 @@ class BuiltPEEC:
     inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
     """
 
-    def __init__(self, spec, fil, terms, part_names, resolve, mag=None, mag_names=(), param_exprs=None, lines=None):
+    def __init__(
+        self, spec, fil, terms, part_names, resolve, mag=None, mag_names=(), param_exprs=None, lines=None, solids=None
+    ):
         self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
+        #: (names, shapes, lattice dict, first sub-point row, first element) of the solid block, for
+        #: `_with_solids`; None when the network has no solid
+        self._solid_info = solids
         #: the magnetic mesh, when any region attached a `mu_r` -- a Filaments of the same shape as
         #: the electric one, since a core is voxels and faces just as a conductor is.
         self.mag, self.mag_names = mag, tuple(mag_names)
@@ -1326,6 +1343,113 @@ class BuiltPEEC:
             length=jnp.concatenate([jnp.asarray(fl.length), jnp.asarray(f.length)[nel:]]),
             area=jnp.concatenate([jnp.asarray(fl.area), jnp.asarray(f.area)[nel:]]),
             skin=jnp.concatenate([jnp.asarray(fl.skin).reshape(-1) * jnp.ones(nel), jnp.asarray(f.skin)[nel:]]),
+        )
+
+    def _with_solids(self, geometry, fil):
+        """The network with its solids' faces moved: ``{solid region: (x0, y0, z0, x1, y1, z1)}``.
+
+        Only on a grid whose every face is a grid line (``grid=jno.peec.faces(...)``): a face given
+        here moves its line, and every line between two FACE lines keeps its reference fraction of
+        the gap, so cell counts, ownership and numbering stay as built while the cells stretch. The
+        lattice block of ``fil`` is recomputed from the moved lines by the discretisation's own traced
+        pass; wires are not touched (give their points through ``geometry`` as well when they must
+        follow a face), and ``nodes`` stays at the reference, since which nodes a pad owns is
+        structural.
+
+        Guards, where a value is concrete: the lines must stay strictly increasing, and a line that
+        two solids share must be given one value. Under a trace neither can be checked; a design that
+        would cross lines needs a rebuild at that design, not a stretched one.
+        """
+        if self._solid_info is None:
+            raise ValueError("jno.peec: geometry= names a solid, but this network has no solid conductor.")
+        names, shapes, lat, nsub0, nel0 = self._solid_info
+        if not lat.get("graded"):
+            raise ValueError(
+                "jno.peec: a solid's geometry can only move on a grid whose faces are grid lines. This "
+                "network was built on a uniform lattice, whose partial inductance is applied by FFT and "
+                "needs one fixed pitch -- a moved face would be silently ignored. Build it with "
+                "grid=jno.peec.faces(pitch=...) and solve with operator=jno.solve.hierarchical(...)."
+            )
+        ref = [np.asarray(e, dtype=float) for e in lat["edges"]]
+        span = [float(e[-1] - e[0]) for e in ref]
+        # host: every solid's six faces as grid-line indices (the reference, so it is structural)
+        face_idx = {}
+        for nm, sh in zip(names, shapes):
+            bnd = np.asarray(sh.bounds(), dtype=float).reshape(2, -1)
+            idx = []
+            for a in range(3):
+                for side in (0, 1):
+                    q = float(bnd[side, a]) if a < bnd.shape[1] else float(ref[a][side * (len(ref[a]) - 1)])
+                    k = int(np.argmin(np.abs(ref[a] - q)))
+                    if abs(ref[a][k] - q) > 1e-9 * max(span[a], 1e-30):
+                        raise ValueError(
+                            f"jno.peec: the {'xyz'[a]}{'01'[side]} face of {nm!r} at {q:.9g} m is not a grid line "
+                            f"(nearest {ref[a][k]:.9g} m). A face can only move with a line that is on it: "
+                            "build with grid=jno.peec.faces(pitch=...)."
+                        )
+                    idx.append(k)
+            face_idx[nm] = idx
+        anchors = [
+            sorted({0, len(ref[a]) - 1} | {face_idx[nm][2 * a + side] for nm in names for side in (0, 1)}) for a in range(3)
+        ]
+        given = [{} for _ in range(3)]
+        for nm, val in geometry.items():
+            vals = list(val) if isinstance(val, (list, tuple)) else list(jnp.reshape(jnp.asarray(val), (-1,)))
+            if len(vals) != 6:
+                raise ValueError(
+                    f"jno.peec: geometry={{{nm!r}: ...}} needs 6 values (x0, y0, z0, x1, y1, z1) for a solid, got {len(vals)}."
+                )
+            for a in range(3):
+                for side in (0, 1):
+                    k, v = face_idx[nm][2 * a + side], vals[3 * side + a]
+                    if k in given[a]:
+                        other, v0 = given[a][k]
+                        both = not isinstance(v, jax.core.Tracer) and not isinstance(v0, jax.core.Tracer)
+                        if both and abs(float(v) - float(v0)) > 1e-12 * max(span[a], 1e-30):
+                            raise ValueError(
+                                f"jno.peec: {nm!r} and {other!r} share the grid line at {ref[a][k]:.9g} m on "
+                                f"{'xyz'[a]} and were given different values ({float(v):.9g} and {float(v0):.9g}). "
+                                "A shared face has one position; give both solids the same value."
+                            )
+                        continue
+                    given[a][k] = (nm, v)
+        edges = []
+        for a in range(3):
+            e = jnp.asarray(ref[a])
+            if given[a]:
+                ks = np.array(sorted(given[a]))
+                e = e.at[ks].set(jnp.stack([jnp.asarray(given[a][k][1], dtype=float).reshape(()) for k in ks]))
+            # the lines between two anchors keep their reference fraction of the gap
+            an = np.asarray(anchors[a])
+            lo_i = np.searchsorted(an, np.arange(len(ref[a])), side="right") - 1
+            lo_i = np.clip(lo_i, 0, len(an) - 2)
+            klo, khi = an[lo_i], an[lo_i + 1]
+            frac = (ref[a] - ref[a][klo]) / np.maximum(ref[a][khi] - ref[a][klo], 1e-300)
+            is_anchor = np.isin(np.arange(len(ref[a])), an)
+            e_new = e[klo] + jnp.asarray(frac) * (e[khi] - e[klo])
+            e = jnp.where(jnp.asarray(is_anchor), e, e_new)
+            if not isinstance(e, jax.core.Tracer):
+                d = np.diff(np.asarray(e))
+                if not np.all(d > 0):
+                    k = int(np.argmin(d))
+                    raise ValueError(
+                        f"jno.peec: the moved grid lines on {'xyz'[a]} are not strictly increasing between "
+                        f"{float(np.asarray(e)[k]):.9g} and {float(np.asarray(e)[k + 1]):.9g} m -- a face crossed "
+                        "another, or a cell closed. The cell counts are structure: rebuild at this design."
+                    )
+            edges.append(e)
+        pos, mom, self_g, ln, area, skin, _nodes = lat["regeom"](edges)
+        f = fil
+        nsub1 = nsub0 + int(pos.shape[0])  # shapes are static under a trace; values are not
+        nel1 = nel0 + int(ln.shape[0])
+        cat = lambda new, old, i0, i1: jnp.concatenate([jnp.asarray(old)[:i0], jnp.asarray(new), jnp.asarray(old)[i1:]])
+        return f._replace(
+            pos=cat(pos, f.pos, nsub0, nsub1),
+            mom=cat(mom, f.mom, nsub0, nsub1),
+            self_g=cat(self_g, f.self_g, nel0, nel1),
+            length=cat(ln, f.length, nel0, nel1),
+            area=cat(area, f.area, nel0, nel1),
+            skin=cat(skin, f.skin, nel0, nel1),
         )
 
     def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None, operator=None, geometry=None):
@@ -1386,7 +1510,22 @@ class BuiltPEEC:
                 # them from tracers.
                 self.solve(sigma={}, **kw)
             return ParametricSolution(self, self._param_exprs, self._params, kw, self._line_geom)
-        fil, nodes, terms = (self.fil if geometry is None else self._with_lines(geometry)), self.nodes, self.terminals
+        fil, nodes, terms = self.fil, self.nodes, self.terminals
+        if geometry:
+            line_names = set(self._line_info[1]) if self._line_info is not None else set()
+            solid_names = set(self._solid_info[0]) if self._solid_info is not None else set()
+            unknown = [k for k in geometry if k not in line_names and k not in solid_names]
+            if unknown:
+                raise ValueError(
+                    f"jno.peec: geometry={{{unknown[0]!r}: ...}} names no conductor of this network. Its "
+                    f"conductors are {sorted(line_names | solid_names)}."
+                )
+            gl = {k: v for k, v in geometry.items() if k in line_names}
+            gs = {k: v for k, v in geometry.items() if k in solid_names}
+            if gl:
+                fil = self._with_lines(gl)
+            if gs:
+                fil = self._with_solids(gs, fil)
         if weights:
             nodes = dict(nodes)
             for name, w in weights.items():
@@ -1716,3 +1855,33 @@ def _graded(fine, halo):
 
 
 peec.graded = _graded
+
+
+def _faces(pitch):
+    """A grid line on every conductor face, uniform in between: ``grid=jno.peec.faces(pitch=...)``.
+
+    The grid on which a solid's GEOMETRY is a design variable. Every face of every solid is a cell
+    boundary, so ``BuiltPEEC.solve(geometry={"trace": (x0, y0, z0, x1, y1, z1)})`` can move that
+    face with its line while the cells between two face lines stretch -- cell counts, ownership and
+    node numbering stay as built, and the loop inductance is differentiable in a trace's width,
+    length and position, a die's position and a layer's thickness, exactly as it already is in a
+    wire's vertices. Between consecutive faces the cells are ``max(1, round(gap / pitch))`` equal
+    ones, so a clearance narrower than the pitch is still one cell rather than a short.
+
+    Args:
+        pitch: the cell size between faces, metres; one number or one per axis.
+
+    Returns:
+        A grid spec for ``jno.peec(..., grid=...)``.
+
+    Note:
+        Like a graded grid this one is not translation-invariant: solve with
+        ``operator=jno.solve.hierarchical(...)``. Under ``geometry=`` the hierarchical structure is
+        built once from the reference geometry and refilled from the moved one, so a design that
+        moves a face far -- past another line, or so that a cell closes -- needs a rebuild at that
+        design rather than a stretch.
+    """
+    return FacesGrid(pitch=pitch)
+
+
+peec.faces = _faces

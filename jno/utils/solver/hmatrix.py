@@ -484,10 +484,16 @@ def _batched_blocks(P, M, Pb, Mb, rows, cols, g, budget=64_000_000):
     if pad:
         rows = np.concatenate([rows, np.zeros((pad, rows.shape[1]), rows.dtype)])
         cols = np.concatenate([cols, np.zeros((pad, cols.shape[1]), cols.dtype)])
-    outs = []
-    for lo in range(0, rows.shape[0], chunk):
-        outs.append(_blocks_chunk(P, M, Pb, Mb, rows[lo : lo + chunk], cols[lo : lo + chunk], g))
-    return jnp.concatenate(outs, axis=0)[:nb]
+    # A SEQUENTIAL map over the chunks, each rematerialised, rather than a Python loop. The loop
+    # bounded the forward pass only: under reverse mode XLA is free to schedule every chunk's
+    # backward at once, and did -- the gradient of a 4,362-element lattice asked for 150 GB in one
+    # buffer where its forward fits in a few hundred MB. `lax.map` keeps the chunks in sequence in
+    # both directions and the checkpoint keeps each one's intermediates out of the saved residuals.
+    body = jax.checkpoint(lambda rc: _blocks_chunk(P, M, Pb, Mb, rc[0], rc[1], g))
+    out = jax.lax.map(
+        body, (jnp.asarray(rows.reshape(-1, chunk, rows.shape[1])), jnp.asarray(cols.reshape(-1, chunk, cols.shape[1])))
+    )
+    return out.reshape(-1, rows.shape[1], cols.shape[1])[:nb]
 
 
 def _far_buckets(h: "HMatrix") -> dict:
@@ -558,22 +564,36 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
     # the tree, so the largest near block can be thousands of elements wide. Padding every block to
     # that measured a 17.44 GB peak against 1.72 GB per-group -- the padding is quadratic and the
     # saving in compilations is not worth any of it.
+    # Rematerialised under reverse mode: a block's values are a kernel evaluation over every
+    # sub-point pair in it, and saving those intermediates for the backward pass is the pair count
+    # again -- measured 31 GB for a gradient over a 13,500-element module whose forward solve
+    # needs 3 GB. Recomputing them from pos/mom costs one more kernel pass in the backward sweep;
+    # what is kept is the inputs and the block values themselves.
+    # The index stacks stay HOST arrays (closed over, not passed): `_batched_blocks` chunks on them.
+    def _bb(rows_, cols_):
+        return jax.checkpoint(lambda P_, M_, Pb_, Mb_: _batched_blocks(P_, M_, Pb_, Mb_, rows_, cols_, g))(P, M, Pb, Mb)
+
     near = []
-    if h.near:
-        mw = max(len(r) for r, _c in h.near)
-        nw = max(len(c) for _r, c in h.near)
-        rows = _pad_stack([r for r, _c in h.near], mw)
-        cols = _pad_stack([c for _r, c in h.near], nw)
-        vals = _batched_blocks(P, M, Pb, Mb, rows, cols, g)
+    # Bucketed by power-of-two width, as the far blocks are: the blocks ACA rejects are stored
+    # densely at whatever size they have, and padding every leaf to the widest of those is
+    # quadratic waste -- it is what the 150 GB above was made of.
+    buckets: dict = {}
+    for r, c in h.near:
+        key = (1 << max(int(np.ceil(np.log2(max(len(r), 1)))), 3), 1 << max(int(np.ceil(np.log2(max(len(c), 1)))), 3))
+        buckets.setdefault(key, []).append((r, c))
+    for (mw, nw), group in buckets.items():
+        rows = _pad_stack([r for r, _c in group], mw)
+        cols = _pad_stack([c for _r, c in group], nw)
+        vals = _bb(rows, cols)
         live = jnp.asarray(
-            (np.arange(mw)[None, :] < np.array([[len(r)] for r, _c in h.near]))[:, :, None]
-            & (np.arange(nw)[None, :] < np.array([[len(c)] for _r, c in h.near]))[:, None, :]
+            (np.arange(mw)[None, :] < np.array([[len(r)] for r, _c in group]))[:, :, None]
+            & (np.arange(nw)[None, :] < np.array([[len(c)] for _r, c in group]))[:, None, :]
         )
         vals = jnp.where(live, vals, 0.0)
         if h.square:  # an element never couples to itself here; the diagonal is the self term
             same = jnp.asarray(rows)[:, :, None] == jnp.asarray(cols)[:, None, :]
             vals = jnp.where(same & live, 0.0, vals)
-        near = [(jnp.asarray(rows), jnp.asarray(cols), vals)]
+        near.append((jnp.asarray(rows), jnp.asarray(cols), vals))
 
     # ---- far blocks: one padded stack PER WIDTH, so the ACA replay batches exactly ------------
     far = []
@@ -596,8 +616,8 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
         prow, pcol = np.where(dead, prow[:, :1], prow), np.where(dead, pcol[:, :1], pcol)
         ipos, jpos = np.where(dead, ipos[:, :1], ipos), np.where(dead, jpos[:, :1], jpos)
         ipos, jpos = jnp.asarray(ipos), jnp.asarray(jpos)
-        C = _batched_blocks(P, M, Pb, Mb, rows, pcol, g)  # (B, m, k)
-        R = _batched_blocks(P, M, Pb, Mb, prow, cols, g)  # (B, k, n)
+        C = _bb(rows, pcol)  # (B, m, k)
+        R = _bb(prow, cols)  # (B, k, n)
         live_m = jnp.asarray(np.arange(mw)[None, :] < np.array([[len(r)] for r, _c, _i, _j, _k in group]))
         live_n = jnp.asarray(np.arange(nw)[None, :] < np.array([[len(c)] for _r, c, _i, _j, _k in group]))
         # ACA's recursion replayed at the frozen pivots -- k steps, batched across the whole group.
@@ -609,7 +629,8 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
         # rank group, which measured 2.66 GB and 45.9 s where the unbatched version took 0.38 GB.
         # As a masked matmul it is two ops per step, so O(k), and the factors are written into
         # preallocated arrays that are exactly the output.
-        Uc, Vc = _replay_group(k, C, R, ipos, jpos, jnp.asarray(kb))
+        # rematerialised too: the replay's k masked matmuls would otherwise all be saved for the backward pass
+        Uc, Vc = jax.checkpoint(lambda C_, R_: _replay_group(k, C_, R_, ipos, jpos, jnp.asarray(kb)))(C, R)
         U = jnp.where(live_m[:, :, None], Uc, 0.0)  # (B, m, k)
         V = jnp.where(live_n[:, None, :], Vc, 0.0)  # (B, k, n)
         far.append((jnp.asarray(rows), jnp.asarray(cols), U, V))

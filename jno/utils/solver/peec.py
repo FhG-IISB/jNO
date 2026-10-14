@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
 
-from .kernel import bar_self, internal_impedance, slab_transfer_impedance, wire_self
+from .kernel import bar_self, bar_self_jax, internal_impedance, slab_transfer_impedance, wire_self
 from .krylov import gmres_chunked
 
 __all__ = [
@@ -42,6 +42,7 @@ __all__ = [
     "terminal_nodes",
     "solve_network",
     "lattice_apply",
+    "FacesGrid",
     "near_block",
     "element_centres",
     "resolve_sigma",
@@ -871,7 +872,9 @@ def solve_network(
         )
     has_lattice = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
     free_form = has_lattice if matrix_free is None else bool(matrix_free)
-    if lat is not None and lat.get("graded") and operator is None:
+    if free_form and lat is not None and lat.get("graded") and operator is None:
+        # `free_form` guards it: the message offers the dense path, so `matrix_free=False` has to be
+        # allowed through -- it was refused here regardless, which made the offer an empty one
         raise ValueError(
             "peec.solve_network: this lattice is GRADED, which is what makes local refinement "
             "possible -- and it is not block-Toeplitz, so there is no FFT for it. Pass "
@@ -950,6 +953,11 @@ def solve_network(
 
     if free_form:
         scale = mu0 / (4.0 * jnp.pi)
+        # The reference geometry the hierarchical STRUCTURE is built from and cached under: the
+        # concrete stand-in when the geometry is traced, else this network itself when it is
+        # concrete -- so an untraced solve and the traced solves that follow share one structure
+        # (measured: without that, the first traced solve rebuilt it, 184 s against 12 s).
+        _host = geometry_host if geometry_host is not None else (fil if _frozen_geometry(fil) else None)
         lp_apply = _geom_cached(
             fil,
             mu0,
@@ -958,10 +966,10 @@ def solve_network(
             # that would hand a `solve(operator=...)` the previous exact apply, or the reverse
             ("lp", None if operator is None else (operator.tol, operator.leaf, operator.eta, operator.floor)),
             lambda: (
-                welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale, operator=operator)
+                welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale, operator=operator, host=_host)
                 if welded
                 else (
-                    _hier_apply(fil, lambda r: 1.0 / r, scale, operator)
+                    _hier_apply(fil, lambda r: 1.0 / r, scale, operator, host=_host)
                     if lat.get("graded")
                     else lattice_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
                 )
@@ -1775,7 +1783,10 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
     delta = np.sqrt(2.0 / (w * mu0 * np.maximum(sig, 1e-300)))
     # non-differentiably: a traced wire GAUGE reaches here once radius is a design variable,
     # and this guard only decides whether to complain -- no gradient runs through it
-    thick = np.asarray(jax.lax.stop_gradient(jnp.asarray(fil.skin)))
+    try:
+        thick = np.asarray(jax.lax.stop_gradient(jnp.asarray(fil.skin)))
+    except (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError):
+        return  # a traced lattice thickness: `peec.build()` already ran this at the reference
     cell = thick / np.maximum(span, 1)
     # Two conditions, and both are needed. The cells must be too coarse to resolve the distribution
     # (a cell wider than half a skin depth), AND the skin effect must actually be worth something at
@@ -2006,6 +2017,67 @@ def _graded_edges(shapes, lo, hi, base, fine, halo):
     return out
 
 
+@dataclass(frozen=True)
+class FacesGrid:
+    """Ask `bar_filaments` for a grid with a line on EVERY conductor face, uniform in between.
+
+    Built by :func:`jno.peec.faces`. The one grid on which a solid's extents can be design
+    variables: a face that is a grid line can move with its line, and the cells between two face
+    lines stretch while their count, their owner and their numbering stay as built.
+    """
+
+    pitch: object  # one length, or one per axis
+
+
+def _faces_edges(shapes, lo, hi, pitch):
+    """Cell boundaries: every face of every shape, and about `pitch` between consecutive faces.
+
+    Faces closer than a millionth of the pitch are one line. Between two faces the cells are
+    ``max(1, round(gap / pitch))`` equal ones, so a gap narrower than the pitch is still one cell --
+    a 1 mm clearance between nets on a 1 mm grid must stay a cell, or the nets short.
+    """
+    h = np.broadcast_to(np.asarray(pitch, dtype=float).reshape(-1), (3,))
+    if np.any(h <= 0) or not np.all(np.isfinite(h)):
+        raise ValueError(f"jno.peec.faces: pitch={pitch!r} must be a positive length in metres, or one per axis.")
+    faces = [[], [], []]
+    for sh in shapes:
+        bnd = np.asarray(sh.bounds(), dtype=float).reshape(2, -1)
+        for a in range(bnd.shape[1]):
+            faces[a] += [float(bnd[0, a]), float(bnd[1, a])]
+    out = []
+    for a in range(3):
+        if not (hi[a] > lo[a]):  # a flat axis is one cell thick, exactly as the uniform path has it
+            out.append(np.array([lo[a], lo[a] + h[a]]))
+            continue
+        f = np.sort(np.array([lo[a], hi[a]] + [q for q in faces[a] if lo[a] < q < hi[a]]))
+        f = f[np.concatenate([[True], np.diff(f) > 1e-6 * h[a]])]
+        f[0], f[-1] = lo[a], hi[a]
+        pieces = [np.linspace(f0, f1, max(1, int(round((f1 - f0) / h[a]))) + 1)[:-1] for f0, f1 in zip(f[:-1], f[1:])]
+        out.append(np.concatenate(pieces + [[f[-1]]]))
+    return out
+
+
+def _volume_rule_jax(ln, w0, w1, axis, quad: int, quad_t: int):
+    """:func:`_volume_rule` for traced dimensions: the same points and weights, in jax.
+
+    ``axis`` stays a host array -- which direction a bar runs is structure -- and selects the
+    coordinate each offset lands on through one-hot masks, so nothing indexes with a tracer.
+    """
+    gl, wl = np.polynomial.legendre.leggauss(quad)
+    gt, wtq = np.polynomial.legendre.leggauss(quad_t)
+    i, j, k = (a.reshape(-1) for a in np.meshgrid(np.arange(quad), np.arange(quad_t), np.arange(quad_t), indexing="ij"))
+    axis = np.asarray(axis, dtype=int)
+    other = np.stack([[c for c in range(3) if c != ax] for ax in axis])
+    oa, o0, o1 = (jnp.asarray(np.eye(3)[v]) for v in (axis, other[:, 0], other[:, 1]))
+    off = (
+        0.5 * ln[:, None, None] * jnp.asarray(gl[i])[None, :, None] * oa[:, None, :]
+        + 0.5 * w0[:, None, None] * jnp.asarray(gt[j])[None, :, None] * o0[:, None, :]
+        + 0.5 * w1[:, None, None] * jnp.asarray(gt[k])[None, :, None] * o1[:, None, :]
+    )
+    w = ln[:, None] * jnp.asarray(wl[i] * wtq[j] * wtq[k])[None, :] / 8.0
+    return off, w
+
+
 def _volume_rule(ln, wt, axis, quad: int, quad_t: int):
     """Tensor-product Gauss points over each element's VOLUME.
 
@@ -2134,6 +2206,8 @@ def bar_filaments(
         # resolved HERE rather than by the caller, because the extent, the base pitch and the faces
         # are all already in scope -- a caller would have to rederive all three to agree with them
         edges = _graded_edges(shapes + frame, lo, lo + ext, h, edges.fine, edges.halo)
+    elif isinstance(edges, FacesGrid):
+        edges = _faces_edges(shapes + frame, lo, lo + ext, edges.pitch)
     if edges is None:
         n = np.maximum(1, np.round(ext / h).astype(int))
         d = ext / n  # cell pitch per axis, closing exactly on the box
@@ -2271,6 +2345,7 @@ def bar_filaments(
 
     cen, tan, ln, area, ends, axis, owner, masks = [], [], [], [], [], [], [], {}
     skin, span = [], []
+    run0, run1, thin_ = [], [], []  # the runs and which transverse extent is the thickness, per bar
     for ax in range(3):
         if n[ax] < 2:
             continue
@@ -2301,6 +2376,9 @@ def bar_filaments(
         thin = e0 <= e1
         skin.append(np.where(thin, e0, e1))  # the conductor's THICKNESS, not the cell pitch
         span.append(np.where(thin, r0, r1))  # 1 means this element is the whole thickness
+        run0.append(r0)
+        run1.append(r1)
+        thin_.append(thin)
         cen.append(0.5 * (pa + pb))
         tan.append(u)
         ln.append(blen)
@@ -2324,6 +2402,7 @@ def bar_filaments(
     part = owner[:, 0]
     end_a = np.concatenate([ea for ea, _ in ends])
     end_b = np.concatenate([eb for _, eb in ends])
+    run0, run1, thin_ = np.concatenate(run0), np.concatenate(run1), np.concatenate(thin_)
     nb = len(ln)
 
     # A conductor thick against the skin depth carries a current SHEET PER FACE rather than one
@@ -2354,6 +2433,7 @@ def bar_filaments(
     pair = -np.ones(nb, dtype=int)
     sheet_thin = -np.ones(nb, dtype=int)
     sheet_ext = np.zeros(nb)
+    sheet_sign = np.zeros(nb)  # +1 / -1 for the two sheets of a pair, 0 where unpaired
     if sheets:
         blocks, start = [], 0
         for ax in sorted(set(axis.tolist())):
@@ -2390,8 +2470,10 @@ def bar_filaments(
         tan, ln, area, axis = tan[take], ln[take], area[take], axis[take]
         owner, part = owner[take], part[take]
         end_a, end_b = end_a[take], end_b[take]
+        run0, run1, thin_ = run0[take], run1[take], thin_[take]
         nb = len(take)
         live = sheet_thin >= 0
+        sheet_sign = np.sign(offs) * live
         cen = cen.copy()
         cen[np.flatnonzero(live), sheet_thin[live]] += offs[live]
     # A bar joins two CELLS, and its two halves are in SERIES, so its conductivity is their harmonic
@@ -2459,6 +2541,51 @@ def bar_filaments(
     group = np.repeat(np.arange(nb), nsub)
     self_g = bar_self(ln, wt[:, 0], wt[:, 1])  # numpy in, numpy out: a host constant of the grid
 
+    # ---- the same geometry from TRACED grid lines ------------------------------------------------
+    # Everything structural above -- which cells are metal, which bars join them, which family carries
+    # a sheet -- is frozen here as index arrays, and the geometry is recomputed from the three edge
+    # arrays in jax. That is the split `line_filaments` makes for a wire's vertices, now for a
+    # lattice: a face that is a grid line moves with its line, the cells between two lines stretch,
+    # and the bar lengths, cross-sections, quadrature points and self terms follow with a gradient.
+    _ijk = ijk[keep]
+    _t0 = np.array([[c for c in range(3) if c != int(ax)][0] for ax in axis])
+    _t1 = np.array([[c for c in range(3) if c != int(ax)][1] for ax in axis])
+    _rows = np.arange(nb)
+    _live = sheet_thin >= 0
+    _thin_col = np.maximum(sheet_thin, 0)
+    _tan, _delta = tan, delta
+
+    def regeom(edge_arrays):
+        """``(pos, mom, self_g, length, area, skin, nodes)`` from three cell-boundary arrays."""
+        eax_ = [jnp.asarray(e, dtype=float).reshape(-1) for e in edge_arrays]
+        if len(eax_) != 3 or any(int(e.shape[0]) != int(n[a]) + 1 for a, e in enumerate(eax_)):
+            raise ValueError(
+                f"peec.bar_filaments: regeom needs three edge arrays of {[int(v) + 1 for v in n]} values "
+                f"(the cell counts are structure), got {[int(e.shape[0]) for e in eax_]}."
+            )
+        cax_ = [0.5 * (e[:-1] + e[1:]) for e in eax_]
+        dax_ = [e[1:] - e[:-1] for e in eax_]
+        nodes_ = jnp.stack([cax_[a][_ijk[:, a]] for a in range(3)], axis=1)
+        nd_ = jnp.stack([dax_[a][_ijk[:, a]] for a in range(3)], axis=1)
+        da, db = nd_[end_a], nd_[end_b]
+        ln_ = 0.5 * (da[_rows, axis] + db[_rows, axis])
+        w_, t_ = da[_rows, _t0], da[_rows, _t1]
+        area_ = w_ * t_
+        skin_ = jnp.where(thin_, run0 * w_, run1 * t_)
+        cen_ = 0.5 * (nodes_[end_a] + nodes_[end_b])
+        wt0, wt1 = w_, t_
+        if _live.any():
+            thick_ = da[_rows, _thin_col]
+            ext_ = jnp.minimum(0.5 * thick_, 4.0 * _delta**3 / thick_**2)
+            shift_ = jnp.where(_live, sheet_sign * 0.5 * (thick_ - ext_), 0.0)
+            cen_ = cen_ + shift_[:, None] * jnp.asarray(np.eye(3)[_thin_col])
+            wt0 = jnp.where(_live & (_t0 == sheet_thin), ext_, wt0)
+            wt1 = jnp.where(_live & (_t1 == sheet_thin), ext_, wt1)
+        sub_, wsub_ = _volume_rule_jax(ln_, wt0, wt1, axis, int(quad), int(quad_t))
+        pos_ = (cen_[:, None, :] + sub_).reshape(-1, 3)
+        mom_ = (jnp.asarray(_tan)[:, None, :] * wsub_[:, :, None]).reshape(-1, 3)
+        return pos_, mom_, bar_self_jax(ln_, wt0, wt1), ln_, area_, skin_, nodes_
+
     # from the PERMUTED ends, not the per-family `ends` list: a sheet pair duplicates and reorders the
     # bars, and an incidence built in the original order wires each sheet to another family's nodes
     cols = np.arange(nb)
@@ -2489,6 +2616,12 @@ def bar_filaments(
             # uniformity and would otherwise be silently wrong rather than absent.
             "graded": edges is not None,
             "dax": None if edges is None else tuple(np.asarray(v) for v in dax),
+            # The cell boundaries this grid was built on, and the traced pass that rebuilds every
+            # geometric array from a moved set of them: what `BuiltPEEC.solve(geometry=)` calls for
+            # a solid. Present on every lattice; only a graded one may USE it, since the FFT path
+            # reads its geometry from `d` and would silently ignore moved lines.
+            "edges": tuple(np.asarray(org[a] + np.concatenate([[0.0], np.cumsum(dax[a])])) for a in range(3)),
+            "regeom": regeom,
             # The grid's ORIGIN -- the lower corner of cell (0,0,0)'s box. Two meshes are the same
             # lattice only if all three agree: same shape, same pitch, SAME ORIGIN. Shape and pitch
             # alone are not enough and it is not a corner case -- a conductor and a core of equal
@@ -3150,29 +3283,50 @@ def cross_block_nearfar(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, sca
     return scale * jnp.concatenate(rows, axis=0)
 
 
-def _hier_apply(fil: Filaments, g, mu_scale, operator):
+_HSTRUCT_CACHE: dict = {}  # (id(host), block key, operator) -> (host, structure); see _hstruct
+_HSTRUCT_MAX = 16
+
+
+def _hstruct(host, key, operator, build):
+    """The hierarchical STRUCTURE (cluster tree and ACA pivots) of one block, built once per network.
+
+    The pivots are chosen from concrete geometry and held, so a traced solve refills the same blocks
+    from its moved geometry (:func:`hmatrix.materialize` is differentiable in pos/mom on a frozen
+    structure). Keyed on the host network's identity, the block and the operator spec; the entry
+    holds the host so a recycled `id` cannot hit a stale structure.
+    """
+    k = (id(host), key, (operator.tol, operator.leaf, operator.eta, getattr(operator, "floor", None)))
+    hit = _HSTRUCT_CACHE.get(k)
+    if hit is not None and hit[0] is host:
+        return hit[1]
+    if len(_HSTRUCT_CACHE) >= _HSTRUCT_MAX:
+        _HSTRUCT_CACHE.pop(next(iter(_HSTRUCT_CACHE)))
+    val = build()
+    _HSTRUCT_CACHE[k] = (host, val)
+    return val
+
+
+def _hier_apply(fil: Filaments, g, mu_scale, operator, host=None, key=()):
     """``apply(cur)`` for a lattice with no translation invariance -- a GRADED grid.
 
     The whole operator through one hierarchical compression, with no FFT and no dense block. This is
     the path that makes local refinement affordable: a uniform grid fine enough for the narrowest
     trace is fine everywhere, and on a real layout that is 1-3 million elements.
+
+    ``host`` is the same block at its REFERENCE geometry, concrete, when ``fil`` is traced: the
+    structure is built from it once (see :func:`_hstruct`) and the values come from ``fil``.
+    Without it the structure is built from ``fil`` itself, which refuses a tracer by name.
     """
     from .hmatrix import build as hbuild
     from .hmatrix import materialize as hmat
 
-    hm = hbuild(
-        fil.pos,
-        fil.mom,
-        np.asarray(fil.group),
-        g,
-        tol=operator.tol,
-        leaf=operator.leaf,
-        eta=operator.eta,
-    )
+    src = fil if host is None else host
+    mk = lambda: hbuild(src.pos, src.mom, np.asarray(src.group), g, tol=operator.tol, leaf=operator.leaf, eta=operator.eta)
+    hm = mk() if host is None else _hstruct(host, ("self",) + tuple(key), operator, mk)
     return hmat(hm, fil.pos, fil.mom, fil.self_g, g, scale=mu_scale)
 
 
-def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2, operator=None):
+def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2, operator=None, host=None):
     """``apply(cur) -> Lp @ cur`` for a network of several discretisations, still without forming Lp.
 
     Each block keeps whatever structure it has -- a lattice by FFT, a set of filaments densely -- and
@@ -3184,6 +3338,10 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
     a 6,806-bar lattice solves in 0.213 s and one welded 19-filament wire takes it to 33.4 s, and a
     12,000-element module allocated 2.7 GB to produce a 46 MB coupling block. The lattice blocks keep
     their FFT untouched -- it is exact and already O(N log N), so there is nothing to win there.
+
+    ``host``: the network at its reference geometry, concrete, when ``fil`` carries traced geometry.
+    Every hierarchical structure is then built from ``host`` once (see :func:`_hstruct`) and refilled
+    from ``fil``, which is what makes a moved lattice differentiable on this path.
     """
     from .hmatrix import build as hbuild
     from .hmatrix import materialize as hmat
@@ -3197,6 +3355,23 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
     diag, sel = [], []
     for lo, hi, lat in spans:
         rows, gl, cnt = _sub_slice(fil, lo, hi)
+        sub_host = None
+        if host is not None:  # the reference geometry of this block, for the structure alone
+            sub_host = Filaments(
+                np.asarray(host.pos)[rows],
+                np.asarray(host.mom)[rows],
+                np.asarray(host.self_g)[lo:hi],
+                gl,
+                None,
+                np.asarray(host.length)[lo:hi],
+                np.asarray(host.area)[lo:hi],
+                None,
+                None,
+                np.asarray(host.skin)[lo:hi],
+                np.asarray(host.round_)[lo:hi],
+                np.asarray(host.span)[lo:hi],
+                lat,
+            )
         # Geometry is sliced on the HOST while it is concrete: a jnp slice inside a jit is a tracer
         # even of a constant, and the hierarchical build below needs concrete sub-points -- it is
         # what made a parametric solve of a graded welded network fail under `jno.core`.
@@ -3220,15 +3395,11 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
             if operator is not None and operator.worth_it(cnt, cnt):
                 # passed through as they are: `hmatrix.build` refuses a tracer by name, which is a
                 # better error than whatever `np.asarray` would raise three frames deeper
-                hm = hbuild(
-                    sub.pos,
-                    sub.mom,
-                    np.asarray(sub.group),
-                    g,
-                    tol=operator.tol,
-                    leaf=operator.leaf,
-                    eta=operator.eta,
+                src = sub if sub_host is None else sub_host
+                mk = lambda src=src: hbuild(
+                    src.pos, src.mom, np.asarray(src.group), g, tol=operator.tol, leaf=operator.leaf, eta=operator.eta
                 )
+                hm = mk() if sub_host is None else _hstruct(host, ("self", lo, hi), operator, mk)
                 diag.append(hmat(hm, sub.pos, sub.mom, sub.self_g, g, scale=mu_scale))
             else:
                 k = pair_matrix(sub.pos, sub.mom, g, sub.self_g, group=sub.group) * mu_scale
@@ -3241,7 +3412,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
                     "peec.welded_apply: one of these parts is a GRADED lattice, which has no FFT. "
                     "Pass `operator=jno.solve.hierarchical(...)`."
                 )
-            diag.append(_hier_apply(sub, g, mu_scale, operator))
+            diag.append(_hier_apply(sub, g, mu_scale, operator, host=sub_host, key=(lo, hi)))
         else:
             diag.append(lattice_apply(sub, g, mu_scale=mu_scale, quad=quad, quad_t=quad_t))
         sel.append((lo, hi, rows, gl, cnt))
@@ -3261,7 +3432,21 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
                 # ONE structure, applied both ways: a cross block appears in each part's row, and
                 # building it twice could pick different pivots for the two directions -- the
                 # operator would then stop being symmetric, which a partial inductance must be.
-                hm = hbuild(pi, mi, gi, g, b=(pj, mj, gj), tol=operator.tol, leaf=operator.leaf, eta=operator.eta)
+                if host is None:
+                    hm = hbuild(pi, mi, gi, g, b=(pj, mj, gj), tol=operator.tol, leaf=operator.leaf, eta=operator.eta)
+                else:
+                    hp, hmo = np.asarray(host.pos), np.asarray(host.mom)
+                    mk = lambda ri=ri, rj=rj, gi=gi, gj=gj: hbuild(
+                        hp[ri],
+                        hmo[ri],
+                        gi,
+                        g,
+                        b=(hp[rj], hmo[rj], gj),
+                        tol=operator.tol,
+                        leaf=operator.leaf,
+                        eta=operator.eta,
+                    )
+                    hm = _hstruct(host, ("cross", loi, hii, loj, hij), operator, mk)
                 cross[(i, j)] = (
                     hmat(hm, pi, mi, None, g, scale=mu_scale, b=(pj, mj)),
                     hmat(hm, pi, mi, None, g, scale=mu_scale, b=(pj, mj), transpose=True),

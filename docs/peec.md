@@ -603,6 +603,41 @@ the position, so **the gradient exists** — the same structure-frozen, values-t
     measured, widening supports to 120–168 nodes pushed the required `restart` from 16 to 160 and a
     single 11,000-bar solve to about twelve minutes.
 
+### A solid's faces — `grid=jno.peec.faces(...)`
+
+A lattice's **coordinates** are not structural; only its cell counts, its occupancy and its node
+numbering are. On a grid with a line on every conductor face those three are fixed by the layout's
+topology, and the lines themselves can move:
+
+```python
+emag = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3)).build()   # every face a grid line
+op = jno.solve.hierarchical(tol=1e-6)
+L = lambda x0, x1: jnp.real(emag.solve(operator=op, geometry={"trace": (x0, y0, z0, x1, y1, z1)}).L)
+jax.grad(L, argnums=(0, 1))(x0, x1)                                          # exact, no rebuild
+```
+
+A solid named in `geometry=` gives its six faces `(x0, y0, z0, x1, y1, z1)`. Each face moves its grid
+line; every line between two face lines keeps its reference fraction of the gap, so the cells stretch
+and nothing is renumbered. Bar lengths, cross-sections, quadrature points, self terms, the skin
+thickness and the sheet offsets are all recomputed in jax from the moved lines -- the same split
+`line_filaments` makes for a wire's vertices. A trace's width, length and position, a die's position and
+a layer's thickness are therefore design variables with exact reverse-mode derivatives, measured
+against central differences of rebuilt networks with the same cell counts
+(`tests/test_peec_traced_grid.py`).
+
+What it needs and what it refuses, up front:
+
+- **The hierarchical operator.** A faces grid is not translation-invariant, so there is no FFT; and
+  under `geometry=` the cluster tree and the ACA pivots are built **once from the reference geometry**
+  and refilled from the moved one. A uniform lattice refuses a moved solid by name rather than
+  ignoring it.
+- **Lines may not cross.** Moving a face past another line, or closing a cell, changes the structure:
+  rebuild at that design. The check runs when the values are concrete; under a trace it cannot.
+- **A shared face has one position.** Two touching solids may both name their common line, with the
+  same value; different values raise when concrete.
+- **Wires are given separately.** A wire landing on a moved face must be moved with it through its own
+  `geometry=` entry; `nodes` stays at the reference, since which nodes a pad owns is structural.
+
 ## Validation
 
 Every layer is checked against an oracle that does not go through the layer below it.
@@ -732,7 +767,9 @@ Three things to read off it.
 - Each filament carries **one** current: the skin effect within a filament is not represented, except
   that a one-cell solid thicker than a skin depth carries a sheet per face. See
   [Frequency and the skin effect](#frequency-and-the-skin-effect).
-- A **built** network freezes its geometry. A conductivity may be traced; a lattice shape may not.
+- A **built** network freezes its STRUCTURE. A conductivity may be traced, a wire's vertices and
+  radius may be traced, and on a `faces` grid a solid's six faces may be traced; cell counts,
+  occupancy and numbering may not -- see [A solid's faces](#a-solids-faces-gridjnopeecfaces).
 - A network of wires alone has no lattice structure, so it forms the **dense** operator — that is the
   small-network path.
 - There is no dielectric and no displacement current: this is a conductor solver, not a full-wave one.

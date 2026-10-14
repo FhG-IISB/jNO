@@ -48,6 +48,7 @@ __all__ = [
     "lattice_operator",
     "sphere_self",
     "bar_self",
+    "bar_self_jax",
     "wire_self",
     "internal_impedance",
 ]
@@ -148,6 +149,60 @@ def bar_self(length, width, thickness):
         parts.append(8.0 * _self_integral(u[:, 1], u[:, 2], u[:, 0]) / (u[:, 0] ** 2 * u[:, 1] ** 2 * u[:, 2] ** 2))
     g = np.concatenate(parts)
     return g[inv].reshape(np.broadcast(length, width, thickness).shape)
+
+
+#: Gauss-Legendre order per axis of the 2-D rule in :func:`bar_self_jax`. Measured against the
+#: order-96 host integral: 32 is within 3e-11 at every lattice aspect ratio and 2.5e-7 on the sliver a
+#: current sheet makes (a 1 mm bar 3.5 um thick); 64 is within 1e-6 on a 1000:1 sliver. One pass per
+#: element at 64^2 x 2 points is 8,192 kernel evaluations, which is nothing next to the operator.
+_SELF_ORDER_JAX = 64
+
+#: Elements per chunk of the batched self-term pass, bounding its transient to a few tens of MB.
+_SELF_CHUNK_JAX = 256
+
+
+def _w_one(w, t, ell, x, wgt):
+    """``W(w, t, l) = int_0^w int_0^t (w-x)(t-y) F(rho) dy dx`` for one bar, in jax.
+
+    The z integral of ``(l-z)/r`` is closed: ``F(rho) = l asinh(l/rho) - sqrt(rho^2 + l^2) + rho``
+    with ``rho^2 = x^2 + y^2``. The remaining rectangle is split along its diagonal and each
+    triangle mapped by ``x = w s, y = t s u`` (Jacobian ``w t s``), which turns the log singularity
+    of ``F`` at the corner into ``s log s``; ``s = sigma^2`` then makes the integrand ``sigma^3 log
+    sigma``, smooth enough for Gauss-Legendre to converge fast (see ``_SELF_ORDER_JAX``).
+    """
+    sig, u = x[:, None], x[None, :]
+    s = sig * sig
+    F = lambda rho: ell * jnp.arcsinh(ell / rho) - jnp.sqrt(rho * rho + ell * ell) + rho
+    r1 = s * jnp.sqrt(w * w + (t * u) ** 2)
+    r2 = s * jnp.sqrt((w * u) ** 2 + t * t)
+    integrand = 2.0 * sig * s * (1.0 - s) * (1.0 - s * u) * (F(r1) + F(r2))
+    return w * w * t * t * jnp.sum(wgt[:, None] * wgt[None, :] * integrand)
+
+
+def bar_self_jax(length, width, thickness):
+    """The self term of :func:`bar_self`, in jax: differentiable in all three dimensions.
+
+    The same integral (``g = 8 W / (l^2 w^2 t^2)``), evaluated by a 2-D rule after the z integral is
+    done in closed form -- see :func:`_w_one`. This is what a MOVING lattice needs: a bar's length and
+    cross-section are then functions of the grid lines, and the host rule of :func:`bar_self`, which
+    deduplicates shapes with ``np.unique``, has no value to deduplicate under a trace. Broadcasts
+    over any common shape; the elements are processed in chunks of ``_SELF_CHUNK_JAX``.
+    """
+    x, wgt = np.polynomial.legendre.leggauss(_SELF_ORDER_JAX)
+    x, wgt = jnp.asarray(0.5 * (x + 1.0)), jnp.asarray(0.5 * wgt)
+    l_, w_, t_ = jnp.broadcast_arrays(jnp.asarray(length, float), jnp.asarray(width, float), jnp.asarray(thickness, float))
+    shape = l_.shape
+    l_, w_, t_ = l_.reshape(-1), w_.reshape(-1), t_.reshape(-1)
+    n = l_.shape[0]
+    c = min(_SELF_CHUNK_JAX, max(n, 1))
+    pad = (-n) % c
+    if pad:
+        l_, w_, t_ = (jnp.concatenate([v, jnp.ones(pad, v.dtype)]) for v in (l_, w_, t_))
+    one = jax.vmap(lambda w, t, ell: _w_one(w, t, ell, x, wgt))
+    W = jax.lax.map(lambda a: one(a[0], a[1], a[2]), (w_.reshape(-1, c), t_.reshape(-1, c), l_.reshape(-1, c))).reshape(-1)[
+        :n
+    ]
+    return (8.0 * W / (l_[:n] ** 2 * w_[:n] ** 2 * t_[:n] ** 2)).reshape(shape)
 
 
 def wire_self(length, radius):
