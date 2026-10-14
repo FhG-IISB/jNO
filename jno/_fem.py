@@ -3824,8 +3824,22 @@ class FEM:
             return None
         if isinstance(idx, jax.core.Tracer):
             return None
-        self._solver_ctx = {"pattern": np.asarray(idx), "complex_n": self._complex_n, "owner": self}
+        self._solver_ctx = {"pattern": np.asarray(idx), "complex_n": self._complex_n, "owner": self,
+                            "symmetric": self._symmetric_operator()}
         return self._solver_ctx
+
+    def _symmetric_operator(self):
+        """Is this real linear form's operator provably symmetric (see ``operator_key.symmetric_operator``)?
+        A direct cuDSS solve then factors it LDL^T inside the compiled program instead of LU through a host
+        callback. ``False`` for a complex form (its own path decides) and wherever it cannot be shown."""
+        if self._complex_n is not None or self._mode != "linear":
+            return False
+        from .utils.solver.operator_key import symmetric_operator
+
+        try:
+            return bool(symmetric_operator(self.domain, list(self._constraints or [])))
+        except Exception:  # noqa: BLE001 -- a form the check cannot read is solved as a general one
+            return False
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""

@@ -133,8 +133,9 @@ def test_different_operators_get_different_keys():
 
 
 def test_nvmath_cudss_lu_factors_a_real_group_once(monkeypatch):
-    """a REAL form on lu(backend="cudss") takes the nvmath cuDSS LU (as a single solve does); the group's block of
-    right-hand sides goes to it in ONE call, and values and gradient equal those of separate solves"""
+    """a REAL non-symmetric form on lu(backend="cudss") takes the nvmath cuDSS LU (as a single solve does; a symmetric
+    one is factored LDL^T in the program, tests/test_symmetric_operator.py); the group's block of right-hand sides
+    goes to it in ONE call, and values and gradient equal those of separate solves"""
     from jno.trace_compiler import TraceCompiler
     import jno.utils.solver.linear as L
     import jno.utils.solver.shared_solve as S
@@ -145,7 +146,7 @@ def test_nvmath_cudss_lu_factors_a_real_group_once(monkeypatch):
     monkeypatch.setattr(L, "_cudss_host_solve", lambda d, i, r, shape, t: calls.append((np.shape(r), t)) or orig(d, i, r, shape, t))
 
     def run():
-        F, crux = _three_loads(LU)
+        F, crux = _three_loads(LU, advect=0.7)
         val = np.asarray(crux.eval([F])).reshape(-1)
         fn = TraceCompiler.compile_traced_expression(F, crux.all_ops)
         params, static = eqx.partition(eqx.tree_inference(crux._unwrapped_models), eqx.is_inexact_array)

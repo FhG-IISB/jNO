@@ -24,7 +24,8 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
-def _three_loads(linear):
+def _three_loads(linear, advect=0.0):
+    """three loads on one operator; ``advect`` adds a convection term (a non-symmetric operator)"""
     d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.15).domain()
     u, v = d.fem_symbols(names=("u", "v"))
     xi, yi = d.variable("interior", split=True)[:2]
@@ -36,7 +37,7 @@ def _three_loads(linear):
     U, V = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     grad = lambda f: jno.np.grad(f, [xi, yi])  # noqa: E731
     loads = [1.0 + 0.0 * xi, xi * yi, jno.np.sin(3.0 * xi)]
-    fems = [jno.fem([k * inner(grad(U), grad(V)) - f * V, u(xb, yb) - 0.0]) for f in loads]
+    fems = [jno.fem([k * inner(grad(U), grad(V)) + advect * grad(U)[..., 0] * V - f * V, u(xb, yb) - 0.0]) for f in loads]
     sols = [f.solve(linear=linear) for f in fems]
     F = jno.fn(lambda a, b, c: jnp.stack([jnp.sum(a * a), jnp.sum(a * b), jnp.sum(c)]), sols, name="F")
     return F, jno.core([F], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))

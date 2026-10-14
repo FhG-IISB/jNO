@@ -187,9 +187,12 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
         if op.bcoo is not None and backend == "cudss" and getattr(op, "solver_context", None):
             # A fused COMPLEX form ([[R, -I], [I, R]]) with a symmetric R + jI: factor the n x n complex
             # symmetric matrix (LDL^T) inside the compiled program instead of LU on the real 2n block through
-            # a host callback. None where it does not apply (no GPU extension, a non-symmetric pattern).
+            # a host callback. A REAL form whose operator is provably symmetric (the weak form is, and there are
+            # no essential-BC rows -- `operator_key.symmetric_operator`): LDL^T inside the program too, so no host
+            # round trip and the adjoint reuses the factors. None where it does not apply (no GPU extension, a
+            # non-symmetric pattern): LU below.
             ctx = op.solver_context
-            if ctx.get("complex_n") is not None:
+            if ctx.get("complex_n") is not None or ctx.get("symmetric"):
                 from .utils.solver.linear import cudss_ldl_solve
 
                 x = cudss_ldl_solve(op.bcoo, b, ctx)

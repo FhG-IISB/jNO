@@ -49,10 +49,11 @@ def _fn_key(fn):
             _hashable(getattr(fn, "__defaults__", None)))
 
 
-def structural_key(node, memo=None, leaf=None) -> Any:
+def structural_key(node, memo=None, leaf=None, commutative=False) -> Any:
     """The structural key of an expression tree (see the module notes). ``leaf(node)``, when given, may key a
     node itself (return a key) or leave it to the rules below (return ``None``) -- e.g. a frozen field as a
-    numbered slot, so two integrands that differ only in which fields they read get one key."""
+    numbered slot, so two integrands that differ only in which fields they read get one key. ``commutative``
+    compares chains of ``*`` and ``+`` and the two arguments of ``inner`` as unordered (for :func:`symmetric_operator`)."""
     from ...trace import (
         BinaryOp,
         FrozenField,
@@ -76,7 +77,7 @@ def structural_key(node, memo=None, leaf=None) -> Any:
         if k is not None:
             memo[id(node)] = k
             return k
-    sk = lambda c: structural_key(c, memo, leaf)  # noqa: E731
+    sk = lambda c: structural_key(c, memo, leaf, commutative)  # noqa: E731
     t = type(n).__name__
     if isinstance(n, (TrialFunction, TestFunction)):
         k = (t, n.field_key, tuple(getattr(n, "value_shape", ()) or ()), getattr(n, "order", None), getattr(n, "space", None))
@@ -88,6 +89,20 @@ def structural_key(node, memo=None, leaf=None) -> Any:
         k = (t, _hashable(n.value))
     elif isinstance(n, RegionMask):
         k = (t, n.region)
+    elif isinstance(n, BinaryOp) and commutative and n.op in ("*", "+"):
+        parts = []
+
+        def flat(m):
+            m_ = m._expr if isinstance(m, _VIEW_TYPES) else m
+            if isinstance(m_, BinaryOp) and m_.op == n.op:
+                flat(m_.left)
+                flat(m_.right)
+            else:
+                parts.append(sk(m))
+
+        flat(n.left)
+        flat(n.right)
+        k = (t, n.op, tuple(sorted(parts, key=repr)))
     elif isinstance(n, BinaryOp):
         k = (t, n.op, sk(n.left), sk(n.right))
     elif isinstance(n, Jacobian):
@@ -97,6 +112,8 @@ def structural_key(node, memo=None, leaf=None) -> Any:
     elif isinstance(n, FunctionCall):
         args = tuple(sk(a) if hasattr(a, "__class__") and a.__class__.__module__.startswith("jno") else _hashable(a)
                      for a in (n.args or ()))
+        if commutative and getattr(n, "_name", None) == "inner" and len(args) == 2 and not getattr(n, "kwargs", None):
+            args = tuple(sorted(args, key=repr))
         k = (t, getattr(n, "_name", None), _fn_key(n.fn), _hashable(getattr(n, "getitem_key", None)), args,
              _hashable(sorted((getattr(n, "kwargs", None) or {}).items())))
     else:
@@ -124,3 +141,43 @@ def operator_key(domain, constraints, extra=()) -> Any:
         else:  # a constraint without a test function: an essential / boundary condition, part of the operator
             parts.append(("bc", structural_key(bare, memo)))
     return (id(domain), tuple(extra), tuple(sorted(parts, key=repr)))
+
+
+def symmetric_operator(domain, constraints) -> bool:
+    """Is the operator of the form ``constraints`` provably symmetric?
+
+    Yes when the bilinear part -- the additive terms with a trial function -- is the same set of terms when each
+    trial function and the test function of its field trade places, with products, sums and ``inner`` compared
+    as commutative. Essential conditions (constraints without a test function) do not enter: the steady linear
+    path eliminates them symmetrically (known columns lifted to the right-hand side, rows and columns zeroed,
+    unit diagonal; see tests/test_fem_dirichlet_symmetry.py). For the steady linear mode only -- the transient
+    blocks replace rows. ``False`` whenever symmetry cannot be shown: a form this does not recognise is solved as
+    a general one, never factored as symmetric when it is not."""
+    from ...trace import TestFunction, TrialFunction
+    from ...trace.views import _VIEW_TYPES
+    from .solver_helper import contains_node_type
+    from .weak_form import _split_additive_terms
+
+    def key(sub, swap):
+        def leaf(n):
+            if isinstance(n, TrialFunction):
+                role = "test" if swap else "trial"
+            elif isinstance(n, TestFunction):
+                role = "trial" if swap else "test"
+            else:
+                return None
+            return (role, n.field_key, tuple(n.value_shape or ()), int(n.order), str(n.space))
+
+        return repr(structural_key(sub, {}, leaf, commutative=True))
+
+    terms = []
+    for c in constraints:
+        bare = c._expr if isinstance(c, _VIEW_TYPES) else c
+        if not contains_node_type(bare, TestFunction):
+            continue  # an essential condition: eliminated symmetrically on the steady linear path
+        for sign, sub in _split_additive_terms(domain, bare):
+            if contains_node_type(sub, TrialFunction):
+                terms.append((repr(sign), sub))
+    if not terms:
+        return False
+    return sorted((sg, key(t, False)) for sg, t in terms) == sorted((sg, key(t, True)) for sg, t in terms)
