@@ -5577,8 +5577,42 @@ class core:
             _release_idle_solver_memory()  # one program per expression: free what it left behind
             return out
 
+        def _batch_sizes(op):
+            """the sample-batch sizes the compiled function would see for ``op`` alone (its tags' leading axes)"""
+            from .trace import collect_tags
+            from .trace_compiler import CONTEXT_METADATA_TAGS
+
+            tags = collect_tags(op)
+            return frozenset(
+                int(arr.shape[0])
+                for tag, arr in ctx.items()
+                if tag in tags and tag != "__time__" and tag not in CONTEXT_METADATA_TAGS and getattr(arr, "ndim", 0) >= 1
+            )
+
+        def _point_eval_all(ops):
+            """Several expressions as ONE program (one evaluator scope, as the training step evaluates its list):
+            a solve or integral they share is computed once, and there is one compile instead of one per
+            expression. Expressions the compiled function would batch differently (different sample-batch sizes)
+            keep one program each, so every result has the shape it has alone."""
+            if len(ops) < 2 or len({_batch_sizes(op) for op in ops}) > 1:
+                return [_point_eval(op) for op in ops]
+            entry = self._eval_cache.get(ops[0])
+            if entry is None:
+                self._eval_cache[ops[0]] = entry = {}
+            slot = ("together", min_consecutive, tuple(id(op) for op in ops[1:]))
+            hit = entry.get(slot)
+            if hit is None or any(r() is not op for r, op in zip(hit[0], ops[1:])):
+                raw_fn = TraceCompiler.compile_multi_expression([cse(fuse_laplacian(op)) for op in ops], self.all_ops)
+                hit = entry[slot] = (
+                    [weakref.ref(op) for op in ops[1:]],
+                    eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
+                )
+            out = list(hit[1](_models, ctx, batchsize=None, key=key))
+            _release_idle_solver_memory()
+            return out
+
         if samples == "point":
-            results = [_point_eval(op) for op in operation]
+            results = _point_eval_all(operation)
             return results[0] if len(results) == 1 else results
 
         # samples == "auto" or "chain": walk each expression to discover its
@@ -5650,12 +5684,12 @@ class core:
             # ``(K, N, *expr_shape)``.
             return jax.vmap(jax.vmap(_one))(chain_part)
 
-        results = []
-        for op, posterior_by_lid in zip(operation, per_op_chains):
-            if posterior_by_lid or (samples == "chain"):
-                results.append(_chain_eval(op, posterior_by_lid))
-            else:
-                results.append(_point_eval(op))
+        chained = [bool(posterior_by_lid) or samples == "chain" for posterior_by_lid in per_op_chains]
+        pointwise = iter(_point_eval_all([op for op, c in zip(operation, chained) if not c]))
+        results = [
+            _chain_eval(op, posterior_by_lid) if c else next(pointwise)
+            for op, posterior_by_lid, c in zip(operation, per_op_chains, chained)
+        ]
 
         return results[0] if len(results) == 1 else results
 

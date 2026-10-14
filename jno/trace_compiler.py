@@ -52,6 +52,24 @@ from .trace import (
 )
 
 
+# Context entries that are FEM metadata, not sample batches: never vmapped over, never a batch size.
+CONTEXT_METADATA_TAGS = frozenset(
+    {
+        "JxW",
+        "flat_cells",
+        "global_areas",
+        "N_flat",
+        "dN_dx_flat",
+        "dirichlet_nodes",
+        "cells",
+        "quad_points",
+        "boundary_nodes",
+        "surface_data",
+        "v_grads_JxW_flat",
+    }
+)
+
+
 # Lazy import: TraceEvaluator imports from this module at package level,
 # so we defer the import to avoid any potential circular dependency.
 # It is resolved at function-call time, well after both modules are loaded.
@@ -996,19 +1014,7 @@ class TraceCompiler:
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
         expr_tags = collect_tags(expr)
-        METADATA_TAGS = {
-            "JxW",
-            "flat_cells",
-            "global_areas",
-            "N_flat",
-            "dN_dx_flat",
-            "dirichlet_nodes",
-            "cells",
-            "quad_points",
-            "boundary_nodes",
-            "surface_data",
-            "v_grads_JxW_flat",
-        }
+        METADATA_TAGS = CONTEXT_METADATA_TAGS
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -1360,19 +1366,7 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
-        METADATA_TAGS = {
-            "JxW",
-            "flat_cells",
-            "global_areas",
-            "N_flat",
-            "dN_dx_flat",
-            "dirichlet_nodes",
-            "cells",
-            "quad_points",
-            "boundary_nodes",
-            "surface_data",
-            "v_grads_JxW_flat",
-        }
+        METADATA_TAGS = CONTEXT_METADATA_TAGS
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""

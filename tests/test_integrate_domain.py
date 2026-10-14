@@ -138,6 +138,31 @@ def test_shared_solves_are_evaluated_once_per_evaluation(monkeypatch):
     assert len(calls) == once, f"{len(calls)} assemblies for one expression with 4 references, {once} for one"
 
 
+def test_a_list_of_expressions_is_evaluated_as_one_program(monkeypatch):
+    """crux.eval([a, b, c, d]) of four functionals of the same two solves compiles ONE program for the list (one
+    evaluator scope, as the training step evaluates its entries), not one per expression; values equal the
+    one-by-one evaluation"""
+    from jno.trace_compiler import TraceCompiler
+
+    d, phi, (xi, yi), fems, grad = _two_conductors()
+    Phi = [phi.bind(x=xi, y=yi).freeze(f.solve(linear=HOST)) for f in fems]
+    nodes = [(inner(grad(Phi[j]), grad(Phi[k]))).integrate(d) for j, k in ((0, 0), (0, 1), (1, 1))]
+    nodes.append(2.0 * nodes[1] - nodes[0])
+    alone = [complex(np.asarray(jno.core([n], domain=_empty()).eval(n)).reshape(-1)[0]) for n in nodes]
+    built = []
+    for name in ("compile_traced_expression", "compile_multi_expression"):
+        orig = getattr(TraceCompiler, name)
+        monkeypatch.setattr(TraceCompiler, name, staticmethod(lambda *a, _o=orig, _n=name, **k: built.append(_n) or _o(*a, **k)))
+    crux = jno.core([nodes[0]], domain=_empty())
+    built.clear()
+    together = [complex(np.asarray(v).reshape(-1)[0]) for v in crux.eval(nodes)]
+    assert built == ["compile_multi_expression"], f"programs built for the list: {built}"
+    np.testing.assert_allclose(together, alone, rtol=1e-12)
+    built.clear()
+    crux.eval(nodes)
+    assert built == [], "the list's program is cached like a single expression's"
+
+
 def _localized_admittance():
     """the eddy admittance of two drives whose sources sit on a few edges at x < 0.3 (a terminal's bar)"""
     d = jno.shape.box(0, 0, 0, 1, 1, 1).sized(0.25).domain()
