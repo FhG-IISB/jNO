@@ -666,6 +666,21 @@ class TestInequalityConstraints:
         assert g.size == 2, "the constraint must be visible to the hook, not just the objective"
         assert float(seen[0]["total_loss"]) == pytest.approx(float(g[0]), rel=1e-6)
 
+    def test_a_parameter_only_in_a_constraint_row_is_a_model_of_the_problem(self):
+        """``c`` appears in a ``jno.le`` row and nowhere else. It used to be missed by the model collection
+        (which did not look inside a constraint), so the first step raised "No model for Model <id>"."""
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
+        c = jnn.parameter((1,), key=jax.random.PRNGKey(1), name="c")
+        c.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
+        tracked = jnn.parameter((1,), key=jax.random.PRNGKey(2), name="t").optimizer(optax.sgd(0.0))
+        crux = jno.core([(a * x - 2.0).mse, jno.le((c * x).mean, 0.4), (tracked * x).mean.tracker(1)], domain=d)
+        crux.solve(1)
+        found = set(crux._collect_flax_modules())
+        assert {a.model.layer_id, c.model.layer_id, tracked.model.layer_id} <= found
+
     def test_substeps_and_inequality_constraints_are_refused(self):
         """A substep descends the mean of its own SUBSET, where a constraint would act as a penalty.
 

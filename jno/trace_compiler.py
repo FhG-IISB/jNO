@@ -31,6 +31,7 @@ from .trace import (
     Assembly,
     BinaryOp,
     Choice,
+    Constraint,
     FunctionCall,
     GroupedAssembly,
     Hessian,
@@ -44,6 +45,7 @@ from .trace import (
     OperationCall,
     OperationDef,
     Placeholder,
+    Tracker,
     TunableModule,
     TunableModuleCall,
     collect_tags,
@@ -397,6 +399,10 @@ class TraceCompiler:
             elif isinstance(node, (Integral, IntegralTime)):
                 visit(node.target)
             elif isinstance(node, Assembly):
+                visit(node.expr)
+            elif isinstance(node, Constraint):  # a jno.le / jno.ge row: its models count even when no other entry has them
+                visit(node.residual)
+            elif isinstance(node, Tracker):
                 visit(node.expr)
             elif isinstance(node, GroupedAssembly):
                 if node.volume_value_expr is not None:

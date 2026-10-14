@@ -6272,6 +6272,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(node.time_var)
         elif isinstance(node, Tracker):
             visit(node.expr)
+        elif isinstance(node, Constraint):
+            visit(node.residual)
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
