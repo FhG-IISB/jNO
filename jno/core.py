@@ -1835,17 +1835,40 @@ class core:
 
         def grad_jac_fn(trainable, rng, context):
             """The objective gradient AND the constraint rows (w.r.t. the blocks ``lids``, raveled in that order)
-            from ONE forward pass: one ``jax.vjp``, then one pullback for the objective and one per row. A
-            constrained optimiser otherwise ran a second program for its Jacobian, with a second forward
-            solve -- a second factorisation of every FEM system per step."""
+            from ONE forward pass: one ``jax.vjp``, then its pullback over the stacked seeds (objective first,
+            then one per row) in ONE ``lax.map``. A constrained optimiser otherwise ran a second program for its
+            Jacobian, with a second forward solve -- a second factorisation of every FEM system per step.
+
+            ``lax.map`` and not a Python loop: each pullback call traces the whole backward graph again (every
+            solve's adjoint, every assembly), so a loop put 1 + rows copies of it into the program and the
+            compile grew with the number of constraints. The map traces it once and runs it once per seed, in
+            sequence, so the peak memory is one backward pass. Not ``vmap`` (or ``lax.map(batch_size=...)``):
+            that holds every row's backward pass at once and batches host-callback and sparse solves, whose
+            cotangents ``custom_linear_solve`` gets wrong under ``vmap`` (see ``shared_solve.py``)."""
+            from jax.flatten_util import ravel_pytree
+
             rng, step_rng = jax.random.split(rng)
-            (total_loss, losses), pullback = jax.vjp(lambda p: loss_fn(p, context, step_rng), trainable)
-            (grads,) = pullback((jnp.ones_like(total_loss), jnp.zeros_like(losses)))
-            jac = []
-            for i in rows:
-                (g_i,) = pullback((jnp.zeros_like(total_loss), jnp.zeros_like(losses).at[i].set(1.0)))
-                jac.append(jnp.concatenate([leaf.ravel() for lid in lids for leaf in jax.tree_util.tree_leaves(g_i[lid])]))
-            return grads, rng, total_loss, losses, jnp.stack(jac) if jac else jnp.zeros((0, 1))
+
+            def loss_wrapper(p):
+                with jax.named_scope("jno/core/loss"):
+                    return loss_fn(p, context, step_rng)
+
+            (total_loss, losses), pullback = jax.vjp(loss_wrapper, trainable)
+            n = 1 + len(rows)
+            seed_total = jnp.zeros((n,) + jnp.shape(total_loss), total_loss.dtype).at[0].set(1)
+            seed_rows = np.zeros((n,) + tuple(jnp.shape(losses)))
+            for r, i in enumerate(rows):
+                seed_rows[(r + 1, i)] = 1.0
+            seed_rows = jnp.asarray(seed_rows, losses.dtype)
+
+            def one(seed):
+                (g,) = pullback(seed)
+                block = jnp.concatenate([leaf.ravel() for lid in lids for leaf in jax.tree_util.tree_leaves(g[lid])])
+                return ravel_pytree(g)[0], block
+
+            flat, blocks = jax.lax.map(one, (seed_total, seed_rows))
+            grads = ravel_pytree(trainable)[1](flat[0])
+            return grads, rng, total_loss, losses, blocks[1:] if rows else jnp.zeros((0, 1))
 
         return grad_jac_fn
 
