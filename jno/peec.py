@@ -1151,7 +1151,15 @@ class PEEC:
             # A magnetic core keeps the one-current model too: its coupling is built for one
             # sub-point offset per family, and a sheet family has its own.
             _sheet_freq = 0.0 if magnetic else float(np.min(np.atleast_1d(self.freq)))
-            fb = bar_filaments(shs, sigma=sgs, grid_shapes=[s for s, _ in magnetic], edges=self.grid, freq=_sheet_freq)
+            fb = bar_filaments(
+                shs,
+                quad=_QUAD,
+                quad_t=_QUAD_T,
+                sigma=sgs,
+                grid_shapes=[s for s, _ in magnetic],
+                edges=self.grid,
+                freq=_sheet_freq,
+            )
             # what `BuiltPEEC._with_solids` needs: the solids by name, the lattice's traced pass, and
             # where its rows start in the welded order (lines come first)
             solid_info = (
