@@ -130,3 +130,33 @@ def test_different_operators_get_different_keys():
     assert fems[0]._operator_key() != fems[1]._operator_key()
     d2, fems2, *_ = _drives()
     assert fems2[0]._operator_key() == fems2[1]._operator_key()
+
+
+def test_nvmath_cudss_lu_factors_a_real_group_once(monkeypatch):
+    """a REAL form on lu(backend="cudss") takes the nvmath cuDSS LU (as a single solve does); the group's block of
+    right-hand sides goes to it in ONE call, and values and gradient equal those of separate solves"""
+    from jno.trace_compiler import TraceCompiler
+    import jno.utils.solver.linear as L
+    import jno.utils.solver.shared_solve as S
+    from tests.test_shared_factorisation_cpu import _three_loads
+
+    calls = []
+    orig = L._cudss_host_solve
+    monkeypatch.setattr(L, "_cudss_host_solve", lambda d, i, r, shape, t: calls.append((np.shape(r), t)) or orig(d, i, r, shape, t))
+
+    def run():
+        F, crux = _three_loads(LU)
+        val = np.asarray(crux.eval([F])).reshape(-1)
+        fn = TraceCompiler.compile_traced_expression(F, crux.all_ops)
+        params, static = eqx.partition(eqx.tree_inference(crux._unwrapped_models), eqx.is_inexact_array)
+        g = jax.grad(lambda p: jnp.sum(fn(eqx.combine(p, static), crux.domain_data.context)))(params)
+        return val, [np.asarray(x) for x in jax.tree_util.tree_leaves(g)]
+
+    v_shared, g_shared = run()
+    fwd = [c for c in calls if not c[1]]
+    assert fwd and all(len(s) == 2 and s[1] == 3 for s, _t in fwd), f"expected block calls of 3: {calls}"
+    monkeypatch.setattr(S, "solve_shared", lambda *a, **kw: False)
+    v_alone, g_alone = run()
+    np.testing.assert_allclose(v_shared, v_alone, rtol=1e-8)
+    for a, b in zip(g_shared, g_alone):
+        np.testing.assert_allclose(a, b, rtol=1e-7, atol=1e-12 * (np.abs(b).max() + 1e-300))

@@ -93,10 +93,13 @@ def solve_shared(evaluator, node, ctx, memo) -> bool:
     solve, A0, B = members[0]._solve_fn, systems[0], jnp.stack(rhs, axis=1)
     X = None
     spec = getattr(members[0], "_linear_spec", None)
-    if getattr(spec, "name", None) == "lu-cudss":  # in-program LDL^T: the block in ONE call, one factorisation
+    ctx0 = members[0]._fem_ref._linear_solver_context()
+    if getattr(spec, "name", None) == "lu-cudss" and ctx0 is not None and ctx0.get("complex_n") is not None:
+        # in-program LDL^T for a complex form -- the same choice a single solve makes (jno.solve.lu): the block
+        # in ONE call, one factorisation
         from .linear import cudss_ldl_solve
 
-        X = cudss_ldl_solve(A0, B, members[0]._fem_ref._linear_solver_context())
+        X = cudss_ldl_solve(A0, B, ctx0)
     if X is None and getattr(spec, "name", None) in ("lu-pardiso", "lu-cudss"):
         # PARDISO and the nvmath cuDSS LU take a block of right-hand sides in one call: one factorisation
         # (their adjoint is the same block call with the cotangents)
