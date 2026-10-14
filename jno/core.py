@@ -3812,16 +3812,10 @@ class core:
 
             self.log.info("JIT compiling step function with mesh sharding — this might take a while")
 
-            # ── Enable persistent XLA compilation cache ──
-            # On the first run XLA compiles and writes artifacts to disk.
-            # Subsequent runs with the same network/batchsize/dtype reload
-            # from disk and skip compilation entirely, saving minutes for
-            # large models.  The cache is keyed on the full XLA program hash
-            # so stale entries are never loaded for a different graph.
-            _cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jno", "xla_cache")
-            os.makedirs(_cache_dir, exist_ok=True)
-            jax.config.update("jax_compilation_cache_dir", _cache_dir)
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+            # The persistent compilation cache is configured once, at `import jno` (jno.utils.config:
+            # on by default, or the user's opt-out); solve() leaves that setting alone. (It used to set a
+            # second directory here and raise the minimum compile time from 0 to 1 s for the rest of the
+            # process, overriding an opt-out.)
 
             # Trigger AOT compilation so the first real step is fast.
 
