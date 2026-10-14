@@ -209,6 +209,64 @@ def test_an_integral_runs_over_the_support_of_its_data_only(monkeypatch):
     assert np.abs(g(Y_all[1])).max() > 0
 
 
+def test_integrals_of_one_structure_are_one_kernel(monkeypatch):
+    """Y_jk = ∫ 3 (E_k - 2j A_k)·E_j differ only in the fields they read: the diagonal pair and the off-diagonal
+    pair are each ONE batched kernel (a diagonal entry reads one field twice, so it is a structure of its own),
+    each member over its own support; value and gradient w.r.t. the parameter equal the one-by-one evaluation"""
+    import equinox as eqx
+
+    import jno.utils.solver.shared_integral as SI
+    from jno.trace_compiler import TraceCompiler
+
+    d, build, fems = _localized_admittance()
+    plans = []
+    orig = SI._plan
+    monkeypatch.setattr(SI, "_plan", lambda m: plans.append(len(m)) or orig(m))
+
+    def run(Y):
+        F = jno.fn(lambda *ys: sum((i + 1) * jnp.real(y) + (i + 2) * jnp.imag(y) for i, y in enumerate(ys)), list(Y), name="F")
+        crux = jno.core([F], domain=_empty())
+        val = float(np.asarray(crux.eval([F])).reshape(-1)[0])
+        fn = TraceCompiler.compile_traced_expression(F, crux.all_ops)
+        params, static = eqx.partition(eqx.tree_inference(crux._unwrapped_models), eqx.is_inexact_array)
+        g = jax.grad(lambda p: jnp.sum(fn(eqx.combine(p, static), crux.domain_data.context)))(params)
+        return val, [np.asarray(x) for x in jax.tree_util.tree_leaves(g)]
+
+    v_group, g_group = run(build())
+    assert sorted(plans) == [2, 2], f"group sizes planned: {plans}"
+    monkeypatch.setattr(SI, "integrate_shared", lambda *a, **k: False)
+    v_alone, g_alone = run(build())
+    np.testing.assert_allclose(v_group, v_alone, rtol=1e-12)
+    for a, b in zip(g_group, g_alone):
+        np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-14 * (np.abs(b).max() + 1e-300))
+    assert any(np.abs(b).max() > 0 for b in g_alone)
+
+
+def test_only_integrands_that_differ_in_their_fields_alone_are_grouped():
+    """the grouping key: the same integrand over other fields of the same element matches; a different parameter,
+    literal, coordinate, component index or element does not"""
+    from jno.utils.solver.shared_integral import _key
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    x, y = d.variable("interior", split=True)[:2]
+    phi, _v = d.fem_symbols(names=("phi", "v"))
+    w, _q = d.fem_symbols(names=("w", "q"), value_shape=(2,))
+    n = len(d.mesh.points)
+    rng = np.random.default_rng(0)
+    F = [phi.bind(x=x, y=y).freeze(rng.normal(size=n)) for _ in range(4)]
+    W = [w.bind(x=x, y=y).freeze(rng.normal(size=2 * n)) for _ in range(2)]
+    k1, k2 = (jno.np.parameter((1,), name=nm) for nm in ("k1", "k2"))
+    key = lambda e: _key(getattr(e.integrate(d), "_expr", e.integrate(d)))  # noqa: E731
+    base = key(k1 * F[0] * F[1])
+    assert key(k1 * F[2] * F[3]) == base, "the same integrand over other fields of the same element must match"
+    assert key(k2 * F[2] * F[3]) != base, "another parameter"
+    assert key(2.0 * F[2] * F[3]) != key(3.0 * F[2] * F[3]), "another literal"
+    assert key(k1 * x * F[2] * F[3]) != key(k1 * y * F[2] * F[3]), "another coordinate"
+    assert key(k1 * F[2] * F[2]) != base, "one field read twice is another structure"
+    assert key(W[0][0] * W[1][0]) != key(W[0][1] * W[1][1]), "another component"
+    assert key(k1 * W[0][0] * F[1]) != key(k1 * F[0] * F[1]), "another element"
+
+
 def test_support_of_region_masks_sums_and_zeros():
     """a region coefficient restricts to its region (a literal-0 default adds nothing), a sum with a term of
     unknown support is unrestricted, a literal 0 has no support"""

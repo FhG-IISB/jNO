@@ -770,6 +770,11 @@ class TraceEvaluator:
 
                     if solve_shared(self, expr, ctx, memo):  # solved with the solves that share its operator
                         return memo[id(expr)][1]
+                elif getattr(expr, "_integral_spec", None) is not None:
+                    from .utils.solver.shared_integral import integrate_shared
+
+                    if integrate_shared(self, expr, ctx, memo):  # one kernel with the integrals of its structure
+                        return memo[id(expr)][1]
                 out = self._dispatch_uncached(expr, ctx)
                 memo[id(expr)] = (expr, out)
                 return out

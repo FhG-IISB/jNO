@@ -151,10 +151,23 @@ def cell_support(expr, n_cells, frozen_rows, region_cells):
     return walk(expr)
 
 
-def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
+def frozen_cell_rows(values, sp):
+    """Per cell: does a known field with these (constant) ``values`` have a nonzero DOF there."""
+    nz = np.any(np.reshape(np.asarray(values), (-1, sp["ncomp"])) != 0, axis=1)
+    return np.any(nz[np.asarray(sp["cdofs"])], axis=1)
+
+
+def domain_functional(domain, expr, as_inputs=frozenset()) -> Tuple[Callable, List[Tuple[Any, Any]]]:
     """``(fn, inputs)``: ``fn(values) -> ()`` integrates ``expr`` over the whole volume of ``domain``;
     ``inputs`` lists ``(key, node)`` for every value it needs at evaluation time -- a frozen field whose values
     are a trace node (a solve), keyed ``("frozen", id)``, and every runtime parameter, keyed by its name.
+
+    ``as_inputs`` (frozen ids): constant frozen fields that are NOT baked into ``fn`` but read from
+    ``values[("frozen", id)]`` like a solve's -- so one ``fn`` can be evaluated for many fields of the same element
+    (:mod:`shared_integral` vmaps it over the members of a group of integrals). ``fn(values, cell_ids,
+    cell_weights, n_batch)`` then takes the cells to loop over (default: the support of ``expr``'s own data,
+    ``fn.support``) and a weight per cell (0 for padding); ``n_batch`` scales the chunking for a batch of that many
+    evaluations at once. ``fn.specs`` holds each field's element (by input key).
 
     The integrand may hold known fields of any element space, runtime parameters (scalar, P0, P1, element
     space), coordinates and region masks -- but no unknown (no trial or test function: that is a form).
@@ -217,6 +230,8 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
         key = ("frozen", f)
         if getattr(n, "values_node", None) is not None:
             inputs.append((key, n.values_node))
+        elif f in as_inputs:
+            continue  # handed in per evaluation (a member of a batched group)
         else:
             const_vals[key] = jnp.reshape(jnp.asarray(n.values), (-1,))
             if const_vals[key].shape[0] != specs[key]["n_vals"]:
@@ -238,11 +253,11 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
     # over those alone -- the integral is the same, the work and the reverse-mode memory scale with the support
     def frozen_rows(node):
         key = ("frozen", node.frozen_id)
-        if key not in const_vals:
-            return None
-        sp = specs[key]
-        nz = np.any(np.reshape(np.asarray(const_vals[key]), (-1, sp["ncomp"])) != 0, axis=1)
-        return np.any(nz[np.asarray(sp["cdofs"])], axis=1)
+        if key in const_vals:
+            return frozen_cell_rows(const_vals[key], specs[key])
+        if node.frozen_id in as_inputs:
+            return frozen_cell_rows(np.reshape(np.asarray(node.values), (-1,)), specs[key])
+        return None
 
     support = cell_support(expr, n_cells, frozen_rows,
                            lambda r: np.asarray(_cell_region_mask(domain, r)).reshape(-1) != 0)
@@ -250,24 +265,26 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
     ids = np.arange(n_cells) if support is None else np.flatnonzero(support)
     cell_ids = jnp.asarray(ids if ids.size else np.zeros(1, np.int64))
 
-    def fn(values):
+    runtime_frozen = [key for key, _n in inputs if isinstance(key, tuple) and key[0] == "frozen"]
+    runtime_frozen += [("frozen", f) for f in frozen if f in as_inputs and ("frozen", f) not in runtime_frozen]
+
+    def fn(values, cell_ids=cell_ids, cell_weights=None, n_batch=1):
         geo = pts
         for ids, axis, name in coords:  # trainable node positions: the geometry is traced
             geo = geo.at[ids, axis].set(jnp.asarray(values[("coord", name)], dtype=geo.dtype).reshape(-1))
         fvals = dict(const_vals)
-        for key, _node in inputs:
-            if isinstance(key, tuple) and key[0] == "frozen":
-                v = jnp.reshape(jnp.asarray(values[key]), (-1,))
-                blk = frozen[key[1]].values_block
-                if blk is not None:
-                    v = v[blk[0] : blk[1]]
-                if v.shape[0] != specs[key]["n_vals"]:
-                    raise ValueError(
-                        f"expr.integrate(domain): a frozen solution has {v.shape[0]} values; its "
-                        f"{specs[key]['fam']}{specs[key]['k']} space has {specs[key]['n_vals']} (a form with "
-                        "several fields: freeze the block of this field)."
-                    )
-                fvals[key] = v
+        for key in runtime_frozen:
+            v = jnp.reshape(jnp.asarray(values[key]), (-1,))
+            blk = frozen[key[1]].values_block
+            if blk is not None:
+                v = v[blk[0] : blk[1]]
+            if v.shape[0] != specs[key]["n_vals"]:
+                raise ValueError(
+                    f"expr.integrate(domain): a frozen solution has {v.shape[0]} values; its "
+                    f"{specs[key]['fam']}{specs[key]['k']} space has {specs[key]['n_vals']} (a form with "
+                    "several fields: freeze the block of this field)."
+                )
+            fvals[key] = v
         pvals = {n: jnp.reshape(jnp.asarray(values[n]), (-1,)) for n in tags}
         for n in tags:
             want = {"cell": n_cells, "node": n_verts}.get(pkind[n])
@@ -317,6 +334,10 @@ def domain_functional(domain, expr) -> Tuple[Callable, List[Tuple[Any, Any]]]:
             return val
 
         n_loop = int(cell_ids.shape[0])
-        return jnp.sum(elem_map(cell, (cell_ids,), cell_chunk(n_loop, 1, 1, _CHUNK_OVERRIDE[0])))
+        per_cell = elem_map(cell, (cell_ids,), cell_chunk(n_loop, int(n_batch), 1, _CHUNK_OVERRIDE[0]))
+        if cell_weights is not None:  # padding cells of a batched member weigh 0
+            per_cell = per_cell * jnp.reshape(cell_weights, (-1,) + (1,) * (per_cell.ndim - 1)).astype(per_cell.real.dtype)
+        return jnp.sum(per_cell)
 
+    fn.specs, fn.support = specs, ids
     return fn, inputs

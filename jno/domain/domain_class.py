@@ -2597,6 +2597,9 @@ class domain(MeshIOMixin):
         keys = [k for k, _n in inputs]
         node = FunctionCall(lambda *vals: fn(dict(zip(keys, vals))), [n for _k, n in inputs], name="domain_integral")
         node._per_evaluation = True  # a scalar of its inputs: evaluated once per evaluation
+        # integrals with the same integrand reading other fields of the same elements are evaluated as ONE
+        # batched kernel per evaluation (jno.utils.solver.shared_integral); this is what they are matched by
+        node._integral_spec = {"domain": self, "expr": bare, "fn": fn}
         return node
 
     def attach(self, target: str | None = None, **props):

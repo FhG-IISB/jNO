@@ -49,8 +49,10 @@ def _fn_key(fn):
             _hashable(getattr(fn, "__defaults__", None)))
 
 
-def structural_key(node, memo=None) -> Any:
-    """The structural key of an expression tree (see the module notes)."""
+def structural_key(node, memo=None, leaf=None) -> Any:
+    """The structural key of an expression tree (see the module notes). ``leaf(node)``, when given, may key a
+    node itself (return a key) or leave it to the rules below (return ``None``) -- e.g. a frozen field as a
+    numbered slot, so two integrands that differ only in which fields they read get one key."""
     from ...trace import (
         BinaryOp,
         FrozenField,
@@ -69,7 +71,12 @@ def structural_key(node, memo=None) -> Any:
     if id(node) in memo:
         return memo[id(node)]
     n = node._expr if isinstance(node, _VIEW_TYPES) else node
-    sk = lambda c: structural_key(c, memo)  # noqa: E731
+    if leaf is not None:
+        k = leaf(n)
+        if k is not None:
+            memo[id(node)] = k
+            return k
+    sk = lambda c: structural_key(c, memo, leaf)  # noqa: E731
     t = type(n).__name__
     if isinstance(n, (TrialFunction, TestFunction)):
         k = (t, n.field_key, tuple(getattr(n, "value_shape", ()) or ()), getattr(n, "order", None), getattr(n, "space", None))

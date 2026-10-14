@@ -15,6 +15,12 @@ from __future__ import annotations
 def _solve_nodes(roots):
     """Every solve node reachable from ``roots`` (through expression children, a frozen field's solve and a
     function call's arguments), in first-seen order."""
+    return nodes_where(roots, lambda n: getattr(n, "_solve_fls", None) is not None)
+
+
+def nodes_where(roots, pred):
+    """Every node reachable from ``roots`` (through expression children, a frozen field's solve and a function
+    call's arguments) for which ``pred`` holds, in first-seen order."""
     from .solver_helper import iter_children
 
     out, seen, stack = [], set(), list(reversed(list(roots)))
@@ -23,7 +29,7 @@ def _solve_nodes(roots):
         if id(n) in seen or n is None:
             continue
         seen.add(id(n))
-        if getattr(n, "_solve_fls", None) is not None:
+        if pred(n):
             out.append(n)
         nxt = []
         vn = getattr(n, "values_node", None)
