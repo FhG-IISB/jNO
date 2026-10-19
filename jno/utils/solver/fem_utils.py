@@ -5652,6 +5652,113 @@ def compress_plan(indices):
     return plan
 
 
+#: Raw triplets per batch in :func:`compress_plan_blocks`: ~24 bytes each of transient (an int64 key, the
+#: sort scratch of one batch), so ~200 MB whatever the mesh size.
+_PLAN_BATCH = 8 << 20
+
+
+def _block_len(blk) -> int:
+    kind, r, c = blk
+    return int(r.shape[0]) * int(r.shape[1]) * int(c.shape[1]) if kind == "outer" else int(r.shape[0])
+
+
+def _block_keys(blk, stride: int, batch: int):
+    """The int64 keys ``row * stride + col`` of one block, in its raw (flattened) order, ``batch`` at a time."""
+    kind, r, c = blk
+    if kind == "flat":
+        for s in range(0, r.shape[0], batch):
+            k = r[s : s + batch].astype(np.int64)
+            k *= stride
+            k += c[s : s + batch]
+            yield k
+        return
+    per = max(1, int(r.shape[1]) * int(c.shape[1]))
+    cells = max(1, batch // per)
+    for s in range(0, r.shape[0], cells):
+        k = r[s : s + cells, :, None].astype(np.int64) * stride + c[s : s + cells, None, :]
+        yield k.reshape(-1)
+
+
+def compress_plan_blocks(blocks):
+    """:func:`compress_plan` of a pattern given as BLOCKS, without ever materialising the raw triplets.
+
+    ``blocks`` lists, in raw order, ``("outer", rows, cols)`` -- per cell, every ``rows[e, a]`` against every
+    ``cols[e, b]``, flattened in ``(e, a, b)`` order: an element block -- or ``("flat", rows, cols)``, plain
+    triplets. Returns the same ``(idx, inverse32, nse)`` as ``compress_plan`` of the concatenated triplets,
+    bit for bit: the sorted unique keys are built a batch at a time, and the inverse is a ``searchsorted``
+    of each batch into them, written straight into the int32 array that is the plan's only per-triplet
+    output. The raw pattern of a 3-D P1 vector problem is ~280 triplets per DOF, and building it whole --
+    rows, columns, their stack, a host copy, an int64 key, its argsort and sorted copy -- was ~43 bytes
+    each: 18 GB of host memory at 1.5M DOFs, the build's peak. Here the transient is one batch.
+
+    Memoized like :func:`compress_plan`, on the blocks' content."""
+    blocks = [(k, np.ascontiguousarray(r, dtype=np.int32), np.ascontiguousarray(c, dtype=np.int32)) for k, r, c in blocks]
+    total = sum(_block_len(b) for b in blocks)
+    if total == 0:
+        return None
+    h = _hashlib.blake2b(digest_size=16)
+    for kind, r, c in blocks:
+        h.update(kind.encode())
+        h.update(np.asarray(r.shape + c.shape, np.int64).tobytes())
+        h.update(memoryview(r).cast("B"))
+        h.update(memoryview(c).cast("B"))
+    key = ("blocks", h.digest(), total)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        _PLAN_CACHE.move_to_end(key)
+        return hit
+    stride = max(int(c.max()) for _k, r, c in blocks if r.size and c.size) + 1
+    uniq = np.zeros(0, np.int64)
+    pending, n_pending = [], 0
+    for b in blocks:
+        for k in _block_keys(b, stride, _PLAN_BATCH):
+            u = np.unique(k)
+            pending.append(u)
+            n_pending += u.shape[0]
+            # merge when the pending uniques outgrow what is merged: amortised O(nse log nse), bounded memory
+            if n_pending > max(_PLAN_BATCH, uniq.shape[0]):
+                uniq = np.unique(np.concatenate([uniq, *pending]))
+                pending, n_pending = [], 0
+    if pending:
+        uniq = np.unique(np.concatenate([uniq, *pending]))
+    del pending
+    inv32 = np.empty(total, np.int32)
+    off = 0
+    for b in blocks:
+        for k in _block_keys(b, stride, _PLAN_BATCH):
+            inv32[off : off + k.shape[0]] = np.searchsorted(uniq, k)
+            off += k.shape[0]
+    idx = np.empty((uniq.shape[0], 2), np.int32)
+    idx[:, 0] = uniq // stride
+    idx[:, 1] = uniq % stride
+    plan = (idx, inv32, int(uniq.shape[0]))
+    if plan[0].nbytes + plan[1].nbytes <= _PLAN_CACHE_MAX_BYTES:
+        _PLAN_CACHE[key] = plan
+        while len(_PLAN_CACHE) > _PLAN_CACHE_MAX or (
+            len(_PLAN_CACHE) > 1 and sum(p[0].nbytes + p[1].nbytes for p in _PLAN_CACHE.values()) > _PLAN_CACHE_MAX_BYTES
+        ):
+            _PLAN_CACHE.popitem(last=False)
+    return plan
+
+
+def raw_pattern_from_blocks(blocks):
+    """The raw ``(n, 2)`` int32 triplet array the blocks stand for -- the uncompressed fallback only.
+
+    ``jnp``, so it also takes a TRACED block (a contact gap table inside a compiled march), which is exactly
+    when the host plan cannot be built and this fallback runs."""
+    rows, cols = [], []
+    for kind, r, c in blocks:
+        r, c = jnp.asarray(r).astype(jnp.int32), jnp.asarray(c).astype(jnp.int32)
+        if kind == "outer":
+            sh = (r.shape[0], r.shape[1], c.shape[1])
+            rows.append(jnp.broadcast_to(r[:, :, None], sh).reshape(-1))
+            cols.append(jnp.broadcast_to(c[:, None, :], sh).reshape(-1))
+        else:
+            rows.append(r.reshape(-1))
+            cols.append(c.reshape(-1))
+    return jnp.stack([jnp.concatenate(rows), jnp.concatenate(cols)], axis=1)
+
+
 def compress_eager(A):
     """Collapse duplicates in a CONCRETE operator without an on-device sort.
 

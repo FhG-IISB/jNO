@@ -70,6 +70,7 @@ from .fem_lagrange import (
 from .fem_utils import (
     _CHUNK_CONSUMED,
     _CHUNK_OVERRIDE,
+    _block_len,
     _cell_region_mask,
     _collect_region_mask_names,
     _collect_tag_mask_names,
@@ -87,7 +88,9 @@ from .fem_utils import (
     cell_chunk,
     compress_eager,
     compress_plan,
+    compress_plan_blocks,
     elem_map,
+    raw_pattern_from_blocks,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .sharding import element_mesh as _element_mesh
@@ -3836,39 +3839,32 @@ def assemble_fem_native(
             _has_bundle = dynamic_topology and bool(args) and TOPOLOGY_ARG in args
             if not _has_bundle and _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
                 return _pattern_cache["val"]
-            _idx_rows, _idx_cols = [], []
-            # int32 SOURCES, not an int32 cast of the result. Under x64 `cdofs` / `cell_all_dofs` are
-            # int64 (`jnp.arange` in the dof-map builder promotes), so every broadcast block below and
-            # both concatenated vectors were int64 -- 8 bytes per raw triplet, three times over, to
-            # produce an array that is cast back down to int32 one line later. Casting the small
-            # (n_cells, n_local) maps ONCE makes the whole pattern pipeline int32. These arrays are
-            # index metadata for the host-side plan; they are never differentiated.
-            _cdofs32 = [_c.astype(jnp.int32) for _c in cdofs]
-            _cad32 = cell_all_dofs.astype(jnp.int32)
+            # The pattern as BLOCKS -- an element block is (cell rows) x (cell columns), never expanded into
+            # its raw triplets: those are ~280 per DOF on a 3-D vector problem, and materialising them (rows,
+            # columns, stack, host copy, sort) was the build's host-memory peak (`compress_plan_blocks`).
+            # int32 numpy: index metadata for the host-side plan, never differentiated.
+            _blocks = []
+            _cdofs32 = [np.asarray(_c, dtype=np.int32) for _c in cdofs]
+            _cad32 = np.asarray(cell_all_dofs, dtype=np.int32)
             for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
-                _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                _idx_rows.append(jnp.broadcast_to(_cdofs32[_tfi_s][:, :, None], _sh).reshape(-1))
-                _idx_cols.append(jnp.broadcast_to(_cad32[:, None, :], _sh).reshape(-1))
+                _blocks.append(("outer", _cdofs32[_tfi_s], _cad32))
             for _region_s, _face_ids_s, _btyped_s in surface_work:
-                _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
+                _pc = np.asarray(parent_j, dtype=np.int64)[np.asarray(_face_ids_s, dtype=np.int64)]
                 _fcols = _cad32[_pc]
                 for _bcoeff_s, _btfi_s in _btyped_s:
-                    _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                    _idx_rows.append(jnp.broadcast_to(_cdofs32[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
-                    _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+                    _blocks.append(("outer", _cdofs32[_btfi_s][_pc], _fcols))
                     # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
                     # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
                     # also drives the main-side reaction. Inactive contact contributes zeros in DATA.
                     if _gap_key_of(_region_s) is not None:
                         _gs = _gap_static(_region_s, _face_ids_s, _btfi_s, args)
-                        _idx_rows.append(_gs["rows_sm"])
-                        _idx_cols.append(_gs["cols_sm"])
+                        # possibly TRACED (a compiled contact march): the plan builder then raises in its
+                        # `try` below and the in-trace fallback takes over, as before
+                        _blocks.append(("flat", _gs["rows_sm"], _gs["cols_sm"]))
                         if _gaps_in(_bcoeff_s, _region_s):
-                            _idx_rows.append(_gs["rows_ms"])
-                            _idx_cols.append(_gs["cols_ms"])
-                            _idx_rows.append(_gs["rows_mm"])
-                            _idx_cols.append(_gs["cols_mm"])
-            _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
+                            _blocks.append(("flat", _gs["rows_ms"], _gs["cols_ms"]))
+                            _blocks.append(("flat", _gs["rows_mm"], _gs["cols_mm"]))
+            _blk_sizes = [_block_len(b) for b in _blocks]  # per-term flat lengths, in append order
             if dynamic_topology:
                 b = (args or {}).get(TOPOLOGY_ARG)
                 _pl = (b or {}).get("plans", [None] * (_my_plan_idx + 1))[_my_plan_idx] if b else None
@@ -3893,31 +3889,16 @@ def assemble_fem_native(
                 # pattern and sent the Dirichlet rows down a different route than the baseline's, which is
                 # measurable: every assembled piece matched bit-for-bit while the STEP differed by 2.6e-3.
                 # So fall through to the ordinary path.
-            _idx_static = (
-                jnp.stack(
-                    [jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
-                )
-                if _idx_rows
-                else None
-            )
-            # Hand the plan builder a HOST copy and let go of the device array before it allocates its
-            # scratch: the two held the same bytes twice through the most memory-hungry phase of the
-            # build. When a plan comes back the raw pattern is DEAD -- the only reader is the
-            # `_plan is None` fallback below, and `_static_idx_for` publishes `_plan[0]` -- so it is
-            # never rebuilt; when compression fails the fallback path needs it on device, so it is
-            # re-uploaded there and only there.
-            _host_idx = None
+            _idx_static = None
             try:
-                _host_idx = np.asarray(_idx_static) if _idx_static is not None else None
-                _idx_static = None  # release the device buffer for the duration of compress_plan
-                _plan = compress_plan(_host_idx) if _host_idx is not None else None
+                _plan = compress_plan_blocks(_blocks) if _blocks else None
             except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
                 # Drop the pattern as the pre-plan code always did: a TRACED one must not be cached
                 # across traces, and the fallback below rebuilds it in-trace anyway.
-                _idx_static, _host_idx, _plan = None, None, None
-            if _plan is None and _host_idx is not None:
-                _idx_static = jnp.asarray(_host_idx)
-            _host_idx = None
+                _plan, _blocks = None, None
+            if _plan is None and _blocks:
+                # the uncompressed fallback needs the raw triplets on device; only here are they built
+                _idx_static = jnp.asarray(raw_pattern_from_blocks(_blocks))
             _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
             return _pattern_cache["val"]
 
