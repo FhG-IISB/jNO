@@ -361,7 +361,7 @@ def _spd(n=40, seed=3):
     [
         jno.precond.jacobi(),
         jno.precond.inner(jno.solve.cg(tol=1e-10, maxiter=200)),
-        jno.precond.cached(jno.precond.jacobi()),
+        jno.precond.jacobi(reuse=True),
     ],
 )
 def test_a_precond_spec_passed_as_M_is_materialized(spec):

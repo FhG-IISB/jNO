@@ -263,9 +263,9 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.lsc()` / `saddle(schur="lsc")` | least-squares commutator — the **convection-aware** Schur factor | Navier–Stokes, where the pressure-mass recipe degrades with Re |
 | `jno.precond.fsai(power=…)` | factored sparse approximate inverse `M⁻¹ = GᵀG` — two sparse products, no triangular solves | **SPD only** — the rung between `jacobi` and multigrid, when the factor is reused ([below](#fsai-jnoprecondfsai)) |
 | `jno.precond.schwarz(parts=…)` | algebraic overlapping Schwarz (domain decomposition), two-level | SPD elliptic systems split across **several devices**; elasticity with `nullspace="rigid"` ([below](#overlapping-schwarz-jnoprecondschwarz)) |
-| `jno.precond.amg(cycles=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; needs the optional `pyamg` |
+| `jno.precond.amg(cycles=…, nullspace=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; `nullspace="rigid"` for elasticity; needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
-| `.cached(refresh=…)` | reuse an expensive setup across solves | Newton loops and transients, where the operator barely changes between solves |
+| `reuse=` (on every spec) | keep an expensive setup across solves: `True` once, `k` every k-th solve | Newton loops, transients and optimisation loops, where the operator barely changes between solves |
 | `M1 + M2` / `M1 @ M2` | **arithmetic on specs** — applied in parallel and summed, or in sequence right-to-left | writing your own Schur approximation instead of asking for one |
 
 Every one of them is passed the same way — `fem.solve(precond=…)`, alongside whichever `linear=`
@@ -283,8 +283,9 @@ fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg(cycles=1))
 fem.solve(linear=jno.solve.fgmres(tol=1e-10),
           precond=jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30)))
 
-# reuse an expensive setup across a Newton loop or a march
-fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg(cycles=1).cached())
+# reuse an expensive setup across solves: build once, pass the SAME spec every time
+M = jno.precond.amg(nullspace="rigid", reuse=True)   # rigid-body modes for a displacement field
+fem.solve(linear=jno.solve.cg(tol=1e-10), precond=M)
 
 # three more with the same shape, each needing something the others do not:
 jno.precond.gmg(n_pre=2, n_post=2)      # geometric MG — needs a STRUCTURED grid
@@ -388,16 +389,16 @@ inside `lax.scan` where every operator is traced — so it used to refuse every 
 now builds it once, before the scan, from the step tangent (a state-dependent mass `c(u) u_t` included).
 
 A frozen setup stays correct — a preconditioner changes convergence speed, never the answer — but goes
-stale when the operator moves. `cached(spec, refresh=k)` spells the cadence, and the march then runs as
+stale when the operator moves. `reuse=k` spells the cadence, and the march then runs as
 `ceil(n/k)` scans, re-composed against the carried state:
 
 ```python
 fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())                      # frozen once
-fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.cached(jno.precond.amg(), refresh=25))
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg(reuse=25))
 ```
 
 Measured where a melt pool's coefficients move ~`1e13` between solid and molten: frozen once, the Krylov
-residual stalls at `2.9e-03`; at `refresh=25` it reaches `1.5e-04`. `theta()`/`exponential()` integrate
+residual stalls at `2.9e-03`; at `reuse=25` it reaches `1.5e-04`. `theta()`/`exponential()` integrate
 the march themselves and are not chunked, so a cadence beside one raises rather than never firing.
 
 A frozen preconditioner is probed once and refused if it makes a random residual worse — but only when it
@@ -417,7 +418,7 @@ fem.solve(linear=jno.solve.fgmres(),
 ```
 
 For Navier–Stokes, lag the convecting velocity (`jno.lag`, [above](#the-momentum-block-picard-not-newton))
-so the velocity block AMG is built on is the Oseen operator. `cached(spec, refresh=k)` is **refused**
+so the velocity block AMG is built on is the Oseen operator. `reuse=k` is **refused**
 here rather than ignored: a rebuild every `k` Newton iterations would need the loop cut into chunks,
 which the steady solve does not do. To rebuild at a better state, solve again from that state (`x0=`).
 
@@ -622,10 +623,11 @@ such a menu are things you can write.
     `linear=jno.solve.amg()` (ONE AmgX crossing per solve, with warm structure-keyed re-setup measured
     ~10x cheaper on repeats).
 
-??? note "`.cached(refresh=…)`"
-    on any spec — reuse an expensive setup across solves: `False` frozen, `True`
-    rebuild on shape/sparsity change, an **int k** to rebuild every k-th materialization (the cadence
-    for a march whose operator values drift step by step), or a `ctx -> key` callable.
+??? note "`reuse=`"
+    on every spec — keep an expensive setup across solves, the keyword `lu` and `newton` use too: `False`
+    (default) rebuilds every solve, `True` builds on the first solve and keeps it (pass the SAME spec
+    object), an **int k** rebuilds every k-th solve (the cadence for a march whose operator values drift
+    step by step). A solve whose preconditioner is kept compiles once and is reused.
 
     The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and the
     viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, 2014, §9.2):
@@ -709,7 +711,7 @@ sparsity pattern poisons the factor with NaN rather than applying a stale one.
     | `amg` | 48 ms | 52 ms | |
 
     The setup costs about one to two solves (101, 115, 530 ms there), so FSAI pays when the factor is
-    **reused**: a constant-operator march, `.cached()` across solves, several right-hand sides.
+    **reused**: a constant-operator march, `reuse=True` across solves, several right-hand sides.
     `power=2` grows the setup steeply (7.1 s on the P2 case, for 32 iterations) — start with `power=1`.
 
 ### Overlapping Schwarz — `jno.precond.schwarz()`

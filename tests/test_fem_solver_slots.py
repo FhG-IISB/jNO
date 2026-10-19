@@ -464,7 +464,7 @@ def test_host_side_slots_stay_eager_and_correct():
         (cg, jno.precond.nystrom(rank=12)),
         (my_linear, None),  # bare callables: no traits, no key
         (cg, my_precond),
-        (cg, jno.precond.jacobi().cached()),  # .cached() owns its own reuse; do not compile over it
+        (cg, jno.precond.jacobi(reuse=True)),  # a kept setup owns its own reuse; do not compile over it
     ]
     for linear, precond in eager:
         assert not _compilable(linear, precond), f"{linear} + {precond} must not be compiled"

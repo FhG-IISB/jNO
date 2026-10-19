@@ -450,7 +450,7 @@ it** — an unbuilt spec re-runs pyamg's host-side setup on every solve, and sta
 because that setup cannot be traced:
 
 ```python
-M = jno.precond.amg().build(fem.operator[0])       # or jno.precond.amg().cached()
+M = jno.precond.amg().build(fem.operator[0])       # or jno.precond.amg(reuse=True)
 u = fem.solve(linear=jno.solve.cg(tol=1e-10), precond=M)
 ```
 

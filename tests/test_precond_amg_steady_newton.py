@@ -148,11 +148,11 @@ def test_ilu_is_built_once_the_same_way():
 
 
 def test_a_rebuild_cadence_is_refused_not_ignored():
-    """``cached(amg(), refresh=k)`` would need the Newton ``while_loop`` cut into chunks; the setup is built
-    once, so a cadence that would silently never fire is refused by name."""
+    """``amg(reuse=k)`` would need the Newton ``while_loop`` cut into chunks; the setup is built once, so a
+    cadence that would silently never fire is refused by name."""
     fem, _exact = _diffusion()
-    with pytest.raises(NotImplementedError, match="refresh=3"):
-        fem.solve(precond=jno.precond.cached(jno.precond.amg(), refresh=3), **_FGMRES)
+    with pytest.raises(NotImplementedError, match="reuse=3"):
+        fem.solve(precond=jno.precond.amg(reuse=3), **_FGMRES)
 
 
 # --- steady Navier-Stokes: triangular((u, amg()), (p, pressure mass)) on the Picard-lagged tangent ---------------

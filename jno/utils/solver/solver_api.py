@@ -1499,7 +1499,7 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
 
 
 def _uncached(spec):
-    """Strip ``cached(...)`` wrappers from a spec tree, keeping the structure around them.
+    """Strip ``reuse=`` wrappers from a spec tree, keeping the structure around them.
 
     A march that honours a cadence rebuilds once per chunk, so the wrapper's own "every k-th
     materialization" counter must not apply on top: with chunks of k steps it would rebuild every k
@@ -1516,12 +1516,12 @@ def _uncached(spec):
 
 
 def _refresh_cadence(precond):
-    """Steps between preconditioner rebuilds, from ``jno.precond.cached(spec, refresh=k)``.
+    """Steps between preconditioner rebuilds, from ``reuse=k`` on the preconditioner.
 
     That spelling already documents this exact policy -- "an ``int k`` rebuilds every k-th
     materialization -- the cadence policy for a Newton loop or transient march whose operator values
-    drift step by step" -- so honouring it needs no new argument anywhere. ``None`` (or ``refresh``
-    True/False, which are the shape/never policies) leaves the march as a single scan.
+    drift step by step" -- so honouring it needs no new argument anywhere. ``reuse=False`` / ``True``
+    (rebuild every solve / keep it) leave the march as a single scan.
     """
     for spec in _specs_in(precond):
         r = getattr(spec, "refresh", None)
@@ -1542,6 +1542,30 @@ def _specs_in(spec):
         yield from _specs_in(child)
     for pair in getattr(spec, "pairs", ()) or ():
         yield from _specs_in(pair[1] if isinstance(pair, tuple) else pair)
+
+
+def precond_compiles(spec) -> bool:
+    """Whether a solve holding ``spec`` may be compiled once and reused across ``fem.solve`` calls.
+
+    Not when anything in the tree holds state built from CONCRETE values that a reused program would keep
+    stale: a ``refresh_from`` hook (a Picard-lagged form, re-assembled from each solve's entry iterate) or
+    a leaf set up on the host per solve (a plain ``amg``/``ilu``: "(re)built at each solve"). Everything
+    else is materialized inside the trace from the operator it is handed (``jacobi``), or is frozen on
+    request and already built (``amg(reuse=True)`` after its first solve, which runs eagerly to build) --
+    and a compiled solve reusing it is exactly what was asked for."""
+
+    def ok(s) -> bool:
+        if getattr(s, "refresh_from", None) is not None:
+            return False
+        child = getattr(s, "spec", None)
+        if child is not None and getattr(s, "traceable", False):
+            return True  # a frozen cache that has built: no setup left, whatever it wraps
+        pairs = getattr(s, "pairs", None) or ()
+        if child is None and not pairs:
+            return bool(getattr(s, "traceable", True))
+        return (child is None or ok(child)) and all(ok(p[1] if isinstance(p, tuple) else p) for p in pairs)
+
+    return spec is None or ok(spec)
 
 
 class _FrozenMarchPrecond:
@@ -1704,7 +1728,7 @@ def _freeze_precond_for_newton(precond, fem, u0, jacobian=None):
 
     The frozen setup does not follow the tangent as Newton moves. That is always CORRECT (a preconditioner
     changes the Krylov convergence speed, never the root Newton converges to); how much speed it costs
-    depends on how far the tangent drifts from ``x0``. A ``cached(spec, refresh=k)`` cadence cannot be
+    depends on how far the tangent drifts from ``x0``. A ``reuse=k`` cadence cannot be
     honoured inside the single ``while_loop`` (rebuilding every k Newton iterations would need the loop cut
     into chunks), so it is refused rather than silently ignored.
     """
@@ -1713,7 +1737,7 @@ def _freeze_precond_for_newton(precond, fem, u0, jacobian=None):
     cadence = _refresh_cadence(precond)
     if cadence is not None:
         raise NotImplementedError(
-            f"fem.solve(precond=jno.precond.cached(..., refresh={cadence})): a steady nonlinear solve builds "
+            f"fem.solve(precond=jno.precond.<spec>(reuse={cadence})): a steady nonlinear solve builds "
             "this preconditioner ONCE, from the tangent at the initial guess, because the Newton loop is a "
             f"single lax.while_loop -- a rebuild every {cadence} iterations cannot happen inside it, and would "
             "silently never fire. Drop the cadence (the frozen setup is always correct, only slower as the "
