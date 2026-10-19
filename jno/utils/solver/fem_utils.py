@@ -469,6 +469,10 @@ def _unpack_components(flat, node, axis=1):
     matrix through :func:`_symmetric_basis`, so every expression downstream sees an ordinary matrix."""
     vs = tuple(getattr(node, "value_shape", ()) or ())
     axis = axis % flat.ndim
+    if not _is_symmetric_field(node):
+        # The components are contiguous on `axis`: split them in place. Moving the axis to the end and
+        # back is the same values through two transposes, which under `jacfwd` XLA writes out.
+        return jnp.reshape(flat, flat.shape[:axis] + vs + flat.shape[axis + 1 :])
     moved = jnp.moveaxis(flat, axis, -1)
     if _is_symmetric_field(node):
         out = jnp.tensordot(moved, _symmetric_basis(vs[0], moved.dtype), axes=([-1], [0]))  # (..., n, n)
@@ -1699,12 +1703,18 @@ def _eval_integrand(domain, node, local):
                 g = jnp.stack([grads[..., d] for d in dims], axis=-1)
                 contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
                 return contracted[..., 0] if len(dims) == 1 else contracted
-            grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
             value_shape = getattr(node.target, "value_shape", ())
-            if len(value_shape) == 0:
-                return _drop_scalar_component_axis(grad_list)
-            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
-            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape[, len(dims)])
+            if len(value_shape) == 0 or len(dims) == 1:
+                grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
+                if len(value_shape) == 0:
+                    return _drop_scalar_component_axis(grad_list)
+                return _unpack_components(grad_list[0], node.target, axis=1)  # (n_quad, *value_shape)
+            # Every direction in ONE multiply-and-sum over the basis, already (n_quad, n_comp, n_dirs): the
+            # per-direction products, their stack and the layout moves between them were what `jacfwd`
+            # carried through the element tangent as separate writes.
+            g = grads[:, :, jnp.asarray(dims)] if list(dims) != list(range(grads.shape[-1])) else grads
+            flat = jnp.sum(g[:, :, None, :] * cell_sol[None, :, :, None], axis=1)
+            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape, len(dims))
 
         # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``.
         # For a NON-NODAL field the value-component cannot be differentiated directly, but
