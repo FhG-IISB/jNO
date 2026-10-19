@@ -424,7 +424,10 @@ def test_pardiso_agrees_with_the_iterative_default_on_a_symmetric_tangent():
     ref = np.asarray(fem.solve())
     got = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True), linear=jno.solve.lu(backend="pardiso")))
     assert np.abs(ref).max() > 1e-6
-    assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-8, "the LDLt factorization changed the answer"
+    # Both are Newton roots to the same residual bound (rtol = atol = 1e-8). The default solves each Newton
+    # step only as accurately as that step needs (inexact Newton), so the two agree to that bound times the
+    # conditioning (8e-8 measured), not to round-off; a factorization that CHANGED the answer is far outside.
+    assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-6, "the LDLt factorization changed the answer"
 
 
 def test_lu_host_reuse_false_does_not_retain_a_factorization():

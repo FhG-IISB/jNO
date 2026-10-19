@@ -5349,6 +5349,10 @@ def assemble_fem_native(
     domain._fem_native_term_functional = _make_functional
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
+    # Linear in the unknown, whatever routes it through Newton below (step history does; a box constraint or
+    # a derived field makes the residual itself nonlinear, so those clear it). Newton on such a residual
+    # converges in one EXACT step, so its driver skips the inexact-Newton forcing (`newton_direct`).
+    linear_in_unknown = not nonlinear and not bounded and not derived_specs
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a
     # different linear system whose coefficients the buffers set. The linear branch below builds a
     # ``FemLinearSystem`` from ``_assemble_at(args)``, which has no ``__history__`` to thread — so the
@@ -5499,6 +5503,7 @@ def assemble_fem_native(
                 _constrained = s_d_dofs
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            _op.linear_in_unknown = linear_in_unknown
             # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
             # (``staggered(over_relax>1)``) must leave these alone: the sub-solve already puts them exactly
             # on the prescribed value, and stepping past it makes the constraint oscillate as (1-omega)^k
@@ -5565,6 +5570,7 @@ def assemble_fem_native(
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.linear_in_unknown = linear_in_unknown
         # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating
         # driver (``staggered(over_relax != 1)``) must leave them alone. Missing here, every NON-parametric
         # problem over-relaxed its prescribed values -- measured g = 2 held at 3.0 after one sweep with

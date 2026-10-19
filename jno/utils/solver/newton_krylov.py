@@ -731,6 +731,16 @@ def newton_default(
 #: ~1e-3 contraction per step on the flows that motivated it; 1e-2 and 1e-4 ran within noise of it there.
 _CHORD_FORCING_FLOOR = 1e-3
 
+#: Internal A/B switch (tests): ``[False]`` solves every fresh-tangent Newton step's linear system to the
+#: slot's own tolerance instead of the Eisenstat-Walker forcing term (see ``newton_direct``).
+_FORCING = [True]
+#: Set by ``fem.solve`` for the duration of a solve whose residual is LINEAR in the unknown (a linear form
+#: marched for its step history): one exact Newton step solves it, and forcing would take ~4 assemblies.
+_LINEAR_FORM = [False]
+#: Eisenstat & Walker (SIAM J. Sci. Comput. 17 (1996) 16), choice 2: eta_k = GAMMA (||r_k||/||r_k-1||)^ALPHA,
+#: safeguarded by GAMMA eta_k-1^ALPHA when that is larger than 0.1, started at ETA_0, never above ETA_MAX.
+_EW_GAMMA, _EW_ALPHA, _EW_ETA0, _EW_ETA_MAX = 0.9, 2.0, 0.1, 0.1
+
 
 def newton_direct(
     residual_fn,
@@ -844,20 +854,37 @@ def newton_direct(
             _u, r, k = state[:3]
             return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
 
+        forcing = _FORCING[0] and not _LINEAR_FORM[0] and getattr(linear_solve, "accepts_rtol", False)
+
         def body(state):
-            u, r, k = state
+            u, r, k, rn_prev, eta_prev = state
+            rn = jnp.linalg.norm(r)
             # The Newton STEP is not gated (see `_step_and_tangent`: the outer residual is the contract,
             # judged by `_convergence_check`); only custom_root's tangent below is. Gating it here also put a
             # host callback inside this while_loop, which JAX's rematerialisation cannot partially evaluate:
             # reverse mode through a checkpointed time march died on an AssertionError in its loop rules.
             with gate_suspended():
-                delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
-            alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
+                if forcing:
+                    # INEXACT Newton: solve each step only as far as it pays. Eisenstat-Walker choice 2 tracks
+                    # how fast the residual is falling, so the steps tighten as quadratic convergence sets in;
+                    # never tighter than half the outer target over the current residual (the last step need
+                    # not out-solve the bound the loop stops on). The loop still stops on the TRUE residual.
+                    ew = _EW_GAMMA * (rn / jnp.maximum(rn_prev, 1e-300)) ** _EW_ALPHA
+                    safe = _EW_GAMMA * eta_prev**_EW_ALPHA
+                    ew = jnp.where(k == 0, _EW_ETA0, jnp.where(safe > 0.1, jnp.maximum(ew, safe), ew))
+                    target = atol + rtol * r0n
+                    eta = jnp.clip(jnp.maximum(ew, 0.5 * target / jnp.maximum(rn, 1e-300)), 0.0, _EW_ETA_MAX)
+                    delta = linear_solve(J_fwd(u), -r, rtol=eta)
+                else:
+                    eta = eta_prev
+                    delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
+            alpha = _backtrack(u, delta, rn) if line_search else damping
             u = u + alpha * delta
-            return u, f_fwd(u), k + 1
+            return u, f_fwd(u), k + 1, rn, jnp.asarray(eta, rn.dtype)
 
         if not reuse:
-            u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+            init = (x0, r_start, 0, r0n, jnp.asarray(_EW_ETA0, r0n.dtype))
+            u, r, k, _rn, _eta = jax.lax.while_loop(cond, body, init)
             return u, k, k, jnp.linalg.norm(r), r0n, None  # a fresh tangent (one factorization) every step
 
         def body_reuse(state):

@@ -2564,9 +2564,17 @@ class FEM:
         import time as _time
 
         from .utils.logger import get_logger
+        from .utils.solver import newton_krylov as _nk
 
         _t0 = _time.perf_counter()
-        out = self._solve_inner(*args, **kwargs)
+        # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
+        # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
+        prev_linear = _nk._LINEAR_FORM[0]
+        _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
+        try:
+            out = self._solve_inner(*args, **kwargs)
+        finally:
+            _nk._LINEAR_FORM[0] = prev_linear
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
         return out
 
