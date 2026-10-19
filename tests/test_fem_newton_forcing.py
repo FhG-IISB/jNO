@@ -83,3 +83,26 @@ def test_forcing_cuts_krylov_work_and_keeps_the_newton_contract(build, monkeypat
     assert st["steps"] <= st_ref["steps"] + 2, (st, st_ref)
     # Both are roots to within the same outer bound; their distance is bounded by that tolerance, not 0.
     assert np.abs(u - u_ref).max() <= 1e-4 * np.abs(u_ref).max()
+
+
+def test_toggling_the_forcing_does_not_reuse_the_compiled_solve():
+    # Break: the compiled-solve cache keyed without the forcing switch -- the second solve then reruns the
+    # program traced with exact steps and lands on its root to roundoff (an A/B in one process measured nothing).
+    import jno.utils.solver.newton_krylov as nk
+
+    fem = _nonlinear_diffusion()
+    slots = lambda: dict(  # noqa: E731
+        nonlinear=jno.solve.newton(direct=True), linear=jno.solve.fgmres(tol=1e-12), precond=jno.precond.jacobi()
+    )
+    prev = nk._FORCING[0]
+    try:
+        nk._FORCING[0] = False
+        exact = np.asarray(fem.solve(**slots()))
+        nk._FORCING[0] = True
+        inexact = np.asarray(fem.solve(**slots()))
+    finally:
+        nk._FORCING[0] = prev
+    diff = np.abs(exact - inexact).max() / np.abs(exact).max()
+    # a rerun differs by GPU scatter roundoff (~1e-16); an inexact root by up to its outer tolerance
+    assert diff > 1e-13, f"the forced solve reran the exact-step program ({diff:.1e} apart)"
+    assert diff <= 1e-4  # both within the outer bound
