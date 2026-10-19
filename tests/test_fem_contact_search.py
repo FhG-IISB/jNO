@@ -519,9 +519,10 @@ def test_a_plain_solve_after_a_searched_one_is_not_the_searched_answer():
     # The tolerance is loose enough to absorb rounding, not a leak. `cell_metric` rides in every
     # volume form's `domain_context`, and an extra entry there is not inert -- it reorders the
     # assembled arithmetic and moves the answer by ~1e-12 (the same lesson as `quad_weights`).
-    # A cache that was NOT dropped returns the searched answer, which differs by ~2e-7 here:
-    # four orders of magnitude above this bound, so the check keeps its teeth.
-    assert np.allclose(plain_first, plain_after, rtol=1e-8, atol=1e-10), (
+    # A cache that was NOT dropped returns the searched answer, which differs by ~2e-7 here. Two identical
+    # default solves agree only to the Newton contract (rtol=atol=1e-8): each step is solved to its
+    # inexact-Newton forcing term, and GPU summation order varies -- measured 1e-9 to 7e-9 apart.
+    assert np.allclose(plain_first, plain_after, rtol=0, atol=5e-8), (
         f"a plain solve changed by {np.abs(plain_first - plain_after).max():.3e} after a searched one"
     )
 

@@ -534,7 +534,10 @@ def test_one_sided_release_separates_without_adhesion():
     undisturbed, the cap carried up rigidly, no tension transmitted across the open gap."""
     d, sol, secondary, main = _one_sided(1e4, +0.02)
     base = np.asarray(d.built_mesh.points)[:, 1] < 0.999
-    assert np.abs(sol[base]).max() < 1e-9, (
+    # The Newton contract, not round-off: the solve stops at a residual of ~1e-8 (rtol=atol=1e-8) with each
+    # step solved to its forcing term, which leaves ~1e-8 of displacement noise. Any adhesion through the
+    # c=1e4 penalty carries a share of the 0.02 lift -- orders of magnitude above this bound.
+    assert np.abs(sol[base]).max() < 1e-6, (
         f"the open gap transmitted load: base max|u| = {np.abs(sol[base]).max():.3e} -- adhesion where there must be none"
     )
     assert sol[secondary, 1].mean() > 0.01, "the cap must move up with the platen once free"
