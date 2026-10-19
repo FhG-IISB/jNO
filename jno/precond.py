@@ -2348,10 +2348,17 @@ class _AMG(_Spec):
         )
         return self
 
+    def _state(self):
+        """The built hierarchy, for a compiled solve to take as an argument (``None`` until built)."""
+        return self._levels
+
     def materialize(self, ctx: PrecondContext):
         from .utils.solver.amg import build_hierarchy, vcycle_apply
+        from .utils.solver.solver_api import _STATE_OVERRIDE
 
-        levels = self._levels  # persisted ONLY by an explicit eager .build(); None → rebuilt THIS solve
+        # persisted ONLY by an explicit eager .build(); None → rebuilt THIS solve. Inside a compiled solve the
+        # hierarchy it was called with (`precond_state`).
+        levels = _STATE_OVERRIDE.get(id(self), self._levels)
         if levels is None:
             A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
             # Rebuild each solve (NOT persisted): the hierarchy depends on the operator *values*, so
@@ -3087,6 +3094,11 @@ class _Cached(_Spec):
     def materialize(self, ctx: PrecondContext):
         from jax._src import core as _core
 
+        from .utils.solver.solver_api import _STATE_OVERRIDE
+
+        bound = _STATE_OVERRIDE.get(id(self))
+        if bound is not None:  # a compiled solve hands in the arrays it was called with (`precond_state`)
+            return self._applier_from(bound)
         key = self._key_of(ctx)
         self._count += 1
         if self._applier is not None and key == self._key:
@@ -3095,12 +3107,46 @@ class _Cached(_Spec):
         if _core.trace_state_clean():
             # Built from CONCRETE values: its arrays are constants to any later trace, so it is kept.
             self._applier, self._key = applier, key
+            self._probe = jax.ShapeDtypeStruct((int(ctx.A.shape[0]),), jnp.result_type(getattr(ctx.A, "dtype", float)))
+            self._jaxprs = None
         # Built INSIDE a trace -- the Newton step of a nonlinear march (a scan body), a jitted or
         # differentiated solve -- the applier closes over that trace's tracers. Keeping it handed them to
         # the next trace: UnexpectedTracerError on the FIRST solve of a nonlinear march, on the second
         # steady `newton(direct=True)` solve, and on a second jit trace or a `grad`. It is returned and not
         # kept; inside a trace the build is part of the compiled program anyway.
         return applier
+
+    # The kept applier, as a computation (its jaxprs) and the arrays it closes over (their constants) -- every
+    # constant, integers included: a hierarchy's index arrays are part of it, and leaving them baked into a
+    # reused program would pair a rebuilt hierarchy's values with the first one's indices.
+    def _closed(self):
+        if getattr(self, "_jaxprs", None) is None:
+            fwd = self._applier
+            t = getattr(fwd, "_t", None)
+            jf = jax.make_jaxpr(lambda r: fwd(r))(self._probe)
+            jt = None if t is None else jax.make_jaxpr(lambda r: fwd.T(r))(self._probe)
+            self._jaxprs = (jf, jt)
+        return self._jaxprs
+
+    def _state(self):
+        """The kept applier's arrays, for a compiled solve to take as arguments (``None`` until kept)."""
+        if not self.traceable or getattr(self, "_probe", None) is None:
+            return None
+        jf, jt = self._closed()
+        return (list(jf.consts), None if jt is None else list(jt.consts))
+
+    def _state_tag(self):
+        jf, jt = self._closed()
+        return hash((str(jf.jaxpr), None if jt is None else str(jt.jaxpr)))
+
+    def _applier_from(self, state):
+        from .utils.solver.solver_api import PrecondApplier
+
+        jf, jt = self._closed()
+        cf, ct = state
+        fwd = lambda r: jax.core.eval_jaxpr(jf.jaxpr, cf, r)[0]  # noqa: E731
+        tr = None if jt is None else (lambda r: jax.core.eval_jaxpr(jt.jaxpr, ct, r)[0])  # noqa: E731
+        return PrecondApplier(fwd, tr, low_precision=getattr(self._applier, "low_precision", False))
 
     def __repr__(self):
         reuse = True if self.refresh is False else self.refresh

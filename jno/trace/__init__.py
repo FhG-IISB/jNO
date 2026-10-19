@@ -4260,6 +4260,10 @@ class FemLinearSystem:
         return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)}, parametric={self.is_parametric})"
 
 
+#: Compiled solve programs kept per operator (`FemResidualOperator.solve`); least recently used dropped first.
+_EAGER_SOLVE_CACHE_MAX = 8
+
+
 class FemResidualOperator:
     """Container for a steady nonlinear FEM residual ``R(u, args) = 0``."""
 
@@ -4384,16 +4388,23 @@ class FemResidualOperator:
         # ... and by the element sharding the residual is traced under: a program compiled across N devices
         # must not answer a later `shard=False` call (nor the reverse).
         key = (_sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token())
+        # A built preconditioner's arrays are ARGUMENTS of the program, not constants baked into it: a spec
+        # rebuilt between solves (same shapes) reuses the program with its new arrays (`precond_state`).
+        from ..utils.solver.solver_api import bound_state, precond_state
+
+        states = precond_state(getattr(solve_fn, "precond", None))[1]
         cache = self.__dict__.setdefault("_eager_solve_cache", {})
         fn = cache.get(key)
         if fn is None:
+            first = solve_fn  # the program holds THIS solver's spec objects; a later call binds its own arrays
 
-            def _run(u0_arg, *value_args):
+            def _run(u0_arg, pstates, *value_args):
                 args = dict(zip(names, value_args))
                 rf = lambda u: self.residual(u, args)  # noqa: E731
-                if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
-                return solve_fn(rf, u0_arg, **_xa(args))
+                with bound_state(precond_state(getattr(first, "precond", None))[0], pstates):
+                    if getattr(first, "wants_jacobian", False) and self.jacobian is not None:
+                        return first(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+                    return first(rf, u0_arg, **_xa(args))
 
             if names:
                 fn = cache[key] = jax.jit(_run)
@@ -4404,11 +4415,17 @@ class FemResidualOperator:
                 from ..utils.solver.newton_krylov import compiled_with_verdicts
 
                 fn = cache[key] = compiled_with_verdicts(_run)
+            # Bounded: each entry holds an executable. A configuration not used for a while is dropped
+            # (and recompiled if it comes back) rather than kept until the device runs out of memory.
+            while len(cache) > _EAGER_SOLVE_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+        else:
+            cache[key] = cache.pop(key)  # most recently used last
         if names:
-            return fn(u0_t, *vals_t)
+            return fn(u0_t, states, *vals_t)
         from ..utils.solver.newton_krylov import judge_verdicts
 
-        u, verdicts = fn(u0_t)
+        u, verdicts = fn(u0_t, states)
         if not isinstance(u, jax.core.Tracer):  # a caller tracing the solve (grad/vmap) gets the cap only
             judge_verdicts(verdicts)
         return u

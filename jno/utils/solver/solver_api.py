@@ -1181,6 +1181,31 @@ def _compilable(linear, precond) -> bool:
     return precond is None or (getattr(precond, "traceable", False) and getattr(precond, "key", None) is not None)
 
 
+class _StateKeyed:
+    """A preconditioner as a STATIC jit argument, compared by structure (``repr`` + state signature) -- its
+    built arrays travel as a separate traced argument (see :func:`precond_state`)."""
+
+    __slots__ = ("spec", "_k")
+
+    def __init__(self, spec):
+        self.spec = spec
+        _specs, states, tags = precond_state(spec)
+        self._k = (repr(spec), getattr(spec, "key", None) if not _specs else None, state_signature(states, tags))
+
+    def __eq__(self, other):
+        return isinstance(other, _StateKeyed) and self._k == other._k
+
+    def __hash__(self):
+        return hash(self._k)
+
+
+@partial(jax.jit, static_argnames=("linear", "keyed"))
+def _composed_compiled_stated(A, b, x0, states, *, linear, keyed):
+    specs = precond_state(keyed.spec)[0]
+    with bound_state(specs, states):
+        return _composed_compiled.__wrapped__(A, b, x0, linear=linear, precond=keyed.spec)
+
+
 @partial(jax.jit, static_argnames=("linear", "precond"))
 def _composed_compiled(A, b, x0, *, linear, precond):
     """The slot-composed linear solve, COMPILED -- and cached by ``jax.jit`` across ``fem.solve()``
@@ -1359,7 +1384,11 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
             return composed(A, b)
         rhs = jnp.asarray(rhs).reshape(-1)
         mat = op.bcoo if op.bcoo is not None else A
-        x = _composed_compiled(mat, rhs, x0_flat, linear=linear, precond=precond)
+        _states = precond_state(precond)[1]
+        if _states:  # built arrays as arguments: a rebuilt spec of the same shapes reuses the program
+            x = _composed_compiled_stated(mat, rhs, x0_flat, _states, linear=linear, keyed=_StateKeyed(precond))
+        else:
+            x = _composed_compiled(mat, rhs, x0_flat, linear=linear, precond=precond)
         return _maybe_residual_check(op, rhs, x, getattr(linear, "name", "solve"))
 
     return composed_jit
@@ -1494,7 +1523,11 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     # fresh one on every call, so anything caching a compiled solve against `id(solve_fn)` would miss
     # every time and re-stage -- which is exactly what happened, and cost the parametric solve its whole
     # advantage. The specs' reprs describe the solver completely, which is what "the same solver" means.
-    _composed.cache_key = ("nl", repr(nonlinear), repr(linear), repr(precond))
+    # ...and by the SHAPE of what its preconditioner has built: the arrays themselves are arguments of the
+    # compiled solve (`precond_state`), so a spec rebuilt between solves reuses the program with its new arrays.
+    _composed.precond = precond
+    _ps = precond_state(precond)
+    _composed.cache_key = ("nl", repr(nonlinear), repr(linear), repr(precond), state_signature(_ps[1], _ps[2]))
     return _composed
 
 
@@ -1542,6 +1575,72 @@ def _specs_in(spec):
         yield from _specs_in(child)
     for pair in getattr(spec, "pairs", ()) or ():
         yield from _specs_in(pair[1] if isinstance(pair, tuple) else pair)
+
+
+# ---- a built preconditioner's arrays as ARGUMENTS of a compiled solve -----------------------------------
+# A compiled solve that closed over a built preconditioner baked its arrays in as constants: a spec rebuilt
+# between solves (an optimisation loop refreshing its AMG) then either hit the old program and was silently
+# ignored, or -- keyed by identity -- compiled a new program per rebuild (~7 s at 100k DOFs) and kept every
+# one with its hierarchy until the card ran out of memory. Passed as arguments instead, a rebuild with the
+# same shapes reuses the program with the new arrays. The state is bound by POSITION in the spec tree: the
+# program holds the spec objects of its first trace, a later call hands in another object's arrays.
+_STATE_OVERRIDE: dict = {}  # id(spec) -> its traced state, while a compiled solve is being traced
+
+
+def precond_state(precond):
+    """``(specs, states, tags)`` for every spec in ``precond`` holding BUILT arrays a compiled solve takes as
+    arguments -- a built ``amg``'s levels, a kept (``reuse=``) spec's stored applier. ``tags`` name what is
+    not in the arrays' shapes (a kept applier's computation), so two states share a program only when their
+    computation is the same. A spec with state covers what it wraps."""
+    specs, states, tags = [], [], []
+
+    def walk(s):
+        get = getattr(s, "_state", None)
+        st = get() if callable(get) else None
+        if st is not None:
+            specs.append(s)
+            states.append(st)
+            tag = getattr(s, "_state_tag", None)
+            tags.append(tag() if callable(tag) else None)
+            return
+        if getattr(s, "spec", None) is not None:
+            walk(s.spec)
+        for pr in getattr(s, "pairs", None) or ():
+            walk(pr[1] if isinstance(pr, tuple) else pr)
+
+    if precond is not None:
+        walk(precond)
+    return specs, states, tags
+
+
+def state_signature(states, tags) -> tuple:
+    """What a compiled solve's program depends on in ``states``: tree structure, leaf shapes and dtypes, tags."""
+    leaves, tree = jax.tree_util.tree_flatten(states)
+    return (str(tree), tuple((tuple(jnp.shape(x)), str(jnp.result_type(x))) for x in leaves), tuple(tags))
+
+
+class bound_state:
+    """``with bound_state(specs, states):`` -- each spec materializes from ``states`` (traced) while inside."""
+
+    def __init__(self, specs, states):
+        self.pairs = list(zip(specs, states))
+
+    def __enter__(self):
+        self.prev = [(id(s), _STATE_OVERRIDE.get(id(s), _MISS_STATE)) for s, _ in self.pairs]
+        for s, st in self.pairs:
+            _STATE_OVERRIDE[id(s)] = st
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.prev:
+            if v is _MISS_STATE:
+                _STATE_OVERRIDE.pop(k, None)
+            else:
+                _STATE_OVERRIDE[k] = v
+        return False
+
+
+_MISS_STATE = object()
 
 
 def precond_compiles(spec) -> bool:

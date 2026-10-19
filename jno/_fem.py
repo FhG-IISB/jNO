@@ -3642,16 +3642,14 @@ class FEM:
             # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
             # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
             # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
-            from .utils.solver.solver_api import _specs_in, precond_compiles
+            from .utils.solver.solver_api import precond_compiles
 
             if solve_fn is None or (getattr(solve_fn, "cache_key", None) is not None and precond_compiles(precond)):
                 # jNO's own solvers (the default, or one composed from the slots) have a value identity, so
                 # the solve is compiled once and reused: evaluated lazily, every call re-staged the Newton
                 # `while_loop` and `custom_root` and ran each residual op by op -- measured 2.3 s per warm
-                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%. A preconditioner keys
-                # the program by its built state too: a frozen cache's applier IS the compilation.
-                if precond is not None:
-                    solve_fn.cache_key = (*solve_fn.cache_key, *(getattr(s, "key", None) for s in _specs_in(precond)))
+                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%. The composed solver's
+                # cache_key names the preconditioner's built state too (`compose_solver`).
                 return self._op.solve(solve_fn, values={}, **kwargs)
             # A user `solve_fn=` has no identity to cache on (a fresh lambda per call would recompile every
             # time) and may do things that need concrete values, so it keeps running eagerly. So does a
