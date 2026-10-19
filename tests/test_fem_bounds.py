@@ -293,7 +293,8 @@ def test_a_slack_bound_changes_nothing():
     u, phi = d.fem_symbols()
     base = [inner(grad(u, X), grad(phi, X), 1) + 1.0 * phi, u(*ce) - 0.0]
     free = np.asarray(jno.fem(base).solve())
-    slack = np.asarray(jno.fem(base + [u.bounds(-1e3, 1e3)]).solve())
+    # far below the default 1e-8: Newton's steps are inexact, so a root is only as good as its outer tolerance
+    slack = np.asarray(jno.fem(base + [u.bounds(-1e3, 1e3)]).solve(nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-12)))
     assert np.abs(free - slack).max() / np.abs(free).max() < 1e-8
 
 

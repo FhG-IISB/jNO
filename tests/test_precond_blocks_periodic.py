@@ -196,7 +196,9 @@ def test_block_preconditioner_on_the_reduced_newton_tangent(periodic):
     velocity block keeps these per-linearization; an unbuilt amg() there is built once, before the
     Newton loop -- tests/test_precond_amg_steady_newton.py.)"""
     fem, u, p, pb, qb, _ref = _channel(periodic, nonlinear=True)
-    newton = jno.solve.newton(direct=True, rtol=1e-11, atol=1e-12)
+    # Inexact Newton steps: a root is only as good as the outer tolerance, and this saddle amplifies the
+    # residual ~1e3-fold (1.5e-8 off the direct root at rtol=1e-11, 7.7e-11 at 1e-13).
+    newton = jno.solve.newton(direct=True, rtol=1e-13, atol=1e-14)
     ref = _arr(fem.solve(nonlinear=newton, linear=jno.solve.lu(backend="host")))
     pts = np.asarray(fem.field_points[0])
     assert np.abs(ref[fem.blocks[0]].reshape(-1, 2)[:, 0] - _poiseuille(pts[:, 1])).max() < 1e-10

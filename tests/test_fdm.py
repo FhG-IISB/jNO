@@ -2200,7 +2200,9 @@ def test_gradient_through_a_nonlinear_solve_with_any_linear_slot(linear):
         S = jno.np.sin(np.pi * x) * jno.np.sin(np.pi * y)
         f = 2 * np.pi**2 * S - 2.0 * jno.np.exp(S + 0.5 * x * y)
         terms = [-(ui.xx + ui.yy) - 2.0 * jno.np.exp(ui) - f, u(xb, yb) - g * xb * yb]
-        return jnp.mean(jnp.asarray(jno.fdm(terms).solve(**slots)).reshape(-1) ** 2)
+        # far below the default 1e-8: Newton's steps are inexact, so a root is only as good as its outer tolerance; the central difference divides that by 2e-5
+        tight = jno.solve.newton(rtol=1e-12, atol=1e-12)
+        return jnp.mean(jnp.asarray(jno.fdm(terms).solve(nonlinear=tight, **slots)).reshape(-1) ** 2)
 
     fd = (float(solve(0.5 + 1e-5)) - float(solve(0.5 - 1e-5))) / 2e-5
     got = float(jax.grad(lambda g: solve(g, linear=getattr(jno.solve, linear)()))(0.5))

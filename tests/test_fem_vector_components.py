@@ -113,7 +113,7 @@ def test_finite_strain_neo_hookean_in_the_natural_spelling():
         P11, P12, P21, P22 = _neo_hookean_P(1.0 + ui[0].x, ui[0].y, ui[1].x, 1.0 + ui[1].y)
         weak = P11 * vi[0].x + P12 * vi[0].y + P21 * vi[1].x + P22 * vi[1].y + load * vi[1]
         fem = jno.fem([weak, u(xl, yl)[0] - 0.0, u(xl, yl)[1] - 0.0])
-        sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(line_search=True)))
+        sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(line_search=True, rtol=1e-12, atol=1e-12)))
         return sol.reshape(len(d.mesh.points), 2)
 
     def solve_scalar(load):
@@ -129,10 +129,11 @@ def test_finite_strain_neo_hookean_in_the_natural_spelling():
         w1 = P11 * va.x + P12 * va.y
         w2 = P21 * vb.x + P22 * vb.y + load * vb
         fem = jno.fem([w1, w2, a(xl, yl) - 0.0, b(xl, yl) - 0.0])
-        sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(line_search=True)))
+        sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(line_search=True, rtol=1e-12, atol=1e-12)))
         n = len(d.mesh.points)
         return np.stack([sol[:n], sol[n:]], axis=1)
 
+    # both solves far below the default 1e-8: Newton's steps are inexact, so a root is only as good as its outer tolerance
     for load in (0.001, 0.05):
         uv, us = solve_vector(load), solve_scalar(load)
         assert np.isfinite(uv).all()

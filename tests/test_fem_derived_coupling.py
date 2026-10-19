@@ -168,8 +168,10 @@ def test_the_same_physics_as_a_coupling_reaches_the_same_root():
     ui2, vi2 = u2.bind(x=xi2, y=yi2), v2.bind(x=xi2, y=yi2)
     coupled = jno.fem([ui2.x * vi2.x + ui2.y * vi2.y - 1.0 * vi2, lambda w: c * jnp.mean(w) * b1, u2(xb2, yb2) - 0.0])
 
-    T_derived = np.asarray(_mean_source(c)[0].solve()).reshape(-1)
-    T_coupling = np.asarray(coupled.solve()).reshape(-1)
+    # far below the default 1e-8: Newton's steps are inexact, so a root is only as good as its outer tolerance
+    tight = jno.solve.newton(rtol=1e-12, atol=1e-12)
+    T_derived = np.asarray(_mean_source(c)[0].solve(nonlinear=tight)).reshape(-1)
+    T_coupling = np.asarray(coupled.solve(nonlinear=tight)).reshape(-1)
     err = np.abs(T_derived - T_coupling).max() / np.abs(T_coupling).max()
     assert err < 1e-8, f"derived and Coupling disagree by {100 * err:.3e} % on the same physics"
 
