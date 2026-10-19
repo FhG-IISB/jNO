@@ -672,11 +672,8 @@ def _capture_geometric_boundary_tags(domain: Any) -> None:
             continue
 
         def _on_region(*coords, _r=region):
-            import jax
-            import jax.numpy as jnp
-
             pts = np.stack([np.asarray(c, dtype=float).reshape(-1) for c in coords], axis=-1)
-            return np.asarray(jax.vmap(_r.contains)(jnp.asarray(pts)))
+            return _r.contains_points(pts)
 
         preds[name] = _on_region
 

@@ -2155,12 +2155,18 @@ class domain(MeshIOMixin):
                 pred = where(*(p[..., i] for i in range(dim)))
                 return pred if full is None else (pred & full.contains(p))
 
+            _loc.n_entities = 1 if full is None else full.n_entities  # sizes `map_points` batches
             return _loc
 
         region = self._boundary_regions.get(tag, None)
         if region is None:
             return None
-        return lambda p: region.contains(p)
+
+        def _in_region(p):
+            return region.contains(p)
+
+        _in_region.n_entities = region.n_entities
+        return _in_region
 
     def tag_node_mask(self, tag, points, *, closure: bool = False):
         """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
@@ -2185,8 +2191,6 @@ class domain(MeshIOMixin):
 
         Returns ``None`` when the tag is unknown, matching ``_make_tag_location_fn``.
         """
-        import jax
-        import jax.numpy as jnp
 
         loc = self._make_tag_location_fn(tag)
         if loc is None:
@@ -2194,16 +2198,14 @@ class domain(MeshIOMixin):
         pts = np.asarray(points)
         n = int(pts.shape[0])
 
-        def _vmapped(fn, num_args=1):
-            # Chunked for the same reason the callers chunked: a geometric region predicate tests one
-            # point against every boundary facet, so an unchunked vmap materialises (n x n_facets) --
-            # 804 MB on a realistic 3-D mesh, which exhausts the device before assembly starts.
-            pj, chunk, out = jnp.asarray(pts), 512, []
-            for s in range(0, n, chunk):
-                blk = pj[s : min(s + chunk, n)]
-                hit = jax.vmap(fn)(blk) if num_args == 1 else jax.vmap(fn)(blk, jnp.arange(s, s + blk.shape[0]))
-                out.append(np.asarray(hit).reshape(-1))
-            return np.concatenate(out) if out else np.zeros(0, dtype=bool)
+        def _vmapped(fn, num_args=1, n_entities=None):
+            # Batched: a geometric region predicate tests one point against every boundary facet, so an
+            # unchunked vmap materialises (n x n_facets) -- 804 MB on a realistic 3-D mesh, which exhausts
+            # the device before assembly starts. The batch is sized by the facet count (`map_points`).
+            from .boundary_region import map_points
+
+            ne = n_entities if n_entities is not None else getattr(fn, "n_entities", 1)
+            return map_points(fn, pts[:n], ne, with_index=num_args != 1)
 
         where = (getattr(self, "_tag_predicates", {}) or {}).get(tag)
         if where is not None:
@@ -2220,7 +2222,7 @@ class domain(MeshIOMixin):
                 # the points the predicate already accepts
                 hit = np.flatnonzero(mask)
                 pts, n = pts[hit], int(hit.size)
-                mask[hit] = _vmapped(full.contains).astype(bool)
+                mask[hit] = _vmapped(full.contains, n_entities=full.n_entities).astype(bool)
             # ...and, for a FACET-based use (`closure=True`), every vertex of the facets the tag SELECTED.
             # The tag picks its facets by the predicate at facet centroids, but a node test re-asks it at
             # the vertices, and the two can disagree: on a curved wall the centroids sit inside the surface

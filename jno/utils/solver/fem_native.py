@@ -4454,7 +4454,10 @@ def assemble_fem_native(
                 loc = domain._make_tag_location_fn(region)
                 if loc is None:
                     return []
-                mask = np.asarray(jax.vmap(loc)(jnp.asarray(coords)), dtype=bool).reshape(-1)
+                from ...domain.boundary_region import map_points
+
+                # batched: one vmap over every boundary node x every region facet was the build's peak
+                mask = map_points(loc, coords, getattr(loc, "n_entities", 1)).astype(bool)
             bnodes = bnodes[mask]
         # `d.tag(..., region=...)`: keep only the nodes belonging to that body. Two coincident faces of
         # a non-conforming interface have identical coordinates, so the predicate above selects BOTH;
