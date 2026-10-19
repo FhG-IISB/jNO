@@ -21,6 +21,15 @@ from ..utils.adaptive import LearningRateSchedule
 from ..utils.iree import IREEModel
 from ..utils.logger import get_logger
 
+
+def _matmul(a, b):
+    """``a @ b`` for the ``@`` operators of the trace: small products lowered elementwise (see
+    :func:`jno.utils.solver.small_linalg.small_matmul`)."""
+    from ..utils.solver.small_linalg import small_matmul  # lazy: jno.utils.solver imports the trace
+
+    return small_matmul(a, b)
+
+
 __all__ = [
     "Placeholder",
     "FunctionCall",
@@ -463,19 +472,19 @@ class Placeholder:
 
         # symbolic path
         if isinstance(other, Placeholder):
-            return FunctionCall(lambda a, b: a @ b, [self, other])
+            return FunctionCall(_matmul, [self, other])
 
         # eager path (other is ndarray)
-        return FunctionCall(lambda a: a @ other, [self])
+        return FunctionCall(lambda a: _matmul(a, other), [self])
 
     def __rmatmul__(self, other) -> FunctionCall:
         """Matrix multiplication: other @ self"""
         other = self._wrap(other)
 
         if isinstance(other, Placeholder):
-            return FunctionCall(lambda a, b: a @ b, [other, self])
+            return FunctionCall(_matmul, [other, self])
 
-        return FunctionCall(lambda b: other @ b, [self])
+        return FunctionCall(lambda b: _matmul(other, b), [self])
 
     def reshape(self, *shape) -> FunctionCall:
         """Reshape this placeholder to a new shape."""

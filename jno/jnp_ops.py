@@ -898,8 +898,20 @@ def where(condition, x, y) -> FunctionCall:
 # ============================================================================
 
 
+def _small_matmul(a, b):
+    from .utils.solver.small_linalg import small_matmul  # lazy: jno.utils.solver imports this module's users
+
+    return small_matmul(a, b)
+
+
+_small_matmul.__name__ = "matmul"
+_small_matmul.__doc__ = jnp.matmul.__doc__
+
 dot = _binary(jnp.dot)
-matmul = _binary(jnp.matmul)
+#: ``jnp.matmul`` semantics; a small per-point product (``M·N·K`` up to 8x8x8) is a broadcast multiply and
+#: a sum rather than a ``dot_general``, which a GPU runs as a padded batched GEMM once the points are batched
+#: (see :func:`jno.utils.solver.small_linalg.small_matmul`). Same values up to summation order.
+matmul = _binary(_small_matmul)
 cross = _binary(jnp.cross)
 
 
