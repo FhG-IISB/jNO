@@ -988,7 +988,7 @@ class PrecondContext:
         nj = sj.stop - sj.start
         return LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=diag_fn, dense_fn=dense_fn, shape=(ni, nj))
 
-    def assemble(self, terms, *, quad_degree: int = 2) -> LinearOperator:
+    def assemble(self, terms, *, quad_degree: int | None = None) -> LinearOperator:
         import jax.experimental.sparse as jsp
 
         from ... import fem as _fem_entry

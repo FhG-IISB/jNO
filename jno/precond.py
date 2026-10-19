@@ -1052,7 +1052,7 @@ class _Form(_Spec):
         return self.inner is not False
 
 
-def form(terms, *, inner=None, quad_degree: int = 2, float32: bool = False) -> _Form:
+def form(terms, *, inner=None, quad_degree: int | None = None, float32: bool = False) -> _Form:
     """**Preconditioners as weak forms**: assemble an auxiliary operator ``Â`` from ordinary
     traced ``jno.fem`` terms and apply ``M^{-1} v = Â^{-1} v`` with ``inner`` (default
     ``jno.solve.lu()``).

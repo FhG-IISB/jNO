@@ -1405,16 +1405,18 @@ def assemble_fem_native(
 
     # On a CURVED cell the map is not affine, so `1/detJ` makes the integrand RATIONAL and no rule is
     # exact any more -- the degree stops being a correctness setting and becomes an accuracy one. Two
-    # extra degrees by default, with `jno.fem(quad_degree=...)` still overriding. Measured on the disk
+    # extra degrees by default; an explicit `jno.fem(quad_degree=...)` is used as written. Measured on the disk
     # rate study this changes the answer by <0.01% (7.6721e-06 -> 7.6719e-06 at degree 8), so it is
     # insurance against a form whose coefficients vary more sharply, not a fix for anything observed.
-    _qd = (quad_degree + 2) if _nonaffine else quad_degree
+    from .fem_utils import _QUAD_EXPLICIT, quad_floor
+
+    _qd = (quad_degree + 2) if (_nonaffine and not _QUAD_EXPLICIT[0]) else quad_degree
     if any(_cover):
         # A cover basis function is h_i * (x - x_i): degree 2, not 1. The entry-side floor
         # (`_fem.py`, max(quad_degree, 2*order)) sees only `order`, which stays 1 here, so the bump
         # has to happen where the enrichment is known. Without it the mass matrix silently
         # under-integrates and only a convergence study would notice.
-        _qd = max(_qd, 2 * (1 + COVER_DEGREE))
+        _qd = quad_floor(_qd, 2 * (1 + COVER_DEGREE), "the cover-enriched mass term")
     specs = [_lagrange_simplex(dim, 1 if f.get("constant") else f["order"], _qd, cell_type=_cell_type) for f in fields]
     specs = [_ConstantSpec(s) if c else s for s, c in zip(specs, _const_f)]
     # All specs share the same simplex quadrature rule (basix is deterministic)

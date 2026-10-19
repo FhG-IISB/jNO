@@ -4497,6 +4497,37 @@ def bcoo_set_unit_diag(A, dofs):
 #: ``None`` = automatic (device-derived), ``False``/``0`` = no chunking, positive int = cells per chunk.
 #: A list rather than a plain global so the context manager can restore the previous value on nesting.
 _CHUNK_OVERRIDE = [None]
+#: Whether the ``jno.fem`` call being assembled was GIVEN a ``quad_degree`` (set and restored by ``jno.fem``,
+#: like ``_CHUNK_OVERRIDE``). Read by :func:`quad_floor`: a default is raised to what the field needs, a
+#: request is honoured as written.
+_QUAD_EXPLICIT = [False]
+#: Floors already reported during the current ``jno.fem`` call, so one request is reported once.
+_QUAD_REPORTED: set = set()
+
+
+def quad_floor(quad_degree: int, minimum: int, what: str) -> int:
+    """The quadrature degree to use where ``minimum`` integrates ``what`` exactly.
+
+    Without an explicit ``jno.fem(quad_degree=...)`` the degree is raised to ``minimum`` -- the default
+    then integrates a field's mass term exactly, which is what a form that cannot be inspected needs. An
+    explicit degree is used AS ASKED, also below ``minimum``: a form with only gradients of a P1 field is
+    exact at degree 0, and raising the request silently cost 4x the points. Below ``minimum`` it is
+    reported once, naming what is then integrated inexactly."""
+    q = int(quad_degree)
+    if q >= minimum:
+        return q
+    if not _QUAD_EXPLICIT[0]:
+        return int(minimum)
+    if (q, minimum, what) not in _QUAD_REPORTED:
+        _QUAD_REPORTED.add((q, minimum, what))
+        _log.warning(
+            f"jno.fem: quad_degree={q} is below {minimum}, the degree that integrates {what} exactly. "
+            f"Using {q} as asked: exact for a form of degree <= {q} (only gradients of a P1 field: degree 0), "
+            "inexact for such a term. Omit quad_degree for the default."
+        )
+    return q
+
+
 #: Set when an assembly consumed the override, so ``jno.fem`` can refuse an explicit ``chunk=`` that
 #: reached an assembler with no element loop instead of silently ignoring it.
 _CHUNK_CONSUMED = [False]
