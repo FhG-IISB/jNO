@@ -12,6 +12,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from jno.utils.solver.small_linalg import small_matmul
+
 
 @pytest.fixture(autouse=True)
 def _x64():
@@ -25,6 +27,13 @@ def _x64():
 
 def _prims(fn, *args):
     return str(jax.make_jaxpr(fn)(*args))
+
+
+def test_a_small_matrix_product_has_no_reduction():
+    # Break: lowering the k-sum as broadcast-multiply + reduce_sum (a fusion boundary under jacfwd).
+    a = jnp.ones((7, 3, 3))
+    assert "reduce_sum" not in _prims(small_matmul, a, a)
+    assert "dot_general" not in _prims(small_matmul, a, a)
 
 
 def test_a_vector_gradient_has_no_transpose():

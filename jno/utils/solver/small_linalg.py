@@ -86,7 +86,12 @@ def small_matmul(a, b, limit: int | None = None):
     m, k, n = a2.shape[-2], a2.shape[-1], b2.shape[-1]
     if k != b2.shape[-2] or m * n * k > (SMALL_CONTRACTION if limit is None else limit):
         return jnp.matmul(a, b)
-    out = jnp.sum(a2[..., :, :, None] * b2[..., None, :, :], axis=-2)
+    # The k-sum unrolled into multiplies and adds: all elementwise, so XLA fuses the product into the
+    # operations around it. A `reduce_sum` here is a fusion boundary, and under `jacfwd` each one became a
+    # separate write of a (cells, tangents, points, m, n) array.
+    out = a2[..., :, 0:1] * b2[..., 0:1, :]
+    for j in range(1, k):
+        out = out + a2[..., :, j : j + 1] * b2[..., j : j + 1, :]
     if vb:
         out = out[..., 0]
     if va:
