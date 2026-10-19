@@ -60,7 +60,10 @@ def _effective_tol(tol, dtype, *, floor_factor=4.0):
     Floored at a small multiple of eps. **float64 is untouched** for any tolerance anyone passes in
     practice (the floor there is ~8.9e-16), so this changes no existing result.
     """
-    return float(max(float(tol), floor_factor * float(_EPS_OF(dtype))))
+    floor = floor_factor * float(_EPS_OF(dtype))
+    if isinstance(tol, jax.core.Tracer):  # a per-call tolerance (an inexact-Newton forcing term) is traced
+        return jnp.maximum(tol, floor)
+    return float(max(float(tol), floor))
 
 
 def _ident(v):

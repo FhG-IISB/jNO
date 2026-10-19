@@ -812,6 +812,18 @@ Because the default hands its linear step an assembled matrix, a `precond=` that
 composes with it; `direct=False` has no matrix and is the choice when the assembled tangent would not fit
 in memory. All three modes are differentiable (implicit differentiation through `lax.custom_root`).
 
+**Each linear step is solved only as far as that step needs (inexact Newton).** With the assembled
+tangent, a Krylov linear step (the default Jacobi-BiCGStab, or any of `cg`, `bicgstab`, `gmres`, `fgmres`,
+`minres`, `cocg` in the `linear=` slot) is asked for the Eisenstat–Walker forcing term (Eisenstat & Walker,
+*SIAM J. Sci. Comput.* 17 (1996) 16, choice 2) instead of its own `tol`: loose far from the root, tightening
+as Newton converges. The contract is unchanged — Newton stops on its own residual bound,
+`‖r‖ ≤ atol + rtol·‖r₀‖` — so the slot's `tol` no longer sets how far each step is solved. A direct linear
+step (`lu`, `dense`) is exact anyway, and a residual linear in the unknown keeps one exact step.
+
+```python
+fem.solve(linear=jno.solve.cg(), precond=jno.precond.amg(nullspace="rigid", reuse=True))  # forcing included
+```
+
 ### Picard / lagged coefficients — `jno.lag`
  When a solution-dependent coefficient's Newton tangent
 destroys the linearized system's structure (the classic case: a shear-thinning viscosity `μ_eff(u)` in

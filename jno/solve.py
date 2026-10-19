@@ -254,7 +254,8 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # lets a non-symmetric preconditioner be transposed for it (see `_firewalled`). The extra
     # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
     # never transposed.
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
+        tol_ = tol if rtol is None else rtol  # a per-call tolerance (traced allowed) replaces the spec's
         if name == "cg" and (getattr(M, "low_precision", False) or getattr(M, "nonsymmetric", False)):
             # A float32 preconditioner is only approximately symmetric: standard CG's beta then loses
             # conjugacy and was measured stopping at a TRUE residual of 6e-6 against a requested 1e-8
@@ -263,7 +264,7 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
 
             raw = _counting(
                 lambda mv, rhs, M, x0: flexible_cg(
-                    mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000, return_iters=True
+                    mv, rhs, M=M, x0=x0, tol=tol_, atol=atol, maxiter=maxiter or 20_000, return_iters=True
                 ),
                 "jno.solve.cg (flexible)",
             )
@@ -273,7 +274,7 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
 
             method = cg_counted if name == "cg" else bicgstab_counted
             raw = _counting(
-                lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M),
+                lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol_, atol=atol, maxiter=maxiter, M=M),
                 f"jno.solve.{name}",
             )
         else:
@@ -285,9 +286,10 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
                     M = _unit_scaled(M, rhs)
                 # Upstream restarted GMRES exposes no count; say so in fem.stats rather than omit it.
                 record_iterations(None, f"jno.solve.{name}", side=_side)
-                return _scaled_gmres(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+                return _scaled_gmres(mv, rhs, x0=x0, tol=tol_, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name, tol=None if atol else tol)
+        gate = None if atol or rtol is not None else tol
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name, tol=gate)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
@@ -296,6 +298,7 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
         name=name,
         key=(tol, atol, maxiter, tuple(sorted(fixed.items()))),
         settings=dict(tol=tol, atol=atol, maxiter=maxiter, **fixed),
+        accepts_rtol=True,
     )
 
 
@@ -393,16 +396,17 @@ def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> Line
     recipe with inexact inner solves), which plain GMRES's fixed-``M`` assumption forbids.
     Memory: two ``(restart, n)`` bases."""
 
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
         from .utils.solver.krylov import fgmres as _raw
 
+        tol_ = tol if rtol is None else rtol
         raw = _counting(
-            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter, return_iters=True),
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol_, restart=restart, maxiter=maxiter, return_iters=True),
             "jno.solve.fgmres",
         )
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres", tol=tol)
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres", tol=tol if rtol is None else None)
 
-    return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter))
+    return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter), accepts_rtol=True)
 
 
 def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
@@ -412,16 +416,17 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     erratic; ``O(1)`` memory where GMRES grows with ``restart``. The preconditioner must be
     symmetric positive definite even when ``A`` is indefinite."""
 
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
         from .utils.solver.krylov import minres as _raw
 
+        tol_ = tol if rtol is None else rtol
         raw = _counting(
-            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True),
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol_, maxiter=maxiter, return_iters=True),
             "jno.solve.minres",
         )
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres", tol=tol)
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres", tol=tol if rtol is None else None)
 
-    return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
+    return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter), accepts_rtol=True)
 
 
 def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
@@ -437,18 +442,19 @@ def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     ``fgmres``. Unlike CG on an SPD matrix, COCG can break down (the bilinear form is indefinite);
     it then returns its last iterate and the residual guard raises."""
 
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
         from .utils.solver.krylov import cocg as _raw
 
+        tol_ = tol if rtol is None else rtol
         raw = _counting(
-            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True),
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol_, maxiter=maxiter, return_iters=True),
             "jno.solve.cocg",
         )
         # symmetric=True means A == A^T, which is exactly COCG's precondition — so
         # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg", tol=tol)
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg", tol=tol if rtol is None else None)
 
-    return LinearSolver(_fn, name="cocg", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
+    return LinearSolver(_fn, name="cocg", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter), accepts_rtol=True)
 
 
 def chebyshev(

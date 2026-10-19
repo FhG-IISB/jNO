@@ -84,7 +84,9 @@ def test_repeated_steady_direct_newton_solves_with_a_kept_preconditioner():
     spec = jno.precond.jacobi(reuse=True)
     for _ in range(3):
         got = _eager(_steady_nonlinear().solve(nonlinear=jno.solve.newton(direct=True), precond=spec))
-        assert np.abs(got - ref).max() <= 1e-12 * np.abs(ref).max()
+        # the Newton contract (rtol=1e-8 on the residual), not round-off: each preconditioned Krylov step is
+        # solved to the inexact-Newton forcing term, the reference by an exact LU
+        assert np.abs(got - ref).max() <= 1e-7 * np.abs(ref).max()
 
 
 def _parametric_poisson():

@@ -630,8 +630,12 @@ class LinearSolver:
         direct: bool = False,
         key: Any = None,
         settings: Optional[dict] = None,
+        accepts_rtol: bool = False,
     ):
         self._fn = fn
+        # A Krylov solver takes a per-call relative tolerance (``solver(A, b, rtol=eta)``, traced allowed) in
+        # place of its configured ``tol``: the inexact-Newton forcing term (``newton_direct``) asks for it.
+        self.accepts_rtol = accepts_rtol
         self.name = name
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
         self.direct = direct  # a direct solver ignores x0 and takes no preconditioner
@@ -647,7 +651,7 @@ class LinearSolver:
         if self.tolerance is None and isinstance(key, tuple) and key and isinstance(key[0], float):
             self.tolerance = key[0]
 
-    def __call__(self, A, b, *, M=None, x0=None):
+    def __call__(self, A, b, *, M=None, x0=None, rtol=None):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
         b = jnp.asarray(b).reshape(-1)
         if self.direct and M is not None:
@@ -662,8 +666,13 @@ class LinearSolver:
         # preconditioner that is not the one asked for.
         if M is not None and hasattr(M, "materialize"):
             M = materialize_precond(M, PrecondContext(op, None))
+        if rtol is not None and not self.accepts_rtol:
+            raise TypeError(
+                f"jno.solve.{self.name} takes no per-call rtol= -- only the Krylov solvers (cg, bicgstab, gmres, "
+                "fgmres, minres, cocg) do; configure its tolerance on the spec instead."
+            )
         prior = len(_GATE_FAILURES)
-        x = self._fn(op, b, M=M, x0=x0)
+        x = self._fn(op, b, M=M, x0=x0) if rtol is None else self._fn(op, b, M=M, x0=x0, rtol=rtol)
         # An EAGER call is a boundary where a Python exception has somewhere to land, so drain the
         # traced gate here. The block is the point: dispatch is asynchronous, so `residual_gate`'s
         # callback has typically not run yet when this returns, and the refusal it raises surfaces
@@ -1460,7 +1469,7 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             prepare_precond(precond, fem)  # aux assembly now, NOT inside the traced Newton loop
 
     def _inner_with(pc):
-        def inner(operator, rhs):
+        def inner(operator, rhs, rtol=None):
             # The direct Newton hands us the ASSEMBLED tangent, the matrix-free one a JVP callable.
             # ``LinearOperator`` is the uniform handle over both, so the same composed inner serves
             # either -- an assembled operator keeps its ``.bcoo``/``.diag()``, which is the whole
@@ -1472,8 +1481,10 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
                 else LinearOperator(operator)
             )
             M = materialize_precond(pc, PrecondContext(op, fem)) if pc is not None else None
-            return solver(op, rhs, M=M)
+            # ``rtol``: the inexact-Newton forcing term for this step, taken by the Krylov solvers only.
+            return solver(op, rhs, M=M) if rtol is None else solver(op, rhs, M=M, rtol=rtol)
 
+        inner.accepts_rtol = bool(getattr(solver, "accepts_rtol", False))
         return inner
 
     inner = None if solver is None else _inner_with(precond)
