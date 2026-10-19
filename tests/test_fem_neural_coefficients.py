@@ -944,8 +944,10 @@ def test_hermite_constitutive_ku_matches_symbolic():
     u2i, v2i = u2.bind(x=xi, y=yi), p2.bind(x=xi, y=yi)
     fem_sym = jno.fem([(1.0 + 0.3 * u2i**2) * (u2i.x * v2i.x + u2i.y * v2i.y) - f * v2i, u2(xb, yb) - 0.0])
     (name,) = fem.operator.runtime_parameter_exprs
-    u_net = newton_krylov(lambda w: fem.operator.residual(w, {name: net.module}), jnp.zeros(fem.operator.size))
-    u_sym = newton_krylov(lambda w: fem_sym.operator(w), jnp.zeros(fem_sym.operator.size))
+    # both far below the default 1e-8: the steps are inexact, so each root is only as good as the outer tolerance
+    tight = {"rtol": 1e-13, "atol": 1e-13}
+    u_net = newton_krylov(lambda w: fem.operator.residual(w, {name: net.module}), jnp.zeros(fem.operator.size), **tight)
+    u_sym = newton_krylov(lambda w: fem_sym.operator(w), jnp.zeros(fem_sym.operator.size), **tight)
     assert float(jnp.max(jnp.abs(u_net - u_sym))) < 1e-9
 
 

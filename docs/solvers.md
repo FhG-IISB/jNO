@@ -797,7 +797,7 @@ otherwise. Its `direct=` argument picks how each linear step is solved:
 | `direct=` | tangent | linear step |
 |---|---|---|
 | `None` *(default)* | **assembled** `J(u)` (a BCOO), wherever the assembler provides one | Jacobi-BiCGStab, or the `linear=`/`precond=` slots. The BiCGStab answer is verified (one SpMV) and re-solved with Jacobi-GMRES when its relative residual is not small |
-| `False` | **matrix-free** — `J·v` from a JVP, no tangent stored | BiCGStab, or the `linear=` slot |
+| `False` | **matrix-free** — `J·v` from a JVP, no tangent stored | Jacobi-BiCGStab, or the `linear=`/`precond=` slots. The Jacobi diagonal comes from a diagonal-only pass of the assembler, so `precond=jno.precond.jacobi()` works here too |
 | `True` | **assembled** | a sparse LU each step, or the `linear=` slot's direct solver (see *Sparse-direct Newton* below) |
 
 When each one falls back:
@@ -808,9 +808,13 @@ When each one falls back:
 - `direct=True` needs the assembled tangent and raises without one; an explicit matrix-free
   `nonlinear=` beside a direct `linear=` raises too.
 
-Because the default hands its linear step an assembled matrix, a `precond=` that needs one (`jacobi`)
-composes with it; `direct=False` has no matrix and is the choice when the assembled tangent would not fit
-in memory. All three modes are differentiable (implicit differentiation through `lax.custom_root`).
+Because the default hands its linear step an assembled matrix, a `precond=` that needs one composes with
+it; `direct=False` has no matrix and is the choice when the assembled tangent would not fit in memory. Its
+Jacobi preconditioner needs only the tangent's diagonal, which the assembler computes without the matrix:
+the same element loop, keeping each element block's diagonal entries (as deal.II's
+`MatrixFreeTools::compute_diagonal` does), so the memory is one vector. Each Newton step uses the diagonal
+at its own iterate. Each matrix-free step costs more than a sparse product (it re-runs the element kernel),
+so prefer the default while the tangent fits. All three modes are differentiable (implicit differentiation through `lax.custom_root`).
 
 **Each linear step is solved only as far as that step needs (inexact Newton).** With the assembled
 tangent, a Krylov linear step (the default Jacobi-BiCGStab, or any of `cg`, `bicgstab`, `gmres`, `fgmres`,

@@ -322,18 +322,24 @@ _GATE_RTOL = 1e-4
 #: convergence contract to check and :func:`residual_gate` must stand down. It is a property of the
 #: CALL, not of the solver: the same ``cg()`` spec gated as an outer solve is ungated as an inner one.
 _GATE_SUSPENDED = False
+#: Set with the gate unless the call is a solve in its own right (a Newton step): a preconditioner
+#: application is an inner iteration, so its count is not a solve's count either.
+_RECORD_SUSPENDED = False
 
 
 @contextlib.contextmanager
-def gate_suspended():
-    """Run a solver call as a preconditioner application: inexact by design, so not gated."""
-    global _GATE_SUSPENDED
-    prev = _GATE_SUSPENDED
+def gate_suspended(*, record=False):
+    """Run a solver call ungated: a preconditioner application, inexact by design. ``record=True`` for a
+    solve that is inexact on purpose but still a solve (an inexact-Newton step): its iteration count still
+    reaches ``fem.stats``."""
+    global _GATE_SUSPENDED, _RECORD_SUSPENDED
+    prev = _GATE_SUSPENDED, _RECORD_SUSPENDED
     _GATE_SUSPENDED = True
+    _RECORD_SUSPENDED = not record
     try:
         yield
     finally:
-        _GATE_SUSPENDED = prev
+        _GATE_SUSPENDED, _RECORD_SUSPENDED = prev
 
 
 #: Convergence failures seen by a TRACED :func:`residual_gate`, drained by :func:`raise_if_gate_failed`
@@ -477,7 +483,7 @@ def record_iterations(k, who: str, *, side: str = "forward", broke=None):
 
     Cost: the callback is a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU) per solve, measured on the default
     Jacobi-BiCGStab -- +7-11% on a 790-DOF solve, unmeasurable (1.000x) at 46,691 DOFs."""
-    if _GATE_SUSPENDED or not _RECORD_ITERATIONS.value:
+    if _RECORD_SUSPENDED or not _RECORD_ITERATIONS.value:
         return
     if k is None:
         # Still at RUN time: this is usually called while a solve is traced, and a solve traced (the
@@ -1419,8 +1425,10 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     so the assembly happens once even though materialization runs per iteration),
     ``inner(<krylov>)``, ``chebyshev`` (bounds by power iteration on the JVP), a **pre-built**
     ``amg`` (``spec.build(A_representative)``), and ``block_diag``/``triangular`` over those.
-    What cannot: specs that need the assembled matrix -- ``jacobi`` (no diagonal on a matvec),
-    ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own targeted errors when
+    ``jacobi`` composes there too when the assembler provides a diagonal-only pass (the native FEM
+    assembler does): the matrix-free Newton hands its operator ``diag J(u)`` without the matrix.
+    What cannot: specs that need the assembled matrix -- ``lu``/``dense`` inner solvers on sub-blocks,
+    or ``jacobi`` on a residual with no diagonal pass -- these raise their own targeted errors when
     materialized.
 
     An unbuilt ``amg`` (any leaf whose setup cannot run under a trace) composes anyway: it is frozen
@@ -1475,8 +1483,10 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             # either -- an assembled operator keeps its ``.bcoo``/``.diag()``, which is the whole
             # point of routing a direct solver here.
             n = rhs.shape[0]
+            # A matrix-free tangent may carry its assembled DIAGONAL (`diag_fn`, the assembler's diagonal-only
+            # pass): `jno.precond.jacobi()` then works without the matrix.
             op = (
-                LinearOperator.from_matvec(operator, shape=(n, n))
+                LinearOperator.from_matvec(operator, shape=(n, n), diag_fn=getattr(operator, "diag_fn", None))
                 if callable(operator) and not hasattr(operator, "shape")
                 else LinearOperator(operator)
             )
@@ -1521,6 +1531,8 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     # ...but only ``direct=True`` cannot run WITHOUT one. A caller that cannot assemble the tangent (the
     # compiled load-path contact march, whose gap tables are traced) may still use the others matrix-free.
     _composed.needs_jacobian = getattr(nonlinear, "direct", False) is True
+    # The matrix-free Newton takes no matrix, but preconditions with the assembler's DIAGONAL when there is one.
+    _composed.wants_jacobian_diag = getattr(nonlinear, "direct", None) is False
     # An over-relaxed driver steps past its sub-solve's answer and needs the box projector to stay
     # feasible; the `bounds` wrapper is the only thing that owns one.
     _composed.wants_project = bool(getattr(nonlinear, "wants_project", False))

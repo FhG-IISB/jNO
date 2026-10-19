@@ -247,7 +247,9 @@ def test_contact_composes_with_a_load_path_march():
     The oracle is the one the frozen AL march is held to: the interface settles at ``-0.01``, half the
     platen displacement, by symmetry.
     """
-    nl = jno.solve.newton(line_search=True, rtol=1e-5, atol=3e-5)
+    # Newton well inside the rounds' settle tolerance (1e-4 relative change): its steps are inexact, so
+    # each round's solve is only as good as rtol/atol, and at 1e-5/3e-5 two rounds differed by 1.5e-4.
+    nl = jno.solve.newton(line_search=True, rtol=1e-7, atol=3e-7)
     d, fem, main = _al_contact_march()
     # the march is triggered by the form's step history, with nothing passed -- as `u.t` triggers
     # the transient stepper -- so `contact=` is the only slot this needs.

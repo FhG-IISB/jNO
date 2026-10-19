@@ -3983,11 +3983,21 @@ def assemble_fem_native(
                 _inv_blocks_cache[key] = hit
             return hit[1]
 
-        def jacobian(u_flat, t=0.0, args=None):
+        def jacobian(u_flat, t=0.0, args=None, *, diag=False):
+            """The assembled tangent (a BCOO); with ``diag=True`` only its DIAGONAL, a ``(total,)`` vector.
+
+            The diagonal runs the same element loop and keeps, per element block, the entries whose global
+            row and column coincide, scattered straight into one vector: no matrix, no sparsity plan, and a
+            batch of element blocks as the only scratch -- what a Jacobi preconditioner on the matrix-free
+            Newton needs (as deal.II's ``MatrixFreeTools::compute_diagonal`` does)."""
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
             # between rounds and the contact block's indices move with it.
             _idx_static, _plan, _blk_sizes = _pattern(args)
+            _dacc = [None]
+            if diag:  # no matrix: the plan and the raw pattern are not used at all
+                _idx_static, _plan = None, None
+                _dacc[0] = jnp.zeros((total,), dtype=u_flat.dtype)
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
@@ -4009,6 +4019,10 @@ def assemble_fem_native(
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             def _emit(flat, rows_fn, cols_fn):
+                if diag:
+                    r, c = rows_fn(), cols_fn()
+                    _dacc[0] = _dacc[0] + jax.ops.segment_sum(jnp.where(r == c, flat, 0.0), r, num_segments=total)
+                    return
                 if _plan is None:
                     data_l.append(flat)
                     rows_l.append(rows_fn())
@@ -4032,6 +4046,16 @@ def assemble_fem_native(
                     return _symmetrise_own_block(Ke, loc_seg[_t], loc_seg[_t + 1])
 
                 _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
+                if diag:
+                    # per cell: the block's entries at (row a, the column holding the same global DOF)
+                    _rows_t = cd_d[tfi]
+
+                    def _kd(c, la, _k=_ke, _rt=_rows_t):
+                        same = _rt[c][:, None] == cad_d[c][None, :]  # (n_test, n_local_all)
+                        return jnp.sum(jnp.where(same, _k(c, la), 0.0), axis=1)
+
+                    _dacc[0] = _elem_map(_kd, (jnp.arange(n_cells), local_all), _chunk_v, scatter=(_dacc[0], _rows_t))
+                    continue
                 if _plan is not None:
                     # Scatter each CHUNK's element blocks straight into the compressed slots (the residual's
                     # own `scatter=` path), so the (n_cell, n_test, n_local) stack of every cell's block is
@@ -4184,6 +4208,8 @@ def assemble_fem_native(
                             d_mm = -jnp.einsum("fqk,fqvpw,fpl->fqkvplw", w_f, Dum.reshape(n_face, n_q, vt, n_q, vt), w_f)
                             _emit(d_mm.reshape(-1), lambda _g=gs: _g["rows_mm"], lambda _g=gs: _g["cols_mm"])
 
+            if diag:
+                return _dacc[0]
             if _plan is not None:
                 if _acc[0] is None:  # no terms -> empty operator
                     return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
@@ -5468,6 +5494,9 @@ def assemble_fem_native(
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
                     return bcoo_eliminate_dirichlet(jacobian(_hold_project(u, args, t), t, args), _d)
 
+                def jac_diag_p(u, args=None, t=0.0, _d=_all_d):
+                    return jacobian(_hold_project(u, args, t), t, args, diag=True).at[_d].set(1.0)
+
                 _constrained = _all_d
             else:
 
@@ -5484,9 +5513,14 @@ def assemble_fem_native(
                     J = jacobian(_s_project(u), t, args)
                     return J if _d is None else bcoo_eliminate_dirichlet(J, _d)
 
+                def jac_diag_p(u, args=None, t=0.0, _d=s_d_dofs):
+                    dg = jacobian(_s_project(u), t, args, diag=True)
+                    return dg if _d is None else dg.at[_d].set(1.0)
+
                 _constrained = s_d_dofs
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            _op.jacobian_diag = jac_diag_p
             _op.linear_in_unknown = linear_in_unknown
             # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
             # (``staggered(over_relax>1)``) must leave these alone: the sub-solve already puts them exactly
@@ -5553,7 +5587,16 @@ def assemble_fem_native(
                 _f._jno_static_idx = _idx_for(args)
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
+        def _jac_diag_np(u, args=None):
+            # the diagonal of `_jac_np`'s matrix: at the projected state, unit on the eliminated rows
+            u = jnp.asarray(u)
+            if not dirichlet_pairs:
+                return jacobian(u, 0.0, args, diag=True)
+            _d, _v, _proj = dirichlet_projection(dirichlet_pairs)
+            return jacobian(_proj(u), 0.0, args, diag=True).at[_d].set(1.0)
+
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.jacobian_diag = _jac_diag_np
         _op_np.linear_in_unknown = linear_in_unknown
         # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating
         # driver (``staggered(over_relax != 1)``) must leave them alone. Missing here, every NON-parametric

@@ -655,6 +655,8 @@ def _root_driver(
             inner_tol=inner_tol,
             inner_maxit=inner_maxit,
             linear_solve=linear_solve,
+            # the assembler's diagonal-only pass, when it offers one: Jacobi without the matrix
+            jacobian_diag=getattr(jacobian, "diag", None),
             damping=damping,
             line_search=line_search,
             ls_max=ls_max,

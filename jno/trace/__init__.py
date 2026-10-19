@@ -4264,6 +4264,12 @@ class FemLinearSystem:
 _EAGER_SOLVE_CACHE_MAX = 8
 
 
+def _takes_jacobian(solve_fn) -> bool:
+    """Whether a composed solver is handed the tangent: an assembled-tangent Newton needs the matrix
+    (``wants_jacobian``), the matrix-free one only its diagonal-only pass (``wants_jacobian_diag``)."""
+    return bool(getattr(solve_fn, "wants_jacobian", False) or getattr(solve_fn, "wants_jacobian_diag", False))
+
+
 class FemResidualOperator:
     """Container for a steady nonlinear FEM residual ``R(u, args) = 0``."""
 
@@ -4279,6 +4285,8 @@ class FemResidualOperator:
     ):
         self.residual = residual_fn
         self.jacobian = jacobian_fn
+        # ``(u, args) -> diag J(u)`` without the matrix, when the assembler provides it (see `_jacobian_handle`)
+        self.jacobian_diag = None
         self.size = size
         self.runtime_parameter_exprs = runtime_parameter_exprs or {}
         self.residual_basis = residual_basis or {}
@@ -4303,6 +4311,17 @@ class FemResidualOperator:
             self.jacobian(u, args),
             -self.residual(u, args),
         )
+
+    def _jacobian_handle(self, args):
+        """``u -> J(u)`` at these ``args``, carrying ``.diag`` (``u -> diag J(u)``) when the assembler has a
+        diagonal-only pass: the matrix-free Newton preconditions with it (``newton_krylov(jacobian_diag=)``)."""
+
+        def jac(u):
+            return self.jacobian(u, args)
+
+        if self.jacobian_diag is not None:
+            jac.diag = lambda u: self.jacobian_diag(u, args)
+        return jac
 
     def solve(self, solve_fn=None, *, u0=None, values=None):
         """Differentiable nonlinear forward solve of ``R(u, θ) = 0`` as a trace node.
@@ -4364,8 +4383,8 @@ class FemResidualOperator:
             # A sparse-direct Newton (``jno.solve.newton(direct=True)``) flags ``wants_jacobian`` and
             # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
             # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
-            if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+            if _takes_jacobian(solve_fn) and self.jacobian is not None:
+                return solve_fn(residual_fn, u0, jacobian=self._jacobian_handle(args), **_xa(args))
             return solve_fn(residual_fn, u0, **_xa(args))
 
         if values is None:
@@ -4402,8 +4421,8 @@ class FemResidualOperator:
                 args = dict(zip(names, value_args))
                 rf = lambda u: self.residual(u, args)  # noqa: E731
                 with bound_state(precond_state(getattr(first, "precond", None))[0], pstates):
-                    if getattr(first, "wants_jacobian", False) and self.jacobian is not None:
-                        return first(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+                    if _takes_jacobian(first) and self.jacobian is not None:
+                        return first(rf, u0_arg, jacobian=self._jacobian_handle(args), **_xa(args))
                     return first(rf, u0_arg, **_xa(args))
 
             if names:

@@ -42,7 +42,9 @@ def test_newton_krylov_gradient_matches_fd():
     u_tgt = jnp.linspace(0.0, 1.0, n)
 
     def usol(alpha):
-        return newton_krylov(lambda u: A @ u + alpha * u**3 - b, jnp.zeros(n))
+        # solved far below the default 1e-8: the steps are inexact (forcing), so the root is only as good as
+        # the outer tolerance, and the central difference below divides that error by 2e-5
+        return newton_krylov(lambda u: A @ u + alpha * u**3 - b, jnp.zeros(n), rtol=1e-13, atol=1e-13)
 
     def loss(alpha):
         return jnp.mean((usol(alpha) - u_tgt) ** 2)
@@ -50,7 +52,7 @@ def test_newton_krylov_gradient_matches_fd():
     a0 = jnp.array(0.7)
     # forward actually solves the nonlinear system
     u = usol(a0)
-    assert float(jnp.linalg.norm(A @ u + a0 * u**3 - b)) < 1e-9
+    assert float(jnp.linalg.norm(A @ u + a0 * u**3 - b)) < 1e-12
 
     g_ad = float(jax.grad(loss)(a0))
     e = 1e-5
