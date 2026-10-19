@@ -142,13 +142,23 @@ def test_a_symmetric_form_now_has_a_symmetric_tangent():
 
 def test_a_vector_form_is_symmetric_to_roundoff():
     """A vector element block contracts components in a different order for (a,i),(b,j) than for
-    (b,j),(a,i), so it differs by an ulp — assembly round-off, not the Dirichlet structure. Measured
-    ~0.25 ulps, against ~1e-1 before this change."""
+    (b,j),(a,i), so its two triangles differ by an ulp; each element block is averaged within the
+    solver's symmetry gate, which makes it bitwise symmetric. The ASSEMBLED matrix is bitwise symmetric
+    only where the global sum is deterministic (the CPU): a GPU scatter-add sums the many tetrahedra on
+    one edge in a varying order, so (i,j) and (j,i) may still differ by an ulp there -- round-off, which
+    the solver's own 64-ulp gate averages."""
     fem, _d = _elasticity()
     A = _dense_tangent(fem, np.asarray(fem.solve()))
     rel = _asymmetry(A)
     assert rel < ULPS, f"vector tangent asymmetry {rel:.3e} ({rel / EPS:.1f} ulps) exceeds a few ulps"
-    assert rel > 0.0, "bitwise symmetry here would mean the element block changed — see the docstring"
+
+
+def test_the_weakest_genuine_asymmetry_is_not_averaged_away():
+    """The element-level average must not reach a real asymmetry. An advection coefficient of 1e-12 is
+    physically nothing beside the Laplacian, and still ~191 ulps -- outside the 64-ulp gate."""
+    fem, _d = _advection(b=1e-12)
+    A = _dense_tangent(fem, np.asarray(fem.solve()))
+    assert not np.array_equal(A, A.T), "a 1e-12 advection term was averaged into a symmetric tangent"
 
 
 def test_a_genuinely_nonsymmetric_form_is_not_symmetrized():

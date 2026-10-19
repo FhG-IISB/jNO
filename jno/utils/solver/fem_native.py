@@ -989,6 +989,25 @@ def _seeded_piece(piece):
     return res
 
 
+def _symmetrise_own_block(Ke, lo: int, hi: int):
+    """``Ke`` with its square test-field block ``Ke[:, lo:hi]`` replaced by ``(B + Bᵀ)/2`` when the block's
+    two triangles already agree to within the solver's symmetry gate (``linear._SYM_ULPS`` of its largest
+    entry), else unchanged. Float addition commutes, so the average is BITWISE symmetric: what LDLᵀ and
+    the eigs guard read. The gate is the solver's own, chosen between measured populations (a tangent's
+    round-off at 0.3-0.5 ulps, the weakest genuine asymmetry -- a 1e-12 advection term -- at ~191), so a
+    non-symmetric form is never averaged. Off-diagonal field blocks pair with ANOTHER kernel's block and
+    are left alone; a complex block is too (its symmetry is Hermitian, not this)."""
+    from .linear import _SYM_ULPS
+
+    if Ke.ndim != 2 or hi - lo != Ke.shape[0] or jnp.iscomplexobj(Ke):
+        return Ke
+    B = Ke[:, lo:hi]
+    gap = jnp.max(jnp.abs(B - B.T))
+    scale = jnp.max(jnp.abs(B))
+    sym = jnp.where(gap <= _SYM_ULPS * jnp.finfo(B.dtype).eps * scale, 0.5 * (B + B.T), B)
+    return Ke.at[:, lo:hi].set(sym)
+
+
 class _FusedVolumeTerms(tuple):
     """Additive volume sub-terms that share ONE test field and ONE region mask, assembled as one kernel.
 
@@ -2854,9 +2873,9 @@ def assemble_fem_native(
         # (n_test,) layout, so their sum is the group's element residual.
         w = qw_shared * meas
         pieces = tuple(coeff) if isinstance(coeff, _FusedVolumeTerms) else (coeff,)
-        # The TANGENT keeps the per-DOF evaluation (``seeded=False``): its element matrix of a symmetric form
-        # is then bitwise symmetric, which is what admits LDLᵀ and keeps the eigs symmetry guard quiet; the
-        # seeded one is forward-over-reverse and symmetric only to round-off (3e-17 measured).
+        # The TANGENT is forward over this SEEDED evaluation. Forward-over-reverse is symmetric only to
+        # round-off (3e-17 measured), so its element block is averaged within the solver's symmetry gate
+        # (``_symmetrise_own_block``) -- bitwise symmetric, as LDLᵀ and the eigs symmetry guard need.
         seeds = [p for p in (_seeded_piece(pc) for pc in pieces) if p is not None] if seeded else []
         out = _seeded_element_residual(seeds, tfi, per, loc, w) if seeds else None
         plain = pieces if out is None else [pc for pc in pieces if _seeded_piece(pc) is None]
@@ -4022,7 +4041,12 @@ def assemble_fem_native(
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=False))(la)
+                    # Forward over the SEEDED residual (one reverse pass per cell for every test DOF), not over
+                    # the per-test-DOF evaluation: that one evaluated the integrand k_test x k_trial times per
+                    # point. Its block is symmetric to round-off only, so it is averaged within the solver's
+                    # own symmetry gate (`_symmetrise_own_block`), which makes it bitwise symmetric.
+                    Ke = jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True))(la)
+                    return _symmetrise_own_block(Ke, loc_seg[_t], loc_seg[_t + 1])
 
                 _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
                 if _plan is not None:

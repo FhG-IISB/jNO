@@ -8,8 +8,12 @@ the tangent's element blocks are bitwise symmetric where the form is.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from jno.utils.solver.small_linalg import small_matmul
@@ -47,3 +51,16 @@ def test_a_vector_gradient_has_no_transpose():
     out = _unpack_components(flat, _Field(), axis=1)
     assert out.shape == (4, 3, 3)
     assert "transpose" not in _prims(lambda f: _unpack_components(f, _Field(), axis=1), flat)
+
+
+def test_the_tangent_of_a_variational_vector_form_is_bitwise_symmetric_where_assembly_is_deterministic():
+    # On the CPU the global sum is deterministic, so a bitwise symmetric element block gives a bitwise
+    # symmetric matrix. Break: dropping the element-block average (the forward-over-reverse block is
+    # symmetric only to ~5e-17).
+    sys.path.insert(0, str(Path(__file__).parent))
+    import test_fem_dirichlet_symmetry as T
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        fem, _d = T._elasticity()
+        A = T._dense_tangent(fem, np.asarray(fem.solve()))
+    assert np.array_equal(A, A.T), f"asymmetry {T._asymmetry(A):.2e}"
