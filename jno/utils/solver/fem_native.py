@@ -1034,6 +1034,9 @@ TOPOLOGY_ARG = "__topology__"
 """``args`` key carrying a runtime CONNECTIVITY bundle -- see ``assemble_fem_native(dynamic_topology=)``."""
 
 
+_NO_POINTS = "__jno_no_point_loads__"  # an `args` flag: assemble without the point loads (static placeholders)
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1262,6 +1265,31 @@ def assemble_fem_native(
     ref_hess_all = [None if s.ref_hess is None else jnp.asarray(s.ref_hess) for s in specs]
     cells_f_j = [jnp.asarray(cf, dtype=jnp.int32) for cf in cells_f_all]  # list of (n_cells, n_local_i)
 
+    # Point loads handed over by `jno.fem` (`c * v(px, py, pz)`), read once and cleared.
+    _point_terms = list(getattr(domain, "_fem_point_terms", None) or [])
+    domain._fem_point_terms = None
+    _point_shape = None
+    if _point_terms:
+        if len(fields) != 1 or vecs[0] != 1:
+            raise NotImplementedError(
+                "jno.fem: point loads are implemented for ONE scalar field so far; this form has "
+                f"{len(fields)} field(s) of widths {list(vecs)}."
+            )
+        from .fem_points import PointShape
+
+        _point_shape = PointShape(_cell_type, pts_p1, cells_p1, cells_f_all[0], dim)
+
+    def _point_space():
+        """``(PointShape, cell DOFs)`` for reading the solution at points (one scalar order-1 field)."""
+        if len(fields) != 1 or vecs[0] != 1:
+            raise NotImplementedError(
+                f"jno.fem: a point value `u(px, py, pz)` is implemented for ONE scalar field so far; this form has "
+                f"{len(fields)} field(s) of widths {list(vecs)}."
+            )
+        from .fem_points import PointShape
+
+        return (_point_shape or PointShape(_cell_type, pts_p1, cells_p1, cells_f_all[0], dim)), cdofs[0]
+
     # Per-field cell DOF index arrays: (n_cells, n_local_i * vec_i)
     cdofs = []
     for i in range(len(fields)):
@@ -1356,6 +1384,19 @@ def assemble_fem_native(
     for _exprs in boundary_terms.values():
         for bare in _exprs:
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
+    # Point loads handed over by `jno.fem` (`c * v(px, py, pz)`): their coefficients and coordinates may
+    # be runtime parameters too, so they join the parameter set the solve threads through.
+    # Their parameters ride `runtime_parameter_exprs` (so the solve receives their values in `args`) but stay
+    # OUT of `runtime_parameter_tags`: they are read by the point assembly, not packed per element -- a
+    # (n_points,) array there would be refused as a field on no FE space. Same split as the coordinate
+    # parameters below.
+    from ...trace import Placeholder as _Ph
+
+    _pt_param_exprs: Dict[str, Any] = {}
+    for _pc, _pe in _point_terms:
+        for _node in (_pc, *_pe.coords):
+            if isinstance(_node, _Ph):
+                _collect_runtime_parameter_exprs(_node, _pt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
     # P0 field parameters carry ONE value per element rather than per node, so they gather by cell
@@ -1404,6 +1445,10 @@ def assemble_fem_native(
     _neural = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags)
     neural_param_names, _neural_models = _neural.param_names, _neural.models
     _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
+    _param_and_neural_exprs = {
+        **_param_and_neural_exprs,
+        **{k: e for k, e in _pt_param_exprs.items() if k not in _param_and_neural_exprs},
+    }
 
     # Trainable mesh-coordinate parameters (geometry design variables) registered by
     # ``Variable.trainable()`` on a spatial coordinate: their value is scattered into the P1 geometry
@@ -3393,6 +3438,29 @@ def assemble_fem_native(
             "wrong elements with every shape still matching -- refused rather than answered wrongly."
         )
 
+    def _point_positions(pe, args):
+        """``(n, dim)`` point coordinates of a point evaluation, from numbers, arrays or parameters."""
+        from ..._fem import _point_value
+
+        cs = [jnp.reshape(_point_value(c, args), (-1,)) for c in pe.coords]
+        if len(cs) != dim:
+            raise ValueError(f"jno.fem: {pe!r} gives {len(cs)} coordinate(s) on a {dim}-D mesh.")
+        n = max(int(c.shape[0]) for c in cs)
+        if any(int(c.shape[0]) not in (1, n) for c in cs):
+            raise ValueError(
+                f"jno.fem: the coordinate arrays of {pe!r} have different lengths {[int(c.shape[0]) for c in cs]}."
+            )
+        return jnp.stack([jnp.broadcast_to(c, (n,)) for c in cs], axis=1)
+
+    def _point_load(pcoef, pe, args, pts_dyn):
+        """``(cell, c_i N_a(p_i))`` of one point term: the elements holding the points and the loads."""
+        from ..._fem import _point_value
+
+        pos = _point_positions(pe, args)
+        coef = jnp.broadcast_to(jnp.reshape(_point_value(pcoef, args), (-1,)), (pos.shape[0],))
+        cell, N = _point_shape(pos, pts_dyn)
+        return cell, coef[:, None] * N
+
     def _make_residual(terms, bterms=None):
         """Build the free global residual ``R(u_flat) -> (total,)`` (volume + optional surface).
 
@@ -3400,6 +3468,7 @@ def assemble_fem_native(
         ``None`` (the default) to assemble volume terms only — used for the transient mass matrix,
         where boundary contributions must not appear."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
+        point_work = list(_point_terms) if bterms is not None else []
 
         def residual(u_flat, t=0.0, args=None):
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
@@ -3489,6 +3558,11 @@ def assemble_fem_native(
                             pts_dyn,
                             _nrm_for(region),
                         )
+            # point loads: c_i * v(p_i) -> c_i N_a(p_i) on the DOFs of the element holding p_i. Not part of
+            # a volume-only build (`bterms is None`: the transient mass matrix), like the surface terms.
+            for pcoef, pe in point_work if not (args and args.get(_NO_POINTS)) else ():
+                cell_, w_ = _point_load(pcoef, pe, args, pts_dyn)
+                R = R.at[cd_d[0][cell_].reshape(-1)].add(w_.reshape(-1))
             return R
 
         return residual
@@ -5230,6 +5304,7 @@ def assemble_fem_native(
         or history_specs
         or surface_history_specs
         or _coord_specs
+        or _pt_param_exprs  # a point load's coefficient or position is a parameter
     ):
         from ...trace import FemLinearSystem
 
@@ -5347,8 +5422,11 @@ def assemble_fem_native(
         # Static placeholder for .A/.b: scalar params at 0, networks (coefficient + Dirichlet) at stored
         # weights, Dirichlet-value parameters at their STORED value (like the nets: `fem.b` then reflects
         # the initialized boundary value rather than an arbitrary zero condition).
+        # Point loads are left out of it (`_NO_POINTS`): their positions may be parameters, and at an
+        # arbitrary placeholder value they need not even lie in the mesh -- a solve always passes them.
         a0, b0 = _assemble_at(
-            {n: 0.0 for n in runtime_parameter_tags}
+            {_NO_POINTS: True}
+            | {n: 0.0 for n in runtime_parameter_tags}
             | {n: _neural_models[n].module for n in neural_param_names}
             | {n: m.module for n, m in _dir_net_models.items()}
             | {n: jnp.asarray(nd.model.module.value) for n, nd in _dir_param_exprs.items()}
@@ -5363,6 +5441,7 @@ def assemble_fem_native(
             # parameter basis), so every runtime parameter -- affine or not -- takes the re-assembly route.
             metadata={"nonaffine_operator": True},
         )
+        op._point_space = _point_space  # what `u(px, py, pz)` on the solve node reads with
         return op, "linear", offs
 
     # nonlinear (non-parametric)

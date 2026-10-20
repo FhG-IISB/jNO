@@ -418,6 +418,104 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
+def _split_point_terms(constraints):
+    """Take the POINT loads out of a term list: ``(point_terms, rest)``.
+
+    A test function called with point coordinates, ``v(px, py, pz)`` (see ``trace.PointEval``), is a
+    point load. Each term is split additively; a piece holding a point evaluation must be
+    ``coefficient * v(points)`` with a point-free coefficient (numbers, arrays, ``jno.np.parameter``s
+    and arithmetic of those), and becomes ``(coefficient, PointEval)``. The other pieces of the same
+    term are kept, as one term, for the usual classification. Anything else raises by name: a point
+    evaluation is never dropped or integrated as if it were a region."""
+    from .trace import BinaryOp, Literal, PointEval, TestFunction, _is_point_coord
+
+    def pieces(e, sign=1.0):
+        if isinstance(e, BinaryOp) and e.op in ("+", "-"):
+            return pieces(e.left, sign) + pieces(e.right, sign if e.op == "+" else -sign)
+        return [(sign, e)]
+
+    def factors(e):
+        if isinstance(e, BinaryOp) and e.op == "*":
+            return factors(e.left) + factors(e.right)
+        if isinstance(e, BinaryOp) and e.op == "/":
+            return factors(e.left) + [("inv", e.right)]
+        return [e]
+
+    point_terms, rest = [], []
+    for c in constraints:
+        if not _contains(c, PointEval):
+            rest.append(c)
+            continue
+        keep = None
+        for sign, piece in pieces(_bare(c)):
+            if not _contains(piece, PointEval):
+                term = piece if sign > 0 else Literal(-1.0) * piece
+                keep = term if keep is None else keep + term
+                continue
+            fs = factors(piece)
+            pe = [f for f in fs if isinstance(f, PointEval)]
+            others = [f for f in fs if not isinstance(f, PointEval)]
+            trial = [f for f in pe if not isinstance(f.of, TestFunction)]
+            if trial:
+                raise NotImplementedError(
+                    f"jno.fem: {trial[0]!r} -- a TRIAL field at points inside a weak form (a point constraint or "
+                    "coupling) is not supported yet. Point LOADS are: `c * v(px, py, pz)` with the test function."
+                )
+            if len(pe) != 1 or any(isinstance(f, tuple) and isinstance(f[1], PointEval) for f in others):
+                raise ValueError(
+                    f"jno.fem: a point term must be `coefficient * v(px, py, pz)` with ONE point evaluation of the "
+                    f"test function as a factor; got {piece!r}."
+                )
+            if not isinstance(pe[0].of, TestFunction):
+                raise NotImplementedError(
+                    f"jno.fem: {pe[0]!r} -- a TRIAL field at points inside a weak form (a point constraint or "
+                    "coupling) is not supported yet. Point LOADS are: `c * v(px, py, pz)` with the test function."
+                )
+            coef = Literal(sign)
+            for f in others:
+                inv = isinstance(f, tuple)
+                g = f[1] if inv else f
+                if not _is_point_coord(g):
+                    raise ValueError(
+                        f"jno.fem: the coefficient of a point load may only hold numbers, arrays and "
+                        f"`jno.np.parameter`s (and arithmetic of those); {g!r} is not one. A coefficient that "
+                        "depends on the solution or on position is not a point load."
+                    )
+                coef = coef / g if inv else coef * g
+            point_terms.append((coef, pe[0]))
+        if keep is not None:
+            rest.append(keep)
+    return point_terms, rest
+
+
+def _point_value(e, args):
+    """The value of a point-free expression (numbers, arrays, parameters, arithmetic) given ``args``."""
+    import jax as _jax
+
+    from .trace import BinaryOp, Constant, Literal, ModelCall
+
+    if isinstance(e, (int, float, np.ndarray, np.number)) or isinstance(e, _jax.Array):
+        return jnp.asarray(e)
+    if isinstance(e, (Literal, Constant)):
+        return jnp.asarray(e.value)
+    if isinstance(e, ModelCall):
+        name = getattr(e.model, "_parameter_name", None)
+        if args and name in args:
+            return jnp.asarray(args[name])
+        if getattr(e.model, "_frozen", False) and getattr(e.model, "_weight_tree", None) is not None:
+            return jnp.asarray(e.model._weight_tree)  # a .freeze()d (known) value
+        raise ValueError(
+            f"jno.fem: the point term uses parameter {name!r}, which has no value here: pass it to `fem.solve({name}=...)`."
+        )
+    if isinstance(e, BinaryOp):
+        a, b = _point_value(e.left, args), _point_value(e.right, args)
+        ops = {"+": jnp.add, "-": jnp.subtract, "*": jnp.multiply, "/": jnp.divide, "**": jnp.power}
+        if e.op not in ops:
+            raise ValueError(f"jno.fem: operator {e.op!r} in a point term is not supported.")
+        return ops[e.op](a, b)
+    raise ValueError(f"jno.fem: {e!r} is not a number, array or parameter.")
+
+
 def _reject_source_terms(fem_obj: Any, where: str) -> None:
     """Fail loud if the weak form carries a **load** — a term with a test function but no trial.
 
@@ -435,6 +533,11 @@ def _reject_source_terms(fem_obj: Any, where: str) -> None:
     from .utils.solver.weak_form import _split_additive_terms
 
     dom = getattr(fem_obj, "domain", None)
+    if getattr(fem_obj, "_point_loads", 0):
+        raise ValueError(
+            f"{where}: the weak form carries point loads (`c * v(px, py, pz)`). An eigenproblem K x = λ M x "
+            "is homogeneous -- a load is not part of the pencil and would be silently ignored. Drop them."
+        )
     for c, cl in zip(getattr(fem_obj, "_constraints", None) or [], fem_obj.classification or []):
         if not (isinstance(cl, str) and (cl.startswith("volume") or cl.startswith("surface"))):
             continue
@@ -6762,6 +6865,10 @@ def _fem_impl(
     # Variables in place, so classifying up front prevents one constraint's retag from
     # leaking into another's region detection — e.g. two surface terms on the same
     # region (a Neumann load + a Robin term) that share the bound boundary coordinates.
+    # Point loads (a test function called at point coordinates) are not region terms: they are taken
+    # out here, before classification, and assembled by the native path through the shape functions
+    # of the elements that hold the points.
+    point_terms, constraints = _split_point_terms(list(constraints))
     classified = [
         (c, _contains(c, TestFunction), _contains(c, TrialFunction), *_region_and_support(c, domain)) for c in constraints
     ]
@@ -7318,6 +7425,30 @@ def _fem_impl(
     # by `kron(P_node, I_vec)`, which `_finalize` already asks for with `vec or 1`. Only the TRANSIENT
     # route pre-builds its reduction in its own branch, so it still falls through here.
     _native_periodic_ok = not periodic_ties or not is_transient
+    if point_terms:
+        # v1 of point loads: the steady, real, native Lagrange path. Anywhere else they are refused
+        # rather than dropped -- the other routes have no place to put them.
+        why = (
+            "a transient form"
+            if is_transient
+            else "a complex form"
+            if _is_complex_form(domain, ir)
+            else "a network-coefficient (VPINN) form"
+            if is_vpinn
+            else "periodic ties"
+            if periodic_ties
+            else "an evolving state"
+            if _evolution
+            else None
+            if _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+            else "this mesh/element"
+        )
+        if why is not None:
+            raise NotImplementedError(
+                f"jno.fem: point loads (`c * v(px, py, pz)`) are supported on steady, real Lagrange problems; "
+                f"this one has {why}."
+            )
+        domain._fem_point_terms = point_terms  # read (and cleared) by assemble_fem_native
     if (
         not is_vpinn
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
@@ -7343,7 +7474,11 @@ def _fem_impl(
             evolution=_evolution,
             bounded=bool(_bounds),
         )
-        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+        if point_terms:
+            classification.append(f"point x{len(point_terms)}")
+        _fem_obj = FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
+        _fem_obj._point_loads = len(point_terms)
+        return _finalize(_fem_obj)
 
     # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively.
     # ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so wrapping each term in ``.real`` /
