@@ -71,3 +71,36 @@ def test_it_stops_a_fem_topology_optimisation_at_a_feasible_design():
 
     assert es.has_stopped and es.stopped_epoch < 199, "a 200-step budget must be cut short"
     assert rho_f.mean() <= VOLFRAC + 1e-6
+
+
+def test_the_design_it_returns_is_feasible_too():
+    """The loss of an epoch is measured before its update; the solve returns the design after it.
+
+    Adam jitters across the bound of an augmented-Lagrangian constraint, so a stop judged on a
+    feasible iterate returned the next one, over the budget by 4e-4.
+    """
+    import jax.numpy as jnp
+    import optax
+
+    a = np.array([1.0, 2.0, 3.0, 4.0])
+    d = jno.domain.from_array({"_": np.zeros((1, 1))})
+    x = jno.np.parameter((4,), name="x")
+    x.dtype(jnp.float64)
+    x.initialize(jax.nn.initializers.constant(0.0))
+    x.optimizer(optax.adam(0.1))
+    f0 = jno.fn(lambda v: jnp.sum((v - jnp.asarray(a)) ** 2), [x], name="f0")
+    s = jno.fn(lambda v: jnp.sum(v), [x], name="sum_x")
+    es = jno.callbacks.early_stopping(patience=5, verbose=False)
+    crux = jno.core([f0, (s <= 6.0).auglag(every=100)], domain=d)
+    crux.solve(1500, callbacks=[es])
+    assert es.has_stopped
+    assert float(np.asarray(crux.eval([x])).sum()) - 6.0 <= 1e-6
+
+
+def test_an_equality_row_counts_as_violated_on_either_side():
+    """``jno.eq`` rows are feasible at ``|g| <= 1e-6``; a negative residual is not slack."""
+    es = jno.callbacks.early_stopping(patience=1, verbose=False)
+    es.on_solve_begin(inequality_idx=[1], equality_idx=[1])
+    for epoch in range(5):
+        assert not es.on_epoch_end(epoch=epoch, total_loss=1.0, individual_losses=np.array([1.0, -0.5]))
+    assert not es.has_stopped

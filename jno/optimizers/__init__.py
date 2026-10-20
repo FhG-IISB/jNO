@@ -22,8 +22,12 @@ with ``optax.chain`` and drops straight into ``model.optimizer(...)`` /
 - :func:`gcmma` — globally convergent MMA (Svanberg, *SIAM J. Optim.* **12**(2), 2002): the same
   sentinel, but each step is re-solved until its approximation is conservative, so from a feasible
   start every design is feasible and the objective never rises.
-- Not an optimiser but its partner: ``jno.le(g, b).auglag()`` enforces a constraint with ANY of
-  these through an augmented Lagrangian (:mod:`jno.optimizers.auglag`).
+- Not an optimiser but its partner: ``jno.le(g, b).auglag()`` (and ``jno.eq(g, b).auglag()``)
+  enforces a constraint with ANY of these through an augmented Lagrangian
+  (:mod:`jno.optimizers.auglag`).
+- :func:`bounded` — box bounds for any optax optimiser: each step is projected back onto
+  ``[lower, upper]`` (projected gradient). A sentinel, like :func:`md`, so the projection comes
+  after jNO's learning-rate scale.
 - :func:`md` — Magnitude–Direction Decoupling: a generic wrapper that factorizes each weight
   matrix into a fixed-norm direction + learnable magnitude gains and steps any optax base optimizer
   on the direction (Hägele et al. 2026, arXiv:2606.25971). Pass it as a sentinel via
@@ -36,6 +40,7 @@ building your own optax chains.
 this package and re-export it below.
 """
 
+from .bounded import BoundedOptimizer, bounded
 from .continuation import (
     GeometricDecay,
     HeavisideContinuation,
@@ -51,6 +56,8 @@ from .soap import scale_by_soap, soap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden
 
 __all__ = [
+    "bounded",
+    "BoundedOptimizer",
     "engd",
     "ENGDOptimizer",
     "mma",

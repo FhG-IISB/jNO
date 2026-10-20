@@ -2142,8 +2142,11 @@ class Tracker(Placeholder):
         return f"Tracker({self.expr!r}, interval={self.interval})"
 
 
+_SENSE_OP = {"le": "<=", "ge": ">=", "eq": "=="}
+
+
 class Constraint(Placeholder):
-    """Wraps an expression that is an **inequality constraint**, not a loss to minimise.
+    """Wraps an expression that is a **constraint**, not a loss to minimise.
 
     ``jno.core`` evaluates it exactly like a constraint entry -- same compiled function, same
     differentiation -- so its value and gradient are available to a constrained optimiser. What it
@@ -2151,33 +2154,34 @@ class Constraint(Placeholder):
     summing a constraint into the objective makes it a soft penalty, which double-counts against an
     optimiser (MMA, OC, SQP) that already handles it in the dual.
 
-    ``sense`` is ``"le"`` (``expr <= bound``) or ``"ge"``; the stored residual is normalised to the
-    ``g <= 0`` convention either way, so a consumer never has to branch on the sense.
+    ``sense`` is ``"le"`` (``expr <= bound``), ``"ge"`` or ``"eq"`` (``expr == bound``, enforced only
+    through :meth:`auglag`); the stored residual is normalised to the ``g <= 0`` convention (``g == 0``
+    for an equality), so a consumer never has to branch on ``le`` versus ``ge``.
 
     Contrast with :class:`Tracker`, which is also kept out of the loss but is evaluated by a
     *separate* function on an interval, is not differentiated, and is invisible to the optimiser.
     """
 
     def __init__(self, expr: Placeholder, bound: float = 0.0, sense: str = "le"):
-        if sense not in ("le", "ge"):
-            raise ValueError(f"Constraint: sense must be 'le' or 'ge', got {sense!r}.")
+        if sense not in ("le", "ge", "eq"):
+            raise ValueError(f"Constraint: sense must be 'le', 'ge' or 'eq', got {sense!r}.")
         self.expr = expr
         self.bound = bound
         self.sense = sense
-        # g <= 0 when feasible, whichever way the user wrote it.
-        self.residual = (expr - bound) if sense == "le" else (bound - expr)
+        # g <= 0 when feasible, whichever way the user wrote it; g == 0 for an equality.
+        self.residual = (bound - expr) if sense == "ge" else (expr - bound)
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        op = "<=" if self.sense == "le" else ">="
-        return f"Constraint({self.expr!r} {op} {self.bound})"
+        return f"Constraint({self.expr!r} {_SENSE_OP[self.sense]} {self.bound})"
 
     def auglag(self, mu: float = 10.0, every: int = 100) -> "AugLagConstraint":
         """Enforce this constraint by an augmented Lagrangian, so ANY optimiser can be used.
 
         The constraint stays a reported row; a multiplier penalty is added to the loss, and every
         ``every`` steps the multiplier is updated from the current violation (method of
-        multipliers, Nocedal & Wright 2006, Sec. 17.4). ``mu`` is the starting penalty weight; it
+        multipliers, Nocedal & Wright 2006, Sec. 17.4). An equality ``jno.eq`` gets the same treatment
+        with a multiplier of either sign (Sec. 17.3). ``mu`` is the starting penalty weight; it
         grows tenfold while the violation stops shrinking. The design between updates may violate
         the constraint: feasibility comes as the multiplier converges, unlike with ``mma``/``gcmma``.
         The multiplier is ``.multiplier`` (evaluate it with ``crux.eval``)::
@@ -2206,14 +2210,15 @@ class AugLagConstraint(Constraint):
         from ..optimizers.auglag import penalty
 
         self.mu, self.every = float(mu), int(every)
-        self.state, psi = penalty(self.residual, mu=mu, every=every, name=getattr(expr, "_user_name", None))
+        self.state, psi = penalty(
+            self.residual, mu=mu, every=every, name=getattr(expr, "_user_name", None), equality=sense == "eq"
+        )
         self.multiplier = self.state[0]
         psi._auglag_penalty = True
         self.penalty = psi
 
     def __repr__(self):
-        op = "<=" if self.sense == "le" else ">="
-        return f"AugLagConstraint({self.expr!r} {op} {self.bound}, mu={self.mu}, every={self.every})"
+        return f"AugLagConstraint({self.expr!r} {_SENSE_OP[self.sense]} {self.bound}, mu={self.mu}, every={self.every})"
 
 
 class Model(Placeholder):

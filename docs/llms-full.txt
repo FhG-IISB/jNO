@@ -320,7 +320,10 @@ rate and is re-evaluated every step. Factories: `lrs.constant`, `lrs.exponential
 absent from optax: `engd`, `ssbroyden`, `ssbfgs`, `soap`, `md`, and the constrained `mma` and
 `gcmma`, which handle `jno.le`/`jno.ge` entries in the `jno.core` list. With any other optimiser,
 write the constraint as `jno.le(g, b).auglag(mu=10.0, every=100)` or `(g <= b).auglag()`: an
-augmented Lagrangian, feasible only as the multiplier converges.
+augmented Lagrangian, feasible only as the multiplier converges (give Adam a decaying rate). An
+equality is `jno.eq(g, b).auglag()` (never `g == b`, which tests node identity). Each constraint
+row's multiplier is logged as `λ[name]` and in `training_logs[-1]["multipliers"]`. Box bounds for
+any optax optimiser: `jno.optimizers.bounded(optax.adam(1e-2), lower=0.0, upper=1.0)`.
 
 ### What `solve()` actually returns
 

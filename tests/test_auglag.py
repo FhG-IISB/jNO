@@ -140,7 +140,45 @@ def test_a_strict_comparison_is_refused():
         (x.mean < 1.0).auglag()
 
 
+@pytest.mark.parametrize("V", [6.0, 14.0])
+def test_an_equality_binds_from_either_side_with_a_signed_multiplier(V):
+    """``sum x == V``: the projection ``x = a - (sum(a) - V)/n`` whichever side ``V`` lies on.
+
+    At V = 14 the inequality would be inactive; the equality pulls UP, with ``lam = -2``. A
+    multiplier clipped at zero, as an inequality's is, cannot get there.
+    """
+    d = jno.domain.from_array({"_": np.zeros((1, 1))})
+    x = jno.np.parameter((N,), name="x")
+    x.dtype(jnp.float64)
+    x.initialize(jax.nn.initializers.constant(0.0))
+    x.optimizer(jno.optimizers.ssbfgs())
+    f0 = jno.fn(lambda v: jnp.sum((v - jnp.asarray(A)) ** 2), [x], name="f0")
+    s = jno.fn(lambda v: jnp.sum(v), [x], name="sum_x")
+    c = jno.eq(s, V).auglag(mu=10.0, every=50)
+    crux = jno.core([f0, c], domain=d)
+    crux.solve(600)
+    shift = (A.sum() - V) / N
+    np.testing.assert_allclose(np.asarray(crux.eval([x])).reshape(-1), A - shift, atol=1e-5)
+    assert _lam(crux, c) == pytest.approx(2.0 * shift, rel=1e-4)
+
+
+def test_the_multiplier_is_logged_beside_its_constraint():
+    crux, _x, c = _projection(jno.optimizers.ssbfgs())
+    lam_log = crux.training_logs[-1]["multipliers"]
+    assert lam_log.shape[1] == 1, "one column per constraint row"
+    assert lam_log[-1, 0] == pytest.approx(_lam(crux, c), rel=1e-12)
+
+
 class TestGuards:
+    def test_a_plain_equality_is_refused(self):
+        """MMA cannot take an equality; without .auglag() it would be evaluated and ignored."""
+        d = jno.domain.from_array({"_": np.zeros((1, 1))})
+        x = jno.np.parameter((4,), name="x").optimizer(optax.adam(1e-2))
+        f0 = jno.fn(lambda v: jnp.sum(v**2), [x], name="f0")
+        vol = jno.fn(lambda v: jnp.sum(v), [x], name="vol")
+        with pytest.raises(ValueError, match=r"jno\.eq\(g, b\)\.auglag\(\)"):
+            jno.core([f0, jno.eq(vol, 1.0)], domain=d).solve(1)
+
     def test_mma_and_an_auglag_constraint_are_refused_together(self):
         """MMA would handle the row in its dual a second time."""
         d = jno.domain.from_array({"_": np.zeros((1, 1))})

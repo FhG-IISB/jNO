@@ -188,6 +188,18 @@ class TestThroughCore:
             assert rows[:, 1].max() <= ACCEPT, f"GCMMA left the feasible set: max g = {rows[:, 1].max():.3e}"
             assert np.all(np.diff(rows[:, 0]) <= ACCEPT * rows[:-1, 0])
 
+    @pytest.mark.parametrize("name", ["mma", "gcmma"])
+    def test_the_logged_multiplier_is_the_kkt_multiplier(self, name):
+        """Stationarity ``c_i / x_i**2 = 4 lam x_i**3`` gives ``lam = c_i / (4 x_i**5)`` at the optimum."""
+        c = _c()
+        x_star, _ = _analytic(c)
+        lam_star = float(np.mean(c / (P * x_star ** (P + 1))))
+        d, x, f0, g = self._build(c, getattr(jno.optimizers, name)(move=0.2, lower=XLO, upper=XHI))
+        crux = jno.core([f0, jno.le(g, R)], domain=d)
+        crux.solve(150)
+        lam = crux.training_logs[-1]["multipliers"]
+        assert lam[-1, 0] == pytest.approx(lam_star, rel=1e-4)
+
     def test_mixing_mma_and_gcmma_is_refused(self):
         """One joint subproblem cannot be both conservative and not."""
         c = _c(4)

@@ -57,7 +57,7 @@ crux.solve(1000)
 
 ---
 
-## Inequality constraints
+## Constraints
 
 `jno.le(g, b)` / `jno.ge(g, b)` mark an entry of the `jno.core` list as a constraint `g <= b`
 (`g >= b`) instead of a loss. There are two ways to enforce it:
@@ -70,23 +70,43 @@ crux.solve(1000)
 
 ```python
 vol_c = jno.le(volume, 0.4).auglag(mu=10.0, every=100)
-crux = jno.core([loss, vol_c, (stress <= s_max).auglag()])   # a comparison works the same way
+crux = jno.core([loss, vol_c, (stress <= s_max).auglag(), jno.eq(mass, m0).auglag()])
 crux.solve(5000)
 lam = crux.eval([vol_c.multiplier])                          # the Lagrange multiplier
 ```
 
 (`jno.auglag(c, ...)` is the same as `c.auglag(...)`.) `.auglag()` adds the penalty `(max(0, λ + μc)² − λ²)/(2μ)` to the loss, with `c = g − b`.
 Every `every` steps it sets `λ ← max(0, λ + μc)`, using `c` averaged over the second half of
-the window, and raises `μ` tenfold whenever the violation has not dropped to a quarter
-(Nocedal & Wright 2006, §17.4). The constraint is still reported as its own row, so the log,
-`early_stopping` and callbacks see `c`.
+the window, and raises `μ` tenfold whenever the violation is positive and has not dropped to
+a quarter (Nocedal & Wright 2006, §17.4). The constraint is still reported as its own row, so
+the log, `early_stopping` and callbacks see `c`.
+
+An equality `jno.eq(g, b)` (`g == b` cannot be written, because `==` on jNO expressions tests
+whether two nodes are the same) is enforced only through `.auglag()`. Its penalty is
+`λc + μc²/2` and its multiplier takes either sign (§17.3).
+
+The multiplier of every constraint row, from `.auglag()` or from MMA's subproblem, is printed
+next to the row as `λ[name]` and kept in `crux.training_logs[-1]["multipliers"]` (one column per
+constraint row). It is the change in the loss per unit of slack in the bound, and `0` for an
+inequality that is not active.
+
+**Box bounds** on a parameter go with the optimiser: `mma`/`gcmma` take `lower=`/`upper=`, and
+any optax optimiser gets them through `jno.optimizers.bounded`, which projects each step back
+onto the box:
+
+```python
+rho.optimizer(jno.optimizers.bounded(optax.adam(1e-2), lower=0.0, upper=1.0))
+```
 
 !!! warning "Feasible only in the limit"
     Between multiplier updates the design may violate the constraint. If every iterate has to
     stay feasible, for example when an infeasible design breaks the next solve, use `gcmma`.
     `every` should be long enough for the optimiser to settle on the current penalty: tens of
-    steps for a quasi-Newton optimiser, hundreds for Adam. An `.auglag()` constraint cannot be
-    combined with `mma`/`gcmma` in the same core, and a strict `<` or `>` is refused.
+    steps for a quasi-Newton optimiser, hundreds for Adam. Adam at a fixed rate keeps jittering
+    by about its rate and, once its gradients fall below its `eps`, takes steps of that size
+    again; over long runs this throws the multiplier off, so give it a decaying rate
+    (`optax.exponential_decay`). An `.auglag()` constraint cannot be combined with
+    `mma`/`gcmma` in the same core, and a strict `<` or `>` is refused.
 
 ---
 

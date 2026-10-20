@@ -243,7 +243,7 @@ def _primal(lam, p0, q0, P, Q, low, upp, alpha, beta):
     return np.clip(x, alpha, beta)
 
 
-def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, dual_iters=400):
+def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, dual_iters=400, with_multipliers=False):
     """One MMA step: build the convex approximation, solve its dual, return the new point.
 
     Args:
@@ -251,11 +251,12 @@ def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spe
         g: constraint values ``(m,)``, feasible when ``<= 0``; ``dg``: their Jacobian ``(m, n)``;
         low/upp: previous asymptotes; xold1/xold2: the two previous iterates (``None`` early on).
 
-    Returns ``(x_new, low, upp)``.
+    Returns ``(x_new, low, upp)``, and the subproblem's multipliers ``(m,)`` after them with
+    ``with_multipliers``.
     """
     low, upp = _asymptotes(x, xold1, xold2, low, upp, xmin, xmax, k, spec.asy_init, spec.asy_shrink, spec.asy_grow)
-    x_new = _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, spec.move, spec.raa, spec.raa, dual_iters)
-    return x_new, low, upp
+    x_new, lam = _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, spec.move, spec.raa, spec.raa, dual_iters)
+    return (x_new, low, upp, lam) if with_multipliers else (x_new, low, upp)
 
 
 def gcmma_step(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, evaluate):
@@ -279,7 +280,8 @@ def gcmma_step(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, e
         evaluate: ``x_hat -> (f0, g)``, the true objective and constraint values at a trial point.
         spec: as for :func:`mma_subproblem`, plus ``max_inner``, the most re-solves per step.
 
-    Returns ``(x_new, low, upp, info)``. ``info["inner"]`` is the number of re-solves and
+    Returns ``(x_new, low, upp, info)``. ``info["inner"]`` is the number of re-solves, ``info["lam"]``
+    the multipliers of the accepted subproblem, and
     ``info["conservative"]`` is False when ``max_inner`` ran out first: the last trial point is
     then accepted as it is, as in Svanberg's code, and is not guaranteed feasible or a descent.
     """
@@ -309,7 +311,7 @@ def gcmma_step(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, e
 
     inner = 0
     while True:
-        xh = _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, spec.move, rho0, rho, spec.dual_iters)
+        xh, lam = _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, spec.move, rho0, rho, spec.dual_iters)
         f_new, g_new = evaluate(xh)
         true = np.concatenate([[float(f_new)], np.asarray(g_new, dtype=np.float64).reshape(-1)])
         shortfall = true - (f_at_x + increments(xh))
@@ -324,7 +326,7 @@ def gcmma_step(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, e
         both = np.where(bad, np.minimum(1.1 * (both + delta), 10.0 * both), both)
         rho0, rho = float(both[0]), both[1:]
         inner += 1
-    return xh, low, upp, {"inner": inner, "conservative": not bad.any(), "f0": float(true[0]), "g": true[1:]}
+    return xh, low, upp, {"inner": inner, "conservative": not bad.any(), "f0": float(true[0]), "g": true[1:], "lam": lam}
 
 
 def _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, raa0, raa, dual_iters):
@@ -333,6 +335,8 @@ def _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, raa0, raa, d
     ``raa0`` is the objective's convexity term and ``raa`` the constraints' (a scalar, or one per
     constraint): MMA uses one small constant for both, GCMMA raises them per function until the
     approximation is conservative (:func:`gcmma_step`).
+
+    Returns ``(x_new, lam)``: the minimiser and the dual solution, one multiplier per constraint.
     """
     span = np.maximum(xmax - xmin, 1e-12)
     m = int(np.size(g))
@@ -363,7 +367,7 @@ def _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, raa0, raa, d
         return np.array([np.sum(P[j] / (upp - xv) + Q[j] / (xv - low)) for j in range(m)]) - b, xv
 
     if m == 0:
-        return _primal(np.zeros(0), p0, q0, P, Q, low, upp, alpha, beta)
+        return _primal(np.zeros(0), p0, q0, P, Q, low, upp, alpha, beta), np.zeros(0)
 
     def bisect_coord(lam, j, iters=100):
         """Maximise the dual along ``lambda_j`` alone, exactly.
@@ -395,7 +399,8 @@ def _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, raa0, raa, d
         return lam
 
     if m == 1:
-        return dual_grad(bisect_coord(np.zeros(1), 0))[1]
+        lam = bisect_coord(np.zeros(1), 0)
+        return dual_grad(lam)[1], lam
 
     # Several constraints: cyclic coordinate ascent, each coordinate solved by the same exact
     # bisection. On a concave dual this converges monotonically, and unlike projected gradient it
@@ -409,7 +414,7 @@ def _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, raa0, raa, d
             lam = bisect_coord(lam, j)
         if np.max(np.abs(lam - prev)) <= 1e-12 * max(1.0, float(np.max(np.abs(lam)))):
             break
-    return dual_grad(lam)[1]
+    return dual_grad(lam)[1], lam
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +457,9 @@ class MMACallback(_Callback):
         self._gcmma = kinds == {True}
         self._values_fn = None
         self._not_conservative = 0
+        # The dual solution of the last subproblem, one multiplier per `jno.le` row (None before the
+        # first step). `jno.core` reports it beside the constraint values.
+        self.multipliers = None
 
     # -- hooks -------------------------------------------------------------
     def on_solve_begin(self, **kw):
@@ -643,6 +651,7 @@ class MMACallback(_Callback):
                 spec,
                 evaluate,
             )
+            self.multipliers = np.asarray(info["lam"], dtype=np.float64)
             if not info["conservative"]:
                 self._not_conservative += 1
                 if self._not_conservative == 1:
@@ -655,7 +664,7 @@ class MMACallback(_Callback):
                         "(Further such steps are counted and reported at the end.)"
                     )
         else:
-            x_new, self._low, self._upp = mma_subproblem(
+            x_new, self._low, self._upp, lam = mma_subproblem(
                 x,
                 None,
                 df0,
@@ -670,7 +679,9 @@ class MMACallback(_Callback):
                 self._k,
                 spec,
                 spec.dual_iters,
+                with_multipliers=True,
             )
+            self.multipliers = np.asarray(lam, dtype=np.float64)
         self._xold2, self._xold1 = self._xold1, x.copy()
         self._k += 1
 
