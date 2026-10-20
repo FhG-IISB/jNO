@@ -546,8 +546,8 @@ the time. Reach for a coarser mesh or a better preconditioner instead.
 | **Domain decomposition** | `schwarz` (overlapping Schwarz on a METIS partition, two-level by default; needs the `[metis]` extra — see [Overlapping Schwarz](solvers.md#overlapping-schwarz-jnoprecondschwarz)) |
 | **Incomplete factorization** | `ilu` (SuperLU `spilu`, complex-capable) |
 | **Block / saddle point** | `block_diag` / `triangular` (block / Schur), `saddle`, `lsc`, `pcd` |
-| **Composition** | `form` (weak-form auxiliary operator), `inner` (any solver as `M⁻¹`), `real_equivalent` (a complex system through its real block), `cached` |
-| **Precision** | `float32=True` on every constructor but `cached` — built and applied in single precision while the solve stays in double; see [Single precision](solvers.md#single-precision-inside-a-double-solve-float32true) |
+| **Composition** | `form` (weak-form auxiliary operator), `inner` (any solver as `M⁻¹`), `real_equivalent` (a complex system through its real block); `reuse=True` / `reuse=k` on any of them keeps its setup across solves |
+| **Precision** | `float32=True` on every constructor — built and applied in single precision while the solve stays in double; see [Single precision](solvers.md#single-precision-inside-a-double-solve-float32true) |
 
 **Process-wide solver settings** (`jno.setup`, or the same keys under `[jno]` in `.jno.toml`):
 `lu_stack=k` stacks `k` systems per call when a batched `jno.solve.lu()` runs on the default `device`

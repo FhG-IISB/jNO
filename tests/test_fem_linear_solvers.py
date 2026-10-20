@@ -381,7 +381,7 @@ def test_the_gate_rejects_asymmetry_well_below_a_physically_meaningful_one():
 
 
 def test_a_vector_fem_tangent_now_qualifies_as_symmetric():
-    """The case this exists for — a 3-D elasticity tangent, which no bitwise test accepts."""
+    """The case this exists for — a 3-D elasticity tangent."""
     nn = jno.np
     inner, grad, symg, trace, ident = nn.inner, nn.grad, nn.sym, nn.trace, nn.identity
     d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
@@ -397,7 +397,9 @@ def test_a_vector_fem_tangent_now_qualifies_as_symmetric():
     )
     J = fem._op.jacobian(jnp.asarray(fem.solve()))
     strict, kind, _out, _p = _perm_and_kinds(np.asarray(J.indices[:, 0]), np.asarray(J.indices[:, 1]), np.asarray(J.data))
-    assert strict == "general", "if this ever becomes bitwise symmetric the change is moot — check why"
+    # Bitwise symmetric since the element tangent averages each block with its transpose when the two agree
+    # within the symmetry gate (fem_native); before that only the tolerant test below accepted it.
+    assert strict == "symmetric"
     assert kind == "symmetric", "a vector FEM tangent must reach the LDLt path"
 
 

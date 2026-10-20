@@ -65,7 +65,9 @@ trailing two axes.
 C = dot(transpose(F), F)                 # right Cauchy-Green tensor
 t = dot(sigma, n)                        # traction, matrix · vector
 f_dot_v = inner(dot(F, f), vi)           # a pushed-forward vector against the test function
-``` The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
+```
+
+The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
 dropped. Every *other* additive piece of a form must carry exactly one test field, since the test
 field is what selects the block: a source term is `-f * vi`, never `-f`.
 

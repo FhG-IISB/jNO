@@ -728,15 +728,24 @@ def newton(
       3-D P1 ``-div((1+u^2) grad u)`` problem (RTX 3070): 2.3-3.4x faster than the matrix-free Newton at
       10k-87k DOF, same root. A problem with no assembled tangent (a residual-only operator) falls back to
       the matrix-free mode automatically.
-    * **``direct=False`` (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default BiCGStab,
-      or the ``linear=`` slot). No tangent is ever stored, so it is the choice when the assembled tangent
-      would not fit in memory. The previous default.
+    * **``direct=False`` (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default
+      Jacobi-BiCGStab, its diagonal from a diagonal-only pass of the assembler; or the ``linear=`` /
+      ``precond=`` slots, ``precond=jno.precond.jacobi()`` included). No tangent is ever stored, so it is the
+      choice when the assembled tangent would not fit in memory. The previous default.
     * **``direct=True`` (sparse-direct)** -- factorize the ASSEMBLED tangent each step with a sparse LU
       (or the ``linear=`` slot's direct solver). Robust on **indefinite / ill-conditioned** systems -- a
       Taylor-Hood velocity/pressure saddle, a stiff Carman-Kozeny phase-change drag -- where an iterative
       inner solve has no saddle-point preconditioner and stalls.
 
     All three are differentiable (implicit differentiation via ``lax.custom_root``).
+
+    **Inexact steps.** With an iterative linear step (the default Jacobi-BiCGStab, or ``cg``/``bicgstab``/
+    ``gmres``/``fgmres``/``minres``/``cocg`` in ``linear=``), on the assembled and the matrix-free path alike,
+    each step is solved to the Eisenstat-Walker forcing term (choice 2), not to ``inner_tol`` or the slot's
+    ``tol``. Newton still stops on its own residual, ``||r|| <= atol + rtol * ||r0||``, so the root is that
+    accurate and no more: ask for ``rtol``/``atol`` below the default to compare a solve tighter than 1e-8.
+    ``inner_tol`` applies where steps are exact -- a residual linear in the unknown, a direct linear step.
+
     ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
     to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning.
 
