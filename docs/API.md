@@ -43,6 +43,7 @@ sampling, and tensor tags.
         - tag
         - attach
         - attached
+        - mask
         - line
         - rect
         - polygon
