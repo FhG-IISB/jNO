@@ -16,6 +16,10 @@ set -uo pipefail
 
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-$PWD/.jax_cache}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
+# MPI (petsc4py, for jno.precond.hypre) runs single-process here, so UCX needs shared memory only.
+# Left to probe the network, MPI_Init fails on runners with an Azure MANA device
+# (`uct_iface_open(ud_verbs/mana_0:1) failed`), and under output capture the test file hangs.
+export UCX_TLS="${UCX_TLS:-self,sm}"
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 rm -f .coverage coverage.xml
