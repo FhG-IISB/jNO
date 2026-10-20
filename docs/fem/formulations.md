@@ -318,10 +318,8 @@ versus a pure linear assembly, in exchange for one march path rather than two.
 
 The coupled march is differentiable in a material parameter, exactly as the single-field one is: thread a
 `jno.np.parameter` into the form and `∂trajectory/∂θ` flows through the whole scan. The same holds for a
-coupled *steady* **nonlinear** form. What still refuses a runtime parameter is a coupled form that is
-**linear and carries no history**, because that one assembles as a matrix/rhs pair and the coupled linear
-assembly has no parametric route; anything on the residual path re-evaluates at the runtime args and is
-field-agnostic.
+coupled *steady* form, linear or nonlinear: a linear one (Stokes with a trainable viscosity) re-assembles
+its matrix/rhs pair at the runtime args, a nonlinear one re-evaluates its residual there.
 
 A constraint that `jno.fem` eliminates rather than assembles — a periodic tie `u(A) - u(B)`, an exact slip
 condition `n·u = 0`, the hanging nodes of a locally refined mesh — is applied at every step: the step solves
