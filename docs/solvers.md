@@ -629,6 +629,10 @@ such a menu are things you can write.
     object), an **int k** rebuilds every k-th solve (the cadence for a march whose operator values drift
     step by step). A solve whose preconditioner is kept compiles once and is reused.
 
+    It replaces `jno.precond.cached(spec)` and `spec.cached()`: `cached(spec)` is `spec` with `reuse=True`,
+    `cached(spec, refresh=k)` is `reuse=k`. `refresh=True` (rebuild when the operator's sparsity changes) and
+    `refresh=callable` (a custom key) have no equivalent; a kept setup is rebuilt only by `reuse=k`.
+
     The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and the
     viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, 2014, §9.2):
 
@@ -816,13 +820,19 @@ the same element loop, keeping each element block's diagonal entries (as deal.II
 at its own iterate. Each matrix-free step costs more than a sparse product (it re-runs the element kernel),
 so prefer the default while the tangent fits. All three modes are differentiable (implicit differentiation through `lax.custom_root`).
 
-**Each linear step is solved only as far as that step needs (inexact Newton).** With the assembled
-tangent, a Krylov linear step (the default Jacobi-BiCGStab, or any of `cg`, `bicgstab`, `gmres`, `fgmres`,
-`minres`, `cocg` in the `linear=` slot) is asked for the Eisenstat–Walker forcing term (Eisenstat & Walker,
+**Each linear step is solved only as far as that step needs (inexact Newton).** On the assembled tangent
+and on the matrix-free path alike, a Krylov linear step (the default Jacobi-BiCGStab, or any of `cg`,
+`bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` in the `linear=` slot) is asked for the Eisenstat–Walker
+forcing term (Eisenstat & Walker,
 *SIAM J. Sci. Comput.* 17 (1996) 16, choice 2) instead of its own `tol`: loose far from the root, tightening
 as Newton converges. The contract is unchanged — Newton stops on its own residual bound,
 `‖r‖ ≤ atol + rtol·‖r₀‖` — so the slot's `tol` no longer sets how far each step is solved. A direct linear
 step (`lu`, `dense`) is exact anyway, and a residual linear in the unknown keeps one exact step.
+
+A nonlinear root is therefore accurate to `atol + rtol·‖r₀‖` (default `1e-8` each) and no further: the last
+steps are no longer solved far past the bound the loop stops on. To compare a nonlinear solve below that —
+two routes to the same root, a convergence study — ask Newton for it:
+`fem.solve(nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-12))`.
 
 ```python
 fem.solve(linear=jno.solve.cg(), precond=jno.precond.amg(nullspace="rigid", reuse=True))  # forcing included
@@ -1105,6 +1115,11 @@ tells the two apart, and guessing wrong would apply a preconditioner you did not
 need eager preparation (`form`, which assembles an auxiliary operator) require `fem.solve(precond=...)`
 — a direct call has no owning FEM.
 
+A direct call to a Krylov solver also takes `rtol=` for that one call, overriding the spec's `tol`
+(`jno.solve.cg()(A, b, rtol=1e-4)`) — how Newton passes its forcing term. `cg`, `bicgstab`, `gmres`,
+`fgmres`, `minres` and `cocg` accept it; the other solvers raise a `TypeError` that says to set the
+tolerance on the spec.
+
 `solve_fn=` is the level below that: instead of a *slot*, you take the assembled system and return
 the answer. jNO does nothing to it — no firewall, no convergence gate — so it is the escape hatch for
 a solver that fits none of the shapes above:
@@ -1188,14 +1203,14 @@ How many iterations each linear solve took — the number that says whether a pr
 ```python
 fem.solve(nonlinear=jno.solve.newton(direct=False))
 fem.stats["linear_iterations"]
-# {'solves': 4, 'iterations': [52, 62, 59, 54], 'total': 227, 'max': 62,
-#  'by': ['the newton_krylov inner BiCGStab']}          # one count per Newton step
+# {'solves': 4, 'iterations': [...], 'total': ..., 'max': ...,
+#  'by': ['the newton_krylov inner Jacobi-BiCGStab']}   # one count per Newton step
 ```
 
 `iterations` lists each forward solve's count in the order they finished, and `transpose` the adjoint
 solves' when a gradient ran any. `breakdown: True` flags a BiCGStab that stopped on one. The default
 solve, `cg`, `bicgstab`, `minres`, `fgmres`, `cocg`, `chebyshev`, the matrix-free Newton's inner
-BiCGStab and the assembled-tangent Krylov all report. Upstream restarted `gmres` exposes no count and is
+Jacobi-BiCGStab and the assembled-tangent Krylov all report. Upstream restarted `gmres` exposes no count and is
 listed under `uncounted`; a direct factorisation reports `None`. Counts are recorded for an eager,
 steady, non-adaptive solve. A march records none per step — its compiled step makes no host call, and
 `fem.stats["march"]` is its record — and neither does a deferred node evaluated later under `jno.core`.

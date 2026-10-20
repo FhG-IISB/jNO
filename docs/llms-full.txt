@@ -499,7 +499,7 @@ Newton-Krylov diverges to NaN there.
 Preconditioners: `jacobi`, `chebyshev(degree=)`, `nystrom(rank=)` and `fsai(power=)` (**SPD only**),
 `amg(cycles=)`, `gmg()`, `ams`, `schwarz(parts=, overlap=)` (overlapping Schwarz; needs the `[metis]`
 extra), `form([terms], inner=)`, `inner(solver)`, `block_diag`/`triangular` (per-field over
-`fem.blocks`), `cached`. Every constructor but `cached` takes `float32=True`: the preconditioner is built
+`fem.blocks`); `reuse=True` / `reuse=k` on any of them keeps the setup across solves. Every constructor takes `float32=True`: the preconditioner is built
 and applied in single precision while the solve stays in double.
 
 **AMG is for repeated solves against the same operator** — build the hierarchy once, or an unbuilt

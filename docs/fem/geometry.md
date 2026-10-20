@@ -74,7 +74,9 @@ curvature term it does not carry. **Facet normals are still straight-facet**, so
 that affects radiation view factors, flux BCs and RCWA's field decomposition is unchanged by this.
 
 Note also that a curved map makes the integrand rational, so **no quadrature rule is exact** any more.
-The default degree is raised by 2 on curved cells and `jno.fem(quad_degree=...)` still overrides;
+The default degree is raised by 2 on curved cells and `jno.fem(quad_degree=...)` still overrides (an explicit degree is used
+as written, also below the default `2 × order`, and a degree below it is reported once with what it integrates
+inexactly);
 measured on the study above, refining the rule moves the answer by less than 0.01 %.
 
 ---
