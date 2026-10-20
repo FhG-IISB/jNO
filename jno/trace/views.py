@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from ..jnp_ops import concat
-from . import FunctionCall, Placeholder
+from . import FunctionCall, Placeholder, _matmul
 
 # ---------------------------------------------------------------------------
 # Stable spectral matrix functions (logm / expm / Aⁿ) on symmetric matrices.
@@ -920,12 +920,12 @@ class VectorView(_DelegatesToPlaceholder):
         if isinstance(other, MatrixView):
             return VectorView(
                 FunctionCall(
-                    lambda v, A: (v[..., jnp.newaxis, :] @ A)[..., 0, :],
+                    lambda v, A: _matmul(v[..., jnp.newaxis, :], A)[..., 0, :],
                     [self._expr, other._expr],
                     "vecmat",
                 )
             )
-        return FunctionCall(lambda a, b: a @ b, [self._expr, _unwrap(other)], "dot")
+        return FunctionCall(_matmul, [self._expr, _unwrap(other)], "dot")
 
 
 # ---------------------------------------------------------------------------
@@ -1685,16 +1685,16 @@ class MatrixView(_DelegatesToPlaceholder):
         if isinstance(other, VectorView):
             return VectorView(
                 FunctionCall(
-                    lambda A, v: (A @ v[..., jnp.newaxis])[..., 0],
+                    lambda A, v: _matmul(A, v[..., jnp.newaxis])[..., 0],
                     [self._expr, other._expr],
                     "matvec",
                 )
             )
-        return MatrixView(FunctionCall(lambda a, b: a @ b, [self._expr, _unwrap(other)], "matmul"))
+        return MatrixView(FunctionCall(_matmul, [self._expr, _unwrap(other)], "matmul"))
 
     def __rmatmul__(self, other):
         """``B @ A`` with a constant (array) or an expression on the left → MatrixView."""
-        return MatrixView(FunctionCall(lambda a, b: a @ b, [_unwrap(other), self._expr], "matmul"))
+        return MatrixView(FunctionCall(_matmul, [_unwrap(other), self._expr], "matmul"))
 
 
 # ---------------------------------------------------------------------------

@@ -98,6 +98,9 @@ def _rel(a, b):
 
 
 _FGMRES = dict(linear=jno.solve.fgmres(tol=1e-10))
+# Against the DEFAULT solve, which solves each Newton step only as accurately as that step needs (inexact
+# Newton): two roots to the same 1e-8 residual bound agree to that bound, not to round-off (1.7e-9 measured).
+_SAME_ROOT = 1e-7
 
 
 @pytest.mark.parametrize("periodic", [False, True], ids=["dirichlet", "periodic"])
@@ -107,7 +110,7 @@ def test_amg_in_a_steady_newton_matches_the_default_solve(periodic, builds):
     # anchor the oracle: P1 on a 16 x 16 grid (measured 2.2e-3 and 1.0e-2 max-norm)
     assert np.abs(ref - exact).max() < (2e-2 if periodic else 5e-3)
     got = _arr(fem.solve(precond=jno.precond.amg(), **_FGMRES))
-    assert _rel(got, ref) < 1e-9
+    assert _rel(got, ref) < _SAME_ROOT
     assert builds == [True], "one hierarchy for the whole Newton solve, from a concrete tangent"
 
 
@@ -121,7 +124,7 @@ def test_drivers_that_are_not_handed_a_tangent_build_from_the_assembled_one(nonl
         ref = _arr(fem.solve())
         builds.clear()
         got = _arr(fem.solve(precond=jno.precond.amg(), nonlinear=driver, **_FGMRES))
-        assert _rel(got, ref) < 1e-9
+        assert _rel(got, ref) < _SAME_ROOT
         assert builds == [True]
 
 
@@ -141,15 +144,15 @@ def test_ilu_is_built_once_the_same_way():
     """Any spec whose setup is host-side (scipy's incomplete LU here), not only AMG."""
     fem, _exact = _diffusion()
     ref = _arr(fem.solve())
-    assert _rel(_arr(fem.solve(precond=jno.precond.ilu(), **_FGMRES)), ref) < 1e-9
+    assert _rel(_arr(fem.solve(precond=jno.precond.ilu(), **_FGMRES)), ref) < _SAME_ROOT
 
 
 def test_a_rebuild_cadence_is_refused_not_ignored():
-    """``cached(amg(), refresh=k)`` would need the Newton ``while_loop`` cut into chunks; the setup is built
-    once, so a cadence that would silently never fire is refused by name."""
+    """``amg(reuse=k)`` would need the Newton ``while_loop`` cut into chunks; the setup is built once, so a
+    cadence that would silently never fire is refused by name."""
     fem, _exact = _diffusion()
-    with pytest.raises(NotImplementedError, match="refresh=3"):
-        fem.solve(precond=jno.precond.cached(jno.precond.amg(), refresh=3), **_FGMRES)
+    with pytest.raises(NotImplementedError, match="reuse=3"):
+        fem.solve(precond=jno.precond.amg(reuse=3), **_FGMRES)
 
 
 # --- steady Navier-Stokes: triangular((u, amg()), (p, pressure mass)) on the Picard-lagged tangent ---------------

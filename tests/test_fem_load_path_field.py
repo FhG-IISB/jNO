@@ -81,7 +81,8 @@ def _march(theta_of_Xtau, nstep):
             *[u(cb[0], cb[1], cb[2])[i] - 0.0 for i in range(3)],
         ]
     )
-    return np.asarray(fem.solve()), d
+    # The tests compare two marches at 1e-9, so Newton is asked for more than its 1e-8 default.
+    return np.asarray(fem.solve(nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-12))), d
 
 
 def test_load_path_field_matches_analytic_in_tau():

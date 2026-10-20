@@ -812,7 +812,7 @@ def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, t
     drag by 1e13, its PSPG ``tau`` by 1e9 and its stiffness by 1e6, and a setup frozen on the cold
     state stagnates at ~1e-4 however many Krylov iterations it is given.
 
-    ``jno.precond.cached(spec, refresh=k)`` already spells the remedy -- "rebuilds every k-th
+    ``reuse=k`` on the preconditioner already spells the remedy -- "rebuilds every k-th
     materialization -- the cadence policy for a ... transient march whose operator values drift step by
     step". A rebuild must happen OUTSIDE the trace, so honouring it means running ``ceil(n/k)`` scans
     instead of one, each starting from the carried state and re-frozen against it.

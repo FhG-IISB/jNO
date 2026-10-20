@@ -469,6 +469,10 @@ def _unpack_components(flat, node, axis=1):
     matrix through :func:`_symmetric_basis`, so every expression downstream sees an ordinary matrix."""
     vs = tuple(getattr(node, "value_shape", ()) or ())
     axis = axis % flat.ndim
+    if not _is_symmetric_field(node):
+        # The components are contiguous on `axis`: split them in place. Moving the axis to the end and
+        # back is the same values through two transposes, which under `jacfwd` XLA writes out.
+        return jnp.reshape(flat, flat.shape[:axis] + vs + flat.shape[axis + 1 :])
     moved = jnp.moveaxis(flat, axis, -1)
     if _is_symmetric_field(node):
         out = jnp.tensordot(moved, _symmetric_basis(vs[0], moved.dtype), axes=([-1], [0]))  # (..., n, n)
@@ -1699,12 +1703,18 @@ def _eval_integrand(domain, node, local):
                 g = jnp.stack([grads[..., d] for d in dims], axis=-1)
                 contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
                 return contracted[..., 0] if len(dims) == 1 else contracted
-            grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
             value_shape = getattr(node.target, "value_shape", ())
-            if len(value_shape) == 0:
-                return _drop_scalar_component_axis(grad_list)
-            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
-            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape[, len(dims)])
+            if len(value_shape) == 0 or len(dims) == 1:
+                grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
+                if len(value_shape) == 0:
+                    return _drop_scalar_component_axis(grad_list)
+                return _unpack_components(grad_list[0], node.target, axis=1)  # (n_quad, *value_shape)
+            # Every direction in ONE multiply-and-sum over the basis, already (n_quad, n_comp, n_dirs): the
+            # per-direction products, their stack and the layout moves between them were what `jacfwd`
+            # carried through the element tangent as separate writes.
+            g = grads[:, :, jnp.asarray(dims)] if list(dims) != list(range(grads.shape[-1])) else grads
+            flat = jnp.sum(g[:, :, None, :] * cell_sol[None, :, :, None], axis=1)
+            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape, len(dims))
 
         # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``.
         # For a NON-NODAL field the value-component cannot be differentiated directly, but
@@ -4487,6 +4497,37 @@ def bcoo_set_unit_diag(A, dofs):
 #: ``None`` = automatic (device-derived), ``False``/``0`` = no chunking, positive int = cells per chunk.
 #: A list rather than a plain global so the context manager can restore the previous value on nesting.
 _CHUNK_OVERRIDE = [None]
+#: Whether the ``jno.fem`` call being assembled was GIVEN a ``quad_degree`` (set and restored by ``jno.fem``,
+#: like ``_CHUNK_OVERRIDE``). Read by :func:`quad_floor`: a default is raised to what the field needs, a
+#: request is honoured as written.
+_QUAD_EXPLICIT = [False]
+#: Floors already reported during the current ``jno.fem`` call, so one request is reported once.
+_QUAD_REPORTED: set = set()
+
+
+def quad_floor(quad_degree: int, minimum: int, what: str) -> int:
+    """The quadrature degree to use where ``minimum`` integrates ``what`` exactly.
+
+    Without an explicit ``jno.fem(quad_degree=...)`` the degree is raised to ``minimum`` -- the default
+    then integrates a field's mass term exactly, which is what a form that cannot be inspected needs. An
+    explicit degree is used AS ASKED, also below ``minimum``: a form with only gradients of a P1 field is
+    exact at degree 0, and raising the request silently cost 4x the points. Below ``minimum`` it is
+    reported once, naming what is then integrated inexactly."""
+    q = int(quad_degree)
+    if q >= minimum:
+        return q
+    if not _QUAD_EXPLICIT[0]:
+        return int(minimum)
+    if (q, minimum, what) not in _QUAD_REPORTED:
+        _QUAD_REPORTED.add((q, minimum, what))
+        _log.warning(
+            f"jno.fem: quad_degree={q} is below {minimum}, the degree that integrates {what} exactly. "
+            f"Using {q} as asked: exact for a form of degree <= {q} (only gradients of a P1 field: degree 0), "
+            "inexact for such a term. Omit quad_degree for the default."
+        )
+    return q
+
+
 #: Set when an assembly consumed the override, so ``jno.fem`` can refuse an explicit ``chunk=`` that
 #: reached an assembler with no element loop instead of silently ignoring it.
 _CHUNK_CONSUMED = [False]
@@ -5609,6 +5650,113 @@ def compress_plan(indices):
         ):
             _PLAN_CACHE.popitem(last=False)
     return plan
+
+
+#: Raw triplets per batch in :func:`compress_plan_blocks`: ~24 bytes each of transient (an int64 key, the
+#: sort scratch of one batch), so ~200 MB whatever the mesh size.
+_PLAN_BATCH = 8 << 20
+
+
+def _block_len(blk) -> int:
+    kind, r, c = blk
+    return int(r.shape[0]) * int(r.shape[1]) * int(c.shape[1]) if kind == "outer" else int(r.shape[0])
+
+
+def _block_keys(blk, stride: int, batch: int):
+    """The int64 keys ``row * stride + col`` of one block, in its raw (flattened) order, ``batch`` at a time."""
+    kind, r, c = blk
+    if kind == "flat":
+        for s in range(0, r.shape[0], batch):
+            k = r[s : s + batch].astype(np.int64)
+            k *= stride
+            k += c[s : s + batch]
+            yield k
+        return
+    per = max(1, int(r.shape[1]) * int(c.shape[1]))
+    cells = max(1, batch // per)
+    for s in range(0, r.shape[0], cells):
+        k = r[s : s + cells, :, None].astype(np.int64) * stride + c[s : s + cells, None, :]
+        yield k.reshape(-1)
+
+
+def compress_plan_blocks(blocks):
+    """:func:`compress_plan` of a pattern given as BLOCKS, without ever materialising the raw triplets.
+
+    ``blocks`` lists, in raw order, ``("outer", rows, cols)`` -- per cell, every ``rows[e, a]`` against every
+    ``cols[e, b]``, flattened in ``(e, a, b)`` order: an element block -- or ``("flat", rows, cols)``, plain
+    triplets. Returns the same ``(idx, inverse32, nse)`` as ``compress_plan`` of the concatenated triplets,
+    bit for bit: the sorted unique keys are built a batch at a time, and the inverse is a ``searchsorted``
+    of each batch into them, written straight into the int32 array that is the plan's only per-triplet
+    output. The raw pattern of a 3-D P1 vector problem is ~280 triplets per DOF, and building it whole --
+    rows, columns, their stack, a host copy, an int64 key, its argsort and sorted copy -- was ~43 bytes
+    each: 18 GB of host memory at 1.5M DOFs, the build's peak. Here the transient is one batch.
+
+    Memoized like :func:`compress_plan`, on the blocks' content."""
+    blocks = [(k, np.ascontiguousarray(r, dtype=np.int32), np.ascontiguousarray(c, dtype=np.int32)) for k, r, c in blocks]
+    total = sum(_block_len(b) for b in blocks)
+    if total == 0:
+        return None
+    h = _hashlib.blake2b(digest_size=16)
+    for kind, r, c in blocks:
+        h.update(kind.encode())
+        h.update(np.asarray(r.shape + c.shape, np.int64).tobytes())
+        h.update(memoryview(r).cast("B"))
+        h.update(memoryview(c).cast("B"))
+    key = ("blocks", h.digest(), total)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        _PLAN_CACHE.move_to_end(key)
+        return hit
+    stride = max(int(c.max()) for _k, r, c in blocks if r.size and c.size) + 1
+    uniq = np.zeros(0, np.int64)
+    pending, n_pending = [], 0
+    for b in blocks:
+        for k in _block_keys(b, stride, _PLAN_BATCH):
+            u = np.unique(k)
+            pending.append(u)
+            n_pending += u.shape[0]
+            # merge when the pending uniques outgrow what is merged: amortised O(nse log nse), bounded memory
+            if n_pending > max(_PLAN_BATCH, uniq.shape[0]):
+                uniq = np.unique(np.concatenate([uniq, *pending]))
+                pending, n_pending = [], 0
+    if pending:
+        uniq = np.unique(np.concatenate([uniq, *pending]))
+    del pending
+    inv32 = np.empty(total, np.int32)
+    off = 0
+    for b in blocks:
+        for k in _block_keys(b, stride, _PLAN_BATCH):
+            inv32[off : off + k.shape[0]] = np.searchsorted(uniq, k)
+            off += k.shape[0]
+    idx = np.empty((uniq.shape[0], 2), np.int32)
+    idx[:, 0] = uniq // stride
+    idx[:, 1] = uniq % stride
+    plan = (idx, inv32, int(uniq.shape[0]))
+    if plan[0].nbytes + plan[1].nbytes <= _PLAN_CACHE_MAX_BYTES:
+        _PLAN_CACHE[key] = plan
+        while len(_PLAN_CACHE) > _PLAN_CACHE_MAX or (
+            len(_PLAN_CACHE) > 1 and sum(p[0].nbytes + p[1].nbytes for p in _PLAN_CACHE.values()) > _PLAN_CACHE_MAX_BYTES
+        ):
+            _PLAN_CACHE.popitem(last=False)
+    return plan
+
+
+def raw_pattern_from_blocks(blocks):
+    """The raw ``(n, 2)`` int32 triplet array the blocks stand for -- the uncompressed fallback only.
+
+    ``jnp``, so it also takes a TRACED block (a contact gap table inside a compiled march), which is exactly
+    when the host plan cannot be built and this fallback runs."""
+    rows, cols = [], []
+    for kind, r, c in blocks:
+        r, c = jnp.asarray(r).astype(jnp.int32), jnp.asarray(c).astype(jnp.int32)
+        if kind == "outer":
+            sh = (r.shape[0], r.shape[1], c.shape[1])
+            rows.append(jnp.broadcast_to(r[:, :, None], sh).reshape(-1))
+            cols.append(jnp.broadcast_to(c[:, None, :], sh).reshape(-1))
+        else:
+            rows.append(r.reshape(-1))
+            cols.append(c.reshape(-1))
+    return jnp.stack([jnp.concatenate(rows), jnp.concatenate(cols)], axis=1)
 
 
 def compress_eager(A):

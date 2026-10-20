@@ -60,7 +60,10 @@ def _effective_tol(tol, dtype, *, floor_factor=4.0):
     Floored at a small multiple of eps. **float64 is untouched** for any tolerance anyone passes in
     practice (the floor there is ~8.9e-16), so this changes no existing result.
     """
-    return float(max(float(tol), floor_factor * float(_EPS_OF(dtype))))
+    floor = floor_factor * float(_EPS_OF(dtype))
+    if isinstance(tol, jax.core.Tracer):  # a per-call tolerance (an inexact-Newton forcing term) is traced
+        return jnp.maximum(tol, floor)
+    return float(max(float(tol), floor))
 
 
 def _ident(v):
@@ -677,6 +680,14 @@ def cg_counted(matvec, b, *, M=None, x0=None, tol=1e-5, atol=0.0, maxiter=None):
     return x, k
 
 
+#: BiCGStab iterations per trip of its while_loop (see ``bicgstab_counted``): the convergence test -- a
+#: device-to-host copy and a sync on a GPU -- runs once per this many iterations. Measured (RTX 3070, fp64,
+#: Jacobi-BiCGStab on a 3-D elasticity tangent): 5-9% per iteration at 20k-100k DOFs, flat beyond 8; an
+#: iteration then costs its two SpMVs, which run at the memory bandwidth. At most m-1 frozen iterations
+#: are computed and discarded per solve.
+_CHECK_EVERY = [8]
+
+
 def bicgstab_counted(matvec, b, *, M=None, x0=None, tol=1e-5, atol=0.0, maxiter=None):
     """``jax.scipy.sparse.linalg.bicgstab``'s own loop, returning ``(x, k, broke)``.
 
@@ -695,7 +706,7 @@ def bicgstab_counted(matvec, b, *, M=None, x0=None, tol=1e-5, atol=0.0, maxiter=
         _x, r, *_, k, broke = v
         return (jnp.vdot(r, r).real > atol2) & (k < maxiter) & ~broke
 
-    def body(v):
+    def step(v):
         x, r, rhat, alpha, omega, rho, p, q, k, _broke = v
         rho_ = jnp.vdot(rhat, r)
         beta = rho_ / rho * alpha / omega
@@ -712,6 +723,19 @@ def bicgstab_counted(matvec, b, *, M=None, x0=None, tol=1e-5, atol=0.0, maxiter=
         r_ = jnp.where(exit_early, s, s - omega_ * t)
         broke = (omega_ == 0) | (alpha_ == 0) | (rho_ == 0)
         return x_, r_, rhat, alpha_, omega_, rho_, p_, q_, jnp.where(broke, k, k + 1), broke
+
+    m = int(_CHECK_EVERY[0])
+
+    def body(v):
+        # `m` iterations per trip of the loop: XLA runs a while_loop on the GPU by copying its condition
+        # to the host after every trip, a sync per iteration. Once an iteration of the block has converged
+        # or broken down the rest are FROZEN (computed, discarded), so the iterates, the count and the
+        # answer are the sequential loop's exactly.
+        for _ in range(m):
+            nxt = step(v)
+            live = cond(v)
+            v = tuple(jnp.where(live, n, o) for n, o in zip(nxt, v))
+        return v
 
     r0 = b - matvec(x0)
     one = jnp.asarray(1, b.dtype)

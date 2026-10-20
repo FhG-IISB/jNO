@@ -90,9 +90,9 @@ def test_amg_composes_as_preconditioner():
 
 
 def test_jaxamg_precond_constructs_and_is_cacheable():
-    p = jno.precond.jaxamg()
+    jno.precond.jaxamg()
     assert "jaxamg" in jno.precond.__all__
-    assert type(p.cached()).__name__ == "_Cached"  # inherits _Spec → fluent .cached() for free
+    assert type(jno.precond.jaxamg(reuse=True)).__name__ == "_Cached"  # reuse= on every constructor
 
 
 def test_jaxamg_precond_rejects_matrix_free():
@@ -122,6 +122,6 @@ def test_jaxamg_precond_solves_poisson():
     op, dense = _spd_operator(64)
     b = jnp.ones(op.shape[0])
     x_ref = jnp.linalg.solve(dense, b)
-    M = materialize_precond(jno.precond.jaxamg().cached(), PrecondContext(op, None))
+    M = materialize_precond(jno.precond.jaxamg(reuse=True), PrecondContext(op, None))
     x = jno.solve.cg(tol=1e-10)(op, b, M=M)
     assert jnp.max(jnp.abs(x - x_ref)) < 1e-6

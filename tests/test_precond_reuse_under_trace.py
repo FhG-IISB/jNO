@@ -1,4 +1,4 @@
-"""``jno.precond.cached(spec)`` keeps only a setup built from CONCRETE values.
+"""``reuse=True`` keeps only a setup built from CONCRETE values.
 
 A cache that first builds inside a trace -- the per-step Newton solve of a nonlinear march (a scan body), a
 solve under ``jax.jit`` or ``jax.grad`` -- gets an applier that closes over that trace's intermediate
@@ -67,25 +67,26 @@ def _eager(out):
     return np.asarray(out.fn() if hasattr(out, "fn") else out)
 
 
-@pytest.mark.parametrize("refresh", [False, True], ids=["frozen", "on_pattern_change"])
-def test_a_nonlinear_march_with_a_cached_preconditioner(refresh):
+def test_a_nonlinear_march_with_a_kept_preconditioner():
     # Compared at 1e-12, below the march Newton's own tolerance: both marches solve tightly.
     tight = jno.solve.newton(rtol=1e-13, atol=1e-15)
     ref = _eager(_heat_march().solve(nonlinear=tight))
-    spec = jno.precond.cached(jno.precond.jacobi(), refresh=refresh)
+    spec = jno.precond.jacobi(reuse=True)
     for _ in range(2):  # the second march must not meet the first one's tracers either
         got = _eager(_heat_march().solve(precond=spec, nonlinear=tight))
         assert np.abs(got - ref).max() <= 1e-12 * np.abs(ref).max()
     assert spec._applier is None, "a setup built inside the march's trace must not be kept"
 
 
-def test_repeated_steady_direct_newton_solves_with_a_cached_preconditioner():
+def test_repeated_steady_direct_newton_solves_with_a_kept_preconditioner():
     nl = jno.solve.newton(direct=True)
     ref = _eager(_steady_nonlinear().solve(nonlinear=nl))
-    spec = jno.precond.cached(jno.precond.jacobi())
+    spec = jno.precond.jacobi(reuse=True)
     for _ in range(3):
         got = _eager(_steady_nonlinear().solve(nonlinear=jno.solve.newton(direct=True), precond=spec))
-        assert np.abs(got - ref).max() <= 1e-12 * np.abs(ref).max()
+        # the Newton contract (rtol=1e-8 on the residual), not round-off: each preconditioned Krylov step is
+        # solved to the inexact-Newton forcing term, the reference by an exact LU
+        assert np.abs(got - ref).max() <= 1e-7 * np.abs(ref).max()
 
 
 def _parametric_poisson():
@@ -99,10 +100,10 @@ def _parametric_poisson():
     return jno.fem([k * (ub.x * vb.x + ub.y * vb.y) - vb, u(xw, yw) - 0.0])
 
 
-def test_one_cached_spec_across_jit_traces_and_grad():
+def test_one_kept_spec_across_jit_traces_and_grad():
     fem = _parametric_poisson()
     ref_node = fem.solve(linear=jno.solve.cg())
-    spec = jno.precond.cached(jno.precond.jacobi())
+    spec = jno.precond.jacobi(reuse=True)
     node = fem.solve(linear=jno.solve.cg(), precond=spec)
     k = jnp.array([2.0])
     ref = np.asarray(ref_node.fn(k))
@@ -115,7 +116,7 @@ def test_one_cached_spec_across_jit_traces_and_grad():
 
 
 def test_a_setup_built_from_concrete_values_is_still_kept():
-    spec = jno.precond.cached(jno.precond.jacobi())
+    spec = jno.precond.jacobi(reuse=True)
     d = jno.shape.rect(0, 0, 1, 1).structured(n=6).domain()
     _wall(d)
     u, v = d.fem_symbols(names=("u", "v"))

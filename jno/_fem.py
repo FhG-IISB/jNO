@@ -2564,9 +2564,17 @@ class FEM:
         import time as _time
 
         from .utils.logger import get_logger
+        from .utils.solver import newton_krylov as _nk
 
         _t0 = _time.perf_counter()
-        out = self._solve_inner(*args, **kwargs)
+        # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
+        # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
+        prev_linear = _nk._LINEAR_FORM[0]
+        _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
+        try:
+            out = self._solve_inner(*args, **kwargs)
+        finally:
+            _nk._LINEAR_FORM[0] = prev_linear
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
         return out
 
@@ -3634,16 +3642,20 @@ class FEM:
             # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
             # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
             # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
-            if solve_fn is None or (getattr(solve_fn, "cache_key", None) is not None and precond is None):
+            from .utils.solver.solver_api import precond_compiles
+
+            if solve_fn is None or (getattr(solve_fn, "cache_key", None) is not None and precond_compiles(precond)):
                 # jNO's own solvers (the default, or one composed from the slots) have a value identity, so
                 # the solve is compiled once and reused: evaluated lazily, every call re-staged the Newton
                 # `while_loop` and `custom_root` and ran each residual op by op -- measured 2.3 s per warm
-                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%.
+                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%. The composed solver's
+                # cache_key names the preconditioner's built state too (`compose_solver`).
                 return self._op.solve(solve_fn, values={}, **kwargs)
             # A user `solve_fn=` has no identity to cache on (a fresh lambda per call would recompile every
             # time) and may do things that need concrete values, so it keeps running eagerly. So does a
-            # `precond=`: it can hold state built from concrete values (a hierarchy, a Picard-lagged form
-            # refreshed from the entry iterate) that a cached compiled solve would silently keep stale.
+            # `precond=` holding state built from concrete values (a hierarchy rebuilt per solve, a
+            # Picard-lagged form refreshed from the entry iterate) that a cached compiled solve would keep
+            # stale -- see `precond_compiles`. A kept (`reuse=True`) one runs here once, to build.
             return self._op.solve(solve_fn, **kwargs).fn()
         if self._mode == "transient" and self.is_complex and not self._op.runtime_parameter_exprs:
             # Non-parametric COMPLEX transient: return the concrete complex trajectory eagerly, exactly as
@@ -3784,13 +3796,13 @@ class FEM:
                 compose_transient_step_solvers,
             )
 
-            # `cached(spec, refresh=k)` asks for a rebuild every k steps. A setup that cannot run under a
+            # `reuse=k` asks for a rebuild every k steps. A setup that cannot run under a
             # trace can only be rebuilt between scans, so the march is chunked at that cadence instead of
             # running as one scan; without it nothing changes.
             _cadence = None if precond is None else _refresh_cadence(precond)
             if _cadence is not None and time is not None:
                 raise NotImplementedError(
-                    f"fem.solve(precond=jno.precond.cached(..., refresh={_cadence})) asks for a rebuild every "
+                    f"fem.solve(precond=jno.precond.<spec>(reuse={_cadence})) asks for a rebuild every "
                     f"{_cadence} steps, but a jno.solve.theta(...)/exponential(...) scheme integrates the march "
                     "itself and is not chunked here, so the setup would silently never refresh. Drop the "
                     "cadence, or use the default scheme."
@@ -6747,7 +6759,7 @@ _TIED_CONSTANT_DOMAINS: List[Any] = []
 def fem(
     constraints: Any,
     *,
-    quad_degree: int = 2,
+    quad_degree: int | None = None,
     chunk: Any = None,
     _dd_overlap: bool = False,
 ) -> FEM:
@@ -6761,8 +6773,11 @@ def fem(
     from .utils.solver import fem_utils as _fn  # the chunk policy's home; both assemblers read it
 
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
+    prev_quad, prev_reported = _fn._QUAD_EXPLICIT[0], set(_fn._QUAD_REPORTED)
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
     _fn._CHUNK_CONSUMED[0] = False
+    _fn._QUAD_EXPLICIT[0] = quad_degree is not None
+    _fn._QUAD_REPORTED.clear()
     try:
         with _host_assembly_scope():
             out = _fem_impl(
@@ -6781,6 +6796,9 @@ def fem(
         return out
     finally:
         _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0] = prev, prev_consumed
+        _fn._QUAD_EXPLICIT[0] = prev_quad
+        _fn._QUAD_REPORTED.clear()
+        _fn._QUAD_REPORTED.update(prev_reported)
         while _TIED_CONSTANT_DOMAINS:
             _TIED_CONSTANT_DOMAINS.pop().__dict__.pop("_fem_tied_constants", None)
 
@@ -6809,7 +6827,7 @@ def _is_volume_region(domain, name: str) -> bool:
 def _fem_impl(
     constraints: Any,
     *,
-    quad_degree: int = 2,
+    quad_degree: int | None = None,
     _dd_overlap: bool = False,
 ) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
@@ -6820,8 +6838,11 @@ def _fem_impl(
         A residual expression or list of them. Weak terms (containing the test
         function) and essential conditions (``u(region) - g``) are auto-classified.
     quad_degree:
-        Quadrature degree (forwarded to the quadrature setup). The element type is
-        derived from the domain's dimension and the trial's ``order``.
+        Quadrature degree. Omitted (the default), it is ``2 x order`` of the field -- what integrates its
+        mass term exactly (6 for a Hermite beam, 12 for Argyris, ...). Given, it is used as written, also
+        below that: a form with only gradients of a P1 field is exact at degree 0, at a quarter of the
+        points in 3-D. A degree below the default is reported once with what it integrates inexactly.
+        The element type is derived from the domain's dimension and the trial's ``order``.
     chunk:
         Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
         device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
@@ -6861,7 +6882,11 @@ def _fem_impl(
     # so re-tracing them picks up the refined mesh automatically.
     _orig_constraints = list(constraints)
     _refuse_point_indexing(constraints)
-    _orig_fem_kwargs = {"quad_degree": quad_degree}
+    _orig_fem_kwargs = {"quad_degree": quad_degree}  # as GIVEN: a rebuild must keep "not given" (None)
+    from .utils.solver.fem_utils import quad_floor
+
+    if quad_degree is None:
+        quad_degree = 2  # raised per field below to what its mass term needs (`quad_floor`)
 
     # Gauge pins (`p.pin()`) remove a field's constant null space. Each lowers to a single-node
     # Dirichlet `p(node) - value`. A GaugePin is a bare marker, not a walkable expression, so it must
@@ -7902,7 +7927,7 @@ def _fem_impl(
                     "Re u = g with Im u = 0 but not a prescribed Im u. Use a real essential value and carry "
                     "the complex part in the operator or the source."
                 )
-            _cx_quad = max(quad_degree, 2 * _order_1d)
+            _cx_quad = quad_floor(quad_degree, 2 * _order_1d, f"a P{_order_1d} mass term")
             _cx_legs = [
                 assemble_fem_1d(
                     domain,
@@ -7945,7 +7970,11 @@ def _fem_impl(
                 # 2D/3D path); too few Gauss points would under-integrate the mass silently. The
                 # Hermite beam's stiffness ∫w''v'' is degree 2 in xi but its mass ∫wv is degree 6, so
                 # it needs the same rule a P3 Lagrange field would.
-                quad_degree=max(quad_degree, 6 if _hermite_1d else 2 * _order_1d),
+                quad_degree=quad_floor(
+                    quad_degree,
+                    6 if _hermite_1d else 2 * _order_1d,
+                    "a Hermite beam's mass term" if _hermite_1d else f"a P{_order_1d} mass term",
+                ),
                 order=_order_1d,
                 space="Hermite" if _hermite_1d else "Lagrange",
                 rotation_bcs=rotation_bcs,
@@ -7958,7 +7987,7 @@ def _fem_impl(
         return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs_1d))
 
     order = _infer_order(constraints)
-    quad_degree = max(quad_degree, 2 * order)
+    quad_degree = quad_floor(quad_degree, 2 * order, f"a P{order} mass term")
 
     # ---- coupled / mixed multi-field -> block (multi-variable) assembly ----
     if multifield:
@@ -7979,7 +8008,9 @@ def _fem_impl(
     # ---- single field: element defaults to the field order (P1->TRI3/TET4,
     # P2->TRI6/TET10); a higher-order field bumps the quadrature for exactness. ----
     element_type = _element_for(domain.dimension, order)
-    quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
+    quad_degree = quad_floor(
+        quad_degree, 2 * order, f"a P{order} mass term"
+    )  # factory uses 2*degree+1; bump to the field's order
 
     # ---- build IR with explicit regions, then detect transient vs steady. This is done so the
     # native path can route from the IR alone: split each weak constraint into additive sub-terms
@@ -8940,7 +8971,11 @@ def _assemble_second_order_time(
     _warn_second_order_float32()
 
     # ---- quadrature setup (the native assembler owns the FE state; no problem object) ----
-    quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
+    from .utils.solver.fem_utils import quad_floor
+
+    quad_degree = quad_floor(
+        quad_degree, 2 * order, f"a P{order} mass term"
+    )  # factory uses 2*degree+1; bump to the field's order
 
     # ---- split each volume term by its temporal order: 2 -> mass M2, 1 -> damping C, 0 -> stiffness/load ----
     def _strip(coeff, times):

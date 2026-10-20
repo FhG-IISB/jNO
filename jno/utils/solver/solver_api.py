@@ -322,18 +322,24 @@ _GATE_RTOL = 1e-4
 #: convergence contract to check and :func:`residual_gate` must stand down. It is a property of the
 #: CALL, not of the solver: the same ``cg()`` spec gated as an outer solve is ungated as an inner one.
 _GATE_SUSPENDED = False
+#: Set with the gate unless the call is a solve in its own right (a Newton step): a preconditioner
+#: application is an inner iteration, so its count is not a solve's count either.
+_RECORD_SUSPENDED = False
 
 
 @contextlib.contextmanager
-def gate_suspended():
-    """Run a solver call as a preconditioner application: inexact by design, so not gated."""
-    global _GATE_SUSPENDED
-    prev = _GATE_SUSPENDED
+def gate_suspended(*, record=False):
+    """Run a solver call ungated: a preconditioner application, inexact by design. ``record=True`` for a
+    solve that is inexact on purpose but still a solve (an inexact-Newton step): its iteration count still
+    reaches ``fem.stats``."""
+    global _GATE_SUSPENDED, _RECORD_SUSPENDED
+    prev = _GATE_SUSPENDED, _RECORD_SUSPENDED
     _GATE_SUSPENDED = True
+    _RECORD_SUSPENDED = not record
     try:
         yield
     finally:
-        _GATE_SUSPENDED = prev
+        _GATE_SUSPENDED, _RECORD_SUSPENDED = prev
 
 
 #: Convergence failures seen by a TRACED :func:`residual_gate`, drained by :func:`raise_if_gate_failed`
@@ -477,7 +483,7 @@ def record_iterations(k, who: str, *, side: str = "forward", broke=None):
 
     Cost: the callback is a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU) per solve, measured on the default
     Jacobi-BiCGStab -- +7-11% on a 790-DOF solve, unmeasurable (1.000x) at 46,691 DOFs."""
-    if _GATE_SUSPENDED or not _RECORD_ITERATIONS.value:
+    if _RECORD_SUSPENDED or not _RECORD_ITERATIONS.value:
         return
     if k is None:
         # Still at RUN time: this is usually called while a solve is traced, and a solve traced (the
@@ -630,8 +636,12 @@ class LinearSolver:
         direct: bool = False,
         key: Any = None,
         settings: Optional[dict] = None,
+        accepts_rtol: bool = False,
     ):
         self._fn = fn
+        # A Krylov solver takes a per-call relative tolerance (``solver(A, b, rtol=eta)``, traced allowed) in
+        # place of its configured ``tol``: the inexact-Newton forcing term (``newton_direct``) asks for it.
+        self.accepts_rtol = accepts_rtol
         self.name = name
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
         self.direct = direct  # a direct solver ignores x0 and takes no preconditioner
@@ -647,7 +657,7 @@ class LinearSolver:
         if self.tolerance is None and isinstance(key, tuple) and key and isinstance(key[0], float):
             self.tolerance = key[0]
 
-    def __call__(self, A, b, *, M=None, x0=None):
+    def __call__(self, A, b, *, M=None, x0=None, rtol=None):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
         b = jnp.asarray(b).reshape(-1)
         if self.direct and M is not None:
@@ -662,8 +672,13 @@ class LinearSolver:
         # preconditioner that is not the one asked for.
         if M is not None and hasattr(M, "materialize"):
             M = materialize_precond(M, PrecondContext(op, None))
+        if rtol is not None and not self.accepts_rtol:
+            raise TypeError(
+                f"jno.solve.{self.name} takes no per-call rtol= -- only the Krylov solvers (cg, bicgstab, gmres, "
+                "fgmres, minres, cocg) do; configure its tolerance on the spec instead."
+            )
         prior = len(_GATE_FAILURES)
-        x = self._fn(op, b, M=M, x0=x0)
+        x = self._fn(op, b, M=M, x0=x0) if rtol is None else self._fn(op, b, M=M, x0=x0, rtol=rtol)
         # An EAGER call is a boundary where a Python exception has somewhere to land, so drain the
         # traced gate here. The block is the point: dispatch is asynchronous, so `residual_gate`'s
         # callback has typically not run yet when this returns, and the refusal it raises surfaces
@@ -988,7 +1003,7 @@ class PrecondContext:
         nj = sj.stop - sj.start
         return LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=diag_fn, dense_fn=dense_fn, shape=(ni, nj))
 
-    def assemble(self, terms, *, quad_degree: int = 2) -> LinearOperator:
+    def assemble(self, terms, *, quad_degree: int | None = None) -> LinearOperator:
         import jax.experimental.sparse as jsp
 
         from ... import fem as _fem_entry
@@ -1181,6 +1196,31 @@ def _compilable(linear, precond) -> bool:
     return precond is None or (getattr(precond, "traceable", False) and getattr(precond, "key", None) is not None)
 
 
+class _StateKeyed:
+    """A preconditioner as a STATIC jit argument, compared by structure (``repr`` + state signature) -- its
+    built arrays travel as a separate traced argument (see :func:`precond_state`)."""
+
+    __slots__ = ("spec", "_k")
+
+    def __init__(self, spec):
+        self.spec = spec
+        _specs, states, tags = precond_state(spec)
+        self._k = (repr(spec), getattr(spec, "key", None) if not _specs else None, state_signature(states, tags))
+
+    def __eq__(self, other):
+        return isinstance(other, _StateKeyed) and self._k == other._k
+
+    def __hash__(self):
+        return hash(self._k)
+
+
+@partial(jax.jit, static_argnames=("linear", "keyed"))
+def _composed_compiled_stated(A, b, x0, states, *, linear, keyed):
+    specs = precond_state(keyed.spec)[0]
+    with bound_state(specs, states):
+        return _composed_compiled.__wrapped__(A, b, x0, linear=linear, precond=keyed.spec)
+
+
 @partial(jax.jit, static_argnames=("linear", "precond"))
 def _composed_compiled(A, b, x0, *, linear, precond):
     """The slot-composed linear solve, COMPILED -- and cached by ``jax.jit`` across ``fem.solve()``
@@ -1359,7 +1399,11 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
             return composed(A, b)
         rhs = jnp.asarray(rhs).reshape(-1)
         mat = op.bcoo if op.bcoo is not None else A
-        x = _composed_compiled(mat, rhs, x0_flat, linear=linear, precond=precond)
+        _states = precond_state(precond)[1]
+        if _states:  # built arrays as arguments: a rebuilt spec of the same shapes reuses the program
+            x = _composed_compiled_stated(mat, rhs, x0_flat, _states, linear=linear, keyed=_StateKeyed(precond))
+        else:
+            x = _composed_compiled(mat, rhs, x0_flat, linear=linear, precond=precond)
         return _maybe_residual_check(op, rhs, x, getattr(linear, "name", "solve"))
 
     return composed_jit
@@ -1381,8 +1425,10 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     so the assembly happens once even though materialization runs per iteration),
     ``inner(<krylov>)``, ``chebyshev`` (bounds by power iteration on the JVP), a **pre-built**
     ``amg`` (``spec.build(A_representative)``), and ``block_diag``/``triangular`` over those.
-    What cannot: specs that need the assembled matrix -- ``jacobi`` (no diagonal on a matvec),
-    ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own targeted errors when
+    ``jacobi`` composes there too when the assembler provides a diagonal-only pass (the native FEM
+    assembler does): the matrix-free Newton hands its operator ``diag J(u)`` without the matrix.
+    What cannot: specs that need the assembled matrix -- ``lu``/``dense`` inner solvers on sub-blocks,
+    or ``jacobi`` on a residual with no diagonal pass -- these raise their own targeted errors when
     materialized.
 
     An unbuilt ``amg`` (any leaf whose setup cannot run under a trace) composes anyway: it is frozen
@@ -1431,20 +1477,24 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             prepare_precond(precond, fem)  # aux assembly now, NOT inside the traced Newton loop
 
     def _inner_with(pc):
-        def inner(operator, rhs):
+        def inner(operator, rhs, rtol=None):
             # The direct Newton hands us the ASSEMBLED tangent, the matrix-free one a JVP callable.
             # ``LinearOperator`` is the uniform handle over both, so the same composed inner serves
             # either -- an assembled operator keeps its ``.bcoo``/``.diag()``, which is the whole
             # point of routing a direct solver here.
             n = rhs.shape[0]
+            # A matrix-free tangent may carry its assembled DIAGONAL (`diag_fn`, the assembler's diagonal-only
+            # pass): `jno.precond.jacobi()` then works without the matrix.
             op = (
-                LinearOperator.from_matvec(operator, shape=(n, n))
+                LinearOperator.from_matvec(operator, shape=(n, n), diag_fn=getattr(operator, "diag_fn", None))
                 if callable(operator) and not hasattr(operator, "shape")
                 else LinearOperator(operator)
             )
             M = materialize_precond(pc, PrecondContext(op, fem)) if pc is not None else None
-            return solver(op, rhs, M=M)
+            # ``rtol``: the inexact-Newton forcing term for this step, taken by the Krylov solvers only.
+            return solver(op, rhs, M=M) if rtol is None else solver(op, rhs, M=M, rtol=rtol)
 
+        inner.accepts_rtol = bool(getattr(solver, "accepts_rtol", False))
         return inner
 
     inner = None if solver is None else _inner_with(precond)
@@ -1481,6 +1531,8 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     # ...but only ``direct=True`` cannot run WITHOUT one. A caller that cannot assemble the tangent (the
     # compiled load-path contact march, whose gap tables are traced) may still use the others matrix-free.
     _composed.needs_jacobian = getattr(nonlinear, "direct", False) is True
+    # The matrix-free Newton takes no matrix, but preconditions with the assembler's DIAGONAL when there is one.
+    _composed.wants_jacobian_diag = getattr(nonlinear, "direct", None) is False
     # An over-relaxed driver steps past its sub-solve's answer and needs the box projector to stay
     # feasible; the `bounds` wrapper is the only thing that owns one.
     _composed.wants_project = bool(getattr(nonlinear, "wants_project", False))
@@ -1494,12 +1546,16 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     # fresh one on every call, so anything caching a compiled solve against `id(solve_fn)` would miss
     # every time and re-stage -- which is exactly what happened, and cost the parametric solve its whole
     # advantage. The specs' reprs describe the solver completely, which is what "the same solver" means.
-    _composed.cache_key = ("nl", repr(nonlinear), repr(linear), repr(precond))
+    # ...and by the SHAPE of what its preconditioner has built: the arrays themselves are arguments of the
+    # compiled solve (`precond_state`), so a spec rebuilt between solves reuses the program with its new arrays.
+    _composed.precond = precond
+    _ps = precond_state(precond)
+    _composed.cache_key = ("nl", repr(nonlinear), repr(linear), repr(precond), state_signature(_ps[1], _ps[2]))
     return _composed
 
 
 def _uncached(spec):
-    """Strip ``cached(...)`` wrappers from a spec tree, keeping the structure around them.
+    """Strip ``reuse=`` wrappers from a spec tree, keeping the structure around them.
 
     A march that honours a cadence rebuilds once per chunk, so the wrapper's own "every k-th
     materialization" counter must not apply on top: with chunks of k steps it would rebuild every k
@@ -1516,12 +1572,12 @@ def _uncached(spec):
 
 
 def _refresh_cadence(precond):
-    """Steps between preconditioner rebuilds, from ``jno.precond.cached(spec, refresh=k)``.
+    """Steps between preconditioner rebuilds, from ``reuse=k`` on the preconditioner.
 
     That spelling already documents this exact policy -- "an ``int k`` rebuilds every k-th
     materialization -- the cadence policy for a Newton loop or transient march whose operator values
-    drift step by step" -- so honouring it needs no new argument anywhere. ``None`` (or ``refresh``
-    True/False, which are the shape/never policies) leaves the march as a single scan.
+    drift step by step" -- so honouring it needs no new argument anywhere. ``reuse=False`` / ``True``
+    (rebuild every solve / keep it) leave the march as a single scan.
     """
     for spec in _specs_in(precond):
         r = getattr(spec, "refresh", None)
@@ -1542,6 +1598,96 @@ def _specs_in(spec):
         yield from _specs_in(child)
     for pair in getattr(spec, "pairs", ()) or ():
         yield from _specs_in(pair[1] if isinstance(pair, tuple) else pair)
+
+
+# ---- a built preconditioner's arrays as ARGUMENTS of a compiled solve -----------------------------------
+# A compiled solve that closed over a built preconditioner baked its arrays in as constants: a spec rebuilt
+# between solves (an optimisation loop refreshing its AMG) then either hit the old program and was silently
+# ignored, or -- keyed by identity -- compiled a new program per rebuild (~7 s at 100k DOFs) and kept every
+# one with its hierarchy until the card ran out of memory. Passed as arguments instead, a rebuild with the
+# same shapes reuses the program with the new arrays. The state is bound by POSITION in the spec tree: the
+# program holds the spec objects of its first trace, a later call hands in another object's arrays.
+_STATE_OVERRIDE: dict = {}  # id(spec) -> its traced state, while a compiled solve is being traced
+
+
+def precond_state(precond):
+    """``(specs, states, tags)`` for every spec in ``precond`` holding BUILT arrays a compiled solve takes as
+    arguments -- a built ``amg``'s levels, a kept (``reuse=``) spec's stored applier. ``tags`` name what is
+    not in the arrays' shapes (a kept applier's computation), so two states share a program only when their
+    computation is the same. A spec with state covers what it wraps."""
+    specs, states, tags = [], [], []
+
+    def walk(s):
+        get = getattr(s, "_state", None)
+        st = get() if callable(get) else None
+        if st is not None:
+            specs.append(s)
+            states.append(st)
+            tag = getattr(s, "_state_tag", None)
+            tags.append(tag() if callable(tag) else None)
+            return
+        if getattr(s, "spec", None) is not None:
+            walk(s.spec)
+        for pr in getattr(s, "pairs", None) or ():
+            walk(pr[1] if isinstance(pr, tuple) else pr)
+
+    if precond is not None:
+        walk(precond)
+    return specs, states, tags
+
+
+def state_signature(states, tags) -> tuple:
+    """What a compiled solve's program depends on in ``states``: tree structure, leaf shapes and dtypes, tags."""
+    leaves, tree = jax.tree_util.tree_flatten(states)
+    return (str(tree), tuple((tuple(jnp.shape(x)), str(jnp.result_type(x))) for x in leaves), tuple(tags))
+
+
+class bound_state:
+    """``with bound_state(specs, states):`` -- each spec materializes from ``states`` (traced) while inside."""
+
+    def __init__(self, specs, states):
+        self.pairs = list(zip(specs, states))
+
+    def __enter__(self):
+        self.prev = [(id(s), _STATE_OVERRIDE.get(id(s), _MISS_STATE)) for s, _ in self.pairs]
+        for s, st in self.pairs:
+            _STATE_OVERRIDE[id(s)] = st
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self.prev:
+            if v is _MISS_STATE:
+                _STATE_OVERRIDE.pop(k, None)
+            else:
+                _STATE_OVERRIDE[k] = v
+        return False
+
+
+_MISS_STATE = object()
+
+
+def precond_compiles(spec) -> bool:
+    """Whether a solve holding ``spec`` may be compiled once and reused across ``fem.solve`` calls.
+
+    Not when anything in the tree holds state built from CONCRETE values that a reused program would keep
+    stale: a ``refresh_from`` hook (a Picard-lagged form, re-assembled from each solve's entry iterate) or
+    a leaf set up on the host per solve (a plain ``amg``/``ilu``: "(re)built at each solve"). Everything
+    else is materialized inside the trace from the operator it is handed (``jacobi``), or is frozen on
+    request and already built (``amg(reuse=True)`` after its first solve, which runs eagerly to build) --
+    and a compiled solve reusing it is exactly what was asked for."""
+
+    def ok(s) -> bool:
+        if getattr(s, "refresh_from", None) is not None:
+            return False
+        child = getattr(s, "spec", None)
+        if child is not None and getattr(s, "traceable", False):
+            return True  # a frozen cache that has built: no setup left, whatever it wraps
+        pairs = getattr(s, "pairs", None) or ()
+        if child is None and not pairs:
+            return bool(getattr(s, "traceable", True))
+        return (child is None or ok(child)) and all(ok(p[1] if isinstance(p, tuple) else p) for p in pairs)
+
+    return spec is None or ok(spec)
 
 
 class _FrozenMarchPrecond:
@@ -1704,7 +1850,7 @@ def _freeze_precond_for_newton(precond, fem, u0, jacobian=None):
 
     The frozen setup does not follow the tangent as Newton moves. That is always CORRECT (a preconditioner
     changes the Krylov convergence speed, never the root Newton converges to); how much speed it costs
-    depends on how far the tangent drifts from ``x0``. A ``cached(spec, refresh=k)`` cadence cannot be
+    depends on how far the tangent drifts from ``x0``. A ``reuse=k`` cadence cannot be
     honoured inside the single ``while_loop`` (rebuilding every k Newton iterations would need the loop cut
     into chunks), so it is refused rather than silently ignored.
     """
@@ -1713,7 +1859,7 @@ def _freeze_precond_for_newton(precond, fem, u0, jacobian=None):
     cadence = _refresh_cadence(precond)
     if cadence is not None:
         raise NotImplementedError(
-            f"fem.solve(precond=jno.precond.cached(..., refresh={cadence})): a steady nonlinear solve builds "
+            f"fem.solve(precond=jno.precond.<spec>(reuse={cadence})): a steady nonlinear solve builds "
             "this preconditioner ONCE, from the tangent at the initial guess, because the Newton loop is a "
             f"single lax.while_loop -- a rebuild every {cadence} iterations cannot happen inside it, and would "
             "silently never fire. Drop the cadence (the frozen setup is always correct, only slower as the "

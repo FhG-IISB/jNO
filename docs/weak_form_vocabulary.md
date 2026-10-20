@@ -51,7 +51,23 @@ f_dot_v = sum(f[k] * vi[k] for k in range(3))        # components, built one at 
 ```
 
 Both assemble to the same operator (to assembly round-off — the products reduce in a different
-order). The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
+order).
+
+`dot(a, b)` is the per-point product NumPy's `dot` would give each point: vector·vector (a
+scalar), matrix·vector, vector·matrix or matrix·matrix, a scaling when one side is a scalar. Which one
+it is follows from each operand's tensor rank, read from the form (a field's `value_shape`, `grad`
+over several coordinates, a view, a constant such as `identity(3)`); an operand whose rank the form
+does not carry — an opaque `function(...)`, a single-coordinate derivative — or a tensor of rank above 2
+raises and names the explicit spelling. `matmul(a, b)` and `a @ b` are the matrix product on the
+trailing two axes.
+
+```python
+C = dot(transpose(F), F)                 # right Cauchy-Green tensor
+t = dot(sigma, n)                        # traction, matrix · vector
+f_dot_v = inner(dot(F, f), vi)           # a pushed-forward vector against the test function
+```
+
+The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
 dropped. Every *other* additive piece of a form must carry exactly one test field, since the test
 field is what selects the block: a source term is `-f * vi`, never `-f`.
 

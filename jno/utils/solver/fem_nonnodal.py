@@ -520,13 +520,19 @@ def assemble_fem_nonnodal(
     dm_tables = {i: (dm_.jax_tables(), int(dm_.ndof_local)) for i, dm_ in dofmaps.items() if not dm_.is_diagonal}
 
     # --- vertex-DOF families (the M(cell) DOF-transform path): Hermite (C0) and Argyris (C1) ---
+    from .fem_utils import quad_floor
+
     hermite_ref = None
     if has_hermite:
-        hs = hermite_triangle(quad_degree=max(quad_degree, 6))  # cubic mass needs a degree-6 rule
+        hs = hermite_triangle(
+            quad_degree=quad_floor(quad_degree, 6, "a Hermite cubic mass term")
+        )  # cubic mass needs a degree-6 rule
         hermite_ref = (jnp.asarray(hs.ref_values), jnp.asarray(hs.ref_grads), jnp.asarray(hs.ref_hess))
     argyris_ref = None
     if has_argyris:
-        as_ = argyris_triangle(quad_degree=max(quad_degree, 12))  # quintic mass needs a degree-10+ rule
+        as_ = argyris_triangle(
+            quad_degree=quad_floor(quad_degree, 12, "an Argyris quintic mass term")
+        )  # quintic mass needs a degree-10+ rule
         argyris_ref = (
             jnp.asarray(as_.ref_values),
             jnp.asarray(as_.ref_grads),
@@ -535,7 +541,9 @@ def assemble_fem_nonnodal(
         )
     morley_ref = None
     if has_morley:
-        ms_ = morley_triangle(quad_degree=max(quad_degree, 4))  # quadratic mass needs a degree-4 rule
+        ms_ = morley_triangle(
+            quad_degree=quad_floor(quad_degree, 4, "a Morley quadratic mass term")
+        )  # quadratic mass needs a degree-4 rule
         morley_ref = (
             jnp.asarray(ms_.ref_values),
             jnp.asarray(ms_.ref_grads),

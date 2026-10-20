@@ -381,7 +381,7 @@ def test_the_gate_rejects_asymmetry_well_below_a_physically_meaningful_one():
 
 
 def test_a_vector_fem_tangent_now_qualifies_as_symmetric():
-    """The case this exists for — a 3-D elasticity tangent, which no bitwise test accepts."""
+    """The case this exists for — a 3-D elasticity tangent."""
     nn = jno.np
     inner, grad, symg, trace, ident = nn.inner, nn.grad, nn.sym, nn.trace, nn.identity
     d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
@@ -397,7 +397,9 @@ def test_a_vector_fem_tangent_now_qualifies_as_symmetric():
     )
     J = fem._op.jacobian(jnp.asarray(fem.solve()))
     strict, kind, _out, _p = _perm_and_kinds(np.asarray(J.indices[:, 0]), np.asarray(J.indices[:, 1]), np.asarray(J.data))
-    assert strict == "general", "if this ever becomes bitwise symmetric the change is moot — check why"
+    # Bitwise symmetric since the element tangent averages each block with its transpose when the two agree
+    # within the symmetry gate (fem_native); before that only the tolerant test below accepted it.
+    assert strict == "symmetric"
     assert kind == "symmetric", "a vector FEM tangent must reach the LDLt path"
 
 
@@ -424,7 +426,10 @@ def test_pardiso_agrees_with_the_iterative_default_on_a_symmetric_tangent():
     ref = np.asarray(fem.solve())
     got = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True), linear=jno.solve.lu(backend="pardiso")))
     assert np.abs(ref).max() > 1e-6
-    assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-8, "the LDLt factorization changed the answer"
+    # Both are Newton roots to the same residual bound (rtol = atol = 1e-8). The default solves each Newton
+    # step only as accurately as that step needs (inexact Newton), so the two agree to that bound times the
+    # conditioning (8e-8 measured), not to round-off; a factorization that CHANGED the answer is far outside.
+    assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-6, "the LDLt factorization changed the answer"
 
 
 def test_lu_host_reuse_false_does_not_retain_a_factorization():

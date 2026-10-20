@@ -154,15 +154,20 @@ def test_adaptive_matches_a_fine_uniform_reference():
 # --------------------------------------------------------------------------------------------------
 def test_replay_over_the_frozen_schedule_reproduces_the_pilot():
     from jno.utils.solver.history_march import run_history_march
+    from jno.utils.solver.newton_krylov import exact_steps
 
-    fem = _burst_march(9)
-    adaptive = np.asarray(fem.solve(tau=jno.solve.adaptive(limit=LIMIT)))
-    sched = np.asarray(fem._tau_schedule)
+    # Exact Newton steps: the pilot and the replay reach each step from different guesses, so with forced
+    # steps their roots agree only to the Newton tolerance (1e-8), not to the 1e-10 asserted here.
+    with exact_steps():
+        fem = _burst_march(9)
+        adaptive = np.asarray(fem.solve(tau=jno.solve.adaptive(limit=LIMIT)))
+        sched = np.asarray(fem._tau_schedule)
 
     # Replay the SAME schedule through the ordinary fixed-grid march by declaring it as the grid.
     fem_replay = _burst_march(len(sched))
     fem_replay.domain._time_points = sched  # the frozen schedule, marched as if it had been declared
-    raw = np.asarray(run_history_march(fem_replay))
+    with exact_steps():
+        raw = np.asarray(run_history_march(fem_replay))
     resampled = np.asarray(
         jax.vmap(lambda c: jnp.interp(jnp.linspace(0.0, 1.0, 9), jnp.asarray(sched), c), in_axes=1, out_axes=1)(
             jnp.asarray(raw)

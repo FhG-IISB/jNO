@@ -18,6 +18,7 @@ No external solver dependency (no optimistix / lineax).
 
 from __future__ import annotations
 
+import contextlib
 import math
 
 import jax
@@ -456,7 +457,7 @@ def _with_gmres_rescue(mv, rhs, x, *, tol):
     eps = float(jnp.finfo(rhs.dtype).eps)
     rel = jnp.linalg.norm(mv(x) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
     return jax.lax.cond(
-        rel < max(10.0 * tol, 1e4 * eps),
+        rel < jnp.maximum(10.0 * tol, 1e4 * eps),  # `tol` may be a traced forcing term
         lambda: x,
         lambda: _scaled_gmres(mv, rhs, tol=tol, atol=0.0, restart=30)[0],
     )
@@ -554,6 +555,36 @@ def _check_anderson(anderson):
     return anderson
 
 
+class _DiagMatvec:
+    """A matvec ``v -> J v`` that also carries ``diag_fn`` (``() -> diag J``), for a composed preconditioner
+    on the matrix-free Newton: :func:`~jno.utils.solver.solver_api.compose_nonlinear_solve_fn` hands it to
+    ``LinearOperator.from_matvec(..., diag_fn=)``, which is what ``jno.precond.jacobi()`` reads."""
+
+    def __init__(self, mv, diag_fn):
+        self._mv, self.diag_fn = mv, diag_fn
+
+    def __call__(self, v):
+        return self._mv(v)
+
+
+def _jacobi_bicgstab(mv, b, d, *, tol, maxit, raw=False):
+    """Jacobi-preconditioned BiCGStab on a matvec, from an assembled diagonal ``d`` (traced ``tol`` allowed).
+
+    Wrapped in ``custom_linear_solve`` with the same solve as transpose (``J^T`` has the same diagonal), unless
+    ``raw``: then it is the bare iteration, for a caller that does its own wrapping."""
+    from .krylov import bicgstab_counted
+    from .solver_api import record_iterations
+
+    dinv = 1.0 / jnp.where(d != 0, d, 1.0)
+
+    def solve(m, rhs):
+        x, k, broke = bicgstab_counted(m, rhs, tol=tol, atol=0.0, maxiter=int(maxit), M=lambda v: dinv * v)
+        record_iterations(k, "the newton_krylov inner Jacobi-BiCGStab", broke=broke)
+        return x
+
+    return solve(mv, b) if raw else jax.lax.custom_linear_solve(mv, b, solve, transpose_solve=solve)
+
+
 def newton_krylov(
     residual_fn,
     u0,
@@ -569,6 +600,7 @@ def newton_krylov(
     ls_max=25,
     ls_c=1e-4,
     anderson=0,
+    jacobian_diag=None,
 ):
     """Root-find ``residual_fn(u) = 0`` from guess ``u0``; differentiable w.r.t. any value
     ``residual_fn`` closes over. Drop-in for the ``(residual_fn, u0) -> u`` solver contract.
@@ -589,7 +621,14 @@ def newton_krylov(
     viscosity spans several orders of magnitude); backtracking finds a safe step automatically, so
     the same driver converges without hand-tuning ``damping``. Off by default (behaviour unchanged).
     The line search is a bounded ``jax.lax.while_loop`` -- differentiability is untouched, since the
-    implicit-diff tangent solve depends only on the converged root, not the path taken to it."""
+    implicit-diff tangent solve depends only on the converged root, not the path taken to it.
+
+    ``jacobian_diag`` (``u -> diag J(u)``, the assembler's diagonal-only pass) preconditions the inner solve
+    without assembling the tangent: the default inner solve becomes Jacobi-BiCGStab, and a composed
+    ``precond=jno.precond.jacobi()`` finds the diagonal on its operator. Each Newton step uses the diagonal
+    at its own iterate; the implicit-diff tangent solve uses the one at ``u0`` (a preconditioner changes how
+    fast a solve converges, never what it converges to). Each step is solved only to the Eisenstat-Walker
+    forcing term, as in :func:`newton_direct`, when the inner solve takes a per-call tolerance."""
     # residual functions can hand back a plain numpy array for concrete inputs; coerce so the
     # jax.lax.custom_root primitive only ever sees JAX values.
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)
@@ -615,9 +654,28 @@ def newton_krylov(
 
     anderson = _check_anderson(anderson)
 
-    def _update(f, u):
+    from .solver_api import gate_suspended
+
+    accepts = linear_solve is None or bool(getattr(linear_solve, "accepts_rtol", False))
+    forcing = _FORCING[0] and not _LINEAR_FORM[0] and accepts
+
+    def _solve_at(u, jvp, rhs, eta=None):
+        """One Newton step's linear solve, preconditioned by ``diag J(u)`` when the assembler provides it."""
+        if jacobian_diag is None and eta is None:
+            return inner_step(jvp, rhs)
+        if linear_solve is None:
+            tol = inner_tol if eta is None else eta
+            if jacobian_diag is None:
+                return _linsolve(jvp, rhs, tol=tol, maxit=inner_maxit, gate_forward=False)
+            return _jacobi_bicgstab(jvp, rhs, jacobian_diag(u), tol=tol, maxit=inner_maxit)
+        dfn = None if jacobian_diag is None else (lambda: jacobian_diag(u))
+        kw = {} if eta is None else {"rtol": eta}
+        lin = lambda mv, b: linear_solve(_DiagMatvec(mv, dfn), b, **kw)  # noqa: E731
+        return jax.lax.custom_linear_solve(jvp, rhs, lin, transpose_solve=lin)
+
+    def _update(f, u, eta=None):
         ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
-        delta = inner_step(jvp, -ru)
+        delta = _solve_at(u, jvp, -ru, eta)
         alpha = _backtrack(f, u, delta, jnp.linalg.norm(ru)) if line_search else damping
         return u + alpha * delta
 
@@ -631,22 +689,50 @@ def newton_krylov(
         r0n = jnp.linalg.norm(r_start)
 
         def cond(state):
-            _, r, k = state
+            _, r, k = state[:3]
             return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
 
         def body(state):
-            u, _r, k = state
-            u = _update(f, u)
-            return u, f(u), k + 1
+            u, r, k, rn_prev, eta_prev = state
+            rn = jnp.linalg.norm(r)
+            eta = None
+            if forcing:  # inexact Newton, as in `newton_direct`
+                eta = _ew_forcing(rn, rn_prev, eta_prev, k, atol + rtol * r0n)
+            with gate_suspended(record=True):  # inexact by design; the outer residual is the contract
+                u = _update(f, u, eta)
+            return u, f(u), k + 1, rn, jnp.asarray(eta_prev if eta is None else eta, rn.dtype)
 
-        u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+        init = (x0, r_start, 0, r0n, jnp.asarray(_EW_ETA0, r0n.dtype))
+        u, r, k, _rn, _eta = jax.lax.while_loop(cond, body, init)
         # Diagnostics ride out of custom_root as AUX (never differentiated): the step count for
         # `fem.stats`, and the two norms the convergence check would otherwise re-evaluate.
         # The count as a FLOAT: custom_root's JVP gives integer aux an int zero tangent, not float0, and
         # then rejects it ("Custom JVP rule must produce primal and tangent outputs ... expecting float0").
         return u, (k.astype(r0n.dtype), jnp.linalg.norm(r), r0n)
 
-    tangent_solve = lambda g, y: inner_tangent(g, y)
+    if jacobian_diag is None:
+        tangent_solve = lambda g, y: inner_tangent(g, y)
+    elif linear_solve is None:
+        # Jacobi-BiCGStab at the start iterate, gated: this solve IS the gradient
+        from .solver_api import residual_gate
+
+        _d0 = lambda: jacobian_diag(u0)  # noqa: E731
+
+        def tangent_solve(g, y):
+            def _s(mv, b):
+                x = _jacobi_bicgstab(mv, b, _d0(), tol=inner_tol, maxit=inner_maxit, raw=True)
+                return residual_gate(mv, b, x, "the newton_krylov inner Jacobi-BiCGStab", side="transpose")
+
+            return jax.lax.custom_linear_solve(g, y, _s, transpose_solve=_s)
+    else:
+        # the slot solver, handed the diagonal INSIDE the callbacks: `custom_linear_solve` passes them its own
+        # matvec, so a diagonal attached to `g` itself would not reach them
+        _d0 = lambda: jacobian_diag(u0)  # noqa: E731
+        _who = "the newton_krylov inner linear_solve slot"
+        _lin0 = lambda mv, b: linear_solve(_DiagMatvec(mv, _d0), b)  # noqa: E731
+        tangent_solve = lambda g, y: jax.lax.custom_linear_solve(  # noqa: E731
+            g, y, _gated(_lin0, _who, "forward"), transpose_solve=_gated(_lin0, _who, "transpose")
+        )
     root, (steps, rn, r0n) = jax.lax.custom_root(f0, u0, solve, tangent_solve, has_aux=True)
     # Checked OUTSIDE custom_root: everything inside `solve` is traced, so an in-loop guard could
     # never concretise. Here `root` is concrete whenever the caller was eager, which is exactly when
@@ -730,6 +816,45 @@ def newton_default(
 #: solve stops at this relative residual unless the outer target needs more. A carried tangent measured
 #: ~1e-3 contraction per step on the flows that motivated it; 1e-2 and 1e-4 ran within noise of it there.
 _CHORD_FORCING_FLOOR = 1e-3
+
+#: Internal A/B switch (tests): ``[False]`` solves every fresh-tangent Newton step's linear system to the
+#: slot's own tolerance instead of the Eisenstat-Walker forcing term (see ``newton_direct``).
+_FORCING = [True]
+#: Set by ``fem.solve`` for the duration of a solve whose residual is LINEAR in the unknown (a linear form
+#: marched for its step history): one exact Newton step solves it, and forcing would take ~4 assemblies.
+_LINEAR_FORM = [False]
+
+
+@contextlib.contextmanager
+def exact_steps():
+    """Solve every Newton step's linear system to the slot's own tolerance while inside, without forcing.
+
+    For loops that compare successive solves of the same step (the contact rounds): a forced root is
+    only as good as ``atol + rtol ||r0||``, so two solves differ by that much, and where the solution is
+    near zero -- a load path's first step -- that difference is all of ``|du|/|u|`` and the rounds never
+    agree. Read when the driver is traced; the compiled-solve cache is keyed on it.
+    """
+    prev = _FORCING[0]
+    _FORCING[0] = False
+    try:
+        yield
+    finally:
+        _FORCING[0] = prev
+
+
+#: Eisenstat & Walker (SIAM J. Sci. Comput. 17 (1996) 16), choice 2: eta_k = GAMMA (||r_k||/||r_k-1||)^ALPHA,
+#: safeguarded by GAMMA eta_k-1^ALPHA when that is larger than 0.1, started at ETA_0, never above ETA_MAX.
+_EW_GAMMA, _EW_ALPHA, _EW_ETA0, _EW_ETA_MAX = 0.9, 2.0, 0.1, 0.1
+
+
+def _ew_forcing(rn, rn_prev, eta_prev, k, target):
+    """The forcing term of step ``k``: Eisenstat-Walker choice 2 with its safeguard, never tighter than half
+    the outer ``target`` over the current residual (the last step need not out-solve the bound the loop
+    stops on), never above ``_EW_ETA_MAX``."""
+    ew = _EW_GAMMA * (rn / jnp.maximum(rn_prev, 1e-300)) ** _EW_ALPHA
+    safe = _EW_GAMMA * eta_prev**_EW_ALPHA
+    ew = jnp.where(k == 0, _EW_ETA0, jnp.where(safe > 0.1, jnp.maximum(ew, safe), ew))
+    return jnp.clip(jnp.maximum(ew, 0.5 * target / jnp.maximum(rn, 1e-300)), 0.0, _EW_ETA_MAX)
 
 
 def newton_direct(
@@ -844,20 +969,34 @@ def newton_direct(
             _u, r, k = state[:3]
             return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
 
+        forcing = _FORCING[0] and not _LINEAR_FORM[0] and getattr(linear_solve, "accepts_rtol", False)
+
         def body(state):
-            u, r, k = state
+            u, r, k, rn_prev, eta_prev = state
+            rn = jnp.linalg.norm(r)
             # The Newton STEP is not gated (see `_step_and_tangent`: the outer residual is the contract,
             # judged by `_convergence_check`); only custom_root's tangent below is. Gating it here also put a
             # host callback inside this while_loop, which JAX's rematerialisation cannot partially evaluate:
             # reverse mode through a checkpointed time march died on an AssertionError in its loop rules.
-            with gate_suspended():
-                delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
-            alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
+            # Iteration counts still record (only in an eager steady solve, never in a march).
+            with gate_suspended(record=True):
+                if forcing:
+                    # INEXACT Newton: solve each step only as far as it pays. Eisenstat-Walker choice 2 tracks
+                    # how fast the residual is falling, so the steps tighten as quadratic convergence sets in;
+                    # never tighter than half the outer target over the current residual (the last step need
+                    # not out-solve the bound the loop stops on). The loop still stops on the TRUE residual.
+                    eta = _ew_forcing(rn, rn_prev, eta_prev, k, atol + rtol * r0n)
+                    delta = linear_solve(J_fwd(u), -r, rtol=eta)
+                else:
+                    eta = eta_prev
+                    delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
+            alpha = _backtrack(u, delta, rn) if line_search else damping
             u = u + alpha * delta
-            return u, f_fwd(u), k + 1
+            return u, f_fwd(u), k + 1, rn, jnp.asarray(eta, rn.dtype)
 
         if not reuse:
-            u, r, k = jax.lax.while_loop(cond, body, (x0, r_start, 0))
+            init = (x0, r_start, 0, r0n, jnp.asarray(_EW_ETA0, r0n.dtype))
+            u, r, k, _rn, _eta = jax.lax.while_loop(cond, body, init)
             return u, k, k, jnp.linalg.norm(r), r0n, None  # a fresh tangent (one factorization) every step
 
         def body_reuse(state):
@@ -865,7 +1004,7 @@ def newton_direct(
             # the last refresh; `fresh` says whether it was assembled at THIS iterate.
             u, r, k, J, fresh, nfact = state
             rn = jnp.linalg.norm(r)
-            with gate_suspended():  # as in `body`: no host callback inside the loop (reverse mode, remat)
+            with gate_suspended(record=True):  # as in `body`: no gate callback inside the loop (reverse mode, remat)
                 if getattr(linear_solve, "accepts_rtol", False):
                     # INEXACT Newton (Dembo, Eisenstat & Steihaug, SIAM J. Numer. Anal. 19 (1982) 400): a
                     # step on a kept tangent contracts the residual by its tangent's contraction, not by the

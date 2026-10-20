@@ -34,6 +34,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from .newton_krylov import exact_steps
+
 
 def _roll_buffer(buf, nv):
     """Push the just-computed state ``nv`` (n_cell, n_quad, *shape) into slot 0 — the next step's
@@ -335,6 +337,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
     # The schedule is a PIECEWISE-CONSTANT function of the parameters (perturb one infinitesimally and
     # the same steps are accepted), so the gradient over a frozen schedule is the true derivative almost
     # everywhere -- the same contract `adapt=` already makes for a frozen mesh sequence.
+    @exact_steps()  # the rounds compare successive solves: see `newton_krylov.exact_steps`
     def _march_eager_contact(spec, param_args):
         """The load path with a contact search PER LOAD STEP.
 

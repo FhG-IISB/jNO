@@ -42,6 +42,10 @@ def _x64():
 LOAD = 0.1  # the coupling: a constant nodal load on every row
 G = 0.5
 E = 1e-9
+#: How exactly a wall holds: its residual row IS u - g, and the default Newton stops once the residual norm is
+#: below atol + rtol ||r(u0)|| (a few 1e-8 here) -- its steps are inexact, so it does not overshoot that. The
+#: defect this file pins moved a wall by the coupling itself (0.1).
+WALL = 1e-7
 
 
 def _load(u):
@@ -88,11 +92,11 @@ def test_a_parameter_valued_wall_holds_under_a_coupling(nonlinear):
     fem = _steady(jno.np.parameter((1,), name="g"), nonlinear)
     got = _array(fem.solve(), G)
     left, right = _walls(fem)
-    assert np.abs(got[right] - G).max() < 1e-10, "the coupling shifted the parameter-valued wall"
-    assert np.abs(got[left] - 0.25).max() < 1e-10
+    assert np.abs(got[right] - G).max() < WALL, "the coupling shifted the parameter-valued wall"
+    assert np.abs(got[left] - 0.25).max() < WALL
 
     twin = _array(_steady(G, nonlinear).solve())  # the constant wall: the path that was always right
-    assert np.abs(got - twin).max() <= 1e-9
+    assert np.abs(got - twin).max() <= 1e-6  # two solves, each within the Newton tolerance
 
     free = _array(_steady(G, nonlinear, coupled=False).solve())
     assert np.abs(got - free).max() > 1e-3, "the coupling must still act on the free rows"
@@ -119,8 +123,8 @@ def test_a_tau_ramped_wall_holds_under_a_coupling_on_the_load_path():
     ys = _array(fem.solve())
     left, right = _walls(fem)
     for k, tau in enumerate([0.0, 0.5, 1.0]):
-        assert np.abs(ys[k, right] - (0.5 + tau)).max() < 1e-10, f"step {k}: the coupling shifted the ramped wall"
-        assert np.abs(ys[k, left] - 0.25).max() < 1e-10
+        assert np.abs(ys[k, right] - (0.5 + tau)).max() < WALL, f"step {k}: the coupling shifted the ramped wall"
+        assert np.abs(ys[k, left] - 0.25).max() < WALL
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -153,8 +157,8 @@ def test_a_time_varying_wall_holds_under_a_coupling(nonlinear):
     ys = _array(fem.solve())
     left, right = _walls(fem)
     for k, t in [(1, 0.1), (2, 0.2)]:
-        assert np.abs(ys[k, right] - (0.5 + t)).max() < 1e-10, f"step {k}: the coupling shifted g(x, t)"
-        assert np.abs(ys[k, left] - 0.25).max() < 1e-10
+        assert np.abs(ys[k, right] - (0.5 + t)).max() < WALL, f"step {k}: the coupling shifted g(x, t)"
+        assert np.abs(ys[k, left] - 0.25).max() < WALL
 
 
 @pytest.mark.parametrize("nonlinear", [False, True], ids=["linear", "nonlinear"])
@@ -162,9 +166,9 @@ def test_a_parameter_valued_wall_holds_under_a_coupling_on_a_transient(nonlinear
     fem = _transient(jno.np.parameter((1,), name="g"), nonlinear)
     ys = _array(fem.solve(), G)
     _, right = _walls(fem)
-    assert np.abs(ys[1:, right] - G).max() < 1e-10, "the coupling shifted the parameter-valued wall"
+    assert np.abs(ys[1:, right] - G).max() < WALL, "the coupling shifted the parameter-valued wall"
     twin = _array(_transient(G, nonlinear).solve())
-    assert np.abs(ys - twin).max() <= 1e-9
+    assert np.abs(ys - twin).max() <= 1e-6  # two solves, each within the Newton tolerance
 
 
 # ---------------------------------------------------------------------------------------------------

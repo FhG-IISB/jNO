@@ -898,8 +898,131 @@ def where(condition, x, y) -> FunctionCall:
 # ============================================================================
 
 
-dot = _binary(jnp.dot)
-matmul = _binary(jnp.matmul)
+def _small_matmul(a, b):
+    from .utils.solver.small_linalg import small_matmul  # lazy: jno.utils.solver imports this module's users
+
+    return small_matmul(a, b)
+
+
+_small_matmul.__name__ = "matmul"
+_small_matmul.__doc__ = jnp.matmul.__doc__
+
+#: FunctionCall names whose result has the rank of their first operand.
+_RANK_PRESERVING = {"transpose", "sym", "antisym", "inv", "matmul", "dot"}
+
+
+def _value_rank(x):
+    """Tensor rank of ``x`` per point (its TRAILING axes), or ``None`` when the trace does not say.
+
+    Read from the trace, never from a runtime shape: inside a kernel ``(4, 3)`` may be four 3-vectors or
+    one 4x3 matrix. Known: a field's ``value_shape``, a ``grad`` over several coordinates (one more than its
+    target), a typed view, a constant (its ``ndim``; ``identity`` is a matrix), elementwise arithmetic (the
+    larger rank), ``transpose``/``sym``/``inv`` (unchanged), ``trace``/``det`` (two fewer) and ``dot``/``matmul``
+    of known ranks. Anything else -- an opaque ``function``, a single-coordinate derivative -- is ``None``."""
+    from .trace import BinaryOp, Literal
+    from .trace.views import MatrixView, ScalarView, VectorView
+
+    if isinstance(x, VectorView):
+        return 1
+    if isinstance(x, MatrixView):
+        return 2
+    if isinstance(x, ScalarView):
+        return 0
+    if not isinstance(x, Placeholder):
+        return jnp.ndim(x)
+    if isinstance(x, Literal):
+        return jnp.ndim(x.value)
+    if isinstance(x, Jacobian):
+        r = _value_rank(x.target)
+        return r + 1 if r is not None and len(x.variables) > 1 else None
+    if isinstance(x, BinaryOp):
+        if x.op not in ("+", "-", "*", "/"):
+            return None
+        ra, rb = _value_rank(x.left), _value_rank(x.right)
+        return None if ra is None or rb is None else builtins.max(ra, rb)
+    if isinstance(x, FunctionCall):
+        name = getattr(x, "_name", "")
+        if name == "identity":
+            return 2
+        if name == "dot" and getattr(x, "_value_rank", None) is not None:
+            return x._value_rank
+        if name in _RANK_PRESERVING and x.args:
+            return _value_rank(x.args[0])
+        if name in ("trace", "det") and x.args:
+            r = _value_rank(x.args[0])
+            return r - 2 if r is not None and r >= 2 else None
+        return None
+    shape = getattr(x, "value_shape", None)  # trial / test functions, state fields
+    return len(shape) if shape is not None else None
+
+
+def _per_point_dot(a, b, ra: int, rb: int):
+    """``dot`` of one point's rank-``ra`` and rank-``rb`` tensors (``<= 2``), over the trailing axes, with
+    the leading batch axes aligned like :func:`inner` aligns them: a test function's extra local-basis
+    axis is matched by a singleton inserted after the other operand's batch axes."""
+    a, b = jnp.asarray(a), jnp.asarray(b)
+    if ra == 0 or rb == 0:
+        return a * b
+    pa, pb = a.ndim - ra, b.ndim - rb
+    if pa < pb:
+        a = jnp.reshape(a, a.shape[:pa] + (1,) * (pb - pa) + a.shape[pa:])
+    elif pb < pa:
+        b = jnp.reshape(b, b.shape[:pb] + (1,) * (pa - pb) + b.shape[pb:])
+    if ra == 1 and rb == 1:
+        return jnp.sum(a * b, axis=-1)
+    from .utils.solver.small_linalg import small_matmul  # lazy: see _small_matmul
+
+    if ra == 2 and rb == 1:
+        return small_matmul(a, b[..., None])[..., 0]
+    if ra == 1 and rb == 2:
+        return small_matmul(a[..., None, :], b)[..., 0, :]
+    return small_matmul(a, b)
+
+
+def dot(x, y):
+    """Dot product of per-point tensors: vector·vector (a scalar), matrix·vector, vector·matrix,
+    matrix·matrix, or a scaling when one side is a scalar -- NumPy's ``dot`` for each point.
+
+    In a weak form every operand carries leading batch axes (quadrature points, a test function's basis
+    axis) and the tensor sits in the trailing ones, the convention of ``transpose`` and ``trace``. Which
+    product is meant depends on each operand's tensor rank, which a shape alone cannot tell, so it is read
+    from the trace (see :func:`_value_rank`). An operand whose rank the trace does not carry, or a tensor of
+    rank above 2, raises: write ``inner(a, b)`` (vectors, any contraction count), ``matmul(a, b)`` /
+    ``a @ b`` (matrices) or ``einsum`` instead. Two plain arrays (no trace, no batch axes) are ``jnp.dot``."""
+    if not any(isinstance(v, (Placeholder,) + _view_types()) for v in (x, y)):
+        return FunctionCall(jnp.dot, [x, y], name="dot")
+    ra, rb = _value_rank(x), _value_rank(y)
+    if ra is None or rb is None or ra > 2 or rb > 2:
+        which = " and ".join(
+            f"{n} (rank {'unknown' if r is None else r})"
+            for n, r in (("the first operand", ra), ("the second operand", rb))
+            if r is None or r > 2
+        )
+        raise ValueError(
+            f"jno.np.dot: cannot tell which product is meant -- {which}. dot picks vector·vector, "
+            "matrix·vector or matrix·matrix from each operand's tensor rank, read from the trace (a field's "
+            "value_shape, grad over several coordinates, a view, a constant), and this operand does not carry "
+            "one. Write the product explicitly: inner(a, b) for vectors, matmul(a, b) or a @ b for matrices, "
+            "or einsum('...ij,...j->...i', A, v)."
+        )
+    call = _attach_coords(
+        FunctionCall(lambda a, b, _ra=ra, _rb=rb: _per_point_dot(a, b, _ra, _rb), [_u(x), _u(y)], name="dot"),
+        [x, y],
+    )
+    call._value_rank = builtins.max(ra, rb) if 0 in (ra, rb) else ra + rb - 2  # a scaling keeps the rank
+    return call
+
+
+def _view_types():
+    from .trace.views import _VIEW_TYPES
+
+    return _VIEW_TYPES
+
+
+#: ``jnp.matmul`` semantics; a small per-point product (``M·N·K`` up to 8x8x8) is a broadcast multiply and
+#: a sum rather than a ``dot_general``, which a GPU runs as a padded batched GEMM once the points are batched
+#: (see :func:`jno.utils.solver.small_linalg.small_matmul`). Same values up to summation order.
+matmul = _binary(_small_matmul)
 cross = _binary(jnp.cross)
 
 

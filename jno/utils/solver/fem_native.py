@@ -70,6 +70,7 @@ from .fem_lagrange import (
 from .fem_utils import (
     _CHUNK_CONSUMED,
     _CHUNK_OVERRIDE,
+    _block_len,
     _cell_region_mask,
     _collect_region_mask_names,
     _collect_tag_mask_names,
@@ -87,7 +88,9 @@ from .fem_utils import (
     cell_chunk,
     compress_eager,
     compress_plan,
+    compress_plan_blocks,
     elem_map,
+    raw_pattern_from_blocks,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .sharding import element_mesh as _element_mesh
@@ -989,6 +992,25 @@ def _seeded_piece(piece):
     return res
 
 
+def _symmetrise_own_block(Ke, lo: int, hi: int):
+    """``Ke`` with its square test-field block ``Ke[:, lo:hi]`` replaced by ``(B + Bᵀ)/2`` when the block's
+    two triangles already agree to within the solver's symmetry gate (``linear._SYM_ULPS`` of its largest
+    entry), else unchanged. Float addition commutes, so the average is BITWISE symmetric: what LDLᵀ and
+    the eigs guard read. The gate is the solver's own, chosen between measured populations (a tangent's
+    round-off at 0.3-0.5 ulps, the weakest genuine asymmetry -- a 1e-12 advection term -- at ~191), so a
+    non-symmetric form is never averaged. Off-diagonal field blocks pair with ANOTHER kernel's block and
+    are left alone; a complex block is too (its symmetry is Hermitian, not this)."""
+    from .linear import _SYM_ULPS
+
+    if Ke.ndim != 2 or hi - lo != Ke.shape[0] or jnp.iscomplexobj(Ke):
+        return Ke
+    B = Ke[:, lo:hi]
+    gap = jnp.max(jnp.abs(B - B.T))
+    scale = jnp.max(jnp.abs(B))
+    sym = jnp.where(gap <= _SYM_ULPS * jnp.finfo(B.dtype).eps * scale, 0.5 * (B + B.T), B)
+    return Ke.at[:, lo:hi].set(sym)
+
+
 class _FusedVolumeTerms(tuple):
     """Additive volume sub-terms that share ONE test field and ONE region mask, assembled as one kernel.
 
@@ -1386,16 +1408,18 @@ def assemble_fem_native(
 
     # On a CURVED cell the map is not affine, so `1/detJ` makes the integrand RATIONAL and no rule is
     # exact any more -- the degree stops being a correctness setting and becomes an accuracy one. Two
-    # extra degrees by default, with `jno.fem(quad_degree=...)` still overriding. Measured on the disk
+    # extra degrees by default; an explicit `jno.fem(quad_degree=...)` is used as written. Measured on the disk
     # rate study this changes the answer by <0.01% (7.6721e-06 -> 7.6719e-06 at degree 8), so it is
     # insurance against a form whose coefficients vary more sharply, not a fix for anything observed.
-    _qd = (quad_degree + 2) if _nonaffine else quad_degree
+    from .fem_utils import _QUAD_EXPLICIT, quad_floor
+
+    _qd = (quad_degree + 2) if (_nonaffine and not _QUAD_EXPLICIT[0]) else quad_degree
     if any(_cover):
         # A cover basis function is h_i * (x - x_i): degree 2, not 1. The entry-side floor
         # (`_fem.py`, max(quad_degree, 2*order)) sees only `order`, which stays 1 here, so the bump
         # has to happen where the enrichment is known. Without it the mass matrix silently
         # under-integrates and only a convergence study would notice.
-        _qd = max(_qd, 2 * (1 + COVER_DEGREE))
+        _qd = quad_floor(_qd, 2 * (1 + COVER_DEGREE), "the cover-enriched mass term")
     specs = [_lagrange_simplex(dim, 1 if f.get("constant") else f["order"], _qd, cell_type=_cell_type) for f in fields]
     specs = [_ConstantSpec(s) if c else s for s, c in zip(specs, _const_f)]
     # All specs share the same simplex quadrature rule (basix is deterministic)
@@ -2854,9 +2878,9 @@ def assemble_fem_native(
         # (n_test,) layout, so their sum is the group's element residual.
         w = qw_shared * meas
         pieces = tuple(coeff) if isinstance(coeff, _FusedVolumeTerms) else (coeff,)
-        # The TANGENT keeps the per-DOF evaluation (``seeded=False``): its element matrix of a symmetric form
-        # is then bitwise symmetric, which is what admits LDLᵀ and keeps the eigs symmetry guard quiet; the
-        # seeded one is forward-over-reverse and symmetric only to round-off (3e-17 measured).
+        # The TANGENT is forward over this SEEDED evaluation. Forward-over-reverse is symmetric only to
+        # round-off (3e-17 measured), so its element block is averaged within the solver's symmetry gate
+        # (``_symmetrise_own_block``) -- bitwise symmetric, as LDLᵀ and the eigs symmetry guard need.
         seeds = [p for p in (_seeded_piece(pc) for pc in pieces) if p is not None] if seeded else []
         out = _seeded_element_residual(seeds, tfi, per, loc, w) if seeds else None
         plain = pieces if out is None else [pc for pc in pieces if _seeded_piece(pc) is None]
@@ -3815,39 +3839,32 @@ def assemble_fem_native(
             _has_bundle = dynamic_topology and bool(args) and TOPOLOGY_ARG in args
             if not _has_bundle and _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
                 return _pattern_cache["val"]
-            _idx_rows, _idx_cols = [], []
-            # int32 SOURCES, not an int32 cast of the result. Under x64 `cdofs` / `cell_all_dofs` are
-            # int64 (`jnp.arange` in the dof-map builder promotes), so every broadcast block below and
-            # both concatenated vectors were int64 -- 8 bytes per raw triplet, three times over, to
-            # produce an array that is cast back down to int32 one line later. Casting the small
-            # (n_cells, n_local) maps ONCE makes the whole pattern pipeline int32. These arrays are
-            # index metadata for the host-side plan; they are never differentiated.
-            _cdofs32 = [_c.astype(jnp.int32) for _c in cdofs]
-            _cad32 = cell_all_dofs.astype(jnp.int32)
+            # The pattern as BLOCKS -- an element block is (cell rows) x (cell columns), never expanded into
+            # its raw triplets: those are ~280 per DOF on a 3-D vector problem, and materialising them (rows,
+            # columns, stack, host copy, sort) was the build's host-memory peak (`compress_plan_blocks`).
+            # int32 numpy: index metadata for the host-side plan, never differentiated.
+            _blocks = []
+            _cdofs32 = [np.asarray(_c, dtype=np.int32) for _c in cdofs]
+            _cad32 = np.asarray(cell_all_dofs, dtype=np.int32)
             for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
-                _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                _idx_rows.append(jnp.broadcast_to(_cdofs32[_tfi_s][:, :, None], _sh).reshape(-1))
-                _idx_cols.append(jnp.broadcast_to(_cad32[:, None, :], _sh).reshape(-1))
+                _blocks.append(("outer", _cdofs32[_tfi_s], _cad32))
             for _region_s, _face_ids_s, _btyped_s in surface_work:
-                _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
+                _pc = np.asarray(parent_j, dtype=np.int64)[np.asarray(_face_ids_s, dtype=np.int64)]
                 _fcols = _cad32[_pc]
                 for _bcoeff_s, _btfi_s in _btyped_s:
-                    _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                    _idx_rows.append(jnp.broadcast_to(_cdofs32[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
-                    _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+                    _blocks.append(("outer", _cdofs32[_btfi_s][_pc], _fcols))
                     # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
                     # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
                     # also drives the main-side reaction. Inactive contact contributes zeros in DATA.
                     if _gap_key_of(_region_s) is not None:
                         _gs = _gap_static(_region_s, _face_ids_s, _btfi_s, args)
-                        _idx_rows.append(_gs["rows_sm"])
-                        _idx_cols.append(_gs["cols_sm"])
+                        # possibly TRACED (a compiled contact march): the plan builder then raises in its
+                        # `try` below and the in-trace fallback takes over, as before
+                        _blocks.append(("flat", _gs["rows_sm"], _gs["cols_sm"]))
                         if _gaps_in(_bcoeff_s, _region_s):
-                            _idx_rows.append(_gs["rows_ms"])
-                            _idx_cols.append(_gs["cols_ms"])
-                            _idx_rows.append(_gs["rows_mm"])
-                            _idx_cols.append(_gs["cols_mm"])
-            _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
+                            _blocks.append(("flat", _gs["rows_ms"], _gs["cols_ms"]))
+                            _blocks.append(("flat", _gs["rows_mm"], _gs["cols_mm"]))
+            _blk_sizes = [_block_len(b) for b in _blocks]  # per-term flat lengths, in append order
             if dynamic_topology:
                 b = (args or {}).get(TOPOLOGY_ARG)
                 _pl = (b or {}).get("plans", [None] * (_my_plan_idx + 1))[_my_plan_idx] if b else None
@@ -3872,31 +3889,16 @@ def assemble_fem_native(
                 # pattern and sent the Dirichlet rows down a different route than the baseline's, which is
                 # measurable: every assembled piece matched bit-for-bit while the STEP differed by 2.6e-3.
                 # So fall through to the ordinary path.
-            _idx_static = (
-                jnp.stack(
-                    [jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
-                )
-                if _idx_rows
-                else None
-            )
-            # Hand the plan builder a HOST copy and let go of the device array before it allocates its
-            # scratch: the two held the same bytes twice through the most memory-hungry phase of the
-            # build. When a plan comes back the raw pattern is DEAD -- the only reader is the
-            # `_plan is None` fallback below, and `_static_idx_for` publishes `_plan[0]` -- so it is
-            # never rebuilt; when compression fails the fallback path needs it on device, so it is
-            # re-uploaded there and only there.
-            _host_idx = None
+            _idx_static = None
             try:
-                _host_idx = np.asarray(_idx_static) if _idx_static is not None else None
-                _idx_static = None  # release the device buffer for the duration of compress_plan
-                _plan = compress_plan(_host_idx) if _host_idx is not None else None
+                _plan = compress_plan_blocks(_blocks) if _blocks else None
             except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
                 # Drop the pattern as the pre-plan code always did: a TRACED one must not be cached
                 # across traces, and the fallback below rebuilds it in-trace anyway.
-                _idx_static, _host_idx, _plan = None, None, None
-            if _plan is None and _host_idx is not None:
-                _idx_static = jnp.asarray(_host_idx)
-            _host_idx = None
+                _plan, _blocks = None, None
+            if _plan is None and _blocks:
+                # the uncompressed fallback needs the raw triplets on device; only here are they built
+                _idx_static = jnp.asarray(raw_pattern_from_blocks(_blocks))
             _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
             return _pattern_cache["val"]
 
@@ -3981,11 +3983,21 @@ def assemble_fem_native(
                 _inv_blocks_cache[key] = hit
             return hit[1]
 
-        def jacobian(u_flat, t=0.0, args=None):
+        def jacobian(u_flat, t=0.0, args=None, *, diag=False):
+            """The assembled tangent (a BCOO); with ``diag=True`` only its DIAGONAL, a ``(total,)`` vector.
+
+            The diagonal runs the same element loop and keeps, per element block, the entries whose global
+            row and column coincide, scattered straight into one vector: no matrix, no sparsity plan, and a
+            batch of element blocks as the only scratch -- what a Jacobi preconditioner on the matrix-free
+            Newton needs (as deal.II's ``MatrixFreeTools::compute_diagonal`` does)."""
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
             # between rounds and the contact block's indices move with it.
             _idx_static, _plan, _blk_sizes = _pattern(args)
+            _dacc = [None]
+            if diag:  # no matrix: the plan and the raw pattern are not used at all
+                _idx_static, _plan = None, None
+                _dacc[0] = jnp.zeros((total,), dtype=u_flat.dtype)
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
@@ -4007,6 +4019,10 @@ def assemble_fem_native(
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             def _emit(flat, rows_fn, cols_fn):
+                if diag:
+                    r, c = rows_fn(), cols_fn()
+                    _dacc[0] = _dacc[0] + jax.ops.segment_sum(jnp.where(r == c, flat, 0.0), r, num_segments=total)
+                    return
                 if _plan is None:
                     data_l.append(flat)
                     rows_l.append(rows_fn())
@@ -4022,9 +4038,24 @@ def assemble_fem_native(
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=False))(la)
+                    # Forward over the SEEDED residual (one reverse pass per cell for every test DOF), not over
+                    # the per-test-DOF evaluation: that one evaluated the integrand k_test x k_trial times per
+                    # point. Its block is symmetric to round-off only, so it is averaged within the solver's
+                    # own symmetry gate (`_symmetrise_own_block`), which makes it bitwise symmetric.
+                    Ke = jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True))(la)
+                    return _symmetrise_own_block(Ke, loc_seg[_t], loc_seg[_t + 1])
 
                 _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
+                if diag:
+                    # per cell: the block's entries at (row a, the column holding the same global DOF)
+                    _rows_t = cd_d[tfi]
+
+                    def _kd(c, la, _k=_ke, _rt=_rows_t):
+                        same = _rt[c][:, None] == cad_d[c][None, :]  # (n_test, n_local_all)
+                        return jnp.sum(jnp.where(same, _k(c, la), 0.0), axis=1)
+
+                    _dacc[0] = _elem_map(_kd, (jnp.arange(n_cells), local_all), _chunk_v, scatter=(_dacc[0], _rows_t))
+                    continue
                 if _plan is not None:
                     # Scatter each CHUNK's element blocks straight into the compressed slots (the residual's
                     # own `scatter=` path), so the (n_cell, n_test, n_local) stack of every cell's block is
@@ -4177,6 +4208,8 @@ def assemble_fem_native(
                             d_mm = -jnp.einsum("fqk,fqvpw,fpl->fqkvplw", w_f, Dum.reshape(n_face, n_q, vt, n_q, vt), w_f)
                             _emit(d_mm.reshape(-1), lambda _g=gs: _g["rows_mm"], lambda _g=gs: _g["cols_mm"])
 
+            if diag:
+                return _dacc[0]
             if _plan is not None:
                 if _acc[0] is None:  # no terms -> empty operator
                     return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
@@ -4428,7 +4461,10 @@ def assemble_fem_native(
                 loc = domain._make_tag_location_fn(region)
                 if loc is None:
                     return []
-                mask = np.asarray(jax.vmap(loc)(jnp.asarray(coords)), dtype=bool).reshape(-1)
+                from ...domain.boundary_region import map_points
+
+                # batched: one vmap over every boundary node x every region facet was the build's peak
+                mask = map_points(loc, coords, getattr(loc, "n_entities", 1)).astype(bool)
             bnodes = bnodes[mask]
         # `d.tag(..., region=...)`: keep only the nodes belonging to that body. Two coincident faces of
         # a non-conforming interface have identical coordinates, so the predicate above selects BOTH;
@@ -5323,6 +5359,10 @@ def assemble_fem_native(
     domain._fem_native_term_functional = _make_functional
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
+    # Linear in the unknown, whatever routes it through Newton below (step history does; a box constraint or
+    # a derived field makes the residual itself nonlinear, so those clear it). Newton on such a residual
+    # converges in one EXACT step, so its driver skips the inexact-Newton forcing (`newton_direct`).
+    linear_in_unknown = not nonlinear and not bounded and not derived_specs
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a
     # different linear system whose coefficients the buffers set. The linear branch below builds a
     # ``FemLinearSystem`` from ``_assemble_at(args)``, which has no ``__history__`` to thread — so the
@@ -5454,6 +5494,9 @@ def assemble_fem_native(
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
                     return bcoo_eliminate_dirichlet(jacobian(_hold_project(u, args, t), t, args), _d)
 
+                def jac_diag_p(u, args=None, t=0.0, _d=_all_d):
+                    return jacobian(_hold_project(u, args, t), t, args, diag=True).at[_d].set(1.0)
+
                 _constrained = _all_d
             else:
 
@@ -5470,9 +5513,15 @@ def assemble_fem_native(
                     J = jacobian(_s_project(u), t, args)
                     return J if _d is None else bcoo_eliminate_dirichlet(J, _d)
 
+                def jac_diag_p(u, args=None, t=0.0, _d=s_d_dofs):
+                    dg = jacobian(_s_project(u), t, args, diag=True)
+                    return dg if _d is None else dg.at[_d].set(1.0)
+
                 _constrained = s_d_dofs
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            _op.jacobian_diag = jac_diag_p
+            _op.linear_in_unknown = linear_in_unknown
             # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
             # (``staggered(over_relax>1)``) must leave these alone: the sub-solve already puts them exactly
             # on the prescribed value, and stepping past it makes the constraint oscillate as (1-omega)^k
@@ -5538,7 +5587,17 @@ def assemble_fem_native(
                 _f._jno_static_idx = _idx_for(args)
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
+        def _jac_diag_np(u, args=None):
+            # the diagonal of `_jac_np`'s matrix: at the projected state, unit on the eliminated rows
+            u = jnp.asarray(u)
+            if not dirichlet_pairs:
+                return jacobian(u, 0.0, args, diag=True)
+            _d, _v, _proj = dirichlet_projection(dirichlet_pairs)
+            return jacobian(_proj(u), 0.0, args, diag=True).at[_d].set(1.0)
+
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.jacobian_diag = _jac_diag_np
+        _op_np.linear_in_unknown = linear_in_unknown
         # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating
         # driver (``staggered(over_relax != 1)``) must leave them alone. Missing here, every NON-parametric
         # problem over-relaxed its prescribed values -- measured g = 2 held at 3.0 after one sweep with

@@ -53,7 +53,9 @@ def test_a_newton_solve_with_an_estimated_chebyshev_preconditioner():
     ref = _eager(_steady_nonlinear().solve(nonlinear=jno.solve.newton()))
     got = _eager(_steady_nonlinear().solve(nonlinear=jno.solve.newton(), precond=jno.precond.chebyshev()))
     assert np.abs(ref).max() > 0.1
-    assert np.abs(got - ref).max() <= 1e-10 * np.abs(ref).max()
+    # Two roots to the same 1e-8 Newton residual bound -- the default solves each step only as accurately
+    # as that step needs (inexact Newton) -- so they agree to that bound, not to round-off (2e-10 measured).
+    assert np.abs(got - ref).max() <= 1e-7 * np.abs(ref).max()
 
 
 @pytest.mark.parametrize(
