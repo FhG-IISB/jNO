@@ -17,6 +17,30 @@ import jax.numpy as jnp
 
 _EDGE_FAMILIES = ("RT", "N1E", "N2E")
 
+_DEVICE_CONSTANTS = None  # content key -> device array, held weakly (see device_constant)
+
+
+def device_constant(x, dtype=None):
+    """``jnp.asarray(x, dtype)`` for host mesh data, one device copy per distinct content.
+
+    Every integral and every form builds its own copy of the same mesh tables (cell DOF maps, edge signs,
+    region masks, vertex coordinates); 78 integrals of one 53 k-cell mesh held ~3 GB of identical copies. Equal
+    arrays (shape, dtype, bytes) now share one. The table holds them weakly: a copy is freed with its last
+    user, so a remeshed domain's tables do not outlive it."""
+    import hashlib
+    import weakref
+
+    global _DEVICE_CONSTANTS
+    if _DEVICE_CONSTANTS is None:
+        _DEVICE_CONSTANTS = weakref.WeakValueDictionary()
+    a = np.ascontiguousarray(np.asarray(x, dtype=dtype))
+    key = (a.shape, a.dtype.str, hashlib.sha1(a.reshape(-1).view(np.uint8)).hexdigest())
+    out = _DEVICE_CONSTANTS.get(key)
+    if out is None:
+        out = jnp.asarray(a)
+        _DEVICE_CONSTANTS[key] = out
+    return out
+
 
 def element_of(space, order):
     """``(family, degree)`` of a symbol's element, as ``build_dofmap`` names it (P0 is DG of degree 0)."""
@@ -45,10 +69,10 @@ def coefficient_spec(fam, k, vs, dofmap, quad_points, dim) -> dict:
         "vs": vs,
         "ncomp": ncomp,
         "n_vals": int(dofmap.n_dofs) * ncomp,
-        "cdofs": jnp.asarray(dofmap.cell_dofs, dtype=jnp.int32),
+        "cdofs": device_constant(dofmap.cell_dofs, np.int32),
         "ref": ref,
         "piola": pf,
-        "signs": jnp.asarray(dofmap.signs) if (edge and dofmap.is_diagonal) else None,
+        "signs": device_constant(dofmap.signs) if (edge and dofmap.is_diagonal) else None,
         "tables": None if dofmap.is_diagonal else (dofmap.jax_tables(), int(dofmap.ndof_local)),
     }
 
@@ -200,8 +224,8 @@ def domain_functional(domain, expr, as_inputs=frozenset()) -> Tuple[Callable, Li
     if kind is None or kind not in domain.mesh.cells_dict:
         raise NotImplementedError(f"expr.integrate(domain): simplex meshes in 2-D / 3-D only (got dimension {dim}).")
     cells_np = np.asarray(domain.mesh.cells_dict[kind], dtype=np.int64)
-    pts = jnp.asarray(np.asarray(domain.mesh.points)[:, :dim])
-    cells = jnp.asarray(cells_np, dtype=jnp.int32)
+    pts = device_constant(np.asarray(domain.mesh.points)[:, :dim])
+    cells = device_constant(cells_np, np.int32)
     n_cells, n_verts = cells_np.shape[0], int(pts.shape[0])
     top = build_edge_topology(cells_np, BASIX_TET_EDGES if dim == 3 else BASIX_TRIANGLE_EDGES)
     _dm = {}
@@ -246,7 +270,7 @@ def domain_functional(domain, expr, as_inputs=frozenset()) -> Tuple[Callable, Li
     ]
     inputs += [(("coord", c["name"]), c["expr"]) for c in getattr(domain, "_trainable_coords", None) or []]
     rnames = tuple(sorted(_collect_region_mask_names(expr)))
-    masks = [jnp.asarray(_cell_region_mask(domain, r)).reshape(-1) for r in rnames]
+    masks = [device_constant(np.reshape(_cell_region_mask(domain, r), (-1,))) for r in rnames]
     ctx = getattr(domain, "context", {}) or {}
 
     # the cells the integrand can be nonzero on (a terminal current lives on its bar's cells only): the loop runs
