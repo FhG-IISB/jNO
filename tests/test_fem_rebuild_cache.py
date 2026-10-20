@@ -187,3 +187,52 @@ def test_compile_cache_is_on_by_default_with_optouts():
     jno.disable_compile_cache()
     assert jax.config.jax_compilation_cache_dir is None
     jno.enable_compile_cache()  # restore for the rest of the session
+
+
+class TestEmptyArraysAreHashable:
+    """An empty array must not take down the cache key that is trying to hash it.
+
+    `_array_digest` hashed via `memoryview(arr).cast("B")`, which refuses any view with a zero in
+    its shape. So an empty array -- a region predicate that matched no nodes, a coordinate axis
+    with no free dofs, a non-design mask covering every cell -- raised
+
+        TypeError: memoryview: cannot cast view with zeros in shape or strides
+
+    from inside `jno.fem(...)`'s structure token: a failure with no relation to anything the user
+    wrote, at build time, with a traceback pointing at a cache. Empty arrays are ordinary inputs.
+    """
+
+    def test_an_empty_array_digests_instead_of_raising(self):
+        import numpy as np
+
+        from jno.utils.solver.fem_utils import _array_digest
+
+        for shape in ((0,), (0, 3), (3, 0), (0, 0)):
+            d = _array_digest(np.zeros(shape))
+            assert d is not None, f"{shape} produced no digest"
+            assert d[2] == shape, f"{shape} digested as {d[2]}"
+
+    def test_empty_arrays_of_different_shape_or_dtype_stay_distinct(self):
+        """There are no bytes to hash, so shape and dtype have to carry the whole identity."""
+        import numpy as np
+
+        from jno.utils.solver.fem_utils import _array_digest
+
+        a = _array_digest(np.zeros((0,), dtype=np.float64))
+        b = _array_digest(np.zeros((0, 3), dtype=np.float64))
+        c = _array_digest(np.zeros((0,), dtype=np.int32))
+        assert a != b, "two empty arrays of different shape share a digest"
+        assert a != c, "two empty arrays of different dtype share a digest"
+
+    def test_a_nonempty_array_is_unaffected(self):
+        """The empty-array branch must not change the digest of anything that has content."""
+        import numpy as np
+
+        from jno.utils.solver.fem_utils import _array_digest
+
+        x = np.arange(6.0).reshape(2, 3)
+        y = np.arange(6.0).reshape(2, 3)
+        z = np.arange(6.0).reshape(2, 3)
+        z[1, 1] = 99.0
+        assert _array_digest(x) == _array_digest(y)
+        assert _array_digest(x) != _array_digest(z)
