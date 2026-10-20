@@ -591,6 +591,10 @@ available for `jno.fdm`, and it raises. It forms `exp(−Δt M⁻¹A)`, and a st
 Dirichlet and flux rows are algebraic constraints with zero mass. Measured with an assembled operator, it
 ran but came back 4.8e-3 off a converged reference, where Crank–Nicolson at the same step was 2.0e-5.
 
+`fdm.solve(log=True)` prints each Newton step and each time step while the solve runs (`log=N`: every
+`N`-th, and the last), as `fem.solve` does — see
+[Watching a solve while it runs](solvers.md#watching-a-solve-while-it-runs-log).
+
 ## Solver slots — `linear=` and `precond=`
 
 `jno.fdm(...).solve()` takes the same solver slots as `fem.solve()`: any `jno.solve` linear solver

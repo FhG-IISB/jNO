@@ -906,6 +906,8 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
         blk = hoist_time_invariant(block, args, t_start)  # static loads/operators: once, not per step
 
         def step(w, t_next):
+            from .. import beacon
+
             out = blk.step(
                 w,
                 t_next - dt,
@@ -916,6 +918,8 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
                 nonlinear_solve=nonlinear_solve,
                 report=_judge,
             )
+            if beacon.active():  # nothing is traced unless the solve has log=
+                _report_time_step(t_next, grid_ts[0], grid_ts[-1], dt, out[0] if _judge else out)
             if not _judge:
                 return out, out
             wn, r_end, r_start = out
@@ -955,6 +959,8 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
         else:
 
             def stepper(args, t_start):
+                from .. import beacon
+
                 blk = hoist_time_invariant(block, args, t_start)
 
                 def step(c, t_next):
@@ -963,6 +969,8 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
                         w, t_next - dt, dt, args=args, theta=theta, linear_solve=linear_solve,
                         nonlinear_solve=nonlinear_solve, report=_judge, tangent=tang,
                     )  # fmt: skip
+                    if beacon.active():  # nothing is traced unless the solve has log=
+                        _report_time_step(t_next, grid_ts[0], grid_ts[-1], dt, out[0] if _judge else out)
                     return (out[0] if _judge else out, tang), out
 
                 return step
@@ -1148,14 +1156,27 @@ def _value_identity(config):
     return tuple(out)
 
 
+def _report_time_step(t_next, t0, t_end, dt, w):
+    """One ``log=`` line for the time step that ended at ``t_next`` (the caller checks log= is on).
+    ``max |u|`` ties the line to the step's result, so it cannot be scheduled ahead of the step."""
+    import jax.numpy as jnp
+
+    from .. import beacon
+
+    k = jnp.round((t_next - t0) / dt)
+    beacon.emit("time", k, t_next, jnp.max(jnp.abs(w)), step=k.astype(jnp.int32), last=t_next >= t_end - 0.5 * dt)
+
+
 def _trace_time_settings():
     """The ``jno.setup`` settings a march bakes in when it is TRACED: the sparse-operator storage
     (``matvec_format``) and how many systems a vmapped device LU stacks (``lu_stack``). Their setters
     clear JAX's caches, which does not reach this block-level cache -- so they are part of its key, or a
-    changed setting would silently keep the old one for any block that had already marched."""
+    changed setting would silently keep the old one for any block that had already marched. The same for
+    whether the solve is traced with ``log=`` (``jno.utils.beacon.settings``)."""
+    from .. import beacon
     from . import matvec_format, sparse_batching
 
-    return (matvec_format._FORMAT, sparse_batching._LU_STACK)
+    return (matvec_format._FORMAT, sparse_batching._LU_STACK, beacon.settings())
 
 
 def _block_fingerprint(block):

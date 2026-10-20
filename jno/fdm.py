@@ -2371,7 +2371,9 @@ class _TraceFDM:
                 v0 = v0.at[jnp.asarray(b * self._N + idx)].set(vb)
         return v0
 
-    def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None):
+    def solve(
+        self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None, log=False
+    ):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
         machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
@@ -2395,7 +2397,10 @@ class _TraceFDM:
 
         ``save_ts=`` are the times a transient solve returns, exactly as ``fem.solve(save_ts=…)``: the march
         keeps its own step ``Δt`` from ``domain.time`` and the trajectory is sampled at ``save_ts`` (linear
-        interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step."""
+        interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step.
+
+        ``log=True`` prints each Newton step and each time step while the solve runs (``log=N``: every N-th
+        step of each loop, and its last), as ``fem.solve(log=...)`` does."""
         if save_ts is not None and not self._transient:
             raise ValueError("jno.fdm([...]): save_ts= samples a transient march; this problem is steady.")
 
@@ -2413,6 +2418,16 @@ class _TraceFDM:
             if trainable:
                 return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
             return self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
+
+        from .utils import beacon
+
+        _run_unlogged = _run
+
+        def _run():
+            out = beacon.logged(_run_unlogged, log, "fdm.solve")()
+            if callable(getattr(out, "fn", None)):  # a deferred solve: its loops are traced when it is evaluated
+                out.fn = beacon.logged(out.fn, log, "fdm.solve")
+            return out
 
         if not profile:
             import jax
@@ -2843,7 +2858,10 @@ class _TraceFDM:
         from .utils.solver.solver_api import record_nonlinear_verdict
 
         cache = self.__dict__.setdefault("_steady_cache", {})
-        key = (nonlinear, self._data_fingerprint())  # a nonlinear spec compares by identity; the key keeps it alive
+        from .utils import beacon
+
+        # a nonlinear spec compares by identity (the key keeps it alive); log= is traced in or not
+        key = (nonlinear, self._data_fingerprint(), beacon.settings())
         entry = cache.get(key)
         if entry is None:
             residual = self._steady_residual()
@@ -3393,6 +3411,9 @@ class _TraceFDM:
             def solve_step(G, guess):
                 return spec(G, guess, linear_solve=inner)
 
+        from .utils import beacon
+        from .utils.solver.backend_blocks import _report_time_step
+
         def body(carry, _):
             u, v, r_now, t = carry
             t_next = t + dt
@@ -3401,6 +3422,8 @@ class _TraceFDM:
             u_next = solve_step(G, guess)
             v_next = jnp.where(algebraic, 0.0, 2.0 * (u_next - u) / dt - v)
             norms = (jnp.linalg.norm(G(u_next)), jnp.linalg.norm(G(guess)))
+            if beacon.active():  # nothing is traced unless the solve has log=
+                _report_time_step(t_next, t0, t0 + n_steps * dt, dt, u_next)
             return (u_next, v_next, spatial_res(u_next, t_next), t_next), (u_next, *norms)
 
         carry0 = (u0, v0, r0, jnp.asarray(t0, dtype=u0.dtype))

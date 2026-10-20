@@ -1362,6 +1362,42 @@ numbers; only the label and the advice differ. It covers the default θ march, `
     and unchecked as a preconditioner application. The convergence contract belongs to the outer
     solve, and that one is still gated.
 
+### Watching a solve while it runs — `log=`
+
+The lines above come before and after a solve. To follow one *while* it runs, give it `log=`:
+
+```python
+u = fem.solve(log=True)                  # each Newton step
+# INFO: newton step 1: residual 2.636e-03 (target 1.0e-08), forcing 1.0e-01
+# INFO: newton step 2: residual 2.554e-04 (target 1.0e-08), forcing 1.0e-01
+# ...
+traj = fem.solve(log=100).fn()           # every 100th time step and the last (a transient solve runs at .fn())
+lam, X = K.eigs(mass=m, k=6, precond=jno.precond.jacobi(), log=10)
+crux.solve(epochs=50_000, log=1000)      # the training line every 1000 epochs
+```
+
+`log=True` reports every step, `log=N` every N-th step of each loop and always its last, `log=False` (the
+default) nothing.
+
+| Solve | What `log=` reports |
+|---|---|
+| `fem.solve` / `fdm.solve`, nonlinear | each Newton step: residual, its target, the forcing term |
+| a transient march (`fem` or `fdm`) | each time step: step, `t`, `max \|u\|`, after that step's Newton lines |
+| `fem.eigs` with `precond=` (LOBPCG) or `sigma=` | each iteration: residual and its target |
+| `jno.core(...).solve` | the training line every N epochs (default: a tenth of the run, a thousandth above 100 000 epochs; `log=False`: none) |
+
+A linear steady solve reports nothing extra (its only loop is the Krylov iteration), and neither does the
+non-symmetric eigensolver, whose Arnoldi iteration runs inside ARPACK.
+
+Each solve reports only when it is given `log=`. A `jno.fem` inside a `jno.core` loss
+(`expr.integrate(fem)`, or a `fem.solve()` node) stays quiet, so the training lines stay readable; a
+`fem.solve(log=True)` there reports its Newton steps on every epoch, before that epoch's training line.
+
+The lines come from inside the compiled program without stopping it: each reported step writes a few
+numbers into a buffer in host memory, and a reader thread prints them, so the device never waits for
+Python as it would for a `jax.debug.callback`. Without `log=` nothing is added: the solve compiles to the
+same program as before.
+
 ### Where the time went — `fem.solve(profile=True)`
 
 `fem.stats` says *what* the solver did; `profile=True` says *how long* and *where*. It runs the solve

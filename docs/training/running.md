@@ -12,6 +12,20 @@ stats.plot("history.png")
 
 Returns a `statistics` object with `.plot()` and loss arrays.
 
+### How often it prints — `log=`
+
+The training line (`Epoch  1000/5000 | L: … | C0: …`) is printed every tenth of the run by default (every
+thousandth above 100 000 epochs). `log=N` prints it every `N` epochs and at the last one, `log=False` not at
+all:
+
+```python
+crux.solve(50_000, log=1000)
+```
+
+A solve inside the loss (`expr.integrate(fem)`, a `fem.solve()` node) prints nothing of its own unless it
+is given `log=` itself; its lines then come before the training line of the same epoch. See
+[Watching a solve while it runs](../solvers.md#watching-a-solve-while-it-runs-log).
+
 ### Memory Optimisations
 
 | Option | Effect | Use When |

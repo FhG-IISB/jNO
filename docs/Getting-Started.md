@@ -71,8 +71,8 @@ crux.solve(epochs=10_000).plot(f"{run}/training.png")
 jno.save(crux, f"{run}/model.pkl")
 ```
 
-During training jNO prints one line per print-interval — `L` is the total loss, `C0, C1, …` the
-per-constraint losses:
+During training jNO prints one line every tenth of the run (`crux.solve(..., log=N)` for every `N` epochs) —
+`L` is the total loss, `C0, C1, …` the per-constraint losses:
 
 ```text
 Epoch  1000/10000 | L: 1.2345e-03 | C0: 1.2345e-03

@@ -2560,21 +2560,30 @@ class FEM:
         return u
 
     def solve(self, *args, **kwargs):
-        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature."""
+        """Solve the problem. See :meth:`_solve_inner` for the full signature.
+
+        ``log=True`` prints each Newton step and each time step while the solve runs (``log=N``: every N-th
+        step of each loop, and its last); a deferred solve reports when it is evaluated. Off by default."""
         import time as _time
 
+        from .utils import beacon
         from .utils.logger import get_logger
         from .utils.solver import newton_krylov as _nk
 
+        # log=True / N: each Newton and time step (every N-th and the last) as it happens -- see jno.utils.beacon
+        log = kwargs.pop("log", False)
         _t0 = _time.perf_counter()
         # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
         # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
         prev_linear = _nk._LINEAR_FORM[0]
         _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
         try:
-            out = self._solve_inner(*args, **kwargs)
+            with beacon.session(log, "fem.solve"):
+                out = self._solve_inner(*args, **kwargs)
         finally:
             _nk._LINEAR_FORM[0] = prev_linear
+        if callable(getattr(out, "fn", None)):  # a deferred solve: its loops are traced when it is evaluated
+            out.fn = beacon.logged(out.fn, log, "fem.solve")
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
         return out
 
@@ -2792,6 +2801,10 @@ class FEM:
         count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
+
+        ``log=True`` prints each Newton step and each time step while the solve runs (``log=N``: every N-th
+        step of each loop, and its last), from inside the compiled program without stopping it. A deferred
+        solve reports when it is evaluated. Off by default, and then nothing is added to the program.
         """
         # ONE site, in the public entry: the mode-specific paths below return at different points
         # (nonlinear and transient both bypass `_compose_slots`), so logging inside them left two of
@@ -4015,6 +4028,7 @@ class FEM:
         tol=None,
         maxiter=None,
         X0=None,
+        log=False,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
@@ -4037,7 +4051,31 @@ class FEM:
 
             lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())
             lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)   # the 4 modes nearest λ = 60
+
+        ``log=True`` prints each iteration of LOBPCG (``precond=``) or of the shift-invert iteration (``sigma=``)
+        while it runs (``log=N``: every N-th and the last); the dense reduction and ARPACK have no loop to report.
         """
+        from .utils import beacon
+
+        with beacon.session(log, "fem.eigs"):
+            return self._eigs_inner(
+                mass=mass, k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0
+            )
+
+    def _eigs_inner(
+        self,
+        *,
+        mass,
+        k: int = 6,
+        which: str = "smallest",
+        sigma=None,
+        linear=None,
+        precond=None,
+        tol=None,
+        maxiter=None,
+        X0=None,
+    ):
+        """The body of :meth:`eigs` (which documents it), run inside its ``log=`` session."""
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
         _reject_source_terms(self, "FEM.eigs")

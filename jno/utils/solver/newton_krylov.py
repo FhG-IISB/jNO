@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .. import beacon
 from .krylov import gmres as _scaled_gmres
 
 __all__ = ["newton_krylov", "newton_direct", "staggered_newton", "bicgstab"]
@@ -700,7 +701,13 @@ def newton_krylov(
                 eta = _ew_forcing(rn, rn_prev, eta_prev, k, atol + rtol * r0n)
             with gate_suspended(record=True):  # inexact by design; the outer residual is the contract
                 u = _update(f, u, eta)
-            return u, f(u), k + 1, rn, jnp.asarray(eta_prev if eta is None else eta, rn.dtype)
+            r_new = f(u)
+            eta_out = jnp.asarray(eta_prev if eta is None else eta, rn.dtype)
+            if beacon.active():  # nothing is traced unless the solve has log=
+                rn_new, target = jnp.linalg.norm(r_new), atol + rtol * r0n
+                last = (rn_new <= target) | (k + 1 >= max_steps)
+                beacon.emit("newton", k + 1, rn_new, target, eta_out, step=k + 1, last=last)
+            return u, r_new, k + 1, rn, eta_out
 
         init = (x0, r_start, 0, r0n, jnp.asarray(_EW_ETA0, r0n.dtype))
         u, r, k, _rn, _eta = jax.lax.while_loop(cond, body, init)
@@ -992,7 +999,12 @@ def newton_direct(
                     delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u = u + alpha * delta
-            return u, f_fwd(u), k + 1, rn, jnp.asarray(eta, rn.dtype)
+            r_new = f_fwd(u)
+            if beacon.active():  # nothing is traced unless the solve has log=
+                rn_new, target = jnp.linalg.norm(r_new), atol + rtol * r0n
+                last = (rn_new <= target) | (k + 1 >= max_steps)
+                beacon.emit("newton", k + 1, rn_new, target, eta, step=k + 1, last=last)
+            return u, r_new, k + 1, rn, jnp.asarray(eta, rn.dtype)
 
         if not reuse:
             init = (x0, r_start, 0, r0n, jnp.asarray(_EW_ETA0, r0n.dtype))
@@ -1028,6 +1040,10 @@ def newton_direct(
             u_new = jnp.where(reject, u, u_try)
             r_new = jnp.where(reject, r, r_try)
             J_new = jax.lax.cond(refresh, lambda: J_fwd(u_new), lambda: J)
+            if beacon.active():  # nothing is traced unless the solve has log=
+                rn_new, target = jnp.linalg.norm(r_new), atol + rtol * r0n
+                last = (rn_new <= target) | (k + 1 >= max_steps)
+                beacon.emit("newton", k + 1, rn_new, target, 0.0, step=k + 1, last=last)
             return u_new, r_new, k + 1, J_new, refresh, nfact + refresh.astype(jnp.int32)
 
         if tangent0 is None:

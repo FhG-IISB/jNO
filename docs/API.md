@@ -316,7 +316,8 @@ keeps at most `k` copies of any one Ritz value, so the cluster cannot crowd out 
 host sparse LU **factorized once** (every sweep is then triangular substitutions); `linear=` swaps in a
 different inner solver when a factorization is too big. Constrained pencils (Dirichlet pins, periodic
 ties) compose: the reduced `K − σM` is assembled sparsely through the same triplet remap the periodic
-solve reduction uses.
+solve reduction uses. `log=True` (or `log=N`) prints the LOBPCG or shift-invert iterations while they run;
+the dense reduction and the non-symmetric ARPACK path have no loop of their own to report.
 
 `K` is the **source-less** `jno.fem` whose bilinear form is the stiffness; `mass=` takes the mass form
 as a plain term list, which `eigs` assembles onto the same space for you:

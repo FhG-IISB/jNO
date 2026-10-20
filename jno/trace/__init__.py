@@ -4419,6 +4419,7 @@ class FemResidualOperator:
         # By the solver's VALUE identity where it has one: `fem.solve` builds a fresh composed solver
         # per call, so `id()` alone never matched and every call re-compiled.
         _sk = getattr(solve_fn, "cache_key", None) or id(solve_fn)
+        from ..utils import beacon as _beacon
         from ..utils.solver.newton_krylov import _FORCING
         from ..utils.solver.sharding import element_token
 
@@ -4426,7 +4427,7 @@ class FemResidualOperator:
         # must not answer a later `shard=False` call (nor the reverse); and by whether Newton steps are
         # inexact (`_FORCING`, read when the driver is traced), for the same reason.
         key = (
-            _sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token(), bool(_FORCING[0])
+            _sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token(), bool(_FORCING[0]), _beacon.settings()
         )  # fmt: skip
         # A built preconditioner's arrays are ARGUMENTS of the program, not constants baked into it: a spec
         # rebuilt between solves (same shapes) reuses the program with its new arrays (`precond_state`).
