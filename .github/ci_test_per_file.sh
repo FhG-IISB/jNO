@@ -33,6 +33,15 @@ for f in "${files[@]}"; do
   echo "::group::${f}"
   pytest "$f" -m 'not slow' --cov=jno --cov-append --cov-report= --tb=short -q
   code=$?
+  # Killed by a signal (exit > 128) before pytest could report anything: a native library crashed
+  # (PETSc, for one, turns a crash into an MPI abort, i.e. SIGTERM, and the captured message is lost).
+  # Run the file once more without output capture, so a repeat shows the native error; a pass is a
+  # flake and is flagged as a warning, not hidden.
+  if [ "$code" -gt 128 ]; then
+    echo "::warning::${f} was killed by signal $((code - 128)); running it once more without capture"
+    pytest "$f" -m 'not slow' --cov=jno --cov-append --cov-report= --tb=short -q -s
+    code=$?
+  fi
   echo "::endgroup::"
   # exit 5 == "no tests collected" (every test in the file is slow-marked/skipped): not a failure.
   if [ "$code" -ne 0 ] && [ "$code" -ne 5 ]; then
