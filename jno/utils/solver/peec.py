@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -1518,7 +1519,7 @@ def solve_network(
         # iteration no longer stops the stream for a host round trip.
         from . import cudss_ffi
 
-        _ffi = cudss_ffi.available() and cdtype == jnp.complex128
+        _ffi = _device_lu() and cudss_ffi.available() and cdtype == jnp.complex128
 
         def _precond(r):
             if _ffi:
@@ -3555,6 +3556,7 @@ class _DeviceLU:
         return (s, bg)
 
     def solve(self, rhs, trans="N"):
+        """SuperLU's face: ``rhs`` is one vector ``(n,)`` or a batch of columns ``(n, k)``."""
         cp = self._cp
         if trans == "T":
             if self._bwd is None:
@@ -3562,9 +3564,14 @@ class _DeviceLU:
             (s, bg), pre, post = self._bwd, self._c, self._r
         else:
             (s, bg), pre, post = self._fwd, self._r, self._c
-        bg[...] = cp.asarray(pre * np.asarray(rhs))
-        s.reset_operands(b=bg)
-        return post * cp.asnumpy(s.solve())
+        rhs = np.asarray(rhs)
+        cols = rhs.reshape(rhs.shape[0], -1)  # the solver was planned for ONE right-hand side
+        out = np.empty(cols.shape, dtype=complex)
+        for j in range(cols.shape[1]):
+            bg[...] = cp.asarray(pre * cols[:, j])
+            s.reset_operands(b=bg)
+            out[:, j] = post * cp.asnumpy(s.solve())
+        return out.reshape(rhs.shape)
 
     def free(self):
         for f in (self._fwd, self._bwd):
@@ -3576,6 +3583,18 @@ class _DeviceLU:
 _FFI_SLOT = 1  # the device slots the current preconditioner occupies: this and the next (its transpose)
 
 
+def _device_lu() -> bool:
+    """Whether the preconditioner may be factorised on the GPU (cuDSS): only when asked for.
+
+    cuDSS pivots statically. On a welded power-module network (6,590 unknowns, a saddle point) its
+    factorisation of the equilibrated matrix, with diagonal matching, solved that matrix to a relative
+    residual of 3e17 and GMRES diverged (jNO #168). SuperLU on the host solves it to 2e-13 at 1.6 ms per
+    apply; cuDSS matches that only with global pivoting, at 9-12 ms per apply. So the host factorisation
+    is the default on a GPU as well, and ``JNO_PEEC_DEVICE_LU=1`` opts into the device paths.
+    """
+    return os.environ.get("JNO_PEEC_DEVICE_LU", "") == "1"
+
+
 def _factor_preconditioner(M):
     """Factorise the preconditioner matrix wherever its applies will run.
 
@@ -3585,7 +3604,7 @@ def _factor_preconditioner(M):
     """
     from . import cudss_ffi
 
-    if cudss_ffi.available():
+    if _device_lu() and cudss_ffi.available():
         old = _LU_HOLDER.get("lu")
         if old is not None and hasattr(old, "free"):
             old.free()
@@ -3606,7 +3625,7 @@ def _host_or_device_lu(M):
     if old is not None and hasattr(old, "free"):
         old.free()  # a replaced device factorisation would otherwise hold its GPU memory
         _LU_HOLDER["lu"] = None
-    if jax.default_backend() == "gpu":
+    if _device_lu() and jax.default_backend() == "gpu":
         from .linear import _cudss_available
 
         if _cudss_available():
