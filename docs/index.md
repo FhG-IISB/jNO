@@ -62,7 +62,7 @@ through the solve.
 
 -   :material-book-open-page-variant-outline: **[Tutorials](#tutorials)**
 
-    38 worked examples — PINN, operator learning, FEM, FDM, Bayesian, RCWA, and generative.
+    44 worked examples — PINN, operator learning, FEM, FDM, Bayesian, RCWA, and generative.
 
 -   :material-language-python: **[API Reference](API.md)**
 
