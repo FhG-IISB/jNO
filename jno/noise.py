@@ -108,8 +108,8 @@ class _NoiseNamespace:
 
         Parameters
         ----------
-        std : float
-            Standard deviation of the noise.
+        std : float or callable
+            Standard deviation of the noise: a number, or a schedule ``lambda t: ...`` (a callable of the march time, only inside ``Model.flow(..., noise=...)``).
         ndim : int
             Number of output dimensions (last axis size). Use ``ndim=2`` for
             2-D vector noise, ``ndim=3`` for 3-D, etc.  Default ``1``. Mutually exclusive with ``like``.
@@ -132,17 +132,17 @@ class _NoiseNamespace:
 
         Parameters
         ----------
-        low : float
-            Lower bound of the uniform distribution.
-        high : float
-            Upper bound of the uniform distribution.
+        low : float or callable
+            Lower bound of the uniform distribution: a number, or a schedule ``lambda t: ...`` (a callable of the march time, only inside ``Model.flow(..., noise=...)``).
+        high : float or callable
+            Upper bound of the uniform distribution, likewise.
         ndim : int
             Number of output dimensions. Default ``1``. Mutually exclusive with ``like``.
         like : Placeholder, optional
             Draw with the shape of another traced expression instead of ``(N, ndim)`` — e.g. a data
             field, so the prior of a flow-matching path lives in the data's space by construction::
 
-                x0 = jno.noise.gaussian(std=1.0, like=x1)
+                x0 = jno.noise.uniform(-1.0, 1.0, like=x1)
 
             Resolved at evaluation time from the reference's own shape, so it follows ``batchsize``,
             ``solve(points=...)`` and time windows automatically; a shape written by hand would go
@@ -268,8 +268,8 @@ class _NoiseNamespace:
 
         Parameters
         ----------
-        std : float
-            Standard deviation (scale = std / sqrt(2)).
+        std : float or callable
+            Standard deviation (scale = std / sqrt(2)): a number, or a schedule ``lambda t: ...`` (a callable of the march time, only inside ``Model.flow(..., noise=...)``).
         ndim : int
             Number of output dimensions. Default ``1``. Mutually exclusive with ``like``.
         like : Placeholder, optional

@@ -2420,7 +2420,8 @@ class Model(Placeholder):
 
         Limitations:
             Heun's method, fixed step, explicit -- no adaptive control and no error estimate, so the
-            step count is the accuracy knob. No log-density: that needs the divergence of ``v`` with
+            step count is the accuracy knob: second order for the ODE, strong order 1/2 with ``noise=``
+            (the Euler--Maruyama increment sets it). No log-density: that needs the divergence of ``v`` with
             respect to the state, which :func:`jno.np.divergence` (defined over coordinate
             ``Variable``\ s) does not provide. Dropout must be off: the network is handed the evaluation key unchanged at every
             step -- only the SDE increment folds in the step index -- so a mask would repeat

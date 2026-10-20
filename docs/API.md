@@ -216,7 +216,8 @@ it needs no divergence. Together with `save=True` for the trajectory, that is th
 ---
 
 **Limitations.** Heun's method, fixed step, explicit — no adaptive control and no error estimate, so
-the step count is the accuracy knob. No log-density: that needs the divergence of `v` with respect
+the step count is the accuracy knob: second order for the ODE, strong order 1/2 for the SDE (the
+Euler–Maruyama increment sets it). No log-density: that needs the divergence of `v` with respect
 to the *state*, which `jno.np.divergence` (defined over coordinate `Variable`s) does not provide —
 note this blocks *exact likelihoods*, not the per-step transition density an SDE sampler gives.
 Dropout must still be off. The network is handed `ctx.key`, which is the *same* key at every step of
@@ -684,6 +685,8 @@ authors of custom operators.
 ::: jno.trace.Integral
 
 ::: jno.trace.Noise
+
+::: jno.trace.Flow
 
 ---
 

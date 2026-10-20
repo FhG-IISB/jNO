@@ -2118,8 +2118,9 @@ class core:
                 memory.  Default ``False``.
             offload_data: If ``True``, keep the full training dataset in
                 host (CPU) memory and stream only the current mini-batch
-                to the device each step.  Requires ``batchsize`` to be
-                set.  Default ``False``.
+                to the device each step.  Requires a mini-batch on either
+                axis (``batchsize`` below the number of samples, or
+                *points*).  Default ``False``.
             inner_steps: Number of gradient steps to fuse into a single
                 ``jax.lax.fori_loop`` call, amortising Python dispatch
                 overhead.  Must evenly divide *epochs*.  Default ``1``.
@@ -2127,8 +2128,9 @@ class core:
                 are averaged before a single optimizer update.  The
                 effective batch size becomes
                 ``batchsize * accumulation_steps`` while peak activation
-                memory stays proportional to *batchsize*.  Requires
-                ``batchsize`` to be set.  Default ``1``.
+                memory stays proportional to *batchsize*.  Requires a
+                mini-batch on either axis (``batchsize`` below the number
+                of samples, or *points*).  Default ``1``.
             min_consecutive: Minimum number of consecutive time steps
                 fed to each constraint evaluation. ``None`` means use all
                 available time steps. Default ``1``.

@@ -62,7 +62,7 @@ through the solve.
 
 -   :material-book-open-page-variant-outline: **[Tutorials](#tutorials)**
 
-    44 worked examples — PINN, operator learning, FEM, FDM, Bayesian, RCWA, and generative.
+    45 worked examples — PINN, operator learning, FEM, FDM, Bayesian, RCWA, and generative.
 
 -   :material-language-python: **[API Reference](API.md)**
 
@@ -136,14 +136,14 @@ for full definitions:
 
 ## Tutorials
 
-46 tutorial pages: 44 worked examples and two overviews. Start with the PINN group if you are new to
+47 tutorial pages: 45 worked examples and two overviews. Start with the PINN group if you are new to
 jNO; jump straight to FEM or FDM if you arrived for the solvers.
 
 | Group | Count | Covers |
 |-------|-------|--------|
 | [PINN](tutorials/01-basics/laplace-1d.md) | 8 | Laplace 1-D, variable-coefficient Poisson, Allen–Cahn, viscous Burgers, inverse parameter, Fredholm integral equation, gradient conflict, Fokker–Planck |
 | [Operator learning](tutorials/11-operator-learning/index.md) | 3 | Overview, DeepONet on a parametric Poisson, FNO2D supervised |
-| [FEM](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | 27 | Poisson, VPINN, Deep Ritz, Helmholtz + PML, elasticity, Navier–Stokes (2-D and 3-D, stabilised, high Re, vortex shedding), droplets, LES subgrid models, laser melt pool, tied two-mesh coating, Rayleigh–Bénard, phase-field fracture, wave & elastodynamics, full-waveform inversion, inverse diffusivity field, adaptive refinement, topology optimisation, 2-D Maxwell |
+| [FEM](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | 28 | Poisson, VPINN, Deep Ritz, Helmholtz + PML, elasticity, Navier–Stokes (2-D and 3-D, stabilised, high Re, vortex shedding), droplets, LES subgrid models, laser melt pool, tied two-mesh coating, Rayleigh–Bénard, phase-field fracture, wave & elastodynamics, full-waveform inversion, inverse diffusivity field, adaptive refinement, topology optimisation, 2-D Maxwell |
 | [FDM](tutorials/09-fdm/poisson-2d-fdm.md) | 4 | Poisson, heat, mixed BC, inverse source |
 | [Bayesian](tutorials/10-bayesian-pinns/index.md) | 2 | Overview and an inverse coefficient with uncertainty |
 | [RCWA](tutorials/12-rcwa/binary-grating-orders.md) | 1 | Binary-grating diffraction orders |
