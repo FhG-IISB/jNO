@@ -91,8 +91,9 @@ _INNER = textwrap.dedent(
     out["grad"] = float(jax.grad(loss)(jax.numpy.asarray([1.3]))[0])
 
     fc = cavity()
-    out["cavity"] = np.asarray(fc.solve()).tolist()
-    out["direct"] = np.asarray(fc.solve(nonlinear=jno.solve.newton(direct=True))).tolist()
+    tight = dict(rtol=1e-12, atol=1e-12)
+    out["cavity"] = np.asarray(fc.solve(nonlinear=jno.solve.newton(**tight))).tolist()
+    out["direct"] = np.asarray(fc.solve(nonlinear=jno.solve.newton(direct=True, **tight))).tolist()
 
     # a NONLINEAR march: a Newton solve per step, each residual split inside the scan
     import jno.utils.solver.fem_native as FN
@@ -140,9 +141,10 @@ def test_one_device_takes_the_plain_path(one):
 @pytest.mark.parametrize("n_dev", [2, 4])
 def test_the_split_solve_matches_one_device(one, n_dev):
     many = _run(n_dev)
-    # Only the summation order moves, so the answers agree to the SOLVER's tolerance, not to round-off: a
-    # Newton stopped at 1e-8 on a saddle point with a 1e-10 inner solve moved the cavity's pressure by
-    # 1.2e-11 on 4 devices. The reaction problem is SPD and well conditioned, and holds 1e-11.
+    # Only the summation order moves, so the answers agree to the SOLVER's tolerance, not to round-off. The
+    # cavity's Newton is asked for 1e-12: a saddle amplifies the residual, and a forced root at the default
+    # 1e-8 moved its velocities by 1.6e-6 between device counts. The reaction problem is SPD and well
+    # conditioned, and holds 1e-11.
     np.testing.assert_allclose(many["reaction"], one["reaction"], rtol=0, atol=1e-11, err_msg="reaction")
     np.testing.assert_allclose(many["march"], one["march"], rtol=0, atol=1e-11, err_msg="march")
     for key in ("cavity", "direct"):
