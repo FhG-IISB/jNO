@@ -474,6 +474,86 @@ def _region_predicate(sub, earlier):
     return where
 
 
+class _LazyReference(dict):
+    """A dict whose entries for some keys are drawn on first read: a mesh-free domain's reference clouds.
+
+    The keys are known up front (``_pending``), so ``in``, ``len``, iteration and ``keys`` answer without
+    drawing anything; reading a pending key's VALUE draws that one tag (`domain._fill_reference`), and
+    reading all values (``items``, ``values``, ``copy``, pickling) draws every pending tag first. A
+    value set before its draw is kept -- the draw only fills what is still missing.
+    """
+
+    def __init__(self, base, fill):
+        super().__init__(base)
+        self._pending = set()
+        self._fill = fill
+
+    def _need(self, key):
+        if key in self._pending:
+            self._fill(key)
+
+    def _need_all(self):
+        for key in list(self._pending):
+            self._fill(key)
+
+    def __getitem__(self, key):
+        self._need(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._need(key)
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        return key in self._pending or super().__contains__(key)
+
+    def keys(self):
+        return list(super().keys()) + [k for k in self._pending if not super().__contains__(k)]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self):
+        return len(self.keys())
+
+    def items(self):
+        self._need_all()
+        return super().items()
+
+    def values(self):
+        self._need_all()
+        return super().values()
+
+    def copy(self):
+        self._need_all()
+        return dict(super().items())
+
+    def pop(self, key, *default):
+        self._need(key)
+        self._pending.discard(key)
+        return super().pop(key, *default)
+
+    def setdefault(self, key, default=None):
+        self._need(key)
+        return super().setdefault(key, default)
+
+    def __setitem__(self, key, value):
+        self._pending.discard(key)
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._pending.discard(key)
+        if super().__contains__(key):
+            super().__delitem__(key)
+
+    def __reduce__(self):  # pickles (and deep-copies) as the plain dict it stands for
+        self._need_all()
+        return (dict, (dict(super().items()),))
+
+    def __repr__(self):
+        return f"{type(self).__name__}(keys={self.keys()!r}, pending={sorted(self._pending)!r})"
+
+
 class domain(MeshIOMixin):
     """
     Mesh-based domain class for defining computational domains and sampling collocation points.
@@ -2894,44 +2974,71 @@ class domain(MeshIOMixin):
         self._populate_reference_pool()
 
     def _populate_reference_pool(self):
-        """Give ``_mesh_pool`` a reference point cloud per tag.
+        """Give ``_mesh_pool`` a reference point cloud per tag -- drawn when first READ, not here.
 
         This is **not** the collocation set -- `variable`/`sample` bypass the pool entirely and draw
         fresh from the geometry every call. It exists because a mesh-free domain still has readers
         that legitimately need *some* finite cloud to work against: `distance_function`'s KD-tree,
         `summary`, `plot`, and the pool-shape reporting. Leaving it empty made those degrade
         silently rather than loudly, which is the failure mode this codebase least wants.
+
+        Drawing every tag here made the constructor the most expensive step of a build: on a
+        welded network of 57 solids and wires, 67 of 70 s went into these clouds (rejection-sampling
+        each small named face against the whole union, one Python ``_classify`` per point), and a
+        solver that never reads them paid it on every rebuild. So the three stores are
+        `_LazyReference` dicts: every tag is listed at once (``in``, ``boundary_tags()``), and a
+        tag's cloud is drawn on the first read of its value (`_fill_reference`).
         """
-        rng = np.random.default_rng(0)  # fixed: a reference cloud must not wobble between reads
-        dim = int(self.dimension)
-        for name, (kind, sub) in self._geometry_tags.items():
-            n = self._REFERENCE_INTERIOR if kind == "interior" else self._REFERENCE_BOUNDARY
-            try:
-                pts, nrm = self._draw_geometry_points(kind, sub, None, n, rng, kind == "boundary")
-            except RuntimeError:
-                continue  # a region that cannot be drawn has no reference cloud; it still samples
-            # Deduplicate: a 1-D domain's boundary is exactly two points, and a reference cloud of
-            # 1024 copies of them is not a point cloud, it is a broadcasting hazard.
-            pts, _keep = np.unique(pts, axis=0, return_index=True)
-            self._mesh_pool[name] = pts
+        self._mesh_pool = _LazyReference(self._mesh_pool, self._fill_reference)
+        self._boundary_regions = _LazyReference(self._boundary_regions, self._fill_reference)
+        self._boundary_registry = _LazyReference(self._boundary_registry, self._fill_reference)
+        self._reference_stores = (self._mesh_pool, self._boundary_regions, self._boundary_registry)
+        for name, (kind, _sub) in self._geometry_tags.items():
+            if not dict.__contains__(self._mesh_pool, name):
+                self._mesh_pool._pending.add(name)
             if kind == "boundary":
                 # so `boundary_tags()` lists the faces that exist, rather than only the ones a
                 # predicate happened to name. The facet arrays stay empty until there is a mesh.
-                self._boundary_regions.setdefault(name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8))
-                self._boundary_registry.setdefault(
-                    name,
-                    {
-                        "tag": name,
-                        "entity_kind": "point",
-                        "point_indices": np.arange(len(pts), dtype=int),
-                        "points": pts,
-                    },
-                )
-            # Deliberately NOT `normals_by_tag`. That dict is mesh-derived everywhere else, and the
-            # deferred build replaces it wholesale -- so filling it here creates arrays that go stale
-            # the moment anything asks for a mesh, and a caller holding both across that boundary
-            # gets a reference cloud's normals against the mesh's node indices. Mesh-free normals
-            # are computed per draw in `_draw_geometry_points`, which cannot go stale.
+                for store in self._reference_stores[1:]:
+                    if not dict.__contains__(store, name):
+                        store._pending.add(name)
+
+    def _fill_reference(self, name):
+        """Draw tag ``name``'s reference cloud into the stores that still wait for it."""
+        import zlib
+
+        stores = [s for s in self._reference_stores if name in s._pending]
+        for store in stores:
+            store._pending.discard(name)
+        kind, sub = self._geometry_tags[name]
+        # one generator PER TAG, seeded from its name: a cloud must not wobble between reads, and
+        # with lazy draws the order the tags are read in must not change any of them either
+        rng = np.random.default_rng([0, zlib.crc32(name.encode())])
+        n = self._REFERENCE_INTERIOR if kind == "interior" else self._REFERENCE_BOUNDARY
+        try:
+            pts, _nrm = self._draw_geometry_points(kind, sub, None, n, rng, kind == "boundary")
+        except RuntimeError:
+            return  # a region that cannot be drawn has no reference cloud; it still samples
+        # Deduplicate: a 1-D domain's boundary is exactly two points, and a reference cloud of
+        # 1024 copies of them is not a point cloud, it is a broadcasting hazard.
+        pts, _keep = np.unique(pts, axis=0, return_index=True)
+        dim = int(self.dimension)
+        pool, regions, registry = self._reference_stores
+        if pool in stores:
+            dict.setdefault(pool, name, pts)
+        if regions in stores:
+            dict.setdefault(regions, name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8))
+        if registry in stores:
+            dict.setdefault(
+                registry,
+                name,
+                {"tag": name, "entity_kind": "point", "point_indices": np.arange(len(pts), dtype=int), "points": pts},
+            )
+        # Deliberately NOT `normals_by_tag`. That dict is mesh-derived everywhere else, and the
+        # deferred build replaces it wholesale -- so filling it here creates arrays that go stale
+        # the moment anything asks for a mesh, and a caller holding both across that boundary
+        # gets a reference cloud's normals against the mesh's node indices. Mesh-free normals
+        # are computed per draw in `_draw_geometry_points`, which cannot go stale.
 
     _REFERENCE_INTERIOR = 4096  #: reference-cloud size for an interior tag (not the collocation count)
     _REFERENCE_BOUNDARY = 1024  #: reference-cloud size for a boundary tag
