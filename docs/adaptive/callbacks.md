@@ -69,6 +69,8 @@ print(cb.stopped_epoch)   # epoch at which training halted (None if not triggere
 print(cb.best_metric)     # best metric value observed
 ```
 
+When it stops, it logs the epoch, the patience and the best metric, so a run that ended early says why.
+
 #### Modes
 
 | `mode` | Stops when |

@@ -413,11 +413,10 @@ class EarlyStoppingCallback(Callback):
             ``total_loss`` (transferred to host).
         baseline: An optional baseline value.  Training will stop if
             the metric never improves beyond this value.
-        verbose: If ``True``, log a message when stopping.
 
     Example::
 
-        cb = jno.callback.early_stopping(patience=1000, min_delta=1e-6)
+        cb = jno.callbacks.early_stopping(patience=1000, min_delta=1e-6)
         solver.solve(epochs=100_000, callbacks=[cb])
 
         print(cb.stopped_epoch)   # epoch at which training was halted
@@ -431,7 +430,6 @@ class EarlyStoppingCallback(Callback):
         mode: str = "min",
         metric_fn: Optional[Any] = None,
         baseline: Optional[float] = None,
-        verbose: bool = True,
     ) -> None:
         if mode not in ("min", "max", "rel"):
             raise ValueError(f"mode must be 'min', 'max', or 'rel', got {mode!r}")
@@ -439,7 +437,6 @@ class EarlyStoppingCallback(Callback):
         self.patience = patience
         self.min_delta = abs(min_delta)
         self.mode = mode
-        self.verbose = verbose
 
         if metric_fn is None:
             self._metric_fn = lambda **kw: float(jax.device_get(kw["total_loss"]))
@@ -478,15 +475,12 @@ class EarlyStoppingCallback(Callback):
         if self._wait >= self.patience:
             self._stopped = True
             self.stopped_epoch = epoch
-            if self.verbose:
-                log = kwargs.get("log")
-                msg = (
-                    f"Early stopping at epoch {epoch}: "
-                    f"no improvement for {self.patience} epochs "
+            log = kwargs.get("log")
+            if log is not None:
+                log.info(
+                    f"Early stopping at epoch {epoch}: no improvement for {self.patience} epochs "
                     f"(best={self.best_metric:.6e})"
                 )
-                if log is not None:
-                    log.info(msg)
             wandb_alert(
                 "Early stopping",
                 f"Stopped at epoch {epoch} — no improvement for {self.patience} epochs (best={self.best_metric:.6e})",
@@ -1682,7 +1676,6 @@ class callbacks:
         mode: str = "min",
         metric_fn: Optional[Any] = None,
         baseline: Optional[float] = None,
-        verbose: bool = True,
     ) -> EarlyStoppingCallback:
         """Create an :class:`EarlyStoppingCallback`.
 
@@ -1695,7 +1688,6 @@ class callbacks:
             metric_fn: Optional callable extracting a scalar metric from
                 ``on_epoch_end`` keyword arguments.
             baseline: Optional initial best metric value.
-            verbose: If ``True``, emit a stop message to the logger.
         """
         return EarlyStoppingCallback(
             patience=patience,
@@ -1703,7 +1695,6 @@ class callbacks:
             mode=mode,
             metric_fn=metric_fn,
             baseline=baseline,
-            verbose=verbose,
         )
 
     @staticmethod

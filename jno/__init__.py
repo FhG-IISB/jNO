@@ -63,7 +63,6 @@ from .trace_compiler import TraceCompiler
 from .trace_evaluator import TraceEvaluator
 from .utils import IREEModel as iree
 from .utils import Logger
-from .utils import init_default_logger as logger
 from .utils.adaptive import LearningRateSchedule, WeightSchedule, callbacks, sampler
 from .utils.config import (
     _auto_compile_cache,
@@ -80,6 +79,7 @@ from .utils.config import (
     wandb_finish,
 )
 from .utils.load_save import load, save
+from .utils.logger import run_logger as logger
 from .utils.solver import sparse_batching as _sparse_batching
 
 # vmap rules for the JAX sparse primitives that ship without one (process-wide; announced via the log)

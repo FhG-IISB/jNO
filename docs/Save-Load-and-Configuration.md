@@ -214,7 +214,7 @@ jNO includes a structured logger. By default `jno.setup()` initialises it:
 dire = jno.setup(__file__)
 
 # Write custom log messages
-log = jno.logger(dire)
+log = jno.logger()                      # the run's logger: run directory and console
 log("Starting experiment")
 log.info("Epoch 1000 reached")
 log.warning("Large loss spike detected")

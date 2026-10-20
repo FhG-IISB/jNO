@@ -1471,13 +1471,12 @@ class PolygonDomain(domain):
 
             last_tag = tag
             last_idx = np.arange(n_samples, dtype=int) if return_indices else None
-            if self._verbose:
-                if batch_count > 1:
-                    self.log.info(
-                        f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} polygon points for '{tag}' with shape {arr.shape}"
-                    )
-                else:
-                    self.log.info(f"Sampled {n_samples} polygon points for '{tag}'")
+            if batch_count > 1:
+                self.log.info(
+                    f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} polygon points for '{tag}' with shape {arr.shape}"
+                )
+            else:
+                self.log.info(f"Sampled {n_samples} polygon points for '{tag}'")
 
         if last_tag is None:
             raise ValueError("sample_spec must contain at least one tag")
@@ -2032,12 +2031,11 @@ class PolygonDomain(domain):
         # `boundary`/`interior`; the user writes interface conditions on them and jno.core reads them.
         self._register_interface_tags()
 
-        if self._verbose:
-            n_pts = int(np.asarray(mesh.points).shape[0])
-            self.log.info(
-                f"PolygonDomain.build_mesh: meshed {len(region_parts)} CSG piece(s) into {n_pts} nodes "
-                f"(mesh_size={mesh_size}, algorithm={getattr(self, '_effective_mesh_algorithm', algorithm)})"
-            )
+        n_pts = int(np.asarray(mesh.points).shape[0])
+        self.log.info(
+            f"PolygonDomain.build_mesh: meshed {len(region_parts)} CSG piece(s) into {n_pts} nodes "
+            f"(mesh_size={mesh_size}, algorithm={getattr(self, '_effective_mesh_algorithm', algorithm)})"
+        )
         return self
 
     def _partition_active_by_source_region(self) -> List[Tuple[BaseGeometry, Optional[str]]]:

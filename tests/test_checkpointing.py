@@ -610,7 +610,7 @@ class TestEarlyStoppingCallback:
         from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         # patience=3 so it stops quickly; min_delta large enough to detect plateau
-        cb = EarlyStoppingCallback(patience=3, min_delta=1e-3, verbose=False)
+        cb = EarlyStoppingCallback(patience=3, min_delta=1e-3)
         solver = _make_solver(epochs=0)
         solver.solve(200, callbacks=[cb])
 
@@ -622,7 +622,7 @@ class TestEarlyStoppingCallback:
         """With high patience, training should complete normally."""
         from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
-        cb = EarlyStoppingCallback(patience=10_000, verbose=False)
+        cb = EarlyStoppingCallback(patience=10_000)
         solver = _make_solver(epochs=0)
         solver.solve(20, callbacks=[cb])
 
@@ -632,7 +632,7 @@ class TestEarlyStoppingCallback:
         """mode='min' should detect when loss stops decreasing."""
         from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
-        cb = EarlyStoppingCallback(patience=5, mode="min", verbose=False)
+        cb = EarlyStoppingCallback(patience=5, mode="min")
 
         # Simulate decreasing then flat losses
         for i, loss_val in enumerate([1.0, 0.5, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]):
@@ -658,7 +658,6 @@ class TestEarlyStoppingCallback:
             patience=3,
             mode="max",
             metric_fn=lambda **kw: float(jax.device_get(kw["total_loss"])),
-            verbose=False,
         )
 
         for i, val in enumerate([0.1, 0.5, 0.9, 0.9, 0.9, 0.9]):
@@ -680,7 +679,7 @@ class TestEarlyStoppingCallback:
         """mode='rel' should use relative improvement threshold."""
         from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
-        cb = EarlyStoppingCallback(patience=2, mode="rel", min_delta=0.1, verbose=False)
+        cb = EarlyStoppingCallback(patience=2, mode="rel", min_delta=0.1)
 
         # 1.0 -> 0.95 is only 5% improvement, below 10% threshold
         losses = [1.0, 0.95, 0.94, 0.93]
@@ -702,7 +701,7 @@ class TestEarlyStoppingCallback:
         """With a baseline, early stopping fires if metric never beats it."""
         from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
-        cb = EarlyStoppingCallback(patience=2, baseline=0.01, verbose=False)
+        cb = EarlyStoppingCallback(patience=2, baseline=0.01)
 
         # Loss never goes below baseline 0.01
         for i in range(5):
@@ -734,7 +733,6 @@ class TestEarlyStoppingCallback:
         cb = EarlyStoppingCallback(
             patience=2,
             metric_fn=lambda **kw: float(jax.device_get(kw["individual_losses"])[0]),
-            verbose=False,
         )
 
         for i, val in enumerate([1.0, 1.0, 1.0]):

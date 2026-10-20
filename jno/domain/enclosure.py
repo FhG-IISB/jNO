@@ -801,7 +801,6 @@ def _refine_near_pairs(
     k_azim=3.0,
     k_merid=3.0,
     chunk=96,
-    log=None,
     occluders=None,
 ):
     """Recompute NEAR element pairs (and the diagonal) with adaptive quadrature; return the corrected F.
@@ -841,7 +840,6 @@ def _refine_near_pairs(
     from shapely.ops import unary_union
 
     F = np.array(F, dtype=np.float64, copy=True)
-    m = e0.shape[0]
     mids = 0.5 * (e0 + e1)
     length = np.linalg.norm(e1 - e0, axis=1)
 
@@ -853,12 +851,6 @@ def _refine_near_pairs(
     need = (D < k_azim * dphi * r_ref) | (D < k_merid * h)
     np.fill_diagonal(need, True)  # the ring self-view: the ultimate near pair
     iu, ju = np.where(np.triu(need))
-    if log:
-        log(
-            f"near-field: refining {len(iu)} of {m * (m + 1) // 2} unordered pairs "
-            f"({100 * len(iu) / (m * (m + 1) / 2):.1f}%)"
-        )
-
     if occluders is None:  # legacy: guess the solids from the element tags (see the docstring's warning)
         regions = getattr(domain, "_source_regions", {}) or {}
         geoms = [regions[s] for s in sorted(set(map(str, elem_tag))) if s in regions]

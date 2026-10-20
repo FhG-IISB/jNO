@@ -903,7 +903,6 @@ class domain(MeshIOMixin):
         self.time = time
         self._is_time_dependent = time is not None
         self._is_pseudo_time = pseudo_time
-        self._verbose = True
         self.same_domain = False
 
         # Tracking
@@ -5934,8 +5933,7 @@ class domain(MeshIOMixin):
                     ii += 1
                 self._sample_geometry_tag(tag, source_tag, n_samples, normals, batch_count, _apply_time_value_to_sampled)
                 idx = None
-                if self._verbose:
-                    self.log.info(f"Sampled {n_samples} points for '{tag}' from the geometry (no mesh)")
+                self.log.info(f"Sampled {n_samples} points for '{tag}' from the geometry (no mesh)")
                 continue
 
             if source_tag not in self._mesh_pool:
@@ -6062,31 +6060,30 @@ class domain(MeshIOMixin):
                         (batch_count, *sampled_nrm.shape),
                     )
 
-            if self._verbose:
-                if is_time_dep:
-                    tag_arr = np.asarray(self.context[tag])
-                    # Time-dependent tag arrays are typically (B, T_tag, N, D).
-                    # Use tag-specific T so regions like 'initial' (T=1) log correctly.
-                    n_time = int(tag_arr.shape[1]) if tag_arr.ndim >= 3 else 1
-                    per_batch_total = n_samples * n_time
-                    if batch_count > 1:
-                        grand_total = per_batch_total * batch_count
-                        self.log.info(
-                            f"Sampled {n_samples} spatial points x {n_time} timesteps x {batch_count} batches "
-                            f"= {grand_total} spatiotemporal points for '{tag}' with shape {self.context[tag].shape}"
-                        )
-                    else:
-                        self.log.info(
-                            f"Sampled {n_samples} spatial points x {n_time} timesteps "
-                            f"= {per_batch_total} spatiotemporal points for '{tag}'"
-                        )
-                    continue
+            if is_time_dep:
+                tag_arr = np.asarray(self.context[tag])
+                # Time-dependent tag arrays are typically (B, T_tag, N, D).
+                # Use tag-specific T so regions like 'initial' (T=1) log correctly.
+                n_time = int(tag_arr.shape[1]) if tag_arr.ndim >= 3 else 1
+                per_batch_total = n_samples * n_time
                 if batch_count > 1:
+                    grand_total = per_batch_total * batch_count
                     self.log.info(
-                        f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.context[tag].shape}"
+                        f"Sampled {n_samples} spatial points x {n_time} timesteps x {batch_count} batches "
+                        f"= {grand_total} spatiotemporal points for '{tag}' with shape {self.context[tag].shape}"
                     )
                 else:
-                    self.log.info(f"Sampled {n_samples} points for '{tag}'")
+                    self.log.info(
+                        f"Sampled {n_samples} spatial points x {n_time} timesteps "
+                        f"= {per_batch_total} spatiotemporal points for '{tag}'"
+                    )
+                continue
+            if batch_count > 1:
+                self.log.info(
+                    f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.context[tag].shape}"
+                )
+            else:
+                self.log.info(f"Sampled {n_samples} points for '{tag}'")
 
         if return_indices:
             return self.context[tag], idx, tag

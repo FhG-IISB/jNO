@@ -5,7 +5,7 @@ import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import jax
 import optax
@@ -1213,43 +1213,15 @@ class Tuner:
 
 
 class tune:
-    """
-    Tuning utilities accessible as pnp.tune.
+    """Search-space helpers, reachable as ``jno.np.tune``::
 
-    Example:
-        space = pnp.tune.space()
-        space.onehot("act", ["tanh", "sin"])
-        best = pnp.tune.solve(space, loss_fn, budget=10)
+    space = jno.np.tune.space()
     """
 
     @staticmethod
     def space() -> ArchSpace:
         """Create a new architecture search space."""
         return ArchSpace()
-
-    @staticmethod
-    def solve(
-        space: ArchSpace,
-        loss_fn: Callable[[Arch], float],
-        budget: int = 20,
-        optimizer: str = "NGOpt",
-        verbose: bool = True,
-    ) -> Arch:
-        """
-        Run architecture search.
-
-        Args:
-            space:  ArchSpace defining the search space.
-            loss_fn:  Function Arch -> float (your training pipeline).
-            budget: Number of architectures to evaluate.
-            optimizer: Nevergrad optimizer name.
-            verbose: Print progress.
-
-        Returns:
-            Best Arch found.
-        """
-        tuner = Tuner(space)
-        return tuner.solve(loss_fn, budget=budget, optimizer=optimizer, verbose=verbose)  # type: ignore[attr-defined]
 
     Arch = Arch
     ArchSpace = ArchSpace

@@ -264,3 +264,14 @@ def init_default_logger(path: Path, log_print: Tuple[bool, bool] = (True, True),
         _default_logger = Logger(path=path, log_print=log_print, name="DefaultLogger")
 
     return _default_logger
+
+
+def run_logger(path=None) -> "Logger | PrintFallback":
+    """The run's logger, for messages of your own: the one ``jno.setup`` started (file and console), or a
+    new one writing ``log.log`` in ``path``::
+
+        jno.setup(__file__)
+        log = jno.logger()
+        log.info("Epoch 1000 reached")
+    """
+    return init_default_logger(path) if path is not None else get_logger()
