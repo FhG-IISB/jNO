@@ -18,6 +18,7 @@ No external solver dependency (no optimistix / lineax).
 
 from __future__ import annotations
 
+import contextlib
 import math
 
 import jax
@@ -822,6 +823,25 @@ _FORCING = [True]
 #: Set by ``fem.solve`` for the duration of a solve whose residual is LINEAR in the unknown (a linear form
 #: marched for its step history): one exact Newton step solves it, and forcing would take ~4 assemblies.
 _LINEAR_FORM = [False]
+
+
+@contextlib.contextmanager
+def exact_steps():
+    """Solve every Newton step's linear system to the slot's own tolerance while inside, without forcing.
+
+    For loops that compare successive solves of the same step (the contact rounds): a forced root is
+    only as good as ``atol + rtol ||r0||``, so two solves differ by that much, and where the solution is
+    near zero -- a load path's first step -- that difference is all of ``|du|/|u|`` and the rounds never
+    agree. Read when the driver is traced; the compiled-solve cache is keyed on it.
+    """
+    prev = _FORCING[0]
+    _FORCING[0] = False
+    try:
+        yield
+    finally:
+        _FORCING[0] = prev
+
+
 #: Eisenstat & Walker (SIAM J. Sci. Comput. 17 (1996) 16), choice 2: eta_k = GAMMA (||r_k||/||r_k-1||)^ALPHA,
 #: safeguarded by GAMMA eta_k-1^ALPHA when that is larger than 0.1, started at ETA_0, never above ETA_MAX.
 _EW_GAMMA, _EW_ALPHA, _EW_ETA0, _EW_ETA_MAX = 0.9, 2.0, 0.1, 0.1

@@ -42,6 +42,7 @@ from typing import Any, Optional, Sequence, Tuple
 import numpy as np
 
 from .fem_utils import _edge_shape, _log, _tri_shape
+from .newton_krylov import exact_steps
 
 #: Reported for a query with no facet inside the capture distance: wide open, so a contact pressure
 #: ``max(0, -g)`` yields exactly zero. Chosen over ``inf`` so a stray multiplication cannot make a NaN.
@@ -399,6 +400,7 @@ def _pairing_moved(a, b):
     return n
 
 
+@exact_steps()  # the rounds compare successive solves: see `newton_krylov.exact_steps`
 def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
     """Solve, re-pair from the deformed configuration, repeat until the pairing settles.
 
