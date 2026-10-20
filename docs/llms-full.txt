@@ -317,7 +317,8 @@ Construct with a placeholder rate of `1` when using `.scale(...)` — the schedu
 rate and is re-evaluated every step. Factories: `lrs.constant`, `lrs.exponential`, `lrs.cosine`,
 `lrs.warmup_cosine`, `lrs.piecewise_constant`, all taking `min_lr`/`max_lr`; any
 `(epoch, losses) -> scalar` callable is a schedule. `jno.optimizers` adds second-order optimisers
-absent from optax: `engd`, `ssbroyden`, `ssbfgs`, `soap`, `md`.
+absent from optax: `engd`, `ssbroyden`, `ssbfgs`, `soap`, `md`, and the constrained `mma` and
+`gcmma` (the only ones that take `jno.le`/`jno.ge` entries in the `jno.core` list).
 
 ### What `solve()` actually returns
 
