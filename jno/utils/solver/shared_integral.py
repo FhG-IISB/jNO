@@ -37,8 +37,15 @@ def _key(node):
                 index[id(n)] = len(slots)
                 slots.append(n)
             blk = getattr(n, "values_block", None)
-            return ("slot", index[id(n)], str(n.space).upper(), int(n.order), tuple(n.value_shape or ()),
-                    None if blk is None else tuple(blk), getattr(n, "values_node", None) is not None)
+            return (
+                "slot",
+                index[id(n)],
+                str(n.space).upper(),
+                int(n.order),
+                tuple(n.value_shape or ()),
+                None if blk is None else tuple(blk),
+                getattr(n, "values_node", None) is not None,
+            )
 
         spec["key"] = (id(spec["domain"]), structural_key(spec["expr"], {}, leaf))
         spec["slots"] = slots
@@ -97,10 +104,13 @@ def _plan(members):
     for k, sup in enumerate(supports):
         ids[k, : len(sup)], w[k, : len(sup)] = sup, 1.0
         if len(sup):
-            ids[k, len(sup):] = sup[0]  # a real cell, weighted 0: its value is finite and drops out
+            ids[k, len(sup) :] = sup[0]  # a real cell, weighted 0: its value is finite and drops out
     vkeys = {("frozen", slots[0][i].frozen_id): i for i in varying}
-    consts = {key: np.stack([np.reshape(np.asarray(s[i].values), (-1,)) for s in slots])
-              for key, i in vkeys.items() if slots[0][i].frozen_id in data}
+    consts = {
+        key: np.stack([np.reshape(np.asarray(s[i].values), (-1,)) for s in slots])
+        for key, i in vkeys.items()
+        if slots[0][i].frozen_id in data
+    }
     return {"members": list(members), "fn": fn, "inputs": inputs, "ids": ids, "w": w, "vkeys": vkeys, "consts": consts}
 
 
@@ -124,11 +134,13 @@ def integrate_shared(evaluator, node, ctx, memo) -> bool:
     batched = {key: jnp.asarray(v) for key, v in plan["consts"].items()}
     for key, i in plan["vkeys"].items():
         if key not in batched:  # a solve per member, from the memo (or the shared factorisation), outside the vmap
-            batched[key] = jnp.stack([jnp.reshape(jnp.asarray(evaluator._dispatch(s[i].values_node, ctx)), (-1,))
-                                      for s in slots])
+            batched[key] = jnp.stack(
+                [jnp.reshape(jnp.asarray(evaluator._dispatch(s[i].values_node, ctx)), (-1,)) for s in slots]
+            )
     fn, n = plan["fn"], len(members)
-    out = jax.vmap(lambda b, ids, w: fn({**fixed, **b}, ids, w, n_batch=n))(batched, jnp.asarray(plan["ids"]),
-                                                                             jnp.asarray(plan["w"]))
+    out = jax.vmap(lambda b, ids, w: fn({**fixed, **b}, ids, w, n_batch=n))(
+        batched, jnp.asarray(plan["ids"]), jnp.asarray(plan["w"])
+    )
     for k, m in enumerate(members):
         memo[id(m)] = (m, out[k])
     return True

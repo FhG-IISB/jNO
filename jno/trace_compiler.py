@@ -51,7 +51,6 @@ from .trace import (
     collect_tags,
 )
 
-
 # Context entries that are FEM metadata, not sample batches: never vmapped over, never a batch size.
 CONTEXT_METADATA_TAGS = frozenset(
     {

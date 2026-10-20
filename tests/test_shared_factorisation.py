@@ -89,14 +89,16 @@ def test_two_drives_share_one_block_solve(monkeypatch):
     k2.initialize(lambda key, shape, dtype=None: kv)
     n2 = (k2 * inner(B[0], B[1])).integrate(d)
     F2 = jno.fn(lambda i: jnp.real(i) + 0.3 * jnp.imag(i), [n2], name="F2")
-    want = float(np.asarray(jno.core([F2], domain=jno.domain.from_array({"_": np.zeros((1, 1))})).eval([F2])).reshape(-1)[0])
+    want = float(
+        np.asarray(jno.core([F2], domain=jno.domain.from_array({"_": np.zeros((1, 1))})).eval([F2])).reshape(-1)[0]
+    )
     np.testing.assert_allclose(got, want, rtol=1e-9)
 
 
 def test_the_gradient_is_that_of_the_separate_solves(monkeypatch):
     """d(F)/d(k) through the shared block solve equals the one through two separate solves"""
-    from jno.trace_compiler import TraceCompiler
     import jno.utils.solver.shared_solve as S
+    from jno.trace_compiler import TraceCompiler
 
     d, fems, F, crux, k = _drives()
     fn = TraceCompiler.compile_traced_expression(F, crux.all_ops)
@@ -136,14 +138,16 @@ def test_nvmath_cudss_lu_factors_a_real_group_once(monkeypatch):
     """a REAL non-symmetric form on lu(backend="cudss") takes the nvmath cuDSS LU (as a single solve does; a symmetric
     one is factored LDL^T in the program, tests/test_symmetric_operator.py); the group's block of right-hand sides
     goes to it in ONE call, and values and gradient equal those of separate solves"""
-    from jno.trace_compiler import TraceCompiler
     import jno.utils.solver.linear as L
     import jno.utils.solver.shared_solve as S
+    from jno.trace_compiler import TraceCompiler
     from tests.test_shared_factorisation_cpu import _three_loads
 
     calls = []
     orig = L._cudss_host_solve
-    monkeypatch.setattr(L, "_cudss_host_solve", lambda d, i, r, shape, t: calls.append((np.shape(r), t)) or orig(d, i, r, shape, t))
+    monkeypatch.setattr(
+        L, "_cudss_host_solve", lambda d, i, r, shape, t: calls.append((np.shape(r), t)) or orig(d, i, r, shape, t)
+    )
 
     def run():
         F, crux = _three_loads(LU, advect=0.7)

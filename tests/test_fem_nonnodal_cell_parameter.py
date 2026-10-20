@@ -33,9 +33,8 @@ def _x64():
 
 def _domain():
     return (
-        B(0, 0, 0, 0.5, 1, 1).name("a").attach(k=2.0)
-        + B(0, 0, 0, 1, 1, 1).name("b").attach(k=5.0)
-    ).sized(0.45).domain()
+        (B(0, 0, 0, 0.5, 1, 1).name("a").attach(k=2.0) + B(0, 0, 0, 1, 1, 1).name("b").attach(k=5.0)).sized(0.45).domain()
+    )
 
 
 def _forms(d, coeff, bc=True):
@@ -82,14 +81,18 @@ def test_p0_coefficient_is_linear_and_local_per_cell():
         rows = np.flatnonzero(np.abs(dK).max(1) > 1e-12 * np.abs(dK).max())
         assert 1 <= len(rows) <= 6, (c, len(rows))
     r1, r2 = jnp.asarray(np.random.default_rng(0).uniform(size=nc)), jnp.asarray(np.random.default_rng(1).uniform(size=nc))
-    np.testing.assert_allclose(np.asarray(K(r1 + 2 * r2)) - K0, (np.asarray(K(r1)) - K0) + 2 * (np.asarray(K(r2)) - K0),
-                               rtol=1e-10, atol=1e-10 * np.abs(K0).max())
+    np.testing.assert_allclose(
+        np.asarray(K(r1 + 2 * r2)) - K0,
+        (np.asarray(K(r1)) - K0) + 2 * (np.asarray(K(r2)) - K0),
+        rtol=1e-10,
+        atol=1e-10 * np.abs(K0).max(),
+    )
 
 
 def test_p0_gradient_matches_finite_differences():
     d = _domain()
     nc = len(d.mesh.cells_dict["tetra"])
-    op = _forms(d, _cell_density(d) ** 3).operator          # a SIMP-like nonlinearity in rho
+    op = _forms(d, _cell_density(d) ** 3).operator  # a SIMP-like nonlinearity in rho
     n = op.evaluate({"rho": jnp.ones(nc)})[0].shape[0]
     w = jnp.asarray(np.random.default_rng(2).normal(size=n))
     f = jax.jit(lambda r: w @ (op.evaluate({"rho": r})[0] @ w))
@@ -105,4 +108,4 @@ def test_p0_array_of_the_wrong_length_is_refused():
     d = _domain()
     op = _forms(d, _cell_density(d)).operator
     with pytest.raises(ValueError, match="one value per cell"):
-        op.evaluate({"rho": jnp.ones(len(d.mesh.points))})          # a vertex-length array for a P0 field
+        op.evaluate({"rho": jnp.ones(len(d.mesh.points))})  # a vertex-length array for a P0 field

@@ -78,14 +78,36 @@ def _load():
                 return None
             cache.mkdir(parents=True, exist_ok=True)
             tmp = so.with_suffix(f".{os.getpid()}.tmp")
-            cmd = [nvcc, "-O2", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", f"-I{inc_jax}", f"-I{nv / 'include'}",
-                   str(_SRC), "-o", str(tmp), f"-L{nv / 'lib'}", "-l:libcudss.so.0", "-Xlinker", f"-rpath={nv / 'lib'}"]
+            cmd = [
+                nvcc,
+                "-O2",
+                "-std=c++17",
+                "-shared",
+                "-Xcompiler",
+                "-fPIC",
+                f"-I{inc_jax}",
+                f"-I{nv / 'include'}",
+                str(_SRC),
+                "-o",
+                str(tmp),
+                f"-L{nv / 'lib'}",
+                "-l:libcudss.so.0",
+                "-Xlinker",
+                f"-rpath={nv / 'lib'}",
+            ]
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError("nvcc failed:\n" + r.stderr[-3000:])
             tmp.replace(so)
         lib = ctypes.cdll.LoadLibrary(str(so))
-        lib.jno_cudsd_create.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        lib.jno_cudsd_create.argtypes = [
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
         lib.jno_cudsd_create.restype = ctypes.c_int
         lib.jno_cudsd_free.argtypes = [ctypes.c_int64]
         lib.jno_cudsd_release.argtypes = [ctypes.c_int64]
@@ -121,7 +143,7 @@ class Plan:
         key = rows[up] * self.n + cols[up]
         uniq, inv = np.unique(key, return_inverse=True)
         self.nnz = len(uniq)
-        pos = np.full(self.nse, self.nnz, np.int32)      # entries below the diagonal go to a dropped dummy slot
+        pos = np.full(self.nse, self.nnz, np.int32)  # entries below the diagonal go to a dropped dummy slot
         pos[up] = inv.astype(np.int32)
         ptr = np.searchsorted(uniq // self.n, np.arange(self.n + 1)).astype(np.int32)
         idx = (uniq % self.n).astype(np.int32)
@@ -166,11 +188,13 @@ def _ffi_solve(p: Plan, token, rhs):
     import jax
 
     sol = "jno_cudsz_solve" if p.complex else "jno_cudsd_solve"
-    r2 = rhs.reshape(p.n, -1).T                             # (k, n): each right-hand side contiguous
+    r2 = rhs.reshape(p.n, -1).T  # (k, n): each right-hand side contiguous
     # vmap over right-hand sides (a block of loads on one matrix: shared factorisations, jacrev): the solve runs
     # once per batch entry on the SAME factors. The factorisation has no batching rule on purpose: a batch of
     # matrices would refactor one slot over and over and every solve would see the last.
-    x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype), vmap_method="sequential")(token, r2, slot=np.int64(p.slot))
+    x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype), vmap_method="sequential")(
+        token, r2, slot=np.int64(p.slot)
+    )
     return x.T.reshape(rhs.shape)
 
 
@@ -181,15 +205,15 @@ def _refine(p: Plan, matvec, rhs, tol, maxiter, restart=10):
     import jax
     import jax.numpy as jnp
 
-    token = jnp.zeros((1,), jnp.int32)                      # no factorisation in this program: no dependency
+    token = jnp.zeros((1,), jnp.int32)  # no factorisation in this program: no dependency
     prec = lambda r: _ffi_solve(p, token, r)
     B = rhs.reshape(p.n, -1)
     bn = jnp.maximum(jnp.linalg.norm(B, axis=0), jnp.finfo(jnp.float64).tiny)
     relres = lambda R: jnp.max(jnp.linalg.norm(R, axis=0) / bn)
-    target = 0.5 * tol * jnp.min(bn)                        # ||R||_F below this -> every column below tol
+    target = 0.5 * tol * jnp.min(bn)  # ||R||_F below this -> every column below tol
     mv = lambda X: matvec(X.reshape(rhs.shape)).reshape(B.shape)
     pc = lambda X: prec(X.reshape(rhs.shape)).reshape(B.shape)
-    m, dot = restart, lambda U, W: jnp.vdot(U, W)
+    m = restart
 
     def cycle(state):
         X, R, nsolve, _ = state
@@ -202,7 +226,7 @@ def _refine(p: Plan, matvec, rhs, tol, maxiter, restart=10):
             V, H, k, _ = st
             W = mv(pc(V[k]))
             mask = (jnp.arange(m + 1) <= k).astype(B.dtype)
-            for _ in range(2):                              # classical Gram-Schmidt, twice
+            for _ in range(2):  # classical Gram-Schmidt, twice
                 h = jnp.einsum("jnk,nk->j", V.conj(), W) * mask
                 W = W - jnp.einsum("j,jnk->nk", h, V)
                 H = H.at[:, k].add(h)
@@ -255,6 +279,7 @@ def solve(p: Plan, values, b, refactor=True, tol=1e-10, maxiter=30):
         token = jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(jax.lax.stop_gradient(vcsr), slot=slot)
         _solve = lambda _matvec, rhs: _ffi_solve(p, token, rhs)
     else:
+
         def _solve(matvec, rhs):
             x, _it, rel = _refine(p, matvec, rhs, tol, maxiter)
             return jnp.where(rel <= tol, x, jnp.nan)

@@ -52,7 +52,9 @@ def _two_conductors():
     kap.initialize(jax.nn.initializers.constant(1.0))
     P, V = phi.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     grad = lambda f: jno.np.grad(f, [xi, yi])  # noqa: E731
-    fems = [jno.fem([kap * inner(grad(P), grad(V)), phi(xl, yl) - gl, phi(xr, yr) - gr]) for gl, gr in ((1.0, 0.0), (0.0, 1.0))]
+    fems = [
+        jno.fem([kap * inner(grad(P), grad(V)), phi(xl, yl) - gl, phi(xr, yr) - gr]) for gl, gr in ((1.0, 0.0), (0.0, 1.0))
+    ]
     return d, phi, (xi, yi), fems, grad
 
 
@@ -67,7 +69,7 @@ def test_cross_form_energy_is_phi_k_K_phi_j():
     K = np.asarray(jno.fem([inner(grad(u.bind(x=xi, y=yi)), grad(w.bind(x=xi, y=yi)))]).operator[0].todense())
     want = np.array([[sol[k] @ K @ sol[j] for k in range(2)] for j in range(2)])
     np.testing.assert_allclose(got, want, rtol=1e-9)
-    assert got[0, 1] < 0 and abs(got[0, 1] - got[1, 0]) < 1e-10 * abs(got[0, 1])   # mutual: negative, symmetric
+    assert got[0, 1] < 0 and abs(got[0, 1] - got[1, 0]) < 1e-10 * abs(got[0, 1])  # mutual: negative, symmetric
 
 
 def test_gradient_with_respect_to_the_solution_values():
@@ -100,7 +102,10 @@ def test_eddy_admittance_matches_the_per_form_integrals():
     curl = lambda f_: f_.vector.curl(x, y, z)  # noqa: E731
     sigma, w = 3.0 * k, 2.0
     E = [e.bind(x=x, y=y, z=z).freeze(h) for h in H]
-    fems = [jno.fem([inner(curl(u), curl(v)) + 1j * w * sigma * inner(A, V) + 0.1 * inner(A, V) - sigma * inner(Ek, V)]) for Ek in E]
+    fems = [
+        jno.fem([inner(curl(u), curl(v)) + 1j * w * sigma * inner(A, V) + 0.1 * inner(A, V) - sigma * inner(Ek, V)])
+        for Ek in E
+    ]
     Ak = [u.bind(x=x, y=y, z=z).freeze(f.solve(linear=HOST)) for f in fems]
     Yd = [(sigma * inner(E[kk] - 1j * w * Ak[kk], E[j])).integrate(d) for j in range(2) for kk in range(2)]
     Yf = [(sigma * inner(E[kk] - 1j * w * A, E[j])).integrate(fems[kk], solver=HOST) for j in range(2) for kk in range(2)]
@@ -152,7 +157,9 @@ def test_a_list_of_expressions_is_evaluated_as_one_program(monkeypatch):
     built = []
     for name in ("compile_traced_expression", "compile_multi_expression"):
         orig = getattr(TraceCompiler, name)
-        monkeypatch.setattr(TraceCompiler, name, staticmethod(lambda *a, _o=orig, _n=name, **k: built.append(_n) or _o(*a, **k)))
+        monkeypatch.setattr(
+            TraceCompiler, name, staticmethod(lambda *a, _o=orig, _n=name, **k: built.append(_n) or _o(*a, **k))
+        )
     crux = jno.core([nodes[0]], domain=_empty())
     built.clear()
     together = [complex(np.asarray(v).reshape(-1)[0]) for v in crux.eval(nodes)]
@@ -173,7 +180,9 @@ def _localized_admittance():
     dm = build_dofmap(np.asarray(d.mesh.cells_dict["tetra"]), "N1E", 1, n_verts=len(d.mesh.points))
     P = np.asarray(d.mesh.points)
     ev = np.zeros((int(dm.n_dofs), 2), np.int64)
-    ev[np.asarray(dm.cell_dofs).reshape(-1)] = np.asarray(d.mesh.cells_dict["tetra"])[:, [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]].reshape(-1, 2)
+    ev[np.asarray(dm.cell_dofs).reshape(-1)] = np.asarray(d.mesh.cells_dict["tetra"])[
+        :, [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]
+    ].reshape(-1, 2)
     near = (P[ev[:, 0], 0] < 0.3) & (P[ev[:, 1], 0] < 0.3)
     H = np.random.default_rng(1).normal(size=(2, int(dm.n_dofs))) * near
     A, V = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
@@ -182,8 +191,10 @@ def _localized_admittance():
     kap = jno.np.parameter((1,), name="kap")  # a runtime parameter: the solves stay lazy, inputs of the integrals
     kap.dtype(jnp.float64)
     kap.initialize(jax.nn.initializers.constant(1.0))
-    fems = [jno.fem([inner(curl(u), curl(v)) + 2j * 3.0 * inner(A, V) + 0.1 * kap * inner(A, V) - 3.0 * inner(Ek, V)])
-            for Ek in E]
+    fems = [
+        jno.fem([inner(curl(u), curl(v)) + 2j * 3.0 * inner(A, V) + 0.1 * kap * inner(A, V) - 3.0 * inner(Ek, V)])
+        for Ek in E
+    ]
     Ak = [u.bind(x=x, y=y, z=z).freeze(f.solve(linear=HOST)) for f in fems]
     return d, lambda: [(3.0 * inner(E[k] - 2j * Ak[k], E[j])).integrate(d) for j in range(2) for k in range(2)], fems
 
@@ -199,7 +210,9 @@ def test_an_integral_runs_over_the_support_of_its_data_only(monkeypatch):
     monkeypatch.setattr(FK, "cell_support", lambda *a: seen.append(orig(*a)) or seen[-1])
     Y = build()
     n_cells = len(d.mesh.cells_dict["tetra"])
-    assert all(s is not None and 0 < s.sum() < 0.5 * n_cells for s in seen), [None if s is None else int(s.sum()) for s in seen]
+    assert all(s is not None and 0 < s.sum() < 0.5 * n_cells for s in seen), [
+        None if s is None else int(s.sum()) for s in seen
+    ]
     monkeypatch.setattr(FK, "cell_support", lambda *a: None)
     Y_all = build()
     np.testing.assert_allclose(np.array(_eval(Y)), np.array(_eval(Y_all)), rtol=1e-12)
@@ -224,7 +237,9 @@ def test_integrals_of_one_structure_are_one_kernel(monkeypatch):
     monkeypatch.setattr(SI, "_plan", lambda m: plans.append(len(m)) or orig(m))
 
     def run(Y):
-        F = jno.fn(lambda *ys: sum((i + 1) * jnp.real(y) + (i + 2) * jnp.imag(y) for i, y in enumerate(ys)), list(Y), name="F")
+        F = jno.fn(
+            lambda *ys: sum((i + 1) * jnp.real(y) + (i + 2) * jnp.imag(y) for i, y in enumerate(ys)), list(Y), name="F"
+        )
         crux = jno.core([F], domain=_empty())
         val = float(np.asarray(crux.eval([F])).reshape(-1)[0])
         fn = TraceCompiler.compile_traced_expression(F, crux.all_ops)

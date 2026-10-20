@@ -43,12 +43,24 @@ def _forms():
         "variable coefficient": (jno.fem([(1.0 + x) * inner(g(U), g(V)) + 2.0 * U * V - V]), True),
         "convection": (jno.fem([inner(g(U), g(V)) + inner(jno.np.vector(1.0 + 0 * x, 0.5 + 0 * x), g(U)) * V - V]), False),
         "Dirichlet condition": (jno.fem([inner(g(U), g(V)) - V, u(xl, yl) - 0.0]), True),
-        "Dirichlet condition, convection": (jno.fem([inner(g(U), g(V)) + 2.0 * g(U)[..., 0] * V - V, u(xl, yl) - 1.0]), False),
+        "Dirichlet condition, convection": (
+            jno.fem([inner(g(U), g(V)) + 2.0 * g(U)[..., 0] * V - V, u(xl, yl) - 1.0]),
+            False,
+        ),
     }
 
 
-@pytest.mark.parametrize("name", ["helmholtz filter", "the same, factors in another order", "variable coefficient",
-                                  "convection", "Dirichlet condition", "Dirichlet condition, convection"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "helmholtz filter",
+        "the same, factors in another order",
+        "variable coefficient",
+        "convection",
+        "Dirichlet condition",
+        "Dirichlet condition, convection",
+    ],
+)
 def test_symmetric_only_when_the_matrix_is(name):
     _d, forms = _forms()
     fem, expect = forms[name]
@@ -82,6 +94,7 @@ def test_a_symmetric_real_form_is_factored_in_the_program():
     orig = L._cudss_host_solve
     L._cudss_host_solve = lambda *a: host_calls.append(1) or orig(*a)
     try:
+
         def value_and_grad(linear):
             sol = p.bind(x=x, y=y).freeze(fem.solve(linear=linear))
             J = (sol * sol * (1.0 + x)).integrate(d)

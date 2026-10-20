@@ -151,7 +151,9 @@ def _emit_node(node, occ, split_full=False, size=None, offset=None):
         rev = occ.revolve(base, *ap, *ad, ang)
         return [dt for dt in rev if dt[0] == 3]
     if kind == "translate":
-        moved = tuple(float(a) + float(b) for a, b in zip(offset or (0.0, 0.0, 0.0), tuple(node[2]) + (0.0,) * (3 - len(node[2]))))
+        moved = tuple(
+            float(a) + float(b) for a, b in zip(offset or (0.0, 0.0, 0.0), tuple(node[2]) + (0.0,) * (3 - len(node[2])))
+        )
         return _emit_node(node[1]._node, occ, split_full, sub(node[1]), moved)
     if kind == "rotate":
         ent = _emit_node(node[1]._node, occ, split_full, sub(node[1]))

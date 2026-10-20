@@ -3773,7 +3773,8 @@ class FEM:
 
             try:
                 key = operator_key(
-                    self.domain, list(self._constraints or []),
+                    self.domain,
+                    list(self._constraints or []),
                     extra=(self._mode, self._complex_n, repr(sorted((self._fem_kwargs or {}).items()))),
                 )
             except Exception:  # noqa: BLE001 -- a form the key cannot describe is simply never shared
@@ -3824,8 +3825,12 @@ class FEM:
             return None
         if isinstance(idx, jax.core.Tracer):
             return None
-        self._solver_ctx = {"pattern": np.asarray(idx), "complex_n": self._complex_n, "owner": self,
-                            "symmetric": self._symmetric_operator()}
+        self._solver_ctx = {
+            "pattern": np.asarray(idx),
+            "complex_n": self._complex_n,
+            "owner": self,
+            "symmetric": self._symmetric_operator(),
+        }
         return self._solver_ctx
 
     def _symmetric_operator(self):

@@ -133,7 +133,9 @@ def test_p2_scalar_coefficient_of_a_linear_function(box):
     P = np.asarray(d.mesh.points)
     cells = np.asarray(d.mesh.cells_dict["tetra"])
     ev = np.asarray(build_edge_topology(cells, BASIX_TET_EDGES).edge_vertices)
-    dm = build_dofmap(cells, "Lagrange", 2, n_verts=len(P), edges=(build_edge_topology(cells, BASIX_TET_EDGES).cell_edges, ev))
+    dm = build_dofmap(
+        cells, "Lagrange", 2, n_verts=len(P), edges=(build_edge_topology(cells, BASIX_TET_EDGES).cell_edges, ev)
+    )
     X = np.concatenate([P, 0.5 * (P[ev[:, 0]] + P[ev[:, 1]])])
     assert dm.n_dofs == len(X)
     f = lambda x_, y_, z_: 1.0 + 2.0 * x_ - z_  # noqa: E731

@@ -31,7 +31,7 @@ def _moving_rect():
     d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25).domain()
     c = d.variable("interior", split=True)
     x, y = c[0], c[1]
-    X, Y = x.trainable(name="X"), y.trainable(name="Y")
+    x.trainable(name="X"), y.trainable(name="Y")  # marks every vertex trainable
     f_sym, _g = d.fem_symbols(names=("f", "g"))
     P = np.asarray(d.mesh.points)
     f = f_sym.bind(x=x, y=y).freeze(1.0 + P[:, 0])

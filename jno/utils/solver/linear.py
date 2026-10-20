@@ -742,7 +742,10 @@ def _symmetric_values(data, rows, cols, complex_n) -> bool:
         n = int(complex_n)
         tl, bl = (rows < n) & (cols < n), (rows >= n) & (cols < n)
         M = sp.coo_matrix(
-            (np.concatenate([v[tl], 1j * v[bl]]), (np.concatenate([rows[tl], rows[bl] - n]), np.concatenate([cols[tl], cols[bl]]))),
+            (
+                np.concatenate([v[tl], 1j * v[bl]]),
+                (np.concatenate([rows[tl], rows[bl] - n]), np.concatenate([cols[tl], cols[bl]])),
+            ),
             shape=(n, n),
         ).tocsr()
     scale = abs(M).max() if M.nnz else 0.0

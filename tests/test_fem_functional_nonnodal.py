@@ -120,4 +120,6 @@ def test_a_view_integrand_takes_the_fem():
     F = jno.fn(lambda i: i, [node], name="F")
     crux = jno.core([F], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
     a = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
-    np.testing.assert_allclose(float(np.asarray(crux.eval([F])).reshape(-1)[0]), 0.5 * float(fem.eval(inner(A, A), a)), rtol=1e-10)
+    np.testing.assert_allclose(
+        float(np.asarray(crux.eval([F])).reshape(-1)[0]), 0.5 * float(fem.eval(inner(A, A), a)), rtol=1e-10
+    )

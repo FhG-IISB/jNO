@@ -538,7 +538,6 @@ def _extract_user_name(orig_expr) -> str | None:
     return None
 
 
-
 def _release_idle_solver_memory() -> None:
     """Between two compiled programs: free the factors of the extra cuDSS slots a program left behind (a form
     solved more than once in it). Each solve keeps its factors for its own adjoint, so inside a program they
@@ -548,7 +547,6 @@ def _release_idle_solver_memory() -> None:
 
     if _lin._LDL_PLANS:
         _lin.release_idle_ldl()
-
 
 
 def _with_poisoned_gates(fn):
@@ -577,6 +575,7 @@ def _raise_if_step_not_finite(epoch, total_loss, losses, grads, jac=None):
             "genuine NaN in the problem. Evaluate the objective and constraints with crux.eval([...]) at the current "
             "parameters to have the failing solve named, with its residual."
         )
+
 
 class core:
     """core solver using traced operations."""

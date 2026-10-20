@@ -45,8 +45,13 @@ def _fn_key(fn):
     if code is None:
         return ("id", id(fn))
     cells = tuple(_hashable(c.cell_contents) for c in (fn.__closure__ or ()))
-    return (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), code.co_code, cells,
-            _hashable(getattr(fn, "__defaults__", None)))
+    return (
+        getattr(fn, "__module__", None),
+        getattr(fn, "__qualname__", None),
+        code.co_code,
+        cells,
+        _hashable(getattr(fn, "__defaults__", None)),
+    )
 
 
 def structural_key(node, memo=None, leaf=None, commutative=False) -> Any:
@@ -80,7 +85,13 @@ def structural_key(node, memo=None, leaf=None, commutative=False) -> Any:
     sk = lambda c: structural_key(c, memo, leaf, commutative)  # noqa: E731
     t = type(n).__name__
     if isinstance(n, (TrialFunction, TestFunction)):
-        k = (t, n.field_key, tuple(getattr(n, "value_shape", ()) or ()), getattr(n, "order", None), getattr(n, "space", None))
+        k = (
+            t,
+            n.field_key,
+            tuple(getattr(n, "value_shape", ()) or ()),
+            getattr(n, "order", None),
+            getattr(n, "space", None),
+        )
     elif isinstance(n, FrozenField):
         k = (t, n.frozen_id)
     elif isinstance(n, Variable):
@@ -110,12 +121,20 @@ def structural_key(node, memo=None, leaf=None, commutative=False) -> Any:
     elif isinstance(n, ModelCall):
         k = (t, id(n.model), tuple(sk(a) for a in (n.args or ())))
     elif isinstance(n, FunctionCall):
-        args = tuple(sk(a) if hasattr(a, "__class__") and a.__class__.__module__.startswith("jno") else _hashable(a)
-                     for a in (n.args or ()))
+        args = tuple(
+            sk(a) if hasattr(a, "__class__") and a.__class__.__module__.startswith("jno") else _hashable(a)
+            for a in (n.args or ())
+        )
         if commutative and getattr(n, "_name", None) == "inner" and len(args) == 2 and not getattr(n, "kwargs", None):
             args = tuple(sorted(args, key=repr))
-        k = (t, getattr(n, "_name", None), _fn_key(n.fn), _hashable(getattr(n, "getitem_key", None)), args,
-             _hashable(sorted((getattr(n, "kwargs", None) or {}).items())))
+        k = (
+            t,
+            getattr(n, "_name", None),
+            _fn_key(n.fn),
+            _hashable(getattr(n, "getitem_key", None)),
+            args,
+            _hashable(sorted((getattr(n, "kwargs", None) or {}).items())),
+        )
     else:
         k = (t, id(n))  # unknown node: identity -- may miss a sharing, never invents one
     memo[id(node)] = k

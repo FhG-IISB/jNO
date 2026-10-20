@@ -144,7 +144,7 @@ def test_a_rebuilt_call_keeps_what_it_carries():
     silently turned off the per-evaluation memo and the shared factorisation for that node."""
     d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
     x, _ = d.variable("interior")
-    e = jno.np.stack([x * x, x * x + 1.0])[1]   # the two x * x merge, so the stack and the getitem are rebuilt
+    e = jno.np.stack([x * x, x * x + 1.0])[1]  # the two x * x merge, so the stack and the getitem are rebuilt
     e._per_evaluation = True
     e2 = cse(e)
     assert e2 is not e, "the call was not rebuilt; the test exercises nothing"

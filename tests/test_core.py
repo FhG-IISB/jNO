@@ -742,7 +742,7 @@ class TestInequalityConstraints:
         cols = np.argsort([a.model.layer_id, b.model.layer_id])  # MMA orders its blocks by layer id
         want = np.array([[bv * m1, av * m1], [-m2, 0.0], [0.0, m2]])[:, cols]
         np.testing.assert_allclose(np.asarray(J), want, rtol=1e-6, atol=1e-7)
-        flat = lambda lid: float(np.concatenate([np.ravel(l) for l in jax.tree_util.tree_leaves(grads[lid])])[0])  # noqa: E731
+        flat = lambda lid: float(np.concatenate([np.ravel(leaf) for leaf in jax.tree_util.tree_leaves(grads[lid])])[0])  # noqa: E731
         np.testing.assert_allclose(flat(a.model.layer_id), 2 * (av * m2 - 2 * m1), rtol=1e-6)
         assert flat(b.model.layer_id) == 0.0 and flat(c.model.layer_id) == 0.0, "rows must not leak into the gradient"
 

@@ -336,9 +336,7 @@ def assemble_fem_nonnodal(
 
     _cell_param_names = frozenset(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "cell")
     # a field on its own element space (N1E / RT / P_k / DG): evaluated with that space's basis, see `_coef_specs`
-    _space_param_names = frozenset(
-        n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "space"
-    )
+    _space_param_names = frozenset(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "space")
 
     def _param_len(name):
         if name in _space_param_names:
@@ -660,13 +658,16 @@ def assemble_fem_nonnodal(
         if v.shape[0] != sp["n_vals"]:
             raise ValueError(
                 f"jno.fem (non-nodal): a frozen {sp['fam']}{sp['k']} field coefficient needs one value per DOF of "
-                f"its space ({sp['n_vals']}" + (f" = DOFs x {sp['ncomp']} components" if sp["ncomp"] > 1 else "")
+                f"its space ({sp['n_vals']}"
+                + (f" = DOFs x {sp['ncomp']} components" if sp["ncomp"] > 1 else "")
                 + f"); got {v.shape[0]}."
             )
         return v
 
     _coef_specs = {key: _coef_spec(*elem) for key, elem in _coef_elems.items()}
-    _coef_frozen_vals = {("frozen", f): _frozen_coef_values(n, _coef_specs[("frozen", f)]) for f, n in _frozen_space.items()}
+    _coef_frozen_vals = {
+        ("frozen", f): _frozen_coef_values(n, _coef_specs[("frozen", f)]) for f, n in _frozen_space.items()
+    }
 
     def _solved_len(f):
         """the length of the solve a solved frozen field arrives as (its whole system, sliced to its block)"""
@@ -2081,9 +2082,7 @@ def assemble_fem_nonnodal(
                 f"fem.eval / expr.integrate(fem) on a non-nodal form: boundary integrands ({sorted(bterms)}) are "
                 "not wired; only volume integrals are. Integrate a volume expression instead."
             )
-        typed = [
-            (_lower_statefield_to_trial(bare, {}), tuple(sorted(_collect_region_mask_names(bare)))) for bare in terms
-        ]
+        typed = [(_lower_statefield_to_trial(bare, {}), tuple(sorted(_collect_region_mask_names(bare)))) for bare in terms]
         # known fields the INTEGRAND reads but the form does not (a mask, a weight, a source field read back):
         # their slots / vertex gathers are built here, for this functional only
         _extra = {f_: n_ for f_, n_ in _collect_frozen_fields(list(terms)).items() if f_ not in _frozen_all}

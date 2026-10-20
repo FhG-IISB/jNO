@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Tuple
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 _EDGE_FAMILIES = ("RT", "N1E", "N2E")
 
@@ -203,12 +203,12 @@ def domain_functional(domain, expr, as_inputs=frozenset()) -> Tuple[Callable, Li
     move with the mesh."""
     import basix
 
-    from ...trace import FrozenField, TestFunction, TrialFunction
+    from ...trace import TestFunction, TrialFunction
+    from .fem_1d import _integrate_term
     from .fem_dofmap import build_dofmap
+    from .fem_nonnodal import _with_cell_size
     from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES, build_edge_topology
     from .fem_utils import _CHUNK_OVERRIDE, _cell_region_mask, _collect_region_mask_names, cell_chunk, elem_map
-    from .fem_1d import _integrate_term
-    from .fem_nonnodal import _with_cell_size
     from .parametric_helpers import _collect_runtime_parameter_exprs, _fem_field_kind
     from .small_linalg import small_det
     from .solver_helper import contains_node_type
@@ -283,8 +283,7 @@ def domain_functional(domain, expr, as_inputs=frozenset()) -> Tuple[Callable, Li
             return frozen_cell_rows(np.reshape(np.asarray(node.values), (-1,)), specs[key])
         return None
 
-    support = cell_support(expr, n_cells, frozen_rows,
-                           lambda r: np.asarray(_cell_region_mask(domain, r)).reshape(-1) != 0)
+    support = cell_support(expr, n_cells, frozen_rows, lambda r: np.asarray(_cell_region_mask(domain, r)).reshape(-1) != 0)
     # an empty support still evaluates one cell (where the integrand is exactly 0): the result keeps its dtype
     ids = np.arange(n_cells) if support is None else np.flatnonzero(support)
     cell_ids = jnp.asarray(ids if ids.size else np.zeros(1, np.int64))

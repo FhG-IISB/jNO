@@ -2,11 +2,10 @@
 right-hand sides on the first form's solver -- host SuperLU and the default solver here. Oracle: the same
 values with sharing switched off."""
 
-import numpy as np
-import pytest
-
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 
 import jno
 from jno.utils.solver.linear import _pardiso_available
@@ -90,7 +89,9 @@ def test_pardiso_factors_the_group_once(monkeypatch):
 
     calls = []
     orig = L._pardiso_host_solve
-    monkeypatch.setattr(L, "_pardiso_host_solve", lambda d, i, r, shape, t: calls.append(np.shape(r)) or orig(d, i, r, shape, t))
+    monkeypatch.setattr(
+        L, "_pardiso_host_solve", lambda d, i, r, shape, t: calls.append(np.shape(r)) or orig(d, i, r, shape, t)
+    )
     F, crux = _three_loads(jno.solve.lu(backend="pardiso"))
     got = np.asarray(crux.eval([F])).reshape(-1)
     assert len(calls) == 1 and calls[0][-1] == 3, f"expected one PARDISO call with a block of 3: {calls}"

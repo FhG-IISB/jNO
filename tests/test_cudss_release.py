@@ -39,7 +39,7 @@ def test_release_frees_the_extra_slots_and_they_still_work():
     fem, nc = _form()
     lu = jno.solve.lu(backend="cudss")
     f = lambda k: jnp.sum(jnp.abs(fem.solve(linear=lu, k=k)) ** 2)  # noqa: E731
-    two = jax.jit(lambda k: f(k) + f(0.7 * k))                      # the same form twice: two slots
+    two = jax.jit(lambda k: f(k) + f(0.7 * k))  # the same form twice: two slots
     k0 = jnp.asarray(np.random.default_rng(0).uniform(0.5, 1.5, nc))
     v1 = float(two(k0))
     pools = [p for p in L._LDL_PLANS.values() if len(p) >= 2]
@@ -49,7 +49,7 @@ def test_release_frees_the_extra_slots_and_they_still_work():
     assert L.release_idle_ldl() >= 1
     assert not _stats(extra), "release left the factors in place"
     assert _stats(pools[0][0]["plan"]), "the first slot keeps its factors (it is refactored in place)"
-    v2 = float(two(k0))                                             # the same compiled program, re-analysed
+    v2 = float(two(k0))  # the same compiled program, re-analysed
     np.testing.assert_allclose(v2, v1, rtol=1e-12)
 
 
@@ -83,7 +83,7 @@ def test_an_eager_solve_frees_its_factors():
     if not new:
         pytest.skip("this solve ran inside a compiled program, not eagerly")
     assert all(not _stats(e["plan"]) for pool in new for e in pool), "an eager solve kept its factors"
-    x2 = np.asarray(fem.solve(linear=lu, k=k0))                    # the same slot, analysed again
+    x2 = np.asarray(fem.solve(linear=lu, k=k0))  # the same slot, analysed again
     np.testing.assert_allclose(x2, x1, rtol=1e-12, atol=1e-14 * np.abs(x1).max())
     ref = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"), k=k0))
     np.testing.assert_allclose(x1, ref, rtol=1e-9, atol=1e-11 * np.abs(ref).max())
