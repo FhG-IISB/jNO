@@ -44,6 +44,7 @@ __all__ = [
     "BinaryOp",
     "Tracker",
     "Constraint",
+    "AugLagConstraint",
     "Model",
     "TunableModule",
     "TunableModuleCall",
@@ -1495,6 +1496,30 @@ class Literal(Placeholder):
 class FunctionCall(Placeholder):
     """Call to a pure function over traced args."""
 
+    def auglag(self, mu: float = 10.0, every: int = 100) -> "AugLagConstraint":
+        """``(a <= b).auglag(...)``: the comparison as a constraint; see :meth:`Constraint.auglag`.
+
+        Only ``<=`` and ``>=`` qualify. A strict ``<`` / ``>`` bound is refused: its optimum sits on
+        the boundary it excludes, so it has none.
+        """
+        if self.fn is jnp.less_equal or self.fn is jnp.greater_equal:
+            a, b = self.args
+            if not isinstance(a, Placeholder):  # `2.0 <= x` reached here as x >= 2.0 already; this is defensive
+                a, b = b, a
+                sense = "ge" if self.fn is jnp.less_equal else "le"
+            else:
+                sense = "le" if self.fn is jnp.less_equal else "ge"
+            return AugLagConstraint(a, b, sense, mu=mu, every=every)
+        if self.fn is jnp.less or self.fn is jnp.greater:
+            op = "<" if self.fn is jnp.less else ">"
+            raise ValueError(
+                f"auglag: a strict `{op}` has no optimum (it sits on the excluded boundary); write `{op}=` instead."
+            )
+        raise TypeError(
+            f".auglag() applies to a comparison `a <= b` / `a >= b` or to jno.le/jno.ge, not to a "
+            f"call of {getattr(self.fn, '__name__', self.fn)!r}."
+        )
+
     def __init__(
         self,
         fn: Callable,
@@ -2146,6 +2171,49 @@ class Constraint(Placeholder):
     def __repr__(self):
         op = "<=" if self.sense == "le" else ">="
         return f"Constraint({self.expr!r} {op} {self.bound})"
+
+    def auglag(self, mu: float = 10.0, every: int = 100) -> "AugLagConstraint":
+        """Enforce this constraint by an augmented Lagrangian, so ANY optimiser can be used.
+
+        The constraint stays a reported row; a multiplier penalty is added to the loss, and every
+        ``every`` steps the multiplier is updated from the current violation (method of
+        multipliers, Nocedal & Wright 2006, Sec. 17.4). ``mu`` is the starting penalty weight; it
+        grows tenfold while the violation stops shrinking. The design between updates may violate
+        the constraint: feasibility comes as the multiplier converges, unlike with ``mma``/``gcmma``.
+        The multiplier is ``.multiplier`` (evaluate it with ``crux.eval``)::
+
+            jno.core([loss, jno.le(volume, 0.4).auglag(mu=10.0, every=100)]).solve(5000)
+
+        Args:
+            mu: Starting penalty weight (> 0), in units of the objective per unit violation squared.
+            every: Optimiser steps between multiplier updates: enough for the optimiser to settle
+                on the current augmented loss (a quasi-Newton optimiser needs far fewer than Adam).
+        """
+        return AugLagConstraint(self.expr, self.bound, self.sense, mu=mu, every=every)
+
+
+class AugLagConstraint(Constraint):
+    """A :class:`Constraint` enforced by an augmented Lagrangian; see :meth:`Constraint.auglag`.
+
+    ``jno.core`` keeps it as the constraint row it is and adds :attr:`penalty`, the multiplier term,
+    to the loss UNAVERAGED (the multiplier update reads its exact gradient). It is an ordinary
+    expression marked ``_auglag_penalty``, so its multiplier parameter is collected like any other.
+    ``multiplier`` is the Lagrange multiplier as a node.
+    """
+
+    def __init__(self, expr, bound=0.0, sense="le", *, mu: float = 10.0, every: int = 100):
+        super().__init__(expr, bound, sense)
+        from ..optimizers.auglag import penalty
+
+        self.mu, self.every = float(mu), int(every)
+        self.state, psi = penalty(self.residual, mu=mu, every=every, name=getattr(expr, "_user_name", None))
+        self.multiplier = self.state[0]
+        psi._auglag_penalty = True
+        self.penalty = psi
+
+    def __repr__(self):
+        op = "<=" if self.sense == "le" else ">="
+        return f"AugLagConstraint({self.expr!r} {op} {self.bound}, mu={self.mu}, every={self.every})"
 
 
 class Model(Placeholder):

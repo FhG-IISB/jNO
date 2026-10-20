@@ -57,6 +57,39 @@ crux.solve(1000)
 
 ---
 
+## Inequality constraints
+
+`jno.le(g, b)` / `jno.ge(g, b)` mark an entry of the `jno.core` list as a constraint `g <= b`
+(`g >= b`) instead of a loss. There are two ways to enforce it:
+
+- **A constrained optimiser** on the design variables: `jno.optimizers.mma(...)` or
+  `jno.optimizers.gcmma(...)`. They take every constraint row into their own subproblem.
+  `gcmma` keeps each step feasible.
+- **An augmented Lagrangian** on the constraint itself, with any optimiser (optax,
+  `ssbfgs`, `soap`, ...):
+
+```python
+vol_c = jno.le(volume, 0.4).auglag(mu=10.0, every=100)
+crux = jno.core([loss, vol_c, (stress <= s_max).auglag()])   # a comparison works the same way
+crux.solve(5000)
+lam = crux.eval([vol_c.multiplier])                          # the Lagrange multiplier
+```
+
+(`jno.auglag(c, ...)` is the same as `c.auglag(...)`.) `.auglag()` adds the penalty `(max(0, λ + μc)² − λ²)/(2μ)` to the loss, with `c = g − b`.
+Every `every` steps it sets `λ ← max(0, λ + μc)`, using `c` averaged over the second half of
+the window, and raises `μ` tenfold whenever the violation has not dropped to a quarter
+(Nocedal & Wright 2006, §17.4). The constraint is still reported as its own row, so the log,
+`early_stopping` and callbacks see `c`.
+
+!!! warning "Feasible only in the limit"
+    Between multiplier updates the design may violate the constraint. If every iterate has to
+    stay feasible, for example when an infeasible design breaks the next solve, use `gcmma`.
+    `every` should be long enough for the optimiser to settle on the current penalty: tens of
+    steps for a quasi-Newton optimiser, hundreds for Adam. An `.auglag()` constraint cannot be
+    combined with `mma`/`gcmma` in the same core, and a strict `<` or `>` is refused.
+
+---
+
 ## Per-Model Controls
 
 Each model is fully independent with respect to its optimiser, trainability, LoRA configuration, and pretrained weight initialisation. See the **[Operations → Part B](../operations.md#part-b-operations-that-require-trainable-parameters)** sub-section for the full API covering freeze, masks, LoRA, dtype conversion, and diagnostics.

@@ -34,6 +34,7 @@ from .architectures.lora import (
 from .domain import DomainData, domain
 from .domain.domain_class import _is_lazy_source
 from .trace import (
+    AugLagConstraint,
     BinaryOp,
     Choice,
     Constraint,
@@ -620,6 +621,12 @@ class core:
                 ``orbax-checkpoint`` package.
         """
         self.log = get_logger()
+        # `jno.le(...).auglag()` is one entry for the user and two rows for the core: the constraint
+        # itself (reported, and seen by callbacks) and its multiplier penalty (added to the loss).
+        if isinstance(constraints, (list, tuple)):
+            from .trace import AugLagConstraint as _ALC
+
+            constraints = [r for c in constraints for r in ((c, c.penalty) if isinstance(c, _ALC) else (c,))]
         self.constraints: List[Placeholder] = constraints
 
         # Domain-decomposition coupling: `jno.core([A, B, ...])` where each item is a subdomain solve
@@ -1226,6 +1233,7 @@ class core:
         # (substeps, `compiled_constraints_fn=`), where a full-length mask would not broadcast.
         objective_mask = getattr(self, "_objective_mask", None) if getattr(self, "_inequality_idx", None) else None
         n_objective = float(int(np.asarray(objective_mask).sum())) if objective_mask is not None else 0.0
+        penalty_mask = getattr(self, "_penalty_mask", None) if getattr(self, "_penalty_idx", None) else None
         # Point-axis mini-batch size, set by solve(points=...). Read once here (not inside loss_fn) so
         # it stays a Python static through the trace, exactly like `batchsize`.
         points = getattr(self, "_points", None)
@@ -1270,7 +1278,12 @@ class core:
             # out of the scalar being descended. Summing a constraint into the objective would make
             # it a soft penalty on top of whatever the constrained optimiser does in the dual.
             obj = jnp.where(objective_mask, losses, 0.0)
-            return jnp.sum(obj) / n_objective, losses
+            total = jnp.sum(obj) / n_objective
+            if penalty_mask is not None:
+                # Augmented-Lagrangian penalties: summed, not averaged with the objective rows, so
+                # d(total)/d(lambda) is the violation itself and the multiplier update reads it exactly.
+                total = total + jnp.sum(jnp.where(penalty_mask, losses, 0.0))
+            return total, losses
 
         return loss_fn
 
@@ -1979,12 +1992,19 @@ class core:
         # optimiser descends. See `jno.le` and `_make_loss_fn`.
         self._inequality_idx: list[int] = []
         self._inequality_senses: list[str] = []
+        # Rows of `.auglag()` constraints (a subset of the inequality rows: handled by their own
+        # multipliers, not by a constrained optimiser), and the rows of their penalties, which are
+        # summed into the loss unaveraged so each multiplier reads its exact gradient.
+        self._auglag_idx: list[int] = []
+        self._penalty_idx: list[int] = []
 
         for orig_expr, expr in zip(self.constraints, constraints):
             inner = expr
             tracker_interval = None
             tracker_reduce = None
             inequality_sense = None
+            _bare = expr.expr if isinstance(expr, OperationDef) else expr
+            penalty = bool(getattr(_bare, "_auglag_penalty", False))
             if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
                 tracker_interval = expr.expr.interval
                 tracker_reduce = expr.expr.reduce
@@ -2001,8 +2021,12 @@ class core:
                 inner = expr.residual
 
             if inequality_sense is not None:
+                if isinstance(_bare, AugLagConstraint):
+                    self._auglag_idx.append(len(constraint_exprs))
                 self._inequality_idx.append(len(constraint_exprs))
                 self._inequality_senses.append(inequality_sense)
+            if penalty:
+                self._penalty_idx.append(len(constraint_exprs))
 
             if tracker_interval is not None:
                 fn_expr = TraceCompiler.compile_traced_expression(inner, self.all_ops)
@@ -2014,7 +2038,8 @@ class core:
                 constraint_exprs.append(inner)
                 self._constraint_exprs.append(inner)
                 self._user_constraint_exprs.append(orig_expr)
-                self._constraint_names.append(_extract_user_name(orig_expr))
+                _nm = _extract_user_name(orig_expr)
+                self._constraint_names.append(f"auglag({_nm})" if penalty and _nm else ("auglag" if penalty else _nm))
 
         # Compile all normal constraints in ONE combined function so XLA
         # can apply CSE across shared sub-expressions.
@@ -2045,7 +2070,7 @@ class core:
         # Boolean row selector for the entries the loss is the mean OF. Built once, here, so the
         # step function stays free of Python-level branching.
         _obj = np.ones(self.n_constraints, dtype=bool)
-        for _i in self._inequality_idx:
+        for _i in self._inequality_idx + self._penalty_idx:
             _obj[_i] = False
         if self._inequality_idx and not _obj.any():
             raise ValueError(
@@ -2053,6 +2078,9 @@ class core:
                 "minimise. Add the quantity you want minimised as a plain (unwrapped) entry."
             )
         self._objective_mask = jnp.asarray(_obj)
+        _pen = np.zeros(self.n_constraints, dtype=bool)
+        _pen[self._penalty_idx] = True
+        self._penalty_mask = jnp.asarray(_pen)
 
         # Keep tag metadata and a pointwise residual function for adaptive
         # resampling. The normal training loss still uses reduced constraints
@@ -2319,6 +2347,13 @@ class core:
             for _lid, _fm in sorted(self._collect_flax_modules().items())
             if isinstance(_fm._opt_fn, _MMAOptimizer)
         ]
+        _plain_ineq = [i for i in getattr(self, "_inequality_idx", []) if i not in getattr(self, "_auglag_idx", [])]
+        if _mma_blocks and getattr(self, "_auglag_idx", None):
+            raise ValueError(
+                "jno.core: an .auglag() constraint cannot be combined with jno.optimizers.mma/gcmma. "
+                "MMA handles every jno.le/jno.ge row in its own dual, so the row would be enforced "
+                "twice. Drop .auglag() and let MMA take it, or optimise with a non-MMA optimiser."
+            )
         if _mma_blocks:
             if not getattr(self, "_inequality_idx", None):
                 raise ValueError(
@@ -2332,11 +2367,12 @@ class core:
             callbacks = [_cb_mma] + list(callbacks or [])
             for _lid, _ in _mma_blocks:
                 _engd_opt_overrides[_lid] = _optax_mma.sgd(1.0)
-        elif getattr(self, "_inequality_idx", None):
+        elif _plain_ineq:
             raise ValueError(
                 "jno.core: jno.le/jno.ge constraints were declared but no constrained optimiser "
                 "is attached, so they would be evaluated and then ignored. Attach one — e.g. "
-                "`param.optimizer(jno.optimizers.mma(move=0.2, lower=..., upper=...))`."
+                "`param.optimizer(jno.optimizers.mma(move=0.2, lower=..., upper=...))` — or enforce "
+                "the constraint with any optimiser through `jno.le(g, b).auglag()`."
             )
 
         # Guard: on_before_update hook callbacks (e.g. ENGDCallback).

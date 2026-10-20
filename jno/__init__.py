@@ -134,7 +134,8 @@ def le(expr, bound=0.0):
                   1e-3 * reg.mean])                 # a genuine penalty, summed
 
     With no constrained optimiser attached this raises at ``solve()`` rather than silently
-    ignoring the constraint.
+    ignoring the constraint. ``jno.le(g, b).auglag(mu=..., every=...)`` (or ``(g <= b).auglag()``)
+    enforces it with ANY optimiser through an augmented Lagrangian instead.
     """
     return Constraint(expr, bound, "le")
 
@@ -144,11 +145,25 @@ def ge(expr, bound=0.0):
     return Constraint(expr, bound, "ge")
 
 
+def auglag(constraint, mu=10.0, every=100):
+    """``jno.auglag(c, ...)`` is ``c.auglag(...)``: an augmented-Lagrangian constraint.
+
+    ``constraint`` is a :func:`le` / :func:`ge` constraint or a comparison ``a <= b`` / ``a >= b``.
+    See :meth:`jno.trace.Constraint.auglag`.
+    """
+    if not hasattr(constraint, "auglag"):
+        raise TypeError(
+            f"jno.auglag takes jno.le(...)/jno.ge(...) or a comparison `a <= b`, got {type(constraint).__name__}."
+        )
+    return constraint.auglag(mu=mu, every=every)
+
+
 __all__ = [
     "schedule",
     "core",
     "le",
     "ge",
+    "auglag",
     "Constraint",
     "sampler",
     "domain",

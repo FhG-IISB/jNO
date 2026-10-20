@@ -318,7 +318,9 @@ rate and is re-evaluated every step. Factories: `lrs.constant`, `lrs.exponential
 `lrs.warmup_cosine`, `lrs.piecewise_constant`, all taking `min_lr`/`max_lr`; any
 `(epoch, losses) -> scalar` callable is a schedule. `jno.optimizers` adds second-order optimisers
 absent from optax: `engd`, `ssbroyden`, `ssbfgs`, `soap`, `md`, and the constrained `mma` and
-`gcmma` (the only ones that take `jno.le`/`jno.ge` entries in the `jno.core` list).
+`gcmma`, which handle `jno.le`/`jno.ge` entries in the `jno.core` list. With any other optimiser,
+write the constraint as `jno.le(g, b).auglag(mu=10.0, every=100)` or `(g <= b).auglag()`: an
+augmented Lagrangian, feasible only as the multiplier converges.
 
 ### What `solve()` actually returns
 
