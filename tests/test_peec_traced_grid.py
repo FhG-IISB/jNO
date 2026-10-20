@@ -117,6 +117,26 @@ def test_a_traced_solve_at_the_reference_equals_the_untraced_one():
     assert abs(got - ref) <= 1e-9 * abs(ref), (got, ref)
 
 
+def test_the_moved_lines_are_the_reference_at_the_reference_and_stretch_between_faces():
+    """`_moved_edges` is what a caller compares with the built lines to decide on a rebuild: at the
+    reference it is the reference, and a moved face moves its own line while the lines between two
+    faces keep their fraction of the gap -- here t2's upper face, so the cells inside t2 stretch."""
+    a, b = _two_traces(gap=3.0)
+    e = _net(a, b)
+    ref = [np.asarray(v) for v in e._solid_info[2]["edges"]]
+    same = e._moved_edges({"t2": _ext(b)})
+    assert all(np.allclose(np.asarray(m), r, rtol=0, atol=1e-12 * mm) for m, r in zip(same, ref))
+    x0, y0, z0, x1, y1, z1 = _ext(b)
+    moved = [np.asarray(v) for v in e._moved_edges({"t2": (x0, y0, z0, x1, y1 + 1.0 * mm, z1)})]
+    ey, ry = moved[1], ref[1]
+    k0, k1 = int(np.argmin(np.abs(ry - y0))), int(np.argmin(np.abs(ry - y1)))
+    assert ey[k1] == pytest.approx(y1 + 1.0 * mm, abs=1e-15)
+    assert ey[k0] == pytest.approx(y0, abs=1e-15)
+    stretch = np.diff(ey[k0 : k1 + 1]) / np.diff(ry[k0 : k1 + 1])
+    assert np.allclose(stretch, (y1 - y0 + 1.0 * mm) / (y1 - y0))
+    assert np.allclose(moved[0], ref[0], rtol=0, atol=1e-12 * mm) and np.allclose(moved[2], ref[2], rtol=0, atol=1e-12 * mm)
+
+
 def test_the_gradient_in_a_trace_face_matches_rebuilt_networks():
     """The claim. d L / d(y0 of t2), by AD through the moved grid, against central differences of
     networks REBUILT at y0 +/- h. Both sides are the same cell counts and the same quadrature, so

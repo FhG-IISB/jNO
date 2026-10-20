@@ -1353,33 +1353,15 @@ class BuiltPEEC:
             skin=jnp.concatenate([jnp.asarray(fl.skin).reshape(-1) * jnp.ones(nel), jnp.asarray(f.skin)[nel:]]),
         )
 
-    def _with_solids(self, geometry, fil):
-        """The network with its solids' faces moved: ``{solid region: (x0, y0, z0, x1, y1, z1)}``.
+    def _moved_edges(self, geometry):
+        """The grid lines per axis with the solids' faces at ``geometry``; see `_with_solids`.
 
-        Only on a grid whose every face is a grid line (``grid=jno.peec.faces(...)``): a face given
-        here moves its line, and every line between two FACE lines keeps its reference fraction of
-        the gap, so cell counts, ownership and numbering stay as built while the cells stretch. The
-        lattice block of ``fil`` is recomputed from the moved lines by the discretisation's own traced
-        pass; wires are not touched (give their points through ``geometry`` as well when they must
-        follow a face), and ``nodes`` stays at the reference, since which nodes a pad owns is
-        structural.
-
-        Guards, where a value is concrete: the lines must stay strictly increasing, and a line that
-        two solids share must be given one value. Under a trace neither can be checked: a cell is then
-        kept at least a fifth of its reference width (the lines after it shift), which is inactive at
-        every design that obeys the line rules and keeps an optimiser's infeasible trial points finite.
-        A design that would cross lines needs a rebuild at that design, not a stretched one.
+        Concrete geometry gives concrete lines (and the guards below raise by name); traced gives
+        traced. The reference lines are ``self._solid_info[2]["edges"]``: comparing the two tells how
+        far each cell has stretched from the width it was built at, which is how a caller decides
+        when a stretched network should be rebuilt instead.
         """
-        if self._solid_info is None:
-            raise ValueError("jno.peec: geometry= names a solid, but this network has no solid conductor.")
-        names, shapes, lat, nsub0, nel0 = self._solid_info
-        if not lat.get("graded"):
-            raise ValueError(
-                "jno.peec: a solid's geometry can only move on a grid whose faces are grid lines. This "
-                "network was built on a uniform lattice, whose partial inductance is applied by FFT and "
-                "needs one fixed pitch -- a moved face would be silently ignored. Build it with "
-                "grid=jno.peec.faces(pitch=...) and solve with operator=jno.solve.hierarchical(...)."
-            )
+        names, shapes, lat, _nsub0, _nel0 = self._solid_info
         ref = [np.asarray(e, dtype=float) for e in lat["edges"]]
         span = [float(e[-1] - e[0]) for e in ref]
         # host: every solid's six faces as grid-line indices (the reference, so it is structural)
@@ -1456,6 +1438,36 @@ class BuiltPEEC:
                         "another, or a cell closed. The cell counts are structure: rebuild at this design."
                     )
             edges.append(e_floor)
+        return edges
+
+    def _with_solids(self, geometry, fil):
+        """The network with its solids' faces moved: ``{solid region: (x0, y0, z0, x1, y1, z1)}``.
+
+        Only on a grid whose every face is a grid line (``grid=jno.peec.faces(...)``): a face given
+        here moves its line, and every line between two FACE lines keeps its reference fraction of
+        the gap, so cell counts, ownership and numbering stay as built while the cells stretch. The
+        lattice block of ``fil`` is recomputed from the moved lines by the discretisation's own traced
+        pass; wires are not touched (give their points through ``geometry`` as well when they must
+        follow a face), and ``nodes`` stays at the reference, since which nodes a pad owns is
+        structural.
+
+        Guards, where a value is concrete: the lines must stay strictly increasing, and a line that
+        two solids share must be given one value. Under a trace neither can be checked: a cell is then
+        kept at least a fifth of its reference width (the lines after it shift), which is inactive at
+        every design that obeys the line rules and keeps an optimiser's infeasible trial points finite.
+        A design that would cross lines needs a rebuild at that design, not a stretched one.
+        """
+        if self._solid_info is None:
+            raise ValueError("jno.peec: geometry= names a solid, but this network has no solid conductor.")
+        names, shapes, lat, nsub0, nel0 = self._solid_info
+        if not lat.get("graded"):
+            raise ValueError(
+                "jno.peec: a solid's geometry can only move on a grid whose faces are grid lines. This "
+                "network was built on a uniform lattice, whose partial inductance is applied by FFT and "
+                "needs one fixed pitch -- a moved face would be silently ignored. Build it with "
+                "grid=jno.peec.faces(pitch=...) and solve with operator=jno.solve.hierarchical(...)."
+            )
+        edges = self._moved_edges(geometry)
         pos, mom, self_g, ln, area, skin, _nodes = lat["regeom"](edges)
         f = fil
         nsub1 = nsub0 + int(pos.shape[0])  # shapes are static under a trace; values are not
