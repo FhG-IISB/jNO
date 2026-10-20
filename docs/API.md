@@ -24,6 +24,40 @@ domain, compiles them once, then exposes `solve()` / `eval()`.
         - eval
         - sweep
 
+### Mini-batching — `batchsize` and `points` are different axes
+
+A context tag is one `(B, [T,] N, D)` array. The two mini-batch arguments cut it along different
+axes and compose freely:
+
+| | draws along | built by | typical use |
+|---|---|---|---|
+| `batchsize` | the **sample** axis `B` | `n * domain` | many realisations of a parametric problem |
+| `points` | the **point** axis `N` | the collocation points / a dataset's rows | a large point cloud or dataset |
+
+```python
+crux.solve(epochs=4000, points=1024)              # 1024 of the N points per step
+crux.solve(epochs=4000, batchsize=8, points=1024) # both, independently
+```
+
+A dataset attached with `jno.domain.from_array` has exactly one sample, `B = 1`, so `batchsize`
+has nothing to draw from there — that is what `points=` is for. Asking for `batchsize > B`
+**raises** and names `points=` as the alternative; it used to sample with replacement and evaluate
+duplicate copies of the same full point set, returning the full-batch loss at `batchsize` times the
+cost with nothing said.
+
+Two properties worth relying on:
+
+- **Tags stay aligned.** Index sets are keyed on the point *count*, not the tag, so any two tags of
+  equal length are sliced identically. An input field and its target cannot drift apart — a failure
+  that would otherwise produce a wrong number while every shape still matched.
+- **`points` is refused, loudly, when a constraint needs the whole point set** — a finite-difference
+  derivative reads a node's neighbours and a FEM assembly integrates over cells. Dropping points
+  there would return a plausible wrong answer rather than raise.
+
+`jno.noise.*` follows the sub-sampled count automatically, and `offload_data` /
+`accumulation_steps` count `points` as sub-sampling, so neither is silently disabled when it is the
+point axis being split.
+
 ---
 
 ## Domain
@@ -112,6 +146,86 @@ optimisers, masks, LoRA, freezing, and so on.
         - constrain
         - initialize
         - tune
+        - flow
+
+### Marching a network as an ODE — `Model.flow`
+
+`v.flow(x0, time=...)` integrates the network as a **velocity field**, `dx/dt = v(x, t, *cond)`.
+The network is called state-first, time-second.
+
+```python
+x  = v.flow(x0_array, time=ts)                     # concrete start -> the marched array
+xg = v.flow(jno.noise.gaussian(ndim=2), time=ts)   # symbolic start -> a node for jno.core([...])
+```
+
+`time=` takes the grid **points**: an array is the primary form, so a non-uniform schedule needs no
+extra argument and a *decreasing* grid marches backwards, mapping a sample back to its latent. A
+`(t0, t1, n)` triple is sugar for `linspace`, with `n` counting points exactly as in
+`domain(time=...)`. The state is any pytree, so a multi-field generative model marches in one call.
+
+Because the symbolic form is an ordinary trace node, a constraint on *generated* samples is just
+another term, and an optimisable latent gets a gradient through the whole march:
+
+```python
+# a physics residual on what the model generates
+xg = v.flow(jno.noise.gaussian(ndim=D), time=(0.0, 1.0, 17))
+crux = jno.core([(v((1 - t) * x0 + t * x1, t) - (x1 - x0)).mse, lam * residual(xg).mse])
+
+# recover the latent behind an observation — v.freeze(), z trainable
+z = jno.np.parameter((n, D))
+crux = jno.core([(observe(v.flow(z, time=ts)) - y_obs).mse])
+```
+
+### Sampling as an SDE — `flow(noise=..., key=...)`
+
+Passing a `jno.noise` spec turns the march into a stochastic one: the deterministic step, then
+`draw · √|dt|`, **redrawn independently at every step** (Euler–Maruyama).
+
+```python
+x = v.flow(x0, time=ts, key=k, noise=jno.noise.gaussian(std=0.3))
+```
+
+Here the noise node names a **distribution, not a draw** — the one place in jNO where it means that.
+Its shape comes from the state being marched, so `ndim=`/`like=` are *refused* rather than ignored.
+Parameters may be **schedules**, callables of the march time, which is what an SDE sampler's `σ_t`
+is:
+
+```python
+noise=jno.noise.gaussian(std=lambda t: 0.3 * jnp.sqrt(t / (1 - t)))
+```
+
+The per-step redraw is the property to rely on. A single draw shared across the march would not be
+Brownian motion at all — the increments would be perfectly correlated and the endpoint variance
+would come out a factor of the *step count* too large, getting worse as the step count is raised.
+Verified against the Itô isometry: with `std=σ` and zero drift the endpoint variance is `σ²T` and
+does not move as the step count goes 10 → 40 → 80.
+
+`key=` is **required on the eager path**. A concrete initial state marches outside the solver, where
+there is no step key to inherit, and a noise node evaluated without a key returns zeros — so
+omitting it would silently give a deterministic ODE labelled as an SDE. Inside a term list the
+solver's step key is used and `key=` may be omitted. A `key=` with no `noise=` also raises, since it
+would do nothing.
+
+A backward grid works: the increment scales with `√|dt|`, so a decreasing `time=` is a real backward
+SDE rather than a NaN.
+
+**Why this matters.** The per-step Gaussian transition is exactly the policy that RL post-training of
+flow models optimises — Flow-GRPO's policy is a per-step Gaussian, not a continuous-time density, so
+it needs no divergence. Together with `save=True` for the trajectory, that is the ingredient list.
+
+---
+
+**Limitations.** Heun's method, fixed step, explicit — no adaptive control and no error estimate, so
+the step count is the accuracy knob: second order for the ODE, strong order 1/2 for the SDE (the
+Euler–Maruyama increment sets it). No log-density: that needs the divergence of `v` with respect
+to the *state*, which `jno.np.divergence` (defined over coordinate `Variable`s) does not provide —
+note this blocks *exact likelihoods*, not the per-step transition density an SDE sampler gives.
+Dropout must still be off. The network is handed `ctx.key`, which is the *same* key at every step of
+the march (only the SDE increment folds in the step index), so a dropout mask would be identical
+across all steps rather than resampled — and on the eager path that key is `None`. Reverse mode
+stores every step, so a march
+inside a training loss costs its step count in both compute and activation memory —
+`core.solve(checkpoint_gradients=True)` trades roughly 30 % compute back for the memory.
 
 ---
 
@@ -572,6 +686,8 @@ authors of custom operators.
 
 ::: jno.trace.Noise
 
+::: jno.trace.Flow
+
 ---
 
 ## Numerical-method front doors
@@ -692,6 +808,26 @@ Backs `model.bayesian(...)` / `model.vi(...)`; see [Bayesian Sampling](training/
         - uniform
         - laplace
         - grf
+
+### Shape by reference — `like=`
+
+`ndim=` gives a *pointwise* shape, `(N, ndim)` with `N` the active point count. That cannot describe
+a **field-valued** draw — the prior a flow-matching path needs when the state is a `(G, G, C)`
+tensor rather than a scalar column. `like=` takes a reference expression instead of a shape:
+
+```python
+x0 = jno.noise.gaussian(std=1.0, like=x1)     # draw shaped like whatever x1 evaluates to
+```
+
+The shape is resolved from the reference's own evaluated shape at evaluation time — only the shape;
+the value is dead and XLA drops it. Because it is measured rather than written down, it tracks
+`batchsize`, `solve(points=...)` and time windows automatically. A literal shape would go stale
+under any of those and fail by *broadcasting* rather than by raising: with `points=8`, a residual
+against a hand-written `(1024, 2)` shape silently becomes a `(1024, 8)` outer product, while
+`like=x1` already gives `(8, 2)` because `x1` itself was resliced.
+
+`ndim=` and `like=` are mutually exclusive — passing both raises. Two noise nodes sharing one
+`like=` reference remain **independent draws**.
 
 ---
 

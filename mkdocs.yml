@@ -210,6 +210,8 @@ nav:
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
     - RCWA:
       - "Binary Grating — diffraction orders": tutorials/12-rcwa/binary-grating-orders.md
+    - Generative:
+      - "Flow Matching — eight-mode ring": tutorials/13-generative/flow-matching-ring.md
   - Reference:
     - API Reference: API.md
     - Hyperparameter Tuning: Hyperparameter-Tuning.md

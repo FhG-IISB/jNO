@@ -299,6 +299,10 @@ stats = crux.solve(epochs=10_000, batchsize=32, callbacks=[...], min_consecutive
 stats.plot(f"{run}/training.png")
 ```
 
+`batchsize` mini-batches the SAMPLE axis (`n * domain`); `points=N` mini-batches the collocation points /
+dataset rows (`jno.domain.from_array` has one sample, so it needs `points=`). They compose; `batchsize > B`
+raises; `points=` raises for terms that need the whole point set (finite differences, FEM).
+
 **Every non-frozen model must have an optimiser before `solve()`.**
 
 ```python
@@ -679,6 +683,11 @@ Enforce positivity of the **field** with an output transform (`k = jno.fn.exp(k_
 ### Models
 
 Every model comes from **foundax**, wrapped with `jno.nn(...)`. Any Equinox module works.
+
+`net.flow(x0, time=ts)` marches a velocity network as an ODE (Heun, fixed step; `save=True` keeps the
+trajectory); `noise=jno.noise.gaussian(std=lambda t: ...)` makes it an SDE (strong order 1/2; an eager call needs `key=`).
+A symbolic `x0` (`jno.noise.gaussian(like=x1)`, the noise shaped like a data expression) puts the march
+inside a `jno.core` term list.
 
 | Family | foundax constructors |
 |---|---|
