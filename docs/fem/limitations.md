@@ -45,7 +45,10 @@ path is unaffected.
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
 | `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
-| `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
+| `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** (`contour=` differentiates through the modes) | NaN, not a silent zero |
+| `eigs`: a Bloch/periodic tie **plus** a Dirichlet pin | the two constraint maps do not compose in the eigen path — so a *slab* (periodic in-plane, PEC or PML above and below) cannot be solved yet; a tie alone and a pin alone are both fine | raises |
+| `eigs` eigenvector gradients at an **exact degeneracy** | NaN at a repeated eigenvalue, where only *subspace-invariant* functionals have a derivative at all. `contour=` differentiates through the modes and is the way round it | NaN, not a silent zero |
+| `eigs` on a **runtime-parametric** form | a design parameter reaches the eigensolve only through `fem.operator.evaluate`, not through `fem.eigs` itself | raises |
 | **Curved-boundary geometry** | straight-sided **by default**; `shape.curved()` is the fix | **silent** |
 | **Axisymmetric vector forms** | the `2πr` measure is wrong for vectors | **silent** |
 
@@ -281,6 +284,12 @@ path is unaffected.
     spectrum it actually has — the case that matters for stability problems (resistive MHD growth
     rates, drift waves, anything with a mean flow), where the sign of the growth rate *is* the
     physics. Neither path ever returns the spectrum of `½(K+Kᵀ)` as though it were the answer.
+
+    Every pair ARPACK returns is checked against the pencil (relative residual against `1e-6`; a converged
+    pair sits near `1e-14`). A set that fails **raises** `RuntimeError` naming the worst residual: ARPACK's
+    generalized solve without a shift assumes a symmetric `M`, and a one-sided coupling block (dispersive
+    auxiliary fields, poroelastic or piezoelectric modes) breaks that and yields plausible values that are
+    not eigenvalues. The way out is the exact dense path on a small problem, `sigma=`, or a symmetric `M`.
 
     The routing probe is a randomized bilinear test and is concrete-only, so **under `jit` the
     symmetric path is assumed**.

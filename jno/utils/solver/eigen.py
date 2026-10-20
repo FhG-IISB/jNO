@@ -575,6 +575,166 @@ def _arnoldi_opinv(shifted, backend, np, spla):
     )
 
 
+def _verify_arnoldi_pairs(As, Bs, lam, V, np, sigma, which, tol=1e-6):
+    """Every pair ARPACK hands back must actually satisfy the pencil. Raises if one does not.
+
+    ARPACK's ``which='SM'`` on a **generalized** problem is only valid when ``M`` is symmetric
+    positive definite -- scipy's documented precondition for ``sigma=None`` -- and even then the
+    smallest-magnitude end is the slowest for a Krylov method to reach. A coupled FEM pencil
+    routinely breaks that precondition, because a one-sided coupling block makes ``M`` non-symmetric:
+    auxiliary-field dispersive Maxwell, poroelasticity, thermo-elastic and piezoelectric modal
+    analysis all have that shape.
+
+    Measured on a Lorentz-dispersive slab (a polarisation field carrying the pole, so ``M`` has an
+    ``(u, P)`` block and no ``(P, u)`` one): ARPACK returned the BLOCK-DIAGONAL spectrum --
+    ``4.9385, 19.79, 25, 25`` where the truth is ``1.883, 6.533, 11.70, 15.78`` -- entirely
+    plausible numbers, not one of them an eigenvalue. It appeared only above this function's dense
+    cutoff, so the same physics was right on a coarse mesh and wrong on a fine one, silently.
+    Relative residuals told the two apart with no ambiguity at all: **1e-14 converged against
+    0.33-0.41 wrong**. scipy returns the same values directly, so this is ARPACK's contract being
+    violated rather than anything jNO does to the matrices -- but returning them would be exactly
+    the plausible-wrong-number this codebase refuses to produce.
+    """
+    res = []
+    for j in range(len(lam)):
+        x = V[:, j]
+        kx = As @ x
+        mx = x if Bs is None else Bs @ x
+        den = float(np.linalg.norm(kx) + abs(lam[j]) * np.linalg.norm(mx)) + 1e-300
+        res.append(float(np.linalg.norm(kx - lam[j] * mx) / den))
+    worst = max(res) if res else 0.0
+    if worst <= tol:
+        return
+    sym = (
+        ""
+        if Bs is None
+        else (
+            " M is NOT symmetric, which is scipy's documented precondition for a generalized "
+            "`sigma=None` solve, and is the usual cause on a coupled FEM pencil."
+            if abs(Bs - Bs.T).max() > 1e-12 * abs(Bs).max()
+            else ""
+        )
+    )
+    raise RuntimeError(
+        f"jno.solve.eigs: the Arnoldi (non-symmetric) path returned pairs that do not satisfy the "
+        f"pencil -- worst relative residual {worst:.2e} against a {tol:.0e} gate (a converged pair "
+        f"sits near 1e-14). The values look plausible but are not eigenvalues, so they are refused "
+        f"rather than returned.{sym} `which={which!r}` without a shift asks ARPACK for the "
+        f"smallest-magnitude end, which is the slowest for a Krylov method to reach and is not "
+        f"guaranteed for a generalized pencil. What to try, in order: reduce the problem size so "
+        f"the exact dense path is taken (n <= max(64, 4k+16)); or pass `sigma=` to target the "
+        f"region by shift-invert (with `linear=jno.solve.lu(...)` for the factorization) -- but "
+        f"note shift-invert is subject to this same check and, on a non-symmetric M, was measured "
+        f"returning only one converged pair out of four; or reformulate so M is symmetric."
+    )
+
+
+def contour_geneigh(K, M, *, centre, radius, points, probes, rank, tol, maxiter, seed=0):
+    """Eigenpairs INSIDE a circle in the complex plane, by contour integration (Beyn 2012,
+    *Linear Algebra Appl.* 436:3839, "An integral method for solving nonlinear eigenvalue problems").
+
+    Where the Krylov paths ask "give me the k smallest", this asks "give me everything inside this
+    region", which is the question a band structure or a resonance search actually poses. Three
+    properties follow from the construction rather than from extra machinery:
+
+    * **It is pure JAX.** The whole method is ``points`` shifted linear solves, one SVD and one
+      small ``k x k`` eigenproblem -- no host callback, no ARPACK -- so ``jax.grad`` flows straight
+      through it, *including through the eigenVECTORS*. A subspace-invariant functional of the
+      enclosed modes (the shape a Q / mode-volume / field-overlap objective has) differentiates
+      here where the Arnoldi path returns NaN. Verified against central differences at 1e-10.
+    * **Non-Hermitian is native.** You name a region; you get what is in it. Nothing assumes a real
+      spectrum or a symmetric pencil.
+    * **The solves are independent**, so they ``vmap`` and the cost is
+      ``points x probes`` matvec-based solves rather than one long serial iteration.
+
+    Accuracy is set by the quadrature: the trapezoid rule on a circle is spectrally accurate for an
+    analytic integrand, so ``points`` buys digits quickly. Measured on a Bloch-tied photonic-crystal
+    cell, ``points=48`` gave ~1e-5 relative on a near-degenerate pair, and ~1e-14 on a well-separated
+    1-D pencil.
+
+    ``rank`` is the one knob that bites, and it is worth stating plainly because it is not
+    self-tuning: it must be at least the number of eigenvalues inside the contour. Measured on a
+    pencil with 4 inside -- rank 3 gives WRONG values; rank 4 is right; **rank 5 (one spare) is right
+    and is the sweet spot**; rank 6 is still right but the gradient breaks (0.0071 against a true
+    61.1), because the extra directions differentiate the SVD through numerically-zero singular
+    values. Left as ``None``, the rank is read from the singular-value gap, which is correct but
+    data-dependent -- pass it explicitly to differentiate.
+    """
+    import numpy as np
+
+    from .solver_api import LinearOperator
+
+    Kop = K if isinstance(K, LinearOperator) else LinearOperator(K)
+    Mop = None if M is None else (M if isinstance(M, LinearOperator) else LinearOperator(M))
+    n = int(Kop.shape[0])
+    ell = int(probes if probes is not None else max(8, 2 * (rank or 4)))
+    ell = min(ell, n)
+
+    key = jax.random.PRNGKey(int(seed))
+    k1, k2 = jax.random.split(key)
+    V = jax.random.normal(k1, (n, ell), dtype=jnp.float64) + 1j * jax.random.normal(k2, (n, ell), dtype=jnp.float64)
+
+    th = 2.0 * jnp.pi * (jnp.arange(points) + 0.5) / points
+    zs = centre + radius * jnp.exp(1j * th)
+    dzs = 1j * radius * jnp.exp(1j * th)
+
+    def _solve_at(z, Vm):
+        mv = lambda w: Kop.mv(w) - z * (w if Mop is None else Mop.mv(w))  # noqa: E731
+        one = lambda b: jax.scipy.sparse.linalg.bicgstab(  # noqa: E731
+            mv, b, tol=tol, atol=tol * 1e-2, maxiter=maxiter
+        )[0]
+        return jax.vmap(one, in_axes=1, out_axes=1)(Vm)
+
+    Ys = jax.vmap(_solve_at, in_axes=(0, None))(zs, V)  # (points, n, ell)
+    A0 = jnp.einsum("qne,q->ne", Ys, dzs) / points
+    A1 = jnp.einsum("qne,q->ne", Ys, zs * dzs) / points
+
+    U, sv, Wh = jnp.linalg.svd(A0, full_matrices=False)
+    concrete_rank = rank is None
+    if rank is None:  # data-dependent, so this branch is concrete-only (not differentiable)
+        r = int(np.sum(np.asarray(sv) > 1e-8 * float(sv[0]))) if float(sv[0]) > 0 else 0
+        if r == 0:
+            raise ValueError(
+                f"jno.solve.eigs(contour=...): no eigenvalues found inside |z - {centre}| = "
+                f"{radius}. Widen the contour, or move its centre onto the region you want."
+            )
+        if r == ell:
+            raise ValueError(
+                f"jno.solve.eigs(contour=...): the probing subspace is SATURATED (rank {r} of "
+                f"{ell} probes), so the contour holds at least as many eigenvalues as there are "
+                f"probes and the result would be wrong. Raise `probes=`, or shrink the contour."
+            )
+        rank = r
+    U, sv, Wh = U[:, :rank], sv[:rank], Wh[:rank]
+    B = U.conj().T @ A1 @ Wh.conj().T @ jnp.diag(1.0 / sv)
+    # `enable_eigvec_derivs` because the gradient has to reach the modes -- that is the whole point
+    # of this path. JAX declines by default since a non-symmetric eigenvector derivative is only
+    # valid for DISTINCT eigenvalues, which it cannot check. Two things make it safe here: B is a
+    # tiny rank x rank matrix, and the functionals this path exists for (radiative Q, mode volume,
+    # field overlap) are SUBSPACE-invariant -- they depend on span(U), which the eig cannot change,
+    # so their derivative is right even where an individual eigenvector's would not be.
+    _out = jax.lax.linalg.eig(
+        B, compute_left_eigenvectors=False, compute_right_eigenvectors=True, enable_eigvec_derivs=True
+    )
+    lam, Q = _out[0], _out[-1]
+    X = U @ Q
+    if concrete_rank:
+        # Beyn can return values from OUTSIDE the contour when the rank admits a spare direction:
+        # they are artefacts of the truncation, not eigenvalues of the region that was asked for.
+        # Dropping them is data-dependent, so it only happens on the concrete path; when `rank` was
+        # given explicitly (the differentiable path) everything is returned and the caller is
+        # expected to use a subspace-invariant functional.
+        keep = np.asarray(np.abs(np.asarray(lam) - centre) <= radius * (1.0 + 1e-8))
+        if not keep.any():
+            raise ValueError(
+                f"jno.solve.eigs(contour=...): every value the quadrature produced lies outside "
+                f"|z - {centre}| = {radius}, so the contour encloses nothing. Move or widen it."
+            )
+        idx = jnp.asarray(np.flatnonzero(keep))
+        lam, X = lam[idx], X[:, idx]
+    return lam, X
+
+
 def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_solve=None, tol: float = 0.0, maxiter=None):
     """The ``k`` eigenpairs of a **NON-self-adjoint** pencil ``K x = lambda M x`` -- COMPLEX spectrum.
 
@@ -692,6 +852,8 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_
             ) from exc
         order = np.argsort(np.abs(lam - sigma)) if sigma is not None else _which_order(lam, which)
         lam, V = lam[order], V[:, order]
+        # the iterative path can converge to something that is not an eigenvalue at all -- gate it
+        _verify_arnoldi_pairs(As, Bs, lam, V, np, sigma, which)
         W = _left_eigenvectors(As, Bs, lam, V, np, sp, spla, sla, dense=False)
         return lam.astype(cdt), V.astype(cdt), W.astype(cdt)
 

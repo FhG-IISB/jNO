@@ -340,7 +340,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` (complex-symmetric); `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard`, `staggered` — `picard`/`staggered` take `anderson=m` (Anderson acceleration) |
-| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |
+| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, interior modes nearest a shift with `sigma=`, or every eigenvalue inside a circle with `contour` (`FEM.eigs(contour=jno.solve.contour(...))`) |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
@@ -414,7 +414,8 @@ jno.solve.applyfun(A, u0, fun=lambda z: jnp.exp(-dt * z))  # exp(-dt·A)·u₀  
 
 ### Eigenproblems at scale
 
-`jno.solve.eigs` / `FEM.eigs` have three paths, chosen by the arguments. With none of the iterative
+`jno.solve.eigs` / `FEM.eigs` have three paths for a symmetric pencil, chosen by the arguments (a
+fourth, `FEM.eigs(contour=...)`, is below; a non-symmetric pencil goes to ARPACK). With none of the iterative
 arguments the pencil is reduced **densely** — exact, and right when you want the whole low spectrum of
 a small problem, but it materializes the operator (`O(N²)` memory). Passing `precond=` selects
 **preconditioned LOBPCG** (Knyazev, *SIAM J. Sci. Comput.* **23**(2), 517–541, 2001), which only applies
@@ -481,6 +482,78 @@ the eigenvalue. A shift-invert call that fails its gate **raises** `ShiftInvertN
 `jno.utils.solver.eigen`, a `RuntimeError`) naming the cause — exhausted budget or singular shift —
 rather than returning NaN (also under a plain `jax.grad`); only under `jit`/`vmap`, where nothing can
 be raised, is its result NaN-poisoned instead.
+
+A non-symmetric pencil goes to ARPACK (Arnoldi), and every pair it returns is checked against the
+pencil: a set that does not satisfy it **raises** `RuntimeError` instead of returning plausible values
+that are not eigenvalues (ARPACK's generalized solve without a shift needs a symmetric `M`, which a
+one-sided coupling block breaks). See the `eigs` routing note in [FEM limitations](fem/limitations.md).
+
+#### Band structure — a Bloch tie in the pencil
+
+A Bloch tie is an ordinary `jno.fem` term, `u(A) - exp(-i k·a) u(B)`, and `eigs` takes it. A band
+diagram is then a sweep over `k` with the pencil rebuilt at each point:
+
+```python
+fem = jno.fem([
+    ui.x * vi.x + ui.y * vi.y,                       # stiffness
+    u(xl, yl) - numpy.exp(-1j * kx) * u(xr, yr),     # Bloch tie across x
+    u(xb, yb) - numpy.exp(-1j * ky) * u(xt, yt),     # ... and across y
+])
+lam, X = fem.eigs(mass=[eps * ui * vi], k=6)         # λ = ω² at this k-point
+```
+
+A tie factor `c ≠ 1` makes the relation **complex** (the Bloch factor `exp(-i k·a)` has `|c| = 1`; it is
+`c ≠ 1`, not the modulus, that matters), so the tied `K` is assembled on the fused real-equivalent
+`2n` block over `[Re; Im]`. `mass=` is lifted into the same `[[M_r, −M_i], [M_i, M_r]]` layout — a
+mass form assembled on its own carries neither the tie nor the complex literal, and an `n × n` mass
+against a `2n × 2n` stiffness is not a pencil — the periodic reduction is taken in that space, and
+the doubled spectrum the block carries (every complex pair appears twice, as `[Re; Im]` and as its
+`i`-multiple `[−Im; Re]`) is thinned back down. The modes come back **complex on the `n`-space**,
+which is what a band diagram wants.
+
+Sweeps warm-start across `k` through the same `X0=`: a complex `n`-space guess is expanded back into
+both of its real-equivalent partners for you.
+
+#### Every mode in a region — `jno.solve.contour`
+
+`k`-smallest and "nearest `σ`" both name a **count**. A leaky or lossy mode is naturally specified by
+a **region** instead — *everything inside this circle* — which is what contour integration answers
+(Beyn, *Linear Algebra Appl.* **436**(10), 2012): the spectral projector is a resolvent integral
+around the contour, taken by the trapezoid rule on a circle and reduced through an SVD of a random
+probing block.
+
+```python
+lam, X = fem.eigs(
+    mass=[eps * ui * vi],
+    contour=jno.solve.contour(centre=10.0, radius=8.0, points=48, probes=12),
+)
+```
+
+Three things follow from the construction rather than from extra machinery:
+
+* **Differentiable through the eigenVECTORS.** The method is `points` shifted linear solves, one SVD
+  and one small dense eigenproblem, all pure JAX — so `jax.grad` reaches the *modes*, not only the
+  eigenvalues. A mode-shape objective (radiative Q, mode volume, field overlap) differentiates here;
+  on the Arnoldi path it returns NaN by construction.
+* **Non-Hermitian, and even nonlinear pencils, are native.** You name a region; whatever is inside
+  comes back. A frequency-dependent material needs no auxiliary field and no polynomial
+  linearisation — measured on a Lorentz slab, the dispersive problem solved directly at half the
+  system size and `3e-14` relative.
+* **The shifted solves are independent**, so they `vmap`: `points × probes` matrix-free solves rather
+  than one long serial iteration.
+
+`contour=` names a region, so it **refuses** the arguments that only mean something for a count —
+`which`, `sigma`, `precond`, `X0` — rather than ignoring them.
+
+`points` sets accuracy; the trapezoid rule on a circle is spectrally accurate for an analytic
+integrand, so digits come quickly (`points=48` measured at ~`1e-5` relative on a near-degenerate
+Bloch pair, ~`1e-14` on a well-separated 1-D pencil). `probes` is the width of the probing block and
+**must exceed the number of eigenvalues inside** — saturation is detected and raises rather than
+returning a quietly wrong answer. `rank` defaults to reading the singular-value gap, which is correct
+but data-dependent; pass it explicitly when differentiating, and prefer **one more** than the number
+of eigenvalues inside: measured on a pencil with 4 inside, rank 3 is wrong, rank 4 is right, rank 5
+is right *and* differentiable, and rank 6 still gives the right values but breaks the gradient by
+differentiating the SVD through numerically-zero singular values.
 
 ### Singular values — `jno.solve.svd`
 

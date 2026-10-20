@@ -543,6 +543,65 @@ def _reject_source_terms(fem_obj: Any, where: str) -> None:
                 )
 
 
+def _eigs_periodic(fem_obj: Any):
+    """The periodic reduction **in the space this fem's operator actually lives in**.
+
+    A complex form -- and a Bloch tie makes one, since ``u(A) - c*u(B)`` with ``c != 1`` (e.g. the Bloch
+    factor ``exp(-1j*k*a)``, of modulus 1) is a complex relation -- is solved on the fused real-equivalent ``2n`` block over ``[Re; Im]``, whose
+    reduction is the realified ``B(P)`` on ``_periodic_2n``, not the ``n``-space complex ``P``.
+    Reaching for ``_periodic`` there would apply an ``(n, n_red)`` map to a ``2n`` vector."""
+    if getattr(fem_obj, "_complex_n", None) is not None:
+        return getattr(fem_obj, "_periodic_2n", None)
+    return getattr(fem_obj, "_periodic", None)
+
+
+def _fuse_mass_like(K_complex_n: int, mass_fem: Any, M: Any) -> Any:
+    """Put ``M`` in the same real-equivalent ``[[M_r, -M_i], [M_i, M_r]]`` layout ``K`` uses.
+
+    ``K x = lambda M x`` only makes sense when both sides are in the same space. ``K`` comes from a
+    complex (e.g. Bloch-tied) form and is ``2n x 2n``; the mass form is assembled as its own
+    ``jno.fem(list(mass))``, which carries neither the tie nor the complex literal, so it stays
+    ``n x n`` and the pencil shapes disagree -- the concrete failure being
+    ``dot_general requires contracting dimensions to have the same shape, got (n,) and (2n,)``.
+    A mass form that is complex in its own right is already fused by the same route and passes
+    through untouched."""
+    if getattr(mass_fem, "_complex_n", None) is not None:
+        return M
+    Mr = _to_bcoo(M)
+    return _complex_block_bcoo(Mr, _bcoo_empty(K_complex_n, K_complex_n, Mr.data.dtype), K_complex_n)
+
+
+def _expand_complex_guess(X0: Any, n_half: int) -> Any:
+    """A complex ``n``-space eigenvector guess, back into the real-equivalent ``2n`` layout.
+
+    The inverse of :func:`_thin_real_equivalent_pairs`, and needed for the same reason: ``eigs``
+    hands back complex modes on the ``n``-space, so feeding them straight back as ``X0`` (the
+    natural thing to do in a band sweep, where the previous k-point's modes are an excellent guess)
+    would present an ``n``-row guess to a ``2n`` solve. Each complex mode contributes BOTH of its
+    real-equivalent partners, ``[Re; Im]`` and ``[-Im; Re]`` -- which is exactly the pair the
+    ``2k``-mode solve is looking for."""
+    W = jnp.asarray(X0)
+    W = W[:, None] if W.ndim == 1 else W
+    re, im = jnp.real(W), jnp.imag(W)
+    return jnp.concatenate([jnp.concatenate([re, im], axis=0), jnp.concatenate([-im, re], axis=0)], axis=1)
+
+
+def _thin_real_equivalent_pairs(lam: Any, X: Any, n_half: int):
+    """Read a real-equivalent ``2n`` spectrum back as the complex one it represents.
+
+    ``[[A_r, -A_i], [A_i, A_r]]`` carries every complex eigenpair **twice** -- ``x = [Re; Im]`` and
+    its ``i``-multiple ``[-Im; Re]`` share an eigenvalue -- so the solve asks for ``2k`` and keeps
+    every second mode of the sorted spectrum. A genuinely degenerate complex mode appears four
+    times and is correctly thinned to two. The vectors come back complex on the ``n``-space, which
+    is what a band structure wants."""
+    lam = jnp.asarray(lam)
+    order = jnp.argsort(jnp.real(lam))
+    keep = order[::2]
+    Xa = jnp.asarray(X)
+    Xc = _complex_recombine(n_half)(Xa.T).T if Xa.ndim == 2 else _complex_recombine(n_half)(Xa)
+    return lam[keep], (Xc[:, keep] if Xc.ndim == 2 else Xc)
+
+
 def _eigs_constraint_maps(fem_obj: Any, n_full: int):
     """``(restrict, prolong, n_red)`` for the **space-reducing** constraints of an eigenproblem.
 
@@ -561,7 +620,7 @@ def _eigs_constraint_maps(fem_obj: Any, n_full: int):
     than matrices so the reduced pencil ``PᵀKP`` is never assembled and the LOBPCG path stays
     matrix-free. ``(None, None, n_full)`` when the form is unconstrained.
     """
-    per = getattr(fem_obj, "_periodic", None)
+    per = _eigs_periodic(fem_obj)
     pairs = getattr(getattr(fem_obj, "domain", None), "_fem_native_dirichlet_pairs", None) or []
     if pairs and any(abs(float(val)) > 1e-12 for _d, val in pairs):
         raise ValueError(
@@ -3925,6 +3984,7 @@ class FEM:
         tol=None,
         maxiter=None,
         X0=None,
+        contour=None,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
@@ -3947,10 +4007,34 @@ class FEM:
 
             lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())
             lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)   # the 4 modes nearest λ = 60
+
+        ``contour=jno.solve.contour(centre=, radius=, ...)`` returns **every** eigenvalue inside a circle
+        instead of a count (Beyn contour integration), differentiable through the eigenvectors; it refuses
+        ``which``/``sigma``/``precond``/``X0``. A Bloch tie ``u(A) - c*u(B)`` among the terms (a band
+        structure: one ``eigs`` per k-point) makes the pencil complex; the modes come back complex on the
+        ``n``-space, and a complex ``X0`` warm-starts the next k-point.
         """
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
         _reject_source_terms(self, "FEM.eigs")
+        if contour is not None:
+            bad = [
+                nm
+                for nm, val in (
+                    ("which", None if which == "smallest" else which),
+                    ("sigma", sigma),
+                    ("precond", precond),
+                    ("X0", X0),
+                )
+                if val is not None
+            ]
+            if bad:
+                raise ValueError(
+                    f"fem.eigs(contour=...) names a REGION of the complex plane, so it does not take "
+                    f"{', '.join(bad)} — those target the k eigenvalues at one end of the spectrum, "
+                    f"which is a different question. Drop them, or drop contour=."
+                )
+            return self._eigs_contour(mass, contour, tol=tol, maxiter=maxiter)
         from . import solve as _solve
         from .utils.solver.solver_api import LinearOperator
 
@@ -3974,7 +4058,12 @@ class FEM:
         # would silently be the identity.
         _pairs = list(getattr(self.domain, "_fem_native_dirichlet_pairs", None) or [])
         _dir_dofs = sorted({int(dof) for dof, _v in _pairs})
-        M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
+        _mass_fem = fem(list(mass))
+        M = _mass_fem.operator[0]  # mass matrix on the same FE space
+        # A complex / Bloch-tied K lives on the fused real-equivalent 2n block; lift M into it.
+        _cn = self._complex_n
+        if _cn is not None:
+            M = _fuse_mass_like(_cn, _mass_fem, M)
         # RESTORE the stash the (Dirichlet-free) mass assembly just cleared: without this, a SECOND
         # eigs() on the same fem finds no constraints, skips the elimination, and silently returns the
         # row-replaced spurious spectrum — eigs would not be idempotent (measured: the repeat call gave
@@ -3983,13 +4072,22 @@ class FEM:
 
         # A warm start (the previous sweep point's eigenvectors) arrives in the FULL DOF space the
         # caller sees; the constrained solve runs in the reduced one, so restrict its columns.
+        if X0 is not None and _cn is not None and int(jnp.shape(jnp.asarray(X0))[0]) == _cn:
+            X0 = _expand_complex_guess(X0, _cn)  # complex n-space guess -> real-equivalent 2n
         if X0 is not None and restrict is not None:
             _W = jnp.asarray(X0)
             _W = _W[:, None] if _W.ndim == 1 else _W
             X0 = jax.vmap(restrict, in_axes=1, out_axes=1)(_W)
-        solver = _solve.eigs(k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0)
+        # the real-equivalent block doubles every complex mode, so ask for 2k and thin afterwards
+        _k_solve = 2 * k if _cn is not None else k
+        _finish = (
+            (lambda lam, X: _thin_real_equivalent_pairs(lam, X, _cn)) if _cn is not None else (lambda lam, X: (lam, X))
+        )
+        solver = _solve.eigs(
+            k=_k_solve, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0
+        )
         if restrict is None:
-            return solver(K, M)
+            return _finish(*solver(K, M))
 
         if sigma is not None:
             # Shift-invert factorizes K − σM, so the constrained pencil must be ASSEMBLED in the
@@ -4001,7 +4099,8 @@ class FEM:
             from .utils.solver.fem_utils import reduce_matrix, reduce_matrix_periodic
 
             if _kind == "periodic":
-                K_red, M_red = reduce_matrix_periodic(self._periodic, K), reduce_matrix_periodic(self._periodic, M)
+                _per = _eigs_periodic(self)
+                K_red, M_red = reduce_matrix_periodic(_per, K), reduce_matrix_periodic(_per, M)
             else:  # dirichlet: the free-DOF selection P as a BCOO, reduced by the sparse remap
                 free = jnp.asarray(sorted(set(range(n_full)) - set(_dir_dofs)), dtype=jnp.int32)
                 P = jsparse.BCOO(
@@ -4010,7 +4109,7 @@ class FEM:
                 )
                 K_red, M_red = reduce_matrix(P, K, is_selection=True), reduce_matrix(P, M, is_selection=True)
             lam, Xr = solver(K_red, M_red)
-            return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)
+            return _finish(lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr))
 
         # Reduced pencil (PᵀKP) x̂ = λ (PᵀMP) x̂ as MATVECS — never assembled, so this composes with the
         # matrix-free LOBPCG path and never densifies a big operator just to drop some rows.
@@ -4030,7 +4129,7 @@ class FEM:
             if _kind == "dirichlet":
                 _free = jnp.asarray(sorted(set(range(n_full)) - {int(dof) for dof, _v in _pairs}), dtype=jnp.int32)
                 return lambda: matrix_diagonal(A_raw)[_free]
-            return lambda: matrix_diagonal(reduce_matrix_periodic(self._periodic, A_raw))
+            return lambda: matrix_diagonal(reduce_matrix_periodic(_eigs_periodic(self), A_raw))
 
         def red(op, A_raw):
             mv = lambda v: restrict(op.mv(prolong(v)))  # noqa: E731
@@ -4044,7 +4143,74 @@ class FEM:
             )
 
         lam, Xr = solver(red(Kop, K), red(Mop, M))
-        return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)  # modes back on the full mesh
+        return _finish(lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr))  # modes back on the full mesh
+
+    def _eigs_contour(self, mass, spec, *, tol=None, maxiter=None):
+        """Beyn contour integration on this fem's pencil; see :func:`jno.solve.contour`.
+
+        A complex form (which a Bloch tie makes, since ``u(A) - c*u(B)`` with ``c != 1`` is a
+        complex relation) is solved on the **complex n-space pencil built from the Re/Im legs**, not
+        on the fused real-equivalent ``2n`` block the other paths use. That is not a detail: the
+        realified block carries every eigenvalue TWICE, and Beyn resolves each artificial pair as two
+        nearby simple values. Measured on a Bloch-tied photonic-crystal cell, the realified route
+        gave 1.2e-03 relative where the complex one gives 1.0e-05, at half the system size.
+        """
+        from .utils.solver.eigen import contour_geneigh
+        from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic
+        from .utils.solver.solver_api import LinearOperator
+
+        _pairs = list(getattr(self.domain, "_fem_native_dirichlet_pairs", None) or [])
+        _dir = sorted({int(dof) for dof, _v in _pairs})
+        mass_fem = fem(list(mass))
+        M_raw = mass_fem.operator[0]
+        self.domain._fem_native_dirichlet_pairs = _pairs  # the mass assembly clears the stash
+
+        cn = self._complex_n
+        if cn is not None:
+            (A_r, _br), (A_i, _bi) = self._complex_legs
+            K_raw = _complex_operator(A_r, A_i)  # the n-space complex operator
+        else:
+            K_raw = self.operator[0]
+        Kop, Mop = LinearOperator(K_raw), LinearOperator(M_raw)
+        n_full = int(Kop.shape[0])
+
+        per = self._periodic
+        if per is not None:
+            restrict = lambda w: jnp.asarray(reduce_vector_periodic(per, w, conj=True))  # noqa: E731
+            prolong = lambda v: jnp.asarray(prolong_periodic(per, v))  # noqa: E731
+            n_red = int(jnp.shape(restrict(jnp.zeros(n_full, dtype=jnp.complex128)))[0])
+        elif _dir:
+            free = jnp.asarray(sorted(set(range(n_full)) - set(_dir)), dtype=jnp.int32)
+            restrict = lambda w: w[free]  # noqa: E731
+            prolong = lambda v: jnp.zeros(n_full, v.dtype).at[free].set(v)  # noqa: E731
+            n_red = int(free.shape[0])
+        else:
+            restrict = prolong = None
+            n_red = n_full
+
+        if restrict is None:
+            Kr, Mr = Kop, Mop
+        else:
+            red = lambda op: LinearOperator.from_matvec(  # noqa: E731
+                lambda v: restrict(op.mv(prolong(v))), shape=(n_red, n_red)
+            )
+            Kr, Mr = red(Kop), red(Mop)
+
+        lam, Xr = contour_geneigh(
+            Kr,
+            Mr,
+            centre=spec.centre,
+            radius=spec.radius,
+            points=spec.points,
+            probes=spec.probes,
+            rank=spec.rank,
+            tol=spec.tol if tol is None else float(tol),
+            maxiter=spec.maxiter if maxiter is None else int(maxiter),
+            seed=spec.seed,
+        )
+        if restrict is None:
+            return lam, Xr
+        return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)
 
     # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
     def _dd_region(self):

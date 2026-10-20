@@ -229,3 +229,17 @@ def test_operators_of_one_size_class_share_a_measurement():
     assert len(mf._DECISIONS) == 1
     mf.choose(c, log=False)
     assert len(mf._DECISIONS) == 2
+
+
+@pytest.mark.parametrize("cols", [1, 3])
+def test_a_real_csr_operator_applies_to_a_complex_vector(cols):
+    """A real operator times a complex vector (a shifted pencil K - z M applied in contour integration, a
+    Bloch mode): JAX's CSR kernel takes only one dtype, so the product must be formed on the real and the
+    imaginary part -- the answer may not depend on which storage the timing picked."""
+    rng = np.random.default_rng(0)
+    A = (sp.random(30, 30, density=0.2, random_state=1) + sp.eye(30)).tocoo()
+    Ab = jsp.BCOO((jnp.asarray(A.data), jnp.asarray(np.stack([A.row, A.col], 1))), shape=A.shape)
+    v = rng.standard_normal((30, cols)) + 1j * rng.standard_normal((30, cols))
+    v = v[:, 0] if cols == 1 else v
+    mv = mf.csr_matvec(mf.csr_parts(Ab), A.shape)
+    np.testing.assert_allclose(np.asarray(mv(jnp.asarray(v))), A.toarray() @ v, rtol=1e-12, atol=1e-12)
