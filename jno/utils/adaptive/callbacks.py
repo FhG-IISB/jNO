@@ -38,6 +38,8 @@ class Callback:
                 (the exact Python objects passed to ``jno.core([...])``).
                 Callbacks that take a ``constraints=`` arg validate user input
                 against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are ``jno.le`` / ``jno.ge``
+                constraints, each feasible when ``<= 0``. Empty without constraints.
             all_ops: List of OperationDef instances (the solver's compiled op set);
                 callbacks may pass this to ``TraceCompiler.compile_multi_expression``
                 to evaluate user-supplied placeholder expressions during training.
@@ -415,9 +417,15 @@ class EarlyStoppingCallback(Callback):
             the metric never improves beyond this value.
         verbose: If ``True``, log a message when stopping.
 
+    **With** ``jno.le`` / ``jno.ge`` **constraints** the total loss is the objective alone, which
+    rises while a constrained optimiser pulls an infeasible design back. So only a *feasible*
+    iterate (every constraint row ``<= 1e-6``) can be an improvement or count towards *patience*,
+    and training never stops on an infeasible one. A run that never becomes feasible therefore
+    runs its full budget rather than stopping on a design that breaks its constraints.
+
     Example::
 
-        cb = jno.callback.early_stopping(patience=1000, min_delta=1e-6)
+        cb = jno.callbacks.early_stopping(patience=1000, min_delta=1e-6)
         solver.solve(epochs=100_000, callbacks=[cb])
 
         print(cb.stopped_epoch)   # epoch at which training was halted
@@ -450,6 +458,7 @@ class EarlyStoppingCallback(Callback):
         self.stopped_epoch: Optional[int] = None
         self._wait = 0
         self._stopped = False
+        self._ineq: list = []
 
     # -- comparison helpers --------------------------------------------------
 
@@ -465,7 +474,14 @@ class EarlyStoppingCallback(Callback):
 
     # -- hooks ---------------------------------------------------------------
 
+    def on_solve_begin(self, **kwargs) -> None:
+        self._ineq = list(kwargs.get("inequality_idx") or [])
+
     def on_epoch_end(self, **kwargs) -> bool:
+        if self._ineq:
+            rows = np.asarray(jax.device_get(kwargs["individual_losses"])).reshape(-1)
+            if rows[np.asarray(self._ineq)].max() > 1e-6:
+                return False  # infeasible: neither an improvement nor a step towards patience
         current = self._metric_fn(**kwargs)
         epoch: int = kwargs["epoch"]
 

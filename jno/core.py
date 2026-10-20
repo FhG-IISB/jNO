@@ -3931,6 +3931,7 @@ class core:
                         min_consecutive=min_consecutive,
                         constraint_exprs=self._user_constraint_exprs,
                         constraint_names=self._constraint_names,
+                        inequality_idx=list(getattr(self, "_inequality_idx", None) or []),
                         all_ops=self.all_ops,
                         domain=self.domain,
                     )
