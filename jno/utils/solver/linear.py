@@ -862,7 +862,14 @@ def cudss_ldl_solve(A, b, context=None):
             return None
         plan = _ldl_plan(ctx.get("owner"), rows, cols, m, False, trace)
         x = cs.solve(plan, A.data, b)
-    return residual_gate(lambda v: A @ v, b, x, "lu(backend='cudss') [LDL^T]", rtol=1e-6)
+    x = residual_gate(lambda v: A @ v, b, x, "lu(backend='cudss') [LDL^T]", rtol=1e-6)
+    if not isinstance(x, jax.core.Tracer):
+        # An EAGER solve: nothing can come back for its factors (no adjoint, no refactorisation in place), so they
+        # are freed now. Kept, every eagerly solved form held its factors for the rest of the process -- twelve
+        # load cases of one operator held twelve factorisations (3.6 GB at 65 k complex unknowns).
+        jax.block_until_ready(x)
+        plan.release()
+    return x
 
 
 def _pardiso_available() -> bool:

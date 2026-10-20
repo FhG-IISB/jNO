@@ -67,3 +67,23 @@ def test_core_releases_between_programs():
     crux.eval([F])
     held = [e["plan"] for p in L._LDL_PLANS.values() for e in p[1:] if _stats(e["plan"])]
     assert not held, f"{len(held)} extra slot(s) still hold factors after jno.core.eval"
+
+
+def test_an_eager_solve_frees_its_factors():
+    """an eager solve (concrete values, no program) frees its slot's factors once it has returned: nothing can come
+    back for them, and kept they pile up, one factorisation per form solved; a later solve re-runs the analysis"""
+    from tests.test_solve_cudss_ldl import _form
+
+    fem, nc = _form()
+    lu = jno.solve.lu(backend="cudss")
+    k0 = jnp.asarray(np.random.default_rng(1).uniform(0.5, 1.5, nc))
+    before = set(L._LDL_PLANS)
+    x1 = np.asarray(fem.solve(linear=lu, k=k0))
+    new = [L._LDL_PLANS[key] for key in L._LDL_PLANS if key not in before]
+    if not new:
+        pytest.skip("this solve ran inside a compiled program, not eagerly")
+    assert all(not _stats(e["plan"]) for pool in new for e in pool), "an eager solve kept its factors"
+    x2 = np.asarray(fem.solve(linear=lu, k=k0))                    # the same slot, analysed again
+    np.testing.assert_allclose(x2, x1, rtol=1e-12, atol=1e-14 * np.abs(x1).max())
+    ref = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"), k=k0))
+    np.testing.assert_allclose(x1, ref, rtol=1e-9, atol=1e-11 * np.abs(ref).max())
