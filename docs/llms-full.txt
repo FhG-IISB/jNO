@@ -210,7 +210,8 @@ dom = 500 * jno.shape.rect(0, 0, 2, 1, size=0.05).domain()        # replicate fo
 ```
 
 `d.plot("domain.png")` renders mesh, regions and normals. Node coordinates: `d.built_mesh.points`,
-or `d.mesh_connectivity["points"]` on an FDM domain.
+or `d.mesh_connectivity["points"]` on an FDM domain. `d.mask("core")`: bool over the mesh nodes of a named
+region, `T[d.mask("core")]` for a P1 scalar solution (vector: `T.reshape(-1, n)[mask]`; P2: select on `fem.points`).
 
 ---
 
