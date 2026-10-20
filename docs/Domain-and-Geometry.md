@@ -48,7 +48,7 @@ a - b     # cut         a | b     # fuse         a & b     # intersect
 
 | Transform | Meaning |
 |---|---|
-| `.extrude(h)` | sweep a 2-D shape straight up into 3-D |
+| `.extrude(h)` | sweep a 2-D shape straight up into 3-D (thinner than the mesh size: one structured layer, no slivers) |
 | `.revolve(axis_point, axis_dir, angle=2π)` | rotate a 2-D profile about an axis (x- or y-axis through the origin); a partial angle gives a wedge/half-donut |
 | `.sweep(path)` | sweep a 2-D profile along a smooth `Path` (bent pipe) |
 | `.array(n, step=v)` / `.array(n, about=(pt, dir), angle=2π)` | `n` fused copies — linear or polar |

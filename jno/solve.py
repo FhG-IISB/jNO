@@ -115,10 +115,14 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
             on a COMPLEX form whose operator is complex symmetric (eddy currents: ``nu curl curl + j w
             sigma``) it factors the ``n x n`` complex matrix with LDL^T inside the compiled program (no host
-            round trip; jit and grad run on the GPU) rather than LU on the real ``2n`` block. A pattern
+            round trip; jit and grad run on the GPU) rather than LU on the real ``2n`` block. A REAL steady
+            linear form whose operator jNO can show symmetric (its bilinear terms are the same set with trial
+            and test swapped, its essential conditions eliminated symmetrically) is factored LDL^T inside the
+            program too; anything it cannot show symmetric stays on LU, through a host callback. A pattern
             that is not symmetric stays on LU; values that are not (only checkable after the solve, under
             a trace) fail the residual gate. Two solves of one form in one program get a factor slot each.
-            the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
+            The in-program path compiles a small extension with ``nvcc`` on first use (cached afterwards).
+            It is the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
             the symbolic plan from the numeric factorization and jNO caches on the SPARSITY: the plan
             survives a change of values. Measured on an RTX 3070 (fp64 at 1/64 rate -- the
             *unfavourable* card) against host SuperLU: factorization 3.4 ms vs 79.9 ms on a

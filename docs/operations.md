@@ -208,6 +208,19 @@ Every functional over one `fem` shares a single solve. See
 [`fem.eval` on a test-free expression](fem/boundary-conditions.md#integrating-a-quantity-femeval-on-a-test-free-expression)
 for the eager form and the scope limits.
 
+**Over a domain, of known fields** — pass the domain, and the integrand is integrated over its mesh
+with each field on its own element. The fields are known: frozen data, parameters, coordinates, or
+solutions frozen with `.freeze(fem.solve())`, from any number of forms:
+
+```python
+Phi = [phi.bind(x=x, y=y).freeze(f.solve()) for f in fems]
+C01 = (eps * inner(grad(Phi[0]), grad(Phi[1]))).integrate(d)      # C_01 = ∫ ε ∇φ_0 · ∇φ_1
+```
+
+The whole volume of a simplex mesh; it follows trainable coordinates, and `d.cell_size` /
+`d.cell_metric` resolve per cell. An expression with a trial or test function is a form, integrated
+over its form with `integrate(fem)`.
+
 ### Reductions, math & comparisons
 
 Reductions are properties returning a squeezed scalar node; the loss helpers are the ones you reach for

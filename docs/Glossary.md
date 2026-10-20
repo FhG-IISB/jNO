@@ -123,6 +123,10 @@ function, optimiser state, and training history. The variable name
   `∫ F(u) dΩ` at that form's solution, on its assembly quadrature. It is a
   trace node, so an objective (compliance, a volume fraction) can be
   optimised through `jno.core`. `fem.eval(F, u)` is the eager form.
+- `expr.integrate(d)` (with a domain) — an integral of **known** fields over the
+  whole mesh: frozen data, solutions frozen with `u.freeze(fem.solve())`,
+  parameters, coordinates. Each field uses its own element; it follows trainable
+  coordinates. The integrand holds no unknown — that would be a form, `integrate(fem)`.
 
 ### `min_consecutive`
 

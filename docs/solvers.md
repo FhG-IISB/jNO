@@ -230,6 +230,18 @@ problem repeats**.
     yourself, or use cuDSS or PARDISO, which check.
     Naming the error costs nothing on a successful solve, because it runs only on the failure path.
 
+### Forms that share an operator — one factorisation
+
+Several forms that differ only in their **load** — one per drive, load case, incident direction or
+sample — have the same operator. When one evaluation (a `jno.core` loss, a `crux.eval([...])` list) solves
+several of them with the same solver spec, jNO factorizes once: every member's system is assembled,
+the first member's matrix takes the whole block of right-hand sides, and each member gets its column
+back. cuDSS and PARDISO take the block in one call, for the forward solve and the adjoint alike; host
+SuperLU reuses its cached factorization. Nothing is passed to ask for it. Each column is still checked
+against its **own** member's matrix by the residual gate, so two forms that only looked alike raise
+instead of sharing a wrong factorization. Likewise, a solve (or an integral) that an expression refers to
+several times is evaluated once per evaluation.
+
 ### Batched solves and operator storage — `jno.setup(lu_stack=, matvec_format=)`
 
 Every `lu` backend has a `vmap` rule, so `jax.jacrev` / `jax.jacfwd` through a solve and a `vmap` over
@@ -1517,8 +1529,10 @@ block layout for you. Its default solver stays **sparse-direct**, not the matrix
 elliptic systems get — the real-equivalent block is indefinite for Helmholtz/PML, where Jacobi-BiCGStab
 does not converge.
 
-One exception keeps a dedicated path: a **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
-directly rather than the block, so the Re/Im legs are retained for it.
+Two exceptions keep a dedicated path: a **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
+directly rather than the block, so the Re/Im legs are retained for it; and `lu(backend="cudss")` on a
+complex-symmetric operator factors the `n×n` complex matrix with LDLᵀ inside the program instead of the
+real `2n` block.
 
 ??? note "Bloch (quasi-periodic) ties"
     A **Bloch** (quasi-periodic) tie fuses like everything else. Its complex prolongation `P` cannot

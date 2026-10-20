@@ -1414,8 +1414,8 @@ class Placeholder:
         ``quadrature=`` does not apply: a FEM functional inherits the rule its operator was
         assembled with, which is what makes ``∫ σ(u):ε(u) dΩ`` equal ``uᵀKu`` exactly. Every
         functional over one ``fem`` shares a single solve. See :meth:`jno.fem.eval` for the eager
-        form and for the scope limits (whole volume and tagged boundary regions, steady
-        native-Lagrange problems).
+        form and for the scope limits (steady problems; the whole volume and tagged boundary regions
+        of a native-Lagrange form, the whole volume of a non-nodal one, real or complex).
 
         ``solver=`` picks the backend for that shared solve, the same spec ``fem.solve()`` takes::
 

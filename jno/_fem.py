@@ -4273,9 +4273,9 @@ class FEM:
 
         The region is read off the expression's coordinate Variables exactly as for a weak term, so a
         boundary integrand is spelled by binding the field to that region's coordinates; a term naming two
-        regions is refused, because an integral has one measure. Narrower in scope than the weak path: the
-        whole volume and tagged boundary regions only, and steady native-Lagrange problems only. Where it
-        is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
+        regions is refused, because an integral has one measure. Narrower in scope than the weak path: steady
+        problems only -- on a native-Lagrange form the whole volume and tagged boundary regions, on a
+        non-nodal form the whole volume (below). Where it is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
         partition of unity.
 
         On a **non-nodal** form (N1E / N2E / RT / DG, alone or mixed with Lagrange) the test-free integrand is

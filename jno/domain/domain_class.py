@@ -2570,7 +2570,8 @@ class domain(MeshIOMixin):
             C01 = (eps * inner(grad(Phi[0]), grad(Phi[1]))).integrate(d)      # C_01 = ∫ ε ∇φ_0 · ∇φ_1
 
         Each field is evaluated with its own element (any space); the rule is the simplex quadrature of
-        degree 2k for fields of degree k. Whole volume only; the mesh is static (no trainable coordinates).
+        degree 2k for fields of degree k. Whole volume only, simplex meshes; it follows trainable coordinates, and
+        ``d.cell_size`` / ``d.cell_metric`` resolve per cell (a mesh-quality measure is an integral).
         An expression with an unknown (trial / test function) is a form, not this: integrate it over its
         form with ``expr.integrate(fem)``."""
         from ..trace import FunctionCall
