@@ -381,4 +381,7 @@ def test_coupled_velocity_identity_driven_matches_manual_march():
     assert np.abs(traj).max() < 10.0, f"the march must stay bounded, got max {np.abs(traj).max():.2e}"
     w_ref = _march(fem)
     rel = np.linalg.norm(traj[-1] - w_ref) / np.linalg.norm(w_ref)
-    assert rel < 1e-9, f"driven coupled first-order vs the canonical manual march: rel {rel:.2e}"
+    # Each step is solved to BiCGStab's relative tolerance (1e-8), so 60 steps may sit ~1e-8 from the exact
+    # march (measured 2.7e-10 and 1.6e-9 for two round-off paths of the same operator). The stall this guards
+    # against compounds to 1e62.
+    assert rel < 1e-7, f"driven coupled first-order vs the canonical manual march: rel {rel:.2e}"
