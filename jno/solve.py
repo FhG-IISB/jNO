@@ -59,6 +59,7 @@ __all__ = [
     "picard",
     "staggered",
     "eigs",
+    "contour",
     "logdet",
     "trace",
     "applyfun",

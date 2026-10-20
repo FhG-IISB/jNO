@@ -226,7 +226,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` (complex-symmetric); `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard`, `staggered` — `picard`/`staggered` take `anderson=m` (Anderson acceleration) |
-| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |
+| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, interior modes nearest a shift with `sigma=`, or every eigenvalue inside a circle with `contour` (`FEM.eigs(contour=jno.solve.contour(...))`) |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
@@ -300,7 +300,8 @@ jno.solve.applyfun(A, u0, fun=lambda z: jnp.exp(-dt * z))  # exp(-dt·A)·u₀  
 
 ### Eigenproblems at scale
 
-`jno.solve.eigs` / `FEM.eigs` have three paths, chosen by the arguments. With none of the iterative
+`jno.solve.eigs` / `FEM.eigs` have three paths for a symmetric pencil, chosen by the arguments (a
+fourth, `FEM.eigs(contour=...)`, is below; a non-symmetric pencil goes to ARPACK). With none of the iterative
 arguments the pencil is reduced **densely** — exact, and right when you want the whole low spectrum of
 a small problem, but it materializes the operator (`O(N²)` memory). Passing `precond=` selects
 **preconditioned LOBPCG** (Knyazev, *SIAM J. Sci. Comput.* **23**(2), 517–541, 2001), which only applies
@@ -368,6 +369,11 @@ the eigenvalue. A shift-invert call that fails its gate **raises** `ShiftInvertN
 rather than returning NaN (also under a plain `jax.grad`); only under `jit`/`vmap`, where nothing can
 be raised, is its result NaN-poisoned instead.
 
+A non-symmetric pencil goes to ARPACK (Arnoldi), and every pair it returns is checked against the
+pencil: a set that does not satisfy it **raises** `RuntimeError` instead of returning plausible values
+that are not eigenvalues (ARPACK's generalized solve without a shift needs a symmetric `M`, which a
+one-sided coupling block breaks). See the `eigs` routing note in [FEM limitations](fem/limitations.md).
+
 #### Band structure — a Bloch tie in the pencil
 
 A Bloch tie is an ordinary `jno.fem` term, `u(A) - exp(-i k·a) u(B)`, and `eigs` takes it. A band
@@ -382,7 +388,8 @@ fem = jno.fem([
 lam, X = fem.eigs(mass=[eps * ui * vi], k=6)         # λ = ω² at this k-point
 ```
 
-`|c| ≠ 1` makes the relation **complex**, so the tied `K` is assembled on the fused real-equivalent
+A tie factor `c ≠ 1` makes the relation **complex** (the Bloch factor `exp(-i k·a)` has `|c| = 1`; it is
+`c ≠ 1`, not the modulus, that matters), so the tied `K` is assembled on the fused real-equivalent
 `2n` block over `[Re; Im]`. `mass=` is lifted into the same `[[M_r, −M_i], [M_i, M_r]]` layout — a
 mass form assembled on its own carries neither the tie nor the complex literal, and an `n × n` mass
 against a `2n × 2n` stiffness is not a pencil — the periodic reduction is taken in that space, and

@@ -546,8 +546,8 @@ def _reject_source_terms(fem_obj: Any, where: str) -> None:
 def _eigs_periodic(fem_obj: Any):
     """The periodic reduction **in the space this fem's operator actually lives in**.
 
-    A complex form -- and a Bloch tie makes one, since ``u(A) - c*u(B)`` with ``|c| != 1`` is a
-    complex relation -- is solved on the fused real-equivalent ``2n`` block over ``[Re; Im]``, whose
+    A complex form -- and a Bloch tie makes one, since ``u(A) - c*u(B)`` with ``c != 1`` (e.g. the Bloch
+    factor ``exp(-1j*k*a)``, of modulus 1) is a complex relation -- is solved on the fused real-equivalent ``2n`` block over ``[Re; Im]``, whose
     reduction is the realified ``B(P)`` on ``_periodic_2n``, not the ``n``-space complex ``P``.
     Reaching for ``_periodic`` there would apply an ``(n, n_red)`` map to a ``2n`` vector."""
     if getattr(fem_obj, "_complex_n", None) is not None:
@@ -3995,6 +3995,12 @@ class FEM:
 
             lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())
             lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)   # the 4 modes nearest λ = 60
+
+        ``contour=jno.solve.contour(centre=, radius=, ...)`` returns **every** eigenvalue inside a circle
+        instead of a count (Beyn contour integration), differentiable through the eigenvectors; it refuses
+        ``which``/``sigma``/``precond``/``X0``. A Bloch tie ``u(A) - c*u(B)`` among the terms (a band
+        structure: one ``eigs`` per k-point) makes the pencil complex; the modes come back complex on the
+        ``n``-space, and a complex ``X0`` warm-starts the next k-point.
         """
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
@@ -4130,7 +4136,7 @@ class FEM:
     def _eigs_contour(self, mass, spec, *, tol=None, maxiter=None):
         """Beyn contour integration on this fem's pencil; see :func:`jno.solve.contour`.
 
-        A complex form (which a Bloch tie makes, since ``u(A) - c*u(B)`` with ``|c| != 1`` is a
+        A complex form (which a Bloch tie makes, since ``u(A) - c*u(B)`` with ``c != 1`` is a
         complex relation) is solved on the **complex n-space pencil built from the Re/Im legs**, not
         on the fused real-equivalent ``2n`` block the other paths use. That is not a detail: the
         realified block carries every eigenvalue TWICE, and Beyn resolves each artificial pair as two
