@@ -70,6 +70,7 @@ from .utils import (
     statistics,
 )
 from .utils.adaptive.callbacks import Callback as _CallbackBase
+from .utils import beacon as _beacon
 from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
 
@@ -2433,6 +2434,7 @@ class core:
         profile: bool = False,
         callbacks: Optional[List] = None,
         substeps: list | None = None,
+        log: bool | int | None = None,
     ) -> "statistics":
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
@@ -2500,6 +2502,12 @@ class core:
                 optimizer state).  Each substep runs sequentially per outer
                 epoch and has its own independent optimizer states, so Adam
                 momentum accumulates only for actively trained models.
+            log: How often the training line is printed: ``None``/``True``
+                every tenth of the run (a thousandth above 100k epochs),
+                ``N`` every N epochs (and the last), ``False`` never.  A solve
+                inside the loss reports its own steps only if it has
+                ``log=`` itself (``fem.solve(log=True)``); its lines come
+                before the training line of the same epoch.
 
                 Example — HyCo alternating::
 
@@ -3933,6 +3941,7 @@ class core:
                     min_consecutive,
                     int(self.n_constraints),
                     bool(bayesian_handles),
+                    _beacon.settings(),  # a solve inside the step traced with log= or without
                 ),
             )
             _cache = getattr(self, "_jit_program_cache", None)
@@ -4280,7 +4289,6 @@ class core:
 
             # ── 8. Training loop ──
 
-            print_rate = max(1, epochs // 10 if epochs < 100_000 else epochs // 1000)
             prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
 
             # Substep state — one prev_losses array per substep + a global step counter
@@ -4325,6 +4333,16 @@ class core:
                     f"running {n_outer * inner_steps} epochs instead."
                 )
             print_rate = max(10, n_outer // 10 if n_outer < 100_000 else n_outer // 1000)
+            if log is not None:
+                _log_every = _beacon.parse_log(log, "jno.core.solve")[1]
+                if _log_every is not None:  # log=N: every N epochs
+                    print_rate = max(1, _log_every // inner_steps)
+
+            def _say(line):
+                if log is False:
+                    return
+                _beacon.flush(wait=False)  # a logging solve inside the loss: its lines before this epoch's
+                self.log.info(line)
 
             # Freeze all surviving Python objects (model params, opt states, etc.)
             # so Python's cyclic GC never has to scan them during the hot loop.
@@ -4521,7 +4539,7 @@ class core:
                             for ci, v in enumerate(_ind_np)
                         ]
                     )
-                    self.log.info(f"Epoch {_epoch_counter - 1:>6}/{epochs}| L:{float(_total_np):.4e} | {_msg}")
+                    _say(f"Epoch {_epoch_counter - 1:>6}/{epochs}| L:{float(_total_np):.4e} | {_msg}")
 
                     # Wandb (per chunk) — mirror the slow-path block:
                     # n_samples, n_chains, plus a running posterior mean
@@ -5102,7 +5120,7 @@ class core:
                         _wandb_nan_alerted = True
 
                 # --- logging: sync only at print interval ---
-                should_print = (outer_epoch % print_rate == 0) or (outer_epoch == n_outer - 1)
+                should_print = log is not False and ((outer_epoch % print_rate == 0) or (outer_epoch == n_outer - 1))
                 if should_print:
                     losses_np, total_np_arr = jax.device_get((individual_losses, total_loss))
                     losses_np = np.asarray(losses_np)
@@ -5159,11 +5177,11 @@ class core:
                             else f"{(_tn_log[i] if i < len(_tn_log) and _tn_log[i] else f'T{i}')}: shape={v.shape} mean={float(np.mean(v)):.4e}"
                             for i, v in enumerate(track_stats_np)
                         )
-                        self.log.info(
+                        _say(
                             f"Epoch {displayed_epoch:>6}/{epochs}| L:{float(total_np):>10.4e} | {loss_strs} | {track_strs}"
                         )
                     else:
-                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| L:{float(total_np):>10.4e} | {loss_strs}")
+                        _say(f"Epoch {displayed_epoch:>6}/{epochs}| L:{float(total_np):>10.4e} | {loss_strs}")
 
                 # --- callbacks ---
                 if callbacks:

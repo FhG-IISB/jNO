@@ -3178,18 +3178,24 @@ class FEM:
             out = coupled(_em, self).solve(**kwargs)
             return self._as_solution(jnp.asarray(out.field)) if isinstance(out, ElectroThermalSolution) else out
 
+        from .utils import beacon
         from .utils.logger import get_logger
         from .utils.solver import newton_krylov as _nk
 
+        # log=True / N: each Newton and time step (every N-th and the last) as it happens -- see jno.utils.beacon
+        log = kwargs.pop("log", False)
         _t0 = _time.perf_counter()
         # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
         # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
         prev_linear = _nk._LINEAR_FORM[0]
         _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
         try:
-            out = self._solve_inner(*args, **given, **kwargs)
+            with beacon.session(log, "fem.solve"):
+                out = self._solve_inner(*args, **given, **kwargs)
         finally:
             _nk._LINEAR_FORM[0] = prev_linear
+        if callable(getattr(out, "fn", None)):  # a deferred solve: its loops are traced when it is evaluated
+            out.fn = beacon.logged(out.fn, log, "fem.solve")
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
         return self._as_solution(out)
 
@@ -3410,6 +3416,10 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
 
+        ``log=True`` prints each Newton step and each time step while the solve runs (``log=N``: every N-th
+        step of each loop, and its last), from inside the compiled program without stopping it. A deferred
+        solve reports when it is evaluated. Off by default, and then nothing is added to the program.
+
         A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
         (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
         ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
@@ -3436,6 +3446,7 @@ class FEM:
             basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
             shard: multi-device execution (see above).
             profile: run inside a JAX trace and report the time (see above).
+            log: ``True`` prints each Newton / time step while the solve runs, ``N`` every N-th and the last (see above).
             **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
                 make a parametric form concrete for this solve.
 
@@ -4661,6 +4672,7 @@ class FEM:
         maxiter=None,
         X0=None,
         contour=None,
+        log=False,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
@@ -4689,7 +4701,33 @@ class FEM:
         ``which``/``sigma``/``precond``/``X0``. A Bloch tie ``u(A) - c*u(B)`` among the terms (a band
         structure: one ``eigs`` per k-point) makes the pencil complex; the modes come back complex on the
         ``n``-space, and a complex ``X0`` warm-starts the next k-point.
+
+        ``log=True`` prints each iteration of LOBPCG (``precond=``) or of the shift-invert iteration (``sigma=``)
+        while it runs (``log=N``: every N-th and the last); the dense reduction and ARPACK have no loop to report.
         """
+        from .utils import beacon
+
+        with beacon.session(log, "fem.eigs"):
+            return self._eigs_inner(
+                mass=mass, k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0,
+                contour=contour,
+            )
+
+    def _eigs_inner(
+        self,
+        *,
+        mass,
+        k: int = 6,
+        which: str = "smallest",
+        sigma=None,
+        linear=None,
+        precond=None,
+        tol=None,
+        maxiter=None,
+        X0=None,
+        contour=None,
+    ):
+        """The body of :meth:`eigs` (which documents it), run inside its ``log=`` session."""
         self._refresh_attachments()
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
