@@ -305,6 +305,133 @@ def _aca(entry_rows, entry_cols, m: int, n: int, tol: float, maxrank: int):
     return np.array(ipiv, dtype=int), np.array(jpiv, dtype=int)
 
 
+@partial(jax.jit, static_argnums=(4,))
+def _entries(Pa, Ma, Pb, Mb, g):
+    """Element-element entries for a STACK of blocks: ``(B, k, s, 3)`` against ``(B, n, s', 3)``."""
+    d = Pa[:, :, None, :, None, :] - Pb[:, None, :, None, :, :]
+    r = jnp.sqrt((d * d).sum(-1))
+    mm = jnp.einsum("bkpc,bnqc->bknpq", Ma, Mb)
+    return (mm * g(r)).sum((3, 4))
+
+
+def _pow2(v: int) -> int:
+    return 1 << max(0, int(v - 1).bit_length())
+
+
+def _aca_batched(blocks, P, M, Pb, Mb, g, tol: float):
+    """`_aca` for MANY blocks at once: the same pivots, with every row and column evaluation batched.
+
+    `_aca` asks the kernel for one row or one column at a time, one Python call each -- 56,000 calls
+    and 17 s for a 5,000-element welded network, every time a network was built. Here the blocks of
+    similar size share a bucket and advance in lockstep, so each ACA step is ONE jitted evaluation of
+    a row of every block and one of a column of every block; the bookkeeping per block (which row
+    next, when to stop, the verification on unvisited rows) is `_aca`'s, line for line.
+
+    ``blocks``: ``[(rows, cols), ...]`` element indices. Returns ``[(ipiv, jpiv), ...]`` in the same
+    order, empty arrays where `_aca` would return them (a block to be stored densely).
+    """
+    # The structure is built while the solve is being TRACED (on its first call), so the jitted
+    # evaluations below would hand back tracers; their inputs are concrete, and this evaluates them.
+    with jax.ensure_compile_time_eval():
+        return _aca_batched_eval(blocks, P, M, Pb, Mb, g, tol)
+
+
+def _aca_batched_eval(blocks, P, M, Pb, Mb, g, tol):
+    out = [None] * len(blocks)
+    buckets: dict = {}
+    for q, (ia, ib) in enumerate(blocks):
+        buckets.setdefault((_pow2(len(ia)), _pow2(len(ib))), []).append(q)
+    P, M, Pb, Mb = (np.asarray(a) for a in (P, M, Pb, Mb))  # gathered on the host; only `_entries` is jax
+    ent = lambda *a: np.asarray(_entries(*a, g))
+    for (mw, nw), qs in buckets.items():
+        B = len(qs)
+        m = np.array([len(blocks[q][0]) for q in qs])
+        n = np.array([len(blocks[q][1]) for q in qs])
+        IA = np.zeros((B, mw), dtype=np.int64)
+        IB = np.zeros((B, nw), dtype=np.int64)
+        for b, q in enumerate(qs):
+            IA[b, : m[b]], IB[b, : n[b]] = blocks[q]
+        cap = np.minimum(m, n)
+        us = [[] for _ in range(B)]
+        vs = [[] for _ in range(B)]
+        ipiv = [[] for _ in range(B)]
+        jpiv = [[] for _ in range(B)]
+        seen = [set() for _ in range(B)]
+        nrm = np.zeros(B)
+        it = np.zeros(B, dtype=np.int64)
+        i = np.zeros(B, dtype=np.int64)
+        done = np.zeros(B, dtype=bool)
+        PbB, MbB = Pb[IB], Mb[IB]
+        PaB, MaB = P[IA], M[IA]
+        while not done.all():
+            for b in np.flatnonzero(~done):  # `_aca`'s "skip rows already seen"
+                while i[b] in seen[b] and len(seen[b]) < m[b]:
+                    i[b] = (i[b] + 1) % m[b]
+            ra = IA[np.arange(B), i][:, None]
+            rows = ent(P[ra], M[ra], PbB, MbB)[:, 0, :]
+            jsel = np.zeros(B, dtype=np.int64)
+            live = np.zeros(B, dtype=bool)
+            for b in np.flatnonzero(~done):
+                row = rows[b, : n[b]].copy()
+                for u, v in zip(us[b], vs[b]):
+                    row = row - u[i[b]] * v
+                j = int(np.argmax(np.abs(row)))
+                it[b] += 1
+                if abs(row[j]) < 1e-300:
+                    seen[b].add(int(i[b]))
+                    i[b] = (i[b] + 1) % m[b]
+                    if len(seen[b]) >= m[b] or it[b] >= cap[b]:
+                        done[b] = True
+                    continue
+                vs[b].append(row / row[j])
+                jsel[b], live[b] = j, True
+            if not live.any():
+                continue
+            cb = IB[np.arange(B), jsel][:, None]
+            cols = ent(PaB, MaB, Pb[cb], Mb[cb])[:, :, 0]
+            for b in np.flatnonzero(live):
+                j = int(jsel[b])
+                col = cols[b, : m[b]].copy()
+                for u, vv in zip(us[b], vs[b][:-1]):
+                    col = col - vv[j] * u
+                us[b].append(col)
+                ipiv[b].append(int(i[b]))
+                jpiv[b].append(j)
+                seen[b].add(int(i[b]))
+                upd = float(np.linalg.norm(col) * np.linalg.norm(vs[b][-1]))
+                nrm[b] = float(np.sqrt(max(nrm[b] ** 2 + upd**2, 0.0)))
+                if upd <= tol * nrm[b] or it[b] >= cap[b]:
+                    done[b] = True
+                    continue
+                colr = np.abs(col)
+                colr[np.array(ipiv[b], dtype=int)] = -1.0
+                i[b] = int(np.argmax(colr))
+        # `_aca`'s verification on rows the pivot chain never visited, batched the same way
+        probes = []
+        for b in range(B):
+            unseen = [t for t in range(m[b]) if t not in seen[b]]
+            pool = unseen or list(range(m[b]))
+            probes.append(pool[:: max(1, len(pool) // 8)][:8])
+        PR = np.zeros((B, 8), dtype=np.int64)
+        for b, pr in enumerate(probes):
+            PR[b, : len(pr)] = IA[b, pr]
+        exact = ent(P[PR], M[PR], PbB, MbB)
+        for b, q in enumerate(qs):
+            if not ipiv[b]:
+                out[q] = (np.array([], dtype=int), np.array([], dtype=int))
+                continue
+            ok = True
+            U, V = np.stack(us[b], 1), np.stack(vs[b], 0)  # (m, k), (k, n)
+            for r, t in enumerate(probes[b]):
+                ex = exact[b, r, : n[b]]
+                scale = np.abs(ex).max()
+                if scale > 0 and np.abs(U[t] @ V - ex).max() > max(1e-8, 100.0 * tol) * scale:
+                    ok = False
+                    break
+            out[q] = (np.array(ipiv[b], dtype=int), np.array(jpiv[b], dtype=int)) if ok else (np.array([], dtype=int),) * 2
+    return out
+
+
 def build(
     pos, mom, group, g: Callable, *, b=None, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, _only=None
 ) -> HMatrix:
@@ -335,13 +462,6 @@ def build(
         P, M, cen = P[_only], M[_only], cen[_only]
         Pb, Mb, cenb = P, M, cen
 
-    def blk(rows, cols):
-        """The exact element-element sub-block, on the host."""
-        d = P[rows][:, None, :, None, :] - Pb[cols][None, :, None, :, :]
-        r = np.sqrt((d * d).sum(-1))
-        mm = np.einsum("apc,bqc->abpq", M[rows], Mb[cols])
-        return (mm * g(r)).sum((2, 3))
-
     # PARTITION BY MOMENT DIRECTION before clustering.
     #
     # `mom_a . mom_b` vanishes exactly between perpendicular bar families, so the operator is block
@@ -368,34 +488,42 @@ def build(
     else:
         nodes_b, children_b = cluster(cenb, leaf)
         box_b = [_boxes(cenb, idx) for idx in nodes_b]
-    near: list = []
-    far: list = []
-    ranks: list = []
+    # Walk the tree first, recording each block in order; the admissible ones then get their ACA
+    # pivots in one batched pass (`_aca_batched`) instead of one kernel call per row and column.
+    order: list = []
     stack = [(0, 0)]
     while stack:
         a, bb = stack.pop()
         ia, ib = nodes[a], nodes_b[bb]
         if _admissible(box[a], box_b[bb], eta):
-            rows = lambda i, ia=ia, ib=ib: blk(ia[i : i + 1], ib)[0]
-            cols = lambda j, ia=ia, ib=ib: blk(ia, ib[j : j + 1])[:, 0]
-            ip, jp = _aca(rows, cols, len(ia), len(ib), tol, maxrank=min(len(ia), len(ib)))
-            # A block ACA could not compress is stored densely: a wrong answer is not the
-            # alternative to a slow one, and the rank is reported so this is visible.
-            if len(ip) == 0 or len(ip) >= min(len(ia), len(ib)) // 2:
-                near.append((ia, ib))
-            else:
-                far.append((ia, ib, ip, jp))
-                ranks.append(len(ip))
+            order.append((True, ia, ib))
             continue
         ca, cb = children[a], children_b[bb]
         if ca is None and cb is None:
-            near.append((ia, ib))
+            order.append((False, ia, ib))
         elif ca is None:
             stack += [(a, cb[0]), (a, cb[1])]
         elif cb is None:
             stack += [(ca[0], bb), (ca[1], bb)]
         else:
             stack += [(ca[0], cb[0]), (ca[0], cb[1]), (ca[1], cb[0]), (ca[1], cb[1])]
+    adm = [(ia, ib) for is_adm, ia, ib in order if is_adm]
+    piv = iter(_aca_batched(adm, P, M, Pb, Mb, g, tol) if adm else [])
+    near: list = []
+    far: list = []
+    ranks: list = []
+    for is_adm, ia, ib in order:
+        if not is_adm:
+            near.append((ia, ib))
+            continue
+        ip, jp = next(piv)
+        # A block ACA could not compress is stored densely: a wrong answer is not the
+        # alternative to a slow one, and the rank is reported so this is visible.
+        if len(ip) == 0 or len(ip) >= min(len(ia), len(ib)) // 2:
+            near.append((ia, ib))
+        else:
+            far.append((ia, ib, ip, jp))
+            ranks.append(len(ip))
     return HMatrix((len(cen), len(cenb)), (P.shape[1], Pb.shape[1]), tuple(near), tuple(far), tuple(ranks), square)
 
 

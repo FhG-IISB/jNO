@@ -224,3 +224,31 @@ def test_mixing_the_two_shapes_is_refused():
     hs = build(pa, ma, ga, G, tol=1e-6, leaf=32)
     with pytest.raises(ValueError, match="built for one element set"):
         materialize(hs, pa, ma, sa, G, b=(pb, mb))
+
+
+@pytest.mark.parametrize("spread", ["scattered", "clustered", "sheet"])
+def test_the_batched_pivot_search_picks_the_one_at_a_time_pivots(spread):
+    """`build` searches every admissible block's pivots in lockstep (`_aca_batched`), one batched
+    kernel evaluation per step instead of one call per row and column. It must be `_aca` -- the same
+    pivots, block for block -- or the structure would change with how many blocks were built at once."""
+    from jno.utils.solver.hmatrix import _aca, _aca_batched, _admissible, _boxes, _prep
+
+    pos, mom, group, _ = _elements(300, nsub=3, spread=spread)
+    P, M, cen = _prep("test", pos, mom, group)
+    nodes, children = cluster(cen, 16)
+    box = [_boxes(cen, idx) for idx in nodes]
+    blocks = [
+        (nodes[a], nodes[b]) for a in range(len(nodes)) for b in range(len(nodes)) if _admissible(box[a], box[b], 2.0)
+    ]
+    assert len(blocks) > 10
+
+    def blk(rows, cols):
+        d = P[rows][:, None, :, None, :] - P[cols][None, :, None, :, :]
+        return (np.einsum("apc,bqc->abpq", M[rows], M[cols]) * G(np.sqrt((d * d).sum(-1)))).sum((2, 3))
+
+    got = _aca_batched(blocks, P, M, P, M, G, 1e-6)
+    for (ia, ib), (ip, jp) in zip(blocks, got):
+        rows = lambda i, ia=ia, ib=ib: blk(ia[i : i + 1], ib)[0]
+        cols = lambda j, ia=ia, ib=ib: blk(ia, ib[j : j + 1])[:, 0]
+        wi, wj = _aca(rows, cols, len(ia), len(ib), 1e-6, maxrank=min(len(ia), len(ib)))
+        assert np.array_equal(ip, wi) and np.array_equal(jp, wj)
