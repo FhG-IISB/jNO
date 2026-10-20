@@ -38,6 +38,7 @@ linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary con
 
 from __future__ import annotations
 
+import warnings
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1535,6 +1536,23 @@ def assemble_fem_native(
     # P0 field parameters carry ONE value per element rather than per node, so they gather by cell
     # index and need no interpolation -- the kernel's scalar branch broadcasts them over the quad
     # points. The design variable of density-based topology optimisation is exactly this.
+
+    # A FEM field parameter k(x) carries P1 (mesh-vertex) nodal values -- `jno.np.parameter` accepts P1
+    # symbols only -- so it gathers on the P1 connectivity and interpolates on the P1 basis, whatever
+    # the fields around it are. Tabulated here against the SAME shared quadrature rule as every other
+    # spec so the contraction lines up.
+    #
+    # This used to use whichever field's terms mentioned the parameter. In a single-field P1 problem
+    # that is the same thing, so it went unnoticed; in a coupled problem it is not. A P1 design field
+    # inside `alpha(rho) <u, v>` -- test function a P2 velocity -- had its 21 nodal values gathered with
+    # P2 node ids running past 21, and JAX CLAMPS an out-of-range gather instead of raising, so the
+    # excess silently read the last node. Uniform k(x) hid it completely (every permutation of equal
+    # values is the same field); a non-uniform one was 44% wrong against the same coefficient written
+    # inline. `fem_nonnodal` already interpolates field parameters on P1 for exactly this reason.
+    _p1_shape_vals = None
+    if _field_param_names:
+        _p1_spec = _lagrange_simplex(dim, 1, _qd, cell_type=_cell_type)
+        _p1_shape_vals = jnp.reshape(jnp.asarray(_p1_spec.ref_values), (int(qp_shared.shape[0]), -1))
     from .parametric_helpers import _fem_field_kind
 
     _cell_field_names: set = {n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"}
@@ -1819,12 +1837,12 @@ def assemble_fem_native(
             **{n: ModelWeights(m) for n, m in _dir_net_models.items()},
             **{n: ModelWeights(m) for n, m in _ic_net_models.items()},
         }
-    # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
-    # coupled (multi-field) problem, associate it with the field whose test function appears in the
-    # term(s) that reference it (e.g. mu(x)*(grad u . grad v) -> the velocity field), so its nodal values
-    # gather/interpolate on THAT field's mesh. All field params must resolve to one field (a single shared
-    # ``shape_vals`` threads the interpolation), else it is rejected.
-    _field_param_field_idx = 0
+    # A nodal FIELD parameter k(x) carries P1 (mesh-vertex) values and interpolates on the P1 basis --
+    # see the tabulation of ``_p1_shape_vals`` above. Which field's terms mention it no longer decides
+    # anything, so nothing needs resolving here. What IS worth saying out loud is when the surrounding
+    # fields are richer than P1: the coefficient then resolves more coarsely than the fields it
+    # multiplies, which is a modelling fact the caller should know rather than discover from a result.
+    # The canonical case is a P1 design field against a P2 velocity in topology optimisation.
     if _field_param_names and len(fields) > 1:
         from .parametric_helpers import _contains_fem_field_parameter
 
@@ -1836,23 +1854,18 @@ def assemble_fem_native(
                     tfi = _test_field_index(coeff, field_index)
                     if tfi is not None:
                         _pf_idxs.add(int(tfi))
-        if len(_pf_idxs) == 1:
-            _field_param_field_idx = _pf_idxs.pop()
-        else:
-            # A field parameter shared across several fields' terms (a material property common to coupled
-            # equations, e.g. a conductivity in both a thermal and a coupling term) is allowed WHEN those
-            # fields share ONE FE space: same element order on the one mesh -> identical nodes, connectivity
-            # and shape_vals, so k(x) interpolates the same regardless of which field's space we pick. Only
-            # DIFFERING orders are ambiguous (no shared node set) and stay rejected.
-            _orders = {int(fields[i]["order"]) for i in _pf_idxs}
-            if not _pf_idxs or len(_orders) != 1:
-                raise NotImplementedError(
-                    "jno.fem (native): a FEM field parameter k(x) on a coupled (multi-field) problem must "
-                    "appear in the terms of fields sharing ONE FE space (same element order) — its nodal "
-                    "values interpolate on that shared space. Resolved to fields "
-                    f"{sorted(_pf_idxs)} with orders {sorted(_orders)} (differing orders share no node set)."
-                )
-            _field_param_field_idx = min(_pf_idxs)
+        _higher = sorted({int(fields[i]["order"]) for i in _pf_idxs} - {1})
+        if _higher:
+            _names = ", ".join(repr(n) for n in sorted(_field_param_names))
+            warnings.warn(
+                f"jno.fem: the field parameter(s) {_names} carry P1 (mesh-vertex) values and interpolate "
+                f"on the P1 basis, but they appear in terms tested by order-{_higher} field(s). The "
+                "coefficient is therefore resolved more coarsely than the fields it multiplies -- correct, "
+                "but its detail is capped by the vertex mesh (in topology optimisation, that is the design "
+                "resolution). Refine the mesh to resolve k(x) more finely; raising the other fields' order "
+                "will not.",
+                stacklevel=2,
+            )
 
     # -------------------------------------------------------------------------
     # Surface integration setup
@@ -2757,7 +2770,7 @@ def assemble_fem_native(
                 # parameter): pack a zero placeholder of the right width. It is only ever read back if
                 # the term actually contains the parameter node, in which case args carries its value.
                 _w = (
-                    n_local_f[_field_param_field_idx]
+                    int(cells_j.shape[1])  # P1 nodes per cell -- the space a field parameter lives on
                     if (name in _field_param_names and name not in _cell_field_names)
                     else 1
                 )
@@ -2769,9 +2782,9 @@ def assemble_fem_native(
                 # broadcasts it over the quad points -- which is what a per-element constant is.
                 pv.append(jnp.reshape(flat[c], (1,)))
             else:
-                # Nodal field parameter -> this cell's local nodal values on its field's mesh (field 0
-                # for a single-field problem; the resolved field for a coupled one).
-                pv.append(flat[cells_f_j[_field_param_field_idx][c]] if name in _field_param_names else flat[:1])
+                # Nodal field parameter -> this cell's P1 vertex values, the space the parameter is
+                # defined on, independent of the fields whose terms mention it.
+                pv.append(flat[cells_j[c]] if name in _field_param_names else flat[:1])
         return tv + tuple(pv)
 
     # -------------------------------------------------------------------------
@@ -2858,10 +2871,10 @@ def assemble_fem_native(
             # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
             loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
-            # The field parameter's nodal slice is interpolated to the quad points with its field's shape
-            # functions (field 0 single-field; the resolved field for a coupled problem).
+            # The field parameter's nodal slice is interpolated to the quad points with the P1 basis it
+            # is defined on -- not the surrounding field's.
             # _runtime_parameter_value_from_internal_vars reads this top-level shape_vals.
-            loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored module
             loc["neural_coefficients"] = _nt
@@ -2964,7 +2977,7 @@ def assemble_fem_native(
             # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
             loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
-            loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
@@ -3289,7 +3302,7 @@ def assemble_fem_native(
         if test_vals is not None:
             loc["test_shape_vals"] = {btfi: test_vals}
         if _field_param_names:
-            loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
@@ -3357,7 +3370,7 @@ def assemble_fem_native(
         }
         _pack_gaps(loc, per_f, n_vec, gaps)  # so an AL multiplier update can read the same gap
         if _field_param_names:
-            loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt

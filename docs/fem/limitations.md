@@ -29,7 +29,7 @@ path is unaffected.
 | `d.tag(name, pred)` over a geometry face | the predicate filters point sampling only; facets still map through the geometry, so naming a DIFFERENT face splits the region | warns |
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
-| Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
+| Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient; on a coupled (multi-field) form only on a first-order transient, not steady or on the τ load path (the parameter's nodes and the constrained field's do not share a numbering) | raises |
 | Time-varying Dirichlet `g(x, t)` | first-order transients, linear or nonlinear, single-field or coupled, a trainable **parameter** inside the value included (differentiable); not a trainable net inside the value, nor a net/parameter-valued Dirichlet beside it, not a parameter inside it on a `u_tt` form or the τ load path, not a nonlinear `u_tt` form. `sdirk(3)` and `ros2` lose some order to it, and `ros2` holds the wall value only to its order (measured below) | raises |
 | Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
@@ -65,7 +65,8 @@ path is unaffected.
     still refuses:
 
     - a field with **no** `u_tt` term — its velocity rows would be singular;
-    - **runtime parameters** — the parametric coupled steady assembly underneath is not wired;
+    - **runtime parameters** — the `u_tt` block re-forms `M₂`/`C`/`K` per step without threading the
+      runtime args, so the parameter would freeze at its initial value;
     - periodic ties.
 
     Time-varying Dirichlet is refused on nonlinear `u_tt` forms (a first-order nonlinear transient
@@ -108,6 +109,11 @@ path is unaffected.
     coordinate profile `u(top) - g*sin(pi*x)`), and the boundary value is recovered from data like
     any other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g`
     through the solve's / each step's `custom_root` (nonlinear / transient).
+
+    On a **coupled** (multi-field) form a parametric essential value is refused, steady or on the τ load
+    path: the boundary lookup reads the parameter's nodal array with the constrained field's node ids, and
+    two fields do not share a numbering. A parameter in the operator or the load of a coupled form is fine;
+    recover a boundary parameter on a single-field form.
 
     A value that is **both** parametric and t/τ-dependent is held at each step's t/τ WITH the runtime
     parameters, on a first-order transient and on a τ load-path march (`u(top)[1] - g*tau`,

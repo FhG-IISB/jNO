@@ -252,7 +252,9 @@ crux.solve(300)                                                  # recovers g = 
 
 The parameter may scale a spatial profile (`u(xb, yb) - g*jno.np.sin(jno.np.pi*xb)`) and may appear
 in the operator and the boundary value simultaneously. Scope and refusals: steady linear, steady
-nonlinear, and linear transient. A value that is both parametric **and** t/τ-dependent is supported
+nonlinear, and linear transient. On a coupled (multi-field) form a parametric boundary value is refused,
+steady or on the τ load path (the two fields' nodes are numbered apart); a parameter in the operator or
+the load of a coupled form is fine. A value that is both parametric **and** t/τ-dependent is supported
 on a first-order transient (`u(wall) - a*sin(t)`) and on a τ load-path march — displacement control
 with a trainable grip, `u(top)[1] - g*tau`, recovered from the trajectory it drives. It refuses loudly
 on a second-order (`u.tt`) form; drive that ramp through a Neumann/body term instead.

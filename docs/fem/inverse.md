@@ -283,8 +283,12 @@ hyper-reduction).
 
 ### Field parameters `k(x)` + regularization
 
-`jno.np.parameter(phi)` is a **nodal field** on the trial space — a trainable value per node. Field
-inversion is ill-posed, so add a smoothness/structure prior with `k.regularize(...)` (`"h1seminorm"`,
+`jno.np.parameter(phi)` is a **nodal field**: a trainable value per mesh vertex, interpolated on the P1
+basis whatever field it multiplies. So it works unchanged in a coupled form of mixed orders (a P1 design
+field `k(x)` in the momentum terms of a P2 velocity and the continuity terms of a P1 pressure). When it
+appears in terms tested by a field of order 2 or higher, `jno.fem` warns that the coefficient is resolved
+more coarsely than the fields it multiplies: its detail is capped by the vertex mesh, so refine the mesh
+to resolve `k(x)` more finely (raising the other fields' order will not). Field inversion is ill-posed, so add a smoothness/structure prior with `k.regularize(...)` (`"h1seminorm"`,
 `"l2"`/`"tikhonov"`, `"tv"`, `"nonneg"`, `"bounded"`):
 
 ```python
