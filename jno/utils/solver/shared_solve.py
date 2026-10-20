@@ -99,9 +99,9 @@ def solve_shared(evaluator, node, ctx, memo) -> bool:
     solve, A0, B = members[0]._solve_fn, systems[0], jnp.stack(rhs, axis=1)
     X = None
     spec = getattr(members[0], "_linear_spec", None)
-    ctx0 = members[0]._fem_ref._linear_solver_context()
-    if getattr(spec, "name", None) == "lu-cudss" and ctx0 is not None and (ctx0.get("complex_n") is not None
-                                                                          or ctx0.get("symmetric")):
+    # the solver context only where it decides something: building it assembles the form once more
+    ctx0 = members[0]._fem_ref._linear_solver_context() if getattr(spec, "name", None) == "lu-cudss" else None
+    if ctx0 is not None and (ctx0.get("complex_n") is not None or ctx0.get("symmetric")):
         # in-program LDL^T for a complex form or a provably symmetric real one -- the same choice a single solve
         # makes (jno.solve.lu): the block in ONE call, one factorisation
         from .linear import cudss_ldl_solve
