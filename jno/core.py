@@ -3966,7 +3966,8 @@ class core:
                         f"Substep {_si}: constraints={_indices}, n_steps={_n_steps_i}, active_models={sorted(_active_lids)}"
                     )
 
-            self.log.info("JIT compiling step function with mesh sharding — this might take a while")
+            if _cached_step is None or _use_substeps or _use_accumulation:  # a reused step compiles nothing
+                self.log.info("JIT compiling step function with mesh sharding — this might take a while")
 
             # The persistent compilation cache is configured once, at `import jno` (jno.utils.config:
             # on by default, or the user's opt-out); solve() leaves that setting alone. (It used to set a
