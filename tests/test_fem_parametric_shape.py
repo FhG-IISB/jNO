@@ -150,3 +150,66 @@ def test_stretch_reads_how_far_the_design_moved_from_the_reference():
     assert at(6 * mm) == pytest.approx(2.0)  # ... or shrinks to 2 mm
     assert at(4 * mm) == np.inf  # closed
     assert float(jno.shape.box(0, 0, 0, 1, 1, 1).name("a").domain().stretch().fn()) == 1.0
+
+
+def _rect_top(y1, size=0.25, time=None):
+    """A unit-wide rect whose top face is at y1; the domain and its moving top tag."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, y1, size=size).domain(**({} if time is None else {"time": time}))
+    return d
+
+
+def _value_of(node, name, v):
+    (mc,) = [m for m in _walk(node) if type(m).__name__ == "ModelCall" and m.model._parameter_name == name][:1]
+    table = {mc.model.layer_id: eqx.tree_at(lambda q: q.value, mc.model.module, jnp.reshape(v, (1,)))}
+    return jnp.asarray(TraceEvaluator(table).evaluate(node, context={})).reshape(-1)
+
+
+def test_a_position_dependent_boundary_value_follows_the_moving_mesh():
+    """Laplace on a rect, u = 0 at y = 0 and u = 3 y on the moving top: u = 3 y exactly (P1 represents
+    it), so the hottest node is 3 * y1 at the MOVED top -- not at the reference one."""
+    y1 = _param("y1", 1.0)
+    d = _rect_top(y1)
+    u, v = d.fem_symbols()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(xt, yt) - 3.0 * yt])
+    node = fem.solve()
+    for yy in (1.0, 1.4, 0.7):
+        assert float(jnp.max(_value_of(node, "y1", yy))) == pytest.approx(3.0 * yy, rel=1e-10)
+
+
+def test_a_position_dependent_initial_condition_follows_the_moving_mesh():
+    """Heat on a rect, insulated, u(0) = y: the stretched transient at y1 = 1.5 equals the one on a mesh
+    BUILT at 1.5 (same cell counts along the stretch), node by node, sorted."""
+
+    def march(y1):
+        d = _rect_top(y1, size=0.25, time=(0.0, 0.05, 3))
+        u, v = d.fem_symbols()
+        x, y, t = d.variable("interior", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=x, y=y, t=t), v.bind(x=x, y=y)
+        return jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(ci[0], ci[1]) - ci[1]]).solve()
+
+    y1 = _param("y1", 1.0)
+    moved = np.sort(np.asarray(_value_of(march(y1), "y1", 1.5)))
+    rebuilt = np.sort(np.asarray(march(1.5)).reshape(-1))
+    if moved.size == rebuilt.size:
+        assert np.allclose(moved, rebuilt, rtol=0, atol=2e-2)
+    # the strong statement that does not depend on matching meshes: the INITIAL maximum is the moved top
+    assert float(np.max(moved)) > 1.0
+
+
+def test_a_path_that_does_not_follow_the_moving_mesh_refuses_by_name():
+    """An obstacle bound written in x is evaluated at the reference nodes: on a moving mesh it would
+    answer for the old shape, so it is refused rather than solved."""
+    y1 = _param("y1", 1.0)
+    d = _rect_top(y1, size=0.25)
+    u, v = d.fem_symbols()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    node = jno.fem([ui.x * vi.x + ui.y * vi.y + vi, u(xb, yb) - 0.0, u.bounds(-0.1 * (1.0 + y), None)]).solve()
+    with pytest.raises(NotImplementedError, match="REFERENCE node positions"):
+        _value_of(node, "y1", 1.0)  # the solve runs -- and its bound would be read at the old nodes

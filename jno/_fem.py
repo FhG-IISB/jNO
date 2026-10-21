@@ -1467,6 +1467,45 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
+#: set by the evaluation sites that hand ``_eval_value_node_at`` the MOVED node positions of a moving
+#: mesh (coordinate parameters); everywhere else a position-dependent value on a moving mesh is refused
+_FOLLOWS_MOVING_MESH = __import__("contextvars").ContextVar("jno_follows_moving_mesh", default=False)
+
+
+def _follows_moving_mesh():
+    """Context: the points handed to ``_eval_value_node_at`` inside are where the mesh is NOW."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        tok = _FOLLOWS_MOVING_MESH.set(True)
+        try:
+            yield
+        finally:
+            _FOLLOWS_MOVING_MESH.reset(tok)
+
+    return cm()
+
+
+def _refuse_stale_position(variables, where="a condition's value"):
+    """A position-dependent value on a mesh that coordinate parameters move, evaluated at the reference
+    node positions by a path that does not follow the motion, would answer for the old shape -- raise."""
+    if _FOLLOWS_MOVING_MESH.get():
+        return
+    for v in variables:
+        if getattr(v, "axis", "spatial") != "spatial":
+            continue
+        dom = getattr(v, "_domain", None)
+        if dom is not None and getattr(dom, "__dict__", {}).get("_trainable_coords"):
+            raise NotImplementedError(
+                f"jno.fem: {where} depends on position (it reads {getattr(v, 'tag', '?')!r}) on a mesh that "
+                "coordinate parameters move (`x.trainable()` or a parametric shape), and this path "
+                "evaluates it at the REFERENCE node positions -- it would not follow the design. Supported: "
+                "an essential (Dirichlet) value and an initial condition on a P1 field. Write this one "
+                "without the coordinates, or build the shape with numbers."
+            )
+
+
 def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
@@ -1486,6 +1525,7 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     from .trace_evaluator import TraceEvaluator
 
     variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    _refuse_stale_position(variables)
     temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
     if temporal and t is None:
         raise ValueError(
@@ -7262,6 +7302,12 @@ def _fem_impl(
     if getattr(domain, "dimension", None) == 1 and not is_vpinn:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
+        if getattr(domain, "_trainable_coords", None):
+            raise NotImplementedError(
+                "jno.fem: the 1-D assembler does not read coordinate parameters (`x.trainable()`), so it "
+                "would solve the reference mesh whatever the design. Moving a 1-D mesh is not supported yet."
+            )
+
         _order_1d = _infer_order(constraints)
         # ---- complex 1D: the same real-equivalent split the 2D/3D and non-nodal paths use ----
         # Every other `_is_complex_form` dispatch sits BELOW this branch, so before this a `1j` on a
@@ -8285,6 +8331,8 @@ def _assemble_second_order_time(
 ):
     r"""Reduce a linear second-order-in-time weak form to a first-order augmented block.
 
+    Assembled once, on the reference mesh: a moving mesh (coordinate parameters) is refused below.
+
     A second-order semidiscrete system :math:`M_2 \ddot u + C \dot u + K u = F` is rewritten with
     the velocity :math:`v = \dot u` as the first-order block
     :math:`M_\text{aug}\,\dot y + A_\text{aug}\,y = c_\text{aug}` in :math:`y = [u; v]`::
@@ -8324,6 +8372,12 @@ def _assemble_second_order_time(
     first-order system); runtime parameters on a *coupled* form (the parametric coupled steady
     assembly underneath does not exist yet).
     """
+    if getattr(domain, "_trainable_coords", None):
+        raise NotImplementedError(
+            "jno.fem: a second-order-in-time form (`u.tt`) is assembled once, on the reference mesh, so "
+            "coordinate parameters (`x.trainable()`, a parametric shape) would not move it -- it would solve "
+            "the old shape whatever the design. Not supported yet; a first-order (`u.t`) or steady form is."
+        )
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
     from .utils.solver.fem_utils import bcoo_set_dirichlet_rows, bcoo_zero_rows

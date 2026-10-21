@@ -114,6 +114,13 @@ What it does not do, up front:
   fillet): refused at the constructor. A fixed curved body between moving planes is stretched with them.
 - **A parametric line is not followed by the mesh.** Its vertices move a PEEC filament, not a meshed tube,
   so `jno.fem` refuses a domain whose meshed line has parametric vertices.
+- **What follows the moving mesh, and what refuses.** The assembly, coefficients written in `x`, surface
+  terms, normals, point loads, functionals and `.evolves` state readouts follow it; so do an essential
+  value `u(wall) - g(x)` and an initial condition `u(initial) - u0(x)` on a P1 field (re-evaluated at the
+  moved nodes). Every other place a position-dependent value is read at nodes (an obstacle bound
+  `u.bounds(psi(x))`, a time- AND position-dependent essential value, a higher-order field's value, the
+  1-D assembler, `u.tt` forms, the VPINN context) refuses by name rather than read the reference
+  positions. `fem.points` stays the reference coordinates.
 - **Only `jno.fem` and `jno.peec` follow yet.** `jno.fdm`, `jno.rcwa` and a `jno.core` loss that samples
   the domain's points (collocation) refuse a parametric domain by name.
 
