@@ -650,7 +650,18 @@ class SemidiscreteTimeBlock:
             # `(matvec, rhs, x0, diag_fn)`; only jNO's own composed step solver advertises that it can
             # also take the step scale, so only it is handed one.
             if getattr(linear_solve, "wants_scale", False):
-                return linear_solve(step_op, rhs, u, _diag, scale=th * dt)
+                kw = {}
+                if getattr(linear_solve, "direct", False):
+                    from .solver_api import _add_step_operator
+
+                    # A direct solver factors the step MATRIX, which only exists prebuilt for a constant
+                    # operator; with a runtime coefficient (`operator_fn`) build it here from this step's A.
+                    kw["operator"] = (
+                        _add_step_operator(M, A, a_scale)
+                        if jnp.ndim(a_scale) == 0
+                        else _add_step_operator(M, _row_scaled(A, w), dt)
+                    )
+                return linear_solve(step_op, rhs, u, _diag, scale=th * dt, **kw)
             return linear_solve(step_op, rhs, u, _diag)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
