@@ -110,3 +110,31 @@ def test_numbers_are_recognised_as_fractions_of_known_constants_only_when_exact(
     assert _number(0.3183, u, float32) == "0.3183"
     assert _number(0.9637, u, float32) == "0.9637"
     assert _number(3 * math.pi**2, a, float32) == "3*pi^2"
+
+
+def test_deep_core_info_is_one_expression_tree_with_shapes():
+    """``jno.info(crux, deep=True)``: every constraint as a tree in the same notation, sums flat, the network
+    as ``u = MLP(x, t)``, each node with its shape, a node used again pointing back with ``↑``."""
+    d, net, u, x, residual = _burgers()
+    net.optimizer(optax.adam(1e-3))
+    crux = jno.core([r.mse for r in residual], domain=d)
+    lines = [v for _, v in jno.info(crux, deep=True).sections[-1][1]]
+    assert jno.info(crux, deep=True).sections[-1][0] == "expression tree"
+    n = np.shape(crux.domain.context["interior"])[-2]
+    assert lines[0].startswith("[0] ∂u/∂t + u ∂u/∂x − 0.01 ∂²u/∂x²") and lines[0].endswith(f"({n}, 1) → mse → ()")
+    body = [ln.strip() for ln in lines[1:]]
+    assert any(b.startswith("├─ ∂u/∂t") for b in body)
+    assert any(b.startswith("└─ −0.01 ∂²u/∂x²") for b in body)  # a subtracted term is a sibling with its sign
+    assert any("u = MLP(x, t)" in b and b.endswith("↑") for b in body)
+
+
+def test_solve_no_longer_logs_constraint_shapes(monkeypatch):
+    """The shapes moved to ``jno.info(crux, deep=True)``; solve() used to log them, and trace every constraint
+    an extra time to do it, on every call."""
+    d, net, u, x, residual = _burgers()
+    net.optimizer(optax.adam(1e-3))
+    crux = jno.core([r.mse for r in residual], domain=d)
+    said = []
+    monkeypatch.setattr(crux.log, "info", lambda msg, *a, **k: said.append(str(msg)))
+    crux.solve(2)
+    assert not any("Shape =" in m for m in said), [m for m in said if "Shape" in m]

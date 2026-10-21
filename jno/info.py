@@ -40,13 +40,17 @@ _RULE = "─"
 MAX_ROWS = 24
 
 
+_UNCAPPED = {"expression tree"}
+
+
 class Info:
     """A printable report. ``str(...)`` renders it; :meth:`as_dict` returns the same content."""
 
     def __init__(self, title: str, sections: list[tuple[str, list[tuple[str, Any]]]], *, cap: int | None = None):
         self.title = title
         cap = MAX_ROWS if cap is None else cap
-        self.sections = [(name, self._cap(rows, cap)) for name, rows in sections]
+        # a tree is shown whole: cut, it no longer says what the expression is
+        self.sections = [(name, rows if name in _UNCAPPED else self._cap(rows, cap)) for name, rows in sections]
 
     @staticmethod
     def _cap(rows, cap: int):
@@ -103,6 +107,102 @@ def _equation_rows(exprs, labels=None, measures=None) -> list:
         key = labels[i] if labels is not None and i < len(labels) else f"[{i}]"
         rows.append((key, eq + (f"   ({loss})" if loss else "")))
     return rows + where_rows(defs, names)
+
+
+def _parameter_rows(flax_mods: dict, models: dict) -> list:
+    """What training will do with each model's parameters -- the summary ``solve()`` logs, from the same rule
+    (``core._trainable_filter``): per model its policy and trainable / frozen / LoRA counts, then the totals.
+    LoRA adapters do not exist before ``solve()`` adds them; they are counted on a copy."""
+    import jax
+
+    from .architectures.lora import apply_lora
+    from .core import _parameter_counts, _trainable_filter
+
+    models = dict(models)
+    lora_counts = {}
+    for lid, fm in flax_mods.items():
+        if getattr(fm, "_lora_config", None) is not None and lid in models:
+            size = lambda t: sum(int(x.size) for x in jax.tree_util.tree_leaves(t) if hasattr(x, "size"))  # noqa: E731
+            before = size(models[lid])
+            models[lid] = apply_lora(
+                models[lid],
+                key=jax.random.PRNGKey(0),
+                specs=fm._lora_config,
+                param_mask=getattr(fm, "_lora_param_mask", None),
+            )
+            lora_counts[lid] = size(models[lid]) - before
+    counts = _parameter_counts(models, _trainable_filter(models, flax_mods), flax_mods, lora_counts)
+    rows = []
+    for name, policy, train, frozen, lora in counts:
+        rows.append(
+            (
+                f"[{name}]",
+                f"{policy} · {_fmt_n(train)} trainable · {_fmt_n(frozen)} frozen"
+                + (f" · {_fmt_n(lora)} LoRA" if lora else ""),
+            )
+        )
+    if len(counts) > 1:
+        tr, fr, lo = (sum(c[k] for c in counts) for k in (2, 3, 4))
+        rows.append(
+            (
+                "total",
+                f"{_fmt_n(tr)} trainable · {_fmt_n(fr)} frozen · {_fmt_n(tr + fr)} total"
+                + (f" (LoRA {_fmt_n(lo)})" if lo else ""),
+            )
+        )
+    try:
+        import paramax
+
+        wrapped = any(
+            isinstance(leaf, paramax.AbstractUnwrappable)
+            for m in models.values()
+            for leaf in jax.tree_util.tree_leaves(m, is_leaf=lambda x: isinstance(x, paramax.AbstractUnwrappable))
+        )
+        if wrapped:
+            rows.append(("paramax", "parametrised arrays (paramax wrappers) are unwrapped before each forward evaluation"))
+    except ImportError:
+        pass
+    return rows
+
+
+def _expression_tree_rows(c) -> list:
+    """Every constraint of a core as a tree in mathematical notation, each node with its shape.
+
+    The shapes come from one abstract evaluation (``jax.eval_shape``: nothing is computed) on the context the
+    training step sees; a node only evaluated inside a derivative pass has no batched shape and says so."""
+    import jax
+
+    from .trace import FunctionCall
+    from .trace.pretty import _fn_name, field_names, tree
+    from .trace_evaluator import TraceEvaluator
+
+    exprs = [getattr(e, "_expr", e) for e in (getattr(c, "constraints", None) or [])]
+    names, _ = field_names(exprs)
+    ctx = c._build_shape_context(min_consecutive=1)
+    evaluator = TraceEvaluator(c._unwrapped_models)
+    shapes: dict = {}
+    dispatch = evaluator._dispatch  # every node passes here, however its value is obtained (memo, shared pass)
+
+    def recording(node, ectx):
+        out = dispatch(node, ectx)
+        if ectx.context is ctx and hasattr(out, "shape"):
+            shapes.setdefault(id(node), str(tuple(out.shape)))
+        return out
+
+    evaluator._dispatch = recording
+    rows = []
+    for i, e in enumerate(exprs):
+        try:
+            jax.eval_shape(lambda e=e: evaluator.evaluate(e, ctx, {}, jax.random.PRNGKey(0)))
+        except Exception as err:  # noqa: BLE001
+            rows.append(("", f"[{i}] shapes unavailable ({type(err).__name__}: {err})"))
+        root, loss = e, ""
+        if isinstance(e, FunctionCall) and _fn_name(e) in ("mse", "mae"):
+            root, loss = e.args[0], f" → {_fn_name(e)} → {shapes.get(id(e), '()')}"
+        lines = tree(root, names, shapes)
+        lines[0] = f"[{i}] {lines[0]}{loss}"
+        rows += [("", ("    " if k else "") + ln) for k, ln in enumerate(lines)]
+    return rows
 
 
 def _bytes(n: float) -> str:
@@ -808,15 +908,18 @@ def _info_core(c, deep: bool) -> Info:
             coupling = [("method", f"undetermined ({type(e).__name__}: {e})")]
         sections = [("models", models), ("subdomain solves", cons), ("coupling", coupling), ("training", training)]
     else:
-        sections = [("models", models), ("equations", cons), ("training", training)]
+        try:
+            params = _parameter_rows(c._collect_flax_modules() or {}, getattr(c, "models", None) or {})
+        except Exception as e:  # noqa: BLE001
+            params = [("", f"unavailable ({type(e).__name__}: {e})")]
+        sections = [("models", models), ("parameters", params), ("equations", cons), ("training", training)]
     if deep:
         # What `core.print_tree()` and `core.print_shapes()` used to print. They were two more
         # spellings to know about; as text builders they become sections of the one report.
-        for label, fn in (("computation tree", "_tree_text"), ("tensor shapes", "_shapes_text")):
-            try:
-                sections.append((label, [("", line) for line in str(getattr(c, fn)()).splitlines() if line.strip()]))
-            except Exception as e:  # noqa: BLE001
-                sections.append((label, [("", f"unavailable ({type(e).__name__}: {e})")]))
+        try:
+            sections.append(("expression tree", _expression_tree_rows(c)))
+        except Exception as e:  # noqa: BLE001
+            sections.append(("expression tree", [("", f"unavailable ({type(e).__name__}: {e})")]))
     return Info("core", sections)
 
 
@@ -1024,6 +1127,11 @@ def _info_model(m, deep: bool) -> Info:
         rows.append(("frozen", "yes — excluded from the optimizer"))
 
     sections = [("", rows)]
+    if mod is not None:
+        try:
+            sections.append(("parameters", _parameter_rows({0: m}, {0: mod})))
+        except Exception as e:  # noqa: BLE001
+            sections.append(("parameters", [("", f"unavailable ({type(e).__name__}: {e})")]))
     inference: list = []
     for cfg_name, cfg in (("bayesian", getattr(m, "_bayesian_cfg", None)), ("vi", getattr(m, "_vi_cfg", None))):
         if not cfg:

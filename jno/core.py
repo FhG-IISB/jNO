@@ -56,13 +56,12 @@ from .trace import (
     collect_operations,
     collect_tags,
     cse,
-    dump_tree,
     fuse_laplacian,
     get_primary_tag,
     refuse_point_index,
 )
 from .trace_compiler import TraceCompiler
-from .trace_evaluator import TraceEvaluator, mark_pointwise_targets
+from .trace_evaluator import mark_pointwise_targets
 from .tuner import ArchSpace, DeviceConfig, Tuner
 from .utils import (
     LearningRateSchedule,
@@ -580,6 +579,79 @@ def _raise_if_step_not_finite(epoch, total_loss, losses, grads, jac=None):
         )
 
 
+def _trainable_filter(models, flax_mods):
+    """``{layer_id: filter}``: which arrays of each model train, from its ``Model`` state (frozen, LoRA, a
+    parameter mask). Shared by ``core.solve`` and ``jno.info``, so the report says what training does."""
+    filter_spec = {}
+    for lid, model in models.items():
+        fm = flax_mods.get(lid)
+        if fm is not None and fm._lora_config is not None:
+            # LoRA modes:
+            # 1) fm._frozen=True  -> freeze everything; only LoRA adapters trainable.
+            #    (freeze().lora() or freeze().mask(M).lora() both land here — base
+            #    params outside LoRA-wrapped layers are frozen too.)
+            # 2) otherwise        -> partial LoRA: adapters trainable, wrapped bases
+            #    frozen, every other param stays trainable (mask(M).lora() case).
+            if fm._frozen:
+                filter_spec[lid] = _lora_trainable_filter(model)
+            else:
+                filter_spec[lid] = _partial_lora_trainable_filter(model)
+        elif fm is not None and fm._frozen:
+            # Whole model frozen – no arrays trainable
+            filter_spec[lid] = jax.tree_util.tree_map(lambda leaf: False, model)
+        elif fm is not None and fm._trainable_param_mask is not None:
+            # Partial mask — only leaves marked True in the mask are trained.
+            # Non-array leaves (e.g. activation functions kept as module
+            # attributes) are always False so equinox does not misinterpret
+            # them as sub-filter callables.
+            filter_spec[lid] = jax.tree_util.tree_map(
+                # Only train floating/complex arrays; integer/bool arrays
+                # (e.g. RNG/state tensors in wrapped modules) must stay frozen.
+                lambda arr, m: bool(m) if eqx.is_inexact_array(arr) else False,
+                model,
+                fm._trainable_param_mask,
+            )
+        else:
+            # Normal – every array trainable, non-arrays (e.g. activation
+            # functions stored as attributes) must be False, not the
+            # original value — equinox interprets callables in the
+            # filter spec as sub-filters.
+            filter_spec[lid] = jax.tree_util.tree_map(
+                # Gradients are defined only for inexact dtypes.
+                lambda leaf: True if eqx.is_inexact_array(leaf) else False,
+                model,
+            )
+    return filter_spec
+
+
+def _parameter_counts(models, filter_spec, flax_mods, lora_counts):
+    """``[(name, policy, trainable, frozen, lora)]`` per model, from :func:`_trainable_filter`."""
+    rows = []
+    for lid, model in models.items():
+        fm = flax_mods.get(lid)
+        if fm is None:
+            continue
+        mname = fm.name or type(fm.module).__name__
+        m_total = sum(param.size for param in jax.tree_util.tree_leaves(model) if eqx.is_array(param))
+        fspec = filter_spec.get(lid)
+        if fspec is not None:
+            m_train = sum(
+                param.size
+                for param, f in zip(
+                    jax.tree_util.tree_leaves(model),
+                    jax.tree_util.tree_leaves(fspec),
+                )
+                if eqx.is_array(param) and f is True
+            )
+        else:
+            m_train = m_total
+        policy = "LoRA" if fm._lora_config else ("frozen" if fm._frozen else "full fine-tune")
+        if fm._trainable_param_mask is not None and fm._lora_config:
+            policy = "LoRA + partial base"
+        rows.append((mname, policy, m_train, m_total - m_train, lora_counts.get(lid, 0)))
+    return rows
+
+
 class core:
     """core solver using traced operations."""
 
@@ -820,22 +892,6 @@ class core:
             return x
 
         return jax.tree_util.tree_map(shard_leaf, params)
-
-    def _shape_probe_context(self) -> Dict:
-        """The full context with lazy handles replaced by zeros of the same shape and dtype.
-
-        Shape logging and trace printing run `jax.eval_shape` over the WHOLE context, which a lazy
-        handle cannot satisfy -- it is not an array and `jnp.asarray` on it raises deep inside JAX.
-        Only the shapes matter to those callers, so a zero stand-in is exact for their purpose and
-        still never reads the source.
-        """
-        ctx = self.domain_data.context
-        if not any(_is_lazy_source(v) for v in ctx.values()):
-            return ctx
-        return {
-            k: (jnp.zeros(tuple(v.shape), dtype=getattr(v, "dtype", jnp.float32)) if _is_lazy_source(v) else v)
-            for k, v in ctx.items()
-        }
 
     def _host_batch(self, host_context: Dict, indices) -> Dict:
         """One mini-batch gathered on the host and moved to device — the single slice path.
@@ -2000,32 +2056,6 @@ class core:
 
         return apply_fn
 
-    def _tree_text(self) -> str:
-        """Print the computation tree for every constraint and tracker.
-
-        Call this **after** constructing the ``core`` object (which calls
-        ``compile`` internally) so that ``self.constraints`` is populated.
-
-        Args:
-            file: Optional path.  When given the tree is written to that
-        Text builder behind ``jno.info(crux, deep=True)``; not a public entry of its own.
-        """
-        constraints = self.wrap_constraints(self.constraints)
-        parts: list[str] = []
-        for i, expr in enumerate(constraints):
-            if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
-                parts.append(f"=== Tracker {i} ===")
-                parts.append(dump_tree(expr))
-            elif isinstance(expr, Tracker):
-                parts.append(f"=== Tracker {i} ===")
-                parts.append(dump_tree(expr))
-            else:
-                parts.append(f"=== Constraint {i} ===")
-                parts.append(dump_tree(expr))
-            parts.append("")
-
-        return "\n".join(parts)
-
     def compile(self, mesh: Optional[Tuple[int, ...]] = (1, 1)):
         # === Parallelism ===
         self._setup_parallelism(mesh)
@@ -2690,45 +2720,7 @@ class core:
                     self.log.warning(f"LoRA: No layers were adapted for model {lid}! LoRA has NO EFFECT on this model.")
 
         # ── 3. Build trainable filter ──
-        filter_spec = {}
-        for lid, model in models.items():
-            fm = flax_mods.get(lid)
-            if fm is not None and fm._lora_config is not None:
-                # LoRA modes:
-                # 1) fm._frozen=True  -> freeze everything; only LoRA adapters trainable.
-                #    (freeze().lora() or freeze().mask(M).lora() both land here — base
-                #    params outside LoRA-wrapped layers are frozen too.)
-                # 2) otherwise        -> partial LoRA: adapters trainable, wrapped bases
-                #    frozen, every other param stays trainable (mask(M).lora() case).
-                if fm._frozen:
-                    filter_spec[lid] = _lora_trainable_filter(model)
-                else:
-                    filter_spec[lid] = _partial_lora_trainable_filter(model)
-            elif fm is not None and fm._frozen:
-                # Whole model frozen – no arrays trainable
-                filter_spec[lid] = jax.tree_util.tree_map(lambda leaf: False, model)
-            elif fm is not None and fm._trainable_param_mask is not None:
-                # Partial mask — only leaves marked True in the mask are trained.
-                # Non-array leaves (e.g. activation functions kept as module
-                # attributes) are always False so equinox does not misinterpret
-                # them as sub-filter callables.
-                filter_spec[lid] = jax.tree_util.tree_map(
-                    # Only train floating/complex arrays; integer/bool arrays
-                    # (e.g. RNG/state tensors in wrapped modules) must stay frozen.
-                    lambda arr, m: bool(m) if eqx.is_inexact_array(arr) else False,
-                    model,
-                    fm._trainable_param_mask,
-                )
-            else:
-                # Normal – every array trainable, non-arrays (e.g. activation
-                # functions stored as attributes) must be False, not the
-                # original value — equinox interprets callables in the
-                # filter spec as sub-filters.
-                filter_spec[lid] = jax.tree_util.tree_map(
-                    # Gradients are defined only for inexact dtypes.
-                    lambda leaf: True if eqx.is_inexact_array(leaf) else False,
-                    model,
-                )
+        filter_spec = _trainable_filter(models, flax_mods)
 
         # ── 4. Three-way partition ──
         trainable, rest = eqx.partition(models, filter_spec)
@@ -2757,29 +2749,9 @@ class core:
             self.log.info(f"    LoRA % of total:       {100.0 * n_lora_params_total / n_total_params:>11.2f}%")
 
         # ── Per-model policy report ──
-        for lid, model in models.items():
-            fm = flax_mods.get(lid)
-            if fm is None:
-                continue
-            mname = fm.name or type(fm.module).__name__
-            m_total = sum(param.size for param in jax.tree_util.tree_leaves(model) if eqx.is_array(param))
-            fspec = filter_spec.get(lid)
-            if fspec is not None:
-                m_train = sum(
-                    param.size
-                    for param, f in zip(
-                        jax.tree_util.tree_leaves(model),
-                        jax.tree_util.tree_leaves(fspec),
-                    )
-                    if eqx.is_array(param) and f is True
-                )
-            else:
-                m_train = m_total
-            m_frozen = m_total - m_train
-            m_lora = lora_param_counts.get(lid, 0)
-            policy = "LoRA" if fm._lora_config else ("frozen" if fm._frozen else "full fine-tune")
-            if fm._trainable_param_mask is not None and fm._lora_config:
-                policy = "LoRA + partial base"
+        for mname, policy, m_train, m_frozen, m_lora in _parameter_counts(
+            models, filter_spec, flax_mods, lora_param_counts
+        ):
             self.log.info(f"    [{mname}] policy={policy}  train={m_train:,}  frozen={m_frozen:,}  lora={m_lora:,}")
 
         # Shard trainable params
@@ -3285,8 +3257,6 @@ class core:
                 ),
                 state,
             )
-
-        self._log_constraint_shapes(batchsize, min_consecutive=min_consecutive)
 
         # ── 5b. Resume from checkpoint (optional) ──
         if self._resume_from is not None:
@@ -5332,114 +5302,6 @@ class core:
             "path, which reads the module at solve time."
         )
 
-    def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
-        """Log the output shape of each constraint by doing a test evaluation.
-
-        When the log level is DEBUG, prints a full shape-annotated tree
-        for each constraint so users can see how shapes evolve through
-        every node of the expression.
-        """
-
-        # Create dummy inputs for shape inference
-        test_rng = jax.random.PRNGKey(0)
-
-        # Use jax.eval_shape to get output shape without computation
-        _models = self._unwrapped_models
-        out_shape = jax.eval_shape(
-            lambda: self.compiled_constraints_fn(
-                _models,
-                self._shape_probe_context(),
-                batchsize=batchsize,
-                key=test_rng,
-                min_consecutive=min_consecutive,
-            )
-        )
-
-        # For each constraint, also get the shape *before* the final
-        # reduction (e.g. .mse) so the log shows the residual geometry.
-        # Constraints are stored as OperationDef(inner_expr); unwrap first.
-        constraint_exprs = getattr(self, "_constraint_exprs", [])
-
-        def _unwrap(expr):
-            """Unwrap OperationDef to get the inner expression."""
-            inner = expr.expr if isinstance(expr, OperationDef) else expr
-            if isinstance(inner, FunctionCall):
-                return inner.args[0], inner._name
-            return inner, None
-
-        parent_exprs = [_unwrap(expr) for expr in constraint_exprs]
-        # Only compile the parent layer if at least one expr has a parent
-        if any(name is not None for _, name in parent_exprs):
-            parent_fn = TraceCompiler.compile_multi_expression([e for e, _ in parent_exprs], self.all_ops)
-            parent_shape = jax.eval_shape(
-                lambda: parent_fn(
-                    _models,
-                    self._shape_probe_context(),
-                    batchsize=batchsize,
-                    key=test_rng,
-                    min_consecutive=min_consecutive,
-                )
-            )
-        else:
-            parent_shape = [None] * len(out_shape)
-
-        for i, (const, (_, op_name)) in enumerate(zip(out_shape, parent_exprs)):
-            p_shape = parent_shape[i]
-            if op_name is not None and p_shape is not None:
-                self.log.info(f"Constraint {i}: Shape = {p_shape.shape} → .{op_name}() → {const.shape}")
-            else:
-                self.log.info(f"Constraint {i}: Shape = {const.shape}")
-
-        for i, (_, fn) in enumerate(self.compiled_trackers):
-            # Use jax.eval_shape to get output shape without computation
-            out_shape = jax.eval_shape(
-                lambda: fn(
-                    _models,
-                    self._shape_probe_context(),
-                    batchsize=batchsize,
-                    key=test_rng,
-                    min_consecutive=min_consecutive,
-                )
-            )
-
-            # Also get the pre-reduction shape for tracker expressions
-            tracker_exprs = getattr(self, "_tracker_exprs", [])
-            tracker_expr = tracker_exprs[i] if i < len(tracker_exprs) else None
-            # Trackers may also be wrapped in OperationDef
-            if tracker_expr is not None and isinstance(tracker_expr, OperationDef):
-                tracker_expr = tracker_expr.expr
-            if tracker_expr is not None and isinstance(tracker_expr, FunctionCall):
-                t_parent_fn = TraceCompiler.compile_multi_expression([tracker_expr.args[0]], self.all_ops)
-                t_parent_shape = jax.eval_shape(
-                    lambda: t_parent_fn(
-                        _models,
-                        self._shape_probe_context(),
-                        batchsize=batchsize,
-                        key=test_rng,
-                        min_consecutive=min_consecutive,
-                    )
-                )
-                t_shape = t_parent_shape[0]
-                op_name = tracker_expr._name
-            else:
-                t_shape = None
-                op_name = None
-
-            if not isinstance(out_shape, tuple):
-                if t_shape is not None:
-                    self.log.info(f"Tracker {i}: Shape = {t_shape.shape} → .{op_name}() → {out_shape.shape}")
-                else:
-                    self.log.info(f"Tracker {i}: Shape = {out_shape.shape}")
-            else:
-                self.log.info(f"Tracker {i}: {out_shape}")
-
-        # === Detailed shape trace (logged at DEBUG level) ===
-        is_enabled_for = getattr(self.log, "isEnabledFor", None)
-        if callable(is_enabled_for) and bool(is_enabled_for(10)):
-            self._log_shape_traces(min_consecutive=min_consecutive)
-
-        return None
-
     def _build_shape_context(self, min_consecutive: Optional[int] = 1) -> dict:
         """Build a single-sample runtime context for shape tracing.
 
@@ -5485,60 +5347,6 @@ class core:
             else:
                 ctx_single[tag] = arr
         return ctx_single
-
-    def _log_shape_traces(self, min_consecutive: Optional[int] = 1):
-        """Emit per-node shape trees for constraints and trackers.
-
-        Called automatically when log level is DEBUG, and by ``jno.info(crux, deep=True)``.
-        """
-        ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
-        evaluator = TraceEvaluator(self._unwrapped_models)
-
-        all_exprs = getattr(self, "_constraint_exprs", [])
-        all_tracker_exprs = getattr(self, "_tracker_exprs", [])
-
-        for i, expr in enumerate(all_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                self.log.debug(f"Constraint {i} shape trace:\n{tree}")
-            except Exception as exc:
-                self.log.debug(f"Constraint {i} shape trace failed: {exc}")
-
-        for i, expr in enumerate(all_tracker_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                self.log.debug(f"Tracker {i} shape trace:\n{tree}")
-            except Exception as exc:
-                self.log.debug(f"Tracker {i} shape trace failed: {exc}")
-
-    def _shapes_text(self, min_consecutive: Optional[int] = 1) -> str:
-        """Print shape-annotated expression trees to stdout.
-
-        Can be called any time after ``compile()`` or ``solve()`` has run. Reachable as
-        ``print(jno.info(crux, deep=True))`` -- useful for troubleshooting shape mismatches.
-        """
-        _out: list[str] = []
-        ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
-        evaluator = TraceEvaluator(self._unwrapped_models)
-
-        all_exprs = getattr(self, "_constraint_exprs", [])
-        all_tracker_exprs = getattr(self, "_tracker_exprs", [])
-
-        for i, expr in enumerate(all_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                _out += [f"═══ Constraint {i} ═══", str(tree)]
-            except Exception as exc:
-                _out.append(f"═══ Constraint {i} ═══  FAILED: {exc}")
-
-        for i, expr in enumerate(all_tracker_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                _out += [f"═══ Tracker {i} ═══", str(tree)]
-            except Exception as exc:
-                _out.append(f"═══ Tracker {i} ═══  FAILED: {exc}")
-
-        return "\n".join(_out)
 
     def sweep(
         self,

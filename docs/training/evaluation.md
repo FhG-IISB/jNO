@@ -26,15 +26,36 @@ pred = crux.predict(points=points, operation=u, context=test_domain.context)
 
 ### Inspect the core — `jno.info`
 
-One entry for everything about a built object: models and their parameter counts, the constraints,
-the optimizer, and — with `deep=True` — the computation tree and the per-node shape trace.
+One entry for everything about a built object: models, what training does with their parameters
+(trainable / frozen / LoRA), the equations in mathematical notation, the optimizer, and — with
+`deep=True` — every constraint as an expression tree with the shape of each node.
 
 ```python
-print(jno.info(crux))                        # models, constraints, optimizer
-print(jno.info(crux, deep=True))             # + computation tree + tensor shapes
+print(jno.info(crux))                        # models, parameters, equations, optimizer
+print(jno.info(crux, deep=True))             # + the expression tree with shapes
 
 open("tree.txt", "w").write(str(jno.info(crux, deep=True)))   # to a file
 ```
+
+For the Burgers equation the tree reads
+
+```
+  expression tree
+      [0] ∂u/∂t + u ∂u/∂x − 0.01/π ∂²u/∂x²         (10000, 1) → mse → ()
+          ├─ ∂u/∂t                                 (10000, 1)
+          │  └─ u = MLP(x, t)                      (10000, 1)
+          ├─ u ∂u/∂x                               (10000, 1)
+          │  ├─ u = MLP(x, t)                      (10000, 1)  ↑
+          │  └─ ∂u/∂x                              (10000, 1)
+          │     └─ u = MLP(x, t)                   (10000, 1)  ↑
+          └─ −0.01/π ∂²u/∂x²                       (10000, 1)
+             └─ ∂²u/∂x²                            (10000, 1)
+                └─ u = MLP(x, t)                   (10000, 1)  ↑
+```
+
+A sum's terms are siblings, each with its sign; `↑` marks a node already expanded above. The shapes come
+from one abstract evaluation (`jax.eval_shape`), so nothing is computed; a node evaluated only inside a
+derivative pass, one point at a time, is marked `per point`.
 
 `jno.info` takes any jNO object — a `domain`, a `jno.fem` form, a `jno.fdm` or `jno.rcwa` solver,
 a `core`, or a `jno.solve` / `jno.precond` spec — and `Info.as_dict()` returns the same content as

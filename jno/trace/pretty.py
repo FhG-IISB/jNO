@@ -645,3 +645,93 @@ def where_rows(defs, names, *, ascii_only=None):
             r.defining = None
         rows.append(("where" if not rows else "", f"{lhs} = {text}"))
     return rows
+
+
+def _terms(n, T, op_set):
+    """The operands of a chain of ``op_set`` operations (``a + b − c`` -> a, b, −c), with the sign each
+    enters with; a chain is flattened so a sum of five terms is five siblings, not four nested levels."""
+    if isinstance(n, T["BinaryOp"]) and n.op in op_set:
+        left = _terms(n.left, T, op_set)
+        right = _terms(n.right, T, op_set)
+        if n.op == "-":
+            right = [(c, not neg) for c, neg in right]
+        return left + right
+    return [(n, False)]
+
+
+def _shown_children(n, T):
+    """``[(child, negated)]`` a tree shows: sums and products flattened, derivative chains collapsed to the
+    field they differentiate, wrappers looked through, and literals and coordinates (visible in their
+    parent's label) left out."""
+    deriv = (T["Jacobian"], T["Hessian"], T["TemporalDerivative"])
+    skip = (T["Literal"], T["Constant"], T["Variable"])
+    if isinstance(n, deriv):  # ∂²u/∂x∂t is one node over u
+        base = n.target
+        while isinstance(base, deriv):
+            base = base.target
+        return [] if isinstance(base, skip) else [(base, False)]
+    if isinstance(n, T["BinaryOp"]) and n.op in ("+", "-"):
+        kids = _terms(n, T, ("+", "-"))
+    elif isinstance(n, T["BinaryOp"]) and n.op == "*":
+        kids = _terms(n, T, ("*",))
+    else:
+        kids = [(c, False) for c in _children(n, T)]
+    out = []
+    for c, neg in kids:
+        if isinstance(c, skip):
+            continue
+        if isinstance(c, (T["OperationDef"], T["Tracker"])):
+            out += _shown_children(c, T)
+            continue
+        out.append((c, neg))
+    return out
+
+
+def tree(expr, names, shapes, *, ascii_only=None, width=58) -> list:
+    """``expr`` as an indented tree, one node per line in mathematical notation with its shape.
+
+    ``shapes`` maps ``id(node)`` to a shape string; a node without one is evaluated only inside a derivative
+    pass (``per point``). A node shared by several terms is expanded once; later uses point back (``↑``).
+    """
+    st = _Style(not unicode_ok() if ascii_only is None else ascii_only)
+    T = _node_types()
+    r = _Renderer(names, st)
+    tee, last, bar, gap = ("├─ ", "└─ ", "│  ", "   ") if not st.ascii else ("|- ", "`- ", "|  ", "   ")
+    up = "↑" if not st.ascii else "^"
+    lines, done = [], set()
+
+    def label(n):
+        r.defining = n  # the node in full here, not by the name it may carry
+        try:
+            text = r(n)
+        except Exception as err:  # noqa: BLE001
+            text = f"{type(n).__name__} ({type(err).__name__})"
+        finally:
+            r.defining = None
+        named = names.get(("node", id(n)))
+        if named:
+            text = f"{named} = {text}"
+        elif isinstance(n, T["ModelCall"]):  # the network itself: u = MLP(x, y)
+            sym = names.get(("model", id(n.model)))
+            call = f"{names.get(('label', id(n.model)), 'net')}({', '.join(r(a) for a in n.args)})"
+            text = f"{r._sub_symbol(sym)} = {call}" if sym else call
+        return text if len(text) <= width else text[: width - 1] + "…"
+
+    def visit(n, prefix, is_last, top=False, negated=False):
+        branch = "" if top else (last if is_last else tee)
+        shape = shapes.get(id(n), "per point")
+        seen = id(n) in done
+        text = (st.minus if negated else "") + label(n)
+        lines.append(
+            f"{prefix}{branch}{text.ljust(max(width - len(prefix) - len(branch), 0))}  {shape}{f'  {up}' if seen else ''}"
+        )
+        if seen:
+            return
+        done.add(id(n))
+        kids = _shown_children(n, T)
+        child_prefix = prefix + ("" if top else (gap if is_last else bar))
+        for i, (c, neg) in enumerate(kids):
+            visit(c, child_prefix, i == len(kids) - 1, negated=neg)
+
+    visit(expr, "", True, top=True)
+    return lines
