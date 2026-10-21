@@ -694,19 +694,44 @@ per-region values compose for free, calibrated through `crux`. Each target must 
 (`from_regions`), a `domain.tag`, or a mesh-file region. It desugars to `sum_r RegionMask(r)·value_r`,
 inheriting the centroid classification.
 
+**Changing a value after `jno.fem` is built.** `d.<name>` reads plain values (numbers, arrays) from the
+domain when the terms are assembled, so a later `attach` reaches an existing `fem`: its next `solve()`
+re-assembles and says so in the log (`jno.fem: re-assembled, since domain.attach changed 'q' ...`). The
+mesh, and anything built on it such as an enclosure's view factors, is not rebuilt.
+
+```python
+fem = jno.fem([d.k * (ui.x*vi.x + ui.y*vi.y) - d.Q * vi, u(xb, yb) - 0.0])
+T1 = fem.solve()
+d.attach("core", Q=2.0e6)                             # a plain number: watched
+T2 = fem.solve()                                      # re-assembled with the new Q
+```
+
+A value that is itself an expression (a function of position, a `jno.fn`, a trainable parameter) is
+captured when the term is written, so re-attaching one raises at the next solve; build a new `jno.fem`
+after such a change. `d.attached(name)` returns the values as a plain mapping at the moment it is called
+and is not watched.
+
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
 
 ### `domain.mask` — a field's values on one region
 
-`d.mask(name)` is a boolean mask over the mesh nodes: every node of the region's cells, read
-from the mesh's own cell labels. Use it to evaluate a solution on one part:
+`d.mask(name)` is a boolean mask over the mesh nodes (`d.mesh.points`): every node of the region's
+cells, read from the mesh's own cell labels. Use it to evaluate a solution on one part:
 
 ```python
-T = fem.solve()
+T = fem.solve()                       # a P1 scalar field: one value per mesh node
 core = d.mask("core")
 T[core].mean(), T[core].max()
 ```
+
+The mask has one entry per mesh node, so it lines up with a solution that has one value per mesh node.
+For other fields, index the part that does:
+
+- **a vector field** (`value_shape=(n,)`): the solution is interleaved per node, `T.reshape(-1, n)[core]`;
+- **P2 and above** on a straight-sided mesh: the solution lists the mesh nodes first and then the added
+  mid-side nodes, so `T[: len(core)][core]` gives the values at the region's vertices. For every DOF of the
+  region, select on `fem.points` (the coordinates the DOFs live on) instead.
 
 A node on an interface belongs to both regions, and on a curved mesh the mid-side nodes are included.
 It works for the parts of a `jno.shape` plan and for the named volumes of a loaded mesh, and raises

@@ -129,6 +129,75 @@ def mma(
     )
 
 
+class GCMMAOptimizer(MMAOptimizer):
+    """Sentinel for :func:`gcmma`: MMA's, plus the inner-iteration budget. See :func:`gcmma`."""
+
+    def __init__(self, *, max_inner: int = 10, **kw):
+        super().__init__(**kw)
+        self.max_inner = int(max_inner)
+
+    def __repr__(self):
+        return f"GCMMAOptimizer(move={self.move}, bounds=({self.lower}, {self.upper}), max_inner={self.max_inner})"
+
+
+def gcmma(
+    *,
+    move: float = 0.2,
+    lower: Optional[float] = None,
+    upper: Optional[float] = None,
+    max_inner: int = 10,
+    asy_init: float = 0.5,
+    asy_shrink: float = 0.7,
+    asy_grow: float = 1.2,
+    dual_iters: int = 400,
+    move_gamma: float = 1.0,
+    move_min: float = 0.0,
+) -> GCMMAOptimizer:
+    """Globally convergent MMA: like :func:`mma`, but every step is feasible and lowers the objective.
+
+    Plain MMA takes the minimiser of its convex approximation as the next design. When a constraint
+    curves more sharply than the approximation (a stress or distortion measure, a p-norm), that
+    step can land infeasible, and the run oscillates about the constraint. GCMMA evaluates the
+    objective and the constraints at the trial point and, for each function the approximation
+    underestimated there, makes that approximation more convex and solves again from the same
+    design. From a feasible start every accepted design is then feasible and the objective never
+    rises (Svanberg 2002), which also makes the run converge to a KKT point rather than chatter.
+
+    The price is one extra evaluation of the objective and constraint VALUES per re-solve (no
+    gradients), typically zero to a few per step. Use it like :func:`mma`, with
+    :func:`jno.le` / :func:`jno.ge` in the ``jno.core`` list::
+
+        rho.optimizer(jno.optimizers.gcmma(move=0.2, lower=1e-3, upper=1.0))
+        jno.core([compliance, jno.le(vol_frac, 0.4)]).solve(200)
+
+    Args:
+        max_inner: Most re-solves per step. When it runs out, the last trial point is accepted as
+            it is (as in Svanberg's code) and is not guaranteed feasible; the solve logs a warning
+            the first time and a count at the end.
+        move, lower, upper, asy_init, asy_shrink, asy_grow, dual_iters, move_gamma, move_min:
+            as for :func:`mma`. There is no ``raa``: GCMMA sets that term itself, per function.
+
+    Every design variable in one ``jno.core`` must use the same one of ``mma`` and ``gcmma``: they
+    share a single subproblem.
+
+    References:
+        Svanberg, *A class of globally convergent optimization methods based on conservative convex
+        separable approximations*, SIAM Journal on Optimization **12**(2), 2002, 555-573.
+    """
+    return GCMMAOptimizer(
+        move=move,
+        lower=lower,
+        upper=upper,
+        max_inner=max_inner,
+        asy_init=asy_init,
+        asy_shrink=asy_shrink,
+        asy_grow=asy_grow,
+        dual_iters=dual_iters,
+        move_gamma=move_gamma,
+        move_min=move_min,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The subproblem
 # ---------------------------------------------------------------------------
@@ -174,7 +243,7 @@ def _primal(lam, p0, q0, P, Q, low, upp, alpha, beta):
     return np.clip(x, alpha, beta)
 
 
-def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, dual_iters=400):
+def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, dual_iters=400, with_multipliers=False):
     """One MMA step: build the convex approximation, solve its dual, return the new point.
 
     Args:
@@ -182,24 +251,109 @@ def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spe
         g: constraint values ``(m,)``, feasible when ``<= 0``; ``dg``: their Jacobian ``(m, n)``;
         low/upp: previous asymptotes; xold1/xold2: the two previous iterates (``None`` early on).
 
-    Returns ``(x_new, low, upp)``.
+    Returns ``(x_new, low, upp)``, and the subproblem's multipliers ``(m,)`` after them with
+    ``with_multipliers``.
     """
+    low, upp = _asymptotes(x, xold1, xold2, low, upp, xmin, xmax, k, spec.asy_init, spec.asy_shrink, spec.asy_grow)
+    x_new, lam = _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, spec.move, spec.raa, spec.raa, dual_iters)
+    return (x_new, low, upp, lam) if with_multipliers else (x_new, low, upp)
+
+
+def gcmma_step(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, evaluate):
+    """One GCMMA outer iteration: an MMA step, re-solved until its approximation is conservative.
+
+    Svanberg, *SIAM J. Optim.* **12**(2), 2002, 555-573, in the form of Svanberg's 2007 note
+    "MMA and GCMMA -- two methods for nonlinear optimization", Sec. 5. The asymptotes are set once,
+    as in MMA. Each function ``f_i`` (the objective and every constraint) gets its own convexity
+    term ``rho_i``, which starts at ``0.1/n * sum_j |df_i/dx_j| (xmax_j - xmin_j)`` (at least 1e-6).
+    After a trial point ``x_hat`` is found, the TRUE values ``evaluate(x_hat)`` are compared with
+    the approximation's. Every ``f_i`` that the approximation underestimated has its ``rho_i``
+    raised by ``min(1.1 (rho_i + delta_i), 10 rho_i)``, with ``delta_i`` the shortfall divided by
+    ``d(x_hat)``, the amount by which ``rho_i`` moves the approximation there. The subproblem is
+    then solved again from the same ``x``.
+
+    Once every approximation is conservative, a feasible ``x`` gives a feasible ``x_hat`` with a
+    lower objective. Each inner iteration costs one evaluation of values only, no gradients.
+
+    Args:
+        f0: the objective's value at ``x`` (MMA ignores it, GCMMA needs it).
+        evaluate: ``x_hat -> (f0, g)``, the true objective and constraint values at a trial point.
+        spec: as for :func:`mma_subproblem`, plus ``max_inner``, the most re-solves per step.
+
+    Returns ``(x_new, low, upp, info)``. ``info["inner"]`` is the number of re-solves, ``info["lam"]``
+    the multipliers of the accepted subproblem, and
+    ``info["conservative"]`` is False when ``max_inner`` ran out first: the last trial point is
+    then accepted as it is, as in Svanberg's code, and is not guaranteed feasible or a descent.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    df0 = np.asarray(df0, dtype=np.float64).reshape(-1)
+    g = np.asarray(g, dtype=np.float64).reshape(-1)
+    m = g.size
+    dg = np.asarray(dg, dtype=np.float64).reshape(m, x.size)
     span = np.maximum(xmax - xmin, 1e-12)
     low, upp = _asymptotes(x, xold1, xold2, low, upp, xmin, xmax, k, spec.asy_init, spec.asy_shrink, spec.asy_grow)
 
+    n = x.size
+    rho0 = max(1e-6, 0.1 / n * float(np.abs(df0) @ span))
+    rho = np.maximum(1e-6, 0.1 / n * (np.abs(dg) @ span)) if m else np.zeros(0)
+    f_at_x = np.concatenate([[float(f0)], g])
+    # Svanberg's acceptance tolerance, 1e-7 on a problem scaled to O(1), here relative to each
+    # function's own size so that a small objective is not held to an absolute 1e-7.
+    tol = 1e-7 * np.maximum(1.0, np.abs(f_at_x))
+
+    def increments(xh):
+        """``f~_i(xh) - f_i(x)`` for every function: the approximation's change from ``x``."""
+        out = np.empty(m + 1)
+        for i, (dfi, ri) in enumerate(zip([df0, *dg], [rho0, *rho])):
+            p, q = _pq(dfi, x, low, upp, span, ri)
+            out[i] = np.sum(p / (upp - xh) + q / (xh - low)) - np.sum(p / (upp - x) + q / (x - low))
+        return out
+
+    inner = 0
+    while True:
+        xh, lam = _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, spec.move, rho0, rho, spec.dual_iters)
+        f_new, g_new = evaluate(xh)
+        true = np.concatenate([[float(f_new)], np.asarray(g_new, dtype=np.float64).reshape(-1)])
+        shortfall = true - (f_at_x + increments(xh))
+        bad = shortfall > tol
+        if not bad.any() or inner >= spec.max_inner:
+            break
+        # d(xh): the change in f~_i(xh) per unit of rho_i. Nonzero whenever xh != x, and
+        # xh == x cannot be optimistic (the approximation is exact there).
+        d = float(np.sum((upp - low) * (xh - x) ** 2 / ((upp - xh) * (xh - low) * span)))
+        delta = shortfall / max(d, 1e-300)
+        both = np.concatenate([[rho0], rho])
+        both = np.where(bad, np.minimum(1.1 * (both + delta), 10.0 * both), both)
+        rho0, rho = float(both[0]), both[1:]
+        inner += 1
+    return xh, low, upp, {"inner": inner, "conservative": not bad.any(), "f0": float(true[0]), "g": true[1:], "lam": lam}
+
+
+def _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, raa0, raa, dual_iters):
+    """Minimise the convex separable approximation built at ``x`` with asymptotes ``low``/``upp``.
+
+    ``raa0`` is the objective's convexity term and ``raa`` the constraints' (a scalar, or one per
+    constraint): MMA uses one small constant for both, GCMMA raises them per function until the
+    approximation is conservative (:func:`gcmma_step`).
+
+    Returns ``(x_new, lam)``: the minimiser and the dual solution, one multiplier per constraint.
+    """
+    span = np.maximum(xmax - xmin, 1e-12)
+    m = int(np.size(g))
+    raa = np.broadcast_to(np.asarray(raa, dtype=np.float64), (m,))
+
     # Move limits: never leave the box, never reach the asymptote (the approximation is singular
     # there), never travel more than `move` of the box width in one iteration.
-    alpha = np.maximum.reduce([xmin, low + 0.1 * (x - low), x - spec.move * span])
-    beta = np.minimum.reduce([xmax, upp - 0.1 * (upp - x), x + spec.move * span])
+    alpha = np.maximum.reduce([xmin, low + 0.1 * (x - low), x - move * span])
+    beta = np.minimum.reduce([xmax, upp - 0.1 * (upp - x), x + move * span])
     alpha = np.minimum(alpha, beta)  # a degenerate box would otherwise invert
 
-    p0, q0 = _pq(df0, x, low, upp, span, spec.raa)
-    m = int(np.size(g))
+    p0, q0 = _pq(df0, x, low, upp, span, raa0)
     if m:
         P = np.empty((m, x.size))
         Q = np.empty((m, x.size))
         for j in range(m):
-            P[j], Q[j] = _pq(np.asarray(dg[j]).reshape(-1), x, low, upp, span, spec.raa)
+            P[j], Q[j] = _pq(np.asarray(dg[j]).reshape(-1), x, low, upp, span, raa[j])
         # r_j: the constant that makes the approximation match g_j at the current point.
         b = np.array([np.sum(P[j] / (upp - x) + Q[j] / (x - low)) for j in range(m)]) - np.asarray(g)
     else:
@@ -213,7 +367,7 @@ def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spe
         return np.array([np.sum(P[j] / (upp - xv) + Q[j] / (xv - low)) for j in range(m)]) - b, xv
 
     if m == 0:
-        return _primal(np.zeros(0), p0, q0, P, Q, low, upp, alpha, beta), low, upp
+        return _primal(np.zeros(0), p0, q0, P, Q, low, upp, alpha, beta), np.zeros(0)
 
     def bisect_coord(lam, j, iters=100):
         """Maximise the dual along ``lambda_j`` alone, exactly.
@@ -245,7 +399,8 @@ def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spe
         return lam
 
     if m == 1:
-        return dual_grad(bisect_coord(np.zeros(1), 0))[1], low, upp
+        lam = bisect_coord(np.zeros(1), 0)
+        return dual_grad(lam)[1], lam
 
     # Several constraints: cyclic coordinate ascent, each coordinate solved by the same exact
     # bisection. On a concave dual this converges monotonically, and unlike projected gradient it
@@ -259,7 +414,7 @@ def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spe
             lam = bisect_coord(lam, j)
         if np.max(np.abs(lam - prev)) <= 1e-12 * max(1.0, float(np.max(np.abs(lam)))):
             break
-    return dual_grad(lam)[1], low, upp
+    return dual_grad(lam)[1], lam
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +446,20 @@ class MMACallback(_Callback):
         self._unravel = None
         self._n_constraints = 0
         self._names: list = []
+        # GCMMA: every block or none, since they share one subproblem.
+        kinds = {isinstance(spec, GCMMAOptimizer) for _lid, spec in self._blocks}
+        if len(kinds) > 1:
+            raise ValueError(
+                "jno.optimizers: the design variables mix mma() and gcmma(), but MMA solves ONE "
+                "subproblem over all of them, which is either conservative (gcmma) or not (mma). "
+                "Give every design variable in this jno.core the same one."
+            )
+        self._gcmma = kinds == {True}
+        self._values_fn = None
+        self._not_conservative = 0
+        # The dual solution of the last subproblem, one multiplier per `jno.le` row (None before the
+        # first step). `jno.core` reports it beside the constraint values.
+        self.multipliers = None
 
     def jacobian_request(self):
         """``(rows, lids)``: the constraint rows MMA needs and the blocks they are taken w.r.t., in design-vector
@@ -362,6 +531,9 @@ class MMACallback(_Callback):
             return rowwise_jacobian(lambda ps: losses_fn(dict(zip(lids, ps)), rest, context, rng), parts, rows)
 
         self._jac_fn = jax.jit(jac)
+        if self._gcmma:
+            # Values only, of every row: GCMMA's inner loop compares them with its approximation.
+            self._values_fn = jax.jit(lambda trainable, context, rng: _losses(trainable, {}, context, rng))
 
     def _report_initial_feasibility(self, g, dg):
         """Say where every ``jno.le`` row starts, and refuse one no step can ever satisfy.
@@ -458,22 +630,68 @@ class MMACallback(_Callback):
             self._report_initial_feasibility(g, dg)
 
         spec = _BlendedSpec(self._blocks, [p.size for p in x_parts], k=self._k)
-        x_new, self._low, self._upp = mma_subproblem(
-            x,
-            None,
-            df0,
-            g,
-            dg,
-            self._low,
-            self._upp,
-            xmin,
-            xmax,
-            self._xold1,
-            self._xold2,
-            self._k,
-            spec,
-            spec.dual_iters,
-        )
+        if self._gcmma:
+            # The objective as core descends it: the mean of the rows that are not `jno.le`.
+            obj = np.ones(g_all.size, dtype=bool)
+            obj[np.asarray(self._ineq, dtype=int)] = False
+            ineq = np.asarray(self._ineq, dtype=int)
+
+            def evaluate(xh):
+                trial = dict(trainable)
+                off = 0
+                for lid, un, size in unravels:
+                    trial[lid] = un(jax.numpy.asarray(xh[off : off + size]))
+                    off += size
+                vals = np.asarray(self._values_fn(trial, context, rng), dtype=np.float64).reshape(-1)
+                return float(vals[obj].mean()), vals[ineq]
+
+            x_new, self._low, self._upp, info = gcmma_step(
+                x,
+                float(g_all[obj].mean()),
+                df0,
+                g,
+                dg,
+                self._low,
+                self._upp,
+                xmin,
+                xmax,
+                self._xold1,
+                self._xold2,
+                self._k,
+                spec,
+                evaluate,
+            )
+            self.multipliers = np.asarray(info["lam"], dtype=np.float64)
+            if not info["conservative"]:
+                self._not_conservative += 1
+                if self._not_conservative == 1:
+                    from jno.utils.logger import get_logger
+
+                    get_logger().warning(
+                        f"jno.optimizers.gcmma: step {self._k} used all max_inner={spec.max_inner} "
+                        "re-solves without a conservative approximation, so it was accepted as it is "
+                        "and may be infeasible or raise the objective. Raise max_inner or lower move. "
+                        "(Further such steps are counted and reported at the end.)"
+                    )
+        else:
+            x_new, self._low, self._upp, lam = mma_subproblem(
+                x,
+                None,
+                df0,
+                g,
+                dg,
+                self._low,
+                self._upp,
+                xmin,
+                xmax,
+                self._xold1,
+                self._xold2,
+                self._k,
+                spec,
+                spec.dual_iters,
+                with_multipliers=True,
+            )
+            self.multipliers = np.asarray(lam, dtype=np.float64)
         self._xold2, self._xold1 = self._xold1, x.copy()
         self._k += 1
 
@@ -485,6 +703,15 @@ class MMACallback(_Callback):
             out[lid] = un(jax.numpy.asarray(delta[off : off + size], dtype=jax.numpy.float32))
             off += size
         return out
+
+    def on_training_end(self, **kw):
+        if self._not_conservative:
+            from jno.utils.logger import get_logger
+
+            get_logger().warning(
+                f"jno.optimizers.gcmma: {self._not_conservative} of {self._k} steps ran out of "
+                "max_inner re-solves and were accepted without the feasibility and descent guarantee."
+            )
 
 
 def _bound_vector(bound, size: int, lid, which: str) -> np.ndarray:
@@ -526,6 +753,7 @@ class _BlendedSpec:
         self.asy_grow = first.asy_grow
         self.raa = first.raa
         self.dual_iters = first.dual_iters
+        self.max_inner = getattr(first, "max_inner", 0)
         # Decayed per block, then concatenated: `move_k = max(move * gamma**k, move_min)`.
         self.move = np.concatenate(
             [

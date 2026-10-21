@@ -200,6 +200,9 @@ and `inclusion` wins inside the disk because it is listed first. Use each region
 PINN. A multi-material shape is a top-level construct — call `.domain()` on it directly; it does not
 compose with boolean operators or transforms.
 
+To read a solution on one region afterwards, `d.mask("inclusion")` is a boolean mask over the mesh nodes
+(see [`domain.mask`](fem/geometry.md#domainmask-a-fields-values-on-one-region)).
+
 Region names that are not valid Python identifiers go through the dict form:
 `shape.regions({"Quartz.1": q1, "Quartz.2": q2})`. Dict order is priority order exactly as for
 keywords, and the two forms combine (dict entries first).
