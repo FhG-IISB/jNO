@@ -4066,7 +4066,7 @@ class Hessian(Placeholder):
         trace: bool = False,
     ):
         self.target = target
-        self.variables = variables if isinstance(variables, list) else [variables]
+        self.variables = list(variables) if isinstance(variables, (list, tuple)) else [variables]
         self.scheme = scheme
         self.trace = trace  # True → Laplacian (sum of diagonal)
         weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
@@ -4093,7 +4093,7 @@ class Jacobian(Placeholder):
         scheme: str = "automatic_differentiation",
     ):
         self.target = target
-        self.variables = variables if isinstance(variables, list) else [variables]
+        self.variables = list(variables) if isinstance(variables, (list, tuple)) else [variables]
         self.scheme = scheme
         weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
         _propagate_weak(self, target, *weak_vars)

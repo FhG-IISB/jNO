@@ -66,6 +66,21 @@ def test_component_spelling_matches_symgrad_linear_elasticity():
     assert sol_c == pytest.approx(sol_s, abs=5e-9), f"spellings disagree: max|d|={np.abs(sol_c - sol_s).max():.3e}"
 
 
+def test_coordinates_as_a_tuple_or_a_list_give_the_same_solve():
+    """``d.variable(...)[:2]`` is a TUPLE; ``symgrad``/``grad``/``jacobian`` must take it like a list. A tuple
+    used to become ONE "variable" of the Jacobian, which the assembler refused."""
+    sols = []
+    for wrap in (list, tuple):
+        d, u, v, _ui, vi, xy, (xl, yl), vr = _cantilever()
+        X = wrap(xy)
+        weak = 2 * MU * J.inner(J.symgrad(u, X), J.symgrad(v, X), n_contract=2) + LAM * J.trace(J.symgrad(u, X)) * J.trace(
+            J.symgrad(v, X)
+        )
+        sols.append(np.asarray(jno.fem([weak, u(xl, yl) - (0.0, 0.0), -0.01 * vr[1]]).solve(linear=jno.solve.lu())))
+    assert np.abs(sols[0]).max() > 0.1, "the load never arrived"
+    np.testing.assert_allclose(sols[1], sols[0], rtol=0, atol=1e-12)  # same matrix, same direct solve
+
+
 @pytest.mark.parametrize("comp, expect", [(0, "axial"), (1, "bending")])
 def test_a_component_traction_loads_the_named_component(comp, expect):
     """``-t * v[i]`` on a boundary is a traction on component ``i`` alone. Comp 0 on the tip of a
