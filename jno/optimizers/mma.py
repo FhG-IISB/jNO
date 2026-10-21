@@ -170,12 +170,14 @@ def gcmma(
         rho.optimizer(jno.optimizers.gcmma(move=0.2, lower=1e-3, upper=1.0))
         jno.core([compliance, jno.le(vol_frac, 0.4)]).solve(200)
 
+    ``move``, ``lower``, ``upper``, ``asy_init``, ``asy_shrink``, ``asy_grow``, ``dual_iters``,
+    ``move_gamma`` and ``move_min`` are as for :func:`mma`. There is no ``raa``: GCMMA sets that term
+    itself, per function.
+
     Args:
         max_inner: Most re-solves per step. When it runs out, the last trial point is accepted as
             it is (as in Svanberg's code) and is not guaranteed feasible; the solve logs a warning
             the first time and a count at the end.
-        move, lower, upper, asy_init, asy_shrink, asy_grow, dual_iters, move_gamma, move_min:
-            as for :func:`mma`. There is no ``raa``: GCMMA sets that term itself, per function.
 
     Every design variable in one ``jno.core`` must use the same one of ``mma`` and ``gcmma``: they
     share a single subproblem.
