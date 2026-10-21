@@ -227,9 +227,9 @@ def test_the_wrong_number_of_radii_is_refused():
 
 
 def test_a_wires_path_and_radius_are_jno_core_parameters():
-    """Through the front door: `.attach(path=..., radius=...)` on a line region makes a bond wire's
-    routing and gauge `jno.np.parameter`s, so they optimise in `jno.core` next to a material field.
-    Pinned against central differences."""
+    """Through the front door: a line's vertex and radius written in `jno.np.parameter`s make a bond
+    wire's routing and gauge design variables, so they optimise in `jno.core` next to a material
+    field. Pinned against central differences."""
     import equinox as eqx
 
     from jno._fem import _walk
@@ -237,14 +237,16 @@ def test_a_wires_path_and_radius_are_jno_core_parameters():
 
     mm = 1e-3
     p0 = np.array([(2, 1.5, 0.5), (10, 1.5, 3.0), (18, 1.5, 0.5)]) * mm
-    ez = np.zeros((3, 3))
-    ez[1, 2] = 1.0
     h = jno.np.parameter((1,), name="h")
     rr = jno.np.parameter((1,), name="rr")
+    for p, v in ((h, 0.0), (rr, 0.15e-3)):
+        p.dtype(jnp.float64)
+        p.initialize(jax.nn.initializers.constant(v))
     plate = jno.shape.box(0, 0, 0, 20 * mm, 3 * mm, 0.5 * mm, size=(1 * mm, 1 * mm, 0.5 * mm)).attach(sigma=5.8e7).name("p")
-    wire = jno.shape.line([tuple(q) for q in p0], r=0.15e-3, size=1 * mm).name("w")
+    pts = [tuple(q) for q in p0]
+    pts[1] = (pts[1][0], pts[1][1], pts[1][2] + h)  # the apex height
+    wire = jno.shape.line(pts, r=rr, size=1 * mm).attach(sigma=3.8e7).name("w")
     d = (plate + wire).domain()
-    d.attach("w", sigma=3.8e7, path=h * ez + p0, radius=rr)
     d.tag("A", lambda x, y, z: x < 1.01 * mm)
     d.tag("B", lambda x, y, z: x > 18.99 * mm)
     i, v = d.peec_symbols()

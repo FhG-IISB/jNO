@@ -103,7 +103,7 @@ def test_a_weighted_pad_reads_the_weighted_average_the_circuit_used():
     readout that took the first node, or that normalised, would disagree with its own circuit."""
     d = _wire(0.0, "w").domain()
     _i, v, at = _ports(d)
-    built = jno.peec([v(*at("w0")) - v(*at("w1")) - 1.0], freq=FREQ).build()
+    built = jno.peec([v(*at("w0")) - v(*at("w1")) - 1.0], freq=FREQ)._build()
     n = len(np.asarray(built.nodes["w0"]))
     w = np.full(n, 1.0 / n)
     sol = built.solve(weights={"w0": w})

@@ -911,6 +911,12 @@ class domain(MeshIOMixin):
             # Read from `_plan` (the shape as written) rather than `constructor`, which a structured
             # plan has already replaced with its lattice closure.
             _shape = _plan if _plan is not None else constructor
+            # A plan with `jno.np.parameter`s in its coordinates was built at their initial values;
+            # register the stretch that puts the design back, for every solver that reads the mesh.
+            self._shape_plan = _shape
+            # (A mesh-free domain registers it when its mesh is first built: `_build_deferred_mesh`.)
+            if "_lazy_plan" not in self.__dict__ and getattr(_shape, "_node", None) is not None:
+                self._register_shape_stretch(_shape)
             _region_name = getattr(_shape, "_region_name", None)
             if getattr(_shape, "_node", (None,))[0] == "regions" or _region_name is not None:
                 items = tuple(_shape._region_items())
@@ -1615,6 +1621,7 @@ class domain(MeshIOMixin):
             self._apply_mesh(self.__dict__.get("_mesh"))
         finally:
             self.__dict__["_building_mesh"] = False
+        self._register_shape_stretch(plan)
         # Tags declared while mesh-free carry only their predicate; the mesh-derived half (node
         # pool, boundary region, normals) has had nothing to be derived from until now. Replay them,
         # or a `u(tag) - g` essential condition on such a tag would be read as a whole-domain
@@ -4106,6 +4113,80 @@ class domain(MeshIOMixin):
         if cells is None:
             raise ValueError(f"domain: no {key!r} cells on this mesh — cell geometry is unavailable.")
         return np.asarray(cells, dtype=np.int64)
+
+    def _register_shape_stretch(self, plan):
+        """Make the mesh follow a parametric plan: one coordinate spec per axis that a design moves,
+        on the vertices it moves, valued by the stretch between the plan's face planes
+        (:func:`jno.geometry.parametric.stretch_planes`). It rides the same route as
+        ``x.trainable()`` (``_trainable_coords``), so ``jno.fem`` scatters it into the assembly
+        geometry and ``∂(solve)/∂(parameter)`` is the shape derivative along the stretch."""
+        from ..geometry import parametric as _par
+
+        if not _par.has_params(plan._node):
+            return
+        axes = _par.stretch_planes(plan)
+        if all(a is None for a in axes):
+            return  # only a line moves: its solver moves it, the mesh does not carry it
+        from ..trace import FunctionCall
+        from ..utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+        pts = np.asarray(self.mesh.points)
+        registry = self.__dict__.setdefault("_trainable_coords", [])
+        for a, ax in enumerate(axes):
+            if ax is None or a >= pts.shape[1]:
+                continue
+            refs, ents = ax
+            ids = _par.moving_ids(pts[:, a], refs, ents)
+            if ids.size == 0:
+                continue
+            params = {}
+            for e in ents:
+                _collect_runtime_parameter_exprs(e, params)
+            names, exprs = list(params), list(params.values())
+            col = jnp.asarray(pts[ids, a])
+
+            def fn(*vals, _n=tuple(names), _r=refs, _e=tuple(ents), _c=col):
+                at = {n: v for n, v in zip(_n, vals)}
+                return _par.stretch_column(_c, _r, _e, at)
+
+            expr = FunctionCall(fn, exprs, name=f"shape_stretch_{'xyz'[a]}")
+            registry.append({"ids": ids, "axis": a, "expr": expr, "name": f"__shape_stretch_{'xyz'[a]}", "tag": None})
+
+    def stretch(self):
+        """How far a design has stretched this domain from the shape it was built at, as ONE number:
+        the largest factor by which any gap between two face planes has grown or shrunk (``1.0`` at
+        the reference, and for a shape without parameters). A trace node over the shape's parameters,
+        so it reads in a loss, a tracker or a script deciding when the cells have stretched too far
+        and the shape should be rebuilt at the current design::
+
+            if float(crux.eval([d.stretch()])[0]) > 1.5:   # rebuild the shape at the current design
+
+        A gap that closes gives ``inf``; under a trace a crossing gives a negative gap, also ``inf``.
+        """
+        from ..geometry import parametric as _par
+        from ..trace import FunctionCall
+        from ..utils.solver.parametric_helpers import _collect_runtime_parameter_exprs, mark_global_scalar
+
+        plan = self.__dict__.get("_shape_plan") or self.__dict__.get("_lazy_plan")
+        axes = _par.stretch_planes(plan) if plan is not None and _par.has_params(plan._node) else [None, None, None]
+        axes = [ax for ax in axes if ax is not None]
+        params = {}
+        for _refs, ents in axes:
+            for e in ents:
+                _collect_runtime_parameter_exprs(e, params)
+        names = list(params)
+
+        def fn(*vals):
+            at = dict(zip(names, vals))
+            worst = jnp.asarray(1.0)
+            for refs, ents in axes:
+                gr = jnp.asarray(np.diff(refs))
+                gn = jnp.diff(_par.stack(list(ents), at))
+                ratio = jnp.where(gn > 0, jnp.maximum(gn / gr, gr / jnp.where(gn > 0, gn, 1.0)), jnp.inf)
+                worst = jnp.maximum(worst, jnp.max(ratio))
+            return worst
+
+        return mark_global_scalar(FunctionCall(fn, list(params.values()), name="domain_stretch"), f"__stretch_{id(self)}")
 
     def _moving_points(self):
         """``(arg_exprs, rebuild)`` for the mesh coordinates *as the optimiser currently has them*.

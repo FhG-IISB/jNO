@@ -976,7 +976,7 @@ def _normalize_extreme_scale(op, b, precond):
     a traced/parametric operator (its magnitude is a tracer, so ``float(...)`` raises) and a normally
     scaled one are returned untouched. A frozen AMS auxiliary (assembled from the *un-scaled* operator) is
     reset so the coming ``materialize`` re-freezes it from the scaled operator; that reset only happens on
-    this concrete forward path, so a traced/parametric ``.build()`` is never disturbed."""
+    this concrete forward path, so a traced/parametric network is never disturbed."""
     import math
 
     import jax.experimental.sparse as jsp

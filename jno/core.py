@@ -406,6 +406,40 @@ def _active_model_lids(exprs):
     return set(_reachable_models(exprs))
 
 
+def _refuse_collocation_on_parametric_shape(constraints):
+    """A loss that samples a domain whose shape has `jno.np.parameter`s in its coordinates would sample
+    the REFERENCE geometry whatever the design: the points are drawn once, at the parameters' initial
+    values, and nothing moves them. Refused by name until collocation follows the stretch (the solvers
+    that do -- jno.fem, jno.peec -- consume their domain inside their own solve, not here)."""
+    from .geometry import parametric as _par
+    from .utils.solver.solver_helper import iter_children as _iter_children_core
+
+    seen, bad = set(), {}
+
+    def walk(node):
+        if id(node) in seen or not isinstance(node, Placeholder):
+            return
+        seen.add(id(node))
+        if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
+            dom = getattr(node, "_domain", None)
+            plan = getattr(dom, "_shape_plan", None) or getattr(dom, "__dict__", {}).get("_lazy_plan")
+            if plan is not None and getattr(plan, "_node", None) is not None and _par.has_params(plan._node):
+                bad[id(dom)] = getattr(node, "tag", "?")
+        for c in _iter_children_core(node) or ():
+            walk(c)
+
+    for c in constraints or ():
+        walk(c)
+    if bad:
+        raise NotImplementedError(
+            f"jno.core: a loss samples the domain variable(s) {sorted(set(bad.values()))} of a shape with "
+            "`jno.np.parameter`s in its coordinates. Collocation points are drawn at the parameters' "
+            "initial values and do not move with the design, so this loss would see the reference geometry "
+            "whatever the parameters. Solve on that domain with jno.fem or jno.peec (which follow it) and "
+            "put their readouts in the loss, or build the shape with numbers."
+        )
+
+
 def _reachable_models(exprs) -> Dict[int, Any]:
     """Map ``layer_id -> Model`` for every Model reachable without crossing stop_gradient.
 
@@ -669,6 +703,7 @@ class core:
                 self.domain = _trivial_domain()
         else:
             self.domain = None
+        _refuse_collocation_on_parametric_shape(constraints)
         self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []

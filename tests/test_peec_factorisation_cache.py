@@ -45,7 +45,7 @@ def _built(pitch=0.002, freq=0.0):
     d.tag("B", lambda x, y, z: x > LX - pitch)
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq)
 
 
 def test_repeating_the_same_solve_does_not_refactorise():

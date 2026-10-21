@@ -25,7 +25,8 @@ Scope, up front:
 * the heat problem is **linear** in its field (a constant or region-wise ``k``); a nonlinear one is refused;
 * the field is a **scalar P1** field on the same domain as the network;
 * the network is solved at **one** frequency;
-* the geometry is frozen at the first solve, as for :meth:`jno.peec.PEEC.build`.
+* the STRUCTURE is frozen at the first solve; a geometry parameter (a shape coordinate written in
+  parameters) moves the network's faces and wires and the FEM mesh together, every pass.
 """
 
 from __future__ import annotations
@@ -149,7 +150,7 @@ class ElectroThermal:
                 f"(one value per mesh node); this one has {np.asarray(T0).size} values on {pts.shape[0]} nodes."
             )
         self.em._field_reference = float(np.mean(np.asarray(T0)))
-        B = self.em.build()
+        B = self.em._build()
         field_exprs = dict(getattr(self.em, "_field_exprs", {}) or {})
         fields = {f for e in field_exprs.values() for f in _field_symbols(e)}
         if len(fields) > 1:
@@ -199,7 +200,15 @@ class ElectroThermal:
     def _step(self, T, em_values, fem_values):
         import jax.numpy as jnp
 
-        sol = self._built.solve(sigma=self._sigma(T, em_values))
+        from ...geometry import parametric as _par
+
+        B = self._built
+        at = dict(zip(self._em_param_names, em_values))
+        geo = {n: (_par.stack(p, at), _par.stack(r, at)) for n, (p, r) in B._line_geom.items()}
+        geo.update({n: _par.stack(f, at) for n, f in B._solid_geom.items()})
+        sol = B.solve(
+            sigma=self._sigma(T, em_values), geometry=geo or None, **self.em._solve_kw
+        )  # the network's own settings
         q = {r: jnp.real(jnp.asarray(v)).reshape(()) for r, v in sol.dissipation().items()}
         return self._fem_solve(q, fem_values), sol
 
@@ -207,18 +216,24 @@ class ElectroThermal:
     def solve(self, *, tol: float = 1e-8, max_iter: int = 50):
         """Converge the coupled field. Returns an :class:`ElectroThermalSolution`, or -- when a trainable
         ``jno.np.parameter`` sits in either problem -- a trace node of the converged FEM field over them."""
-        from ...peec import _initial_value, _parameters_in
+        from ...geometry import parametric as _par
+        from ...peec import _parameters_in
 
         em_params = _parameters_in(list(self._em_material_exprs().values()))
+        # the network's GEOMETRY parameters too (a shape coordinate written in parameters): its faces and
+        # wires move with them in every pass, as the FEM mesh does through its own stretch
+        plan = getattr(self.em.domain, "_shape_plan", None)
+        if plan is not None and getattr(plan, "_node", None) is not None:
+            em_params.update(_par.plan_parameters(plan))
         self._em_param_names = list(em_params)
         em_nodes = [em_params[n] for n in self._em_param_names]
         if em_nodes or self._fem_param_nodes:
             if self._built is None:
                 # The structural build reads concrete values, so it runs here, eagerly, at the parameters'
                 # initial values -- never inside the traced solve.
-                self._setup([_initial_value(mc) for mc in self._fem_param_nodes])
+                self._setup([_par.evaluate(e) for e in self._fem_param_nodes])
             return self._parametric(em_nodes, tol=tol, max_iter=max_iter)
-        em_vals = [_initial_value(mc) for mc in em_nodes]
+        em_vals = [_par.evaluate(mc) for mc in em_nodes]
         if self._built is None:
             self._setup([])
         T = self._T0
@@ -287,4 +302,57 @@ class ElectroThermal:
 
         node = FunctionCall(_run, nodes, name="electrothermal_solve")
         node._domain = self.em.domain
+        # the network at the converged field, readout by readout, as trace nodes -- the parametric
+        # counterpart of `ElectroThermalSolution.em`
+        node.em = _CoupledReadouts(self, node, list(em_nodes), n_em, list(self._fem_param_nodes))
         return node
+
+
+class _CoupledReadouts:
+    """``node.em`` of a parametric coupled solve: the network's readouts at the CONVERGED field, each a
+    trace node over the field and the parameters (``.L``, ``.R``, ``.Z``, ``.joule``, ``.i``,
+    ``.current(t)``, ``.voltage(a, b)``, ``.dissipation()``). Each re-solves the network once at that
+    field; the field itself is the fixed point, so its gradient is the implicit one."""
+
+    _SCALAR = ("L", "R", "Z", "joule", "current", "voltage", "dissipation")
+
+    def __init__(self, et, field, em_nodes, n_em, fem_nodes):
+        self._et, self._field, self._em_nodes, self._n_em = et, field, em_nodes, n_em
+        self._fem_nodes = fem_nodes
+
+    def _node(self, kind, *args, key=None):
+        from ...trace import FunctionCall
+        from .parametric_helpers import mark_global_scalar
+
+        et, n_em = self._et, self._n_em
+
+        def fn(T, *vals):
+            import jax.numpy as jnp
+
+            sol = et._step(jnp.reshape(T, (-1,)), list(vals[:n_em]), list(vals[n_em:]))[1]
+            out = getattr(sol, kind)
+            out = out(*args) if callable(out) else out
+            return out[key] if key is not None else out
+
+        label = f"electrothermal_{kind}" + (f"_{key}" if key is not None else "") + "".join(f"_{a}" for a in args)
+        node = FunctionCall(fn, [self._field, *self._em_nodes, *self._fem_nodes], name=label)
+        if kind in self._SCALAR:
+            mark_global_scalar(node, f"__et_{id(self)}_{label}")
+        return node
+
+    L = property(lambda self: self._node("L"))
+    R = property(lambda self: self._node("R"))
+    Z = property(lambda self: self._node("Z"))
+    joule = property(lambda self: self._node("joule"))
+    i = property(lambda self: self._node("i"))
+
+    def current(self, terminal):
+        return self._node("current", terminal)
+
+    def voltage(self, a, b=None):
+        return self._node("voltage", a, *(() if b is None else (b,)))
+
+    def dissipation(self):
+        names = self._et._built.part_names
+        own = np.asarray(self._et._built.fil.part)
+        return {n: self._node("dissipation", key=n) for k, n in enumerate(names) if np.any(own == k)}

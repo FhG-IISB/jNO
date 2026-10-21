@@ -58,7 +58,7 @@ def _net(core=None):
     d.tag("B", lambda x, y, z: (x < -0.0021) & (z > 0.0039) & (z < 0.0059))
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=FREQ).build().solve()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=FREQ).solve()
 
 
 def _total(sol, channel):

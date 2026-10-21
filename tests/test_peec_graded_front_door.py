@@ -35,7 +35,7 @@ def _net(grid, freq=1e6):
     d.tag("B", lambda x, y, z: x > 15.1 * mm)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq, grid=grid).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq, grid=grid)
 
 
 def test_the_default_grid_is_untouched():
@@ -110,7 +110,7 @@ def _slotted(grid, freq=1e6):
     d.tag("B", lambda x, y, z: x > 15.1 * mm)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq, grid=grid).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq, grid=grid)
 
 
 def test_a_graded_solve_reproduces_the_uniform_answer_it_approximates():
@@ -167,7 +167,7 @@ def test_a_graded_grid_carries_face_sheets_like_a_uniform_one():
             if graded
             else None
         )
-        b = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e7, grid=grid).build()
+        b = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e7, grid=grid)
         s = b.solve(operator=jno.solve.hierarchical(tol=1e-7)) if graded else b.solve()
         return float(np.real(s.L)), int((np.asarray(b.fil.pair) >= 0).sum())
 

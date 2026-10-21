@@ -87,7 +87,7 @@ def test_a_solve_does_not_construct_arrays_per_NODE(pitch):
         d.tag("B", lambda x, y, z: x > LX - p)
         _i, v = d.peec_symbols()
         at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-        built = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0).build()
+        built = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0)
         built.solve().R.block_until_ready()  # warm the compile and the caches
 
         n = {"c": 0}

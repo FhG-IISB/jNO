@@ -79,6 +79,49 @@ measured on the study above, refining the rule moves the answer by less than 0.0
 
 ---
 
+## Parametric shapes — a parameter in the shape's coordinates
+
+A box face, a rect corner, an extrusion height or a translation may be an expression in
+`jno.np.parameter`s, written where the number would be:
+
+```python
+y1 = jno.np.parameter((1,), name="y1")
+y1.initialize(jax.nn.initializers.constant(8e-3))         # the reference the mesh is built at
+heater = jno.shape.box(0, 4e-3, 0, 10e-3, y1, 1e-3, size=7e-4).name("heater").attach(k=1.0, q=1e6)
+d = (base + heater).domain()
+...
+T = jno.fem([...]).solve()                               # differentiable in y1
+```
+
+The mesh is built once, at the parameters' initial values. A design then **stretches** it: along each
+axis, every face plane of every box in the plan is a breakpoint, a plane written with a parameter goes
+where the parameter puts it, a plane written with a number stays, and every vertex between two planes
+keeps its reference fraction of the gap. So box faces land exactly where asked, cells stay valid as long
+as no two planes cross, and everything not between a moving plane and its fixed neighbours keeps its
+vertices. The stretch rides the `.trainable()` route below, so `∂(solve)/∂(parameter)` is the exact
+derivative of the stretched discretisation (pinned against central differences and against meshes
+rebuilt at the moved design in `tests/test_fem_parametric_shape.py`). The same parameters move a
+`jno.peec` network on the same domain (its grid lines follow the same rule).
+
+What it does not do, up front:
+
+- **A large move distorts cells.** It is a stretch, not a remesh: `d.stretch()` reads, as one traced
+  number, the largest factor any gap between two face planes has grown or shrunk by -- rebuild the shape
+  at the current design when it gets large.
+- **Two faces on one plane move together.** They are one plane of a conforming mesh: write them with the
+  same expression, or start them apart. A fixed face and a moving one on one plane are refused by name.
+- **Curved primitives cannot carry a parameter** (disk, cylinder, sphere, polygon, rotate, revolve,
+  fillet): refused at the constructor. A fixed curved body between moving planes is stretched with them.
+- **A parametric line is not followed by the mesh.** Its vertices move a PEEC filament, not a meshed tube,
+  so `jno.fem` refuses a domain whose meshed line has parametric vertices.
+- **Only `jno.fem` and `jno.peec` follow yet.** `jno.fdm`, `jno.rcwa` and a `jno.core` loss that samples
+  the domain's points (collocation) refuse a parametric domain by name.
+
+Another solver's scalar readout -- a PEEC loss, an RCWA power, an `expr.integrate(fem)` -- may be a
+coefficient here (`d.attach(region, q=em.solve().dissipation()[region])`): it is one value per solve,
+resolved once and handed to the kernel, so a design parameter reaches this solve through it too
+(`tests/test_peec_fem_parametric_chain.py`, `tests/test_fem_global_scalar_coefficient.py`).
+
 ## Differentiable mesh geometry — trainable coordinates (`.trainable()`)
 
 Any placeholder promotes to a `jno.np.parameter` seeded at its current values with **`.trainable()`** —

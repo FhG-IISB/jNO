@@ -45,7 +45,7 @@ def _net(core=None, both=False, wire=False):
 
 def test_a_core_is_discretised_into_its_own_mesh():
     """A core is voxels and the faces between them, exactly as a conductor is -- the same builder."""
-    e = _net(core=2000.0).build()
+    e = _net(core=2000.0)._build()
     assert e.mag is not None and e.mag_names == ("core",)
     assert int(np.asarray(e.mag.length).size) > 0
     assert int(np.asarray(e.fil.length).size) > 0  # and the conductor is still its own mesh
@@ -53,15 +53,15 @@ def test_a_core_is_discretised_into_its_own_mesh():
 
 def test_a_network_with_no_core_is_untouched():
     """The governing constraint: with no mu_r anywhere, nothing about the old path changes."""
-    e = _net().build()
+    e = _net()._build()
     assert e.mag is None and e.mag_names == ()
     assert float(np.real(e.solve().R)) > 0
 
 
 def test_a_conducting_magnetic_region_is_in_BOTH_meshes():
     """A lamination conducts and carries flux; it is not a choice between the two."""
-    plain = _net(core=2000.0).build()
-    both = _net(core=2000.0, both=True).build()
+    plain = _net(core=2000.0)._build()
+    both = _net(core=2000.0, both=True)._build()
     assert int(np.asarray(both.mag.length).size) == int(np.asarray(plain.mag.length).size)
     assert int(np.asarray(both.fil.length).size) > int(np.asarray(plain.fil.length).size)
 
@@ -76,7 +76,7 @@ def test_a_region_carrying_neither_property_is_refused():
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
     with pytest.raises(ValueError, match="neither a conductivity nor a permeability"):
-        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5)._build()
 
 
 def test_a_core_on_a_filament_is_refused():
@@ -88,7 +88,7 @@ def test_a_core_on_a_filament_is_refused():
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
     with pytest.raises(NotImplementedError, match="carries FLUX through a cross-section"):
-        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5)._build()
 
 
 def test_a_core_beside_a_conductor_in_its_own_plane_does_exactly_nothing():
@@ -100,8 +100,8 @@ def test_a_core_beside_a_conductor_in_its_own_plane_does_exactly_nothing():
     coreless one to the last bit. A transposed cross product or a flipped separation would break this
     while leaving every absolute check in this file passing.
     """
-    bare = float(np.real(_net().build().solve().L))
-    with_core = float(np.real(_net(core=2000.0).build().solve().L))
+    bare = float(np.real(_net().solve().L))
+    with_core = float(np.real(_net(core=2000.0).solve().L))
     assert abs(with_core / bare - 1) < 1e-6, (bare, with_core)
 
 
@@ -120,7 +120,7 @@ def test_a_core_above_a_conductor_raises_the_inductance():
         d.tag("B", lambda x, y, z: x > 0.0189)
         i, v = d.peec_symbols()
         at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-        return float(np.real(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build().solve().L))
+        return float(np.real(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).solve().L))
 
     bare = stacked()
     assert stacked(2.0) > bare  # even a barely magnetic core adds, and it adds monotonically
@@ -142,13 +142,13 @@ def test_a_core_at_DC_is_refused():
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
     with pytest.raises(ValueError, match="at DC"):
-        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0).build().solve()
+        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0).solve()
 
 
 def test_a_core_on_the_dense_path_is_refused():
     """The magnetic blocks are applied by FFT on the shared cell grid; the dense path forms Lp as a
     matrix and has no assembled operator for them to join. Refused rather than silently ignored."""
-    e = _net(core=2000.0).build()
+    e = _net(core=2000.0)
     with pytest.raises(ValueError, match="lattice path"):
         e.solve(matrix_free=False)
 
@@ -157,7 +157,7 @@ def test_a_core_in_a_welded_network_is_refused_for_now():
     """Welding already needs a cross block and a whole-system factorisation; a coupled magnetic
     system on top of that is untested, so it is refused rather than guessed at."""
     with pytest.raises(NotImplementedError, match="together with a Shape.line"):
-        _net(core=2000.0, wire=True).build()
+        _net(core=2000.0, wire=True)._build()
 
 
 def test_a_unit_permeability_region_is_air_and_says_so():
@@ -174,7 +174,7 @@ def test_a_unit_permeability_region_is_air_and_says_so():
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
     with pytest.raises(ValueError, match="air with a name"):
-        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5)._build()
 
 
 def test_a_unit_permeability_conductor_still_conducts():
@@ -186,7 +186,7 @@ def test_a_unit_permeability_conductor_still_conducts():
     d.tag("B", lambda x, y, z: x > 0.0189)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5)._build()
     assert e.mag is None  # no magnetisation to carry, so no magnetic mesh and no refusal
     assert float(np.real(e.solve().R)) > 0
 
@@ -200,7 +200,7 @@ def test_the_two_meshes_land_on_one_grid():
     against (10,3,1) on this very geometry. Each mesh is now framed by the other's shapes, which
     fixes the grid without putting the other's cells into its occupancy.
     """
-    e = _net(core=2000.0).build()
+    e = _net(core=2000.0)._build()
     le, lm = e.fil.lattice, e.mag.lattice
     assert le["n"] == lm["n"], (le["n"], lm["n"])
     assert le["d"] == lm["d"], (le["d"], lm["d"])
@@ -226,10 +226,10 @@ def test_a_conductor_only_network_keeps_the_grid_it_always_had():
 
 
 def test_a_magnetic_network_still_jits():
-    """`.build()` exists so the host discretisation runs once and the solve is traceable.
+    """`` exists so the host discretisation runs once and the solve is traceable.
 
     A core must not quietly cost that: its mesh, its potential and its coupling are all functions of
-    geometry, which `.build()` has already frozen. Only the conductivity is traced here -- which is
+    geometry, which `` has already frozen. Only the conductivity is traced here -- which is
     what an electro-thermal loop or a density optimisation does every pass.
     """
     bar = jno.shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
@@ -239,7 +239,7 @@ def test_a_magnetic_network_still_jits():
     d.tag("B", lambda x, y, z: x > 0.0189)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5)
 
     f = jax.jit(lambda s: e.solve(sigma={"bar": s}).L)
     hot, cold = float(np.real(f(CU))), float(np.real(e.solve(sigma={"bar": CU}).L))

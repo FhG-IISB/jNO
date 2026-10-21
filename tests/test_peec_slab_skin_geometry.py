@@ -47,7 +47,7 @@ def _microstrip(thick, freq, pitch=5.0e-4):
     d.tag("B", lambda x, y, z: (np.abs(x) < pitch * 0.6) & (np.abs(y - 0.02) < pitch * 0.6) & (z < ZTOP + 1e-9))
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build().solve()
+    s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).solve()
     # pypeec's inductance is Im(Z) / omega (utils/matrix.py), which includes the INTERNAL inductance
     # of the skin layer; `s.L` is the external, field-energy one, so it is not the quantity compared
     z = complex(np.asarray(s.Z))
@@ -126,7 +126,7 @@ def test_the_loop_inductance_does_not_jump_where_a_sheet_pair_would_start():
         d.tag("B", lambda x, y, z: (x > 0.0359) & (z < thick + 1e-9))
         i, v = d.peec_symbols()
         at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-        s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build().solve()
+        s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).solve()
         return float(np.real(s.L))
 
     a, b = bar(lo), bar(hi)
@@ -148,7 +148,7 @@ def test_a_paired_bar_carries_the_same_current_as_an_unpaired_one():
         d.tag("B", lambda x, y, z: x > length - 1.1e-3)
         i, v = d.peec_symbols()
         at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-        b = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build()
+        b = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq)
         s = b.solve()
         return int(np.asarray(b.fil.length).size), float(np.real(s.R)), float(np.real(s.L))
 
@@ -190,7 +190,7 @@ def test_a_strip_over_a_plane_matches_the_closed_form_microstrip():
         d.tag("B", lambda x, y, z: (x < pitch * 1.01) & (z < 1e-9) & (np.abs(y) < width / 2))
         i, v = d.peec_symbols()
         at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-        return float(np.real(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build().solve().L))
+        return float(np.real(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).solve().L))
 
     per_m = (loop(40 * mm) - loop(20 * mm)) / (20 * mm)
     we = width + thick / np.pi * (1 + np.log(2 * gap / thick))

@@ -1,13 +1,12 @@
-"""``peec.build()``: freeze the discretisation once, and the solve becomes jittable.
+"""``peec``: the discretisation is done once, on the first solve, and later solves jit.
 
 Everything structural -- which cells are metal, which nodes a pad owns, which filaments weld to
-which -- is decided on the host from concrete geometry, and none of it survives a trace. So
-``.solve()`` was differentiable but not jittable, and it redid that whole pass on every design
-iteration. ``build()`` is the same split ``jno.precond.ams().build(fem)`` and ``FemLinearSystem``
-already use: host once, then pure jax.
+which -- is decided on the host from concrete geometry, and none of it survives a trace. So the
+first ``.solve()`` does that pass and the network keeps it (``peec._build``); every later solve is
+pure jax -- under ``jax.jit`` too, where the first solve runs the host pass at compile time.
 
-What has to hold is that the split changes nothing but the cost -- the built solve must agree with
-the eager one to the last bit, under jit and under a gradient, and a conductivity handed in at solve
+What has to hold is that the split changes nothing but the cost -- a kept network must agree with a
+fresh one to the last bit, under jit and under a gradient, and a conductivity handed in at solve
 time must agree with the same value attached to the geometry.
 """
 
@@ -54,7 +53,9 @@ def wire_network(sigma=SIG):
 
 @pytest.mark.parametrize("freq", [0.0, 1e6])
 def test_building_first_changes_no_digit(freq):
-    a, b = network(freq=freq).solve(), network(freq=freq).build().solve()
+    kept = network(freq=freq)
+    kept.solve()  # discretised here; the solve below reuses it
+    a, b = network(freq=freq).solve(), kept.solve()
     # bitwise on CPU; on a GPU the preconditioner is cuDSS, whose parallel reductions are not
     # bit-reproducible run to run, so the Krylov iterate can differ by up to the solve tolerance
     tol = 0.0 if jax.default_backend() == "cpu" else 1e-8
@@ -65,33 +66,33 @@ def test_building_first_changes_no_digit(freq):
 
 def test_a_welded_network_builds_the_same_too():
     """Lines then solids: the resolvers must concatenate in exactly `_weld`'s order."""
-    a, b = wire_network().solve(), wire_network().build().solve()
+    a, b = wire_network().solve(), wire_network().solve()
     assert complex(a.Z) == complex(b.Z)
     assert np.array_equal(np.asarray(a.i), np.asarray(b.i))
 
 
 def test_the_resolver_reproduces_the_eager_conductivity():
-    built = wire_network().build()
+    built = wire_network()._build()
     assert np.allclose(np.asarray(built._resolve(None)), SIG, rtol=0, atol=0)
 
 
 def test_solve_is_still_the_one_call_path():
-    """`peec.solve()` must BE `build().solve()`, not a second implementation drifting beside it."""
-    assert np.asarray(network().solve().i).shape == np.asarray(network().build().solve().i).shape
+    """A second solve on the same network reuses its discretisation and gives the same answer."""
+    assert np.asarray(network().solve().i).shape == np.asarray(network().solve().i).shape
 
 
 # --- and now it jits ------------------------------------------------------------------------------
 
 
 def test_the_built_solve_jits():
-    built = network().build()
+    built = network()
     f = lambda s: built.solve(sigma={"plate": SIG * s}).R  # noqa: E731
     assert float(jax.jit(f)(1.0)) == pytest.approx(float(f(1.0)), rel=1e-12)
 
 
 def test_the_built_solve_differentiates_under_jit():
     """R = rho*L/A is exactly inverse in sigma, so dR/ds at s=1 is -R. An oracle, not a re-run."""
-    built = network().build()
+    built = network()
     f = lambda s: built.solve(sigma={"plate": SIG * s}).R  # noqa: E731
     r = float(f(1.0))
     for g in (float(jax.grad(f)(1.0)), float(jax.jit(jax.grad(f))(1.0))):
@@ -99,7 +100,7 @@ def test_the_built_solve_differentiates_under_jit():
 
 
 def test_a_field_conductivity_jits_too():
-    built = network().build()
+    built = network()
 
     def port(t):
         fld = lambda x, y, z: SIG * (0.2 + t * x / LX)  # noqa: E731
@@ -113,7 +114,7 @@ def test_a_field_conductivity_jits_too():
 
 def test_a_welded_network_jits():
     """The welded path carries the near-field preconditioner, which is where the cache lives."""
-    built = wire_network().build()
+    built = wire_network()
     f = lambda s: jnp.real(built.solve(sigma={"wire": SIG * s}).Z)  # noqa: E731
     assert float(jax.jit(f)(1.0)) == pytest.approx(float(f(1.0)), rel=1e-10)
 
@@ -125,7 +126,7 @@ def test_two_separate_traces_do_not_leak(capfd):
     Freezing the network made the identity stable, the cache finally hit, and the second trace
     raised UnexpectedTracerError -- a bug that `build()` did not introduce so much as expose.
     """
-    built = network().build()
+    built = network()
     f = lambda s: built.solve(sigma={"plate": SIG * s}).R  # noqa: E731
     one = float(jax.jit(f)(1.0))
     two = float(jax.jit(lambda s: f(s) + 0.0)(1.0))  # a DIFFERENT trace of the same network
@@ -138,7 +139,7 @@ def test_the_eager_cache_still_serves_a_frequency_sweep():
     from jno.utils.solver.peec import _KRYLOV_CACHE
 
     _KRYLOV_CACHE.clear()
-    wire_network().build().solve()
+    wire_network().solve()
     assert len(_KRYLOV_CACHE) >= 1
 
 
@@ -150,7 +151,7 @@ def test_the_dissipation_readout_jits():
     provenance array, on the host -- and asking it in jnp made the whole readout unjittable, which
     put `jno.core` out of reach for anything thermal.
     """
-    built = network().build()
+    built = network()
     f = lambda s: built.solve(sigma={"plate": SIG * s}).dissipation()["plate"]  # noqa: E731
     r = float(f(1.0))
     assert r > 0
@@ -166,7 +167,7 @@ def test_the_dissipation_readout_jits():
 
 def test_dissipation_still_reconciles_with_the_total():
     """The host-side ownership must select the same elements the jnp mask did: sum(q_r V_r) = joule."""
-    sol = wire_network().build().solve()
+    sol = wire_network().solve()
     q, vol, own = sol.dissipation(), np.asarray(sol._vol), np.asarray(sol._owner)
     total = sum(float(jnp.real(v)) * vol[own == k].sum() for k, (_n, v) in enumerate(q.items()))
     assert total == pytest.approx(float(sol.joule), rel=1e-10)
@@ -176,20 +177,20 @@ def test_dissipation_still_reconciles_with_the_total():
 
 
 def test_an_override_matches_attaching_the_same_value():
-    got = network().build().solve(sigma={"plate": SIG / 3})
+    got = network().solve(sigma={"plate": SIG / 3})
     ref = network(sigma=SIG / 3).solve()
     assert complex(got.R) == pytest.approx(complex(ref.R), rel=1e-12)
 
 
 def test_overriding_only_one_conductor_leaves_the_other_alone():
-    a = wire_network().build().solve(sigma={"wire": SIG})
+    a = wire_network().solve(sigma={"wire": SIG})
     assert complex(a.Z) == pytest.approx(complex(wire_network().solve().Z), rel=1e-12)
-    b = wire_network().build().solve(sigma={"wire": SIG / 10})
+    b = wire_network().solve(sigma={"wire": SIG / 10})
     assert jnp.real(b.Z) > jnp.real(a.Z)  # a worse wire, in series, is more resistance
 
 
 def test_an_unknown_conductor_in_the_override_is_refused():
-    built = network().build()
+    built = network()
     with pytest.raises(ValueError, match="names no conductor"):
         built.solve(sigma={"Plate": SIG})  # a terminal, a typo -- either way, loudly
     with pytest.raises(ValueError, match="names no conductor"):
@@ -209,7 +210,7 @@ def test_building_once_beats_rediscretising(monkeypatch):
     orig = mod.PEEC._discretise
     monkeypatch.setattr(mod.PEEC, "_discretise", lambda self: (calls.append(1), orig(self))[1])
 
-    built = network().build()
+    built = network()
     for k in range(5):
         built.solve(sigma={"plate": SIG * (1.0 + 0.01 * k)})
     assert len(calls) == 1  # five solves, ONE discretisation
@@ -246,7 +247,7 @@ def test_a_device_impedance_can_be_overridden_at_solve():
     It cannot be a constant in the constraint list, and rebuilding the network per pass throws away
     the discretisation. So it is handed in at solve, exactly like `sigma`.
     """
-    built = device_network().build()
+    built = device_network()
     ref = complex(built.solve().Z)
     assert complex(built.solve(devices={}).Z) == ref  # an empty override changes nothing
     for spelling in (5e-3, jnp.asarray(5e-3), complex(5e-3)):  # scalar, array, complex all land
@@ -255,7 +256,7 @@ def test_a_device_impedance_can_be_overridden_at_solve():
 
 def test_a_bigger_device_impedance_shows_up_at_the_port():
     """Series: the device's own resistance adds to the loop, so the port must see it."""
-    built = device_network().build()
+    built = device_network()
     lo = jnp.real(built.solve(devices={"M": 1e-3}).Z)
     hi = jnp.real(built.solve(devices={"M": 50e-3}).Z)
     assert float(hi - lo) == pytest.approx(49e-3, rel=1e-6)  # exactly the difference, nothing else
@@ -265,9 +266,9 @@ def test_re_solving_with_a_different_device_value_is_not_the_cached_operator():
     """Regression: the compiled Krylov solve captures the CONSTRAINT MATRIX, and a device impedance
     lives in it. Keyed only on the network, a second solve at a different Z reused the first call's
     operator -- surfacing as a solve that would not converge rather than as a wrong number, and only
-    because the residual check was there. Invisible until `.build()` made the network identity stable.
+    because the residual check was there. Invisible until `` made the network identity stable.
     """
-    built = device_network().build()
+    built = device_network()
     a = float(jnp.real(built.solve(devices={"M": 1e-3}).Z))
     b = float(jnp.real(built.solve(devices={"M": 50e-3}).Z))
     c = float(jnp.real(built.solve(devices={"M": 1e-3}).Z))  # back again: must not be b's operator
@@ -276,7 +277,7 @@ def test_re_solving_with_a_different_device_value_is_not_the_cached_operator():
 
 
 def test_an_unknown_device_terminal_is_refused():
-    built = device_network().build()
+    built = device_network()
     with pytest.raises(ValueError, match="names no device of this network"):
         built.solve(devices={"A": 1e-3})
 
@@ -293,7 +294,7 @@ def test_a_gradient_does_not_poison_the_cache_for_later_calls():
     Worse than the crash: when it did not crash it returned a stale operator, and the gradient came
     back 14 % wrong while still looking perfectly reasonable.
     """
-    built = device_network().build()
+    built = device_network()
     f = lambda z: jnp.real(built.solve(devices={"M": z}).Z)  # noqa: E731
     before = float(f(5e-3))
     g = float(jax.grad(f)(5e-3))
@@ -307,7 +308,7 @@ def test_the_cache_still_serves_repeated_identical_solves():
     """The guard must not disable the cache where it earns its keep: same network, same values."""
     from jno.utils.solver.peec import _KRYLOV_CACHE
 
-    built = wire_network().build()
+    built = wire_network()
     _KRYLOV_CACHE.clear()
     a = complex(built.solve().Z)
     n_after_first = len(_KRYLOV_CACHE)
@@ -321,7 +322,7 @@ def test_the_cache_still_serves_repeated_identical_solves():
 
 def test_L_agrees_with_the_matrix_it_no_longer_forms():
     """The quadratic form and the matrix must give the same number, or the saving is a lie."""
-    sol = network(freq=1e6).build().solve()
+    sol = network(freq=1e6).solve()
     cur = jnp.atleast_2d(sol.i)[0]
     ref = jnp.real(jnp.conj(cur) @ sol.partial.astype(cur.dtype) @ cur) / abs(complex(sol._port_current)) ** 2
     assert float(sol.L) == pytest.approx(float(ref), rel=1e-10)
@@ -341,7 +342,7 @@ def test_reading_L_does_not_build_an_n_by_n_array(monkeypatch):
 
     # a PLAIN lattice: the welded path legitimately forms this for its thin wire sub-block, which is
     # a few hundred filaments against the lattice's thousands and is the point of the near/far split.
-    sol = network().build().solve()
+    sol = network().solve()
     assert len(calls) == 0, "solving formed the dense matrix"
     _ = float(sol.L)
     assert len(calls) == 0, "reading L formed the dense matrix"
@@ -352,8 +353,8 @@ def test_reading_L_does_not_build_an_n_by_n_array(monkeypatch):
 def test_L_is_still_the_hermitian_form_at_frequency():
     """Re(I)'Lp Re(I) + Im(I)'Lp Im(I) is I^H Lp I exactly, and must stay positive once phases spread."""
     for freq in (0.0, 1e6, 1e7):
-        assert float(network(freq=freq).build().solve().L) > 0
-    assert float(wire_network().build().solve().L) > 0  # and on a WELDED network too
+        assert float(network(freq=freq).solve().L) > 0
+    assert float(wire_network().solve().L) > 0  # and on a WELDED network too
 
 
 # --- the solver knobs the failure message names --------------------------------------------------
@@ -361,7 +362,7 @@ def test_L_is_still_the_hermitian_form_at_frequency():
 
 def test_the_dense_path_and_the_matrix_free_one_agree():
     """`matrix_free=False` is the escape hatch, so it has to give the same answer, not merely run."""
-    built = wire_network().build()
+    built = wire_network()
     auto = complex(built.solve().Z)
     dense = complex(built.solve(matrix_free=False).Z)
     assert dense == pytest.approx(auto, rel=1e-9)
@@ -369,7 +370,7 @@ def test_the_dense_path_and_the_matrix_free_one_agree():
 
 def test_a_deeper_restart_does_not_change_a_converged_answer():
     """It buys convergence at scale; where the default already converges it must be a no-op."""
-    built = wire_network().build()
+    built = wire_network()
     base = complex(built.solve().Z)
     for r in (24, 48):
         assert complex(built.solve(restart=r).Z) == pytest.approx(base, rel=1e-8)

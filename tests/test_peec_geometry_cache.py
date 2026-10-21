@@ -173,12 +173,12 @@ def test_welding_says_so_because_it_changes_the_solver(caplog):
     """
     P._PITCH_WARNED.clear()  # `_warn_once` dedupes on the message text, for the whole process
     with caplog.at_level("WARNING", logger="jno"):
-        _module(with_wire=True).build()
+        _module(with_wire=True)._build()
     assert any("WELDED" in r.message for r in caplog.records)
 
     caplog.clear()
     with caplog.at_level("WARNING", logger="jno"):
-        _module(with_wire=False).build()
+        _module(with_wire=False)._build()
     assert not any("WELDED" in r.message for r in caplog.records), "a solids-only model is not welded"
 
 
@@ -187,5 +187,5 @@ def test_the_welded_warning_is_said_once(caplog):
     P._PITCH_WARNED.clear()
     with caplog.at_level("WARNING", logger="jno"):
         for _ in range(3):
-            _module(with_wire=True).build()
+            _module(with_wire=True)._build()
     assert sum("WELDED" in r.message for r in caplog.records) == 1

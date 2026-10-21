@@ -1666,7 +1666,11 @@ class _ParametricSol:
         def fn(*values):  # crux threads the current parameter values in here
             return getattr(self._p._solve_at(dict(zip(names, values))), method)(*args)
 
-        return FunctionCall(fn, exprs, name=f"rcwa_{method}")
+        from .utils.solver.parametric_helpers import mark_global_scalar
+
+        # one value per solve: a FEM that uses it as a coefficient (an absorbed power as a heat source)
+        # reads it once, not per quadrature point
+        return mark_global_scalar(FunctionCall(fn, exprs, name=f"rcwa_{method}"), f"__rcwa_{id(self)}_{method}_{args!r}")
 
     def efficiency(self, kind):
         return self._node("efficiency", kind)
@@ -2067,6 +2071,9 @@ def rcwa(
         raise RcwaError(f"smoothing must be a positive integer (1 = off), got {smoothing!r}.")
     femobj = _as_fem(problem)
     domain = femobj.domain
+    from .geometry.parametric import refuse_if_parametric
+
+    refuse_if_parametric(domain, "jno.rcwa", "its layers are detected from the reference mesh as numbers")
     axes, period = _periodic_period(femobj, domain)
     bottom, top = _z_ambient_faces(domain)
     pts = np.asarray(domain.points)

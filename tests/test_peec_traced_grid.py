@@ -101,7 +101,7 @@ def _net(a, b, freq=1e6):
     d.tag("B", lambda x, y, z: x > 11.1 * mm)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq, grid=jno.peec.faces(pitch=P)).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq, grid=jno.peec.faces(pitch=P))
 
 
 def _ext(sh):
@@ -122,7 +122,7 @@ def test_the_moved_lines_are_the_reference_at_the_reference_and_stretch_between_
     reference it is the reference, and a moved face moves its own line while the lines between two
     faces keep their fraction of the gap -- here t2's upper face, so the cells inside t2 stretch."""
     a, b = _two_traces(gap=3.0)
-    e = _net(a, b)
+    e = _net(a, b)._build()
     ref = [np.asarray(v) for v in e._solid_info[2]["edges"]]
     same = e._moved_edges({"t2": _ext(b)})
     assert all(np.allclose(np.asarray(m), r, rtol=0, atol=1e-12 * mm) for m, r in zip(same, ref))
@@ -166,7 +166,7 @@ def test_a_moved_solid_on_the_uniform_lattice_is_refused():
     d.tag("B", lambda x, y, z: x > 11.1 * mm)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build()
+    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
     with pytest.raises(ValueError, match="faces"):
         e.solve(geometry={"t2": _ext(b)})
 
@@ -223,7 +223,7 @@ def _welded():
     d.tag("B", lambda x, y, z: (x < 0.9 * mm) & (y > 4.9 * mm))
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6, grid=jno.peec.faces(pitch=P)).build(), b
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6, grid=jno.peec.faces(pitch=P)), b
 
 
 def test_the_hierarchical_path_takes_a_traced_lattice_and_is_differentiable():

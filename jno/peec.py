@@ -43,26 +43,26 @@ That is the ordinary fixed-mesh treatment, and it is why a converged density has
 as a shape rather than assumed to be one.
 
 A design loop wants the geometry decided ONCE. Everything structural -- which cells are metal,
-which nodes a pad owns, which filaments weld to which -- is host work on concrete geometry, and
-``solve()`` redoes all of it every call, which is why it differentiates but does not jit.
-:meth:`peec.build` is that pass done once::
+which nodes a pad owns, which filaments weld to which -- is host work on concrete geometry, so the
+first ``solve()`` does it and keeps it, and every later solve reuses it::
 
-    emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6).build()      # host, once
+    emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6)
     loss = jax.jit(lambda rho: emag.solve(sigma={"trace": f(rho)}).L)
 
-What comes back solves in pure jax, so it jits and composes into ``jno.core`` through ``jno.fn``
+A solve after the first is pure jax, so it jits and composes into ``jno.core`` through ``jno.fn``
 exactly as ``fem.solve()`` does -- which is what puts a PEEC objective behind ``.optimizer()``,
 ``jno.optimizers.mma`` and ``jno.le``. Measured on a 1,540-bar plate: **42x** on the value and 23x
-on the gradient, because the host pass, not the solve, was the cost. The same split as
-:meth:`jno.precond.ams.build` and :class:`jno.trace.FemLinearSystem`.
+on the gradient, because the host pass, not the solve, was the cost. The same host/traced split as
+:class:`jno.trace.FemLinearSystem`.
 
 **Scope, up front.** A conductor is either a :meth:`jno.shape.line` tube or a closed-form solid,
 which voxelises onto a lattice shared with every other solid on it. A network containing a lattice
 is applied matrix-free -- that block by FFT -- and solved by GMRES; a network of wires alone has no
 such structure, forms the dense operator, and is therefore the small-network path. Each filament
 carries ONE current and its self-term is the DC geometric mean distance, so the skin effect WITHIN a
-filament is not represented -- see ``freq``. A built network freezes its GEOMETRY: a design variable
-may change a conductivity, never a shape, so build again for a new one.
+filament is not represented -- see ``freq``. A network freezes its STRUCTURE at the first solve: a
+design variable may change a conductivity and stretch the built cells (a parameter in a shape's
+coordinates), never add or renumber them, so make a new ``jno.peec`` for a new topology.
 """
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sparse
 
+from .geometry import parametric as _par
 from .utils.solver.peec import (
     FacesGrid,
     Filaments,
@@ -522,12 +523,7 @@ class PEECSolution:
 
 
 #: the `.attach(...)` properties a PEEC network reads; any other is named once by `peec._discretise`
-_PEEC_PROPS = frozenset({"sigma", "mu_r", "path", "radius", "faces"})
-
-
-def _faces_entries(val):
-    """An attached ``faces=`` as a list of entries: a 6-sequence as given, an expression as itself."""
-    return list(val) if isinstance(val, (list, tuple)) else [val]
+_PEEC_PROPS = frozenset({"sigma", "mu_r", "path", "radius", "faces"})  # the last three: to refuse by name
 
 
 def _model_calls(node):
@@ -746,7 +742,7 @@ class ParametricSolution:
     Every readout is a **trace node** over those parameters rather than a number, so an objective is
     written the way the rest of jNO writes one -- ``emag.solve().R`` straight into ``jno.core`` --
     and crux threads the values. It is the same treatment :class:`jno.rcwa` gives its readouts, and
-    it fits PEEC unusually well: the geometry is frozen at ``build()`` already, so only values are
+    it fits PEEC unusually well: the structure is frozen at the first solve already, so only values are
     ever traced.
 
     ``solve(sigma=...)`` with concrete values is the way back to a plain number.
@@ -819,10 +815,9 @@ class ParametricSolution:
                         "initialising, that is the cause, and giving the material a non-zero floor "
                         "(`CU * (0.01 + 0.99 * rho**3)`) both fixes it and is better conditioned."
                     )
-            ev = lambda e: None if e is None else _eval_material(e, at)
-            geo = {n: (ev(p), ev(r)) for n, (p, r) in self._geom.items()}
+            geo = {n: (_par.stack(p, at), _par.stack(r, at)) for n, (p, r) in self._geom.items()}
             for n, f in self._faces.items():
-                geo[n] = [x for e in _faces_entries(f) for x in jnp.reshape(jnp.asarray(ev(e), dtype=float), (-1,))]
+                geo[n] = _par.stack(f, at)
             geo = geo or None
             sol = self._b.solve(sigma=mats if mats else {}, geometry=geo, **self._solve_kw)
             out = getattr(sol, kind)
@@ -830,7 +825,13 @@ class ParametricSolution:
                 out = out(*args)
             return out[key] if key is not None else out
 
-        return FunctionCall(fn, exprs, name=label or f"peec_{kind}")
+        node = FunctionCall(fn, exprs, name=label or f"peec_{kind}")
+        if kind in ("L", "R", "Z", "joule", "current", "voltage", "dissipation"):
+            # one number per solve: a FEM that uses it as a coefficient reads it once, not per point
+            from .utils.solver.parametric_helpers import mark_global_scalar
+
+            mark_global_scalar(node, f"__peec_{id(self)}_{label or kind}" + (f"_{key}" if key is not None else ""))
+        return node
 
     @property
     def Z(self):
@@ -886,9 +887,13 @@ class ParametricSolution:
 class PEEC:
     """A partial-element problem: built from the constraint list, solved by :meth:`solve`."""
 
-    def __init__(self, constraints, freq=0.0, grid=None):
+    def __init__(self, constraints, freq=0.0, grid=None, operator=None, restart=None, matrix_free=None):
         self.constraints = list(constraints)
         self.grid = grid
+        #: how this network is solved, for every solve (a keyword to `solve()` overrides it there)
+        self._solve_kw = {
+            k: v for k, v in dict(operator=operator, restart=restart, matrix_free=matrix_free).items() if v is not None
+        }
         if not self.constraints:
             raise ValueError("jno.peec: no constraints. A network with nothing impressed on it carries no current.")
         self.freq = np.atleast_1d(np.asarray(freq, dtype=float))
@@ -989,15 +994,21 @@ class PEEC:
         # `sigma` alone is a conductor; `mu_r` alone is a core that does not conduct, a ferrite or a
         # powder; both together is a conducting magnetic material, a lamination or a lossy core.
         sig, mur = _attached("sigma"), _attached("mu_r")
-        # A wire's GEOMETRY may be a design variable too: `.attach(path=..., radius=...)` on a line
-        # region overrides its vertices and radius by expressions in `jno.np.parameter`s. Structure --
-        # how many filaments, which node is which, where it welds -- stays the shape's own; only the
-        # positions and the gauge move (see `line_filaments(points=, radii=)`).
-        geo_pts, geo_rad = _attached("path"), _attached("radius")
+        # The GEOMETRY may be a design variable too: a shape coordinate written in
+        # `jno.np.parameter`s (`jno.shape.box(0, 0, 0, w, ...)`, a line vertex, its radius) is built at
+        # the parameters' initial values and moved under a trace -- a wire's vertices and gauge
+        # (`line_filaments(points=, radii=)`), a solid's faces on a `faces` grid (`_with_solids`).
+        # Structure -- how many filaments or cells, which node is which, where it welds -- stays the
+        # reference's. Before the shape carried them, `.attach(path=, radius=, faces=)` did this.
+        for old in ("path", "radius", "faces"):
+            if _attached(old):
+                raise ValueError(
+                    f"jno.peec: `.attach({old}=...)` on {sorted(_attached(old))} is no longer read -- the "
+                    "geometry's design variables are the shape's own coordinates now. Write the parameter "
+                    "where the number was: `jno.shape.box(x0, y0, z0, w, y1, z1)` for a face, "
+                    "`jno.shape.line([(x, y, z + h), ...], r=rr)` for a wire's vertices and radius."
+                )
         line_geom: dict = {}
-        # The same for a solid: `.attach(faces=(x0, y0, z0, x1, y1, z1))` with entries in
-        # `jno.np.parameter`s moves its faces on a `faces` grid (`BuiltPEEC._with_solids`).
-        geo_faces = _attached("faces")
         solid_geom: dict = {}
         # A property this network does not read is not an error -- the same domain may carry a
         # `jno.fem` problem's coefficients -- but a misspelt `sigma` or `faces` would otherwise be
@@ -1017,7 +1028,7 @@ class PEEC:
             _warn_once(
                 "jno.peec: "
                 + "; ".join(f"{p!r} on {rs}" for p, rs in sorted(_unread.items()))
-                + f" -- jno.peec reads only {sorted(_PEEC_PROPS)}, so these do nothing in the network. "
+                + " -- jno.peec reads only ['mu_r', 'sigma'], so these do nothing in the network. "
                 "Fine if they are coefficients of a jno.fem problem on the same domain; otherwise check "
                 "the spelling."
             )
@@ -1099,13 +1110,9 @@ class PEEC:
                 _ref = _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])})
                 sig[n] = _ref[0] if _ref.size == 1 else _ref
             if kind == "Line":
-                if n in geo_faces:
-                    raise ValueError(
-                        f"jno.peec: {n!r} is a Shape.line and attaches `faces=`, which moves a solid's "
-                        "faces. A wire moves with `.attach(path=..., radius=...)`."
-                    )
-                if _model_calls(geo_pts.get(n)) or _model_calls(geo_rad.get(n)):
-                    line_geom[n] = (geo_pts.get(n), geo_rad.get(n))
+                wl = _par.world_line(sh)
+                if wl is not None and _par.any_expr(list(wl)):
+                    line_geom[n] = wl
                 val = sig[n]
                 if _model_calls(val):
                     # A trainable parameter on a wire is recorded and evaluated at its CURRENT value for
@@ -1122,24 +1129,16 @@ class PEEC:
                 # A trainable parameter is recorded and replaced by its CURRENT value here: the
                 # discretisation is structure, it is frozen at build() anyway, and it must be
                 # concrete for the lattice's occupancy test. Only the VALUES are traced later.
-                if n in geo_pts or n in geo_rad:
-                    raise ValueError(
-                        f"jno.peec: {n!r} is a solid and attaches `path=` / `radius=`, which move a "
-                        "Shape.line. A solid's faces move with `.attach(faces=(x0, y0, z0, x1, y1, z1))`."
-                    )
-                if n in geo_faces:
-                    ent = _faces_entries(geo_faces[n])
-                    if not any(_model_calls(e) for e in ent):
-                        raise ValueError(
-                            f"jno.peec: {n!r} attaches `faces=` with no `jno.np.parameter` in it, so "
-                            "there is nothing to move: give the shape those coordinates instead."
+                if _par.has_params(sh._node):
+                    wb = _par.world_box(sh)
+                    if wb is None:
+                        raise NotImplementedError(
+                            f"jno.peec: the solid {n!r} has a `jno.np.parameter` in its coordinates, but it "
+                            "is not an axis-aligned box (a box, an extruded rect, either translated). A "
+                            "network moves a solid by moving its six faces' grid lines, which a CSG "
+                            "combination or another primitive does not have."
                         )
-                    size = sum(int(np.size(jax.lax.stop_gradient(jnp.asarray(_eval_material(e, {}))))) for e in ent)
-                    if size != 6:
-                        raise ValueError(
-                            f"jno.peec: `faces=` on {n!r} needs 6 values (x0, y0, z0, x1, y1, z1), got {size}."
-                        )
-                    solid_geom[n] = geo_faces[n]
+                    solid_geom[n] = wb
                 val = sig[n]
                 if _model_calls(val):
                     param_exprs[n] = val
@@ -1318,45 +1317,64 @@ class PEEC:
             solid_geom,
         )
 
-    def build(self) -> "BuiltPEEC":
-        """Freeze the discretisation and return the jittable :class:`BuiltPEEC`.
+    def _build(self) -> "BuiltPEEC":
+        """The discretisation, done once per network and kept: the jittable :class:`BuiltPEEC`.
 
         Everything structural -- which cells are metal, which nodes a pad owns, which filaments weld
-        to which -- is decided on the HOST from concrete geometry, and none of it can run under a
-        trace. ``.solve()`` does that work every call, so it is differentiable but not jittable, and
-        it redoes the same host pass on every design iteration.
-
-        ``build()`` is that pass, done once. What comes back solves in pure jax, so it jits, and its
-        conductivity is still free to be traced -- which is the split
-        :meth:`jno.precond.ams.build` and :class:`jno.trace.FemLinearSystem` already use::
-
-            emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6).build()   # host, once
-            jax.jit(lambda s: emag.solve(sigma={"trace": s}).L)(sig)   # traced, every iteration
+        to which -- is decided on the HOST from concrete geometry. It runs on the first `solve()` and
+        every later solve reuses it, so a design loop pays for it once and the solve jits; under a
+        trace it runs at compile time (`jax.ensure_compile_time_eval`), since none of it reads a
+        traced value. Rebuilt only when the coupled driver changes the field reference it was built at.
 
         **Scope, up front.** The STRUCTURE is frozen -- cell counts, ownership, numbering. A design
-        variable may change a conductivity, a wire's path and radius (`.attach(path=, radius=)`) and,
-        on a `faces` grid, a solid's faces (`.attach(faces=)` or `solve(geometry=)`), all of which
-        stretch the built cells; anything else -- a new pitch, a conductor added or re-ordered --
-        answers for the geometry you built, silently. Build again for a new one. The thickness runs behind the
-        skin term are frozen with it, so overriding a conductivity does not re-label which cells
-        count as one material.
+        variable may change a conductivity, a wire's vertices and radius and, on a `faces` grid, a
+        box's faces (parameters in the shape's coordinates, or `solve(geometry=)`), all of which
+        stretch the built cells; anything else -- a new pitch, a conductor added or re-ordered, a
+        domain changed after the first solve -- answers for the geometry first built, silently. Make
+        a new `jno.peec` for a new one. The thickness runs behind the skin term are frozen with it, so
+        overriding a conductivity does not re-label which cells count as one material.
         """
-        return BuiltPEEC(self, *self._discretise())
+        key = getattr(self, "_field_reference", None)
+        cached = getattr(self, "_built", None)
+        if cached is None or cached[0] != key:
+            with jax.ensure_compile_time_eval():
+                cached = (key, BuiltPEEC(self, *self._discretise()))
+            self._built = cached
+        return cached[1]
+
+    @property
+    def fil(self):
+        """The discretised network (filaments, nodes, and ``fil.lattice`` for a solid: its cell
+        counts ``n``, origin ``lo`` and pitch ``d``) -- what a per-cell parameter is laid out on.
+        Discretises the network if no solve has yet."""
+        return self._build().fil
+
+    @property
+    def nodes(self):
+        """``{terminal: node ids}`` -- which network nodes each terminal owns, the support a
+        ``solve(weights={terminal: w})`` distribution is laid out on (one weight per node)."""
+        return self._build().nodes
 
     def solve(self, **kw):
         """Solve at every frequency and return a :class:`PEECSolution`.
 
-        Discretises and solves in one call. For a design loop use :meth:`build` instead and solve
-        the result -- same answer, the host pass done once, and jittable. Keyword arguments are
-        those of :meth:`BuiltPEEC.solve` -- ``operator=`` for a graded lattice, for one.
+        The first call discretises the network (host work, see :meth:`_build`); every later call
+        reuses that discretisation and is pure jax, so it jits and differentiates::
+
+            emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6)
+            jax.jit(lambda s: emag.solve(sigma={"trace": s}).L)(sig)   # traced, every iteration
+
+        With a `jno.np.parameter` in the material or the geometry, the readouts are trace nodes for
+        `jno.core` instead. Keyword arguments are those of :meth:`BuiltPEEC.solve` -- ``sigma=``,
+        ``geometry=``, ``operator=`` for a graded lattice, and the rest.
         """
-        return self.build().solve(**kw)
+        return self._build().solve(**{**self._solve_kw, **kw})
 
 
 class BuiltPEEC:
     """A PEEC network with its discretisation frozen: the jittable, differentiable half.
 
-    Comes from :meth:`peec.build`. Holds the filaments, the terminal node sets and the conductivity
+    Made by the first :meth:`peec.solve` and kept on the network (:meth:`peec._build`). Holds the filaments, the terminal node sets and the conductivity
     resolvers -- all of it concrete -- so :meth:`solve` touches nothing but jax and can be put
     inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
     """
@@ -1393,13 +1411,13 @@ class BuiltPEEC:
         #: region -> attached material expression, for the regions whose material carries a
         #: `jno.np.parameter`. Non-empty makes `solve()` hand back trace nodes instead of numbers.
         self._param_exprs = dict(param_exprs or {})
-        #: line region -> (points expr, radius expr), for wires whose geometry is a design variable
+        #: line region -> (points, radius), entries numbers or expressions (`_par.world_line`), for wires whose geometry is a design variable
         self._line_geom, self._line_info = lines if lines is not None else ({}, None)
         #: solid region -> attached `faces=` (a 6-sequence or one expression), for solids whose faces
         #: are a design variable
         self._solid_geom = dict(solid_geom or {})
-        _geo_vals = [v for pr in self._line_geom.values() for v in pr if v is not None]
-        _geo_vals += [e for f in self._solid_geom.values() for e in _faces_entries(f)]
+        _geo_vals = [e for pr in self._line_geom.values() for e in _par.flat(list(pr))]
+        _geo_vals += [e for f in self._solid_geom.values() for e in _par.flat(f)]
         self._params = _parameters_in(list(self._param_exprs.values()) + _geo_vals)
         # Which nodes each pad owns is STRUCTURAL -- `terminal_nodes` reads coordinates, which are
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
@@ -1901,7 +1919,7 @@ def _renumber(blocks):
     return np.concatenate(out)
 
 
-def peec(constraints, *, freq=0.0, grid=None):
+def peec(constraints, *, freq=0.0, grid=None, operator=None, restart=None, matrix_free=None):
     """Build a partial-element circuit problem from its port constraints.
 
     Args:
@@ -1918,11 +1936,16 @@ def peec(constraints, *, freq=0.0, grid=None):
             a filament is not represented. Redistribution BETWEEN conductors is (that is what the
             method is for); to capture it inside one, split a conductor that is wide against the
             skin depth into filaments across its section.
+        operator, restart, matrix_free: how THIS network is solved -- the same settings
+            :meth:`BuiltPEEC.solve` takes, kept on the network so every solve uses them, the ones a
+            coupled ``jno.core([em, heat])`` runs included. A keyword given to ``solve()`` overrides
+            them for that call. ``grid=jno.peec.faces(...)`` needs ``operator=jno.solve.hierarchical(...)``
+            (or ``matrix_free=False``, dense) here, since its lattice has no FFT.
 
     Returns:
         :class:`PEEC` — call ``.solve()``.
     """
-    return PEEC(constraints, freq=freq, grid=grid)
+    return PEEC(constraints, freq=freq, grid=grid, operator=operator, restart=restart, matrix_free=matrix_free)
 
 
 def _graded(fine, halo):

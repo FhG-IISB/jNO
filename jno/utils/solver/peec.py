@@ -1369,7 +1369,7 @@ def solve_network(
         # And NOT reused across traces. A closure built inside a jit is only valid inside that jit:
         # even a bare `jnp.zeros(())` made there binds to the trace, so a later hit raises
         # UnexpectedTracerError. That never fired while every call rediscretised -- a fresh `fil`
-        # missed the cache every time -- and appeared the moment `.build()` made the identity stable.
+        # missed the cache every time -- and appeared the moment keeping the discretisation made the identity stable.
         # Skipping it under a trace costs nothing: XLA caches the compiled executable, so the reuse
         # this was written for (an eager sweep over frequencies) is the only case it was ever paying.
         # ...and keyed on the CONSTRAINT VALUES too, because the compiled closure captures the
@@ -1793,7 +1793,7 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
         sig = np.broadcast_to(np.asarray(jax.lax.stop_gradient(jnp.asarray(sigma)), dtype=float), span.shape)
     except (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError):
         # Inside a jit there is no value to read. Rather than go silent -- a guard that stops
-        # guarding the moment you make the loop fast is worse than none -- `peec.build()` runs this
+        # guarding the moment you make the loop fast is worse than none -- the first solve runs this
         # ONCE at the declared conductivity, and that is the conservative case: the verdict turns on
         # the skin depth, a design variable only ever lowers sigma, and a lower sigma is a DEEPER
         # skin depth and so a milder verdict. Whatever a density field does to it later, the
@@ -1805,7 +1805,7 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
     try:
         thick = np.asarray(jax.lax.stop_gradient(jnp.asarray(fil.skin)))
     except (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError):
-        return  # a traced lattice thickness: `peec.build()` already ran this at the reference
+        return  # a traced lattice thickness: the first solve already ran this at the reference
     cell = thick / np.maximum(span, 1)
     # Two conditions, and both are needed. The cells must be too coarse to resolve the distribution
     # (a cell wider than half a skin depth), AND the skin effect must actually be worth something at
@@ -1892,7 +1892,7 @@ def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
     # This is a connected-components question, so it is asked as one. It used to be a python
     # union-find over every filament and every node it touches: 685,194 calls to `find` on a
     # 113,800-bar network, 0.186 s a solve and 14 % of it on a GPU, to answer a question about
-    # geometry that `build()` had already frozen. `connected_components` does the same in C.
+    # geometry that the first solve had already frozen. `connected_components` does the same in C.
     from scipy.sparse.csgraph import connected_components
 
     nn, _ne = A.shape
@@ -2505,7 +2505,7 @@ def bar_filaments(
     # grid's -- the grid spans every conductor sharing it, which is not a design variable.
     #
     # Kept as a CLOSURE over the concrete pieces rather than a value, so the conductivity can be
-    # re-resolved later without redoing any of the host work above. That is what lets `.build()`
+    # re-resolved later without redoing any of the host work above. That is what lets the kept network
     # freeze the discretisation once and still take a traced conductivity on every solve.
     _sel = [np.flatnonzero(cell_part == si) for si in range(len(shapes))]
     _inv = np.empty(len(nodes), dtype=int)
@@ -2654,7 +2654,7 @@ def bar_filaments(
             # are derived from rather than the bar masks themselves.
             "cells": (nid >= 0),
             "sigma": bar_sigma,
-            # The conductivity RESOLVER, not just the value it produced: `.build()` keeps it and
+            # The conductivity RESOLVER, not just the value it produced: the kept network keeps it and
             # calls it again per solve, so a design variable never re-runs the host discretisation.
             "resolve": resolve,
             # The FFT generator needs one length and one self term PER AXIS FAMILY, and on a lattice
@@ -3768,8 +3768,9 @@ def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
         except jax.errors.TracerArrayConversionError as e:
             raise ValueError(
                 "peec: the near-field preconditioner is built on the host from concrete geometry, "
-                "and a geometry that is traced INSIDE a jit has no value to read. Freeze it with "
-                "`jno.peec(...).build()` and vary the conductivity instead, or drop the jit -- "
+                "and a geometry that is traced INSIDE a jit has no value to read. Solve the network "
+                "once outside the jit (it keeps its discretisation) and vary the conductivity "
+                "or move faces through `geometry=` instead, or drop the jit -- "
                 "under jax.grad alone the primal geometry is still concrete."
             ) from e
 

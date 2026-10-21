@@ -376,8 +376,11 @@ class ScalarView(_DelegatesToPlaceholder):
         """
         return ScalarView(new_expr)
 
-    def integrate(self, **kwargs) -> "ScalarView":
-        """Integrate the underlying scalar, preserving the ScalarView type."""
+    def integrate(self, *args, **kwargs) -> "ScalarView":
+        """Integrate the underlying scalar, preserving the ScalarView type. ``.integrate(fem)`` -- the integral over a FEM
+        solve, one traced number -- is handed through as the node it is."""
+        if args:
+            return self._expr.integrate(*args, **kwargs)
         return self._rewrap(self._expr.integrate(**kwargs))
 
     @property
@@ -685,8 +688,11 @@ class VectorView(_DelegatesToPlaceholder):
         underlying Placeholder must carry that layout. See :class:`ComplexVectorView`."""
         return ComplexVectorView(self._expr)
 
-    def integrate(self, **kwargs) -> "VectorView":
-        """Component-wise integral, preserving VectorView type."""
+    def integrate(self, *args, **kwargs) -> "VectorView":
+        """Component-wise integral, preserving VectorView type. ``.integrate(fem)`` -- the integral over a FEM
+        solve, one traced number -- is handed through as the node it is."""
+        if args:
+            return self._expr.integrate(*args, **kwargs)
         return self._rewrap(self._expr.integrate(**kwargs))
 
     @property

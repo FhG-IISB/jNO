@@ -35,7 +35,7 @@ def _welded(n_wire=6):
     d.tag("B", lambda x, y, z: x > 22.9 * mm)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
 
 
 def test_the_compressed_operator_gives_the_same_answer():
@@ -90,5 +90,5 @@ def test_a_plain_lattice_ignores_it():
     d.tag("B", lambda x, y, z: x > 18.9 * mm)
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
-    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build()
+    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
     assert float(np.real(e.solve().L)) == float(np.real(e.solve(operator=jno.solve.hierarchical(floor=0)).L))

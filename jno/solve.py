@@ -2179,7 +2179,7 @@ def hierarchical(*, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, floor: 
     This compresses those blocks instead. Clusters that are far apart compared to their own size
     couple through a numerically low-rank block, found by ACA from sampled rows and columns::
 
-        emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build()
+        emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
         sol = emag.solve(operator=jno.solve.hierarchical(tol=1e-6))
 
     **Opt-in, and exact without it.** The default path is unchanged, so this changes no existing

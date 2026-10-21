@@ -40,7 +40,7 @@ def _network():
     d.tag("B", lambda x, y, z: x > 18.99 * MM)
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]  # noqa: E731
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
 
 
 def _readouts(b):

@@ -40,7 +40,7 @@ def _net(sigma):
 
 
 def _ncell():
-    return int(np.prod(np.asarray(_net(CU).build().fil.lattice["n"])))
+    return int(np.prod(np.asarray(_net(CU).fil.lattice["n"])))
 
 
 def _rho(value=0.5, name="rho"):
@@ -113,7 +113,7 @@ def test_the_gradient_matches_the_hand_written_form_it_replaces():
     """`jno.fn(lambda r: ... built.solve(sigma={...}) ...)` already worked. The node has to give the
     same gradient, or it is a different objective wearing a nicer API."""
     ncell = _ncell()
-    built = _net(CU).build()
+    built = _net(CU)
 
     def hand(r):
         return jnp.real(built.solve(sigma={"bar": CU * r**3}).R)
@@ -173,7 +173,7 @@ def test_dissipation_and_field_are_nodes_too():
 def test_an_explicit_sigma_override_still_solves_concretely():
     """`solve(sigma=...)` names concrete values, so it is an escape hatch back to a number -- which
     is what a convergence check or a one-off evaluation wants."""
-    e = _net(CU * _rho() ** 3).build()
+    e = _net(CU * _rho() ** 3)
     sol = e.solve(sigma={"bar": CU})
     assert isinstance(complex(sol.Z), complex)
 

@@ -3830,7 +3830,10 @@ class FEM:
         def _run(u, *vals):
             return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
 
-        return FunctionCall(_run, [sol, *params], name="fem_integral")
+        from .utils.solver.parametric_helpers import mark_global_scalar
+
+        # one number per solve: usable as another FEM's coefficient, read once rather than per point
+        return mark_global_scalar(FunctionCall(_run, [sol, *params], name="fem_integral"), f"__fem_integral_{id(expr)}")
 
     def _functional_solution(self, solver=None):
         """The one solve every functional over this system shares.
@@ -6956,6 +6959,20 @@ def _fem_impl(
     classification.extend(f"slip@{spec[1]}" for spec in slip_bcs)
 
     _check_movable_bc_nodes(domain, dirichlet_raw, boundary_terms)
+    _plan = getattr(domain, "_shape_plan", None)
+    if _plan is not None and getattr(_plan, "_node", None) is not None:
+        from .geometry import parametric as _par
+
+        _wires = _par.unfollowed(_plan) if _par.has_params(_plan._node) else []
+        if _wires:
+            raise NotImplementedError(
+                f"jno.fem: the line region(s) {_wires} have `jno.np.parameter`s in their vertices or "
+                "radius. The mesh follows a design by stretching along x, y and z between face planes, "
+                "which does not move a tube along its own path, so this FEM would integrate over the "
+                "wire at its reference position whatever the design. Keep the parametric wire out of "
+                "the meshed domain (a jno.peec line on its own, its heat as point loads), or give it "
+                "numbers."
+            )
 
     if is_vpinn and multifield:
         # Single-field is a real boundary, not a guard: the network-trial lowering wraps ONE primary

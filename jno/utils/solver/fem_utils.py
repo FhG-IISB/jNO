@@ -580,7 +580,9 @@ def _gather_runtime_parameter_tags(node, out=None):
 
     if out is None:
         out = []
-    if _is_runtime_scalar_parameter(node):
+    from .parametric_helpers import _is_global_scalar
+
+    if _is_runtime_scalar_parameter(node) or _is_global_scalar(node):
         name = _parameter_name(node)
         if name not in out:
             out.append(name)
@@ -1768,6 +1770,13 @@ def _eval_integrand(domain, node, local):
         )
 
     if isinstance(node, FunctionCall):
+        from .parametric_helpers import _is_global_scalar, _parameter_name
+
+        if _is_global_scalar(node):
+            # one value per solve (another solver's readout): crux evaluated it, the kernel reads it
+            val = _runtime_parameter_value_from_internal_vars(local, _parameter_name(node))
+            if val is not None:
+                return val
         args = [_eval_integrand(domain, arg, local) for arg in node.args]
         kwargs = node.kwargs if node.kwargs else {}
         return node.fn(*args, **kwargs)

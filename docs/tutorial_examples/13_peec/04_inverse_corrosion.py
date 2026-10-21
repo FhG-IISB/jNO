@@ -51,7 +51,7 @@ def busbar(sigma):
 
 
 # --- which cells are in the corroded stretch: geometry, so it is decided once, on the host --------
-lat = busbar(CU).build().fil.lattice
+lat = busbar(CU).fil.lattice
 n, lo, d = (np.asarray(lat[k]) for k in ("n", "lo", "d"))
 ijk = np.stack(np.meshgrid(*[np.arange(v) for v in n], indexing="ij"), -1).reshape(-1, 3)
 x_c = lo[0] + (ijk[:, 0] + 0.5) * d[0]

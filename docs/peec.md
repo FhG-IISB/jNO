@@ -183,7 +183,7 @@ Pass `freq=` a scalar or an array. Each filament carries **one** current, and it
 geometric mean distance, so the skin effect **within** a filament is not resolved by subdivision — it
 enters as an analytic **surface impedance** on elements that span the whole thickness.
 
-That gives a hard rule, and `jno.peec` enforces it at `build()` rather than returning a wrong number:
+That gives a hard rule, and `jno.peec` enforces it when the network is discretised rather than returning a wrong number:
 
 !!! danger "One cell through the thickness, or thirty times finer"
     An element may take the surface impedance only when it **is** the whole thickness — there it is
@@ -222,7 +222,7 @@ core = (jno.shape.box(0, 0, 0, 0.024, 0.024, 0.008, size=(0.002,) * 3)
 
 d = (core + turn).domain()       # `turn`: one solid turn threading the window, elided here
 ...
-sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build().solve()
+sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).solve()
 print(float(sol.L) * 1e9)        # 916.7 nH, against mu0 mu_r A / l = 837.8 nH
 ```
 
@@ -305,28 +305,29 @@ sweep is a rebuild per point rather than a gradient — see [Geometry as a desig
 variable](#geometry-as-a-design-variable). The **permeability**, by contrast, is differentiable like
 any other material value: `jax.grad` through `mu_r` matches a central difference to five digits.
 
-## Freeze the geometry once — `build()`
+## The geometry is discretised once
 
-`solve()` redoes all of the host work — which cells are metal, which nodes a pad owns, which filaments
-weld to which — on every call. That differentiates, but it does not jit. A design loop wants that pass
-done **once**:
+The host work — which cells are metal, which nodes a pad owns, which filaments weld to which — runs on
+the **first** `solve()`, and the network keeps it. Every later solve reuses it, so a design loop pays
+for it once:
 
 ```python
-emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()   # host, once
+emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5)   # discretised on the first solve
 
 @jax.jit
 def loss(rho):
     return emag.solve(sigma={"trace": SIG * rho}).joule
 ```
 
-What comes back solves in **pure JAX**, so it jits and composes into `jno.core` through `jno.fn`
+A solve after the first is **pure JAX**, so it jits and composes into `jno.core` through `jno.fn`
 exactly as `fem.solve()` does — which is what puts a PEEC objective behind `.optimizer()`,
 `jno.optimizers.mma` and `jno.le`. Measured on a 1,540-bar plate: **42×** on the value and **23×** on
 the gradient, because the host pass, not the solve, was the cost.
 
-!!! warning "A built network freezes its GEOMETRY"
-    A design variable may change a **conductivity**, never a **shape**. Build again for a new shape.
-    The exception is the wire path — see below.
+!!! warning "A network freezes its STRUCTURE at the first solve"
+    A design variable may change a **conductivity**, and stretch the cells it was discretised into —
+    a wire's path and radius, a solid's faces on a `faces` grid (see below) — but never add or renumber
+    them. Make a new `jno.peec` for a new topology.
 
 ## Grading the mesh
 
@@ -483,7 +484,7 @@ the fixed point by `jax.lax.custom_root` -- implicit differentiation, not unroll
 !!! warning "Scope"
     The heat problem must be **linear** in its field (a constant or region-wise `k`), the field a scalar
     P1 field on the same domain, and the network solved at **one** frequency. The geometry is frozen at
-    the first solve, as for `build()`. A conductivity written in a FEM field cannot be solved without its
+    the first solve, as for any network. A conductivity written in a FEM field cannot be solved without its
     FEM problem: `em.solve()` refuses and names `jno.core([em, heat])`.
 
 `sol.em.dissipation()` still returns the `{region: W/m^3}` mapping, for a thermal model outside jNO.
@@ -610,7 +611,7 @@ numbering are. On a grid with a line on every conductor face those three are fix
 topology, and the lines themselves can move:
 
 ```python
-emag = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3)).build()   # every face a grid line
+emag = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3))   # every face a grid line
 op = jno.solve.hierarchical(tol=1e-6)
 L = lambda x0, x1: jnp.real(emag.solve(operator=op, geometry={"trace": (x0, y0, z0, x1, y1, z1)}).L)
 jax.grad(L, argnums=(0, 1))(x0, x1)                                          # exact, no rebuild
@@ -638,29 +639,39 @@ What it needs and what it refuses, up front:
 - **Wires are given separately.** A wire landing on a moved face must be moved with it through its own
   `geometry=` entry; `nodes` stays at the reference, since which nodes a pad owns is structural.
 
-#### In `jno.core`: `.attach(faces=...)`
+#### In `jno.core`: parameters in the shape's coordinates
 
-The same move, with the faces as `jno.np.parameter`s, is an attachment on the solid -- the counterpart
-of a wire's `.attach(path=..., radius=...)`. Its readouts are then trace nodes and go straight into
-`jno.core`:
+The same move, with the faces as `jno.np.parameter`s, is written where the numbers were -- in the
+shape. A box face, an extruded rect, a translation, a line's vertices and its radius all take an
+expression in parameters; the network's readouts are then trace nodes and go straight into `jno.core`:
 
 ```python
 w = jno.np.parameter((1,), name="w")
+w.initialize(jax.nn.initializers.constant(12e-3))           # the reference the network is built at
 w.optimizer(jno.optimizers.mma(move=0.2, lower=6e-3, upper=20e-3))
-trace = jno.shape.box(0, 0, 0, 12e-3, 2e-3, 5e-4, size=1e-3).attach(sigma=CU, faces=(0, 0, 0, w, 2e-3, 5e-4)).name("trace")
+trace = jno.shape.box(0, 0, 0, w, 2e-3, 5e-4, size=1e-3).attach(sigma=CU).name("trace")
+wire = jno.shape.line([(2e-3, 1e-3, 5e-4), (2e-3, 1e-3, 1.5e-3 + h), ...], r=rr).attach(sigma=AL).name("w")
 ...
-s = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3)).build().solve(operator=jno.solve.hierarchical(tol=1e-6))
+s = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3)).solve(operator=jno.solve.hierarchical(tol=1e-6))
 jno.core([s.L, jno.le(...)]).solve(50)
 ```
 
-`faces=` is six entries `(x0, y0, z0, x1, y1, z1)`, each a number or an expression in parameters, or
-one expression of six values. The network is built at the shape's own coordinates, so the parameters
-should start there; the rules above (no crossing, one value per shared line) hold unchanged. Refused by
-name: `faces=` with no parameter in it, not six values, on a `Shape.line`, or on a uniform lattice, and
-`path=` / `radius=` on a solid. A property `jno.peec` does not read (anything but `sigma`, `mu_r`,
-`path`, `radius`, `faces`) is named once in a warning: it may be a `jno.fem` coefficient on the same
+Settings of how a network is solved live on the network --
+`jno.peec(cons, freq, grid=jno.peec.faces(pitch=1e-3), operator=jno.solve.hierarchical(tol=1e-6))` (or
+`restart=`, `matrix_free=`) -- so every solve uses them, the coupled `jno.core([em, heat])` included; a
+keyword to `solve()` overrides them for that call. With a parameter in either problem the coupled solve
+returns the converged field as a trace node, and `node.em.L` / `.R` / `.current(t)` / `.dissipation()`
+are the network's readouts at that field, trace nodes too.
+
+Every parameter needs an initial value: the shape is built -- discretised, and meshed for a `jno.fem`
+on the same domain -- at the parameters' initial values, and moved from there under a trace. The rules
+above (no crossing, one value per shared line) hold unchanged. Refused by name: a parameter in a disk,
+cylinder, sphere, polygon, rotation, revolution or fillet (a curved surface does not move with the
+grid lines), a parametric solid that is not an axis-aligned box, a moved face on a uniform lattice,
+and the old `.attach(path=, radius=, faces=)` spelling. A property `jno.peec` does not read (anything
+but `sigma` and `mu_r`) is named once in a warning: it may be a `jno.fem` coefficient on the same
 domain, or a misspelling. Pinned against `solve(geometry=)` and central differences
-(`tests/test_peec_faces_parameter.py`).
+(`tests/test_peec_parametric_shape.py`).
 
 ## Validation
 
@@ -724,10 +735,10 @@ Every layer is checked against an oracle that does not go through the layer belo
 
 ## Cost — what to expect
 
-Measured on one CPU core-set, a copper bar discretised as a plain lattice. `build()` is the host pass;
-*first* includes the XLA compile; *warm* is a repeat solve on the built network.
+Measured on one CPU core-set, a copper bar discretised as a plain lattice. *Discretise* is the host pass
+of the first solve; *warm* is a repeat solve on the kept network.
 
-| bars | `build()` | warm solve (`R`), CPU | `L` |
+| bars | discretise | warm solve (`R`), CPU | `L` |
 |---|---|---|---|
 | 712 | 0.22 s | 0.04 s | 0.02 s |
 | 6,688 | 0.19 s | 0.16 s | 0.02 s |
@@ -737,8 +748,8 @@ Measured on one CPU core-set, a copper bar discretised as a plain lattice. `buil
 
 Three things to read off it.
 
-- **`build()` is cheap and flat.** The host pass is well under a second even at 57k bars. Building once
-  and solving many times is the intended shape, and it is why `build()` exists.
+- **The discretisation is cheap and flat.** The host pass is well under a second even at 57k bars, and
+  it runs once per network.
 - **The first solve is dominated by compilation**, not arithmetic — a few seconds against a warm solve
   of well under one. For a one-shot answer that is the number you feel; in a design loop it is paid once.
 - **The solve is linear in the bars**, and the frequency does not change its cost.

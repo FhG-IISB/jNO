@@ -46,7 +46,7 @@ def _built(pitch, freq=0.0):
     d.tag("B", lambda x, y, z: x > LX - (pitch[0] if isinstance(pitch, tuple) else pitch))
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq)
 
 
 @pytest.mark.parametrize("pitch", [0.002, 0.001])

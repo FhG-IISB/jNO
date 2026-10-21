@@ -243,7 +243,7 @@ def test_the_thickness_guard_runs_at_build_and_does_not_block_a_jit(caplog):
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]  # noqa: E731
 
     with caplog.at_level(logging.WARNING):
-        built = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build()
+        built = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)._build()
     assert "skin depth" in caplog.text, "the guard did not run at build"
     caplog.clear()
 

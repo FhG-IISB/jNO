@@ -56,7 +56,7 @@ def _module(wire, ground, freq=1e6):
         # short across part of the plane and not the pure reference the auto-pin applies
         d.tag("GND", lambda x, y, z: (x < 1.1 * mm) & (y < 1.1 * mm) & (z < T))
         cons.append(v(*at("GND")) - 0.0)
-    return jno.peec(cons, freq=freq).build()
+    return jno.peec(cons, freq=freq)
 
 
 def _solve(wire, ground):
@@ -108,7 +108,7 @@ def test_a_fully_connected_network_is_left_alone():
     log.setLevel(logging.INFO)
     log.addHandler(h)
     try:
-        s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build().solve()
+        s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).solve()
     finally:
         log.removeHandler(h)
     assert np.isfinite(float(np.real(s.R)))

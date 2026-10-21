@@ -25,7 +25,7 @@ def _solved(freq=0.0):
     d.tag("B", lambda x, y, z: x > 0.02 - 0.0011)
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).build().solve()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=freq).solve()
 
 
 def test_it_writes_a_file_a_reader_can_read_back(tmp_path):
@@ -74,6 +74,6 @@ def test_a_swept_solution_says_which_frequency_rather_than_guessing(tmp_path):
     d.tag("B", lambda x, y, z: x > 0.02 - 0.0011)
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-    sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=[0.0, 1e5]).build().solve()
+    sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=[0.0, 1e5]).solve()
     with pytest.raises(ValueError, match="which frequency|freq="):
         sol.export_vtk(str(pathlib.Path("/tmp") / "never-written.vtk"))

@@ -93,4 +93,4 @@ def test_a_tag_that_shares_a_region_name_is_refused():
     i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
     with pytest.raises(ValueError, match="both a region and a tag"):
-        jno.peec([v(*at("DCP")) - v(*at("N")) - 1.0], freq=1e3).build()
+        jno.peec([v(*at("DCP")) - v(*at("N")) - 1.0], freq=1e3)._build()

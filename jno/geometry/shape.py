@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from . import parametric as _par
 from .primitives import Box, Cylinder, Disk, Line, Polygon, Rect, Sphere, _to3
 
 # Nodes with no closed-form point membership. `sweep` follows an arbitrary path and `fillet`
@@ -676,6 +677,26 @@ class Selector:
         return local_name in self.names or key in self.keys
 
 
+def _leaf(prim, exprs=()):
+    """A leaf node; its parametric coordinates, if any, ride as a fourth entry ``((index, expr), ...)``."""
+    return ("leaf", prim, next(_LEAF_KEYS)) + ((tuple(exprs),) if exprs else ())
+
+
+def _no_params(what, *values):
+    """Refuse a parameter where a shape cannot move with one yet, by name rather than as float() failing."""
+    for v in values:
+        for q in v if isinstance(v, (list, tuple)) else (v,):
+            for c in q if isinstance(q, (list, tuple)) else (q,):
+                if _par.is_expr(c):
+                    raise NotImplementedError(
+                        f"jno.shape.{what}: a `jno.np.parameter` in its coordinates is not supported. A "
+                        "design moves the domain by stretching it along x, y and z between face planes, "
+                        "which follows a box, a rect, an extrusion height, a translation and a line's "
+                        f"vertices exactly, but not a {what}. Use one of those, or "
+                        "rebuild the shape at each design."
+                    )
+
+
 @dataclass(frozen=True)
 class shape:
     """An immutable geometry build-plan. Operators return new shapes.
@@ -707,19 +728,35 @@ class shape:
     # ----- primitive constructors ------------------------------------------------
     @classmethod
     def rect(cls, x0: float, y0: float, x1: float, y1: float, size: Size = None) -> "shape":
-        return cls(("leaf", Rect(x0, y0, x1, y1), next(_LEAF_KEYS)), 2, size)
+        """Axis-aligned rectangle. Any corner coordinate may be an expression in
+        ``jno.np.parameter``\\ s: the shape is built at their initial values and the expression kept
+        for the solvers to move it (see :mod:`jno.geometry.parametric`)."""
+        refs, ex = _par.split((x0, y0, x1, y1), "rect coordinate")
+        return cls(_leaf(Rect(*refs), ex), 2, size)
 
     @classmethod
     def disk(cls, cx: float, cy: float, r: float, size: Size = None) -> "shape":
+        _no_params("disk", cx, cy, r)
         return cls(("leaf", Disk(cx, cy, r), next(_LEAF_KEYS)), 2, size)
 
     @classmethod
     def box(cls, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float, size: Size = None) -> "shape":
-        return cls(("leaf", Box(x0, y0, z0, x1, y1, z1), next(_LEAF_KEYS)), 3, size)
+        """Axis-aligned box. Any face coordinate may be an expression in ``jno.np.parameter``\\ s::
+
+            w = jno.np.parameter((1,), name="w")
+            w.initialize(jax.nn.initializers.constant(12e-3))
+            trace = jno.shape.box(0, 0, 0, w, 20e-3, 3e-4, size=1e-3)   # its upper x face is a design variable
+
+        The shape is built -- meshed, sampled, discretised -- at the parameters' initial values, and
+        the expression is kept: the domain stretches its mesh and a PEEC network its grid lines to
+        where the parameters put the faces, under a trace (see :mod:`jno.geometry.parametric`)."""
+        refs, ex = _par.split((x0, y0, z0, x1, y1, z1), "box coordinate")
+        return cls(_leaf(Box(*refs), ex), 3, size)
 
     @classmethod
     def polygon(cls, points, size: Size = None) -> "shape":
         """Arbitrary 2-D polygon from ordered ``(x, y)`` vertices; edges auto-named ``e0, e1, ...``."""
+        _no_params("polygon", points)
         pts = tuple((float(px), float(py)) for px, py in points)
         return cls(("leaf", Polygon(pts), next(_LEAF_KEYS)), 2, size)
 
@@ -728,6 +765,7 @@ class shape:
         cls, x: float, y: float, z: float, dx: float, dy: float, dz: float, r: float, size: Size = None
     ) -> "shape":
         """Right cylinder: base centre ``(x,y,z)``, axis vector ``(dx,dy,dz)``, radius ``r``."""
+        _no_params("cylinder", x, y, z, dx, dy, dz, r)
         return cls(("leaf", Cylinder(x, y, z, dx, dy, dz, r), next(_LEAF_KEYS)), 3, size)
 
     @classmethod
@@ -747,27 +785,37 @@ class shape:
 
         Built as overlapping capsules (a cylinder per segment, a sphere at each interior joint), so a
         bend is smooth rather than notched on its outer side.
+
+        Any vertex coordinate and the radius may be expressions in ``jno.np.parameter``\\ s (a bond
+        wire's routing and gauge as design variables): built at their initial values, moved by the
+        solver that reads the line (see :mod:`jno.geometry.parametric`).
         """
         if (d is None) == (r is None):
             raise ValueError("shape.line: pass exactly one of d= (diameter) or r= (radius).")
-        rad = float(r) if r is not None else 0.5 * float(d)
+        rad_in = r if r is not None else (0.5 * d if _par.is_expr(d) else 0.5 * float(d))
+        rad = _par.reference(rad_in, "line radius")
         if rad <= 0:
             raise ValueError(f"shape.line: radius must be positive, got {rad}.")
 
         def _p3(q):
-            v = [float(c) for c in q]
+            v = list(q)
             if not 2 <= len(v) <= 3:
                 raise ValueError(f"shape.line: each point needs 2 or 3 coordinates, got {len(v)}.")
             return tuple(v + [0.0] * (3 - len(v)))
 
-        pts = tuple(_p3(q) for q in points)
-        if len(pts) < 2:
-            raise ValueError(f"shape.line: needs at least two points, got {len(pts)}.")
-        return cls(("leaf", Line(pts, rad), next(_LEAF_KEYS)), 3, size)
+        raw = [_p3(q) for q in points]
+        if len(raw) < 2:
+            raise ValueError(f"shape.line: needs at least two points, got {len(raw)}.")
+        flat, ex = _par.split([c for q in raw for c in q], "line vertex coordinate")
+        pts = tuple(tuple(flat[3 * k : 3 * k + 3]) for k in range(len(raw)))
+        # the radius is entry 3 * n_points of the flat list, after every vertex coordinate
+        ex = ex + (((3 * len(raw), rad_in),) if _par.is_expr(rad_in) else ())
+        return cls(_leaf(Line(pts, rad), ex), 3, size)
 
     @classmethod
     def sphere(cls, cx: float, cy: float, cz: float, r: float, size: Size = None) -> "shape":
         """Sphere centred ``(cx,cy,cz)`` radius ``r``."""
+        _no_params("sphere", cx, cy, cz, r)
         return cls(("leaf", Sphere(cx, cy, cz, r), next(_LEAF_KEYS)), 3, size)
 
     @classmethod
@@ -910,7 +958,9 @@ class shape:
     def extrude(self, height: float) -> "shape":
         if self.dim != 2:
             raise ValueError("extrude requires a 2-D shape")
-        return replace(self, _node=("extrude", self, float(height)), dim=3, _region_name=None)
+        h, ex = _par.split((height,), "extrusion height")
+        node = ("extrude", self, h[0]) + ((ex[0][1],) if ex else ())
+        return replace(self, _node=node, dim=3, _region_name=None)
 
     def revolve(self, axis_point, axis_dir, angle: float = 2.0 * math.pi) -> "shape":
         """Sweep a 2-D shape around an axis by ``angle`` radians into a 3-D solid.
@@ -924,6 +974,7 @@ class shape:
         """
         if self.dim != 2:
             raise ValueError("revolve requires a 2-D shape")
+        _no_params("revolve", axis_point, axis_dir, angle)
         ap = tuple(float(c) for c in axis_point)
         ad = tuple(float(c) for c in axis_dir)
         # Validate the axis up front: an unsupported axis (e.g. z, perpendicular to the profile)
@@ -939,13 +990,15 @@ class shape:
 
     def translate(self, vector) -> "shape":
         """Move the shape by ``vector`` (2- or 3-component). Boundary names are preserved."""
-        v = tuple(float(c) for c in vector)
-        if len(v) == 2:
-            v = (v[0], v[1], 0.0)
-        return replace(self, _node=("translate", self, v), _region_name=None)
+        vec = list(vector)
+        if len(vec) == 2:
+            vec = vec + [0.0]
+        v, ex = _par.split(vec, "translation")
+        return replace(self, _node=("translate", self, v) + ((ex,) if ex else ()), _region_name=None)
 
     def rotate(self, axis_point, axis_dir, angle: float) -> "shape":
         """Rotate ``angle`` radians about the axis through ``axis_point`` along ``axis_dir``."""
+        _no_params("rotate", axis_point, axis_dir, angle)
         ap = tuple(float(c) for c in axis_point)
         ad = tuple(float(c) for c in axis_dir)
         return replace(self, _node=("rotate", self, ap, ad, float(angle)), _region_name=None)
@@ -991,6 +1044,7 @@ class shape:
         edges). The rounded blend faces are unnamed (they fall into ``boundary``); the flat
         faces keep their names.
         """
+        _no_params("fillet", radius)
         return replace(self, _node=("fillet", self, float(radius), where), _region_name=None)
 
     def sized(self, size: Size) -> "shape":

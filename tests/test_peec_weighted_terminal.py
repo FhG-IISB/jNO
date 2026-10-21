@@ -32,7 +32,7 @@ def bar():
     d.tag("B", lambda x, y, z: x > LX - 6 * H)  # a WIDE pad, so weighting has room to matter
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(6, None))[:3]  # noqa: E731
-    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0).build()
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0)._build()
 
 
 # --- it reduces to the unweighted terminal where it should ------------------------------------------

@@ -102,7 +102,7 @@ def test_the_published_bar_converges_instead_of_diverging():
         d.tag("B", lambda x, y, z, p=p: y > L0 - p * 1.01)
         _i, v = d.peec_symbols()
         at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-        s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e3).build().solve()
+        s = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e3).solve()
         got.append(float(np.real(s.L)) * 1e9)
     # it converges from BELOW (the lattice conducts centre-to-centre, so a coarse grid is short),
     # so the test is that refining gets CLOSER, not that it decreases
