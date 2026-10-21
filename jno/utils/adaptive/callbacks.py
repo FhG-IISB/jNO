@@ -38,6 +38,10 @@ class Callback:
                 (the exact Python objects passed to ``jno.core([...])``).
                 Callbacks that take a ``constraints=`` arg validate user input
                 against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
             all_ops: List of OperationDef instances (the solver's compiled op set);
                 callbacks may pass this to ``TraceCompiler.compile_multi_expression``
                 to evaluate user-supplied placeholder expressions during training.
@@ -415,9 +419,18 @@ class EarlyStoppingCallback(Callback):
             the metric never improves beyond this value.
         verbose: If ``True``, log a message when stopping.
 
+    **With** ``jno.le`` / ``jno.ge`` / ``jno.eq`` **constraints** the total loss is the objective
+    alone, which rises while a constrained optimiser pulls an infeasible design back. So only a
+    *feasible* iterate (every inequality row ``<= 1e-6``, every equality row within ``1e-6`` of zero)
+    can be an improvement or count towards *patience*. The loss of an epoch is measured before its
+    update, so before stopping the design the solve would return, the updated one, is checked too:
+    if it is infeasible, training goes on until a stop lands on a feasible one. A run that never
+    becomes feasible therefore runs its full budget rather than stopping on a design that breaks
+    its constraints.
+
     Example::
 
-        cb = jno.callback.early_stopping(patience=1000, min_delta=1e-6)
+        cb = jno.callbacks.early_stopping(patience=1000, min_delta=1e-6)
         solver.solve(epochs=100_000, callbacks=[cb])
 
         print(cb.stopped_epoch)   # epoch at which training was halted
@@ -450,6 +463,9 @@ class EarlyStoppingCallback(Callback):
         self.stopped_epoch: Optional[int] = None
         self._wait = 0
         self._stopped = False
+        self._ineq: list = []
+        self._eq_cols: list = []
+        self._rows_at = None
 
     # -- comparison helpers --------------------------------------------------
 
@@ -465,7 +481,38 @@ class EarlyStoppingCallback(Callback):
 
     # -- hooks ---------------------------------------------------------------
 
+    def on_solve_begin(self, **kwargs) -> None:
+        self._ineq = list(kwargs.get("inequality_idx") or [])
+        eq = set(kwargs.get("equality_idx") or [])
+        # Positions of the equality rows among the constraint rows, which are in `_ineq` order.
+        self._eq_cols = [j for j, i in enumerate(self._ineq) if i in eq]
+        self._rows_at = None
+        fn = kwargs.get("compiled_inequality_fn")
+        if self._ineq and fn is not None:
+            import equinox as eqx
+            import jax.numpy as jnp
+            import paramax as _paramax
+
+            frozen, static = kwargs["frozen"], kwargs["static"]
+            bs, mc = kwargs.get("batchsize"), kwargs.get("min_consecutive", 1)
+
+            def rows(trainable, context, rng):
+                full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
+                return jnp.stack([jnp.mean(r) for r in fn(full, context, batchsize=bs, key=rng, min_consecutive=mc)])
+
+            self._rows_at = jax.jit(rows)
+
+    def _violation(self, g) -> float:
+        """The largest violation among constraint rows ``g`` (in ``inequality_idx`` order)."""
+        g = np.array(g, dtype=np.float64).reshape(-1)
+        g[self._eq_cols] = np.abs(g[self._eq_cols])
+        return float(g.max())
+
     def on_epoch_end(self, **kwargs) -> bool:
+        if self._ineq:
+            rows = np.asarray(jax.device_get(kwargs["individual_losses"])).reshape(-1)
+            if self._violation(rows[np.asarray(self._ineq)]) > 1e-6:
+                return False  # infeasible: neither an improvement nor a step towards patience
         current = self._metric_fn(**kwargs)
         epoch: int = kwargs["epoch"]
 
@@ -474,6 +521,13 @@ class EarlyStoppingCallback(Callback):
             self._wait = 0
         else:
             self._wait += 1
+
+        if self._wait >= self.patience and self._rows_at is not None:
+            # The rows above describe the design BEFORE this epoch's update; the solve returns the
+            # one after it. Stop only if that one is feasible as well.
+            after = jax.device_get(self._rows_at(kwargs["trainable"], kwargs["context"], kwargs["rng"]))
+            if self._violation(after) > 1e-6:
+                return False
 
         if self._wait >= self.patience:
             self._stopped = True

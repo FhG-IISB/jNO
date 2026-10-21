@@ -134,7 +134,8 @@ def le(expr, bound=0.0):
                   1e-3 * reg.mean])                 # a genuine penalty, summed
 
     With no constrained optimiser attached this raises at ``solve()`` rather than silently
-    ignoring the constraint.
+    ignoring the constraint. ``jno.le(g, b).auglag(mu=..., every=...)`` (or ``(g <= b).auglag()``)
+    enforces it with ANY optimiser through an augmented Lagrangian instead.
     """
     return Constraint(expr, bound, "le")
 
@@ -144,11 +145,38 @@ def ge(expr, bound=0.0):
     return Constraint(expr, bound, "ge")
 
 
+def eq(expr, bound=0.0):
+    """An equality constraint ``expr == bound``, enforced through an augmented Lagrangian.
+
+    Only ``jno.eq(g, b).auglag(mu=..., every=...)`` is accepted in ``jno.core``: MMA and GCMMA take
+    inequalities only. (``g == b`` cannot be written as a comparison, because ``==`` on jNO
+    expressions tests whether two nodes are the same.) Its multiplier may take either sign.
+    """
+    return Constraint(expr, bound, "eq")
+
+
+def auglag(constraint, mu=10.0, every=100):
+    """``jno.auglag(c, ...)`` is ``c.auglag(...)``: an augmented-Lagrangian constraint.
+
+    ``constraint`` is a :func:`le` / :func:`ge` / :func:`eq` constraint or a comparison ``a <= b`` /
+    ``a >= b``.
+    See :meth:`jno.trace.Constraint.auglag`.
+    """
+    if not hasattr(constraint, "auglag"):
+        raise TypeError(
+            f"jno.auglag takes jno.le(...)/jno.ge(...)/jno.eq(...) or a comparison `a <= b`, "
+            f"got {type(constraint).__name__}."
+        )
+    return constraint.auglag(mu=mu, every=every)
+
+
 __all__ = [
     "schedule",
     "core",
     "le",
     "ge",
+    "eq",
+    "auglag",
     "Constraint",
     "sampler",
     "domain",
