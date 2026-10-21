@@ -118,6 +118,9 @@ def _boundary_shells(facets: np.ndarray) -> np.ndarray:
     return np.asarray(labels, dtype=np.int64)
 
 
+_CELL_DIM = {"vertex": 0, "line": 1, "triangle": 2, "quad": 2, "tetra": 3, "hexahedron": 3, "wedge": 3, "pyramid": 3}
+
+
 def _derive_region_cell_sets(mesh, dim: int):
     """Give a loaded mesh the ``interior`` / ``boundary`` tags jNO's own constructors write.
 
@@ -136,8 +139,11 @@ def _derive_region_cell_sets(mesh, dim: int):
     internal cavity or a second body can be addressed on its own; a single-shell part gains no
     numbered tags, since they would only be noise.
 
-    Returns ``(mesh, added)`` — the mesh (possibly with a facet block appended) and the tag names
-    created, for logging.
+    A ``.msh`` 2.2 file's physical groups (``gmsh:physical`` cell data named by ``field_data``) are
+    turned into cell sets first, so they are tags like those of a 4.1 file.
+
+    Returns ``(mesh, named, added)`` — the mesh (possibly with a facet block appended), the physical
+    group names read from the file and the tag names derived here, for logging.
     """
     from .mesh_utils import MeshUtils, p1_cells_dict
 
@@ -146,12 +152,36 @@ def _derive_region_cell_sets(mesh, dim: int):
     cd = p1_cells_dict(mesh) if getattr(mesh, "cells_dict", None) else {}
     cell_type = next((n for n in _VOLUME_BLOCKS_BY_DIM.get(int(dim), ()) if n in cd), None)
     if cell_type is None:
-        return mesh, []  # no volume cells: a surface/shell mesh, refused with its own message
+        return mesh, [], []  # no volume cells: a surface/shell mesh, refused with its own message
     existing = dict(getattr(mesh, "cell_sets", None) or {})
+    # A .msh 2.2 file carries its physical groups as `gmsh:physical` cell data and a name table
+    # (`field_data`: name -> [id, dim]), not as `cell_sets` (meshio fills those for 4.1 only). Every
+    # named group becomes a cell set here, so a face the author called `inlet` is a tag like any other.
+    physical = (getattr(mesh, "cell_data", None) or {}).get("gmsh:physical")
+    named = []
+    if physical is not None:
+        for name, (gid, gdim) in (getattr(mesh, "field_data", None) or {}).items():
+            if name in existing:
+                continue
+            sets_ = [
+                np.flatnonzero(np.asarray(ids) == gid).astype(np.int64)
+                if _CELL_DIM.get(_base_cell_type(b.type)) == int(gdim)
+                else np.array([], dtype=np.int64)
+                for b, ids in zip(mesh.cells, physical)
+            ]
+            if any(len(x) for x in sets_):
+                existing[name] = sets_
+                named.append(name)
     want_interior = "interior" not in existing
     want_boundary = "boundary" not in existing
     if not (want_interior or want_boundary):
-        return mesh, []
+        if named:
+            return (
+                meshio.Mesh(points=mesh.points, cells=list(mesh.cells), cell_sets=existing, field_data=mesh.field_data),
+                named,
+                [],
+            )
+        return mesh, [], []
 
     # `cells_dict` AGGREGATES same-type blocks, but `mesh.cells` keeps them split -- meshio emits one
     # block per gmsh entity, and a real CAD file has many (a sensor model here has 97). The boundary
@@ -195,7 +225,7 @@ def _derive_region_cell_sets(mesh, dim: int):
                 sets[f"boundary_{k}"] = sk
                 added.append(f"boundary_{k}")
 
-    return meshio.Mesh(points=mesh.points, cells=blocks, cell_sets=sets, field_data=mesh.field_data), added
+    return meshio.Mesh(points=mesh.points, cells=blocks, cell_sets=sets, field_data=mesh.field_data), named, added
 
 
 def _is_lazy_source(obj: Any) -> bool:
@@ -3467,7 +3497,9 @@ class domain(MeshIOMixin):
             _refuse_mixed_cells(mesh, int(self.dimension))
             # AFTER `_drop_orphan_nodes`, which renumbers nodes, and BEFORE the tag machinery, so a
             # derived tag goes through exactly the same path as one the file defined.
-            mesh, _added = _derive_region_cell_sets(mesh, int(self.dimension))
+            mesh, _named, _added = _derive_region_cell_sets(mesh, int(self.dimension))
+            if _named:
+                self.log.info(f"Mesh physical groups {_named}")
             if _added:
                 self.log.info(f"Derived mesh regions {_added} (not defined by the file)")
             self.mesh = mesh
