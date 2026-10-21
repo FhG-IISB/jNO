@@ -521,6 +521,15 @@ class PEECSolution:
         return out if jnp.ndim(self._port) else out[0]
 
 
+#: the `.attach(...)` properties a PEEC network reads; any other is named once by `peec._discretise`
+_PEEC_PROPS = frozenset({"sigma", "mu_r", "path", "radius", "faces"})
+
+
+def _faces_entries(val):
+    """An attached ``faces=`` as a list of entries: a 6-sequence as given, an expression as itself."""
+    return list(val) if isinstance(val, (list, tuple)) else [val]
+
+
 def _model_calls(node):
     """Trainable-parameter nodes inside an attached value, or nothing if it is a plain number."""
     from jno.trace import Placeholder
@@ -743,9 +752,11 @@ class ParametricSolution:
     ``solve(sigma=...)`` with concrete values is the way back to a plain number.
     """
 
-    def __init__(self, built, exprs, params, solve_kw=None, geometry=None):
+    def __init__(self, built, exprs, params, solve_kw=None, geometry=None, faces=None):
         self._b, self._exprs, self._params = built, dict(exprs), dict(params)
         self._geom = dict(geometry or {})
+        #: solid region -> attached `faces=`, evaluated at the parameter values on every solve
+        self._faces = dict(faces or {})
         #: what `solve(...)` was given besides the material -- `operator=` for a graded lattice --
         #: replayed on every traced solve, so a parametric readout solves the network it was asked to
         self._solve_kw = dict(solve_kw or {})
@@ -809,7 +820,10 @@ class ParametricSolution:
                         "(`CU * (0.01 + 0.99 * rho**3)`) both fixes it and is better conditioned."
                     )
             ev = lambda e: None if e is None else _eval_material(e, at)
-            geo = {n: (ev(p), ev(r)) for n, (p, r) in self._geom.items()} or None
+            geo = {n: (ev(p), ev(r)) for n, (p, r) in self._geom.items()}
+            for n, f in self._faces.items():
+                geo[n] = [x for e in _faces_entries(f) for x in jnp.reshape(jnp.asarray(ev(e), dtype=float), (-1,))]
+            geo = geo or None
             sol = self._b.solve(sigma=mats if mats else {}, geometry=geo, **self._solve_kw)
             out = getattr(sol, kind)
             if callable(out):
@@ -981,6 +995,32 @@ class PEEC:
         # positions and the gauge move (see `line_filaments(points=, radii=)`).
         geo_pts, geo_rad = _attached("path"), _attached("radius")
         line_geom: dict = {}
+        # The same for a solid: `.attach(faces=(x0, y0, z0, x1, y1, z1))` with entries in
+        # `jno.np.parameter`s moves its faces on a `faces` grid (`BuiltPEEC._with_solids`).
+        geo_faces = _attached("faces")
+        solid_geom: dict = {}
+        # A property this network does not read is not an error -- the same domain may carry a
+        # `jno.fem` problem's coefficients -- but a misspelt `sigma` or `faces` would otherwise be
+        # dropped without a word, so it is named once.
+        _props = self.domain.__dict__.get("_region_attachments") or {}
+        _unread = {
+            p: sorted(r for r in regs if r in regions or r == type(self.domain)._DEFAULT_TARGET)
+            for p, regs in _props.items()
+            if p not in _PEEC_PROPS
+        }
+        _unread = {
+            p: [r if r != type(self.domain)._DEFAULT_TARGET else "<default>" for r in rs] for p, rs in _unread.items() if rs
+        }
+        if _unread:
+            from .utils.solver.peec import _warn_once
+
+            _warn_once(
+                "jno.peec: "
+                + "; ".join(f"{p!r} on {rs}" for p, rs in sorted(_unread.items()))
+                + f" -- jno.peec reads only {sorted(_PEEC_PROPS)}, so these do nothing in the network. "
+                "Fine if they are coefficients of a jno.fem problem on the same domain; otherwise check "
+                "the spelling."
+            )
         # `d.attach(sigma=...)` with no target is the default for every region that declares neither
         # a conductivity nor a permeability -- the same rule `d.<name>` applies to a FEM coefficient.
         _default = type(self.domain)._DEFAULT_TARGET
@@ -1059,6 +1099,11 @@ class PEEC:
                 _ref = _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])})
                 sig[n] = _ref[0] if _ref.size == 1 else _ref
             if kind == "Line":
+                if n in geo_faces:
+                    raise ValueError(
+                        f"jno.peec: {n!r} is a Shape.line and attaches `faces=`, which moves a solid's "
+                        "faces. A wire moves with `.attach(path=..., radius=...)`."
+                    )
                 if _model_calls(geo_pts.get(n)) or _model_calls(geo_rad.get(n)):
                     line_geom[n] = (geo_pts.get(n), geo_rad.get(n))
                 val = sig[n]
@@ -1077,6 +1122,24 @@ class PEEC:
                 # A trainable parameter is recorded and replaced by its CURRENT value here: the
                 # discretisation is structure, it is frozen at build() anyway, and it must be
                 # concrete for the lattice's occupancy test. Only the VALUES are traced later.
+                if n in geo_pts or n in geo_rad:
+                    raise ValueError(
+                        f"jno.peec: {n!r} is a solid and attaches `path=` / `radius=`, which move a "
+                        "Shape.line. A solid's faces move with `.attach(faces=(x0, y0, z0, x1, y1, z1))`."
+                    )
+                if n in geo_faces:
+                    ent = _faces_entries(geo_faces[n])
+                    if not any(_model_calls(e) for e in ent):
+                        raise ValueError(
+                            f"jno.peec: {n!r} attaches `faces=` with no `jno.np.parameter` in it, so "
+                            "there is nothing to move: give the shape those coordinates instead."
+                        )
+                    size = sum(int(np.size(jax.lax.stop_gradient(jnp.asarray(_eval_material(e, {}))))) for e in ent)
+                    if size != 6:
+                        raise ValueError(
+                            f"jno.peec: `faces=` on {n!r} needs 6 values (x0, y0, z0, x1, y1, z1), got {size}."
+                        )
+                    solid_geom[n] = geo_faces[n]
                 val = sig[n]
                 if _model_calls(val):
                     param_exprs[n] = val
@@ -1169,6 +1232,12 @@ class PEEC:
                 0 if line_info is None else line_info[3],
                 0 if line_info is None else line_info[4],
             )
+            if solid_geom and not fb.lattice.get("graded"):
+                raise ValueError(
+                    f"jno.peec: {sorted(solid_geom)} attach `faces=`, but a solid's faces can only move on a "
+                    "grid whose faces are grid lines. Build with grid=jno.peec.faces(pitch=...) and solve "
+                    "with operator=jno.solve.hierarchical(...)."
+                )
             blocks.append((tuple(solid_names), fb.lattice["resolve"]))
             parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)
@@ -1246,6 +1315,7 @@ class PEEC:
             param_exprs,
             (line_geom, line_info if lines else None),
             solid_info if solids else None,
+            solid_geom,
         )
 
     def build(self) -> "BuiltPEEC":
@@ -1263,9 +1333,11 @@ class PEEC:
             emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6).build()   # host, once
             jax.jit(lambda s: emag.solve(sigma={"trace": s}).L)(sig)   # traced, every iteration
 
-        **Scope, up front.** The geometry is frozen, so a design variable may change a conductivity
-        but not a shape: move a conductor, change a pitch or re-route a wire and the answer is for
-        the geometry you built, silently. Build again for a new one. The thickness runs behind the
+        **Scope, up front.** The STRUCTURE is frozen -- cell counts, ownership, numbering. A design
+        variable may change a conductivity, a wire's path and radius (`.attach(path=, radius=)`) and,
+        on a `faces` grid, a solid's faces (`.attach(faces=)` or `solve(geometry=)`), all of which
+        stretch the built cells; anything else -- a new pitch, a conductor added or re-ordered --
+        answers for the geometry you built, silently. Build again for a new one. The thickness runs behind the
         skin term are frozen with it, so overriding a conductivity does not re-label which cells
         count as one material.
         """
@@ -1290,7 +1362,18 @@ class BuiltPEEC:
     """
 
     def __init__(
-        self, spec, fil, terms, part_names, resolve, mag=None, mag_names=(), param_exprs=None, lines=None, solids=None
+        self,
+        spec,
+        fil,
+        terms,
+        part_names,
+        resolve,
+        mag=None,
+        mag_names=(),
+        param_exprs=None,
+        lines=None,
+        solids=None,
+        solid_geom=None,
     ):
         self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
         #: (names, shapes, lattice dict, first sub-point row, first element) of the solid block, for
@@ -1312,7 +1395,11 @@ class BuiltPEEC:
         self._param_exprs = dict(param_exprs or {})
         #: line region -> (points expr, radius expr), for wires whose geometry is a design variable
         self._line_geom, self._line_info = lines if lines is not None else ({}, None)
+        #: solid region -> attached `faces=` (a 6-sequence or one expression), for solids whose faces
+        #: are a design variable
+        self._solid_geom = dict(solid_geom or {})
         _geo_vals = [v for pr in self._line_geom.values() for v in pr if v is not None]
+        _geo_vals += [e for f in self._solid_geom.values() for e in _faces_entries(f)]
         self._params = _parameters_in(list(self._param_exprs.values()) + _geo_vals)
         # Which nodes each pad owns is STRUCTURAL -- `terminal_nodes` reads coordinates, which are
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
@@ -1522,7 +1609,7 @@ class BuiltPEEC:
                 perpendicular bar families, those blocks are detected and stored densely, and the
                 measured compression is 1.00x. See :mod:`~jno.utils.solver.hmatrix`.
         """
-        if (self._param_exprs or self._line_geom) and sigma is None:
+        if (self._param_exprs or self._line_geom or self._solid_geom) and sigma is None:
             # The material carries a trainable parameter, so the readouts are trace nodes over it and
             # crux threads the values -- the same treatment `jno.rcwa` gives its readouts. Naming
             # concrete values in `sigma=` is the way back to a number.
@@ -1539,7 +1626,7 @@ class BuiltPEEC:
                 # traced solves `jno.core` runs later find them cached instead of trying to build
                 # them from tracers.
                 self.solve(sigma={}, **kw)
-            return ParametricSolution(self, self._param_exprs, self._params, kw, self._line_geom)
+            return ParametricSolution(self, self._param_exprs, self._params, kw, self._line_geom, self._solid_geom)
         fil, nodes, terms = self.fil, self.nodes, self.terminals
         if geometry:
             line_names = set(self._line_info[1]) if self._line_info is not None else set()

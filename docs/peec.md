@@ -638,6 +638,30 @@ What it needs and what it refuses, up front:
 - **Wires are given separately.** A wire landing on a moved face must be moved with it through its own
   `geometry=` entry; `nodes` stays at the reference, since which nodes a pad owns is structural.
 
+#### In `jno.core`: `.attach(faces=...)`
+
+The same move, with the faces as `jno.np.parameter`s, is an attachment on the solid -- the counterpart
+of a wire's `.attach(path=..., radius=...)`. Its readouts are then trace nodes and go straight into
+`jno.core`:
+
+```python
+w = jno.np.parameter((1,), name="w")
+w.optimizer(jno.optimizers.mma(move=0.2, lower=6e-3, upper=20e-3))
+trace = jno.shape.box(0, 0, 0, 12e-3, 2e-3, 5e-4, size=1e-3).attach(sigma=CU, faces=(0, 0, 0, w, 2e-3, 5e-4)).name("trace")
+...
+s = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3)).build().solve(operator=jno.solve.hierarchical(tol=1e-6))
+jno.core([s.L, jno.le(...)]).solve(50)
+```
+
+`faces=` is six entries `(x0, y0, z0, x1, y1, z1)`, each a number or an expression in parameters, or
+one expression of six values. The network is built at the shape's own coordinates, so the parameters
+should start there; the rules above (no crossing, one value per shared line) hold unchanged. Refused by
+name: `faces=` with no parameter in it, not six values, on a `Shape.line`, or on a uniform lattice, and
+`path=` / `radius=` on a solid. A property `jno.peec` does not read (anything but `sigma`, `mu_r`,
+`path`, `radius`, `faces`) is named once in a warning: it may be a `jno.fem` coefficient on the same
+domain, or a misspelling. Pinned against `solve(geometry=)` and central differences
+(`tests/test_peec_faces_parameter.py`).
+
 ## Validation
 
 Every layer is checked against an oracle that does not go through the layer below it.
