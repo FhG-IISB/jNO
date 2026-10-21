@@ -299,6 +299,38 @@ def test_a_laplacian_of_a_laplacian_matches_the_per_node_path():
     assert np.allclose(got, want, rtol=1e-3, atol=1e-4), np.abs(got - want).max()
 
 
+def test_third_and_fourth_order_derivatives_match_the_per_node_path():
+    """Order 3 by nested shared passes, order 4 by univariate Taylor passes: ``u_xxx``, ``d/dx Lap u``,
+    ``d/dt Lap u`` (time as a coordinate), ``u_xxxx`` and ``d/dt d/dx Lap u``."""
+
+    def build():
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0, 1.0, 4))
+        x, y, t = dom.variable("interior")
+        net = jno.nn(foundax.mlp(in_features=3, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
+        u = (net(x, y, t) * x * (1 - x)).scalar.bind(x=x, y=y, t=t)
+        r, h = PER_NODE, "automatic_differentiation:fwd-over-rev"
+        shared = [
+            u.d(x).d(x).d(x),
+            u.laplacian(x, y).d(x),
+            u.laplacian(x, y).d(t),
+            u.d(x).d(x).d(x).d(x),
+            u.laplacian(x, y).d(x).d(t),
+        ]
+        per_node = [
+            u.d(x, scheme=r).d(x, scheme=r).d(x, scheme=r),
+            u.laplacian(x, y, scheme=h).d(x, scheme=r),
+            u.laplacian(x, y, scheme=h).d(t, scheme=r),
+            u.d(x, scheme=r).d(x, scheme=r).d(x, scheme=r).d(x, scheme=r),
+            u.laplacian(x, y, scheme=h).d(x, scheme=r).d(t, scheme=r),
+        ]
+        return dom, shared, per_node, net
+
+    got, want = _per_node_vs_shared(build)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape
+        assert np.allclose(g, w, rtol=1e-3, atol=1e-4), np.abs(g - w).max()
+
+
 def test_an_ad_derivative_of_a_target_that_couples_points_raises():
     """``u - mean(u)`` at one point depends on every point; its per-point AD derivative used to be returned
     silently as if it did not. The coupling is measured when the problem is compiled."""

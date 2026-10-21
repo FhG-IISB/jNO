@@ -95,6 +95,10 @@ couples points -- `u - jno.np.mean(u, axis=0)`, attention across points, an oper
 -- naming `scheme="finite_difference"` instead. For a pointwise target, the value of a field that is also
 differentiated (`u` in `u * u.d(x)`) comes from the derivative pass rather than a second evaluation.
 
+Derivatives of order four and up (`u.laplacian(x, y).laplacian(x, y)`, `u.d(x).d(x).d(x).d(x)`) come
+from univariate Taylor passes along a few fixed directions, which give every mixed partial of that order
+exactly (Griewank, Utke & Walther, *Math. Comp.* 69, 1117 (2000)).
+
 #### Spectral differentiation
 
 On a uniform grid the derivative is a multiply in Fourier space, which is **exact** for a
