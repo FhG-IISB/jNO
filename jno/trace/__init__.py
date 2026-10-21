@@ -4812,6 +4812,7 @@ class FemResidualOperator:
         ``u0`` is the initial guess (default: zeros of the operator size; enable
         x64 — the residual is float64).
         """
+        default_start = u0 is None
         if u0 is None:
             if self.size is None:
                 raise ValueError("FemResidualOperator.solve: pass u0= (operator size is unknown).")
@@ -4839,15 +4840,30 @@ class FemResidualOperator:
         # wrapper needs them when a slip surface moves with runtime coordinates (its P is rebuilt per solve).
         _xa = (lambda a: {"args": a}) if getattr(solve_fn, "wants_args", False) else (lambda a: {})  # noqa: E731
 
-        def _solve(*values):
-            args = dict(zip(names, values))
-            residual_fn = lambda u: self.residual(u, args)  # noqa: E731
+        def _drive(driver, u_start, args):
             # A sparse-direct Newton (``jno.solve.newton(direct=True)``) flags ``wants_jacobian`` and
             # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
             # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
-            if _takes_jacobian(solve_fn) and self.jacobian is not None:
-                return solve_fn(residual_fn, u0, jacobian=self._jacobian_handle(args), **_xa(args))
-            return solve_fn(residual_fn, u0, **_xa(args))
+            def call(res, x0, jac):
+                if _takes_jacobian(driver) and jac is not None:
+                    return driver(res, x0, jacobian=jac, **_xa(args))
+                return driver(res, x0, **_xa(args))
+
+            # From the default start (zeros) on a problem with non-zero prescribed values, first take the
+            # linearised step that carries the boundary increment into the interior (`dirichlet_lift_start`);
+            # otherwise Newton would begin at the projected start, which a large prescribed displacement
+            # can turn inside out. Decided statically -- a caller's own `x0` is left alone -- and called
+            # plainly, so a driver that works on the host runs it as it runs any solve. Only an initial
+            # guess: no gradient flows through it.
+            lift = getattr(self, "lift_start", None) if default_start else None
+            if lift is not None:
+                res_l, jac_l, _gap = lift(u_start, args)
+                u_start = jax.lax.stop_gradient(call(res_l, u_start, jac_l))
+            jac = self._jacobian_handle(args) if self.jacobian is not None else None
+            return call(lambda u: self.residual(u, args), u_start, jac)
+
+        def _solve(*values):
+            return _drive(solve_fn, u0, dict(zip(names, values)))
 
         if values is None:
             node = FunctionCall(_solve, params, name="fem_solve")
@@ -4886,12 +4902,8 @@ class FemResidualOperator:
             first = solve_fn  # the program holds THIS solver's spec objects; a later call binds its own arrays
 
             def _run(u0_arg, pstates, *value_args):
-                args = dict(zip(names, value_args))
-                rf = lambda u: self.residual(u, args)  # noqa: E731
                 with bound_state(precond_state(getattr(first, "precond", None))[0], pstates):
-                    if _takes_jacobian(first) and self.jacobian is not None:
-                        return first(rf, u0_arg, jacobian=self._jacobian_handle(args), **_xa(args))
-                    return first(rf, u0_arg, **_xa(args))
+                    return _drive(first, u0_arg, dict(zip(names, value_args)))
 
             if names:
                 fn = cache[key] = jax.jit(_run)

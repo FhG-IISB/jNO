@@ -54,6 +54,7 @@ from .fem_1d import (
     _integrate_term,
     _line_quadrature,
     _region_node_ids,
+    dirichlet_lift_start,
     dirichlet_projection,
 )
 from .fem_cover import COVER_ORDER as COVER_DEGREE
@@ -5513,7 +5514,7 @@ def assemble_fem_native(
                 def jac_diag_p(u, args=None, t=0.0, _d=_all_d):
                     return jacobian(_hold_project(u, args, t), t, args, diag=True).at[_d].set(1.0)
 
-                _constrained = _all_d
+                _constrained, _proj_p, _held = _all_d, _hold_project, True
             else:
 
                 def _s_project(u, _d=s_d_dofs, _g=s_d_vals):
@@ -5533,10 +5534,19 @@ def assemble_fem_native(
                     dg = jacobian(_s_project(u), t, args, diag=True)
                     return dg if _d is None else dg.at[_d].set(1.0)
 
-                _constrained = s_d_dofs
+                _constrained, _proj_p, _held = s_d_dofs, (lambda u, args=None, t=0.0: _s_project(u)), False
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
             _op.jacobian_diag = jac_diag_p
+            # only where a prescribed value can be non-zero: a held (args- or time-dependent) value, or a
+            # static one that is not all zeros. A homogeneous problem starts consistent and skips the step.
+            if _constrained is not None and (_held or bool(jnp.any(s_d_vals != 0))):
+                _op.lift_start = lambda u0, args=None: dirichlet_lift_start(
+                    lambda uu: residual(uu, 0.0, args),
+                    lambda uu: jacobian(uu, 0.0, args),
+                    lambda uu: _proj_p(uu, args, 0.0),
+                    _constrained,
+                )(u0)
             _op.linear_in_unknown = linear_in_unknown
             # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
             # (``staggered(over_relax>1)``) must leave these alone: the sub-solve already puts them exactly
@@ -5613,6 +5623,11 @@ def assemble_fem_native(
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
         _op_np.jacobian_diag = _jac_diag_np
+        if dirichlet_pairs and any(float(v) != 0.0 for _dof, v in dirichlet_pairs):
+            _ld, _lv, _lproj = dirichlet_projection(dirichlet_pairs)
+            _op_np.lift_start = lambda u0, args=None: dirichlet_lift_start(
+                lambda uu: residual(uu, 0.0, args), lambda uu: jacobian(uu, 0.0, args), _lproj, _ld
+            )(u0)
         _op_np.linear_in_unknown = linear_in_unknown
         # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating
         # driver (``staggered(over_relax != 1)``) must leave them alone. Missing here, every NON-parametric
