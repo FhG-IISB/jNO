@@ -7,7 +7,7 @@ spellings on three different classes. `jno.info` is the one front door.
 ```python
 print(jno.info())                    # the environment: x64, device, memory, versions
 print(jno.info(d))                   # a domain: mesh, quality, tags, attachments
-print(jno.info(fem))                 # a form: mode, blocks, every term as classified
+print(jno.info(fem))                 # a form: mode, every term as written and as classified, blocks
 print(jno.info(fem, deep=True))      # + operator symmetry and empty rows
 print(jno.info(jno.solve.newton(direct=True)))   # what a spec actually does
 ```
@@ -85,31 +85,51 @@ Tag extents are the check that `lambda x, y: y > 1 - 1e-9` caught the edge you m
 
 ## A form
 
-A Taylor–Hood Stokes cavity (P2 velocity `u`, P1 pressure `p`, pinned):
+A Poisson problem on two regions, the conductivity `k` attached per region:
 
 ```
   form
-    mode           linear
-    dofs           350
-    saddle blocks  p
-  terms (as classified)
-    [0]  volume
-    [1]  volume
-    [2]  dirichlet@boundary[x]
-    [3]  dirichlet@boundary[y]
-    [4]  dirichlet@_gauge_pin_p
+    mode  linear
+    dofs  50
+  equations
+    [0] volume              ∫ (k (∂u/∂x ∂φ/∂x + ∂u/∂y ∂φ/∂y) − φ) dx
+    [1] dirichlet@boundary  u = 0
   field blocks
-    u  dofs 0:306  (306) · value_shape (2,) · P2
-    p  dofs 306:350  (44) · P1
+    u  dofs 0:50  (50) · P1
   operator
-    nnz               4,237  ·  fill 3.46e-02  ·  ~12.1/row
-    dense equivalent  957.0 kB
+    nnz               172  ·  fill 6.88e-02  ·  ~3.4/row
+    dense equivalent  19.5 kB
     dtype             float64
-    load ‖b‖          5.519
+    load ‖b‖          0.5841
 ```
 
-**`terms (as classified)` is the important one.** It names every term by how jNO recognised it, so a
-boundary condition that landed nowhere is visible here rather than as a wrong answer later.
+**`equations` is the important one.** Every term is written out as it was given and labelled by how
+jNO recognised it, so a boundary condition that landed nowhere, or a term that is not the one you
+meant, is visible here rather than as a wrong answer later.
+
+### How the equations are written
+
+`jno.info` of a `jno.core`, a `jno.fem` and a `jno.fdm` writes each term in mathematical notation. For
+the Burgers equation as a PINN:
+
+```
+  equations
+    [0] interior · 10,000 pts  ∂u/∂t + u ∂u/∂x − 0.003183 ∂²u/∂x² = 0   (mse)
+    [1] ic · 50 pts            u + sin(π x) = 0   (mse)
+    [2] walls · 50 pts         u = 0   (mse)
+    where                      u = MLP(x, t)
+```
+
+* **Coordinates** print as `x, y, z` by column and `t` for time. A coordinate that is really something
+  else (time as the second column of a rectangle) prints by its `.name`: `d.variable(...)[1].name("t")`.
+* **Unknowns.** A network output is `u` (the components of one network `u₀, u₁, …`); a field built on a
+  network and differentiated (`net(x, y) * x * (1 - x)`) is `u` itself, and the `where` line defines it.
+  `.name("…")` on an expression or a network overrides the letter. A grid unknown is `unknown`.
+* **Derivatives** collapse: `∂²u/∂x∂t`, `∂³u/∂x³`, `Δu`, `Δ²u`. A `jno.fem` volume or surface term is
+  written as the integral it contributes, `∫ (…) dx`; an attached property by its name (`k`); a name
+  like `phi` as `φ`.
+* **ASCII** replaces the symbols where the terminal cannot encode them (`du/dt + u du/dx - 0.003183
+  d^2u/dx^2 = 0`), so a log file on a cluster stays readable.
 
 **Field-block order is first appearance — including inside a term.** Blocks are numbered in the
 order each trial field first appears in the term list. Writing the momentum equation above as

@@ -68,8 +68,19 @@ def test_fem_info_reports_mode_dofs_and_every_term():
     data = jno.info(f).as_dict()
     assert data["form"]["mode"] == "linear"
     assert int(str(data["form"]["dofs"]).replace(",", "")) == int(f.dofs)
-    # every term, classified -- the check that a boundary condition was recognised AS one
-    assert list(data["terms (as classified)"].values()) == list(f.classification)
+    # every term, classified -- the check that a boundary condition was recognised AS one -- next to the
+    # term as written
+    keys = [k for k in data["equations"] if k.startswith("[")]
+    assert keys == [f"[{i}] {c}" for i, c in enumerate(f.classification)]
+
+
+def test_fem_info_writes_the_weak_form():
+    """The terms in mathematical notation: the integrand as the integral it contributes, the attached
+    coefficient by its name, the test function by its (Greek) name, the Dirichlet condition as an equation."""
+    data = jno.info(_poisson(_two_region_domain())).as_dict()["equations"]
+    rows = list(data.values())
+    assert rows[0] == "∫ (k (∂u/∂x ∂φ/∂x + ∂u/∂y ∂φ/∂y) − φ) dx"
+    assert rows[1] == "u = 0"
 
 
 def test_fem_info_deep_adds_symmetry_and_empty_rows():

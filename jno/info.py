@@ -87,6 +87,24 @@ def _fmt_n(x) -> str:
         return str(x)
 
 
+def _equation_rows(exprs, labels=None, measures=None) -> list:
+    """The expressions in mathematical notation (:mod:`jno.trace.pretty`), one row each, then the ``where``
+    rows defining the fields and networks they read."""
+    from .trace.pretty import equation, field_names, where_rows
+
+    exprs = [getattr(e, "_expr", e) for e in exprs]
+    try:
+        names, defs = field_names(exprs)
+    except Exception as e:  # noqa: BLE001 -- a report never fails on an expression it cannot spell
+        return [("", f"unavailable ({type(e).__name__}: {e})")]
+    rows = []
+    for i, e in enumerate(exprs):
+        eq, loss = equation(e, names, measure=measures[i] if measures is not None else None)
+        key = labels[i] if labels is not None and i < len(labels) else f"[{i}]"
+        rows.append((key, eq + (f"   ({loss})" if loss else "")))
+    return rows + where_rows(defs, names)
+
+
 def _bytes(n: float) -> str:
     for unit in ("B", "kB", "MB", "GB", "TB"):
         if abs(n) < 1024 or unit == "TB":
@@ -475,7 +493,22 @@ def _info_fem(f, deep: bool) -> Info:
         bb = np.asarray(b).reshape(-1)
         op.append(("load ‖b‖", f"{np.linalg.norm(bb):.4g}" + ("   ← ALL ZERO" if not np.any(bb) else "")))
 
-    sections = [("form", form), ("terms (as classified)", terms), ("field blocks", blocks), ("operator", op)]
+    written = list(getattr(f, "_constraints", None) or [])
+    if written:
+        cls = list(getattr(f, "classification", None) or [])
+        eq_labels = [f"[{i}] {cls[i]}" for i in range(len(written))] if len(cls) == len(written) else None
+        # a weak-form term is the integrand of what it contributes: ∫ (…) dx on a volume, ∫ (…) ds on a surface
+        measures = (
+            [("dx" if c.startswith("volume") else "ds" if c.startswith("surface") else None) for c in cls]
+            if eq_labels
+            else None
+        )
+        equations = _equation_rows(written, eq_labels, measures)
+        sections = [("form", form), ("equations", equations), ("field blocks", blocks), ("operator", op)]
+        if eq_labels is None:
+            sections.insert(2, ("terms (as classified)", terms))
+    else:
+        sections = [("form", form), ("terms (as classified)", terms), ("field blocks", blocks), ("operator", op)]
     st = getattr(f, "stats", None)
     if st:
         sections.append(("last solve", _last_solve_rows(st)))
@@ -601,7 +634,9 @@ def _info_fdm(o, deep: bool) -> Info:
     if d is not None and getattr(d, "time", None):
         t0, t1, nt = d.time
         rows.append(("time", f"[{t0}, {t1}] · {nt} steps"))
-    return Info("fdm (collocation)", [("solver", rows)])
+    written = list(getattr(o, "_constraints", None) or [])
+    sections = [("equations", _equation_rows(written))] if written else []
+    return Info("fdm (collocation)", sections + [("solver", rows)])
 
 
 def _subdomain_label(prob, geom=None) -> str:
@@ -714,12 +749,16 @@ def _info_core(c, deep: bool) -> Info:
             models.append((f"[{key}]", type(m).__name__))
     if len(models) > 1:
         models.append(("total", f"{_fmt_n(total)} parameters"))
-    cons: list = []
+    labels = []
     try:
+        ctx = getattr(getattr(c, "domain", None), "context", None) or {}
         for i, t in enumerate(c.get_constraint_tags(c.constraints)):
-            cons.append((f"[{i}]", str(t)))
+            tags = sorted(map(str, t)) if isinstance(t, (set, list, tuple)) else [str(t)]
+            n = [np.shape(ctx[k])[-2] for k in tags if k in ctx and np.ndim(ctx[k]) >= 2]
+            labels.append(f"[{i}] {', '.join(tags)}" + (f" · {_fmt_n(n[0])} pts" if len(n) == 1 else ""))
     except Exception:  # noqa: BLE001
-        cons = [("count", _fmt_n(len(getattr(c, "constraints", []) or [])))]
+        labels = None
+    cons = _equation_rows(list(getattr(c, "constraints", []) or []), labels)
     training: list = []
     dom = getattr(c, "domain", None)
     if dom is not None:
@@ -769,7 +808,7 @@ def _info_core(c, deep: bool) -> Info:
             coupling = [("method", f"undetermined ({type(e).__name__}: {e})")]
         sections = [("models", models), ("subdomain solves", cons), ("coupling", coupling), ("training", training)]
     else:
-        sections = [("models", models), ("constraints", cons), ("training", training)]
+        sections = [("models", models), ("equations", cons), ("training", training)]
     if deep:
         # What `core.print_tree()` and `core.print_shapes()` used to print. They were two more
         # spellings to know about; as text builders they become sections of the one report.

@@ -2797,6 +2797,7 @@ class domain(MeshIOMixin):
             def mark(e):
                 if snapshot:
                     e._attached_snapshot = (self, name)
+                e._attached_name = name  # what jno.info prints for it (jno.trace.pretty)
                 return e
 
             if declared == {"surface"}:
