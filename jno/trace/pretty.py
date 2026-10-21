@@ -62,6 +62,12 @@ class _Style:
     def __init__(self, ascii_only: bool):
         self.ascii = ascii_only
 
+    def symbol_const(self, sym: str) -> str:
+        """A known constant: ``pi^2`` -> ``π²``, ``sqrt2`` -> ``√2`` (ASCII keeps the spelling)."""
+        if self.ascii:
+            return {"sqrt2": "sqrt(2)", "sqrt3": "sqrt(3)"}.get(sym, sym)
+        return {"pi": "π", "pi^2": "π²", "pi^3": "π³", "sqrt2": "√2", "sqrt3": "√3", "e": "e"}[sym]
+
     def symbol(self, name: str) -> str:
         """A user's name as a symbol: ``phi`` -> ``φ`` where the terminal can show it."""
         return name if self.ascii else _GREEK.get(name, name)
@@ -272,16 +278,75 @@ def _children(n, T):
     return []
 
 
-def _number(v, st: _Style) -> str:
+# constants a number is recognised as a small fraction of: (value, symbol, in the denominator?)
+_KNOWN = (
+    (math.pi, "pi", False),
+    (math.pi**2, "pi^2", False),
+    (math.pi**3, "pi^3", False),
+    (math.pi, "pi", True),
+    (math.pi**2, "pi^2", True),
+    (math.sqrt(2.0), "sqrt2", False),
+    (math.sqrt(3.0), "sqrt3", False),
+    (math.e, "e", False),
+)
+
+
+def _fraction(r: float, rel: float):
+    """``r`` as ``Fraction(p, q)`` with ``q <= 12`` or a power of ten (and ``|p| <= 1000``), if one agrees with it
+    to ``rel``; else ``None``."""
+    from fractions import Fraction
+
+    for limit in (12, 1000):
+        f = Fraction(r).limit_denominator(limit)
+        if f.denominator > 12 and f.denominator not in (100, 1000):
+            continue
+        if abs(f.numerator) <= 1000 and abs(float(f) - r) <= rel * max(abs(r), 1e-300):
+            return f
+    return None
+
+
+def _coefficient(f) -> str:
+    """A fraction as written in a formula: ``3``, ``3/4``, ``0.01``."""
+    if f.denominator == 1:
+        return str(f.numerator)
+    if f.denominator in (10, 100, 1000):
+        return f"{float(f):g}"
+    return f"{f.numerator}/{f.denominator}"
+
+
+def _number(v, st: _Style, rel: float = 1e-6) -> str:
+    """A number as written in a formula: an integer, a small fraction (``1/3``), a small fraction of a known
+    constant (``3π²``, ``0.01/π``, ``√2/2``), or else four significant digits.
+
+    A match must agree with the stored value to ``rel`` -- its precision (float32 about 1e-7, float64 about
+    1e-16, with room for the arithmetic that produced it) -- so a number typed to four digits (``0.3183``) is
+    never promoted to ``1/π``.
+    """
     v = float(v)
     if v < 0:
-        return st.minus + _number(-v, st)
-    if v != 0 and abs(abs(v) / math.pi - round(abs(v) / math.pi)) < 1e-6 and 0 < round(abs(v) / math.pi) <= 9:
-        k = round(abs(v) / math.pi)
-        txt = st.pi if k == 1 else f"{k}{st.pi}"
-        return txt
-    if v == int(v) and abs(v) < 1e6:
+        return st.minus + _number(-v, st, rel)
+    if v == 0 or (v == int(v) and v < 1e6):
         return str(int(v))
+    f = _fraction(v, rel)
+    if f is not None and f.denominator not in (10, 100, 1000):
+        return _coefficient(f)
+    for value, sym, below in _KNOWN:
+        f = _fraction(v * value if below else v / value, rel)
+        if f is None:
+            continue
+        k = st.symbol_const(sym)
+        j = "*" if st.ascii else ""  # 3π², 3*pi^2
+        if below:
+            return (
+                f"{_coefficient(f)}/{k}"
+                if f.denominator == 1 or f.denominator in (10, 100, 1000)
+                else f"{f.numerator}/({f.denominator}{j}{k})"
+            )
+        if f.denominator == 1:
+            return k if f.numerator == 1 else f"{f.numerator}{j}{k}"
+        if f.denominator in (10, 100, 1000):
+            return f"{_coefficient(f)}{j or ' '}{k}"
+        return (k if f.numerator == 1 else f"{f.numerator}{j}{k}") + f"/{f.denominator}"
     return f"{v:.4g}"
 
 
@@ -312,9 +377,12 @@ class _Renderer:
             return (st.symbol(_user_name(n)), _ATOM)
         if isinstance(n, T["Literal"]):
             v = np.asarray(getattr(n, "value", np.nan))
+            rel = 1e-6 if v.dtype.itemsize <= 4 else 1e-12
             if v.size == 1:
-                txt = _number(v.reshape(()), st)
-                return (txt, _NEG if txt.startswith("-") else _ATOM)
+                txt = _number(v.reshape(()), st, rel)
+                if txt.startswith(("-", "−")):
+                    return (txt, _NEG)
+                return (txt, _PROD if ("/" in txt or " " in txt) else _ATOM)
             return ("[" + ", ".join(_number(x, st) for x in v.reshape(-1)[:4]) + (", …]" if v.size > 4 else "]"), _ATOM)
         if isinstance(n, T["Constant"]):
             return (str(getattr(n, "key", None) or getattr(n, "tag", "c")), _ATOM)

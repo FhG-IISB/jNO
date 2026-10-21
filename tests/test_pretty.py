@@ -91,3 +91,22 @@ def test_a_node_the_printer_does_not_know_prints_its_class_name():
         pass
 
     assert render(Unknown(), {}) == "Unknown(…)"
+
+
+def test_numbers_are_recognised_as_fractions_of_known_constants_only_when_exact():
+    """``3π²``, ``0.01/π``, ``√2/2`` and ``1/3`` as written in the formula, but only when they agree with the
+    stored value to its precision: a number typed to four digits (``0.3183``) is not promoted to ``1/π``."""
+    import math
+
+    from jno.trace.pretty import _number, _Style
+
+    u, a = _Style(False), _Style(True)
+    float32 = 1e-6
+    assert _number(3 * math.pi**2, u, float32) == "3π²"
+    assert _number(0.01 / math.pi, u, float32) == "0.01/π"
+    assert _number(math.sqrt(2) / 2, u, float32) == "√2/2"
+    assert _number(1 / 3, u, 1e-12) == "1/3"
+    assert _number(1 / (4 * math.pi), u, float32) == "1/(4π)"
+    assert _number(0.3183, u, float32) == "0.3183"
+    assert _number(0.9637, u, float32) == "0.9637"
+    assert _number(3 * math.pi**2, a, float32) == "3*pi^2"
