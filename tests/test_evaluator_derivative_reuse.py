@@ -129,6 +129,89 @@ def test_windowed_laplacian_matches_jax_hessian():
 
 
 # ---------------------------------------------------------------------------
+# automatic differentiation: the derivatives over one point set share their passes
+# ---------------------------------------------------------------------------
+
+RE = 40.0
+
+
+def _three_field_net(width=16, size=0.25):
+    dom = jno.shape.rect(0, 0, 1, 1, size=size).domain()
+    x, y, _ = dom.variable("interior")
+    net = jno.nn(foundax.mlp(in_features=2, output_dim=3, hidden_dims=width, num_layers=2, key=KEY))
+    net.optimizer(optax.adam(1e-3))
+    o = net(x, y)
+    return dom, x, y, net, o, (o[..., 0], o[..., 1], o[..., 2])
+
+
+def _navier_stokes(u, v, p, x, y):
+    """The steady incompressible residuals, summed into one expression."""
+    mom_x = u * u.d(x) + v * u.d(y) + p.d(x) - u.laplacian(x, y) / RE
+    mom_y = u * v.d(x) + v * v.d(y) + p.d(y) - v.laplacian(x, y) / RE
+    return mom_x + mom_y + (u.d(x) + v.d(y))
+
+
+def _optimal_navier_stokes(module):
+    """The same residual with the fewest AD passes: one forward-over-forward pass per coordinate gives the
+    first AND second derivative of all three outputs along it."""
+    eye = np.eye(2, dtype=np.float32)
+
+    def residual(z):
+        f = lambda q: module(q[None, :])[0]  # noqa: E731
+        (d1x, d2x), (d1y, d2y) = (jax.jvp(lambda w, e=e: jax.jvp(f, (w,), (e,))[1], (z,), (e,)) for e in eye)
+        u, v, _ = f(z)
+        mom_x = u * d1x[0] + v * d1y[0] + d1x[2] - (d2x[0] + d2y[0]) / RE
+        mom_y = u * d1x[1] + v * d1y[1] + d1y[2] - (d2x[1] + d2y[1]) / RE
+        return mom_x + mom_y + (d1x[0] + d1y[1])
+
+    return jax.jit(jax.vmap(residual))
+
+
+def test_ad_derivatives_over_one_point_set_cost_what_a_hand_written_residual_costs():
+    """Eight derivative nodes over three outputs of one network: each used to re-run the network under its
+    own reverse pass (3.3x the work of the hand-written step on a Navier-Stokes PINN). Sharing one
+    forward-over-forward pass per coordinate brings it to the hand-written cost."""
+    _, x, y, net, _, (u, v, p) = _three_field_net()
+    expr = _navier_stokes(u, v, p, x, y)
+    evaluator = TraceEvaluator({net.layer_id: net.module})
+    points = jax.random.uniform(jax.random.PRNGKey(1), (64, 2))
+    jno_flops = _flops(jax.jit(lambda q: evaluator.evaluate(expr, {x.tag: q}, {}, None)), points)
+    optimal = _flops(_optimal_navier_stokes(net.module), points)
+
+    got = np.asarray(jax.jit(lambda q: evaluator.evaluate(expr, {x.tag: q}, {}, None))(points)).reshape(-1)
+    want = np.asarray(_optimal_navier_stokes(net.module)(points)).reshape(-1)
+    assert np.allclose(got, want, rtol=1e-4, atol=1e-5)
+    # 1.25: room for the element-wise arithmetic of the residual, which jNO does on (N, 1) columns
+    assert jno_flops <= 1.25 * optimal, f"{jno_flops:.3g} FLOPs vs {optimal:.3g} hand-written"
+
+
+def test_shared_ad_derivatives_match_jax():
+    """Every derivative kind the shared pass serves, against JAX on the bare network."""
+    dom, x, y, net, o, (u, v, p) = _three_field_net()
+    exprs = [u.d(x), v.d(y), p.d(x), o.d(x), u.laplacian(x, y), jno.np.hessian(u, [x, y]), u.d(x).d(y), v.d(y).d(y)]
+    crux = jno.core([_navier_stokes(u, v, p, x, y).mse], domain=dom)
+    got = [np.asarray(g)[0] for g in crux.eval(exprs)]
+
+    pts = np.asarray(crux.domain_data.context[x.tag]).reshape(-1, 2)
+    f = lambda q: net.module(q[None, :])[0]  # noqa: E731
+    jac = np.asarray(jax.vmap(jax.jacrev(f))(pts))  # (N, 3, 2)
+    hess = np.asarray(jax.vmap(jax.hessian(f))(pts))  # (N, 3, 2, 2)
+    want = [
+        jac[:, 0, 0:1],
+        jac[:, 1, 1:2],
+        jac[:, 2, 0:1],
+        jac[:, :, 0],
+        hess[:, 0, 0, 0:1] + hess[:, 0, 1, 1:2],
+        hess[:, 0],
+        hess[:, 0, 0, 1:2],
+        hess[:, 1, 1, 1:2],
+    ]
+    for g, w, e in zip(got, want, exprs):
+        assert g.shape == w.shape, f"{e}: {g.shape} != {w.shape}"
+        assert np.allclose(g, w, rtol=1e-4, atol=1e-5), f"{e}: max error {np.abs(g - w).max():.3g}"
+
+
+# ---------------------------------------------------------------------------
 # argument validation
 # ---------------------------------------------------------------------------
 
