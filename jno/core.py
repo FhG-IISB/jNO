@@ -62,7 +62,7 @@ from .trace import (
     refuse_point_index,
 )
 from .trace_compiler import TraceCompiler
-from .trace_evaluator import TraceEvaluator
+from .trace_evaluator import TraceEvaluator, mark_pointwise_targets
 from .tuner import ArchSpace, DeviceConfig, Tuner
 from .utils import (
     LearningRateSchedule,
@@ -2071,6 +2071,7 @@ class core:
             # swap the core has NOT seen can be caught instead of silently ignored (see
             # `_check_modules_unchanged`).
             self._module_refs = {lid: layer.module for lid, layer in self._collect_flax_modules().items()}
+            mark_pointwise_targets(constraints, self._unwrapped_models, self.domain_data.context, self.log)
         else:
             self.domain_data = None
             self.models = {}

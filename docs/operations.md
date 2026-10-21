@@ -88,6 +88,13 @@ per coordinate; mixed second derivatives from a forward pass over that one. A ne
 fields and derivatives is evaluated once per pass. A scheme with an explicit sub-mode
 (`"automatic_differentiation:reverse"`, `:fwd-over-rev`, ...) keeps the one-derivative-at-a-time path.
 
+An AD derivative is taken one point at a time, so it is the derivative of a target only if the target's
+value at a point depends on that point alone. jNO **measures** this when the problem is compiled (the
+target is differentiated on three of its points with the real weights) and raises for a target that
+couples points -- `u - jno.np.mean(u, axis=0)`, attention across points, an operator over the point set
+-- naming `scheme="finite_difference"` instead. For a pointwise target, the value of a field that is also
+differentiated (`u` in `u * u.d(x)`) comes from the derivative pass rather than a second evaluation.
+
 #### Spectral differentiation
 
 On a uniform grid the derivative is a multiply in Fourier space, which is **exact** for a

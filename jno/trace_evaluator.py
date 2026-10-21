@@ -473,6 +473,96 @@ def _context_tag(var, context) -> str:
     return region if region is not None and region in context else tag
 
 
+def mark_pointwise_targets(exprs, params, context, log=None, n_probe=3):
+    """Mark the target of every AD derivative in ``exprs`` pointwise or not, by measuring it.
+
+    An AD derivative is taken one point at a time (see ``TraceEvaluator._shared_ad_derivative``), which is the
+    derivative of the target only if the target's value at a point depends on that point alone. Whether it
+    does is measured, not assumed from the kind of network: the target is evaluated with the concrete weights
+    on ``n_probe`` points of its point set and differentiated with respect to all of them; any dependence of
+    the value at one point on another point marks it ``_jno_pointwise = False``. A pointwise target is
+    ``True``, with ``_jno_point_shape`` the per-point shape of its value. A target the probe cannot evaluate
+    (a stochastic node, a FEM solve) stays unmarked and keeps the per-node path.
+
+    Runs once per compile, eagerly, on a few points: microseconds to milliseconds per target.
+    """
+    from .trace import _contains_variational
+    from .utils.solver.solver_helper import iter_children
+
+    nodes, seen = [], set()
+
+    def walk(n):
+        if not isinstance(n, Placeholder) or id(n) in seen:
+            return
+        seen.add(id(n))
+        if (
+            isinstance(n, (Jacobian, Hessian))
+            and n.scheme == "automatic_differentiation"
+            and not isinstance(n.target, (TestFunction, FrozenField))
+        ):
+            nodes.append(n)
+        for c in iter_children(n) or ():
+            walk(c)
+
+    for e in exprs:
+        if not _contains_variational(e):
+            walk(e)
+    if not nodes:
+        return
+
+    small = {}  # one sample, one time step, n_probe points: the (N, D) layout one evaluation sees
+    for k, v in context.items():
+        if not hasattr(v, "ndim"):
+            small[k] = v
+        elif str(k).startswith("__time"):
+            small[k] = v[0] if v.ndim >= 2 else v
+        elif v.ndim == 4:
+            small[k] = v[0, 0, :n_probe]
+        elif v.ndim == 2:
+            small[k] = v[0]
+        else:
+            small[k] = v
+    # The weights may be sharded on the accelerator and the domain context pinned to the host; one device for
+    # both, as `core.eval` does, or every probe fails with "incompatible devices".
+    device = jax.devices()[0]
+    params, small = jax.device_put(params, device), jax.device_put(small, device)
+    evaluator = TraceEvaluator(params)
+    for node in nodes:
+        target = node.target
+        if hasattr(target, "_jno_pointwise"):
+            continue
+        tags = {v.tag for v in node.variables if getattr(v, "axis", "spatial") == "spatial"}
+        if not tags:
+            tags = {t for t in collect_tags(target) if getattr(small.get(t), "ndim", 0) == 2}
+        if len(tags) != 1:
+            continue
+        tag = tags.pop()
+        points = small.get(tag)
+        if getattr(points, "ndim", 0) != 2 or points.shape[0] < 2:
+            continue
+        n = points.shape[0]
+
+        def value(p, _t=target, _tag=tag):
+            return evaluator.evaluate(_t, {**small, _tag: p}, {}, None)
+
+        try:
+            out = jax.eval_shape(value, points)
+            if not out.shape or out.shape[0] != n:
+                target._jno_pointwise = False  # one value for the whole point set: a reduction
+                continue
+            jac = np.asarray(jax.jacfwd(lambda p: jnp.reshape(value(p), (n, -1)))(points))  # (n, m, n, D)
+        except Exception as err:  # noqa: BLE001 -- the probe is optional: an unprobeable target keeps its own path
+            if log is not None:
+                log.info(
+                    f"Not measured whether {target!r} is pointwise ({type(err).__name__}: {err}); its derivatives take the per-node path"
+                )
+            continue
+        across = np.abs(jac.transpose(0, 2, 1, 3))[~np.eye(n, dtype=bool)]
+        scale = float(np.abs(jac).max())
+        target._jno_pointwise = bool(across.size == 0 or float(across.max()) <= 1e-6 * max(scale, 1e-30))
+        target._jno_point_shape = tuple(out.shape[1:])
+
+
 class TraceEvaluator:
     """Evaluates traced expressions - designed for JIT compilation.
 
@@ -789,7 +879,11 @@ class TraceEvaluator:
         for node, seen_ctx, seen_trace, out in entries:
             if node is expr and seen_trace == trace and self._same_eval_ctx(seen_ctx, ctx):
                 return out
-        out = self._dispatch_memoised(expr, ctx)
+        out = None
+        if getattr(expr, "_jno_pointwise", False) and ctx.roots is not None and ctx.active_region is None:
+            out = self._shared_value(expr, ctx)
+        if out is None:
+            out = self._dispatch_memoised(expr, ctx)
         entries.append((expr, ctx, trace, out))
         return out
 
@@ -896,6 +990,15 @@ class TraceEvaluator:
         on a normal derivative, on stacked time windows, and on a time derivative of something that reads no
         point set.
         """
+        target = getattr(expr, "target", None)
+        if getattr(target, "_jno_pointwise", None) is False and expr.scheme == "automatic_differentiation":
+            raise ValueError(
+                f"{type(expr).__name__} of {target!r} by automatic differentiation: this target's value at a point "
+                "depends on the OTHER points as well (measured when the problem was compiled) -- an operator network "
+                "over the point set, attention across points, or a reduction over the points. An AD derivative is "
+                "taken one point at a time, so it would not be the derivative of this target. Differentiate on the "
+                "mesh instead (scheme='finite_difference'), or make the target pointwise."
+            )
         memo = getattr(self, "_per_eval_memo", None)
         if memo is None or not getattr(self, "_in_evaluate", False) or ctx.active_region is not None:
             return None
@@ -925,6 +1028,26 @@ class TraceEvaluator:
             and a.var_bindings.keys() == b.var_bindings.keys()
             and all(a.var_bindings[k] is b.var_bindings[k] for k in a.var_bindings)
         )
+
+    def _shared_value(self, expr, ctx):
+        """The value of a pointwise ``expr`` from the shared derivative pass of this context, or ``None``.
+
+        A field that is both used and differentiated (``u`` in ``u * u.d(x)``) was evaluated twice: batched for
+        its value and per point inside the derivative pass, which XLA cannot merge (the shapes differ). For a
+        target measured pointwise (:func:`mark_pointwise_targets`) the two are the same numbers, so the value
+        comes from the pass.
+        """
+        for node in self._ad_derivative_nodes(ctx.roots):
+            request = self._ad_request(node, ctx)
+            if request is None or request[1] is not expr:
+                continue
+            self._shared_ad_derivative(node, ctx)
+            trace = _trace_state()
+            for seen_ctx, seen_trace, members, values in self._per_eval_memo.get(("shared-ad-derivatives", request[0]), []):
+                if seen_trace == trace and id(node) in members and self._same_eval_ctx(seen_ctx, ctx):
+                    return values.get(-id(expr))
+            return None
+        return None
 
     def _ad_derivative_nodes(self, roots):
         """The Jacobian/Hessian nodes reachable from ``roots`` without a change of context.
@@ -1062,14 +1185,15 @@ class TraceEvaluator:
             ``zs`` and the times ``ts``."""
             local = {"__active_spatial_n__": 1, **shared, **{k: v[jnp.newaxis] for k, v in row.items()}}
 
-            def values(zs, ts):  # the targets usually share one network call: `_dispatch` evaluates it once
+            def values(zs, ts, squeeze=True):  # the targets usually share one network call: evaluated once
                 point = {**local, tag: zs[jnp.newaxis, :]}
                 for j, k in enumerate(times):
                     point[k] = jnp.reshape(ts[j], jnp.shape(ctx.context[k])).astype(ctx.context[k].dtype)
                     if k != "__time__" and "__time__" in ctx.context:  # the global time stays coherent
                         point["__time__"] = jnp.reshape(ts[j], jnp.shape(ctx.context["__time__"]))
                 point_ctx = self._EvalCtx(point, ctx.var_bindings, ctx.key, roots=targets)
-                return tuple(jnp.squeeze(self._dispatch(t, point_ctx)) for t in targets)
+                outs = tuple(self._dispatch(t, point_ctx) for t in targets)
+                return tuple(jnp.squeeze(o) for o in outs) if squeeze else outs
 
             return values
 
@@ -1113,13 +1237,25 @@ class TraceEvaluator:
                 else:
                     pairs.add(tuple(sorted(dims)))
         lap_sets = sorted(lap_sets)
+        # the values of the targets measured pointwise, for `_shared_value`: one entry per point, shaped as
+        # the batched evaluation would shape it
+        raw_shapes = jax.eval_shape(lambda zs: at(row0)(zs, time_now, squeeze=False), points[0])
+        shared_values = [
+            k
+            for k, t in enumerate(targets)
+            if getattr(t, "_jno_pointwise", False)
+            and raw_shapes[k].shape[:1] == (1,)
+            and tuple(raw_shapes[k].shape[1:]) == tuple(getattr(t, "_jno_point_shape", ()))
+        ]
 
         def per_point(row):
             f, zs = at(row), row[tag]
             d1, d2, lap = {}, {}, {}
+            primal = None  # the targets' values, as a by-product of a pass that computes them anyway
             for dims in lap_sets:
                 g, cur = restricted(f, zs, dims)
                 lapl = folx.forward_laplacian(g)(cur)
+                primal = primal or tuple(t.x for t in lapl)
                 lap[dims] = tuple(t.laplacian for t in lapl)
                 jacs = [t.jacobian.dense_array for t in lapl]  # (len(dims), *value_shape) each
                 for i, d in enumerate(dims):
@@ -1135,7 +1271,8 @@ class TraceEvaluator:
             for d in first:
                 if d not in d1:
                     g, cur = restricted(f, zs, (d,))
-                    d1[d] = jax.jvp(g, (cur,), (jnp.ones(1, cur.dtype),))[1]
+                    value, d1[d] = jax.jvp(g, (cur,), (jnp.ones(1, cur.dtype),))
+                    primal = primal or value
 
             out = {}
             for node, (_, target, kind, dims) in served:
@@ -1155,6 +1292,10 @@ class TraceEvaluator:
                     out[id(node)] = lap[(dims[0],)][k][jnp.newaxis]
                 else:
                     out[id(node)] = d2[tuple(sorted(dims))][k][jnp.newaxis]
+            if shared_values:
+                primal = primal or f(zs, time_now)
+                for k in shared_values:  # values keyed -id: derivatives are +id(node)
+                    out[-id(targets[k])] = jnp.reshape(primal[k], raw_shapes[k].shape[1:])
             return out
 
         values = jax.vmap(per_point)(rows)

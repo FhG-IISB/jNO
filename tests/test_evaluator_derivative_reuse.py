@@ -299,6 +299,24 @@ def test_a_laplacian_of_a_laplacian_matches_the_per_node_path():
     assert np.allclose(got, want, rtol=1e-3, atol=1e-4), np.abs(got - want).max()
 
 
+def test_an_ad_derivative_of_a_target_that_couples_points_raises():
+    """``u - mean(u)`` at one point depends on every point; its per-point AD derivative used to be returned
+    silently as if it did not. The coupling is measured when the problem is compiled."""
+    dom, x, y, net, _, (u, _, _) = _three_field_net()
+    net.optimizer(optax.adam(1e-3))
+    coupled = u - jno.np.mean(u, axis=0)
+    with pytest.raises(ValueError, match="OTHER points"):
+        jno.core([coupled.d(x).mse], domain=dom).solve(1)
+
+
+def test_a_differentiated_field_is_not_evaluated_again_for_its_value(monkeypatch):
+    """``u`` in ``u * u.d(x)`` comes from the derivative pass (the target is measured pointwise), not from a
+    second, batched evaluation of the network."""
+    deriv = _network_dispatches(lambda u, x, y: u.d(x) - 1.0, monkeypatch)
+    both = _network_dispatches(lambda u, x, y: u * u.d(x) - 1.0, monkeypatch)
+    assert both == deriv
+
+
 # ---------------------------------------------------------------------------
 # indexing a per-point field
 # ---------------------------------------------------------------------------
