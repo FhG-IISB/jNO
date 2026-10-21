@@ -246,3 +246,35 @@ def test_the_list_form_and_the_method_form_still_work():
 
     assert jno.np.laplacian(u, [x, y]).trace is True
     assert u.laplacian(x, y).trace is True
+
+
+# ---------------------------------------------------------------------------
+# indexing a per-point field
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pick",
+    [
+        lambda o, u, x: o[0],
+        lambda o, u, x: o[1, 0],
+        lambda o, u, x: u[0],
+        lambda o, u, x: u.d(x)[0],
+        lambda o, u, x: (2.0 * o + x)[-1],
+        lambda o, u, x: x[0],
+    ],
+)
+def test_an_integer_index_on_a_per_point_field_raises(pick):
+    """``o[0]`` used to pick collocation point 0 silently, where ``o[..., 0]`` (the first output) was meant."""
+    dom, x, _, _, o, (u, _, _) = _three_field_net()
+    with pytest.raises(IndexError, match=r"\[\.\.\., "):
+        jno.core([(pick(o, u, x) - 1.0).mse], domain=dom)
+
+
+def test_component_and_parameter_indexing_still_work():
+    dom, x, _, _, o, _ = _three_field_net()
+    o[..., 0], o[..., -1], o[:, 0]  # components, and an explicit slice of the point axis
+    p = jno.np.parameter((3,), key=KEY)
+    first = p[0] + 0.0 * x  # a parameter vector is not a point set: its [0] is its first entry
+    crux = jno.core([first.mse], domain=dom)
+    assert np.allclose(np.asarray(crux.eval(first)), np.asarray(crux.eval(p[..., 0] + 0.0 * x)))

@@ -246,7 +246,8 @@ u.scalar   u.vector   u.complex   u.matrix   u.voigt   u.field
 ```
 
 **Components.** A subscript indexes the leading axis, as in NumPy, and a per-point field is
-`(points, components)`: on a network `u[1]` is point 1. Component `i` is `u[..., i]` or `u.vector[i]`, on
+`(points, components)`, so on a network or a coordinate `u[1]` would be point 1, and it raises instead of picking it
+silently. Component `i` is `u[..., i]` or `u.vector[i]`, on
 every trial and path (network, grid unknown, FE trial), and it keeps its axis, `(N, 1)`, like every other
 per-point scalar in a trace. (A bare `(N,)` would broadcast against an `(N, 1)` coordinate to `(N, N)`.) On an
 FE symbol `u[i]` is read as the component too; on a derived FE expression (`grad(u, X)[0]`) `jno.fem` refuses

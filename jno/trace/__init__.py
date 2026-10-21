@@ -4121,6 +4121,37 @@ class NormalDerivative(Placeholder):
         return f"NormalDerivative({self.target})"
 
 
+def _is_per_point_field(expr) -> bool:
+    """Whether ``expr`` certainly has one entry per collocation point along its first axis.
+
+    True for a network or a coordinate and for what pointwise operations build from them (arithmetic, a
+    component ``[..., i]``, a derivative); anything else met on the way (a reduction, an integral, a
+    user function, a FE symbol) makes the answer "not certain", and :meth:`Placeholder.__getitem__` then
+    indexes as asked. Used by :func:`refuse_point_index`.
+    """
+    seen, stack, found = set(), [expr], False
+    while stack:
+        n = stack.pop()
+        if id(n) in seen or not isinstance(n, Placeholder):
+            continue
+        seen.add(id(n))
+        if isinstance(n, Variable):
+            if getattr(n, "axis", "spatial") != "spatial":
+                return False
+            found = True
+        elif isinstance(n, ModelCall):  # per point through its inputs; a parameter (no inputs) is not
+            stack.extend(a for a in n.args if isinstance(a, Placeholder))
+        elif isinstance(n, BinaryOp):
+            stack.extend((n.left, n.right))
+        elif isinstance(n, (Jacobian, Hessian)):
+            stack.append(n.target)
+        elif isinstance(n, FunctionCall) and getattr(n, "getitem_key", (None,))[:1] == (Ellipsis,):
+            stack.extend(a for a in n.args if isinstance(a, Placeholder))
+        elif not isinstance(n, (Literal, Constant)):
+            return False
+    return found
+
+
 def _component_keeps_axis(expr) -> bool:
     """Whether the component ``expr[..., i]`` keeps its axis, i.e. is ``(N, 1)`` rather than ``(N,)``.
 
@@ -6488,6 +6519,41 @@ def _child_placeholders(node):
         out = [e for e in (node.volume_value_expr, node.volume_grad_expr) if e is not None]
         return out + list(node.boundary_value_exprs.values())
     return []
+
+
+def refuse_point_index(expr: Placeholder) -> Placeholder:
+    """``expr`` unchanged, after refusing an integer index on the point axis of a per-point field.
+
+    A per-point field is ``(points, components)``, so on the collocation path ``u[0]`` -- for
+    ``u = net(x, y)``, a coordinate, or what pointwise arithmetic and derivatives build from them -- is
+    POINT 0, broadcast against every other point: a plausible residual of the wrong problem, never an
+    error. Component ``i`` is ``u[..., i]``.
+
+    Weak-form (``jno.fem``) trees are left alone: their lowering reads ``u[i]`` on a trial as the
+    component. That is why this runs where a collocation expression is compiled rather than in
+    ``Placeholder.__getitem__``, which cannot tell the two apart.
+
+    Raises:
+        IndexError: naming the expression and the ``[..., i]`` spelling.
+    """
+    if _contains_variational(expr):
+        return expr
+    seen, stack = set(), [expr]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        key = getattr(node, "getitem_key", None) if isinstance(node, FunctionCall) else None
+        if key and isinstance(key[0], int) and not isinstance(key[0], bool) and _is_per_point_field(node.args[0]):
+            i = key[0]
+            raise IndexError(
+                f"{node.args[0]!r}[{i}] picks collocation POINT {i}: the first axis of a per-point field has one "
+                f"entry per point. For component {i} (an output of a network, a coordinate of a vector field) "
+                f"write [..., {i}]. To read the value at one point, evaluate the field and index the array."
+            )
+        stack.extend(_child_placeholders(node))
+    return expr
 
 
 def fuse_laplacian(expr: Placeholder) -> Placeholder:

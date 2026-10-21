@@ -59,6 +59,7 @@ from .trace import (
     dump_tree,
     fuse_laplacian,
     get_primary_tag,
+    refuse_point_index,
 )
 from .trace_compiler import TraceCompiler
 from .trace_evaluator import TraceEvaluator
@@ -2043,7 +2044,7 @@ class core:
         # Runs after CSE so structurally identical targets are already a single
         # object and the per-coordinate terms can be matched by identity; the
         # second CSE re-shares whatever the rewrite introduced.
-        constraints = [cse(fuse_laplacian(c)) for c in constraints]
+        constraints = [cse(fuse_laplacian(refuse_point_index(c))) for c in constraints]
         self.all_ops = self.collect_unique_operations(constraints)
 
         # === Prepare domain data ===
@@ -5736,7 +5737,7 @@ class core:
                 # Same rewrite the training path gets, so an expression evaluated here
                 # costs what it costs inside the loss. The cache stays keyed on the
                 # caller's original object.
-                raw_fn = TraceCompiler.compile_traced_expression(cse(fuse_laplacian(op)), self.all_ops)
+                raw_fn = TraceCompiler.compile_traced_expression(cse(fuse_laplacian(refuse_point_index(op))), self.all_ops)
                 # Bake min_consecutive into the closure — it controls array shapes
                 # inside the compiled function and must remain a static Python int
                 # for XLA to reuse the compiled kernel across calls.
@@ -5770,7 +5771,9 @@ class core:
             slot = ("together", min_consecutive, tuple(id(op) for op in ops[1:]))
             hit = entry.get(slot)
             if hit is None or any(r() is not op for r, op in zip(hit[0], ops[1:])):
-                raw_fn = TraceCompiler.compile_multi_expression([cse(fuse_laplacian(op)) for op in ops], self.all_ops)
+                raw_fn = TraceCompiler.compile_multi_expression(
+                    [cse(fuse_laplacian(refuse_point_index(op))) for op in ops], self.all_ops
+                )
                 hit = entry[slot] = (
                     [weakref.ref(op) for op in ops[1:]],
                     eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
