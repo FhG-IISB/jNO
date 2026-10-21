@@ -60,7 +60,7 @@ def test_a_geometry_parameter_drives_a_peec_heated_fem_solve():
 
 def _coupled(x1):
     """Two conductors meeting at x = x1 (one expression for both faces), sigma(T) from the FEM field,
-    heated by their own loss: the two-way fixed point of `jno.core([em, heat])`."""
+    heated by their own loss: the two-way fixed point `heat.solve()` / `em.solve()` share."""
     A = jno.shape.box(0, 0, 1e-3, x1, 4e-3, 1.5e-3, size=1e-3).name("A")
     B = jno.shape.box(x1, 0, 1e-3, 16e-3, 4e-3, 1.5e-3, size=1e-3).name("B")
     d = (A + B).domain()
@@ -75,21 +75,21 @@ def _coupled(x1):
     x = d.variable("interior", split=True)[:3]
     Ti, si = T.bind(x=x[0], y=x[1], z=x[2]), s.bind(x=x[0], y=x[1], z=x[2])
     heat = jno.fem([d.k * (Ti.x * si.x + Ti.y * si.y + Ti.z * si.z) - em.loss * si, T(*pad("N")) - 300.0])
-    return jno.core([em, heat]).solve()
+    return heat.solve(), em
 
 
 def test_a_geometry_parameter_through_the_two_way_electrothermal_fixed_point():
     x1 = jno.np.parameter((1,), name="x1")
     x1.dtype(jnp.float64)
     x1.initialize(jax.nn.initializers.constant(6e-3))
-    node = _coupled(x1)
+    node, _em = _coupled(x1)
     (mc,) = {m.model._parameter_name: m for m in _walk(node) if type(m).__name__ == "ModelCall"}.values()
 
     def tmax(wv):
         table = {mc.model.layer_id: eqx.tree_at(lambda q: q.value, mc.model.module, jnp.reshape(wv, (1,)))}
         return jnp.max(jnp.asarray(TraceEvaluator(table).evaluate(node, context={})).reshape(-1))
 
-    assert float(tmax(6e-3)) == pytest.approx(float(np.max(_coupled(6e-3).field)), rel=1e-10)  # measured 2e-14
+    assert float(tmax(6e-3)) == pytest.approx(float(np.max(np.asarray(_coupled(6e-3)[0]))), rel=1e-10)  # measured 2e-14
     g = float(jax.grad(tmax)(6e-3))
     h = 1e-7
     fd = (float(tmax(6e-3 + h)) - float(tmax(6e-3 - h))) / (2 * h)
@@ -97,19 +97,19 @@ def test_a_geometry_parameter_through_the_two_way_electrothermal_fixed_point():
 
 
 def test_the_network_at_the_converged_field_is_a_trace_node_too():
-    """`node.em.R` of the parametric coupled solve: the network's resistance at the converged field, equal
+    """`em.solve().R` of the parametric coupled pair: the network's resistance at the converged field, equal
     to the eager `ElectroThermalSolution.em.R` at the reference, and differentiable in the geometry."""
     x1 = jno.np.parameter((1,), name="x1")
     x1.dtype(jnp.float64)
     x1.initialize(jax.nn.initializers.constant(6e-3))
-    R = _coupled(x1).em.R
+    R = _coupled(x1)[1].solve().R  # the network at the converged field, as a trace node
     (mc,) = {m.model._parameter_name: m for m in _walk(R) if type(m).__name__ == "ModelCall"}.values()
 
     def r(wv):
         table = {mc.model.layer_id: eqx.tree_at(lambda q: q.value, mc.model.module, jnp.reshape(wv, (1,)))}
         return jnp.real(jnp.asarray(TraceEvaluator(table).evaluate(R, context={}))).reshape(())
 
-    assert float(r(6e-3)) == pytest.approx(float(np.real(_coupled(6e-3).em.R)), rel=1e-10)
+    assert float(r(6e-3)) == pytest.approx(float(np.real(_coupled(6e-3)[1].solve().R)), rel=1e-10)
     g = float(jax.grad(r)(6e-3))
     h = 1e-7
     fd = (float(r(6e-3 + h)) - float(r(6e-3 - h))) / (2 * h)

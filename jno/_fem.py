@@ -1994,6 +1994,13 @@ class FEM:
         self._op = op
         self._mode = mode
         self.classification = classification
+        # A problem heated by a jno.peec network's `em.loss` is coupled to it: the network learns which
+        # problem its loss heats, so `em.solve()` and `self.solve()` converge the pair, once, together.
+        from .utils.solver.electrothermal import peec_source_of
+
+        _em = peec_source_of(self)
+        if _em is not None:
+            _em._heat = self
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
@@ -2264,8 +2271,26 @@ class FEM:
         return u
 
     def solve(self, *args, **kwargs):
-        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature."""
+        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature.
+
+        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that
+        network (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the
+        same state ``em.solve()`` then reads the network at. ``tol=`` / ``max_iter=`` set the fixed point."""
         import time as _time
+
+        from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
+
+        _em = peec_source_of(self)
+        if _em is not None:
+            extra = sorted(set(kwargs) - {"tol", "max_iter"})
+            if args or extra:
+                raise ValueError(
+                    "jno.fem: this problem is heated by a jno.peec network's `em.loss`, so its solve is the "
+                    f"coupled fixed point, which takes only tol= and max_iter= (got {extra or 'positional args'}). "
+                    "The network's own solve settings go on jno.peec(..., operator=, restart=, matrix_free=)."
+                )
+            out = coupled(_em, self).solve(**kwargs)
+            return jnp.asarray(out.field) if isinstance(out, ElectroThermalSolution) else out
 
         from .utils.logger import get_logger
 

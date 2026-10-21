@@ -1,8 +1,8 @@
-"""Electro-thermal coupling written with jno.peec, jno.fem and jno.core alone.
+"""Electro-thermal coupling written with jno.peec and jno.fem alone: the references are the coupling.
 
     d.attach(sigma=sigma20 / (1 + alpha (T - T0)), k=...)     # sigma depends on the FEM field T
     em = jno.peec([...]);  heat = jno.fem([... - em.loss * s, ...])
-    jno.core([em, heat]).solve()
+    T_conv = heat.solve(); sol = em.solve()           # solving either converges the pair once
 
 Oracles: with alpha = 0 the coupling is one-way, so it must reproduce the network solved alone and the
 heat problem solved with that network's loss attached by hand; with alpha > 0 the converged state is a
@@ -58,13 +58,14 @@ def test_one_way_coupling_reproduces_the_two_solves_done_separately():
     problem with that network's loss attached by hand."""
     d = _domain()
     em, heat, _T = _problems(d, lambda T: SIG20 + 0.0 * T)
-    sol = _quiet(lambda: jno.core([em, heat]).solve())
+    field = np.asarray(_quiet(lambda: heat.solve())).reshape(-1)
+    sol = _quiet(lambda: em.solve())  # the network at that field: the same coupled solve, not a second one
 
     d2 = _domain()
     d2.attach(sigma=SIG20, k=K_CU)
     i2, v2 = d2.peec_symbols()
     alone = _quiet(lambda: jno.peec([v2(*_pad(d2, "P")) - v2(*_pad(d2, "N")) - 0.05], freq=1e3).solve())
-    assert float(sol.em.R) == pytest.approx(float(alone.R), rel=1e-10)
+    assert float(sol.R) == pytest.approx(float(alone.R), rel=1e-10)
 
     for name, q in alone.dissipation().items():
         d2.attach(name, Q=float(np.real(q)))
@@ -80,19 +81,22 @@ def test_one_way_coupling_reproduces_the_two_solves_done_separately():
     ).reshape(-1)
     # the hand-written solve runs the default iterative solver (relative tolerance 1e-8 on the residual),
     # the coupled one a direct solve, so they agree to the iterative solver's accuracy, not to round-off
-    assert np.max(np.abs(sol.field - by_hand)) < 1e-6 * np.max(np.abs(by_hand))
-    assert sol.field.max() > 300.0 + 1e-3, "the loss must actually heat the conductor"
+    assert np.max(np.abs(field - by_hand)) < 1e-6 * np.max(np.abs(by_hand))
+    assert field.max() > 300.0 + 1e-3, "the loss must actually heat the conductor"
 
 
 def test_a_temperature_dependent_conductivity_converges_to_a_fixed_point_and_raises_R():
     alpha = 3.93e-3
     d = _domain()
     em, heat, _T = _problems(d, lambda T: SIG20 / (1 + alpha * (T - 293.15)))
-    sol = _quiet(lambda: jno.core([em, heat]).solve())
+    from jno.utils.solver.electrothermal import coupled
+
+    sol = _quiet(lambda: coupled(em, heat).solve())  # the shared state both solves read, with its history
     assert sol.change < 1e-8
+    assert np.allclose(np.asarray(heat.solve()).reshape(-1), sol.field) and em.solve() is sol.em
     d0 = _domain()
     em0, heat0, _ = _problems(d0, lambda T: SIG20 / (1 + alpha * (300.0 - 293.15)) + 0.0 * T)
-    cold = _quiet(lambda: jno.core([em0, heat0]).solve())
+    cold = _quiet(lambda: coupled(em0, heat0).solve())
     # `cold` holds every element at the sink temperature; the coupled conductor is hotter than that
     # everywhere except at the sink itself, so it is strictly more resistive
     assert float(sol.em.R) > float(cold.em.R), "a hotter conductor must be more resistive"
@@ -106,7 +110,7 @@ def test_the_gradient_through_the_coupled_fixed_point_matches_a_central_differen
     scale = jno.np.parameter((1,), name="scale")
     scale.initialize(jax.nn.initializers.constant(1.0))
     em, heat, _T = _problems(d, lambda T: scale * SIG20 / (1 + alpha * (T - 293.15)))
-    node = _quiet(lambda: jno.core([em, heat]).solve())
+    node = _quiet(lambda: heat.solve())
     f = lambda a: jnp.max(node.fn(jnp.asarray([a])))  # noqa: E731
     g = float(jax.grad(f)(1.0))
     h = 1e-4
@@ -116,9 +120,14 @@ def test_the_gradient_through_the_coupled_fixed_point_matches_a_central_differen
 
 
 def test_a_field_dependent_network_alone_says_what_it_needs():
+    """sigma(T) and no jno.fem heated by this network's loss: nothing can produce T, so it says how to write
+    the pair. (With the heat problem built, `em.solve()` is the coupled solve -- tested above.)"""
     d = _domain()
-    em, _heat, _T = _problems(d, lambda T: SIG20 / (1 + 3.93e-3 * (T - 293.15)))
-    with pytest.raises(ValueError, match=r"jno.core\(\[em, heat\]\)"):
+    T, _s = d.fem_symbols()
+    d.attach(sigma=SIG20 / (1 + 3.93e-3 * (T - 293.15)), k=K_CU)
+    i, v = d.peec_symbols()
+    em = jno.peec([v(*_pad(d, "P")) - v(*_pad(d, "N")) - 0.05], freq=1e3)
+    with pytest.raises(ValueError, match=r"em.loss \* s"):
         _quiet(lambda: em.solve())
 
 
@@ -131,7 +140,9 @@ def test_a_heat_problem_without_the_loss_is_not_coupled():
     x = d.variable("interior", split=True)[:3]
     Ti, si = T.bind(x=x[0], y=x[1], z=x[2]), s.bind(x=x[0], y=x[1], z=x[2])
     heat = jno.fem([d.k * (Ti.x * si.x + Ti.y * si.y + Ti.z * si.z) - 1.0 * si, T(*_pad(d, "N")) - 300.0])
-    with pytest.raises(ValueError, match="em.loss"):
+    assert em.__dict__.get("_heat") is None  # nothing refers to the network: two independent problems
+    # and listing the two in jno.core is not a coupling call -- it says how to write one
+    with pytest.raises(TypeError, match="heat.solve"):
         jno.core([em, heat])
 
 
@@ -158,7 +169,7 @@ def test_jno_core_trains_a_design_variable_through_the_coupled_solve():
     a.initialize(jax.nn.initializers.constant(1.0))
     a.optimizer(optax.adam(2e-2))
     em, heat, _T = _problems(d, lambda T: a * SIG20 / (1 + 3.93e-3 * (T - 293.15)))
-    field = _quiet(lambda: jno.core([em, heat]).solve())
+    field = _quiet(lambda: heat.solve())
     fit = jno.core([(field - 320.0).mse], domain=d)
     _quiet(lambda: fit.solve(6))
     # every step moved it downhill: the conductor starts too hot for the 320 K target

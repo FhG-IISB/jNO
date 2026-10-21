@@ -658,19 +658,18 @@ class core:
         # Domain-decomposition coupling: `jno.core([A, B, ...])` where each item is a subdomain solve
         # (`jno.fdm([...])` carrying a named region via `domain.region(...)`) — couple by overlapping
         # Schwarz instead of PINN training. `.solve()` delegates to the coupling driver.
-        # Electro-thermal coupling: `jno.core([em, heat])` with `em` a jno.peec network and `heat` the
-        # jno.fem problem whose source is `em.loss` -- solved together as a fixed point, no training.
-        from .utils.solver.electrothermal import ElectroThermal, detect_pair
+        # A jno.peec network and the jno.fem problem it heats are coupled by their references (`em.loss`
+        # in the heat source, the FEM field in sigma) and solved by `heat.solve()` / `em.solve()`, not
+        # listed here: a core is for losses. Listing them is refused with the spelling that works.
+        from .utils.solver.electrothermal import detect_pair
 
-        _pair = detect_pair(constraints)
-        self._electrothermal = None
-        if _pair is not None:
-            self._electrothermal = ElectroThermal(*_pair)
-            self.domain = _pair[0].domain
-            self.models = {}
-            self._module_refs = {}
-            self._dd_subdomains = None
-            return
+        if detect_pair(constraints) is not None:
+            raise TypeError(
+                "jno.core: a jno.peec network and a jno.fem problem are not losses. A pair coupled through "
+                "`em.loss` is solved by solving either: `T = heat.solve()` (the converged field) and "
+                "`sol = em.solve()` (the network there). Put their readouts in jno.core to optimise -- "
+                "`jno.core([sol.L / L0 + jno.np.max(T) / T0, jno.le(...)])`."
+            )
 
         _detected = _detect_subdomains(constraints)
         self._dd_subdomains = None
@@ -2186,8 +2185,6 @@ class core:
         # Domain-decomposition coupling: the constraints are subdomain solve problems, not losses —
         # couple them by the inferred method (line Dirichlet-Neumann or overlapping Schwarz), no PINN
         # training. `epochs` maps to the coupling iteration cap (line DN needs a few hundred).
-        if getattr(self, "_electrothermal", None) is not None:
-            return self._electrothermal.solve(max_iter=int(epochs) if epochs and epochs != 1000 else 50)
         if getattr(self, "_dd_subdomains", None) is not None:
             from .dd import couple
 

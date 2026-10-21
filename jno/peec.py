@@ -921,7 +921,7 @@ class PEEC:
         It is the heat source of a thermal problem on the same geometry::
 
             heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(sink) - 300.0])
-            jno.core([em, heat]).solve()
+            T_conv = heat.solve()     # solved together with this network: em.solve() is the network there
 
         The value of a conductor's loss is only known once this network is solved, so ``em.loss`` is a
         placeholder that the coupled solve fills in -- region by region, one value per conductor, the
@@ -939,6 +939,8 @@ class PEEC:
                     "conductors -- `shape.name('trace')` -- so each one's loss can be a heat source."
                 )
             self._loss_params = {n: parameter((1,), name=f"__peec_loss_{n}") for n in regions}
+            for p in self._loss_params.values():
+                p.model._peec_network = self  # how a jno.fem built on `em.loss` finds the network it couples to
             self._loss = self.domain._by_region(self._loss_params, default=0.0)
         return self._loss
 
@@ -1103,8 +1105,9 @@ class PEEC:
                     names = sorted({f.name for f in _field_symbols(sig[n])})
                     raise ValueError(
                         f"jno.peec: the conductivity of {n!r} depends on the FEM field {names}, which only a "
-                        "FEM solve produces. Solve the two problems together -- "
-                        "`jno.core([em, heat]).solve()` -- where `heat` is the `jno.fem` problem of that field."
+                        "FEM solve produces. Write the jno.fem problem of that field with this network's loss "
+                        "as its source -- `jno.fem([... - em.loss * s, ...])` -- and the two are solved "
+                        "together: `heat.solve()` (the converged field), `em.solve()` (the network there)."
                     )
                 field_exprs[n] = sig[n]
                 _ref = _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])})
@@ -1368,6 +1371,19 @@ class PEEC:
         `jno.core` instead. Keyword arguments are those of :meth:`BuiltPEEC.solve` -- ``sigma=``,
         ``geometry=``, ``operator=`` for a graded lattice, and the rest.
         """
+        heat = self.__dict__.get("_heat")
+        if heat is not None:
+            # A jno.fem problem is heated by this network's `em.loss`: the network is solved at the
+            # converged temperature of the pair -- the same solve `heat.solve()` returns.
+            if kw:
+                raise ValueError(
+                    f"jno.peec: this network heats a jno.fem problem (its `em.loss`), so it is solved at their "
+                    f"coupled fixed point with its own settings; solve() takes no keywords here (got {sorted(kw)}). "
+                    "Give them to jno.peec(..., operator=, restart=, matrix_free=)."
+                )
+            from .utils.solver.electrothermal import coupled
+
+            return coupled(self, heat).solve().em
         return self._build().solve(**{**self._solve_kw, **kw})
 
 
@@ -1938,7 +1954,7 @@ def peec(constraints, *, freq=0.0, grid=None, operator=None, restart=None, matri
             skin depth into filaments across its section.
         operator, restart, matrix_free: how THIS network is solved -- the same settings
             :meth:`BuiltPEEC.solve` takes, kept on the network so every solve uses them, the ones a
-            coupled ``jno.core([em, heat])`` runs included. A keyword given to ``solve()`` overrides
+            coupled solve of a network and the jno.fem problem its ``em.loss`` heats included. A keyword given to ``solve()`` overrides
             them for that call. ``grid=jno.peec.faces(...)`` needs ``operator=jno.solve.hierarchical(...)``
             (or ``matrix_free=False``, dense) here, since its lattice has no FFT.
 

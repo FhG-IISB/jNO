@@ -460,7 +460,8 @@ the property that caused them — the same spelling in and out, as with `.attach
 ### Electro-thermal coupling
 
 The loss heats the conductor, and a hotter conductor is more resistive -- copper by about 0.39 %/K. The
-two problems are written as two term lists and solved together by `jno.core`:
+two problems are written as two term lists that refer to each other -- the network's conductivity reads
+the FEM field, the FEM's source is the network's loss -- and those references are the coupling:
 
 ```python
 T, s = d.fem_symbols()
@@ -471,23 +472,25 @@ em = jno.peec([v(*at("P")) - v(*at("N")) - 1.0], freq=1e6)
 
 heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(*at("N")) - 300.0])
 
-sol = jno.core([em, heat]).solve()          # a fixed point: sigma(T) <-> T
-sol.field, sol.em.R, sol.iterations
+T_conv = heat.solve()       # the converged field: a fixed point, sigma(T) <-> T
+sol = em.solve()            # the network at that field: sol.R, sol.L, sol.current("P"), ...
 ```
 
 `em.loss` is the loss density of each conductor [W/m^3], a coefficient the weak form uses like any
-other; the coupled solve fills it in. The temperature reaches each PEEC element by linear interpolation
+other; the coupled solve fills it in. Solving either problem converges the pair once, and the other's
+solve reads that same state. The temperature reaches each PEEC element by linear interpolation
 of the FEM field at the element centre. With a trainable `jno.np.parameter` in either problem,
-`solve()` returns the converged field as a trace node over the parameters, and the gradient goes through
-the fixed point by `jax.lax.custom_root` -- implicit differentiation, not unrolled iterations.
+`heat.solve()` returns the converged field as a trace node over the parameters and `em.solve()` readouts
+computed from that node, and the gradient goes through the fixed point by `jax.lax.custom_root` --
+implicit differentiation, not unrolled iterations. To optimise, put those readouts in `jno.core`.
 
 !!! warning "Scope"
     The heat problem must be **linear** in its field (a constant or region-wise `k`), the field a scalar
     P1 field on the same domain, and the network solved at **one** frequency. The geometry is frozen at
     the first solve, as for any network. A conductivity written in a FEM field cannot be solved without its
-    FEM problem: `em.solve()` refuses and names `jno.core([em, heat])`.
+    FEM problem: `em.solve()` refuses and says how to write it.
 
-`sol.em.dissipation()` still returns the `{region: W/m^3}` mapping, for a thermal model outside jNO.
+`sol.dissipation()` still returns the `{region: W/m^3}` mapping, for a thermal model outside jNO.
 
 ## Solver controls
 
@@ -658,10 +661,10 @@ jno.core([s.L, jno.le(...)]).solve(50)
 
 Settings of how a network is solved live on the network --
 `jno.peec(cons, freq, grid=jno.peec.faces(pitch=1e-3), operator=jno.solve.hierarchical(tol=1e-6))` (or
-`restart=`, `matrix_free=`) -- so every solve uses them, the coupled `jno.core([em, heat])` included; a
-keyword to `solve()` overrides them for that call. With a parameter in either problem the coupled solve
-returns the converged field as a trace node, and `node.em.L` / `.R` / `.current(t)` / `.dissipation()`
-are the network's readouts at that field, trace nodes too.
+`restart=`, `matrix_free=`) -- so every solve uses them, the coupled one included; a keyword to `solve()`
+overrides them for an uncoupled network. With a parameter in either problem, `heat.solve()` is the
+converged field as a trace node, and `em.solve().L` / `.R` / `.current(t)` / `.dissipation()` are the
+network's readouts at that field, trace nodes too.
 
 Every parameter needs an initial value: the shape is built -- discretised, and meshed for a `jno.fem`
 on the same domain -- at the parameters' initial values, and moved from there under a trace. The rules

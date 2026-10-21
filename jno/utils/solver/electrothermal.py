@@ -1,30 +1,34 @@
 """Electro-thermal coupling: a ``jno.peec`` network and the ``jno.fem`` problem of its temperature.
 
-Written as two term lists and solved together by ``jno.core``::
+Written as two term lists that refer to each other, and solved by solving either::
 
     T, s = d.fem_symbols()
-    d.attach(sigma=sigma20 / (1 + alpha * (T - 293.15)), k=400.0)   # sigma depends on the FEM field
+    d.attach(sigma=sigma20 / (1 + alpha * (T - 293.15)), k=400.0)   # the network reads the FEM field
     em = jno.peec([v(P) - v(N) - 1.0], freq=1e6)
-    heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(N) - 300.0])
-    sol = jno.core([em, heat]).solve()
+    heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(N) - 300.0])   # the FEM reads the network
+    T_conv = heat.solve()     # the converged temperature
+    sol = em.solve()          # the network at that temperature
 
-The coupling is a fixed point on the FEM field ``T``: the network is solved with the conductivity at the
+The two references ARE the coupling -- no coupling call: a FEM whose source is ``em.loss`` records the
+network when it is built, and solving either problem converges the pair once (:func:`coupled`), shared
+by both. It is a fixed point on the FEM field ``T``: the network is solved with the conductivity at the
 current temperature, its loss density per conductor (``em.loss``) is the heat source of the FEM problem,
 and the FEM solve gives the next temperature. The temperature reaches each PEEC element by linear (P1)
 interpolation of the FEM field at the element centre.
 
 Differentiability. Every step of the map is JAX -- the conductivity is evaluated by the trace evaluator,
-the network is the frozen ``BuiltPEEC``, the heat solve is the assembled ``FemLinearSystem`` -- so when a
-trainable ``jno.np.parameter`` sits in either problem, ``solve()`` returns a trace node over those
-parameters and the gradient flows through the converged fixed point by ``jax.lax.custom_root`` (implicit
-differentiation, never unrolled iterations). Without a trainable parameter it returns the converged
-:class:`ElectroThermalSolution` directly.
+the network is the kept ``BuiltPEEC``, the heat solve is the assembled ``FemLinearSystem`` -- so when a
+trainable ``jno.np.parameter`` sits in either problem (a material, or a shape coordinate), ``heat.solve()``
+returns a trace node over those parameters and ``em.solve()`` readouts computed FROM that node, and the
+gradient flows through the converged fixed point by ``jax.lax.custom_root`` (implicit differentiation,
+never unrolled iterations). Without a trainable parameter both are eager: the converged field, and the
+:class:`~jno.peec.PEECSolution` at it.
 
 Scope, up front:
 
 * the heat problem is **linear** in its field (a constant or region-wise ``k``); a nonlinear one is refused;
 * the field is a **scalar P1** field on the same domain as the network;
-* the network is solved at **one** frequency;
+* the network is solved at **one** frequency, with the settings given to ``jno.peec(...)``;
 * the STRUCTURE is frozen at the first solve; a geometry parameter (a shape coordinate written in
   parameters) moves the network's faces and wires and the FEM mesh together, every pass.
 """
@@ -42,6 +46,33 @@ def _is_peec(obj):
 
 def _is_fem(obj):
     return hasattr(obj, "_op") and hasattr(obj, "operator") and not _is_peec(obj)
+
+
+def peec_source_of(fem_obj):
+    """The ``jno.peec`` network whose ``em.loss`` is a source of this FEM problem, or ``None``."""
+    op = getattr(fem_obj, "_op", None)
+    exprs = dict(getattr(op, "runtime_parameter_exprs", None) or {})
+    nets = {}
+    for e in exprs.values():
+        net = getattr(getattr(e, "model", None), "_peec_network", None)
+        if net is not None:
+            nets[id(net)] = net
+    if len(nets) > 1:
+        raise NotImplementedError(
+            "jno.fem: this problem is heated by the losses of several jno.peec networks; the coupled solve "
+            "couples one network and one heat problem."
+        )
+    return next(iter(nets.values()), None)
+
+
+def coupled(em, heat):
+    """The one coupled solve of ``em`` and ``heat``, built once and shared by ``em.solve()`` and
+    ``heat.solve()`` -- so the two return views of the same converged state, not two fixed points."""
+    et = em.__dict__.get("_coupling")
+    if et is None or et.heat is not heat:
+        et = ElectroThermal(em, heat)
+        em._coupling = et
+    return et
 
 
 def detect_pair(constraints):
@@ -86,14 +117,15 @@ class ElectroThermalSolution:
 
 
 class ElectroThermal:
-    """The coupled driver behind ``jno.core([em, heat])``. See the module docstring."""
+    """The coupled solve behind ``heat.solve()`` / ``em.solve()`` of a pair coupled through ``em.loss``. See the module docstring."""
 
     def __init__(self, em, heat):
         self.em, self.heat = em, heat
+        self._result = None  # the converged state (or its trace node), shared by em.solve() and heat.solve()
         loss = getattr(em, "_loss_params", None)
         if not loss:
             raise ValueError(
-                "jno.core([em, heat]): the FEM problem does not use the network's loss. Write it as the heat "
+                "jno.peec + jno.fem (coupled through em.loss): the FEM problem does not use the network's loss. Write it as the heat "
                 "source of the FEM problem -- `jno.fem([... - em.loss * s, ...])` -- so the two are coupled."
             )
         from ...trace import FemLinearSystem
@@ -101,7 +133,7 @@ class ElectroThermal:
         op = heat._op
         if not isinstance(op, FemLinearSystem) or not op.is_parametric:
             raise NotImplementedError(
-                "jno.core([em, heat]): the heat problem must be a LINEAR jno.fem problem whose source is "
+                "jno.peec + jno.fem (coupled through em.loss): the heat problem must be a LINEAR jno.fem problem whose source is "
                 "`em.loss`. A nonlinear heat problem (a temperature-dependent k, radiation) is not supported "
                 "by the coupled solve yet."
             )
@@ -110,12 +142,12 @@ class ElectroThermal:
         missing = [n for n in self._loss_names if n not in names]
         if missing:
             raise ValueError(
-                "jno.core([em, heat]): the FEM problem does not use the network's loss. Write it as the heat "
+                "jno.peec + jno.fem (coupled through em.loss): the FEM problem does not use the network's loss. Write it as the heat "
                 "source of the FEM problem -- `jno.fem([... - em.loss * s, ...])` -- so the two are coupled."
             )
         if np.size(em.freq) != 1:
             raise NotImplementedError(
-                "jno.core([em, heat]): the network is solved at several frequencies, and a heat source is one "
+                "jno.peec + jno.fem (coupled through em.loss): the network is solved at several frequencies, and a heat source is one "
                 "loss. Give jno.peec a single frequency for the coupled solve."
             )
         self._op = op
@@ -146,7 +178,7 @@ class ElectroThermal:
         cells = np.asarray(d._cells_p1())
         if pts.shape[0] != int(np.max(cells)) + 1 or np.asarray(T0).reshape(-1).shape[0] != pts.shape[0]:
             raise NotImplementedError(
-                "jno.core([em, heat]): the coupled field must be a scalar P1 field on the network's domain "
+                "jno.peec + jno.fem (coupled through em.loss): the coupled field must be a scalar P1 field on the network's domain "
                 f"(one value per mesh node); this one has {np.asarray(T0).size} values on {pts.shape[0]} nodes."
             )
         self.em._field_reference = float(np.mean(np.asarray(T0)))
@@ -155,7 +187,7 @@ class ElectroThermal:
         fields = {f for e in field_exprs.values() for f in _field_symbols(e)}
         if len(fields) > 1:
             raise NotImplementedError(
-                "jno.core([em, heat]): a conductivity depends on more than one FEM field "
+                "jno.peec + jno.fem (coupled through em.loss): a conductivity depends on more than one FEM field "
                 f"({sorted(f.name for f in fields)}); the coupled solve couples one field."
             )
         # Each field-dependent conductor's element centres, read off the resolver itself (so the order is
@@ -214,8 +246,16 @@ class ElectroThermal:
 
     # -- the solve -------------------------------------------------------------------------------------------
     def solve(self, *, tol: float = 1e-8, max_iter: int = 50):
-        """Converge the coupled field. Returns an :class:`ElectroThermalSolution`, or -- when a trainable
-        ``jno.np.parameter`` sits in either problem -- a trace node of the converged FEM field over them."""
+        """Converge the coupled field, once: later calls return the same result. Returns an
+        :class:`ElectroThermalSolution`, or -- when a trainable ``jno.np.parameter`` sits in either
+        problem -- a trace node of the converged FEM field over them (its ``.em`` the network there)."""
+        if self._result is not None and self._result[0] == (tol, max_iter):
+            return self._result[1]
+        out = self._solve(tol=tol, max_iter=max_iter)
+        self._result = ((tol, max_iter), out)
+        return out
+
+    def _solve(self, *, tol, max_iter):
         from ...geometry import parametric as _par
         from ...peec import _parameters_in
 
@@ -248,7 +288,7 @@ class ElectroThermal:
                 break
         else:
             raise RuntimeError(
-                f"jno.core([em, heat]): the electro-thermal fixed point did not converge in {max_iter} passes "
+                f"jno.peec + jno.fem (coupled through em.loss): the electro-thermal fixed point did not converge in {max_iter} passes "
                 f"(last relative change {change:.2e} against tol={tol:g}). A loss that grows faster with "
                 "temperature than the heat path can remove has no steady state -- thermal runaway -- so check "
                 "the drive and the heat sink before raising max_iter."
