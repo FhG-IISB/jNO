@@ -49,6 +49,20 @@ def test_domain_info_says_when_the_mesh_is_still_lazy():
     assert "lazy" in jno.info(d).as_dict()["mesh"]["built"]
 
 
+def test_domain_info_reports_the_points_in_use_not_the_mesh_pool():
+    """``variable(tag, sample=(N, None))`` puts N points in the context, and those are what a constraint
+    trains on; the tag row used to report the size of the mesh pool they are drawn beside (4,096 shown for
+    40,000 used)."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
+    d.variable("interior", sample=(1234, None))
+    pool = np.asarray(d._mesh_pool["interior"]).shape[0]
+    assert pool != 1234
+    row = dict(jno.info(d).sections)["tags"]
+    interior = dict(row)["interior"]
+    assert interior.startswith("1,234 points"), interior
+    assert f"mesh {pool:,}" in interior, interior
+
+
 def test_fem_info_reports_mode_dofs_and_every_term():
     f = _poisson(_two_region_domain())
     data = jno.info(f).as_dict()

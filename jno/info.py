@@ -150,13 +150,16 @@ def _info_domain(d, deep: bool) -> Info:
                 continue
             seen_pairs.add(frozenset((a, b)))
         ctx = getattr(d, "context", None) or {}
-        if tag in pool:
-            row = f"{_fmt_n(np.asarray(pool[tag]).shape[0])} points"
+        # The points a constraint trains on are the ones in `context` (what `variable(tag, sample=...)` drew);
+        # the mesh pool beside them is only reported when it differs.
+        n_pool = np.asarray(pool[tag]).shape[0] if tag in pool else None
+        if tag in ctx and np.ndim(ctx[tag]) >= 2:
+            n_used = np.shape(ctx[tag])[-2]
+            row = f"{_fmt_n(n_used)} points" + (f" (mesh {_fmt_n(n_pool)})" if n_pool not in (None, n_used) else "")
+        elif n_pool is not None:
+            row = f"{_fmt_n(n_pool)} points"
         elif entry.get("point_indices") is not None:
             row = f"{_fmt_n(len(entry['point_indices']))} points"
-        elif tag in ctx and np.ndim(ctx[tag]) >= 2:
-            # A region added after the mesh is sampled into `context` on first use, not into the pool.
-            row = f"{_fmt_n(np.shape(ctx[tag])[-2])} points"
         else:
             row = "not sampled yet"
         # Extents for a boundary tag -- the check that `lambda x, y: y > 1-1e-9` actually caught the
