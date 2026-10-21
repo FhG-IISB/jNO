@@ -230,7 +230,7 @@ def field_names(exprs):
     for f in fields:  # the fields the equations are about take the first letters
         sym = _user_name(f) or next(letters)
         names[("node", id(f))] = sym
-        defs.append(([sym], f))
+        defs.append(([sym], f, ("node", id(f))))
     for mid in order:
         call = calls[mid]
         module = getattr(call.model, "module", None)
@@ -251,7 +251,7 @@ def field_names(exprs):
                 base if comps == [0] and _single_output(call) else f"{base}#{i}"
             )
         symbols = [names[("component", mid, i)] for i in comps] if comps else [base]
-        defs.append((symbols, (label, list(call.args))))
+        defs.append((symbols, (label, list(call.args)), ("model", mid)))
     return names, defs
 
 
@@ -628,12 +628,15 @@ def equation(expr, names, *, ascii_only=None, measure=None) -> tuple[str, str]:
     return f"{text} = 0", loss
 
 
-def where_rows(defs, names, *, ascii_only=None):
-    """``[("where", "u = MLP(x, t)"), ...]`` from :func:`field_names` definitions."""
+def where_rows(defs, names, *, ascii_only=None, shapes=None, width=58):
+    """``[("where", "u = MLP(x, t)"), ...]`` from :func:`field_names` definitions. With ``shapes`` (``key ->
+    [shape, ...]``, as :func:`tree` collects it) only the definitions it holds, each with its shapes."""
     st = _Style(not unicode_ok() if ascii_only is None else ascii_only)
     r = _Renderer(names, st)
     rows = []
-    for symbols, rhs in defs:
+    for symbols, rhs, key in defs:
+        if shapes is not None and key not in shapes:
+            continue
         syms = [r._sub_symbol(s) for s in symbols]
         lhs = syms[0] if len(syms) == 1 else "(" + ", ".join(syms) + ")"
         if isinstance(rhs, tuple):
@@ -643,7 +646,11 @@ def where_rows(defs, names, *, ascii_only=None):
             r.defining = rhs
             text = r(rhs)
             r.defining = None
-        rows.append(("where" if not rows else "", f"{lhs} = {text}"))
+        text = f"{lhs} = {text}"
+        if shapes is not None:
+            known = [sh for sh in shapes[key] if sh != "per point"] or shapes[key]
+            text = f"{text.ljust(width)}  {', '.join(known)}"
+        rows.append(("where" if not rows else "", text))
     return rows
 
 
@@ -687,51 +694,70 @@ def _shown_children(n, T):
     return out
 
 
-def tree(expr, names, shapes, *, ascii_only=None, width=58) -> list:
+def _definition_key(n, names, T):
+    """The ``where`` entry a node stands for -- a named field, a network, one of a network's outputs -- or
+    ``None`` for a node drawn in the tree."""
+    if ("node", id(n)) in names:
+        return ("node", id(n))
+    if isinstance(n, T["ModelCall"]):
+        return ("model", id(n.model))
+    if isinstance(n, T["FunctionCall"]) and _fn_name(n) == "getitem" and isinstance(n.args[0], T["ModelCall"]):
+        return ("model", id(n.args[0].model))
+    return None
+
+
+def tree(expr, names, shapes, *, defined=None, ascii_only=None, width=58) -> list:
     """``expr`` as an indented tree, one node per line in mathematical notation with its shape.
 
-    ``shapes`` maps ``id(node)`` to a shape string; a node without one is evaluated only inside a derivative
-    pass (``per point``). A node shared by several terms is expanded once; later uses point back (``↑``).
+    Nothing is drawn twice. A named node (a field, a network or one of its outputs) is not drawn at all: it is
+    visible by name in every label that uses it and is defined once, in the ``where`` block (``defined``
+    collects ``key -> [shapes]`` for it, see :func:`where_rows`). Any other node used again is drawn the
+    first time only. ``shapes`` maps ``id(node)`` to a shape string; a node without one is evaluated only
+    inside a derivative pass (``per point``).
     """
     st = _Style(not unicode_ok() if ascii_only is None else ascii_only)
     T = _node_types()
     r = _Renderer(names, st)
     tee, last, bar, gap = ("├─ ", "└─ ", "│  ", "   ") if not st.ascii else ("|- ", "`- ", "|  ", "   ")
-    up = "↑" if not st.ascii else "^"
+    defined = {} if defined is None else defined
     lines, done = [], set()
 
     def label(n):
-        r.defining = n  # the node in full here, not by the name it may carry
         try:
             text = r(n)
         except Exception as err:  # noqa: BLE001
             text = f"{type(n).__name__} ({type(err).__name__})"
-        finally:
-            r.defining = None
-        named = names.get(("node", id(n)))
-        if named:
-            text = f"{named} = {text}"
-        elif isinstance(n, T["ModelCall"]):  # the network itself: u = MLP(x, y)
-            sym = names.get(("model", id(n.model)))
-            call = f"{names.get(('label', id(n.model)), 'net')}({', '.join(r(a) for a in n.args)})"
-            text = f"{r._sub_symbol(sym)} = {call}" if sym else call
         return text if len(text) <= width else text[: width - 1] + "…"
+
+    def record(n, key):
+        shape = shapes.get(id(n), "per point")
+        seen = defined.setdefault(key, [])
+        if shape not in seen:
+            seen.append(shape)
+
+    def visible(n):
+        key = _definition_key(n, names, T)
+        if key is not None:
+            record(n, key)
+            return False
+        return id(n) not in done
 
     def visit(n, prefix, is_last, top=False, negated=False):
         branch = "" if top else (last if is_last else tee)
-        shape = shapes.get(id(n), "per point")
-        seen = id(n) in done
-        text = (st.minus if negated else "") + label(n)
+        text = label(n)
+        if negated:  # a subtracted term: − a, and − (−a) = a
+            text = text[1:] if text.startswith(("-", "−")) else st.minus + text
         lines.append(
-            f"{prefix}{branch}{text.ljust(max(width - len(prefix) - len(branch), 0))}  {shape}{f'  {up}' if seen else ''}"
+            f"{prefix}{branch}{text.ljust(max(width - len(prefix) - len(branch), 0))}  {shapes.get(id(n), 'per point')}"
         )
-        if seen:
-            return
         done.add(id(n))
-        kids = _shown_children(n, T)
+        kids = [(c, neg) for c, neg in _shown_children(n, T) if visible(c)]
         child_prefix = prefix + ("" if top else (gap if is_last else bar))
         for i, (c, neg) in enumerate(kids):
             visit(c, child_prefix, i == len(kids) - 1, negated=neg)
 
+    key = _definition_key(expr, names, T)
+    if key is not None:
+        record(expr, key)
     visit(expr, "", True, top=True)
     return lines

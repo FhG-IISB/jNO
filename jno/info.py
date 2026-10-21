@@ -173,11 +173,11 @@ def _expression_tree_rows(c) -> list:
     import jax
 
     from .trace import FunctionCall
-    from .trace.pretty import _fn_name, field_names, tree
+    from .trace.pretty import _fn_name, field_names, tree, where_rows
     from .trace_evaluator import TraceEvaluator
 
     exprs = [getattr(e, "_expr", e) for e in (getattr(c, "constraints", None) or [])]
-    names, _ = field_names(exprs)
+    names, defs = field_names(exprs)
     ctx = c._build_shape_context(min_consecutive=1)
     evaluator = TraceEvaluator(c._unwrapped_models)
     shapes: dict = {}
@@ -190,7 +190,7 @@ def _expression_tree_rows(c) -> list:
         return out
 
     evaluator._dispatch = recording
-    rows = []
+    rows, defined = [], {}
     for i, e in enumerate(exprs):
         try:
             jax.eval_shape(lambda e=e: evaluator.evaluate(e, ctx, {}, jax.random.PRNGKey(0)))
@@ -199,9 +199,13 @@ def _expression_tree_rows(c) -> list:
         root, loss = e, ""
         if isinstance(e, FunctionCall) and _fn_name(e) in ("mse", "mae"):
             root, loss = e.args[0], f" → {_fn_name(e)} → {shapes.get(id(e), '()')}"
-        lines = tree(root, names, shapes)
+        lines = tree(root, names, shapes, defined=defined)
         lines[0] = f"[{i}] {lines[0]}{loss}"
         rows += [("", ("    " if k else "") + ln) for k, ln in enumerate(lines)]
+    # what the trees use by name, defined once
+    rows += [
+        ("", ("where " if k == "where" else "      ") + v) for k, v in where_rows(defs, names, shapes=defined, width=56)
+    ]
     return rows
 
 

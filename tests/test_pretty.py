@@ -113,8 +113,8 @@ def test_numbers_are_recognised_as_fractions_of_known_constants_only_when_exact(
 
 
 def test_deep_core_info_is_one_expression_tree_with_shapes():
-    """``jno.info(crux, deep=True)``: every constraint as a tree in the same notation, sums flat, the network
-    as ``u = MLP(x, t)``, each node with its shape, a node used again pointing back with ``↑``."""
+    """``jno.info(crux, deep=True)``: every constraint as a tree in the same notation, sums flat, each node with
+    its shape, nothing drawn twice, and the network defined once below the trees."""
     d, net, u, x, residual = _burgers()
     net.optimizer(optax.adam(1e-3))
     crux = jno.core([r.mse for r in residual], domain=d)
@@ -125,7 +125,9 @@ def test_deep_core_info_is_one_expression_tree_with_shapes():
     body = [ln.strip() for ln in lines[1:]]
     assert any(b.startswith("├─ ∂u/∂t") for b in body)
     assert any(b.startswith("└─ −0.01 ∂²u/∂x²") for b in body)  # a subtracted term is a sibling with its sign
-    assert any("u = MLP(x, t)" in b and b.endswith("↑") for b in body)
+    # nothing is drawn twice: u is not a node of the tree, it is defined once, with its shapes
+    assert not any(b.endswith("↑") or "MLP" in b for b in body[:-1])
+    assert body[-1].startswith("where u = MLP(x, t)") and body[-1].endswith(f"({n}, 1)")
 
 
 def test_solve_no_longer_logs_constraint_shapes(monkeypatch):

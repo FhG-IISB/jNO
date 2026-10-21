@@ -43,23 +43,21 @@ For the Burgers equation the tree reads
   expression tree
       [0] ∂u/∂t + u ∂u/∂x − 0.01/π ∂²u/∂x²         (10000, 1) → mse → ()
           ├─ ∂u/∂t                                 (10000, 1)
-          │  └─ u = MLP(x, t)                      (10000, 1)
           ├─ u ∂u/∂x                               (10000, 1)
-          │  ├─ u = MLP(x, t)                      (10000, 1)  ↑
           │  └─ ∂u/∂x                              (10000, 1)
-          │     └─ u = MLP(x, t)                   (10000, 1)  ↑
           └─ −0.01/π ∂²u/∂x²                       (10000, 1)
              └─ ∂²u/∂x²                            (10000, 1)
-                └─ u = MLP(x, t)                   (10000, 1)  ↑
+      [1] u + sin(π x)                             (50, 1) → mse → ()
+          └─ sin(π x)                              (50, 1)
+             └─ π x                                (50, 1)
+      where u = MLP(x, t)                          (10000, 1), (50, 1)
 ```
 
-A sum's terms are siblings, each with its sign; `↑` marks a node already expanded above. The shapes come
-from one abstract evaluation (`jax.eval_shape`), so nothing is computed; a node evaluated only inside a
-derivative pass, one point at a time, is marked `per point`.
-
-`jno.info` takes any jNO object — a `domain`, a `jno.fem` form, a `jno.fdm` or `jno.rcwa` solver,
-a `core`, or a `jno.solve` / `jno.precond` spec — and `Info.as_dict()` returns the same content as
-data, so a test can assert on it.
+Nothing is drawn twice. A sum's terms are siblings, each with its sign. A network, its outputs and a
+field built on it are not nodes of the tree: they appear by name in the labels and are defined once, in
+the `where` block, with the shape on every point set they are evaluated on. The shapes come from one
+abstract evaluation (`jax.eval_shape`), so nothing is computed; a node evaluated only inside a derivative
+pass, one point at a time, is marked `per point`.
 
 ### Debug Print Inside Expressions
 
