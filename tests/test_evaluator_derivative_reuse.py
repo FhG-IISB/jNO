@@ -300,8 +300,8 @@ def test_a_laplacian_of_a_laplacian_matches_the_per_node_path():
 
 
 def test_third_and_fourth_order_derivatives_match_the_per_node_path():
-    """Order 3 by nested shared passes, order 4 by univariate Taylor passes: ``u_xxx``, ``d/dx Lap u``,
-    ``d/dt Lap u`` (time as a coordinate), ``u_xxxx`` and ``d/dt d/dx Lap u``."""
+    """Orders 3 and 4 by univariate Taylor passes: ``u_xxx``, ``d/dx Lap u``, ``d/dt Lap u`` (time as a
+    coordinate), ``u_xxxx`` and ``d/dt d/dx Lap u``."""
 
     def build():
         dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0, 1.0, 4))
@@ -329,6 +329,27 @@ def test_third_and_fourth_order_derivatives_match_the_per_node_path():
     for g, w in zip(got, want):
         assert g.shape == w.shape
         assert np.allclose(g, w, rtol=1e-3, atol=1e-4), np.abs(g - w).max()
+
+
+def test_a_taylor_pass_along_an_axis_also_gives_the_lower_derivatives(monkeypatch):
+    """KdV reads u, u_x and u_xxx: one third-order Taylor pass along x carries all three, so no forward-mode or
+    forward-Laplacian pass runs besides it (and the one along t)."""
+    import folx as _folx
+    import jax as _jax
+
+    jvps, laps = [], []
+    real_jvp, real_lap = _jax.jvp, _folx.forward_laplacian
+    monkeypatch.setattr(_jax, "jvp", lambda *a, **k: jvps.append(1) or real_jvp(*a, **k))
+    monkeypatch.setattr(_folx, "forward_laplacian", lambda *a, **k: laps.append(1) or real_lap(*a, **k))
+    d = jno.shape.rect(-1, 0, 1, 1, size=0.25).domain()
+    x, t = d.variable("interior", split=True)[:2]
+    net = jno.nn(foundax.mlp(2, 1, hidden_dims=8, num_layers=2, key=KEY))
+    net.optimizer(optax.adam(1e-3))
+    u = net(x, t)
+    crux = jno.core([(u.d(t) + 6 * u * u.d(x) + u.d(x).d(x).d(x)).mse], domain=d)
+    jvps.clear(), laps.clear()
+    crux.eval([crux.constraints[0]])
+    assert laps == [] and len(jvps) == 1, (len(jvps), len(laps))  # the jvp along t; x is all in the Taylor pass
 
 
 def test_an_ad_derivative_of_a_target_that_couples_points_raises():

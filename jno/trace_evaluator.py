@@ -987,9 +987,9 @@ class TraceEvaluator:
             return None
         coords = tuple(coords)
         poly = self._ad_polynomial(node, ctx, tag, coords)
-        # Order 4 and up by Taylor passes: measured 1.13-1.6x faster than nested passes for the biharmonic operator,
-        # while at order 3 (u_xxx) the nested path (a forward Laplacian, then a forward pass) was 3-8% faster.
-        if poly is not None and len(next(iter(poly[1]))) >= 4:
+        # Order 3 and up by Taylor passes: one pass gives u, u_x, u_xx and u_xxx along an axis together (KdV), and
+        # the biharmonic operator was measured 1.13-1.6x faster than by nested passes.
+        if poly is not None and len(next(iter(poly[1]))) >= 3:
             return tag, poly[0], "taylor", tuple(sorted(poly[1].items(), key=lambda kv: [_coord_order(c) for c in kv[0]]))
         if isinstance(node, Hessian):
             return tag, node.target, "laplacian" if getattr(node, "trace", False) else "hessian", coords
@@ -1144,7 +1144,7 @@ class TraceEvaluator:
                 else:
                     pairs.add(tuple(sorted(dims)))
         lap_sets = sorted(lap_sets)
-        # Derivatives of order 4 and up (Lap Lap u, u_xxxx, d/dt Lap Lap u): every mixed partial of one order is a fixed
+        # Derivatives of order 3 and up (u_xxx, Lap Lap u, d/dt Lap u): every mixed partial of one order is a fixed
         # combination of univariate Taylor derivatives along a few directions (`_taylor_interpolation`), so each
         # (order, coordinates) group costs one Taylor pass per direction it needs.
         taylor = {}  # (order, coords) -> {direction: {id(node): weight}}
@@ -1162,13 +1162,17 @@ class TraceEvaluator:
                 if abs(w) > 1e-12 * np.abs(weights).max():
                     per_direction.setdefault(j, {})[id(node)] = float(w)
 
-        def taylor_derivative(f, zs, order, group, direction):
-            """The ``order``-th derivative of the targets along ``direction`` (in the ``group`` coordinates)."""
+        def taylor_series(f, zs, order, group, direction):
+            """The targets and their derivatives 1..``order`` along ``direction`` (in the ``group`` coordinates):
+            ``(values, [derivatives of order 1, ..., order])``, each a tuple over the targets."""
             g, cur = restricted(f, zs, group)
             v = jnp.asarray(direction, cur.dtype)
             zero = jnp.zeros_like(v)
-            series = jet.jet(g, (cur,), ((v,) + (zero,) * (order - 1),))[1]  # per target: its derivatives 1..order
-            return tuple(terms[order - 1] for terms in series)
+            values, series = jet.jet(g, (cur,), ((v,) + (zero,) * (order - 1),))
+            return values, [tuple(terms[k] for terms in series) for k in range(order)]
+
+        def taylor_derivative(f, zs, order, group, direction):
+            return taylor_series(f, zs, order, group, direction)[1][order - 1]
 
         unsupported = set()  # a network with an operation `jet` has no rule for: those members keep their own path
         for order, group in list(taylor):
@@ -1199,7 +1203,27 @@ class TraceEvaluator:
             f, zs = at(row), row[tag]
             d1, d2, lap = {}, {}, {}
             primal = None  # the targets' values, as a by-product of a pass that computes them anyway
+
+            # Taylor passes first: one along a coordinate axis (direction K e_c) carries every lower derivative
+            # along c too -- its k-th term over K^k -- so u_x, u_xx and u itself come from the pass that gives u_xxx
+            taylor_out = {}
+            for (order, group), per_direction in taylor.items():
+                for direction, weights in per_direction.items():
+                    values, series = taylor_series(f, zs, order, group, direction)
+                    for nid, w in weights.items():
+                        taylor_out[nid] = taylor_out.get(nid, 0.0) + w * series[order - 1][index_of_node[nid]]
+                    axis = [i for i, j in enumerate(direction) if j]
+                    if len(axis) == 1:
+                        c, scale = group[axis[0]], float(direction[axis[0]])
+                        primal = primal or values
+                        d1.setdefault(c, tuple(t / scale for t in series[0]))
+                        if order >= 2:
+                            lap.setdefault((c,), tuple(t / scale**2 for t in series[1]))
+                            d2.setdefault((c, c), lap[(c,)])
+
             for dims in lap_sets:
+                if dims in lap:  # a single second derivative a Taylor pass already gave
+                    continue
                 g, cur = restricted(f, zs, dims)
                 lapl = folx.forward_laplacian(g)(cur)
                 primal = primal or tuple(t.x for t in lapl)
@@ -1208,6 +1232,8 @@ class TraceEvaluator:
                 for i, d in enumerate(dims):
                     d1.setdefault(d, tuple(j[i] for j in jacs))
             for a, b in sorted(pairs):
+                if (a, b) in d2:
+                    continue
                 g, cur = restricted(f, zs, (a,) if a == b else (a, b))
                 e_a, e_b = (jnp.ones(1, cur.dtype),) * 2 if a == b else tuple(jnp.eye(2, dtype=cur.dtype))
 
@@ -1220,13 +1246,6 @@ class TraceEvaluator:
                     g, cur = restricted(f, zs, (d,))
                     value, d1[d] = jax.jvp(g, (cur,), (jnp.ones(1, cur.dtype),))
                     primal = primal or value
-
-            taylor_out = {}
-            for (order, group), per_direction in taylor.items():
-                for direction, weights in per_direction.items():
-                    dk = taylor_derivative(f, zs, order, group, direction)
-                    for nid, w in weights.items():
-                        taylor_out[nid] = taylor_out.get(nid, 0.0) + w * dk[index_of_node[nid]]
 
             out = {}
             for node, (_, target, kind, dims) in served:
