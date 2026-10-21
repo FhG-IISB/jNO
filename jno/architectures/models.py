@@ -56,6 +56,36 @@ def _resolve_key(key: jax.Array | None):
     return key_out
 
 
+def _space_family(sym):
+    """The element family of a FEM symbol, as the non-nodal assembler names it."""
+    sp = str(getattr(sym, "space", "") or "Lagrange")
+    return {"P0": "DG", "LAGRANGE": "Lagrange", "DG": "DG"}.get(sp.upper(), sp.upper())
+
+
+def _space_field_dofs(sym):
+    """``(n_dofs, per-DOF shape)`` of a symbol whose field parameter lives on its own element space (anything
+    but P0 and P1 Lagrange, which keep their cell / vertex layouts), else ``None``."""
+    fam, k = _space_family(sym), int(getattr(sym, "order", 1))
+    if str(getattr(sym, "space", "")).upper() == "P0" or (fam == "Lagrange" and k == 1):
+        return None
+    import numpy as _np
+
+    from ..utils.solver.fem_dofmap import build_dofmap
+
+    dom = sym._domain
+    cd = dom.mesh.cells_dict
+    kind = "tetra" if "tetra" in cd else "triangle" if "triangle" in cd else None
+    if kind is None:
+        raise NotImplementedError(
+            f"jno.np.parameter(<{fam} symbol, order={k}>): a field on the {fam} space needs a simplex (triangle / "
+            "tetrahedron) mesh; on a line, quadrilateral or hexahedral mesh use a P1 (order=1) or P0 symbol."
+        )
+    cells = _np.asarray(cd[kind])
+    n = int(build_dofmap(cells, fam, k, n_verts=int(dom.mesh.points.shape[0])).n_dofs)
+    vs = tuple(int(s) for s in (getattr(sym, "value_shape", ()) or ()))
+    return n, (vs if fam in ("Lagrange", "DG") else ())
+
+
 def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = None) -> ModelCall:
     """
     Create a trainable parameter tensor.
@@ -63,8 +93,16 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = 
     Useful for learning scalar or tensor constants during optimization,
     such as PDE coefficients or normalization factors.
 
+    Given a FEM symbol instead of a shape, the parameter is a FIELD on that symbol's space: a P0 symbol gives
+    one value per cell, a P1 Lagrange symbol one per mesh vertex (times its value_shape), and any other element
+    space (N1E / N2E / RT of any degree, Lagrange P_k with k >= 2, DG) one value per DOF of that space, in jNO's
+    global DOF order -- for N1E degree 1 the circulation along each edge from its lower to its higher vertex
+    id. The assembler evaluates such a field with its space's own basis and Piola map, so
+    ``jno.np.parameter(e)`` with ``e`` an N1E symbol is a vector field with a tangential trace, as a solved
+    N1E field would be.
+
     Args:
-        shape: Shape of the parameter tensor.
+        shape: Shape of the parameter tensor, or a FEM symbol (a field parameter, see above).
         key: Optional JAX PRNG key used as default when calling
             ``.initialize(<jax initializer>)`` later.
         name: Optional readable label. Omit it and each parameter gets a unique id-based
@@ -108,12 +146,18 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = 
             # their shape, and a quadrilateral or hexahedral mesh has no simplex block to count.
             shape = (int(sym._domain._cells_topo()[0].shape[0]),)
             fem_field = "cell"
+        elif _space_field_dofs(sym) is not None:
+            # Any OTHER finite-element space (N1E / N2E / RT of any degree, Lagrange P_k with k >= 2, DG):
+            # one value per DOF of that space, in jNO's global DOF order (for degree-1 N1E: the circulation
+            # along each edge from its lower to its higher vertex id, the edges in `build_edge_topology`
+            # order). The assembler evaluates it with the space's own basis and Piola map. A Lagrange vector
+            # symbol carries value_shape values per DOF; an H(curl)/H(div) one carries one (the basis is the
+            # vector). Before this branch an N1E symbol fell through to the P1 one and was silently sized
+            # (and evaluated) as a per-vertex vector field.
+            n_dofs, per_dof = _space_field_dofs(sym)
+            shape = (n_dofs,) + per_dof
+            fem_field = "space"
         else:
-            if int(getattr(sym, "order", 1)) != 1:
-                raise NotImplementedError(
-                    "jno.np.parameter(<symbol>): nodal field parameters support P1 (order=1) "
-                    "symbols only for now (higher-order spaces add nodes during init_fem)."
-                )
             # A vector/tensor symbol (``domain.unknown(value_shape=(2,))``) carries that many values per
             # node; it used to be sized as a scalar field, silently, whatever value_shape it was given.
             shape = (int(mesh.points.shape[0]),) + tuple(int(s) for s in (getattr(sym, "value_shape", ()) or ()))
@@ -145,6 +189,12 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = 
     # A nodal field coefficient is re-assembled (parameter inside the integrand,
     # interpolated to quad points), not factored into a constant basis.
     model._fem_field = fem_field
+    # ("space" fields) the element the values belong to: (family, degree, value_shape)
+    model._fem_space = (
+        (_space_family(sym), int(getattr(sym, "order", 1)), tuple(getattr(sym, "value_shape", ()) or ()))
+        if fem_field == "space"
+        else None
+    )
     model._fem_field_key = fem_field_key
     model._fem_field_domain = fem_field_domain
 

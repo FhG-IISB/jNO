@@ -296,6 +296,12 @@ k = jno.np.parameter(phi, name="k")                       # P1 field, one DOF pe
 crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean], domain=obs)
 ```
 
+In a form whose unknown is a non-nodal element (N1E / N2E / RT / DG / P_k), the parameter may live on
+any element space: `jno.np.parameter(e)` with `e` a symbol of that space, e.g. a per-cell (P0) value. The
+same holds for a frozen coefficient, including a field frozen to another form's solve
+(`u.freeze(fem1.solve())`, real or complex) — one-way coupling, in volume terms
+([limitations](limitations.md)).
+
 ### Neural coefficients — `jno.nn(net)` inside the weak form
 
 A network called inside a weak form is a trainable **coefficient** on an assembled FE system —

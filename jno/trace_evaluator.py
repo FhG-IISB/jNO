@@ -528,7 +528,19 @@ class TraceEvaluator:
         # keys hold identities that only exist inside this call.
         self._mesh_eval_cache.clear()
         self._mesh_points_cache.clear()
-        return self._dispatch(expr, ctx)
+        # Nodes marked `_per_evaluation` (a FEM solve, a FEM / domain integral: values of the parameters only,
+        # never of the evaluation points) are computed ONCE per evaluation, however often the expression refers
+        # to them -- the shared node is combined, as a common subexpression. Without it every reference
+        # re-assembled and re-factored the same system inside one compiled program (6 factorisations of one
+        # form in an MMA gradient: out of device memory). Scoped to the outermost call, like the caches above.
+        outer = not getattr(self, "_in_evaluate", False)
+        if outer:
+            self._in_evaluate, self._per_eval_memo, self._per_eval_roots = True, {}, [expr]
+        try:
+            return self._dispatch(expr, ctx)
+        finally:
+            if outer:
+                self._in_evaluate, self._per_eval_memo, self._per_eval_roots = False, {}, []
 
     # ------------------------------------------------------------------
     # Shape tracing — walk the expression tree and record output shapes
@@ -749,6 +761,28 @@ class TraceEvaluator:
 
     def _dispatch(self, expr, ctx):
         """Look up handler in the dispatch table and call it."""
+        if getattr(expr, "_per_evaluation", False):
+            memo = getattr(self, "_per_eval_memo", None)
+            if memo is not None:
+                hit = memo.get(id(expr))
+                if hit is not None and hit[0] is expr:
+                    return hit[1]
+                if getattr(expr, "_solve_fls", None) is not None:
+                    from .utils.solver.shared_solve import solve_shared
+
+                    if solve_shared(self, expr, ctx, memo):  # solved with the solves that share its operator
+                        return memo[id(expr)][1]
+                elif getattr(expr, "_integral_spec", None) is not None:
+                    from .utils.solver.shared_integral import integrate_shared
+
+                    if integrate_shared(self, expr, ctx, memo):  # one kernel with the integrals of its structure
+                        return memo[id(expr)][1]
+                out = self._dispatch_uncached(expr, ctx)
+                memo[id(expr)] = (expr, out)
+                return out
+        return self._dispatch_uncached(expr, ctx)
+
+    def _dispatch_uncached(self, expr, ctx):
         for node_type, method_name in self._HANDLERS:
             if isinstance(expr, node_type):
                 # Assembly defines the active variational bucket for its subtree.

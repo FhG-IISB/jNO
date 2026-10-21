@@ -342,6 +342,32 @@ def gate_suspended(*, record=False):
         _GATE_SUSPENDED, _RECORD_SUSPENDED = prev
 
 
+#: Set while ``jno.core`` TRACES its compiled design step (see :func:`poison_gates`): a traced
+#: :func:`residual_gate` that fails returns NaN instead of calling back to the host.
+_GATE_POISON = False
+
+
+@contextlib.contextmanager
+def poison_gates():
+    """Trace a program whose traced residual gates return NaN on failure instead of calling back to the host.
+
+    JAX never writes a program with a host callback to its persistent compilation cache, and every traced gate
+    (``jax.debug.callback`` in a ``lax.cond``) is one -- so a design loop's step, which can take many minutes
+    to compile, was recompiled on every run. Under this mode a failed gate (relative residual above the hard
+    limit, or not finite) makes the solve's result NaN: it reaches every value computed from it, and the
+    caller MUST check the program's outputs for finiteness and raise -- ``jno.core.solve`` does, on every step
+    it runs this way. What the mode gives up: the failing solve's name and residual in the message (an eager
+    evaluation of the same expression reports them), and the warning-level messages of a residual between the
+    solver's own tolerance and the hard limit."""
+    global _GATE_POISON
+    prev = _GATE_POISON
+    _GATE_POISON = True
+    try:
+        yield
+    finally:
+        _GATE_POISON = prev
+
+
 #: Convergence failures seen by a TRACED :func:`residual_gate`, drained by :func:`raise_if_gate_failed`
 #: at the eager boundary. Raising from inside the callback instead is not reliable: measured, the same
 #: refusal propagates on the CPU backend and is SWALLOWED into a log line on GPU, so the residual
@@ -565,6 +591,8 @@ def residual_gate(mv, b, x, who: str, *, side: str = "forward", rtol: float = No
     if not isinstance(rel, jax.core.Tracer):
         _raise_unconverged(rel, who, side, soft)
         return x
+    if _GATE_POISON:  # no host callback in this program: a failed solve is NaN, and the caller checks for it
+        return jnp.where(jnp.isfinite(rel) & (rel <= _GATE_RTOL), x, jnp.nan)
     ok = rel <= (_GATE_RTOL if soft is None else soft)
     jax.lax.cond(
         jnp.isfinite(rel) & ok,
@@ -1353,6 +1381,10 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
                 x0=x0_flat,
             )
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+        if fem is not None and getattr(linear, "traits", {}).get("solver_context"):
+            # what a direct solver may know beyond the values: the operator's pattern (concrete, for a
+            # factorisation planned inside a trace) and whether it is a fused complex block
+            op.solver_context = fem._linear_solver_context()
         return linear(op, rhs, M=M, x0=x0_flat)
 
     if not _compilable(linear, precond):

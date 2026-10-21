@@ -265,10 +265,10 @@ Differentiable in all three of its arguments: the solution, the runtime paramete
 included), and the **mesh coordinates** — `∂/∂X` flows through `|det J|` and through the facet area
 element, which is what a deformable-mesh design problem needs.
 
-Scope, and it is narrower than the weak path: the whole volume and tagged boundary regions only (a
-sub-region-restricted functional raises), and steady native-Lagrange problems only — transient,
-complex, 1-D, non-nodal elements and the VPINN path never publish the assembler this rides on, and
-say so. Where it is unavailable the equivalent is `sum(fem.eval(F * phi, sol))`: a Lagrange basis is a
+Scope, and it is narrower than the weak path: steady problems only. On a native-Lagrange form, the
+whole volume and tagged boundary regions (a sub-region-restricted functional raises); on a non-nodal
+form (N1E / N2E / RT / DG, alone or mixed with Lagrange), real or complex, the whole volume only.
+Transient, 1-D and VPINN problems never publish the assembler this rides on, and say so. Where it is unavailable the equivalent is `sum(fem.eval(F * phi, sol))`: a Lagrange basis is a
 partition of unity, so summing the weak term `F·φ` over every DOF is the same integral.
 
 ### Tying a region to a constant — `u(region) - U`

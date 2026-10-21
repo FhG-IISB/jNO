@@ -169,6 +169,9 @@ def assemble_fem_nonnodal(
     # happen to agree it worked by luck; where the block SIZES also agree it would have been a
     # silently wrong preconditioner rather than a shape error.
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
+    # the functional behind `fem.eval(F, u)` / `F.integrate(fem)` (steady forms publish it below); cleared
+    # first so a functional left on the domain by an earlier assembly is never picked up for this one
+    domain._fem_native_term_functional = None
 
     spaces = [f["space"] for f in fields]
     if any(s not in ("RT", "N1E", "N2E", "P0", "DG", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
@@ -324,22 +327,45 @@ def assemble_fem_nonnodal(
         return tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
 
     _field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
-    # A P0 ("cell") field parameter has no gather on this path: `_field_param_names` is used below as
-    # if every field parameter were P1 VERTEX data (`_fv[name][cells_j[c]]`, interpolated with
-    # `p1_shape_vals`). Handing it a per-cell array reads the values at vertex ids -- wrong numbers,
-    # out-of-range indices clamped by JAX, and no error. Refuse it, and name what does work here.
+    # Field parameters come in two kinds, gathered differently (as in `fem_native`): a P1 ("node") field is
+    # this cell's VERTEX values, interpolated to the quad points with `p1_shape_vals`; a P0 ("cell") field is
+    # ONE value per element -- the design density of topology optimisation -- gathered by cell index and
+    # broadcast over the quad points (width 1 -> the evaluator's scalar branch). Gathering a P0 array at
+    # vertex ids would read the wrong cells' values and JAX would clamp the out-of-range ids silently.
     from .parametric_helpers import _fem_field_kind
 
-    _cell_param_names = sorted(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "cell")
-    if _cell_param_names:
-        raise NotImplementedError(
-            f"jno.fem (non-nodal): the P0 (per-cell) field parameter(s) {_cell_param_names} are not "
-            "wired on this assembler -- only nodal P1 field parameters are, and a per-cell array would "
-            "be gathered at VERTEX indices and silently give the wrong coefficient. For a per-region "
-            'material use d._by_region({"steel": 16.0, ...}) (or d.attach), which is one value per cell '
-            "and is threaded through the per-cell region masks; for a smooth field, use a P1 "
-            "(Lagrange) parameter."
-        )
+    _cell_param_names = frozenset(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "cell")
+    # a field on its own element space (N1E / RT / P_k / DG): evaluated with that space's basis, see `_coef_specs`
+    _space_param_names = frozenset(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "space")
+
+    def _param_len(name):
+        if name in _space_param_names:
+            _sp = _coef_specs[("param", name)]
+            return _sp["n_vals"], f"one per DOF of its {_sp['fam']}{_sp['k']} space" + (
+                f", times {_sp['vs']}" if _sp["ncomp"] > 1 else ""
+            )
+        if name in _cell_param_names:
+            return n_cells, "P0: one value per cell"
+        return n_verts, "P1: one value per mesh vertex"
+
+    def _param_zeros(name, dtype=jnp.float64):
+        """placeholder for a field parameter absent from `args`: zeros of its kind's length"""
+        return jnp.zeros((_param_len(name)[0],), dtype)
+
+    def _field_array(name, value, dtype):
+        """a field parameter's global array, its length checked against its kind (static under jit)"""
+        arr = jnp.reshape(jnp.asarray(value, dtype=dtype), (-1,))
+        want, kind = _param_len(name)
+        if arr.shape[0] != want:
+            raise ValueError(f"jno.fem: the field parameter {name!r} got {arr.shape[0]} values; it needs {want} ({kind}).")
+        return arr
+
+    def _gather_param(name, vals, c):
+        """cell c's slice of a field parameter: P0 -> its single value, P1 -> its vertex values. A field on its
+        own element space reaches the evaluator through `coef_fields` instead; its slot holds a placeholder."""
+        if name in _space_param_names:
+            return jnp.zeros((1,), vals.dtype)
+        return jnp.reshape(vals[c], (1,)) if name in _cell_param_names else vals[cells_j[c]]
 
     # Neural coefficients (``jno.nn.wrap(net)`` in the weak form) on a non-nodal element: like the native
     # path, the network is re-evaluated at the quad points and its weights ride the runtime ``args`` as a
@@ -410,9 +436,10 @@ def assemble_fem_nonnodal(
     # Mirrors the native path (fem_native `_collect_frozen_fields` / `_frozen_gathered`), with one
     # difference: there, a frozen field is a pinned copy of a field that is already among the solved
     # unknowns, so it gathers on `cells_f_j[field_index[key]]`. Here the trial is N1E (edge DOFs) and a
-    # frozen coefficient lives on the P1 VERTEX space instead — the same space the P1 field parameters
-    # already use — so it gathers on `cells_j` and is interpolated with `p1_shape_vals`. That is what
-    # lets a computed source (e.g. J_s from an electrokinetic pre-solve) enter an H(curl) form.
+    # P1 frozen coefficient lives on the VERTEX space — the same space the P1 field parameters already use —
+    # so it gathers on `cells_j` and is interpolated with `p1_shape_vals`. That is what lets a computed source
+    # (e.g. J_s from an electrokinetic pre-solve) enter an H(curl) form. A frozen field on any OTHER space
+    # (N1E, RT, P_k, DG, P0) goes through the coefficient slots below (`_coef_specs`).
     def _collect_frozen_fields(terms):
         from ...trace import FrozenField
         from .solver_helper import iter_children
@@ -431,9 +458,26 @@ def assemble_fem_nonnodal(
             stack.extend(iter_children(n))
         return found
 
-    _frozen_nodes = _collect_frozen_fields(
+    _frozen_all = _collect_frozen_fields(
         list(volume_terms) + [e for exprs in (boundary_terms or {}).values() for e in exprs]
     )
+    # A frozen field on its OWN element space (N1E / N2E / RT of any degree, Lagrange P_k with k >= 2, DG,
+    # P0) is a coefficient field: evaluated below with that space's basis and Piola map (`_coef_specs`).
+    # Only a P1 Lagrange one keeps the per-vertex gather.
+    # A field frozen to a SOLVE (`u.freeze(fem1.solve())`, a one-way coupling) has no values at build time:
+    # it becomes a runtime input of this form -- its expression IS the other form's solve node, so jno.core
+    # evaluates that solve first and the gradient flows through it -- and is evaluated per cell from a
+    # coefficient slot, whatever its space.
+    _frozen_solved = {f: n for f, n in _frozen_all.items() if getattr(n, "values_node", None) is not None}
+    _frozen_nodes = {
+        f: n
+        for f, n in _frozen_all.items()
+        if f not in _frozen_solved and str(n.space).upper() == "LAGRANGE" and int(n.order) == 1
+    }
+    _frozen_space = {f: n for f, n in _frozen_all.items() if f not in _frozen_nodes and f not in _frozen_solved}
+    _solved_name = {f: f"frozen_solution_{f}" for f in _frozen_solved}
+    for _f, _n in _frozen_solved.items():  # each solved frozen field: its solve node is a runtime input
+        _param_and_neural_exprs = {**_param_and_neural_exprs, _solved_name[_f]: _n.values_node}
     # Per-cell nodal slice, a compile-time constant (no args threading, no jacfwd tangent).
     # scalar (n_nodes,) -> (n_cell, n_local, 1); VECTOR (n_nodes, vec) -> (n_cell, n_local, vec).
     _frozen_gathered: dict = {}
@@ -442,8 +486,8 @@ def assemble_fem_nonnodal(
         if _fvals.shape[0] != n_verts:
             raise ValueError(
                 f"jno.fem (non-nodal): a frozen field coefficient must carry one value per MESH VERTEX "
-                f"({n_verts}); got {_fvals.shape[0]}. On an N1E form the frozen field is a P1 coefficient, "
-                "not a copy of the (edge-DOF) unknown."
+                f"({n_verts}); got {_fvals.shape[0]}. A P1 Lagrange frozen field is per vertex; a field on "
+                "another space (N1E, RT, P_k, DG) is frozen from a symbol of that space."
             )
         _frozen_gathered[_fid] = (
             _fvals[cells_j].reshape(n_cells, cells_j.shape[1], 1) if _fvals.ndim == 1 else _fvals[cells_j]
@@ -452,7 +496,18 @@ def assemble_fem_nonnodal(
     # --- quadrature for the polynomial degree in play. Degree 1 keeps the caller's rule untouched (the
     # lowest-order operators stay bit-identical); degree k needs the mass (degree 2k) exact plus room
     # for a coefficient, so the rule is raised to 2k + 2 when the caller's is lower. ---
-    _kmax = max([o for o, s_ in zip(_orders, spaces) if s_ in _EDGE_FAMILIES + ("Lagrange", "DG")] + [1])
+    from .fem_known import element_of as _coef_family
+
+    # key -> (family, degree, value_shape) of every coefficient field on its own element space
+    _coef_elems = {("param", n): tuple(_rt_param_exprs[n].model._fem_space) for n in _space_param_names}
+    _coef_elems.update(
+        {
+            ("frozen", f): _coef_family(n.space, n.order) + (tuple(n.value_shape),)
+            for f, n in {**_frozen_space, **_frozen_solved}.items()
+        }
+    )
+    _coef_orders = [k for (_f, k, _v) in _coef_elems.values()]
+    _kmax = max([o for o, s_ in zip(_orders, spaces) if s_ in _EDGE_FAMILIES + ("Lagrange", "DG")] + _coef_orders + [1])
     if _kmax > 1:
         quad_degree = max(int(quad_degree), 2 * _kmax + 2)
 
@@ -516,6 +571,7 @@ def assemble_fem_nonnodal(
     # The per-cell transform tables, built HERE (eagerly) and held as plain tuples so `elem_map` lifts
     # their mesh-sized orientation arrays out of the compiled kernel rather than baking them in.
     from .fem_dofmap import transform_from_tables as _B_of
+    from .fem_known import coefficient_slot, coefficient_spec
 
     dm_tables = {i: (dm_.jax_tables(), int(dm_.ndof_local)) for i, dm_ in dofmaps.items() if not dm_.is_diagonal}
 
@@ -584,6 +640,83 @@ def assemble_fem_nonnodal(
                 jnp.asarray(np.stack([_tab[1 + a][..., 0] for a in range(dim)], axis=-1)),
                 None if _dm.is_diagonal else True,
             )
+
+    # --- coefficient fields on their own element space (a frozen `e.bind(...).freeze(values)` or a field
+    # parameter `jno.np.parameter(e)` of an N1E / N2E / RT / DG / P_k symbol): per field its DOF map (the
+    # assembler's own numbering), its reference basis at the volume quadrature and its Piola map. Per cell
+    # `_coef_slots` pushes the basis forward exactly as `_cell_fields` does for an unknown of that space and
+    # hands the evaluator a field slot with the KNOWN cell values in place of the solution, so the value
+    # and the gradient of the coefficient follow the unknowns' conventions. ---
+    _qp_np = np.asarray(ref_spec.quad_points)
+
+    def _coef_spec(fam, k, vs):
+        """DOF map, reference basis at the volume quadrature and Piola map of one coefficient element"""
+        return coefficient_spec(fam, k, vs, _dofmap_for(fam, k), _qp_np, dim)
+
+    def _frozen_coef_values(node, sp):
+        v = jnp.reshape(jnp.asarray(node.values), (-1,))
+        if v.shape[0] != sp["n_vals"]:
+            raise ValueError(
+                f"jno.fem (non-nodal): a frozen {sp['fam']}{sp['k']} field coefficient needs one value per DOF of "
+                f"its space ({sp['n_vals']}"
+                + (f" = DOFs x {sp['ncomp']} components" if sp["ncomp"] > 1 else "")
+                + f"); got {v.shape[0]}."
+            )
+        return v
+
+    _coef_specs = {key: _coef_spec(*elem) for key, elem in _coef_elems.items()}
+    _coef_frozen_vals = {
+        ("frozen", f): _frozen_coef_values(n, _coef_specs[("frozen", f)]) for f, n in _frozen_space.items()
+    }
+
+    def _solved_len(f):
+        """the length of the solve a solved frozen field arrives as (its whole system, sliced to its block)"""
+        blk = _frozen_solved[f].values_block
+        return blk[1] if blk is not None else _coef_specs[("frozen", f)]["n_vals"]
+
+    def _frozen_vals_at(args):
+        """the known values of every frozen coefficient for this call: the constant ones, plus each field
+        frozen to a solve read from ``args`` (sliced to its block, length checked)"""
+        if not _frozen_solved:
+            return _coef_frozen_vals
+        out = dict(_coef_frozen_vals)
+        a_ = args or {}
+        for f, n in _frozen_solved.items():
+            nm = _solved_name[f]
+            if args is None:
+                # NO runtime values at all: the build-time default operator (its size, the static legs of a
+                # complex form) -- the same zeros an absent runtime parameter packs. A call that passes values
+                # but leaves this one out is still refused below.
+                v = jnp.zeros((_solved_len(f),), jnp.float64)
+                blk = n.values_block
+                out[("frozen", f)] = v if blk is None else v[blk[0] : blk[1]]
+                continue
+            if nm not in a_:
+                raise ValueError(
+                    f"jno.fem: this form reads {n.name}, frozen to another form's solve, whose solution was not "
+                    "supplied. It is evaluated through jno.core (`fem.solve()` with no values, then crux); to "
+                    "solve eagerly, freeze the concrete solution array instead."
+                )
+            v = jnp.reshape(jnp.asarray(a_[nm]), (-1,))
+            if v.shape[0] != _solved_len(f):
+                raise ValueError(f"jno.fem: {n.name}: the solve has {v.shape[0]} values, expected {_solved_len(f)}.")
+            blk = n.values_block
+            out[("frozen", f)] = v if blk is None else v[blk[0] : blk[1]]
+        return out
+
+    def _coef_slots(c, param_vals, pts_dyn, specs=None, frozen_vals=None):
+        """This cell's coefficient-field slots ``{key: field slot}`` (the `_cell_fields` dict layout)."""
+        specs = _coef_specs if specs is None else specs
+        frozen_vals = _coef_frozen_vals if frozen_vals is None else frozen_vals
+        if not specs:
+            return None
+        verts = (pts if pts_dyn is None else pts_dyn)[cells_j[c]]
+        J = jnp.stack([verts[k_] - verts[0] for k_ in range(1, dim + 1)], axis=1)
+        detJ = small_det(J)
+        return {
+            key: coefficient_slot(sp, frozen_vals[key] if key[0] == "frozen" else param_vals[key[1]], c, J, detJ)
+            for key, sp in specs.items()
+        }
 
     # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris/Morley need it for the global
     # id + orientation of their edge-normal DOFs (Hermite, pure-vertex, does not).
@@ -952,7 +1085,7 @@ def assemble_fem_nonnodal(
         for key, (_dofs, phiB) in g["across"].items():
             dctx[key] = jnp.einsum("qj,qjv->qv", lbs[key], phiB[f])
         vol_vars = tuple(
-            (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
+            (_gather_param(name, field_vals[name], c) if name in _field_param_names else rt_scalar[name])
             for name in runtime_parameter_tags
         )
         local = {
@@ -1037,26 +1170,28 @@ def assemble_fem_nonnodal(
             # (gathered at `cells_j[c]`), which the evaluator interpolates with the P1 `shape_vals` supplied in
             # `local`. A parameter absent from `args` packs a zero placeholder (right width per kind).
             _a = args or {}
-            _zero_field = jnp.zeros((n_verts,), dtype=u_flat.dtype)
             rt_scalar = {
                 name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=u_flat.dtype), (-1,))[:1]
                 for name in runtime_parameter_tags
                 if name not in _field_param_names
             }
-            field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=u_flat.dtype) for name in _field_param_names}
+            field_vals = {
+                name: _field_array(name, _a.get(name, _param_zeros(name)), u_flat.dtype) for name in _field_param_names
+            }
             R = jnp.zeros(total, dtype=jnp.result_type(u_flat.dtype, np.complex64) if _cx_form else u_flat.dtype)
             _nt = neural_local_table(_neural, args)  # once per call, not per (term × cell) inside `_cell`
             # Scatter trainable coordinates once per residual evaluation, not per (term x cell).
             # The steady linear operator is built FROM this residual (jacfwd -> A, -residual(0) -> b),
             # so without this the shape derivative is lost before `assemble` is ever reached.
             _pts_r = _apply_coord_params(pts, _a)
+            _fz = _frozen_vals_at(args)
             for coeff, tfi, rnames in typed:
 
-                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r):
+                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r, _fz=_fz):
                     per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
                     _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _p is None else _p)[cells_j[c]])
                     vol_vars = tuple(
-                        (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
+                        (_gather_param(name, _fv[name], c) if name in _field_param_names else _sc[name])
                         for name in runtime_parameter_tags
                     )
                     local = {
@@ -1077,6 +1212,8 @@ def assemble_fem_nonnodal(
                         local["shape_vals"] = p1_shape_vals
                     if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
                         local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+                    if _coef_specs:  # coefficient fields on their own element space
+                        local["coef_fields"] = _coef_slots(c, _fv, _p, None, _fz)
                     if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                         local["neural_coefficients"] = _nt
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
@@ -1351,7 +1488,6 @@ def assemble_fem_nonnodal(
 
         _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
         _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
-        _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
         _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # u=0: the LINEAR default
         # TERMS SHARING A TEST FIELD are one GROUP: their element blocks have identical (row, col)
         # layout, so they are summed at the element level and emit ONE pattern block -- the old
@@ -1460,10 +1596,11 @@ def assemble_fem_nonnodal(
                 if name not in _field_param_names
             }
             field_vals = {
-                name: jnp.asarray(_a.get(name, _asm_zero_field), dtype=zeros.dtype) for name in _field_param_names
+                name: _field_array(name, _a.get(name, _param_zeros(name)), zeros.dtype) for name in _field_param_names
             }
             _nt = neural_local_table(_neural, args)
             _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
+            _fz_a = _frozen_vals_at(args)
 
             def _elem_res(c, la, coeff, tfi, rnames):
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
@@ -1471,7 +1608,7 @@ def assemble_fem_nonnodal(
                 per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
                 _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _pts_dyn is None else _pts_dyn)[cells_j[c]])
                 vol_vars = tuple(
-                    (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
+                    (_gather_param(name, field_vals[name], c) if name in _field_param_names else rt_scalar[name])
                     for name in runtime_parameter_tags
                 )
                 local = {
@@ -1492,6 +1629,8 @@ def assemble_fem_nonnodal(
                     local["shape_vals"] = p1_shape_vals
                 if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
                     local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+                if _coef_specs:  # coefficient fields on their own element space
+                    local["coef_fields"] = _coef_slots(c, field_vals, _pts_dyn, None, _fz_a)
                 if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                     local["neural_coefficients"] = _nt
                 return _integrate_term(domain, coeff, local, qw * meas)
@@ -1746,7 +1885,7 @@ def assemble_fem_nonnodal(
             else:
                 # re-form A_aug/forcing from the runtime args each step; the θ=½ stepper differentiates through
                 # its own scan (no stepper change), exactly like the native second-order parametric path.
-                _ph = {nm: (jnp.zeros((n_verts,)) if nm in _field_param_names else 0.0) for nm in runtime_parameter_tags}
+                _ph = {nm: (_param_zeros(nm) if nm in _field_param_names else 0.0) for nm in runtime_parameter_tags}
                 _ph.update({nm: _neural_models[nm].module for nm in neural_param_names})
                 c_dir = jnp.zeros((2 * n,), zeros.dtype) if dd is None else jnp.zeros((2 * n,), zeros.dtype).at[dd].set(dg)
                 block = SemidiscreteTimeBlock(
@@ -1933,6 +2072,98 @@ def assemble_fem_nonnodal(
 
     residual = _make_residual(volume_terms, with_gsurf=True)
 
+    def _make_functional(terms, bterms=None):
+        """``F(u_flat, t, args) -> ()``: the integral of TEST-FREE expressions over the volume, on the quadrature
+        and the field / coefficient slots the residual uses (so ``∫ a(u, u) = u . R_a(u)`` exactly). Complex
+        solutions and coefficients integrate as they assemble. Differentiable in ``u_flat``, the runtime
+        parameters and trainable coordinates. Volume only: a boundary integrand is refused."""
+        if bterms:
+            raise NotImplementedError(
+                f"fem.eval / expr.integrate(fem) on a non-nodal form: boundary integrands ({sorted(bterms)}) are "
+                "not wired; only volume integrals are. Integrate a volume expression instead."
+            )
+        typed = [(_lower_statefield_to_trial(bare, {}), tuple(sorted(_collect_region_mask_names(bare)))) for bare in terms]
+        # known fields the INTEGRAND reads but the form does not (a mask, a weight, a source field read back):
+        # their slots / vertex gathers are built here, for this functional only
+        _extra = {f_: n_ for f_, n_ in _collect_frozen_fields(list(terms)).items() if f_ not in _frozen_all}
+        f_specs, f_vals, f_gath = dict(_coef_specs), dict(_coef_frozen_vals), dict(_frozen_gathered)
+        for f_, n_ in _extra.items():
+            if str(n_.space).upper() == "LAGRANGE" and int(n_.order) == 1:
+                fv = jnp.asarray(n_.values)
+                if fv.shape[0] != n_verts:
+                    raise ValueError(
+                        f"fem.eval / expr.integrate(fem): a frozen P1 field needs one value per mesh vertex ({n_verts}); "
+                        f"got {fv.shape[0]}."
+                    )
+                f_gath[f_] = fv[cells_j].reshape(n_cells, cells_j.shape[1], 1) if fv.ndim == 1 else fv[cells_j]
+            else:
+                key = ("frozen", f_)
+                f_specs[key] = _coef_spec(*(_coef_family(n_.space, n_.order) + (tuple(n_.value_shape),)))
+                f_vals[key] = _frozen_coef_values(n_, f_specs[key])
+
+        _b0 = 1.0 - qp[:, 0] - qp[:, 1] - (qp[:, 2] if dim == 3 else 0.0)
+        _p1_tab = jnp.stack([_b0, qp[:, 0], qp[:, 1]] + ([qp[:, 2]] if dim == 3 else []), axis=1)
+
+        def functional(u_flat, t=0.0, args=None):
+            u_blocks = [u_flat[offs[i] : offs[i + 1]] for i in range(len(fields))]
+            _a = args or {}
+            rt_scalar = {
+                name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=jnp.real(u_flat).dtype), (-1,))[:1]
+                for name in runtime_parameter_tags
+                if name not in _field_param_names
+            }
+            field_vals = {
+                name: _field_array(name, _a.get(name, _param_zeros(name)), jnp.real(u_flat).dtype)
+                for name in _field_param_names
+            }
+            _nt = neural_local_table(_neural, args)
+            _p = _apply_coord_params(pts, _a)
+            _fv_call = {**_frozen_vals_at(args), **{k_: v_ for k_, v_ in f_vals.items() if k_ not in _coef_frozen_vals}}
+            out = 0.0  # promotes to the integrand's dtype (a complex coefficient on a real solution stays complex)
+            for expr, rnames in typed:
+
+                def _cell(c, e=expr, _rn=rnames):
+                    per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
+                    vol_vars = tuple(
+                        (_gather_param(n_, field_vals[n_], c) if n_ in _field_param_names else rt_scalar[n_])
+                        for n_ in runtime_parameter_tags
+                    )
+                    local = {
+                        "physical_quad_points": xq,
+                        "fields": per,
+                        "field_index": field_index,
+                        "tag": "fem_gauss",
+                        "surface": False,
+                        "domain_context": _with_cell_size(ctx, meas, xq, (pts if _p is None else _p)[cells_j[c]]),
+                        "temporal_tags": (),
+                        "runtime_parameter_tags": runtime_parameter_tags,
+                        "region_mask_names": _rn,
+                        "volume_vars": vol_vars + _cell_masks(c, _rn),
+                    }
+                    if _field_param_names or f_gath:
+                        local["shape_vals"] = p1_shape_vals if p1_shape_vals is not None else _p1_tab
+                    if f_gath:
+                        local["frozen_fields"] = {fid: g[c] for fid, g in f_gath.items()}
+                    if f_specs:
+                        local["coef_fields"] = _coef_slots(c, field_vals, _p, f_specs, _fv_call)
+                    if _nt is not None:
+                        local["neural_coefficients"] = _nt
+                    val = _integrate_term(domain, e, local, qw * meas)
+                    if val.shape != (1,):
+                        raise ValueError(
+                            f"fem.eval / expr.integrate(fem): the integrand is not a scalar per point (it integrates "
+                            f"to shape {tuple(val.shape)} per cell). Contract it, e.g. with inner(...)."
+                        )
+                    return val
+
+                per_cell = _elem_map(_cell, (jnp.arange(n_cells),), _cell_chunk_of(n_cells, 1, 1, _chunk_setting))
+                out = out + jnp.sum(per_cell)
+            return jnp.asarray(out)
+
+        return functional
+
+    domain._fem_native_term_functional = _make_functional  # (the attribute name predates the non-nodal path)
+
     def full_residual(u_flat, args=None):  # the natural BC is a constant load on the RHS: R(u) = assembled(u) - load
         return residual(u_flat, args) - nat_load
 
@@ -1981,7 +2212,7 @@ def assemble_fem_nonnodal(
     # COEFFICIENT, so it never appears in `runtime_parameter_tags`. Without it here the assembler
     # returns a static (A, b) and the shape derivative is silently zero -- which reads as a
     # converged design rather than a missing feature.
-    if runtime_parameter_tags or neural_param_names or _coord_specs:
+    if runtime_parameter_tags or neural_param_names or _coord_specs or _frozen_solved:
         from ...trace import FemLinearSystem
 
         def _assemble_at(args):
@@ -1994,13 +2225,16 @@ def assemble_fem_nonnodal(
                 A, b = _apply_dirichlet_symmetric(A, jnp.asarray(b), pins)
             return A, b
 
-        # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_verts,),
+        # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_cells,) or (n_verts,),
         # a neural coefficient rides its stored module)
-        _ph = {n: (jnp.zeros((n_verts,)) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
+        _ph = {n: (_param_zeros(n) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
         _ph.update({n: _neural_models[n].module for n in neural_param_names})
         # a coordinate parameter's placeholder is the CURRENT node positions, not zeros: `.A` / `.b`
         # must describe the mesh as it stands, and zeros would collapse those vertices onto the origin.
         _ph.update({_nm: pts[_ids, _ax] for _ids, _ax, _nm in _coord_specs})
+        # a solved frozen field's placeholder is zeros of its solve's length: `.A` / `.b` are then the system with
+        # that coefficient at zero (the real values exist only when jno.core evaluates the other solve)
+        _ph.update({_solved_name[f]: jnp.zeros((_solved_len(f),)) for f in _frozen_solved})
         a0, b0 = _assemble_at(_ph)
         return (
             FemLinearSystem(
@@ -2009,7 +2243,9 @@ def assemble_fem_nonnodal(
                 operator_fn=lambda args=None: _assemble_at(args)[0],
                 rhs_fn=lambda args=None: _assemble_at(args)[1],
                 runtime_parameter_exprs=dict(_param_and_neural_exprs),
-                metadata={"nonaffine_operator": True},  # re-assembles at each args; no affine parameter basis
+                # re-assembles at each args (no affine parameter basis); the shape of every runtime input, for
+                # callers that need one without a value (a solver planning its factorisation)
+                metadata={"nonaffine_operator": True, "runtime_value_shapes": {k: jnp.shape(v) for k, v in _ph.items()}},
             ),
             "linear",
             offs,

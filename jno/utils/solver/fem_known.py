@@ -1,0 +1,366 @@
+"""Known fields on any element space: their per-cell evaluation, and integrals of them over a domain.
+
+A *known* field is a frozen field (``e.bind(...).freeze(values)``) or a field parameter of an element space.
+Per cell it is pushed forward with its own space's basis, DOF transform and Piola map, exactly as an unknown
+of that space is, and handed to the evaluator as a field slot ``{shape_vals, shape_grads, cell_sol, space}``
+with the known values in place of the solution. The non-nodal assembler uses this for coefficients;
+:func:`domain_functional` uses it for ``expr.integrate(d)``, the integral of an expression made of known fields
+(frozen data, frozen SOLUTIONS of any number of forms, parameters, coordinates, region masks) over a domain.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, List, Tuple
+
+import jax.numpy as jnp
+import numpy as np
+
+_EDGE_FAMILIES = ("RT", "N1E", "N2E")
+
+_DEVICE_CONSTANTS = None  # content key -> device array, held weakly (see device_constant)
+
+
+def device_constant(x, dtype=None):
+    """``jnp.asarray(x, dtype)`` for host mesh data, one device copy per distinct content.
+
+    Every integral and every form builds its own copy of the same mesh tables (cell DOF maps, edge signs,
+    region masks, vertex coordinates); 78 integrals of one 53 k-cell mesh held ~3 GB of identical copies. Equal
+    arrays (shape, dtype, bytes) now share one. The table holds them weakly: a copy is freed with its last
+    user, so a remeshed domain's tables do not outlive it."""
+    import hashlib
+    import weakref
+
+    global _DEVICE_CONSTANTS
+    if _DEVICE_CONSTANTS is None:
+        _DEVICE_CONSTANTS = weakref.WeakValueDictionary()
+    a = np.ascontiguousarray(np.asarray(x, dtype=dtype))
+    key = (a.shape, a.dtype.str, hashlib.sha1(a.reshape(-1).view(np.uint8)).hexdigest())
+    out = _DEVICE_CONSTANTS.get(key)
+    if out is None:
+        out = jnp.asarray(a)
+        _DEVICE_CONSTANTS[key] = out
+    return out
+
+
+def element_of(space, order):
+    """``(family, degree)`` of a symbol's element, as ``build_dofmap`` names it (P0 is DG of degree 0)."""
+    sp = str(space).upper()
+    if sp == "P0":
+        return "DG", 0
+    return {"LAGRANGE": "Lagrange", "DG": "DG"}.get(sp, sp), int(order)
+
+
+def coefficient_spec(fam, k, vs, dofmap, quad_points, dim) -> dict:
+    """DOF map, reference basis at ``quad_points`` and Piola map of one known-field element."""
+    from .fem_elements import piola_contravariant, piola_contravariant_grad, piola_covariant, piola_covariant_grad
+
+    tab = dofmap.element.tabulate(1, np.asarray(quad_points))
+    edge = fam in _EDGE_FAMILIES
+    ncomp = 1 if edge else int(np.prod(vs)) if vs else 1
+    if edge:
+        ref = (jnp.asarray(tab[0]), jnp.asarray(np.stack([tab[1 + a] for a in range(dim)], axis=-1)))
+        pf = (piola_contravariant, piola_contravariant_grad) if fam == "RT" else (piola_covariant, piola_covariant_grad)
+    else:
+        ref = (jnp.asarray(tab[0][..., 0]), jnp.asarray(np.stack([tab[1 + a][..., 0] for a in range(dim)], axis=-1)))
+        pf = None
+    return {
+        "fam": fam,
+        "k": k,
+        "vs": vs,
+        "ncomp": ncomp,
+        "n_vals": int(dofmap.n_dofs) * ncomp,
+        "cdofs": device_constant(dofmap.cell_dofs, np.int32),
+        "ref": ref,
+        "piola": pf,
+        "signs": device_constant(dofmap.signs) if (edge and dofmap.is_diagonal) else None,
+        "tables": None if dofmap.is_diagonal else (dofmap.jax_tables(), int(dofmap.ndof_local)),
+    }
+
+
+def coefficient_slot(sp, values, c, J, detJ) -> dict:
+    """Cell ``c``'s field slot of a known field with global ``values`` (the `_cell_fields` dict layout)."""
+    from .fem_dofmap import transform_from_tables
+    from .small_linalg import small_inv
+
+    loc = sp["cdofs"][c]
+    cv = values[loc] if sp["ncomp"] == 1 else jnp.reshape(values, (-1, sp["ncomp"]))[loc]
+    rv, rg = sp["ref"]
+    if sp["tables"] is not None:  # degree k: the per-cell DOF transform mixes each entity's DOFs
+        Bc = transform_from_tables(sp["tables"][0], sp["tables"][1], c)
+        rv = jnp.einsum("ij,qj...->qi...", Bc, rv)
+        rg = jnp.einsum("ij,qj...->qi...", Bc, rg)
+    if sp["piola"] is not None:  # H(curl) / H(div): Piola map with the orientation signs
+        sg = sp["signs"][c] if sp["signs"] is not None else jnp.ones((rv.shape[1],), rv.dtype)
+        pf, pgf = sp["piola"]
+        phi, _d = pf(rv, jnp.zeros(rv.shape[:2], rv.dtype), J, detJ, sg)
+        return {"shape_vals": phi, "shape_grads": pgf(rg, J, detJ, sg), "cell_sol": cv, "space": sp["fam"]}
+    return {  # Lagrange / DG: scalar basis, the isoparametric chain rule for the gradient
+        "shape_vals": rv,
+        "shape_grads": rg @ small_inv(J),
+        "cell_sol": cv[:, None] if cv.ndim == 1 else cv,
+        "space": "Lagrange",
+    }
+
+
+def collect_frozen(expr) -> Dict[int, Any]:
+    """Every FrozenField in ``expr``, by ``frozen_id``."""
+    from ...trace import FrozenField
+    from .solver_helper import iter_children
+
+    found, seen, stack = {}, set(), [expr]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if isinstance(n, FrozenField):
+            found[n.frozen_id] = n
+            continue
+        stack.extend(iter_children(n))
+    return found
+
+
+# FunctionCalls that vanish wherever ONE argument does (products), and those of one argument with f(0) = 0
+_PRODUCTS = {"inner", "einsum"}
+_ZERO_PRESERVING = {"getitem", "transpose", "sym", "antisym", "trace"}
+
+
+def cell_support(expr, n_cells, frozen_rows, region_cells):
+    """The cells on which ``expr`` can be nonzero (a bool array), or ``None`` when that is not known statically.
+
+    Read from the factors that are DATA: a frozen field with constant values is zero on every cell whose DOFs are
+    all zero (``frozen_rows(node)`` gives that per-cell mask), a region mask outside its region, a literal 0
+    everywhere; a product is zero where either factor is, a sum where both are. Anything this does not know (a
+    solve, a parameter, an unknown function) counts as nonzero everywhere, so the support can only be too LARGE,
+    never too small: restricting the cell loop to it never changes the integral.
+    """
+    from ...trace import BinaryOp, FrozenField, FunctionCall, Literal, RegionMask
+    from ...trace.views import _VIEW_TYPES
+
+    def union(a, b):
+        return None if a is None or b is None else a | b
+
+    def meet(a, b):
+        return b if a is None else a if b is None else a & b
+
+    def walk(n):
+        n = n._expr if isinstance(n, _VIEW_TYPES) else n
+        if isinstance(n, (int, float, complex)) or isinstance(n, Literal):
+            v = np.asarray(n.value if isinstance(n, Literal) else n)
+            return np.zeros(n_cells, bool) if v.size and not np.any(v) else None
+        if isinstance(n, RegionMask):
+            return region_cells(n.region)
+        if isinstance(n, FrozenField):
+            return frozen_rows(n) if getattr(n, "values_node", None) is None else None
+        if isinstance(n, BinaryOp):
+            if n.op == "*":
+                return meet(walk(n.left), walk(n.right))
+            if n.op == "/":
+                return walk(n.left)
+            if n.op in ("+", "-"):
+                return union(walk(n.left), walk(n.right))
+            return None
+        if isinstance(n, FunctionCall):
+            name = getattr(n, "_name", None)
+            args = [a for a in (n.args or ()) if hasattr(a, "__class__") and a.__class__.__module__.startswith("jno")]
+            if name in _PRODUCTS and args:
+                out = None
+                for a in args:
+                    out = meet(out, walk(a))
+                return out
+            if name in _ZERO_PRESERVING and len(args) == 1:
+                return walk(args[0])
+        return None
+
+    return walk(expr)
+
+
+def frozen_cell_rows(values, sp):
+    """Per cell: does a known field with these (constant) ``values`` have a nonzero DOF there."""
+    nz = np.any(np.reshape(np.asarray(values), (-1, sp["ncomp"])) != 0, axis=1)
+    return np.any(nz[np.asarray(sp["cdofs"])], axis=1)
+
+
+def domain_functional(domain, expr, as_inputs=frozenset()) -> Tuple[Callable, List[Tuple[Any, Any]]]:
+    """``(fn, inputs)``: ``fn(values) -> ()`` integrates ``expr`` over the whole volume of ``domain``;
+    ``inputs`` lists ``(key, node)`` for every value it needs at evaluation time -- a frozen field whose values
+    are a trace node (a solve), keyed ``("frozen", id)``, and every runtime parameter, keyed by its name.
+
+    ``as_inputs`` (frozen ids): constant frozen fields that are NOT baked into ``fn`` but read from
+    ``values[("frozen", id)]`` like a solve's -- so one ``fn`` can be evaluated for many fields of the same element
+    (:mod:`shared_integral` vmaps it over the members of a group of integrals). ``fn(values, cell_ids,
+    cell_weights, n_batch)`` then takes the cells to loop over (default: the support of ``expr``'s own data,
+    ``fn.support``) and a weight per cell (0 for padding); ``n_batch`` scales the chunking for a batch of that many
+    evaluations at once. ``fn.specs`` holds each field's element (by input key).
+
+    The integrand may hold known fields of any element space, runtime parameters (scalar, P0, P1, element
+    space), coordinates and region masks -- but no unknown (no trial or test function: that is a form).
+    Quadrature: the simplex rule of degree ``2 k`` (at least 2), with ``k`` the highest field degree, so a
+    product of two fields of degree ``k`` is exact (times a cell-wise constant coefficient). Differentiable in
+    every input value, and in the node positions when the domain has trainable coordinates
+    (``domain.variable(...).trainable()``): they are inputs too, keyed ``("coord", name)``, scattered into the
+    geometry before each cell's Jacobian, so ``|det J|``, the quadrature points and every pushed-forward basis
+    move with the mesh."""
+    import basix
+
+    from ...trace import TestFunction, TrialFunction
+    from .fem_1d import _integrate_term
+    from .fem_dofmap import build_dofmap
+    from .fem_nonnodal import _with_cell_size
+    from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES, build_edge_topology
+    from .fem_utils import _CHUNK_OVERRIDE, _cell_region_mask, _collect_region_mask_names, cell_chunk, elem_map
+    from .parametric_helpers import _collect_runtime_parameter_exprs, _fem_field_kind
+    from .small_linalg import small_det
+    from .solver_helper import contains_node_type
+
+    if contains_node_type(expr, TrialFunction) or contains_node_type(expr, TestFunction):
+        raise ValueError(
+            "expr.integrate(domain): the integrand holds an unknown (a trial or test function). An integral over "
+            "a domain integrates KNOWN fields -- freeze a solution with `u.bind(...).freeze(fem.solve())`, or "
+            "integrate over its form with `expr.integrate(fem)`."
+        )
+    dim = int(domain.dimension)
+    kind = {3: "tetra", 2: "triangle"}.get(dim)
+    if kind is None or kind not in domain.mesh.cells_dict:
+        raise NotImplementedError(f"expr.integrate(domain): simplex meshes in 2-D / 3-D only (got dimension {dim}).")
+    cells_np = np.asarray(domain.mesh.cells_dict[kind], dtype=np.int64)
+    pts = device_constant(np.asarray(domain.mesh.points)[:, :dim])
+    cells = device_constant(cells_np, np.int32)
+    n_cells, n_verts = cells_np.shape[0], int(pts.shape[0])
+    top = build_edge_topology(cells_np, BASIX_TET_EDGES if dim == 3 else BASIX_TRIANGLE_EDGES)
+    _dm = {}
+
+    def dofmap(fam, k):  # the assemblers' numbering (same edge topology), so solution vectors line up
+        if (fam, k) not in _dm:
+            _dm[(fam, k)] = build_dofmap(cells_np, fam, k, n_verts=n_verts, edges=(top.cell_edges, top.edge_vertices))
+        return _dm[(fam, k)]
+
+    frozen = collect_frozen(expr)
+    params: dict = {}
+    _collect_runtime_parameter_exprs(expr, params)
+    tags = tuple(sorted(params))
+    pkind = {n: _fem_field_kind(e) for n, e in params.items()}
+    elems = {("frozen", f): element_of(n.space, n.order) + (tuple(n.value_shape),) for f, n in frozen.items()}
+    elems.update({("param", n): tuple(params[n].model._fem_space) for n in tags if pkind[n] == "space"})
+    kmax = max([k for (_f, k, _v) in elems.values()] + [1 if "node" in pkind.values() else 0])
+    rule = basix.make_quadrature(basix.CellType.tetrahedron if dim == 3 else basix.CellType.triangle, max(2, 2 * kmax))
+    qp, qw = np.asarray(rule[0]), jnp.asarray(rule[1])
+    specs = {key: coefficient_spec(fam, k, vs, dofmap(fam, k), qp, dim) for key, (fam, k, vs) in elems.items()}
+    p1 = jnp.asarray(np.column_stack([1.0 - qp.sum(axis=1), qp]))
+
+    inputs: List[Tuple[Any, Any]] = []
+    const_vals: dict = {}
+    for f, n in frozen.items():
+        key = ("frozen", f)
+        if getattr(n, "values_node", None) is not None:
+            inputs.append((key, n.values_node))
+        elif f in as_inputs:
+            continue  # handed in per evaluation (a member of a batched group)
+        else:
+            const_vals[key] = jnp.reshape(jnp.asarray(n.values), (-1,))
+            if const_vals[key].shape[0] != specs[key]["n_vals"]:
+                raise ValueError(
+                    f"expr.integrate(domain): the frozen {specs[key]['fam']}{specs[key]['k']} field {n.name} has "
+                    f"{const_vals[key].shape[0]} values; its space has {specs[key]['n_vals']}."
+                )
+    inputs += [(n, params[n]) for n in tags]
+    coords = [
+        (jnp.asarray(c["ids"], dtype=jnp.int32), int(c["axis"]), str(c["name"]))
+        for c in getattr(domain, "_trainable_coords", None) or []
+    ]
+    inputs += [(("coord", c["name"]), c["expr"]) for c in getattr(domain, "_trainable_coords", None) or []]
+    rnames = tuple(sorted(_collect_region_mask_names(expr)))
+    masks = [device_constant(np.reshape(_cell_region_mask(domain, r), (-1,))) for r in rnames]
+    ctx = getattr(domain, "context", {}) or {}
+
+    # the cells the integrand can be nonzero on (a terminal current lives on its bar's cells only): the loop runs
+    # over those alone -- the integral is the same, the work and the reverse-mode memory scale with the support
+    def frozen_rows(node):
+        key = ("frozen", node.frozen_id)
+        if key in const_vals:
+            return frozen_cell_rows(const_vals[key], specs[key])
+        if node.frozen_id in as_inputs:
+            return frozen_cell_rows(np.reshape(np.asarray(node.values), (-1,)), specs[key])
+        return None
+
+    support = cell_support(expr, n_cells, frozen_rows, lambda r: np.asarray(_cell_region_mask(domain, r)).reshape(-1) != 0)
+    # an empty support still evaluates one cell (where the integrand is exactly 0): the result keeps its dtype
+    ids = np.arange(n_cells) if support is None else np.flatnonzero(support)
+    cell_ids = jnp.asarray(ids if ids.size else np.zeros(1, np.int64))
+
+    runtime_frozen = [key for key, _n in inputs if isinstance(key, tuple) and key[0] == "frozen"]
+    runtime_frozen += [("frozen", f) for f in frozen if f in as_inputs and ("frozen", f) not in runtime_frozen]
+
+    def fn(values, cell_ids=cell_ids, cell_weights=None, n_batch=1):
+        geo = pts
+        for ids, axis, name in coords:  # trainable node positions: the geometry is traced
+            geo = geo.at[ids, axis].set(jnp.asarray(values[("coord", name)], dtype=geo.dtype).reshape(-1))
+        fvals = dict(const_vals)
+        for key in runtime_frozen:
+            v = jnp.reshape(jnp.asarray(values[key]), (-1,))
+            blk = frozen[key[1]].values_block
+            if blk is not None:
+                v = v[blk[0] : blk[1]]
+            if v.shape[0] != specs[key]["n_vals"]:
+                raise ValueError(
+                    f"expr.integrate(domain): a frozen solution has {v.shape[0]} values; its "
+                    f"{specs[key]['fam']}{specs[key]['k']} space has {specs[key]['n_vals']} (a form with "
+                    "several fields: freeze the block of this field)."
+                )
+            fvals[key] = v
+        pvals = {n: jnp.reshape(jnp.asarray(values[n]), (-1,)) for n in tags}
+        for n in tags:
+            want = {"cell": n_cells, "node": n_verts}.get(pkind[n])
+            if pkind[n] == "space":
+                want = specs[("param", n)]["n_vals"]
+                fvals[("param", n)] = pvals[n]
+            if want is not None and pvals[n].shape[0] != want:
+                raise ValueError(f"expr.integrate(domain): parameter {n!r} has {pvals[n].shape[0]} values, needs {want}.")
+
+        def cell(c):
+            verts = geo[cells[c]]
+            J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)
+            detJ = small_det(J)
+            vol_vars = tuple(
+                pvals[n][:1]
+                if pkind[n] is None
+                else jnp.reshape(pvals[n][c], (1,))
+                if pkind[n] == "cell"
+                else pvals[n][cells[c]]
+                if pkind[n] == "node"
+                else jnp.zeros((1,), pvals[n].dtype)
+                for n in tags
+            )
+            xq = verts[0][None, :] + jnp.asarray(qp) @ J.T
+            local = {
+                "physical_quad_points": xq,
+                "fields": [],
+                "field_index": {},
+                "tag": "fem_gauss",
+                "surface": False,
+                # `d.cell_size` / `d.cell_metric` of THIS cell, moving with the coordinates: mesh quality as an
+                # integral, e.g. the condition number sqrt(tr G tr G^-1) / dim aggregated by a p-norm
+                "domain_context": _with_cell_size(ctx, jnp.abs(detJ), xq, verts),
+                "temporal_tags": (),
+                "runtime_parameter_tags": tags,
+                "region_mask_names": rnames,
+                "volume_vars": vol_vars + tuple(m[c] for m in masks),
+                "shape_vals": p1,
+                "coef_fields": {key: coefficient_slot(sp, fvals[key], c, J, detJ) for key, sp in specs.items()},
+            }
+            val = _integrate_term(domain, expr, local, qw * jnp.abs(detJ))
+            if val.shape != (1,):
+                raise ValueError(
+                    f"expr.integrate(domain): the integrand is not a scalar per point (shape {tuple(val.shape)} per "
+                    "cell). Contract it, e.g. with inner(...)."
+                )
+            return val
+
+        n_loop = int(cell_ids.shape[0])
+        per_cell = elem_map(cell, (cell_ids,), cell_chunk(n_loop, int(n_batch), 1, _CHUNK_OVERRIDE[0]))
+        if cell_weights is not None:  # padding cells of a batched member weigh 0
+            per_cell = per_cell * jnp.reshape(cell_weights, (-1,) + (1,) * (per_cell.ndim - 1)).astype(per_cell.real.dtype)
+        return jnp.sum(per_cell)
+
+    fn.specs, fn.support = specs, ids
+    return fn, inputs

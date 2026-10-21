@@ -1556,6 +1556,9 @@ def assemble_fem_native(
     from .parametric_helpers import _fem_field_kind
 
     _cell_field_names: set = {n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"}
+    from .parametric_helpers import refuse_space_field_parameters
+
+    refuse_space_field_parameters(_rt_param_exprs, "nodal Lagrange")
 
     # A BARE (non-field) runtime parameter is packed as a single scalar -- ``flat[:1]`` in
     # ``_runtime_vals`` below -- and read back as one. A multi-component one therefore had every entry

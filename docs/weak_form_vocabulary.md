@@ -113,7 +113,8 @@ Ku = (kernel(x, y) * u_of(y)).integrate(var=x)
 
 `expr.integrate()` is a domain (or boundary) integral; `expr.integrate(var=x)` is the **non-local**
 kernel form (one value per collocation point — Fredholm-type operators); `expr.integrate(t)` is a
-time-window integral.
+time-window integral; `expr.integrate(d)` integrates known fields (frozen data or solutions) over the
+whole mesh, each on its own element.
 
 ## Geometry symbols
 

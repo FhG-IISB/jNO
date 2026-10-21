@@ -540,6 +540,45 @@ def _extract_user_name(orig_expr) -> str | None:
     return None
 
 
+def _release_idle_solver_memory() -> None:
+    """Between two compiled programs: free the factors of the extra cuDSS slots a program left behind (a form
+    solved more than once in it). Each solve keeps its factors for its own adjoint, so inside a program they
+    are needed; after it they only pile up, across the gradient, a hook's Jacobian and an evaluation, until the
+    card runs out (measured: 12 slots on two forms in one MMA step). A no-op unless that path was used."""
+    from .utils.solver import linear as _lin
+
+    if _lin._LDL_PLANS:
+        _lin.release_idle_ldl()
+
+
+def _with_poisoned_gates(fn):
+    """``fn``, traced with poisoned residual gates (``solver_api.poison_gates``): a solve that fails its residual
+    check gives NaN instead of a host callback, so the compiled program can be stored in the persistent cache.
+    The caller checks every output with :func:`_raise_if_step_not_finite`."""
+    from .utils.solver.solver_api import poison_gates
+
+    @functools.wraps(fn)
+    def traced(*args, **kwargs):
+        with poison_gates():
+            return fn(*args, **kwargs)
+
+    return traced
+
+
+def _raise_if_step_not_finite(epoch, total_loss, losses, grads, jac=None):
+    """Raise when a step traced with poisoned gates returned a non-finite loss, gradient or constraint Jacobian."""
+    parts = {"loss": [total_loss, losses], "gradient": jax.tree_util.tree_leaves(grads), "constraint Jacobian": [jac]}
+    bad = [name for name, vals in parts.items() if any(v is not None and not bool(jnp.all(jnp.isfinite(v))) for v in vals)]
+    if bad:
+        raise RuntimeError(
+            f"jno.core.solve: step {epoch} gave a non-finite {', '.join(bad)}. Inside the compiled step a linear "
+            "solve that fails its residual check returns NaN (instead of calling back to the host, which would keep "
+            "the program out of the persistent compile cache), so this is a solve that did not converge, or a "
+            "genuine NaN in the problem. Evaluate the objective and constraints with crux.eval([...]) at the current "
+            "parameters to have the failing solve named, with its residual."
+        )
+
+
 class core:
     """core solver using traced operations."""
 
@@ -1828,6 +1867,7 @@ class core:
         static,
         checkpoint_gradients=False,
         min_consecutive=1,
+        jacobian=None,
     ):
         """Build a function that computes gradients without an optimizer update.
 
@@ -1857,7 +1897,48 @@ class core:
             (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
             return grads, rng, total_loss, individual_losses
 
-        return grad_fn
+        if jacobian is None:
+            return grad_fn
+        rows, lids = list(jacobian[0]), list(jacobian[1])
+
+        def grad_jac_fn(trainable, rng, context):
+            """The objective gradient AND the constraint rows (w.r.t. the blocks ``lids``, raveled in that order)
+            from ONE forward pass: one ``jax.vjp``, then its pullback over the stacked seeds (objective first,
+            then one per row) in ONE ``lax.map``. A constrained optimiser otherwise ran a second program for its
+            Jacobian, with a second forward solve -- a second factorisation of every FEM system per step.
+
+            ``lax.map`` and not a Python loop: each pullback call traces the whole backward graph again (every
+            solve's adjoint, every assembly), so a loop put 1 + rows copies of it into the program and the
+            compile grew with the number of constraints. The map traces it once and runs it once per seed, in
+            sequence, so the peak memory is one backward pass. Not ``vmap`` (or ``lax.map(batch_size=...)``):
+            that holds every row's backward pass at once and batches host-callback and sparse solves, whose
+            cotangents ``custom_linear_solve`` gets wrong under ``vmap`` (see ``shared_solve.py``)."""
+            from jax.flatten_util import ravel_pytree
+
+            rng, step_rng = jax.random.split(rng)
+
+            def loss_wrapper(p):
+                with jax.named_scope("jno/core/loss"):
+                    return loss_fn(p, context, step_rng)
+
+            (total_loss, losses), pullback = jax.vjp(loss_wrapper, trainable)
+            n = 1 + len(rows)
+            seed_total = jnp.zeros((n,) + jnp.shape(total_loss), total_loss.dtype).at[0].set(1)
+            seed_rows = np.zeros((n,) + tuple(jnp.shape(losses)))
+            for r, i in enumerate(rows):
+                seed_rows[(r + 1, i)] = 1.0
+            seed_rows = jnp.asarray(seed_rows, losses.dtype)
+
+            def one(seed):
+                (g,) = pullback(seed)
+                block = jnp.concatenate([leaf.ravel() for lid in lids for leaf in jax.tree_util.tree_leaves(g[lid])])
+                return ravel_pytree(g)[0], block
+
+            flat, blocks = jax.lax.map(one, (seed_total, seed_rows))
+            grads = ravel_pytree(trainable)[1](flat[0])
+            return grads, rng, total_loss, losses, blocks[1:] if rows else jnp.zeros((0, 1))
+
+        return grad_jac_fn
 
     def make_apply_fn(
         self,
@@ -3549,13 +3630,26 @@ class core:
 
         # ── 7c. Build split grad/apply for on_before_update hooks (non-accumulation) ──
         # Not needed for the accumulation path — it already separates grad and apply.
+        _jac_requests = [
+            (cb, cb.jacobian_request()) for cb in (callbacks or []) if callable(getattr(cb, "jacobian_request", None))
+        ]
+        _jac_requests = [(cb, req) for cb, req in _jac_requests if req is not None]
+        if len(_jac_requests) > 1:  # one shared program serves one request; more fall back to their own
+            _jac_requests = []
+        _jac_cb, _jac_req = _jac_requests[0] if _jac_requests else (None, None)
         if _has_before_update_hooks and not _use_accumulation:
-            _hook_grad_fn = self.make_grad_fn(
-                batchsize=effective_batchsize,
-                frozen=frozen_arrays,
-                static=static,
-                checkpoint_gradients=checkpoint_gradients,
-                min_consecutive=min_consecutive,
+            # traced with poisoned residual gates: no host callback in the program, so JAX's persistent cache
+            # can store it (a design step can take many minutes to compile); every step's outputs are then
+            # checked for finiteness below, where a failed solve shows as NaN
+            _hook_grad_fn = _with_poisoned_gates(
+                self.make_grad_fn(
+                    batchsize=effective_batchsize,
+                    frozen=frozen_arrays,
+                    static=static,
+                    checkpoint_gradients=checkpoint_gradients,
+                    min_consecutive=min_consecutive,
+                    jacobian=_jac_req,
+                )
             )
             _hook_apply_fn = self.make_apply_fn(
                 per_model_opts=per_model_opts,
@@ -3733,7 +3827,8 @@ class core:
                 _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
                 _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
 
-                jit_hook_grad = _cache.get("hook_grad") or jax.jit(
+                _hg_key = "hook_grad" if _jac_req is None else ("hook_grad_jac", tuple(_jac_req[0]), tuple(_jac_req[1]))
+                jit_hook_grad = _cache.get(_hg_key) or jax.jit(
                     _hook_grad_fn,
                     in_shardings=(
                         _trainable_sharding,
@@ -3745,7 +3840,8 @@ class core:
                         replicated,  # rng
                         replicated,  # total_loss
                         replicated,  # individual_losses
-                    ),
+                    )
+                    + ((replicated,) if _jac_req is not None else ()),  # constraint Jacobian rows
                 )
                 jit_hook_apply = _cache.get("hook_apply") or jax.jit(
                     _hook_apply_fn,
@@ -3763,7 +3859,7 @@ class core:
                     donate_argnums=(2,),  # donate grads buffer
                 )
                 if _step_key is not None:
-                    _cache["hook_grad"], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
+                    _cache[_hg_key], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
 
             if has_trackers:
                 jit_track = jax.jit(track_fn)
@@ -3870,16 +3966,10 @@ class core:
 
             self.log.info("JIT compiling step function with mesh sharding — this might take a while")
 
-            # ── Enable persistent XLA compilation cache ──
-            # On the first run XLA compiles and writes artifacts to disk.
-            # Subsequent runs with the same network/batchsize/dtype reload
-            # from disk and skip compilation entirely, saving minutes for
-            # large models.  The cache is keyed on the full XLA program hash
-            # so stale entries are never loaded for a different graph.
-            _cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jno", "xla_cache")
-            os.makedirs(_cache_dir, exist_ok=True)
-            jax.config.update("jax_compilation_cache_dir", _cache_dir)
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+            # The persistent compilation cache is configured once, at `import jno` (jno.utils.config:
+            # on by default, or the user's opt-out); solve() leaves that setting alone. (It used to set a
+            # second directory here and raise the minimum compile time from 0 to 1 s for the rest of the
+            # process, overriding an opt-out.)
 
             # Trigger AOT compilation so the first real step is fast.
 
@@ -3976,7 +4066,7 @@ class core:
                     del _gw
                 elif _has_before_update_hooks:
                     for _ in range(3):
-                        _gw, _rw, _, _ = jit_hook_grad(_tw, _rw, trace_context)
+                        _gw, _rw = jit_hook_grad(_tw, _rw, trace_context)[:2]  # (+ Jacobian rows when requested)
                         _, _ow = jit_hook_apply(_tw, _ow, _gw, _ew, _pl)
                     del _gw
                 else:
@@ -4587,6 +4677,7 @@ class core:
                                 _micro_grads,
                             )
                         _acc_total = _acc_total + float(jax.device_get(_micro_loss)) * _inv_accum
+                        _release_idle_solver_memory()
                         _acc_losses = _acc_losses + _micro_indiv * _inv_accum
 
                     # Apply on_before_update hooks to accumulated gradients.
@@ -4632,9 +4723,14 @@ class core:
 
                     if _has_before_update_hooks:
                         # Split path: grad → on_before_update hooks → apply.
-                        _hgrads, self.rng, total_loss, individual_losses = jit_hook_grad(trainable, self.rng, context)
+                        _hout = jit_hook_grad(trainable, self.rng, context)
+                        _hgrads, self.rng, total_loss, individual_losses = _hout[:4]
+                        _hjac = _hout[4] if len(_hout) > 4 else None
+                        _raise_if_step_not_finite(outer_epoch, total_loss, individual_losses, _hgrads, _hjac)
+                        _release_idle_solver_memory()
                         for _cb in callbacks:
                             if type(_cb).on_before_update is not _Callback.on_before_update:
+                                _extra = {"constraint_jacobian": _hjac} if (_cb is _jac_cb and _hjac is not None) else {}
                                 _modified = _cb.on_before_update(
                                     grads=_hgrads,
                                     trainable=trainable,
@@ -4643,9 +4739,11 @@ class core:
                                     epoch=outer_epoch,
                                     total_loss=total_loss,
                                     individual_losses=individual_losses,
+                                    **_extra,
                                 )
                                 if _modified is not None:
                                     _hgrads = _modified
+                        _release_idle_solver_memory()  # a hook may have run programs of its own (MMA's Jacobian)
                         trainable, opt_states = jit_hook_apply(trainable, opt_states, _hgrads, epoch_jnp, prev_losses)
                         epoch_jnp = epoch_jnp + jnp.asarray(1, dtype=epoch_jnp.dtype)
                         _step_bayesian_info: Dict[str, Dict[str, jnp.ndarray]] = {}
@@ -5643,10 +5741,46 @@ class core:
                 # inside the compiled function and must remain a static Python int
                 # for XLA to reuse the compiled kernel across calls.
                 op_entry[min_consecutive] = eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive))
-            return op_entry[min_consecutive](_models, ctx, batchsize=None, key=key)
+            out = op_entry[min_consecutive](_models, ctx, batchsize=None, key=key)
+            _release_idle_solver_memory()  # one program per expression: free what it left behind
+            return out
+
+        def _batch_sizes(op):
+            """the sample-batch sizes the compiled function would see for ``op`` alone (its tags' leading axes)"""
+            from .trace import collect_tags
+            from .trace_compiler import CONTEXT_METADATA_TAGS
+
+            tags = collect_tags(op)
+            return frozenset(
+                int(arr.shape[0])
+                for tag, arr in ctx.items()
+                if tag in tags and tag != "__time__" and tag not in CONTEXT_METADATA_TAGS and getattr(arr, "ndim", 0) >= 1
+            )
+
+        def _point_eval_all(ops):
+            """Several expressions as ONE program (one evaluator scope, as the training step evaluates its list):
+            a solve or integral they share is computed once, and there is one compile instead of one per
+            expression. Expressions the compiled function would batch differently (different sample-batch sizes)
+            keep one program each, so every result has the shape it has alone."""
+            if len(ops) < 2 or len({_batch_sizes(op) for op in ops}) > 1:
+                return [_point_eval(op) for op in ops]
+            entry = self._eval_cache.get(ops[0])
+            if entry is None:
+                self._eval_cache[ops[0]] = entry = {}
+            slot = ("together", min_consecutive, tuple(id(op) for op in ops[1:]))
+            hit = entry.get(slot)
+            if hit is None or any(r() is not op for r, op in zip(hit[0], ops[1:])):
+                raw_fn = TraceCompiler.compile_multi_expression([cse(fuse_laplacian(op)) for op in ops], self.all_ops)
+                hit = entry[slot] = (
+                    [weakref.ref(op) for op in ops[1:]],
+                    eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
+                )
+            out = list(hit[1](_models, ctx, batchsize=None, key=key))
+            _release_idle_solver_memory()
+            return out
 
         if samples == "point":
-            results = [_point_eval(op) for op in operation]
+            results = _point_eval_all(operation)
             return results[0] if len(results) == 1 else results
 
         # samples == "auto" or "chain": walk each expression to discover its
@@ -5718,12 +5852,12 @@ class core:
             # ``(K, N, *expr_shape)``.
             return jax.vmap(jax.vmap(_one))(chain_part)
 
-        results = []
-        for op, posterior_by_lid in zip(operation, per_op_chains):
-            if posterior_by_lid or (samples == "chain"):
-                results.append(_chain_eval(op, posterior_by_lid))
-            else:
-                results.append(_point_eval(op))
+        chained = [bool(posterior_by_lid) or samples == "chain" for posterior_by_lid in per_op_chains]
+        pointwise = iter(_point_eval_all([op for op, c in zip(operation, chained) if not c]))
+        results = [
+            _chain_eval(op, posterior_by_lid) if c else next(pointwise)
+            for op, posterior_by_lid, c in zip(operation, per_op_chains, chained)
+        ]
 
         return results[0] if len(results) == 1 else results
 

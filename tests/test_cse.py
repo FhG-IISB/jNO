@@ -135,3 +135,18 @@ class TestSharingStillHappens:
         _, u, v, _ = two_nets
         shared = cse((u * v) + (u * v))
         assert shared.left is shared.right
+
+
+def test_a_rebuilt_call_keeps_what_it_carries():
+    """When cse rebuilds a call because an argument was merged, the new call keeps the attributes the old one
+    carried beyond its constructor arguments -- here ``getitem_key`` and ``_per_evaluation`` (a solve's
+    shared-factorisation markers and an integral's spec ride the same way). They used to be dropped, which
+    silently turned off the per-evaluation memo and the shared factorisation for that node."""
+    d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+    x, _ = d.variable("interior")
+    e = jno.np.stack([x * x, x * x + 1.0])[1]  # the two x * x merge, so the stack and the getitem are rebuilt
+    e._per_evaluation = True
+    e2 = cse(e)
+    assert e2 is not e, "the call was not rebuilt; the test exercises nothing"
+    assert getattr(e2, "getitem_key", None) == e.getitem_key
+    assert getattr(e2, "_per_evaluation", False) is True

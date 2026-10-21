@@ -31,6 +31,7 @@ from .trace import (
     Assembly,
     BinaryOp,
     Choice,
+    Constraint,
     Flow,
     FunctionCall,
     GroupedAssembly,
@@ -45,9 +46,27 @@ from .trace import (
     OperationCall,
     OperationDef,
     Placeholder,
+    Tracker,
     TunableModule,
     TunableModuleCall,
     collect_tags,
+)
+
+# Context entries that are FEM metadata, not sample batches: never vmapped over, never a batch size.
+CONTEXT_METADATA_TAGS = frozenset(
+    {
+        "JxW",
+        "flat_cells",
+        "global_areas",
+        "N_flat",
+        "dN_dx_flat",
+        "dirichlet_nodes",
+        "cells",
+        "quad_points",
+        "boundary_nodes",
+        "surface_data",
+        "v_grads_JxW_flat",
+    }
 )
 
 
@@ -459,6 +478,10 @@ class TraceCompiler:
             elif isinstance(node, (Integral, IntegralTime)):
                 visit(node.target)
             elif isinstance(node, Assembly):
+                visit(node.expr)
+            elif isinstance(node, Constraint):  # a jno.le / jno.ge row: its models count even when no other entry has them
+                visit(node.residual)
+            elif isinstance(node, Tracker):
                 visit(node.expr)
             elif isinstance(node, GroupedAssembly):
                 if node.volume_value_expr is not None:
@@ -1052,19 +1075,7 @@ class TraceCompiler:
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
         expr_tags = collect_tags(expr)
-        METADATA_TAGS = {
-            "JxW",
-            "flat_cells",
-            "global_areas",
-            "N_flat",
-            "dN_dx_flat",
-            "dirichlet_nodes",
-            "cells",
-            "quad_points",
-            "boundary_nodes",
-            "surface_data",
-            "v_grads_JxW_flat",
-        }
+        METADATA_TAGS = CONTEXT_METADATA_TAGS
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -1424,25 +1435,20 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
-        METADATA_TAGS = {
-            "JxW",
-            "flat_cells",
-            "global_areas",
-            "N_flat",
-            "dN_dx_flat",
-            "dirichlet_nodes",
-            "cells",
-            "quad_points",
-            "boundary_nodes",
-            "surface_data",
-            "v_grads_JxW_flat",
-        }
+        METADATA_TAGS = CONTEXT_METADATA_TAGS
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
             evaluator = TraceEvaluator(params)
-            # One evaluator → one JAX trace → XLA sees all constraints together
-            return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
+            # One evaluator → one JAX trace → XLA sees all constraints together. One per-evaluation scope
+            # over ALL of them, too: a solve or integral node shared by the objective and a constraint is
+            # computed once for the whole list, not once per expression (the evaluator's memo is scoped to
+            # the outermost evaluate; this makes the list that outermost scope).
+            evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots = True, {}, list(exprs)
+            try:
+                return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
+            finally:
+                evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots = False, {}, []
 
         # Collect tags from ALL expressions so batch inference is scoped.
         expr_tags = set()

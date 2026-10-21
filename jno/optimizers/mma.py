@@ -461,6 +461,15 @@ class MMACallback(_Callback):
         # first step). `jno.core` reports it beside the constraint values.
         self.multipliers = None
 
+    def jacobian_request(self):
+        """``(rows, lids)``: the constraint rows MMA needs and the blocks they are taken w.r.t., in design-vector
+        order. jno.core then computes them in the SAME program as the objective gradient (one forward pass,
+        one factorisation of every FEM system per step) and hands them over as ``constraint_jacobian``;
+        ``_jac_fn`` stays the fallback for the paths that do not (gradient accumulation)."""
+        if not self._ineq:
+            return None
+        return list(self._ineq), [lid for lid, _ in self._blocks]
+
     # -- hooks -------------------------------------------------------------
     def on_solve_begin(self, **kw):
         """Capture what is needed to evaluate the constraint Jacobian on demand."""
@@ -612,7 +621,8 @@ class MMACallback(_Callback):
         g_all = np.asarray(kw.get("individual_losses")).reshape(-1)
         if self._ineq:
             g = g_all[np.asarray(self._ineq)]
-            dg = np.asarray(self._jac_fn(trainable, context, rng), dtype=np.float64)
+            pre = kw.get("constraint_jacobian")
+            dg = np.asarray(pre if pre is not None else self._jac_fn(trainable, context, rng), dtype=np.float64)
         else:
             g, dg = np.zeros(0), np.zeros((0, x.size))
 

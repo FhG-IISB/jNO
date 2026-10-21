@@ -2954,6 +2954,7 @@ class FEM:
                 # ... and with its FEM, so orchestration (the tune `sequence` axis) can find the operator
                 # behind a constraint without a side channel. Lazy nodes only: a concrete array needs none.
                 result._fem_ref = self
+                result._linear_spec = linear  # the solver it was asked to use: forms share a factorisation only on one spec
             return result
 
         def _run_with_stats():
@@ -3643,7 +3644,11 @@ class FEM:
             from .trace import FunctionCall
 
             _rc = _complex_recombine(self._complex_n)
-            return FunctionCall(lambda *v, _f=_node.fn: _rc(_f(*v)), _node.args, name="fem_complex_solve")
+            node = FunctionCall(lambda *v, _f=_node.fn: _rc(_f(*v)), _node.args, name="fem_complex_solve")
+            node._per_evaluation = True
+            node._solve_fls, node._solve_recombine = self._op, _rc  # for a shared factorisation (trace_evaluator)
+            node._solve_fn = getattr(_node, "_solve_fn", None)
+            return node
         if self._mode == "nonlinear" and self._periodic is not None:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
             # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
@@ -3837,6 +3842,91 @@ class FEM:
                 "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0 (a nearby "
                 "solved parameter value, e.g. fem.solve(continuation=...))."
             )
+
+    def _operator_key(self):
+        """A structural key of this form's operator (load summands left out; cached), for sharing one
+        factorisation between forms that differ only in their load -- see `utils/solver/operator_key.py`.
+        ``None`` where the solve does not take the assembled operator as it is (a periodic reduction)."""
+        if getattr(self, "_op_key_cache", None) is not None:
+            return self._op_key_cache[0]
+        key = None
+        if self._mode == "linear" and (self._periodic_2n if self._complex_n is not None else self._periodic) is None:
+            from .utils.solver.operator_key import operator_key
+
+            try:
+                key = operator_key(
+                    self.domain,
+                    list(self._constraints or []),
+                    extra=(self._mode, self._complex_n, repr(sorted((self._fem_kwargs or {}).items()))),
+                )
+            except Exception:  # noqa: BLE001 -- a form the key cannot describe is simply never shared
+                key = None
+        self._op_key_cache = (key,)
+        return key
+
+    def _linear_solver_context(self):
+        """What a direct solver may know about the steady linear operator beyond its values (cached):
+        ``pattern`` -- its COO indices as a concrete array, from one COMPILED evaluation (the same program a
+        traced solve runs, so the same entry order), which lets a factorisation be planned while the values
+        are still tracers; ``complex_n`` -- the half size when the operator is a fused complex block;
+        ``owner`` -- this FEM (factor slots are per form). ``None`` where the solve does not hand over the
+        assembled operator unchanged (a periodic reduction re-forms it per call)."""
+        if getattr(self, "_solver_ctx", None) is not None:
+            return self._solver_ctx
+        if self._mode != "linear" or (self._periodic_2n if self._complex_n is not None else self._periodic) is not None:
+            return None
+        op = self._op
+        if isinstance(op, FemLinearSystem):
+            if op.operator_fn is not None:
+                names = list(op.runtime_parameter_exprs)
+                shapes = []
+                known = (op.metadata or {}).get("runtime_value_shapes") or {}
+                for n_ in names:
+                    if n_ in known:  # the assembler recorded it (coordinates, a field frozen to another solve)
+                        shapes.append(np.zeros(known[n_]))
+                        continue
+                    mod = getattr(getattr(op.runtime_parameter_exprs[n_], "model", None), "module", None)
+                    val = getattr(mod, "value", None)
+                    if val is None:
+                        return None  # a parameter whose shape is not known here: no planned pattern
+                    shapes.append(np.zeros(np.shape(val), np.asarray(val).dtype))
+                # The pattern of the COMPILED evaluation: it is what a traced solve sees (an eager evaluation
+                # can differ, e.g. 336 entries fewer on a 3-D N1E form). Run on a worker thread, whose JAX
+                # trace state is its own, so the result is concrete even when first asked from inside a
+                # trace (`ensure_compile_time_eval` would run the jit op by op: the EAGER pattern).
+                import concurrent.futures
+
+                _pat = lambda: np.asarray(jax.jit(lambda *v: op.evaluate(dict(zip(names, v)))[0].indices)(*shapes))  # noqa: E731
+                with concurrent.futures.ThreadPoolExecutor(1) as _ex:
+                    idx = _ex.submit(_pat).result()
+            else:
+                idx = getattr(op.A, "indices", None)
+        else:
+            idx = getattr(op[0], "indices", None)
+        if idx is None:
+            return None
+        if isinstance(idx, jax.core.Tracer):
+            return None
+        self._solver_ctx = {
+            "pattern": np.asarray(idx),
+            "complex_n": self._complex_n,
+            "owner": self,
+            "symmetric": self._symmetric_operator(),
+        }
+        return self._solver_ctx
+
+    def _symmetric_operator(self):
+        """Is this real linear form's operator provably symmetric (see ``operator_key.symmetric_operator``)?
+        A direct cuDSS solve then factors it LDL^T inside the compiled program instead of LU through a host
+        callback. ``False`` for a complex form (its own path decides) and wherever it cannot be shown."""
+        if self._complex_n is not None or self._mode != "linear":
+            return False
+        from .utils.solver.operator_key import symmetric_operator
+
+        try:
+            return bool(symmetric_operator(self.domain, list(self._constraints or [])))
+        except Exception:  # noqa: BLE001 -- a form the check cannot read is solved as a general one
+            return False
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
@@ -4401,10 +4491,15 @@ class FEM:
 
         The region is read off the expression's coordinate Variables exactly as for a weak term, so a
         boundary integrand is spelled by binding the field to that region's coordinates; a term naming two
-        regions is refused, because an integral has one measure. Narrower in scope than the weak path: the
-        whole volume and tagged boundary regions only, and steady native-Lagrange problems only. Where it
-        is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
+        regions is refused, because an integral has one measure. Narrower in scope than the weak path: steady
+        problems only -- on a native-Lagrange form the whole volume and tagged boundary regions, on a
+        non-nodal form the whole volume (below). Where it is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
         partition of unity.
+
+        On a **non-nodal** form (N1E / N2E / RT / DG, alone or mixed with Lagrange) the test-free integrand is
+        integrated over the whole volume, real or complex, with coefficient fields of any space — e.g. the
+        current through an impressed field ``E`` of an eddy-current form,
+        ``I = (sigma * inner(E - 1j*w*A, E)).integrate(fem)``. Boundary integrands are not wired there.
         """
         self._refresh_attachments()
         return self._eval_at(term, u, 0.0, args=args)
@@ -4511,7 +4606,9 @@ class FEM:
         def _run(u, *vals):
             return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
 
-        return FunctionCall(_run, [sol, *params], name="fem_integral")
+        node = FunctionCall(_run, [sol, *params], name="fem_integral")
+        node._per_evaluation = True  # a scalar of the parameters: evaluated once per evaluation
+        return node
 
     def _functional_solution(self, solver=None):
         """The one solve every functional over this system shares.
@@ -4538,7 +4635,15 @@ class FEM:
                 )
             return sol
         self._functional_solver = solver
-        self._functional_sol = sol = self.solve() if solver is None else self.solve(solver)
+        from .utils.solver.solver_api import LinearSolver
+
+        if solver is None:
+            sol = self.solve()
+        elif isinstance(solver, LinearSolver):  # a `jno.solve.*` spec fills the linear slot, with this FEM as context
+            sol = self.solve(linear=solver)
+        else:
+            sol = self.solve(solver)
+        self._functional_sol = sol
         return sol
 
     def _functional_fn(self, terms, bares):
@@ -4550,11 +4655,10 @@ class FEM:
         factory = getattr(self, "_term_functional_factory", None)
         if factory is None:
             raise NotImplementedError(
-                "fem.eval: a test-free integrand is integrated only through the native Lagrange assembler "
-                "on a STEADY problem, which is the only route that publishes the functional. Not wired "
-                "for: transient, complex, 1-D, non-nodal (Argyris/Morley/edge) elements, and the VPINN "
-                "path. Assemble the equivalent weak term `F * phi` and sum it instead — a Lagrange basis "
-                "is a partition of unity, so that is the same integral."
+                "fem.eval: a test-free integrand is integrated on STEADY problems of the native Lagrange "
+                "and the non-nodal assemblers, which publish the functional. Not wired for: transient, "
+                "1-D, and the VPINN path. On a Lagrange form, assemble the equivalent weak term `F * phi` "
+                "and sum it instead — a Lagrange basis is a partition of unity, so that is the same integral."
             )
         vol, surf = [], {}
         for t, bare in zip(terms, bares):
@@ -6031,9 +6135,11 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     A_i_fn, b_i_fn = _parts(op_i)
     n = int(jnp.shape(b_r_fn(None))[0])
     rpe: dict = {}
+    shapes: dict = {}  # runtime inputs without a parameter model (coordinates, coupled solutions): their shapes
     for leg in (op_r, op_i):
         if isinstance(leg, _FLS):
             rpe.update(getattr(leg, "runtime_parameter_exprs", None) or {})
+            shapes.update((getattr(leg, "metadata", None) or {}).get("runtime_value_shapes") or {})
 
     blk = lambda a: _complex_block_bcoo(A_r_fn(a), A_i_fn(a), n)  # noqa: E731
     rhs = lambda a: jnp.concatenate([b_r_fn(a), b_i_fn(a)])  # noqa: E731
@@ -6044,7 +6150,7 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
             operator_fn=blk,
             rhs_fn=rhs,
             runtime_parameter_exprs=rpe,
-            metadata={"complex": True},
+            metadata={"complex": True, **({"runtime_value_shapes": shapes} if shapes else {})},
         )
     else:
         fused = (blk(None), rhs(None))

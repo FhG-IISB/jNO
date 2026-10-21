@@ -1392,6 +1392,12 @@ class Placeholder:
 
             space_time_integral = u_net(x, t).integrate().integrate(t)
 
+        **Domain integral of known fields** (``var=d`` — a domain): an expression of frozen fields (data, or
+        solutions of any number of forms frozen with ``u.bind(...).freeze(fem.solve())``), parameters and
+        coordinates, integrated over the volume with each field's own element -- so a reciprocity matrix is its
+        formula, e.g. ``C_jk = (eps * inner(grad(Phi[k]), grad(Phi[j]))).integrate(d)``. See
+        ``Domain._integral_node``.
+
         **FEM integral** (``var=fem`` — a ``jno.fem(...)`` object):
         Integrates an expression built from that FEM's own symbols over its basis, at its
         solution, returning a differentiable scalar. This is the FEM twin of the collocation
@@ -1410,8 +1416,8 @@ class Placeholder:
         ``quadrature=`` does not apply: a FEM functional inherits the rule its operator was
         assembled with, which is what makes ``∫ σ(u):ε(u) dΩ`` equal ``uᵀKu`` exactly. Every
         functional over one ``fem`` shares a single solve. See :meth:`jno.fem.eval` for the eager
-        form and for the scope limits (whole volume and tagged boundary regions, steady
-        native-Lagrange problems).
+        form and for the scope limits (steady problems; the whole volume and tagged boundary regions
+        of a native-Lagrange form, the whole volume of a non-nodal one, real or complex).
 
         ``solver=`` picks the backend for that shared solve, the same spec ``fem.solve()`` takes::
 
@@ -2186,6 +2192,11 @@ class Constraint(Placeholder):
     def __init__(self, expr: Placeholder, bound: float = 0.0, sense: str = "le"):
         if sense not in ("le", "ge", "eq"):
             raise ValueError(f"Constraint: sense must be 'le', 'ge' or 'eq', got {sense!r}.")
+        from .views import _VIEW_TYPES
+
+        # a typed view (u.scalar, or an expression of frozen fields that stays a view) is its Placeholder here,
+        # as in jno.np.* and jno.core.eval: the evaluator has no handler for the view wrapper
+        expr = expr._expr if isinstance(expr, _VIEW_TYPES) else expr
         self.expr = expr
         self.bound = bound
         self.sense = sense
@@ -4613,7 +4624,11 @@ class FemLinearSystem:
             return solve_fn(A, b)
 
         if values is None:
-            return FunctionCall(_solve, params, name="fem_solve")
+            node = FunctionCall(_solve, params, name="fem_solve")
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            if periodic is None:  # a shared factorisation needs the operator as assembled (trace_evaluator)
+                node._solve_fls, node._solve_recombine, node._solve_fn = self, None, solve_fn
+            return node
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
@@ -4786,7 +4801,9 @@ class FemResidualOperator:
             return solve_fn(residual_fn, u0, **_xa(args))
 
         if values is None:
-            return FunctionCall(_solve, params, name="fem_solve")
+            node = FunctionCall(_solve, params, name="fem_solve")
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            return node
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
         check_runtime_values(names, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
@@ -5315,6 +5332,12 @@ class FrozenField(Placeholder):
     """A field whose DOFs are *pinned* to a known nodal vector ``values`` (e.g. a
     precomputed FE solution), produced by ``u.bind(...).freeze(values)``.
 
+    ``values`` holds one entry per DOF of the source's space: per node (times the value_shape) for
+    Lagrange, per cell for P0, and for N1E / N2E / RT one per DOF (edge circulations, face fluxes: the basis
+    carries the vector). On a non-nodal form a frozen field of ANY of these spaces is a coefficient,
+    evaluated with its space's own basis and Piola map (value and gradient), whether or not the space is
+    among the solved unknowns.
+
     It carries the source field's identity (``field_key`` / ``value_shape`` / ``order``
     / ``space``) so the kernel finds the right basis, and interpolates ``values`` at the
     quadrature points -- its value and its gradient ``.x`` / ``.y`` are therefore concrete
@@ -5337,10 +5360,34 @@ class FrozenField(Placeholder):
         self.space = str(getattr(source, "space", "Lagrange"))
         self.op_id = _next_op_id()
         self.field_key = source.field_key  # share the source field's shape data
+        # VALUES FROM THE TRACE: `u.bind(...).freeze(fem.solve())` -- the solution of a form, known to any
+        # expression read after the solve (and differentiable through it). A solve of a form with several
+        # fields is sliced to this field's block. Read today by `expr.integrate(domain)`.
+        _node = (
+            values._expr
+            if (not isinstance(values, Placeholder) and isinstance(getattr(values, "_expr", None), Placeholder))
+            else values
+        )
+        self.values_node, self.values_block = None, None
+        if isinstance(_node, Placeholder):
+            self.values_node = _node
+            _fem = getattr(_node, "_fem_ref", None)
+            _offs = None if _fem is None else getattr(_fem, "offsets", None)
+            if _offs is not None and len(_offs) > 2:
+                _i = _fem.block_index(source)
+                self.values_block = (int(_offs[_i]), int(_offs[_i + 1]))
+            self._values = None
+            self.frozen_id = _next_op_id()
+            self._domain = domain
+            self._coord_tag = coord_tag
+            return
         _v = jnp.asarray(values)
         # scalar field: a flat global nodal vector (n_nodes,); VECTOR field: (n_nodes, vec) so the assembler
         # gathers each cell's per-node vec-vectors (the kernel interpolates either). value_shape is set above.
-        self.values = _v.reshape(-1) if self.num_components == 1 else _v.reshape(-1, self.num_components)
+        # An H(curl)/H(div) field (N1E, N2E, RT) carries ONE value per DOF (edge circulations, face fluxes):
+        # its vector value comes from the basis, not from per-node components, so it stays flat.
+        _per_dof = self.space.upper() in ("N1E", "N2E", "RT") or self.num_components == 1
+        self._values = _v.reshape(-1) if _per_dof else _v.reshape(-1, self.num_components)
         self.frozen_id = _next_op_id()  # kernel gather-table key
         # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
         # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
@@ -5354,6 +5401,24 @@ class FrozenField(Placeholder):
         for s in self.value_shape:
             n *= int(s)
         return n
+
+    @property
+    def values(self):
+        """The known DOF values. A field frozen to a SOLVE has none until evaluation: it is read by
+        ``expr.integrate(domain)`` and, as a runtime input (one-way coupling), by a non-nodal form; the nodal
+        Lagrange assembler and a standalone ``.eval()`` cannot take it yet."""
+        if self.values_node is not None:
+            raise NotImplementedError(
+                f"{self.name}: a field frozen to a solve (`freeze(fem.solve())`) has its values only inside the "
+                "trace. It is read by `expr.integrate(domain)` and by non-nodal forms (N1E / N2E / RT / DG / P_k "
+                "unknowns); the nodal Lagrange assembler and a standalone `.eval()` need a concrete solution "
+                "array -- freeze that there."
+            )
+        return self._values
+
+    @values.setter
+    def values(self, v):
+        self._values = v
 
     def _field_view(self):
         n = len(self.value_shape)
@@ -5369,7 +5434,9 @@ class FrozenField(Placeholder):
     bind = partials
 
     def __repr__(self):
-        return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
+        if self.values_node is not None:
+            return f"FrozenField(source_key={self.field_key}, values=<solve>)"
+        return f"FrozenField(source_key={self.field_key}, ndof={self._values.shape[0]})"
 
 
 class LoadPathField(FrozenField):
@@ -6187,7 +6254,14 @@ def cse(expr: Placeholder) -> Placeholder:
         elif isinstance(node, FunctionCall):
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
-                node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                rebuilt = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                # keep what the call carries beyond its constructor arguments: ``getitem_key``, a solve's
+                # ``_solve_fls`` / ``_fem_ref`` / ``_linear_spec``, ``_per_evaluation``, an integral's spec --
+                # dropping them silently turned off the shared factorisation and the per-evaluation memo
+                for k, v in vars(node).items():
+                    if k not in vars(rebuilt):
+                        setattr(rebuilt, k, v)
+                node = rebuilt
         elif isinstance(node, Choice):
             new_opts = [_visit(a) if isinstance(a, Placeholder) else a for a in node.options]
             if any(n is not o for n, o in zip(new_opts, node.options)):
@@ -6610,6 +6684,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(node.time_var)
         elif isinstance(node, Tracker):
             visit(node.expr)
+        elif isinstance(node, Constraint):
+            visit(node.residual)
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
