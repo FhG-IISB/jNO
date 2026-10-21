@@ -140,3 +140,26 @@ def test_solve_no_longer_logs_constraint_shapes(monkeypatch):
     monkeypatch.setattr(crux.log, "info", lambda msg, *a, **k: said.append(str(msg)))
     crux.solve(2)
     assert not any("Shape =" in m for m in said), [m for m in said if "Shape" in m]
+
+
+def test_a_derivative_not_computed_by_the_default_ad_says_how_it_is():
+    """``scheme="finite_difference"`` and ``"finite_difference:cotangent"`` used to print exactly like the AD
+    Laplacian: two different losses, one text."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain(compute_mesh_connectivity=True)
+    x, y, _ = d.variable("interior")
+    net = jno.nn(foundax.mlp(2, 1, hidden_dims=8, num_layers=2, key=KEY))
+    net.optimizer(optax.adam(1e-3))
+    u = net(x, y)
+    crux = jno.core(
+        [
+            (u.laplacian(x, y) - 1.0).mse,
+            (u.laplacian(x, y, scheme="finite_difference") - 1.0).mse,
+            (u.laplacian(x, y, scheme="finite_difference:cotangent") - 1.0).mse,
+        ],
+        domain=d,
+    )
+    info = jno.info(crux, deep=True)
+    eqs = [v for k, v in dict(info.sections)["equations"] if k.startswith("[")]
+    assert [e.rsplit("(", 1)[1] for e in eqs] == ["mse)", "mse · FD)", "mse · FD cotangent)"]
+    tree = [v.strip() for _, v in dict(info.sections)["expression tree"]]
+    assert any(t.startswith("└─ Δu") and t.endswith("FD cotangent") for t in tree)

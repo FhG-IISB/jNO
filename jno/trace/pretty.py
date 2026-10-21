@@ -694,6 +694,41 @@ def _shown_children(n, T):
     return out
 
 
+def scheme_note(n) -> str:
+    """How a derivative node is computed, when it is not the default automatic differentiation: ``FD``,
+    ``FD cotangent``, ``spectral``, ``AD reverse``; ``""`` for the default (and for other nodes)."""
+    T = _node_types()
+    if not isinstance(n, (T["Jacobian"], T["Hessian"], T["TemporalDerivative"])):
+        return ""
+    scheme = getattr(n, "scheme", None)
+    if scheme is None or scheme == "automatic_differentiation":
+        return ""
+    if not isinstance(scheme, str):  # a jno.fd(...) stencil object
+        return "FD stencil"
+    family, _, sub = scheme.partition(":")
+    short = {"finite_difference": "FD", "automatic_differentiation": "AD", "spectral": "spectral"}.get(family, family)
+    return f"{short} {sub}".strip()
+
+
+def scheme_notes(expr) -> list:
+    """The distinct :func:`scheme_note` of the derivatives in ``expr``, in order of appearance."""
+    T = _node_types()
+    out, seen = [], set()
+
+    def walk(n):
+        if not isinstance(n, T["Placeholder"]) or id(n) in seen:
+            return
+        seen.add(id(n))
+        note = scheme_note(n)
+        if note and note not in out:
+            out.append(note)
+        for c in _children(n, T):
+            walk(c)
+
+    walk(expr)
+    return out
+
+
 def _definition_key(n, names, T):
     """The ``where`` entry a node stands for -- a named field, a network, one of a network's outputs -- or
     ``None`` for a node drawn in the tree."""
@@ -747,8 +782,10 @@ def tree(expr, names, shapes, *, defined=None, ascii_only=None, width=58) -> lis
         text = label(n)
         if negated:  # a subtracted term: − a, and − (−a) = a
             text = text[1:] if text.startswith(("-", "−")) else st.minus + text
+        note = scheme_note(n)  # a derivative not computed by the default AD says how it is
         lines.append(
             f"{prefix}{branch}{text.ljust(max(width - len(prefix) - len(branch), 0))}  {shapes.get(id(n), 'per point')}"
+            + (f"  {note}" if note else "")
         )
         done.add(id(n))
         kids = [(c, neg) for c, neg in _shown_children(n, T) if visible(c)]

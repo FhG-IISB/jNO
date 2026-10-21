@@ -94,7 +94,7 @@ def _fmt_n(x) -> str:
 def _equation_rows(exprs, labels=None, measures=None) -> list:
     """The expressions in mathematical notation (:mod:`jno.trace.pretty`), one row each, then the ``where``
     rows defining the fields and networks they read."""
-    from .trace.pretty import equation, field_names, where_rows
+    from .trace.pretty import equation, field_names, scheme_notes, where_rows
 
     exprs = [getattr(e, "_expr", e) for e in exprs]
     try:
@@ -105,7 +105,8 @@ def _equation_rows(exprs, labels=None, measures=None) -> list:
     for i, e in enumerate(exprs):
         eq, loss = equation(e, names, measure=measures[i] if measures is not None else None)
         key = labels[i] if labels is not None and i < len(labels) else f"[{i}]"
-        rows.append((key, eq + (f"   ({loss})" if loss else "")))
+        note = " · ".join(([loss] if loss else []) + scheme_notes(e))  # mse · FD
+        rows.append((key, eq + (f"   ({note})" if note else "")))
     return rows + where_rows(defs, names)
 
 
