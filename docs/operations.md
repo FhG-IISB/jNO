@@ -77,6 +77,17 @@ either a whole scheme or an AD sub-mode (`"forward"` / `"reverse"`, its original
 per-call `scheme=` always overrides it, which is how one term keeps finite differences while the
 run is spectral.
 
+#### How the default AD derivatives are computed
+
+With the default `"automatic_differentiation"`, all derivatives one evaluation takes over the same
+point set are computed together, per point, with time as one more coordinate: a Laplacian or a single
+second derivative (`u.xx`, `u.tt`) from one *forward-Laplacian* pass that carries value, gradient and
+summed second derivative through the network at once (Li et al., *Nat. Mach. Intell.* 6, 209 (2024),
+via [`folx`](https://github.com/microsoft/folx)); other first derivatives from one forward-mode pass
+per coordinate; mixed second derivatives from a forward pass over that one. A network read by several
+fields and derivatives is evaluated once per pass. A scheme with an explicit sub-mode
+(`"automatic_differentiation:reverse"`, `:fwd-over-rev`, ...) keeps the one-derivative-at-a-time path.
+
 #### Spectral differentiation
 
 On a uniform grid the derivative is a multiply in Fourier space, which is **exact** for a

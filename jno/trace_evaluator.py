@@ -6,6 +6,7 @@ import functools
 import inspect
 from typing import Any, Dict, List, NamedTuple, Tuple
 
+import folx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -506,13 +507,14 @@ class TraceEvaluator:
     class _EvalCtx:
         """Bundles the read-only state that every handler needs."""
 
-        __slots__ = ("context", "var_bindings", "key", "active_region")
+        __slots__ = ("context", "var_bindings", "key", "active_region", "roots")
 
-        def __init__(self, context, var_bindings, key, active_region=None):
+        def __init__(self, context, var_bindings, key, active_region=None, roots=None):
             self.context = context
             self.var_bindings = var_bindings
             self.key = key
             self.active_region = active_region
+            self.roots = roots  # the expressions evaluated in this context, when known: see `_shared_ad_derivative`
 
     # ------------------------------------------------------------------
     # Public entry-point
@@ -544,6 +546,7 @@ class TraceEvaluator:
         outer = not getattr(self, "_in_evaluate", False)
         if outer:
             self._in_evaluate, self._per_eval_memo, self._per_eval_roots, self._node_memo = True, {}, [expr], {}
+        ctx.roots = self._per_eval_roots  # every expression of this evaluation shares its derivative passes
         try:
             return self._dispatch(expr, ctx)
         finally:
@@ -878,33 +881,39 @@ class TraceEvaluator:
 
         Each derivative node used to re-run its target under its own ``vmap`` and AD pass, so a Navier-Stokes
         residual (eight derivative nodes over the three outputs of one network) did 3.3x the work of the
-        hand-written training step. Here every AD derivative of the evaluation that reads the same point set is
-        computed together: per point, one forward-mode pass per coordinate gives the first derivative of all
-        their targets along it, and a forward pass over that one gives the second derivatives (univariate
-        Taylor propagation; Griewank & Walther, *Evaluating Derivatives*, 2nd ed., SIAM 2008, ch. 13). A
-        network read by several fields and derivatives is evaluated once per pass.
+        hand-written training step. Here every AD derivative that a context evaluates over the same points is
+        computed together, per point, with time as one more coordinate of the point: a Laplacian, and any
+        single second derivative (``u.xx``, ``u.tt``), from one forward-Laplacian pass that carries value,
+        gradient and the summed second derivative through the target at once (Li et al., *Nat. Mach. Intell.*
+        6, 209 (2024), via ``folx``); other first derivatives from one forward-mode pass per coordinate, and
+        mixed second derivatives from a forward pass over that one (Griewank & Walther, *Evaluating
+        Derivatives*, 2nd ed., SIAM 2008, ch. 13). A network read by several fields and derivatives is
+        evaluated once per pass. A derivative inside a derivative's target (a Laplacian of a Laplacian) gets a
+        shared pass of its own, per point.
 
-        Returns ``None`` -- the node takes its own path, unchanged -- outside an evaluation, inside another
-        derivative's target or a FEM region, for a scheme with an explicit submethod
-        (``"automatic_differentiation:reverse"`` asks for that mode), and when no other AD derivative reads
-        the same point set.
+        Returns ``None`` -- the node takes its own path, unchanged -- outside an evaluation, in a FEM region,
+        for a scheme with an explicit submethod (``"automatic_differentiation:reverse"`` asks for that mode),
+        on a normal derivative, on stacked time windows, and on a time derivative of something that reads no
+        point set.
         """
         memo = getattr(self, "_per_eval_memo", None)
-        if memo is None or not getattr(self, "_in_evaluate", False) or getattr(self, "_in_shared_derivative", False):
-            return None
-        if ctx.active_region is not None:
+        if memo is None or not getattr(self, "_in_evaluate", False) or ctx.active_region is not None:
             return None
         request = self._ad_request(expr, ctx)
         if request is None:
             return None
-        slot = ("shared-ad-derivatives", request[0])
-        hit = memo.get(slot)
-        if hit is None or not self._same_eval_ctx(hit[0], ctx):
-            members = [
-                (n, r) for n in self._ad_derivative_nodes() if (r := self._ad_request(n, ctx)) and r[0] == request[0]
-            ]
-            hit = memo[slot] = (ctx, self._shared_ad_pass(request[0], members, ctx) if len(members) > 1 else {})
-        return hit[1].get(id(expr))
+        entries = memo.setdefault(("shared-ad-derivatives", request[0]), [])
+        trace = _trace_state()
+        for seen_ctx, seen_trace, members, values in entries:
+            if seen_trace == trace and id(expr) in members and self._same_eval_ctx(seen_ctx, ctx):
+                return values.get(id(expr))
+        roots = ctx.roots if ctx.roots is not None else [expr]
+        group = [(n, r) for n in self._ad_derivative_nodes(roots) if (r := self._ad_request(n, ctx)) and r[0] == request[0]]
+        if all(n is not expr for n, _ in group):
+            group.append((expr, request))
+        values = self._shared_ad_pass(request[0], group, ctx)
+        entries.append((ctx, trace, {id(n) for n, _ in group}, values))
+        return values.get(id(expr))
 
     @staticmethod
     def _same_eval_ctx(a, b):
@@ -917,17 +926,18 @@ class TraceEvaluator:
             and all(a.var_bindings[k] is b.var_bindings[k] for k in a.var_bindings)
         )
 
-    def _ad_derivative_nodes(self):
-        """The Jacobian/Hessian nodes of this evaluation's roots that are evaluated in the roots' own context.
+    def _ad_derivative_nodes(self, roots):
+        """The Jacobian/Hessian nodes reachable from ``roots`` without a change of context.
 
         The walk stops at every node that evaluates its children in a context of its own (a derivative's
         target, an integral, an assembly, an operation call), so a node found here is never computed under
         a context it does not see.
         """
-        roots = getattr(self, "_per_eval_roots", [])
-        cached = getattr(self, "_ad_nodes_cache", None)
-        if cached is not None and len(cached[0]) == len(roots) and all(a is b for a, b in zip(cached[0], roots)):
-            return cached[1]
+        cache = self.__dict__.setdefault("_ad_nodes_cache", {})
+        key = tuple(id(r) for r in roots)
+        hit = cache.get(key)
+        if hit is not None and all(a is b for a, b in zip(hit[0], roots)):
+            return hit[1]
         found, seen = [], set()
 
         def walk(node):
@@ -954,14 +964,18 @@ class TraceEvaluator:
 
         for root in roots:
             walk(root)
-        self._ad_nodes_cache = (list(roots), found)
+        if len(cache) > 256:
+            cache.clear()
+        cache[key] = (list(roots), found)
         return found
 
     def _ad_request(self, node, ctx):
-        """What a derivative node needs from the shared pass: ``(tag, target, kind, dims)``, or ``None``.
+        """What a derivative node needs from the shared pass: ``(tag, target, kind, coords)``, or ``None``.
 
-        ``kind`` is ``"jacobian"`` (first derivatives along ``dims``), ``"laplacian"``, ``"hessian"``, or
-        ``"second"`` (a Jacobian of a Jacobian, ``dims`` = (inner, outer) coordinate).
+        ``tag`` names the ``(N, D)`` point set; a coordinate is a column ``d`` of it or ``("time", key)``, the
+        scalar time of this evaluation. ``kind`` is ``"jacobian"`` (first derivatives along ``coords``),
+        ``"laplacian"``, ``"hessian"``, or ``"second"`` (a Jacobian of a Jacobian, ``coords`` = (inner,
+        outer)).
         """
         if not isinstance(node, (Jacobian, Hessian)) or node.scheme != "automatic_differentiation":
             return None
@@ -969,30 +983,41 @@ class TraceEvaluator:
             return None  # jno.setup(diff_type=...) made a bare scheme mean another family
         if isinstance(node.target, (TestFunction, FrozenField)):
             return None
-        bound = [ctx.var_bindings.get(id(v), v) for v in node.variables]
-        spans = [getattr(b, "dim", None) for b in bound]
-        if not all(
-            isinstance(b, Variable)
-            and getattr(b, "axis", "spatial") == "spatial"
-            and isinstance(d, (list, tuple))
-            and len(d) == 2
-            and d[1] is not None
-            and d[1] - d[0] == 1  # one coordinate; a normal (``u.d(n)``) spans several
-            for b, d in zip(bound, spans)
-        ):
+        coords, tags = [], set()
+        for v in node.variables:
+            b = ctx.var_bindings.get(id(v), v)
+            if not isinstance(b, Variable):
+                return None
+            if getattr(b, "axis", "spatial") == "temporal":
+                key = b.tag if b.tag in ctx.context else "__time__"
+                if getattr(ctx.context.get(key), "size", 0) != 1:
+                    return None  # stacked time windows: the per-node path
+                coords.append(("time", key))
+                continue
+            d = getattr(b, "dim", None)
+            if not (isinstance(d, (list, tuple)) and len(d) == 2 and d[1] is not None and d[1] - d[0] == 1):
+                return None  # a normal (``u.d(n)``) spans several coordinates
+            tags.add(_context_tag(b, ctx.context))
+            coords.append(int(v.dim[0]))
+        if not tags:  # time only: the points are the ones the target reads
+            tags = {
+                t
+                for t in collect_tags(node.target)
+                if not str(t).startswith("__time") and getattr(ctx.context.get(t), "ndim", 0) == 2
+            }
+        if len(tags) != 1:
             return None
-        tag = _context_tag(bound[0], ctx.context)
-        points = ctx.context.get(tag)
-        if getattr(points, "ndim", 0) != 2:
+        tag = tags.pop()
+        if getattr(ctx.context.get(tag), "ndim", 0) != 2:
             return None
-        dims = tuple(int(v.dim[0]) for v in node.variables)
+        coords = tuple(coords)
         if isinstance(node, Hessian):
-            return tag, node.target, "laplacian" if getattr(node, "trace", False) else "hessian", dims
-        if isinstance(node.target, Jacobian) and len(dims) == 1:
+            return tag, node.target, "laplacian" if getattr(node, "trace", False) else "hessian", coords
+        if isinstance(node.target, Jacobian) and len(coords) == 1:
             inner = self._ad_request(node.target, ctx)
             if inner is not None and inner[0] == tag and inner[2] == "jacobian" and len(inner[3]) == 1:
-                return tag, inner[1], "second", (inner[3][0], dims[0])
-        return tag, node.target, "jacobian", dims
+                return tag, inner[1], "second", (inner[3][0], coords[0])
+        return tag, node.target, "jacobian", coords
 
     def _shared_ad_pass(self, tag, members, ctx):
         """The values of ``members`` (``[(node, request)]``, all over ``tag``) from one pass: ``{id(node): value}``.
@@ -1001,76 +1026,138 @@ class TraceEvaluator:
         asking one of a vector target is left out and takes its own path.
         """
         points = ctx.context[tag]
-        n_points, n_dim = points.shape
+        n_points, n_space = points.shape
+        times = sorted({c[1] for _, r in members for c in r[3] if isinstance(c, tuple)})
+        column = {("time", k): n_space + j for j, k in enumerate(times)}
+        members = [(n, (t, tgt, kind, tuple(column.get(c, c) for c in cs))) for n, (t, tgt, kind, cs) in members]
         targets, index = [], {}
         for _, (_, target, _, _) in members:
             if id(target) not in index:
                 index[id(target)] = len(targets)
                 targets.append(target)
+        # The time of this evaluation is ONE scalar shared by all points. It stays an unbatched argument, so what
+        # depends on time alone (the branch net of a DeepONet in t) is computed once, not once per point.
+        time_now = (
+            jnp.stack([jnp.reshape(ctx.context[k], (-1,))[0].astype(points.dtype) for k in times])
+            if times
+            else jnp.zeros((0,), points.dtype)
+        )
 
-        def at(idx):
-            """The targets at point ``idx``, as a function of its coordinates."""
-            local = self._build_local_context(idx, tag, points, ctx.context)
+        # One point's view of the context: every entry with one row per point is mapped over (the rule of
+        # `_build_local_context`), the rest is shared. Mapping `vmap` over the arrays, rather than over an index
+        # that slices them, keeps the per-point rows out of gathers.
+        rows = {
+            k: v
+            for k, v in ctx.context.items()
+            if k != "__active_spatial_n__"
+            and not isinstance(v, dict)
+            and getattr(v, "ndim", 0) >= 1
+            and (k == tag or v.shape[0] == n_points)
+        }
+        shared = {k: v for k, v in ctx.context.items() if k not in rows and k != "__active_spatial_n__"}
+        row0 = {k: v[0] for k, v in rows.items()}
 
-            def values(p):
-                # The targets usually share their network call (``o[..., 0]``, ``o[..., 1]``, ...): one
-                # memo for this call evaluates it once. XLA does not merge the copies once they are vmapped.
-                point_ctx = self._EvalCtx({**local, tag: p[jnp.newaxis, :]}, ctx.var_bindings, ctx.key)
+        def at(row):
+            """The targets at one point (``row``: its entries of the context), as a function of its coordinates
+            ``zs`` and the times ``ts``."""
+            local = {"__active_spatial_n__": 1, **shared, **{k: v[jnp.newaxis] for k, v in row.items()}}
+
+            def values(zs, ts):  # the targets usually share one network call: `_dispatch` evaluates it once
+                point = {**local, tag: zs[jnp.newaxis, :]}
+                for j, k in enumerate(times):
+                    point[k] = jnp.reshape(ts[j], jnp.shape(ctx.context[k])).astype(ctx.context[k].dtype)
+                    if k != "__time__" and "__time__" in ctx.context:  # the global time stays coherent
+                        point["__time__"] = jnp.reshape(ts[j], jnp.shape(ctx.context["__time__"]))
+                point_ctx = self._EvalCtx(point, ctx.var_bindings, ctx.key, roots=targets)
                 return tuple(jnp.squeeze(self._dispatch(t, point_ctx)) for t in targets)
 
             return values
 
-        self._in_shared_derivative = True
-        try:
-            scalar = [s.ndim == 0 for s in jax.eval_shape(at(0), points[0])]
-            served = [(n, r) for n, r in members if r[2] == "jacobian" or scalar[index[id(r[1])]]]
-            if len(served) < 2:
-                return {}
-            first = sorted({d for _, r in served if r[2] == "jacobian" for d in r[3]})
-            pairs = set()
-            for _, (_, _, kind, dims) in served:
-                if kind == "laplacian":
+        def restricted(f, zs, sub):
+            """``f`` as a function of the coordinates ``sub`` alone, the others held; and their current values."""
+
+            where = {c: i for i, c in enumerate(sub)}
+
+            def g(q):  # the point with the coordinates `sub` replaced by `q`
+                z2 = jnp.stack([q[where[c]] if c in where else zs[c] for c in range(n_space)])
+                t2 = (
+                    jnp.stack([q[where[n_space + j]] if n_space + j in where else time_now[j] for j in range(len(times))])
+                    if times
+                    else time_now
+                )
+                return f(z2, t2)
+
+            return g, jnp.stack([zs[c] if c < n_space else time_now[c - n_space] for c in sub])
+
+        scalar = [s.ndim == 0 for s in jax.eval_shape(at(row0), points[0], time_now)]
+        served = [(n, r) for n, r in members if r[2] == "jacobian" or scalar[index[id(r[1])]]]
+        if not served:
+            return {}
+        first = sorted({d for _, r in served if r[2] == "jacobian" for d in r[3]})
+        # A Laplacian over distinct coordinates, and a single second derivative, come from one forward-Laplacian
+        # pass over their coordinates (value, gradient and the SUMMED second derivative together): half the work
+        # of one second-order pass per coordinate. A repeated coordinate (u.xx + u.xx) keeps the per-coordinate
+        # sum; a mixed one (u.d(x).d(y), a full Hessian) a forward pass over a forward pass.
+        lap_sets, pairs = set(), set()
+        for _, (_, _, kind, dims) in served:
+            if kind == "laplacian":
+                if len(set(dims)) == len(dims):
+                    lap_sets.add(tuple(sorted(dims)))
+                else:
                     pairs |= {(d, d) for d in dims}
-                elif kind == "hessian":
-                    pairs |= {tuple(sorted((a, b))) for a in dims for b in dims}
-                elif kind == "second":
+            elif kind == "hessian":
+                pairs |= {tuple(sorted((a, b))) for a in dims for b in dims}
+            elif kind == "second":
+                if dims[0] == dims[1]:
+                    lap_sets.add((dims[0],))
+                else:
                     pairs.add(tuple(sorted(dims)))
+        lap_sets = sorted(lap_sets)
 
-            def per_point(idx):
-                f, z = at(idx), points[idx]
-                basis = jnp.eye(n_dim, dtype=points.dtype)
-                d1, d2 = {}, {}
-                for a in sorted({a for a, _ in pairs}):
+        def per_point(row):
+            f, zs = at(row), row[tag]
+            d1, d2, lap = {}, {}, {}
+            for dims in lap_sets:
+                g, cur = restricted(f, zs, dims)
+                lapl = folx.forward_laplacian(g)(cur)
+                lap[dims] = tuple(t.laplacian for t in lapl)
+                jacs = [t.jacobian.dense_array for t in lapl]  # (len(dims), *value_shape) each
+                for i, d in enumerate(dims):
+                    d1.setdefault(d, tuple(j[i] for j in jacs))
+            for a, b in sorted(pairs):
+                g, cur = restricted(f, zs, (a,) if a == b else (a, b))
+                e_a, e_b = (jnp.ones(1, cur.dtype),) * 2 if a == b else tuple(jnp.eye(2, dtype=cur.dtype))
 
-                    def along(w, a=a):
-                        return jax.jvp(f, (w,), (basis[a],))[1]
+                def along(w, g=g, e_a=e_a):
+                    return jax.jvp(g, (w,), (e_a,))[1]
 
-                    for b in sorted({b for a2, b in pairs if a2 == a}):
-                        d1[a], d2[(a, b)] = jax.jvp(along, (z,), (basis[b],))
-                for d in first:
-                    if d not in d1:
-                        d1[d] = jax.jvp(f, (z,), (basis[d],))[1]
+                d1[a], d2[(a, b)] = jax.jvp(along, (cur,), (e_b,))
+            for d in first:
+                if d not in d1:
+                    g, cur = restricted(f, zs, (d,))
+                    d1[d] = jax.jvp(g, (cur,), (jnp.ones(1, cur.dtype),))[1]
 
-                out = {}
-                for node, (_, target, kind, dims) in served:
-                    k = index[id(target)]
-                    if kind == "jacobian":
-                        comps = [d1[d][k] for d in dims]
-                        if comps[0].ndim == 0:
-                            out[id(node)] = jnp.stack(comps)  # (n_vars,)
-                        else:
-                            out[id(node)] = comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
-                    elif kind == "laplacian":
-                        out[id(node)] = sum(d2[(d, d)][k] for d in dims)
-                    elif kind == "hessian":
-                        out[id(node)] = jnp.stack([jnp.stack([d2[tuple(sorted((a, b)))][k] for b in dims]) for a in dims])
+            out = {}
+            for node, (_, target, kind, dims) in served:
+                k = index[id(target)]
+                if kind == "jacobian":
+                    comps = [d1[d][k] for d in dims]
+                    if comps[0].ndim == 0:
+                        out[id(node)] = jnp.stack(comps)  # (n_vars,)
                     else:
-                        out[id(node)] = d2[tuple(sorted(dims))][k][jnp.newaxis]
-                return out
+                        out[id(node)] = comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+                elif kind == "laplacian":
+                    key = tuple(sorted(dims))
+                    out[id(node)] = lap[key][k] if key in lap else sum(d2[(d, d)][k] for d in dims)
+                elif kind == "hessian":
+                    out[id(node)] = jnp.stack([jnp.stack([d2[tuple(sorted((a, b)))][k] for b in dims]) for a in dims])
+                elif dims[0] == dims[1]:
+                    out[id(node)] = lap[(dims[0],)][k][jnp.newaxis]
+                else:
+                    out[id(node)] = d2[tuple(sorted(dims))][k][jnp.newaxis]
+            return out
 
-            values = jax.vmap(per_point)(jnp.arange(n_points))
-        finally:
-            self._in_shared_derivative = False
+        values = jax.vmap(per_point)(rows)
         for node, (_, _, kind, _) in served:
             if kind == "laplacian":
                 values[id(node)] = values[id(node)][:, jnp.newaxis]

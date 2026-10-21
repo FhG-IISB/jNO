@@ -248,6 +248,57 @@ def test_the_list_form_and_the_method_form_still_work():
     assert u.laplacian(x, y).trace is True
 
 
+PER_NODE = "automatic_differentiation:reverse"  # an explicit submethod keeps the per-node path: the oracle
+
+
+def _per_node_vs_shared(build):
+    """The same derivatives through the shared pass and through the per-node path, evaluated together."""
+    dom, exprs_shared, exprs_per_node, net = build()
+    net.optimizer(optax.adam(1e-3))
+    crux = jno.core([(e - 0.0).mse for e in exprs_shared], domain=dom)
+    got = [np.asarray(v) for v in crux.eval(exprs_shared)]
+    want = [np.asarray(v) for v in crux.eval(exprs_per_node)]
+    return got, want
+
+
+def test_time_derivatives_join_the_shared_pass_and_match_the_per_node_path():
+    """``u.t`` (time as one more coordinate, one value for all points) and ``u.tt`` with the Laplacian."""
+
+    def build():
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0, 1.0, 4))
+        x, y, t = dom.variable("interior")
+        net = jno.nn(foundax.mlp(in_features=3, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
+        u = (net(x, y, t) * x * (1 - x)).scalar.bind(x=x, y=y, t=t)
+        shared = [u.t, u.tt, u.laplacian(x, y), u.d(t).d(x)]
+        per_node = [
+            u.d(t, scheme=PER_NODE),
+            u.d(t, scheme=PER_NODE).d(t, scheme=PER_NODE),
+            u.laplacian(x, y, scheme="automatic_differentiation:fwd-over-rev"),
+            u.d(t, scheme=PER_NODE).d(x, scheme=PER_NODE),
+        ]
+        return dom, shared, per_node, net
+
+    got, want = _per_node_vs_shared(build)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape
+        assert np.allclose(g, w, rtol=1e-4, atol=1e-5), np.abs(g - w).max()
+
+
+def test_a_laplacian_of_a_laplacian_matches_the_per_node_path():
+    def build():
+        dom, x, y, net, o, (u, _, _) = _three_field_net()
+        scheme = "automatic_differentiation:fwd-over-rev"
+        return (
+            dom,
+            [u.laplacian(x, y).laplacian(x, y)],
+            [u.laplacian(x, y, scheme=scheme).laplacian(x, y, scheme=scheme)],
+            net,
+        )
+
+    (got,), (want,) = _per_node_vs_shared(build)
+    assert np.allclose(got, want, rtol=1e-3, atol=1e-4), np.abs(got - want).max()
+
+
 # ---------------------------------------------------------------------------
 # indexing a per-point field
 # ---------------------------------------------------------------------------
