@@ -62,7 +62,7 @@ through the solve.
 
 -   :material-book-open-page-variant-outline: **[Tutorials](#tutorials)**
 
-    33 worked examples — PINN, operator learning, FEM, FDM, and Bayesian.
+    45 worked examples — PINN, operator learning, FEM, FDM, Bayesian, RCWA, and generative.
 
 -   :material-language-python: **[API Reference](API.md)**
 
@@ -87,7 +87,7 @@ Maturity is stated per capability; each link goes to the page that documents it.
 | **FDM** — `jno.fdm` | [stable](fdm.md) | Strong-form collocation from a term list; **structured grids + geometric multigrid**; unstructured meshes; periodic, coupled, flux BCs; **vector unknowns** (Navier–Stokes, elasticity); stencils chosen with `jno.fd(order=, points=, upwind=, fit=, …)`; 2-D & 3-D |
 | **Spectral / RCWA** — `jno.rcwa` | [stable](rcwa.md) | Vector-Maxwell RCWA, anisotropic media, Jones / polarization readout |
 | **Linear & nonlinear solvers** — `jno.solve` / `jno.precond` | [stable](solvers.md) | Sparse-direct LU, Jacobi-BiCGStab, GMRES, CG, MINRES, Chebyshev, geometric multigrid, optional GPU **AMG** — matrix-free and differentiable |
-| **Generalized eigenproblems** — `fem.eigs` | [beta](API.md#solvers-and-preconditioners) | `K x = λ M x`, differentiable, M-orthonormal |
+| **Generalized eigenproblems** — `fem.eigs` | [beta](API.md#solvers-and-preconditioners) | `K x = λ M x`, differentiable, M-orthonormal; **photonic band structure** through a Bloch tie; **contour integration** for every mode in a region of the complex plane, differentiable through the eigenvectors |
 | **Time integration** | [stable](fdm.md) | θ-method (backward-Euler / Crank–Nicolson), BDF2, SDIRK, Rosenbrock, exponential integrators, adaptive step size, all through `fem.solve(time=…)`; `jno.fdm` takes the same slot (tested there: θ, BDF2, adaptive; the exponential integrator is refused) |
 | **Adaptive & moving meshes** | [beta](fem/geometry.md) | Hessian-metric remeshing (AFEM), r-adaptivity, moving meshes stated in the term list |
 | **Differentiable inverse / PDE-constrained** | [stable](inverse-problems.md) | Recover a scalar, a field `k(x)`, the geometry, or a **neural coefficient** through any solve — the gradient flows through the whole march |
@@ -102,6 +102,7 @@ Maturity is stated per capability; each link goes to the page that documents it.
 | Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](tutorials/11-operator-learning/index.md) | PDE-residual or data-driven |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](adaptive/resampling.md) | |
 | Stochastic PDEs & noise nodes (gaussian / uniform / laplace) | [stable](tutorials/07-stochastic/fokker-planck-2d.md) | Fokker–Planck, stochastic forcing |
+| Generative modelling (flow matching) | [beta](tutorials/13-generative/flow-matching-ring.md) | `Model.flow` marches a network as an ODE velocity; the training objective is one term. Heun fixed-step, no log-density |
 | Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](training/bayesian.md) | `model.bayesian(kernel_factory)` mirrors `.optimizer()` — per-parameter, mixed freely |
 | Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [stable](model-controls/lora.md) | Chain `.lora(...)` on any wrapped model |
 | Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity) | [stable](training/explainability.md) | |
@@ -135,17 +136,18 @@ for full definitions:
 
 ## Tutorials
 
-45 tutorial pages: 43 worked examples and two overviews. Start with the PINN group if you are new to
+47 tutorial pages: 45 worked examples and two overviews. Start with the PINN group if you are new to
 jNO; jump straight to FEM or FDM if you arrived for the solvers.
 
 | Group | Count | Covers |
 |-------|-------|--------|
 | [PINN](tutorials/01-basics/laplace-1d.md) | 8 | Laplace 1-D, variable-coefficient Poisson, Allen–Cahn, viscous Burgers, inverse parameter, Fredholm integral equation, gradient conflict, Fokker–Planck |
 | [Operator learning](tutorials/11-operator-learning/index.md) | 3 | Overview, DeepONet on a parametric Poisson, FNO2D supervised |
-| [FEM](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | 27 | Poisson, VPINN, Deep Ritz, Helmholtz + PML, elasticity, Navier–Stokes (2-D and 3-D, stabilised, high Re, vortex shedding), droplets, LES subgrid models, laser melt pool, tied two-mesh coating, Rayleigh–Bénard, phase-field fracture, wave & elastodynamics, full-waveform inversion, inverse diffusivity field, adaptive refinement, topology optimisation, 2-D Maxwell |
+| [FEM](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | 28 | Poisson, VPINN, Deep Ritz, Helmholtz + PML, elasticity, Navier–Stokes (2-D and 3-D, stabilised, high Re, vortex shedding), droplets, LES subgrid models, laser melt pool, tied two-mesh coating, Rayleigh–Bénard, phase-field fracture, wave & elastodynamics, full-waveform inversion, inverse diffusivity field, adaptive refinement, topology optimisation, 2-D Maxwell |
 | [FDM](tutorials/09-fdm/poisson-2d-fdm.md) | 4 | Poisson, heat, mixed BC, inverse source |
 | [Bayesian](tutorials/10-bayesian-pinns/index.md) | 2 | Overview and an inverse coefficient with uncertainty |
 | [RCWA](tutorials/12-rcwa/binary-grating-orders.md) | 1 | Binary-grating diffraction orders |
+| [Generative](tutorials/13-generative/flow-matching-ring.md) | 1 | Conditional flow matching on an eight-mode ring |
 
 The full list is in the **Tutorials** tab; the source scripts live under
 [`docs/tutorial_examples/`](https://github.com/FhG-IISB/jno/tree/main/docs/tutorial_examples).

@@ -24,6 +24,40 @@ domain, compiles them once, then exposes `solve()` / `eval()`.
         - eval
         - sweep
 
+### Mini-batching — `batchsize` and `points` are different axes
+
+A context tag is one `(B, [T,] N, D)` array. The two mini-batch arguments cut it along different
+axes and compose freely:
+
+| | draws along | built by | typical use |
+|---|---|---|---|
+| `batchsize` | the **sample** axis `B` | `n * domain` | many realisations of a parametric problem |
+| `points` | the **point** axis `N` | the collocation points / a dataset's rows | a large point cloud or dataset |
+
+```python
+crux.solve(epochs=4000, points=1024)              # 1024 of the N points per step
+crux.solve(epochs=4000, batchsize=8, points=1024) # both, independently
+```
+
+A dataset attached with `jno.domain.from_array` has exactly one sample, `B = 1`, so `batchsize`
+has nothing to draw from there — that is what `points=` is for. Asking for `batchsize > B`
+**raises** and names `points=` as the alternative; it used to sample with replacement and evaluate
+duplicate copies of the same full point set, returning the full-batch loss at `batchsize` times the
+cost with nothing said.
+
+Two properties worth relying on:
+
+- **Tags stay aligned.** Index sets are keyed on the point *count*, not the tag, so any two tags of
+  equal length are sliced identically. An input field and its target cannot drift apart — a failure
+  that would otherwise produce a wrong number while every shape still matched.
+- **`points` is refused, loudly, when a constraint needs the whole point set** — a finite-difference
+  derivative reads a node's neighbours and a FEM assembly integrates over cells. Dropping points
+  there would return a plausible wrong answer rather than raise.
+
+`jno.noise.*` follows the sub-sampled count automatically, and `offload_data` /
+`accumulation_steps` count `points` as sub-sampling, so neither is silently disabled when it is the
+point axis being split.
+
 ---
 
 ## Domain
@@ -112,6 +146,86 @@ optimisers, masks, LoRA, freezing, and so on.
         - constrain
         - initialize
         - tune
+        - flow
+
+### Marching a network as an ODE — `Model.flow`
+
+`v.flow(x0, time=...)` integrates the network as a **velocity field**, `dx/dt = v(x, t, *cond)`.
+The network is called state-first, time-second.
+
+```python
+x  = v.flow(x0_array, time=ts)                     # concrete start -> the marched array
+xg = v.flow(jno.noise.gaussian(ndim=2), time=ts)   # symbolic start -> a node for jno.core([...])
+```
+
+`time=` takes the grid **points**: an array is the primary form, so a non-uniform schedule needs no
+extra argument and a *decreasing* grid marches backwards, mapping a sample back to its latent. A
+`(t0, t1, n)` triple is sugar for `linspace`, with `n` counting points exactly as in
+`domain(time=...)`. The state is any pytree, so a multi-field generative model marches in one call.
+
+Because the symbolic form is an ordinary trace node, a constraint on *generated* samples is just
+another term, and an optimisable latent gets a gradient through the whole march:
+
+```python
+# a physics residual on what the model generates
+xg = v.flow(jno.noise.gaussian(ndim=D), time=(0.0, 1.0, 17))
+crux = jno.core([(v((1 - t) * x0 + t * x1, t) - (x1 - x0)).mse, lam * residual(xg).mse])
+
+# recover the latent behind an observation — v.freeze(), z trainable
+z = jno.np.parameter((n, D))
+crux = jno.core([(observe(v.flow(z, time=ts)) - y_obs).mse])
+```
+
+### Sampling as an SDE — `flow(noise=..., key=...)`
+
+Passing a `jno.noise` spec turns the march into a stochastic one: the deterministic step, then
+`draw · √|dt|`, **redrawn independently at every step** (Euler–Maruyama).
+
+```python
+x = v.flow(x0, time=ts, key=k, noise=jno.noise.gaussian(std=0.3))
+```
+
+Here the noise node names a **distribution, not a draw** — the one place in jNO where it means that.
+Its shape comes from the state being marched, so `ndim=`/`like=` are *refused* rather than ignored.
+Parameters may be **schedules**, callables of the march time, which is what an SDE sampler's `σ_t`
+is:
+
+```python
+noise=jno.noise.gaussian(std=lambda t: 0.3 * jnp.sqrt(t / (1 - t)))
+```
+
+The per-step redraw is the property to rely on. A single draw shared across the march would not be
+Brownian motion at all — the increments would be perfectly correlated and the endpoint variance
+would come out a factor of the *step count* too large, getting worse as the step count is raised.
+Verified against the Itô isometry: with `std=σ` and zero drift the endpoint variance is `σ²T` and
+does not move as the step count goes 10 → 40 → 80.
+
+`key=` is **required on the eager path**. A concrete initial state marches outside the solver, where
+there is no step key to inherit, and a noise node evaluated without a key returns zeros — so
+omitting it would silently give a deterministic ODE labelled as an SDE. Inside a term list the
+solver's step key is used and `key=` may be omitted. A `key=` with no `noise=` also raises, since it
+would do nothing.
+
+A backward grid works: the increment scales with `√|dt|`, so a decreasing `time=` is a real backward
+SDE rather than a NaN.
+
+**Why this matters.** The per-step Gaussian transition is exactly the policy that RL post-training of
+flow models optimises — Flow-GRPO's policy is a per-step Gaussian, not a continuous-time density, so
+it needs no divergence. Together with `save=True` for the trajectory, that is the ingredient list.
+
+---
+
+**Limitations.** Heun's method, fixed step, explicit — no adaptive control and no error estimate, so
+the step count is the accuracy knob: second order for the ODE, strong order 1/2 for the SDE (the
+Euler–Maruyama increment sets it). No log-density: that needs the divergence of `v` with respect
+to the *state*, which `jno.np.divergence` (defined over coordinate `Variable`s) does not provide —
+note this blocks *exact likelihoods*, not the per-step transition density an SDE sampler gives.
+Dropout must still be off. The network is handed `ctx.key`, which is the *same* key at every step of
+the march (only the SDE increment folds in the step index), so a dropout mask would be identical
+across all steps rather than resampled — and on the eager path that key is `None`. Reverse mode
+stores every step, so a march
+inside a training loss costs its step count in both compute and activation memory —
+`core.solve(checkpoint_gradients=True)` trades roughly 30 % compute back for the memory.
 
 ---
 
@@ -226,7 +340,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` (complex-symmetric); `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard`, `staggered` — `picard`/`staggered` take `anderson=m` (Anderson acceleration) |
-| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |
+| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, interior modes nearest a shift with `sigma=`, or every eigenvalue inside a circle with `contour` (`FEM.eigs(contour=jno.solve.contour(...))`) |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
@@ -300,7 +414,8 @@ jno.solve.applyfun(A, u0, fun=lambda z: jnp.exp(-dt * z))  # exp(-dt·A)·u₀  
 
 ### Eigenproblems at scale
 
-`jno.solve.eigs` / `FEM.eigs` have three paths, chosen by the arguments. With none of the iterative
+`jno.solve.eigs` / `FEM.eigs` have three paths for a symmetric pencil, chosen by the arguments (a
+fourth, `FEM.eigs(contour=...)`, is below; a non-symmetric pencil goes to ARPACK). With none of the iterative
 arguments the pencil is reduced **densely** — exact, and right when you want the whole low spectrum of
 a small problem, but it materializes the operator (`O(N²)` memory). Passing `precond=` selects
 **preconditioned LOBPCG** (Knyazev, *SIAM J. Sci. Comput.* **23**(2), 517–541, 2001), which only applies
@@ -367,6 +482,78 @@ the eigenvalue. A shift-invert call that fails its gate **raises** `ShiftInvertN
 `jno.utils.solver.eigen`, a `RuntimeError`) naming the cause — exhausted budget or singular shift —
 rather than returning NaN (also under a plain `jax.grad`); only under `jit`/`vmap`, where nothing can
 be raised, is its result NaN-poisoned instead.
+
+A non-symmetric pencil goes to ARPACK (Arnoldi), and every pair it returns is checked against the
+pencil: a set that does not satisfy it **raises** `RuntimeError` instead of returning plausible values
+that are not eigenvalues (ARPACK's generalized solve without a shift needs a symmetric `M`, which a
+one-sided coupling block breaks). See the `eigs` routing note in [FEM limitations](fem/limitations.md).
+
+#### Band structure — a Bloch tie in the pencil
+
+A Bloch tie is an ordinary `jno.fem` term, `u(A) - exp(-i k·a) u(B)`, and `eigs` takes it. A band
+diagram is then a sweep over `k` with the pencil rebuilt at each point:
+
+```python
+fem = jno.fem([
+    ui.x * vi.x + ui.y * vi.y,                       # stiffness
+    u(xl, yl) - numpy.exp(-1j * kx) * u(xr, yr),     # Bloch tie across x
+    u(xb, yb) - numpy.exp(-1j * ky) * u(xt, yt),     # ... and across y
+])
+lam, X = fem.eigs(mass=[eps * ui * vi], k=6)         # λ = ω² at this k-point
+```
+
+A tie factor `c ≠ 1` makes the relation **complex** (the Bloch factor `exp(-i k·a)` has `|c| = 1`; it is
+`c ≠ 1`, not the modulus, that matters), so the tied `K` is assembled on the fused real-equivalent
+`2n` block over `[Re; Im]`. `mass=` is lifted into the same `[[M_r, −M_i], [M_i, M_r]]` layout — a
+mass form assembled on its own carries neither the tie nor the complex literal, and an `n × n` mass
+against a `2n × 2n` stiffness is not a pencil — the periodic reduction is taken in that space, and
+the doubled spectrum the block carries (every complex pair appears twice, as `[Re; Im]` and as its
+`i`-multiple `[−Im; Re]`) is thinned back down. The modes come back **complex on the `n`-space**,
+which is what a band diagram wants.
+
+Sweeps warm-start across `k` through the same `X0=`: a complex `n`-space guess is expanded back into
+both of its real-equivalent partners for you.
+
+#### Every mode in a region — `jno.solve.contour`
+
+`k`-smallest and "nearest `σ`" both name a **count**. A leaky or lossy mode is naturally specified by
+a **region** instead — *everything inside this circle* — which is what contour integration answers
+(Beyn, *Linear Algebra Appl.* **436**(10), 2012): the spectral projector is a resolvent integral
+around the contour, taken by the trapezoid rule on a circle and reduced through an SVD of a random
+probing block.
+
+```python
+lam, X = fem.eigs(
+    mass=[eps * ui * vi],
+    contour=jno.solve.contour(centre=10.0, radius=8.0, points=48, probes=12),
+)
+```
+
+Three things follow from the construction rather than from extra machinery:
+
+* **Differentiable through the eigenVECTORS.** The method is `points` shifted linear solves, one SVD
+  and one small dense eigenproblem, all pure JAX — so `jax.grad` reaches the *modes*, not only the
+  eigenvalues. A mode-shape objective (radiative Q, mode volume, field overlap) differentiates here;
+  on the Arnoldi path it returns NaN by construction.
+* **Non-Hermitian, and even nonlinear pencils, are native.** You name a region; whatever is inside
+  comes back. A frequency-dependent material needs no auxiliary field and no polynomial
+  linearisation — measured on a Lorentz slab, the dispersive problem solved directly at half the
+  system size and `3e-14` relative.
+* **The shifted solves are independent**, so they `vmap`: `points × probes` matrix-free solves rather
+  than one long serial iteration.
+
+`contour=` names a region, so it **refuses** the arguments that only mean something for a count —
+`which`, `sigma`, `precond`, `X0` — rather than ignoring them.
+
+`points` sets accuracy; the trapezoid rule on a circle is spectrally accurate for an analytic
+integrand, so digits come quickly (`points=48` measured at ~`1e-5` relative on a near-degenerate
+Bloch pair, ~`1e-14` on a well-separated 1-D pencil). `probes` is the width of the probing block and
+**must exceed the number of eigenvalues inside** — saturation is detected and raises rather than
+returning a quietly wrong answer. `rank` defaults to reading the singular-value gap, which is correct
+but data-dependent; pass it explicitly when differentiating, and prefer **one more** than the number
+of eigenvalues inside: measured on a pencil with 4 inside, rank 3 is wrong, rank 4 is right, rank 5
+is right *and* differentiable, and rank 6 still gives the right values but breaks the gradient by
+differentiating the SVD through numerically-zero singular values.
 
 ### Singular values — `jno.solve.svd`
 
@@ -572,6 +759,8 @@ authors of custom operators.
 
 ::: jno.trace.Noise
 
+::: jno.trace.Flow
+
 ---
 
 ## Numerical-method front doors
@@ -692,6 +881,26 @@ Backs `model.bayesian(...)` / `model.vi(...)`; see [Bayesian Sampling](training/
         - uniform
         - laplace
         - grf
+
+### Shape by reference — `like=`
+
+`ndim=` gives a *pointwise* shape, `(N, ndim)` with `N` the active point count. That cannot describe
+a **field-valued** draw — the prior a flow-matching path needs when the state is a `(G, G, C)`
+tensor rather than a scalar column. `like=` takes a reference expression instead of a shape:
+
+```python
+x0 = jno.noise.gaussian(std=1.0, like=x1)     # draw shaped like whatever x1 evaluates to
+```
+
+The shape is resolved from the reference's own evaluated shape at evaluation time — only the shape;
+the value is dead and XLA drops it. Because it is measured rather than written down, it tracks
+`batchsize`, `solve(points=...)` and time windows automatically. A literal shape would go stale
+under any of those and fail by *broadcasting* rather than by raising: with `points=8`, a residual
+against a hand-written `(1024, 2)` shape silently becomes a `(1024, 8)` outer product, while
+`like=x1` already gives `(8, 2)` because `x1` itself was resliced.
+
+`ndim=` and `like=` are mutually exclusive — passing both raises. Two noise nodes sharing one
+`like=` reference remain **independent draws**.
 
 ---
 

@@ -2168,6 +2168,35 @@ class domain(MeshIOMixin):
         _in_region.n_entities = region.n_entities
         return _in_region
 
+    def mask(self, name: str) -> np.ndarray:
+        """``(n_nodes,)`` bool: the mesh nodes of the named region -- every node of its cells.
+
+        ``name`` is a region of the mesh: a named part of a ``jno.shape`` plan
+        (``(a.name("core") + b.name("clad")).domain().mask("core")``) or a named volume of a
+        loaded mesh. Read from the mesh's own cell labels, so it is exact for this mesh: a node on an
+        interface belongs to both regions, and a curved mesh contributes its mid-side nodes too.
+        Use it to select a field's values on one part, ``T[d.mask("core")]``.
+
+        Membership is structural (host-side numpy), not a differentiable quantity. For a boundary
+        tag, use :meth:`tag_node_mask` instead.
+
+        Raises:
+            KeyError: ``name`` is not a region of this mesh; the message lists the regions it has.
+        """
+        from .mesh_utils import _CURVED_BLOCKS, volume_cell_type
+
+        dim = int(self.dimension)
+        membership = mesh_cell_region_membership(self.mesh, dim)
+        if name not in membership:
+            raise KeyError(f"domain.mask: no region {name!r}; this mesh has regions {sorted(membership)}.")
+        p1 = volume_cell_type(self.mesh, dim)
+        cd = self.mesh.cells_dict
+        # The curved block, when present, holds the same cells in the same order plus the mid-side nodes.
+        block = next((c for c, (base, _n) in _CURVED_BLOCKS.items() if base == p1 and c in cd), p1)
+        mask = np.zeros(len(self.mesh.points), dtype=bool)
+        mask[np.asarray(cd[block])[membership[name]].ravel()] = True
+        return mask
+
     def tag_node_mask(self, tag, points, *, closure: bool = False):
         """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
 

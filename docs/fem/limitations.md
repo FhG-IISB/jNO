@@ -29,7 +29,7 @@ path is unaffected.
 | `d.tag(name, pred)` over a geometry face | the predicate filters point sampling only; facets still map through the geometry, so naming a DIFFERENT face splits the region | warns |
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
-| Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
+| Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient; on a coupled (multi-field) form only on a first-order transient, not steady or on the τ load path (the parameter's nodes and the constrained field's do not share a numbering) | raises |
 | Time-varying Dirichlet `g(x, t)` | first-order transients, linear or nonlinear, single-field or coupled, a trainable **parameter** inside the value included (differentiable); not a trainable net inside the value, nor a net/parameter-valued Dirichlet beside it, not a parameter inside it on a `u_tt` form or the τ load path, not a nonlinear `u_tt` form. `sdirk(3)` and `ros2` lose some order to it, and `ros2` holds the wall value only to its order (measured below) | raises |
 | Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
@@ -48,7 +48,10 @@ path is unaffected.
 | Coefficient fields on an element space (`e.bind(...).freeze(values)` or `jno.np.parameter(e)` with `e` an N1E / N2E / RT / DG / P_k symbol) | **volume** terms of the non-nodal assembler (a form with such an unknown): value and gradient (`.curl`, `.d(x)`) of a frozen field, value of a parameter. Not in boundary terms, not on the nodal Lagrange or 1-D assembler (P0 / P1 fields only there) | raises |
 | Integrals over a domain (`expr.integrate(d)`) of known fields, incl. solutions frozen with `u.freeze(fem.solve())` | the whole volume, simplex meshes; follows trainable coordinates, and `d.cell_size` / `d.cell_metric` resolve per cell (mesh quality as an integral); the integrand may hold no unknown | raises |
 | A field frozen to a solve (`u.freeze(fem1.solve())`) as a coefficient of another form (one-way coupling) | non-nodal forms (an N1E / N2E / RT / DG / P_k unknown), volume terms, evaluated through `jno.core` (the coupled solve is a runtime input); not the nodal Lagrange assembler, a boundary term, or an eager `fem.solve()` without the value | raises |
-| `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
+| `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** (`contour=` differentiates through the modes) | NaN, not a silent zero |
+| `eigs`: a Bloch/periodic tie **plus** a Dirichlet pin | the two constraint maps do not compose in the eigen path — so a *slab* (periodic in-plane, PEC or PML above and below) cannot be solved yet; a tie alone and a pin alone are both fine | raises |
+| `eigs` eigenvector gradients at an **exact degeneracy** | NaN at a repeated eigenvalue, where only *subspace-invariant* functionals have a derivative at all. `contour=` differentiates through the modes and is the way round it | NaN, not a silent zero |
+| `eigs` on a **runtime-parametric** form | a design parameter reaches the eigensolve only through `fem.operator.evaluate`, not through `fem.eigs` itself | raises |
 | **Curved-boundary geometry** | straight-sided **by default**; `shape.curved()` is the fix | **silent** |
 | **Axisymmetric vector forms** | the `2πr` measure is wrong for vectors | **silent** |
 
@@ -65,7 +68,8 @@ path is unaffected.
     still refuses:
 
     - a field with **no** `u_tt` term — its velocity rows would be singular;
-    - **runtime parameters** — the parametric coupled steady assembly underneath is not wired;
+    - **runtime parameters** — the `u_tt` block re-forms `M₂`/`C`/`K` per step without threading the
+      runtime args, so the parameter would freeze at its initial value;
     - periodic ties.
 
     Time-varying Dirichlet is refused on nonlinear `u_tt` forms (a first-order nonlinear transient
@@ -108,6 +112,11 @@ path is unaffected.
     coordinate profile `u(top) - g*sin(pi*x)`), and the boundary value is recovered from data like
     any other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g`
     through the solve's / each step's `custom_root` (nonlinear / transient).
+
+    On a **coupled** (multi-field) form a parametric essential value is refused, steady or on the τ load
+    path: the boundary lookup reads the parameter's nodal array with the constrained field's node ids, and
+    two fields do not share a numbering. A parameter in the operator or the load of a coupled form is fine;
+    recover a boundary parameter on a single-field form.
 
     A value that is **both** parametric and t/τ-dependent is held at each step's t/τ WITH the runtime
     parameters, on a first-order transient and on a τ load-path march (`u(top)[1] - g*tau`,
@@ -284,6 +293,12 @@ path is unaffected.
     spectrum it actually has — the case that matters for stability problems (resistive MHD growth
     rates, drift waves, anything with a mean flow), where the sign of the growth rate *is* the
     physics. Neither path ever returns the spectrum of `½(K+Kᵀ)` as though it were the answer.
+
+    Every pair ARPACK returns is checked against the pencil (relative residual against `1e-6`; a converged
+    pair sits near `1e-14`). A set that fails **raises** `RuntimeError` naming the worst residual: ARPACK's
+    generalized solve without a shift assumes a symmetric `M`, and a one-sided coupling block (dispersive
+    auxiliary fields, poroelastic or piezoelectric modes) breaks that and yields plausible values that are
+    not eigenvalues. The way out is the exact dense path on a small problem, `sigma=`, or a symmetric `M`.
 
     The routing probe is a randomized bilinear test and is concrete-only, so **under `jit` the
     symmetric path is assumed**.

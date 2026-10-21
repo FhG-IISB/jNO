@@ -269,7 +269,7 @@ def test_solve_resampling_with_offload_data():
     strategy = CountingStrategy(resample_every=1, resample_fraction=0.5, start_epoch=0)
     solver, _ = _build_solver(strategy)
 
-    stats = solver.solve(epochs=4, offload_data=True, batchsize=16)
+    stats = solver.solve(epochs=4, offload_data=True, points=16)
 
     assert strategy.call_count > 0
     assert strategy._last_resample_epoch == 3

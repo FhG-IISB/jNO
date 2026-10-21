@@ -111,3 +111,94 @@ class TestOutputShape:
         (val,) = crux.eval([n])
         # eval returns (B, N, ndim)
         assert val.shape[-1] == ndim
+
+
+# ---------------------------------------------------------------------------
+# like= — shape borrowed from another traced expression
+# ---------------------------------------------------------------------------
+
+
+class TestLike:
+    def test_like_matches_the_reference_shape(self):
+        dom = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, *_ = dom.variable("interior")
+        net = _tiny_net(hidden=8)
+        net.optimizer(optax.adam(1e-3))
+        u = net(x)  # (N, 1)
+
+        n = jno.noise.gaussian(std=1.0, like=u)
+        crux = jno.core([(u + 0.0).mse])
+        (val, ref) = crux.eval([n, u], key=jax.random.PRNGKey(0))
+        assert val.shape == ref.shape
+
+    def test_like_tracks_a_field_shaped_reference(self):
+        # The motivating case: the prior of a flow-matching path takes the DATA's shape, not a
+        # pointwise (N, ndim) shape — here a (2, 3) tensor per sample rather than a scalar column.
+        import numpy as np
+
+        arr = np.random.default_rng(0).normal(size=(4, 2, 3)).astype(np.float32)
+        dom = jno.domain.from_array({"pt": np.zeros((1, 2), dtype=np.float32)})
+        dom = 4 * dom
+        dom.variable("pt")
+        field = dom.variable("_f", arr[:, None, None, :, :])
+
+        n = jno.noise.gaussian(std=1.0, like=field)
+        crux = jno.core([(field + 0.0).mse])
+        (val, ref) = crux.eval([n, field], key=jax.random.PRNGKey(1))
+        assert val.shape == ref.shape == (4, 1, 2, 3)
+
+    def test_like_follows_points_subsampling(self):
+        # The property that motivates `like=` over a shape written down by hand: it must track
+        # solve(points=...) automatically, since a literal shape would silently go stale under it.
+        import numpy as np
+
+        x = np.random.default_rng(0).normal(size=(64, 2)).astype(np.float32)
+        dom = jno.domain.from_array({"data": x})
+        d0, d1, _ = dom.variable("data")
+        target = jno.np.concatenate([d0, d1])
+
+        n = jno.noise.gaussian(std=1.0, like=target)
+        crux = jno.core([(0.0 * target + n).mse])
+        out = crux.compiled_resample_constraints_fn(
+            crux.models, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(0), points=8
+        )
+        assert out[0].shape == (1, 8, 2)
+
+    def test_like_and_ndim_together_raises(self):
+        dom = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, *_ = dom.variable("interior")
+        with pytest.raises(ValueError, match=r"either ndim= or like="):
+            jno.noise.gaussian(ndim=2, like=x)
+
+    def test_like_rejects_a_non_placeholder(self):
+        import numpy as np
+
+        with pytest.raises(TypeError, match=r"like= expects a traced jNO expression"):
+            jno.noise.gaussian(like=np.zeros(3))
+
+    def test_like_works_for_uniform_and_laplace(self):
+        dom = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, *_ = dom.variable("interior")
+        net = _tiny_net()
+        net.optimizer(optax.adam(1e-3))
+        u = net(x)
+        crux = jno.core([(u + 0.0).mse])
+
+        for node in (jno.noise.uniform(0.0, 1.0, like=u), jno.noise.laplace(std=1.0, like=u)):
+            (val, ref) = crux.eval([node, u], key=jax.random.PRNGKey(2))
+            assert val.shape == ref.shape
+
+    def test_two_like_draws_stay_independent(self):
+        # The same collapse risk the CSE fix (584058db) guards against: two Noise nodes sharing a
+        # `like=` reference must still be two independent draws, not one shared realisation.
+        dom = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, *_ = dom.variable("interior")
+        net = _tiny_net()
+        net.optimizer(optax.adam(1e-3))
+        u = net(x)
+        crux = jno.core([(u + 0.0).mse])
+
+        a = jno.noise.gaussian(std=1.0, like=u)
+        b = jno.noise.gaussian(std=1.0, like=u)
+        (val,) = crux.eval([a - b], key=jax.random.PRNGKey(3))
+        assert float(jnp.abs(val).max()) > 0.0

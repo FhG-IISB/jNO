@@ -3,7 +3,8 @@
 ```python
 stats = crux.solve(
     epochs=5000,
-    batchsize=128,              # None = full batch (all collocation points)
+    batchsize=None,             # mini-batch over the SAMPLE axis (n * domain); None = all samples
+    points=1024,                # mini-batch over the collocation POINTS; None = all points
     checkpoint_gradients=False, # True → gradient checkpointing (saves memory, ~30% slower)
     offload_data=False,         # True → keep dataset on CPU, stream mini-batches
 )
@@ -12,16 +13,22 @@ stats.plot("history.png")
 
 Returns a `statistics` object with `.plot()` and loss arrays.
 
+`batchsize` and `points` cut different axes and compose freely: `batchsize` draws stacked samples (the
+`B` of `n * domain`), `points` draws collocation points or dataset rows. A single domain or a dataset
+from `jno.domain.from_array` has one sample, so `points=` is the one that mini-batches it. See
+[Mini-batching](../API.md#mini-batching-batchsize-and-points-are-different-axes).
+
 ### Memory Optimisations
 
 | Option | Effect | Use When |
 |--------|--------|----------|
-| `batchsize=N` | Mini-batch gradient estimation | Dataset doesn't fit in GPU memory |
+| `points=N` | Mini-batch over the collocation points / dataset rows | Too many points or rows for one step |
+| `batchsize=N` | Mini-batch over the stacked samples (`n * domain`) | Many realisations of a parametric problem |
 | `checkpoint_gradients=True` | Rematerialise activations during backward pass | Very deep networks or long time sequences |
 | `offload_data=True` | Keep dataset on CPU; stream each mini-batch | Very large datasets |
 | `accumulation_steps=N` | Average gradients over `N` micro-batches before one optimizer update | You want a larger effective batch than fits in memory |
 
-`offload_data` requires `batchsize < total_samples`.
+`offload_data` needs a mini-batch on either axis: `points=`, or `batchsize` below the number of samples.
 
 ### Gradient accumulation
 
@@ -30,8 +37,9 @@ stats = crux.solve(5000, batchsize=8, accumulation_steps=4)
 # INFO: Gradient accumulation enabled: 4 micro-batches per update (effective batch = 8 × 4 = 32)
 ```
 
-Requires `batchsize`. With full-batch training it has nothing to accumulate, and jNO says so and
-falls back to `1` rather than pretending. It is also rejected alongside `substeps`.
+Needs a mini-batch on either axis (`points=`, or `batchsize` below the number of samples). With
+full-batch training it has nothing to accumulate, and jNO says so and falls back to `1` rather than
+pretending. It is also rejected alongside `substeps`.
 
 !!! warning "I could not measure a behavioural difference — treat this as unverified"
     On a small test (`64 *` batched domain, `batchsize=8`, Adam) `accumulation_steps=4` produced a

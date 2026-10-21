@@ -59,6 +59,7 @@ __all__ = [
     "picard",
     "staggered",
     "eigs",
+    "contour",
     "logdet",
     "trace",
     "applyfun",
@@ -1103,6 +1104,70 @@ def staggered(
     spec.wants_project = float(over_relax) != 1.0
     spec.prepare = _prepare  # eager block resolution at compose time (mirrors a precond spec's .prepare)
     return spec
+
+
+class _Contour:
+    """Spec for the contour-integral eigensolver; see :func:`contour`."""
+
+    __slots__ = ("centre", "radius", "points", "probes", "rank", "tol", "maxiter", "seed")
+
+    def __init__(self, centre, radius, points, probes, rank, tol, maxiter, seed):
+        self.centre, self.radius, self.points = complex(centre), float(radius), int(points)
+        self.probes, self.rank = probes, rank
+        self.tol, self.maxiter, self.seed = float(tol), int(maxiter), int(seed)
+
+    def __repr__(self):
+        return f"jno.solve.contour(centre={self.centre}, radius={self.radius}, points={self.points}, rank={self.rank})"
+
+
+def contour(
+    *,
+    centre,
+    radius,
+    points: int = 48,
+    probes: int | None = None,
+    rank: int | None = None,
+    tol: float = 1e-11,
+    maxiter: int = 1500,
+    seed: int = 0,
+) -> _Contour:
+    """Ask for every eigenvalue **inside a circle in the complex plane** — Beyn's contour-integral
+    method — instead of "the k smallest".
+
+    ``fem.eigs(mass=[...], contour=jno.solve.contour(centre=10.0, radius=8.0))``
+
+    That is the question a band structure or a resonance search actually asks, and answering it this
+    way buys three things the Krylov paths cannot give:
+
+    * **Differentiable, eigenVECTORS included.** The method is ``points`` shifted linear solves, an
+      SVD and one small dense eigenproblem — all pure JAX — so ``jax.grad`` flows through the modes,
+      not just the eigenvalues. A mode-shape objective (radiative Q, mode volume, field overlap)
+      differentiates here; on the Arnoldi path it returns NaN by construction.
+    * **Non-Hermitian and even NONLINEAR pencils are native.** ``centre``/``radius`` name a region;
+      whatever is inside comes back. A frequency-dependent material needs no auxiliary field and no
+      polynomial linearisation — measured on a Lorentz slab, the dispersive problem solved directly
+      at half the system size and 3e-14 relative accuracy.
+    * **The shifted solves are independent**, so they ``vmap``; the work is ``points x probes``
+      matrix-free solves rather than one long serial iteration.
+
+    ``points`` sets the accuracy (trapezoid on a circle is spectrally accurate, so digits come
+    quickly). ``probes`` is the size of the random probing block and must EXCEED the number of
+    eigenvalues inside — saturation is detected and raises rather than returning a wrong answer.
+    ``rank`` defaults to reading the singular-value gap, which is correct but data-dependent; pass it
+    explicitly when differentiating, and prefer **one more than the number of eigenvalues inside**
+    (measured: one spare is exact and differentiable, two spare still gives the right values but
+    breaks the gradient by differentiating the SVD through numerically-zero singular values).
+    """
+    if radius <= 0:
+        raise ValueError(f"jno.solve.contour: radius must be positive, got {radius}.")
+    if points < 8:
+        raise ValueError(f"jno.solve.contour: points={points} is too few for the quadrature (>= 8).")
+    if probes is not None and rank is not None and probes <= rank:
+        raise ValueError(
+            f"jno.solve.contour: probes={probes} must exceed rank={rank} — the probing block has to "
+            f"be wider than the invariant subspace it is sampling, or saturation cannot be detected."
+        )
+    return _Contour(centre, radius, points, probes, rank, tol, maxiter, seed)
 
 
 def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None, X0=None):

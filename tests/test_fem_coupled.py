@@ -470,9 +470,15 @@ def test_coupled_nonlinear_form_threads_a_runtime_parameter():
     assert np.allclose(g, fd, rtol=1e-6), f"AD {g:.8e} vs FD {fd:.8e}"
 
 
-def test_coupled_linear_form_with_a_runtime_parameter_still_fails_loud():
-    """The other side of the same gate: linear + no history really has no parametric route, and the
-    message must say which of the two facts decided it."""
+def test_coupled_linear_form_with_a_runtime_parameter_is_differentiable():
+    """A coupled LINEAR form carrying a runtime parameter -- the sibling of the nonlinear case above.
+
+    This used to refuse, on the stated grounds that "linear with no step history" had no parametric
+    route. That was wrong: ``assemble_fem_native`` builds a ``FemLinearSystem`` whose
+    ``operator_fn``/``rhs_fn`` close over an ``_assemble_at(args)`` re-assembly, and that closure is
+    field-agnostic. Only the gate in ``_fem`` refused to let a coupled form reach it. The refusal is
+    gone, and this pins what replaced it -- an intended contract change, not a relaxed assertion.
+    """
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -481,12 +487,27 @@ def test_coupled_linear_form_with_a_runtime_parameter_still_fails_loud():
     b, chi = d.fem_symbols(names=("lb", "lchi"))
     ai, pi = a.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     bi, qi = b.bind(x=xi, y=yi), chi.bind(x=xi, y=yi)
-    with pytest.raises(NotImplementedError, match="linear with no step history"):
-        jno.fem(
-            [
-                (ai.x * pi.x + ai.y * pi.y) - 1.0 * pi - k * b * pi,
-                (bi.x * qi.x + bi.y * qi.y) + b * qi - 2.0 * a * qi,
-                a(xb, yb) - 0.0,
-                b(xb, yb) - 0.0,
-            ]
-        )
+    fem = jno.fem(
+        [
+            (ai.x * pi.x + ai.y * pi.y) - 1.0 * pi - k * b * pi,
+            (bi.x * qi.x + bi.y * qi.y) + b * qi - 2.0 * a * qi,
+            a(xb, yb) - 0.0,
+            b(xb, yb) - 0.0,
+        ]
+    )
+    assert fem.is_linear, "a linear form must not be reclassified to buy itself a parametric route"
+    assert len(fem.blocks) == 2 and fem._op.is_parametric
+
+    # A(args) x = b(args): solve at the runtime value and differentiate through it.
+    def norm_at(kv):
+        args = {"kl": jnp.reshape(kv, (1,))}
+        A = fem._op.operator_fn(args)
+        rhs = fem._op.rhs_fn(args)
+        dense = jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+        x = jnp.linalg.solve(dense, jnp.asarray(rhs).reshape(-1))
+        return jnp.sum(x**2)
+
+    g = jax.grad(norm_at)(0.4)
+    fd = (norm_at(0.4 + 1e-6) - norm_at(0.4 - 1e-6)) / 2e-6
+    assert np.isfinite(g) and abs(g) > 0, "the gradient to the coupling parameter vanished"
+    assert np.allclose(g, fd, rtol=1e-6), f"AD {g:.8e} vs FD {fd:.8e}"

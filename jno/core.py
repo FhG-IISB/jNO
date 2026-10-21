@@ -37,6 +37,7 @@ from .trace import (
     BinaryOp,
     Choice,
     Constraint,
+    Flow,
     FunctionCall,
     Hessian,
     IntegralTime,
@@ -79,8 +80,8 @@ def _expression_involves_model(expr: "Placeholder", lid: int) -> bool:
         if nid in seen:
             return False
         seen.add(nid)
-        if isinstance(node, ModelCall):
-            return node.model.layer_id == lid
+        if isinstance(node, (ModelCall, Flow)):
+            return node.model.layer_id == lid or any(visit(a) for a in node.args if isinstance(a, Placeholder))
         if isinstance(node, BinaryOp):
             return visit(node.left) or visit(node.right)
         if isinstance(node, FunctionCall):
@@ -423,7 +424,7 @@ def _reachable_models(exprs) -> Dict[int, Any]:
         # stop_gradient boundary — everything inside is frozen, skip
         if isinstance(node, FunctionCall) and node.fn is jax.lax.stop_gradient:
             return
-        if isinstance(node, ModelCall):
+        if isinstance(node, (ModelCall, Flow)):
             active[node.model.layer_id] = node.model
             for arg in node.args:
                 if isinstance(arg, Placeholder):
@@ -1264,13 +1265,16 @@ class core:
         # (substeps, `compiled_constraints_fn=`), where a full-length mask would not broadcast.
         objective_mask = getattr(self, "_objective_mask", None) if getattr(self, "_inequality_idx", None) else None
         n_objective = float(int(np.asarray(objective_mask).sum())) if objective_mask is not None else 0.0
+        # Point-axis mini-batch size, set by solve(points=...). Read once here (not inside loss_fn) so
+        # it stays a Python static through the trace, exactly like `batchsize`.
+        points = getattr(self, "_points", None)
 
         def loss_fn(trainable, context, rng):
             full_models = eqx.combine(trainable, frozen, static)
             full_models = _paramax.unwrap(full_models)
 
             if checkpoint_gradients:
-                _fn, _bs = compiled_constraints_fn, batchsize
+                _fn, _bs, _pts = compiled_constraints_fn, batchsize, points
 
                 # Equinox wrapper avoids JAX export false-positives in type stubs.
                 @eqx.filter_checkpoint
@@ -1281,6 +1285,7 @@ class core:
                         batchsize=_bs,
                         key=key,
                         min_consecutive=min_consecutive,
+                        points=_pts,
                     )
 
                 all_residuals = _remat_eval(full_models, context, rng)
@@ -1292,6 +1297,7 @@ class core:
                     batchsize=batchsize,
                     key=rng,
                     min_consecutive=min_consecutive,
+                    points=points,
                 )
 
             # all_residuals is a list of (B, T, ...) arrays — one per constraint
@@ -2148,6 +2154,7 @@ class core:
         self,
         epochs: int = 1000,
         batchsize: Optional[int] = None,
+        points: Optional[int] = None,
         checkpoint_gradients: bool = False,
         offload_data: bool = False,
         inner_steps: int = 1,
@@ -2166,7 +2173,25 @@ class core:
 
         Args:
             epochs: Number of training epochs.
-            batchsize: Mini-batch size (``None`` for full-batch).
+            batchsize: Mini-batch size over the **sample** axis — the one ``n * domain`` builds
+                (``None`` for full-batch). A single un-stacked domain has one sample, so
+                ``batchsize`` has nothing to draw from there; use *points* instead. Asking for
+                more than the number of stacked samples raises rather than sampling with
+                replacement.
+            points: Mini-batch size over the **collocation-point** axis (``None`` for all points).
+                This is the one to use for a dataset attached with :meth:`jno.domain.from_array`,
+                where every training example is a point rather than a stacked domain::
+
+                    crux.solve(epochs=4000, points=1024)      # 1024 of the N data points per step
+
+                Orthogonal to *batchsize*, so the two compose (``batchsize=8, points=1024``).
+                Tags holding fewer than *points* points are used whole, and any two tags with the
+                **same** point count are sliced identically, so an input field and its target stay
+                aligned. ``jno.noise.*`` follows the sub-sampled count automatically.
+
+                Raises when any constraint needs the full point set — a finite-difference
+                derivative (whose stencil reads a node's neighbours) or a FEM assembly (which
+                integrates over cells). Use ``scheme='automatic_differentiation'`` in that case.
             checkpoint_gradients: If ``True``, wrap each constraint's
                 forward pass in ``jax.checkpoint`` (gradient
                 checkpointing / activation rematerialisation).  Trades
@@ -2174,8 +2199,9 @@ class core:
                 memory.  Default ``False``.
             offload_data: If ``True``, keep the full training dataset in
                 host (CPU) memory and stream only the current mini-batch
-                to the device each step.  Requires ``batchsize`` to be
-                set.  Default ``False``.
+                to the device each step.  Requires a mini-batch on either
+                axis (``batchsize`` below the number of samples, or
+                *points*).  Default ``False``.
             inner_steps: Number of gradient steps to fuse into a single
                 ``jax.lax.fori_loop`` call, amortising Python dispatch
                 overhead.  Must evenly divide *epochs*.  Default ``1``.
@@ -2183,8 +2209,9 @@ class core:
                 are averaged before a single optimizer update.  The
                 effective batch size becomes
                 ``batchsize * accumulation_steps`` while peak activation
-                memory stays proportional to *batchsize*.  Requires
-                ``batchsize`` to be set.  Default ``1``.
+                memory stays proportional to *batchsize*.  Requires a
+                mini-batch on either axis (``batchsize`` below the number
+                of samples, or *points*).  Default ``1``.
             min_consecutive: Minimum number of consecutive time steps
                 fed to each constraint evaluation. ``None`` means use all
                 available time steps. Default ``1``.
@@ -2242,10 +2269,19 @@ class core:
 
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
 
+        # Point-axis mini-batching. Stashed on self rather than threaded through every
+        # _make_loss_fn call site (bayesian / VI / substeps all build their own loss); it is read
+        # once at loss-build time, so it stays a Python static exactly like `batchsize`.
+        if points is not None and int(points) < 1:
+            raise ValueError(f"points must be >= 1, got {points}.")
+        self._points = int(points) if points is not None else None
+
         # Validate accumulation_steps
         if accumulation_steps < 1:
             raise ValueError(f"accumulation_steps must be >= 1, got {accumulation_steps}")
-        if accumulation_steps > 1 and batchsize >= self.domain.total_samples:
+        # "Full batch" now means neither axis is sub-sampled: `points` splits the collocation points
+        # even when there is a single stacked sample, and accumulation is meaningful in that case.
+        if accumulation_steps > 1 and batchsize >= self.domain.total_samples and self._points is None:
             self.log.warning(
                 "accumulation_steps > 1 has no effect with full-batch training; falling back to accumulation_steps=1"
             )
@@ -2477,13 +2513,21 @@ class core:
             return None, sharded_ctx.context, total_samples_local
 
         # ── 0. Validate offload_data ──
-        if offload_data and (batchsize is None or batchsize >= self.domain.total_samples):
+        # `points` counts as sub-sampling here too: with it set, only a slice of each step's points is
+        # needed on device, which is exactly the case offloading exists for.
+        if (
+            offload_data
+            and getattr(self, "_points", None) is None
+            and (batchsize is None or batchsize >= self.domain.total_samples)
+        ):
             # A lazy source is the exception: streaming it is not a throughput choice but the only
             # way to read it at all, so keep offloading on even at full batch.
             if any(_is_lazy_source(v) for v in self.domain_data.context.values()):
                 batchsize = batchsize or self.domain.total_samples
             else:
-                self.log.warning("offload_data requires batchsize < total_samples; ignoring offload_data for this run.")
+                self.log.warning(
+                    "offload_data requires batchsize < total_samples (or points= set); ignoring offload_data for this run."
+                )
                 offload_data = False
 
         self.log.info("Paramax auto-unwrap enabled: wrappers are unwrapped before each forward evaluation")
