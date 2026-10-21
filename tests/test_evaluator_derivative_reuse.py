@@ -185,6 +185,14 @@ def test_ad_derivatives_over_one_point_set_cost_what_a_hand_written_residual_cos
     assert jno_flops <= 1.25 * optimal, f"{jno_flops:.3g} FLOPs vs {optimal:.3g} hand-written"
 
 
+def test_a_node_read_several_times_is_evaluated_once(monkeypatch):
+    """``u`` in every term of a residual, and the outputs of one network call, used to be traced once per
+    reference -- seven forward passes of the network for two distinct calls in a Navier-Stokes loss."""
+    once = _network_dispatches(lambda u, x, y: u - 1.0, monkeypatch)
+    often = _network_dispatches(lambda u, x, y: u * u + 3.0 * u - jno.np.sin(u) - 1.0, monkeypatch)
+    assert often == once
+
+
 def test_shared_ad_derivatives_match_jax():
     """Every derivative kind the shared pass serves, against JAX on the bare network."""
     dom, x, y, net, o, (u, v, p) = _three_field_net()

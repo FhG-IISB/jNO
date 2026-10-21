@@ -9,6 +9,7 @@ from typing import Any, Dict, List, NamedTuple, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import core as _jax_core
 
 from .trace import (
     Assembly,
@@ -42,6 +43,11 @@ from .trace import (
     Variable,
     collect_tags,
 )
+
+
+def _trace_state():
+    """An opaque token of the current JAX trace; equal only within the same trace (jit, vmap, jvp, scan body)."""
+    return _jax_core.get_opaque_trace_state(convention="flax")
 
 
 def _default_float_dtype():
@@ -537,12 +543,12 @@ class TraceEvaluator:
         # form in an MMA gradient: out of device memory). Scoped to the outermost call, like the caches above.
         outer = not getattr(self, "_in_evaluate", False)
         if outer:
-            self._in_evaluate, self._per_eval_memo, self._per_eval_roots = True, {}, [expr]
+            self._in_evaluate, self._per_eval_memo, self._per_eval_roots, self._node_memo = True, {}, [expr], {}
         try:
             return self._dispatch(expr, ctx)
         finally:
             if outer:
-                self._in_evaluate, self._per_eval_memo, self._per_eval_roots = False, {}, []
+                self._in_evaluate, self._per_eval_memo, self._per_eval_roots, self._node_memo = False, {}, [], None
 
     # ------------------------------------------------------------------
     # Shape tracing — walk the expression tree and record output shapes
@@ -762,16 +768,27 @@ class TraceEvaluator:
     ]
 
     def _dispatch(self, expr, ctx):
-        """Look up handler in the dispatch table and call it."""
-        point_memo = getattr(self, "_point_memo", None)
-        if point_memo is not None:  # inside one point of a shared derivative pass: see `_shared_ad_pass`
-            hit = point_memo.get(id(expr))
-            if hit is not None and hit[0] is expr and hit[1] is ctx:
-                return hit[2]
-            out = self._dispatch_memoised(expr, ctx)
-            point_memo[id(expr)] = (expr, ctx, out)
-            return out
-        return self._dispatch_memoised(expr, ctx)
+        """Look up handler in the dispatch table and call it -- once per node, context and trace.
+
+        An expression is a graph: ``u = net(x, y)[..., 0]`` appears in every term that reads ``u``, and each
+        output of one network call shares that call. Walking it as a tree traced the shared node once per
+        reference (seven forward passes of a network for two distinct calls in a Navier-Stokes loss), and
+        XLA's CSE merges such copies only sometimes -- never once they differ in shape, as a vmapped copy
+        does. So within one evaluation a node is evaluated once per context it is read in. The JAX trace
+        state is part of the key: a value traced inside a ``jvp``, ``vmap`` or ``scan`` is never handed to
+        code outside it.
+        """
+        memo = getattr(self, "_node_memo", None)
+        if memo is None:
+            return self._dispatch_memoised(expr, ctx)
+        trace = _trace_state()
+        entries = memo.setdefault(id(expr), [])
+        for node, seen_ctx, seen_trace, out in entries:
+            if node is expr and seen_trace == trace and self._same_eval_ctx(seen_ctx, ctx):
+                return out
+        out = self._dispatch_memoised(expr, ctx)
+        entries.append((expr, ctx, trace, out))
+        return out
 
     def _dispatch_memoised(self, expr, ctx):
         """``_dispatch`` with the per-evaluation memo of solves and integrals."""
@@ -999,11 +1016,7 @@ class TraceEvaluator:
                 # The targets usually share their network call (``o[..., 0]``, ``o[..., 1]``, ...): one
                 # memo for this call evaluates it once. XLA does not merge the copies once they are vmapped.
                 point_ctx = self._EvalCtx({**local, tag: p[jnp.newaxis, :]}, ctx.var_bindings, ctx.key)
-                outer, self._point_memo = getattr(self, "_point_memo", None), {}
-                try:
-                    return tuple(jnp.squeeze(self._dispatch(t, point_ctx)) for t in targets)
-                finally:
-                    self._point_memo = outer
+                return tuple(jnp.squeeze(self._dispatch(t, point_ctx)) for t in targets)
 
             return values
 
