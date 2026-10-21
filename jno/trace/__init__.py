@@ -8,6 +8,7 @@ Operations trace computations and return callable placeholders.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union
 
@@ -4543,10 +4544,14 @@ class Noise(Placeholder):
 
 
 def check_runtime_values(names, values):
-    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter or leaves one out.
+    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter, leaves one out, or gives
+    a FIELD parameter (one value per cell, node or dof) a value of the wrong size.
 
     Every solve that accepts the values (steady linear and nonlinear, transient, load-path march) checks
-    them here, so the same call fails the same way whichever path the form takes."""
+    them here, so the same call fails the same way whichever path the form takes. ``names`` is the
+    operator's ``runtime_parameter_exprs`` mapping (or just the names, which skips the size check). The
+    size check matters because the element kernels GATHER from a field value and JAX clamps an
+    out-of-range gather: a vector of the wrong length used to solve without a word."""
     unknown = sorted(set(values) - set(names))
     if unknown:
         raise TypeError(f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}.")
@@ -4557,6 +4562,19 @@ def check_runtime_values(names, values):
             f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
             "let `crux` resolve them (the solve is then a trace node, not an array)."
         )
+    for name, expr in names.items() if isinstance(names, dict) else ():
+        model = getattr(expr, "model", None)
+        kind = getattr(model, "_fem_field", None)
+        if not kind or name not in values:
+            continue
+        want = tuple(model.module.value.shape)
+        got = tuple(jnp.shape(values[name]))
+        if math.prod(got) != math.prod(want):
+            per = {"cell": "cell", "node": "mesh node"}.get(kind, "dof of its space")
+            raise ValueError(
+                f"fem.solve(): the field parameter {name!r} takes one value per {per}, shape {want} "
+                f"({math.prod(want)} values); it was given shape {got}. Pass a value of shape {want}."
+            )
 
 
 class FemLinearSystem:
@@ -4663,7 +4681,7 @@ class FemLinearSystem:
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
-        check_runtime_values(names, values)
+        check_runtime_values(self.runtime_parameter_exprs, values)
         return _solve(*(jnp.asarray(values[n]) for n in names))
 
     def __iter__(self):
@@ -4836,7 +4854,7 @@ class FemResidualOperator:
             node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
             return node
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
-        check_runtime_values(names, values)
+        check_runtime_values(self.runtime_parameter_exprs, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
         # jit, every call re-stages the solver -- `lax.while_loop` / `custom_root` / `linearize` trace
         # their bodies on each Python call -- so an 8-value sweep cost 48 tracings and the whole point,

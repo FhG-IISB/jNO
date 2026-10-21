@@ -79,7 +79,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
     if values is not None:
         from ...trace import check_runtime_values
 
-        check_runtime_values(list(getattr(op, "runtime_parameter_exprs", {}) or {}), values)
+        check_runtime_values(dict(getattr(op, "runtime_parameter_exprs", {}) or {}), values)
         values = {k: jnp.asarray(v) for k, v in values.items()}
     domain = fem.domain
     specs: Dict[Any, Any] = op.history_specs

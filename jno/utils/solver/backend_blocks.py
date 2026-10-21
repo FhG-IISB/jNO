@@ -768,7 +768,7 @@ class SemidiscreteTimeBlock:
 
             from ...trace import check_runtime_values
 
-            check_runtime_values(names, values)
+            check_runtime_values(self.runtime_parameter_exprs, values)
             return _solve(*(jnp.asarray(values[n]) for n in names))
         return FunctionCall(_solve, params, name="fem_transient_solve")
 
