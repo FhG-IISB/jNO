@@ -77,7 +77,8 @@ def _space_field_dofs(sym):
     kind = "tetra" if "tetra" in cd else "triangle" if "triangle" in cd else None
     if kind is None:
         raise NotImplementedError(
-            f"jno.np.parameter(<{fam} symbol>): a field on the {fam} space needs a simplex (triangle / tetrahedron) mesh."
+            f"jno.np.parameter(<{fam} symbol, order={k}>): a field on the {fam} space needs a simplex (triangle / "
+            "tetrahedron) mesh; on a line, quadrilateral or hexahedral mesh use a P1 (order=1) or P0 symbol."
         )
     cells = _np.asarray(cd[kind])
     n = int(build_dofmap(cells, fam, k, n_verts=int(dom.mesh.points.shape[0])).n_dofs)
