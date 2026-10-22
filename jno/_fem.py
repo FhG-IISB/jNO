@@ -2001,6 +2001,8 @@ class FEM:
         _em = peec_source_of(self)
         if _em is not None:
             _em._heat = self
+        if hasattr(domain, "_register_solver"):
+            domain._register_solver(self)  # a `domain.rebuild` rebuilds this problem with the domain
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
@@ -2269,6 +2271,25 @@ class FEM:
         for mask, load, total in ops:
             u = u - mask * (_weighted(load, u) / total)
         return u
+
+    def _rebuild(self):
+        """Assemble this problem again from its term list, in place, on a domain that has just been
+        rebuilt (`domain.rebuild`): every trace node holding this object then solves the new one."""
+        if self._constraints is None:
+            return  # an internal sub-problem; the problem that owns it is rebuilt instead
+        import jno
+
+        cur = jno.fem(self._constraints, **self._fem_kwargs)
+        self.__dict__.update(cur.__dict__)
+        from .utils.solver.electrothermal import peec_source_of
+
+        em = peec_source_of(self)
+        if em is not None:
+            if em.__dict__.get("_heat") is cur:
+                em._heat = self  # the rebuild's throw-away object registered itself as the heated problem
+            et = em.__dict__.get("_coupling")
+            if et is not None:
+                et._result = None
 
     def solve(self, *args, **kwargs):
         """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature.

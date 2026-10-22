@@ -722,18 +722,9 @@ def _initial_value(mc):
     inside a preconditioner callback with nothing pointing back to the material. So the initializer
     is applied here instead.
     """
-    m = getattr(mc, "model", None)
-    fn = getattr(m, "_initializer_fn", None)
-    if fn is None:
-        return None
-    v = jnp.asarray(m.module.value)
-    key = getattr(m, "_initializer_key", None)
-    if key is None:
-        key = jax.random.PRNGKey(0)
-    try:
-        return jnp.asarray(fn(key, v.shape, v.dtype))
-    except TypeError:
-        return jnp.asarray(fn(v.shape))
+    from .geometry.parametric import initial_value
+
+    return initial_value(mc)
 
 
 class ParametricSolution:
@@ -749,13 +740,20 @@ class ParametricSolution:
     """
 
     def __init__(self, built, exprs, params, solve_kw=None, geometry=None, faces=None):
-        self._b, self._exprs, self._params = built, dict(exprs), dict(params)
+        self._b0, self._exprs, self._params = built, dict(exprs), dict(params)
         self._geom = dict(geometry or {})
         #: solid region -> attached `faces=`, evaluated at the parameter values on every solve
         self._faces = dict(faces or {})
         #: what `solve(...)` was given besides the material -- `operator=` for a graded lattice --
         #: replayed on every traced solve, so a parametric readout solves the network it was asked to
         self._solve_kw = dict(solve_kw or {})
+
+    @property
+    def _b(self):
+        """The network's CURRENT discretisation: a `domain.rebuild` replaces the one this solution was
+        made from, and every readout node made before it must solve the new one."""
+        spec = getattr(self._b0, "_spec", None)
+        return self._b0 if spec is None else spec._build()
 
     def _node(self, kind, *args, key=None, label=None):
         from jno.trace import FunctionCall
@@ -899,6 +897,8 @@ class PEEC:
         self.freq = np.atleast_1d(np.asarray(freq, dtype=float))
         self._scalar_freq = np.ndim(freq) == 0
         self.domain = _domain_of(self.constraints)
+        if hasattr(self.domain, "_register_solver"):
+            self.domain._register_solver(self)  # a `domain.rebuild` discretises this network again
         self.sources, self.currents, self.grounds, self.devices = port_spec(self.constraints)
         if len(self.sources) != 1:
             raise ValueError(
@@ -1345,6 +1345,56 @@ class PEEC:
             self._built = cached
         return cached[1]
 
+    def cell_aspect(self):
+        """Per-cell aspect ratio of the network's solid grid at the design, as a trace node over the
+        parameters: each metal cell's longest side over its shortest (``1`` for a cube), one value per
+        metal cell. A face that a design moves stretches the cells between it and the next face, so
+        this is what a rebuild condition reads for a network::
+
+            d.rebuild(when=em.cell_aspect().max > 4)
+
+        A thin layer one cell thick has a large aspect at the reference already; compare with the
+        value there. Network without a solid conductor: refused.
+        """
+        return self._cell_node("aspect")
+
+    def cell_size(self):
+        """Per-cell size of the network's solid grid at the design, ``(dx dy dz)^(1/3)`` per metal
+        cell, as a trace node over the parameters. See :meth:`cell_aspect`."""
+        return self._cell_node("size")
+
+    def _cell_node(self, kind):
+        from .geometry import parametric as _par
+        from .trace import FunctionCall
+
+        b = self._build()
+        if b._solid_info is None:
+            raise ValueError(f"jno.peec: cell_{kind}() reads the solid grid, and this network has no solid conductor.")
+        names = list(b._params)
+        exprs = [b._params[n] for n in names]
+
+        def fn(*vals):
+            at = dict(zip(names, vals))
+            built = self._build()  # the current discretisation: a rebuild replaces it
+            lat = built._solid_info[2]
+            occ = np.nonzero(np.asarray(lat["cells"]))
+            geo = {n: _par.stack(f, at) for n, f in built._solid_geom.items()}
+            edges = built._moved_edges(geo) if geo else [jnp.asarray(e) for e in lat["edges"]]
+            w = jnp.stack([jnp.diff(edges[a])[occ[a]] for a in range(3)])
+            if kind == "aspect":
+                return jnp.max(w, axis=0) / jnp.min(w, axis=0)
+            return jnp.prod(w, axis=0) ** (1.0 / 3.0)
+
+        return FunctionCall(fn, exprs, name=f"peec_cell_{kind}")
+
+    def _rebuild(self):
+        """Forget the discretisation (`domain.rebuild` has moved the reference): the next solve builds
+        the network again at the new reference, and every readout node of this network follows."""
+        self._built = None
+        et = self.__dict__.get("_coupling")
+        if et is not None:
+            et._result = None
+
     @property
     def fil(self):
         """The discretised network (filaments, nodes, and ``fil.lattice`` for a solid: its cell
@@ -1410,6 +1460,7 @@ class BuiltPEEC:
         solid_geom=None,
     ):
         self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
+        self._spec = spec  # the network this discretises (what a parametric readout rebuilds from)
         #: (names, shapes, lattice dict, first sub-point row, first element) of the solid block, for
         #: `_with_solids`; None when the network has no solid
         self._solid_info = solids

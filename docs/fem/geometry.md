@@ -105,9 +105,18 @@ rebuilt at the moved design in `tests/test_fem_parametric_shape.py`). The same p
 
 What it does not do, up front:
 
-- **A large move distorts cells.** It is a stretch, not a remesh: `d.stretch()` reads, as one traced
-  number, the largest factor any gap between two face planes has grown or shrunk by -- rebuild the shape
-  at the current design when it gets large.
+- **A large move distorts cells.** It is a stretch, not a remesh. `d.rebuild(when=...)` rebuilds the
+  shape at the current design whenever a condition over the design holds during `jno.core.solve`, and
+  every `jno.fem` / `jno.peec` built on the domain follows; training continues from the same
+  parameters (the optimizer state too, unless `keep_opt_state=False`):
+
+  ```python
+  d.rebuild(when=d.cell_aspect().max > 6)      # the FEM mesh
+  d.rebuild(when=em.cell_aspect().max > 4)     # a PEEC network's face grid
+  ```
+
+  The objective can jump at a rebuild, by as much as the two discretisations disagree. A condition that
+  still holds on the freshly rebuilt cells is refused (it would rebuild every epoch).
 - **Two faces on one plane move together.** They are one plane of a conforming mesh: write them with the
   same expression, or start them apart. A fixed face and a moving one on one plane are refused by name.
 - **Curved primitives cannot carry a parameter** (disk, cylinder, sphere, polygon, rotate, revolve,

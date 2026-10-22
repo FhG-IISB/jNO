@@ -139,19 +139,6 @@ def test_jno_core_trains_the_shape_through_the_solve_and_refuses_collocation():
         jno.core([(x * y).mse])
 
 
-def test_stretch_reads_how_far_the_design_moved_from_the_reference():
-    y1 = _param("y1", 8 * mm)
-    d, _fem = _blocks(y1)
-    st = d.stretch()
-    (mc,) = [m for m in _walk(st) if type(m).__name__ == "ModelCall"]
-    at = lambda v: float(st.fn(jnp.asarray([v])))  # noqa: E731
-    assert at(8 * mm) == pytest.approx(1.0)
-    assert at(10 * mm) == pytest.approx(1.5)  # the heated block's 4 mm gap grows to 6 mm
-    assert at(6 * mm) == pytest.approx(2.0)  # ... or shrinks to 2 mm
-    assert at(4 * mm) == np.inf  # closed
-    assert float(jno.shape.box(0, 0, 0, 1, 1, 1).name("a").domain().stretch().fn()) == 1.0
-
-
 def _rect_top(y1, size=0.25, time=None):
     """A unit-wide rect whose top face is at y1; the domain and its moving top tag."""
     d = jno.shape.rect(0.0, 0.0, 1.0, y1, size=size).domain(**({} if time is None else {"time": time}))

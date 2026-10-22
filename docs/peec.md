@@ -676,6 +676,21 @@ but `sigma` and `mu_r`) is named once in a warning: it may be a `jno.fem` coeffi
 domain, or a misspelling. Pinned against `solve(geometry=)` and central differences
 (`tests/test_peec_parametric_shape.py`).
 
+A long move stretches the cells further and further from the ones the network was built with.
+`em.cell_aspect()` (each metal cell's longest side over its shortest) and `em.cell_size()` read the
+grid at the design, as trace nodes, and `d.rebuild(when=...)` re-discretises the network -- and any
+`jno.fem` on the same domain -- at the current design when a condition on them holds, then training
+continues:
+
+```python
+d.rebuild(when=em.cell_aspect().max > 4)
+jno.core([s.L, ...]).solve(200)          # rebuilt at the design whenever the cells pass aspect 4
+```
+
+The readouts made before a rebuild solve the new network. A rebuilt network equals one built from
+scratch with that design as its reference (`tests/test_domain_rebuild.py`). A thin layer one cell thick
+has a large aspect at the reference already; set the threshold against the value there.
+
 ## Validation
 
 Every layer is checked against an oracle that does not go through the layer below it.

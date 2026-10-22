@@ -53,6 +53,10 @@ def initial_value(mc):
     conductivity, has to be the point the optimisation starts from, so the initializer is applied here.
     """
     m = getattr(mc, "model", None)
+    # a `domain.rebuild` moved the reference to the design it rebuilt at
+    ref = getattr(m, "_rebuild_reference", None)
+    if ref is not None:
+        return jnp.asarray(ref)
     fn = getattr(m, "_initializer_fn", None)
     if fn is None:
         return None
@@ -377,3 +381,58 @@ def plan_parameters(plan):
 
     walk(plan._node)
     return parameters_in(exprs)
+
+
+# ---- a shape built again at a moved reference -------------------------------------------------------
+
+
+def rereferenced(sh):
+    """``sh`` with every parametric coordinate re-evaluated at its parameters' CURRENT reference.
+
+    A primitive holds the numbers it was built with (the reference); its expressions ride beside it.
+    `domain.rebuild` moves the reference (:func:`initial_value`), and this makes the matching shape:
+    same tree, same names, sizes and attachments, each parametric leaf, extrusion height and
+    translation re-built from its expressions. A shape without parameters comes back as it is."""
+    from dataclasses import replace
+
+    node = _reref_node(sh._node)
+    return sh if node is sh._node else replace(sh, _node=node)
+
+
+def _reref_node(node):
+    kind = node[0]
+    if kind == "leaf":
+        if len(node) <= 3:
+            return node
+        from .shape import _LEAF_KEYS
+
+        # a fresh key: anything cached under the old leaf describes the old geometry
+        return ("leaf", _reref_prim(node[1], node[3]), next(_LEAF_KEYS), node[3])
+    if kind == "regions":
+        subs = tuple((n, rereferenced(s)) for n, s in node[1])
+        return ("regions", subs) + tuple(node[2:])
+    if kind == "extrude" and len(node) > 3:
+        return ("extrude", rereferenced(node[1]), reference(node[3], "extrusion height"), node[3])
+    if kind == "translate" and len(node) > 3:
+        v = list(node[2])
+        for i, e in node[3]:
+            v[i] = reference(e, "translation")
+        return ("translate", rereferenced(node[1]), type(node[2])(v), node[3])
+    kids = tuple(rereferenced(c) if hasattr(c, "_node") else c for c in node[1:])
+    return node if all(a is b for a, b in zip(kids, node[1:])) else (kind,) + kids
+
+
+def _reref_prim(prim, exprs):
+    import dataclasses
+
+    if type(prim).__name__ == "Line":
+        # the flat order `shape.line` split: every vertex coordinate, then the radius
+        flat = [c for q in prim.points for c in q] + [prim.r]
+        for i, e in exprs:
+            flat[i] = reference(e, "line coordinate")
+        n = len(prim.points)
+        return dataclasses.replace(prim, points=tuple(tuple(flat[3 * k : 3 * k + 3]) for k in range(n)), r=flat[3 * n])
+    vals = [getattr(prim, f.name) for f in dataclasses.fields(prim)]
+    for i, e in exprs:
+        vals[i] = reference(e, f"{type(prim).__name__.lower()} coordinate")
+    return type(prim)(*vals)

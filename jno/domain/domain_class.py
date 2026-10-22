@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import weakref as _weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
@@ -119,6 +120,41 @@ def _refuse_mixed_cells(mesh, dim: int) -> None:
 #: The facet block a volume cell's boundary is written into, matching what the native constructors
 #: emit (``geometries.py`` / ``emit.py``): a triangle's facet is a 2-node line, a hexahedron's a
 #: 4-node quad.
+def _mesh_readout(method):
+    """Mark a domain method whose node reads the CURRENT mesh (cell sizes, angles, aspect ratios).
+
+    Such a node captures the mesh it was made on. A `domain.rebuild` replaces the mesh, so every node
+    made by a marked method is made again on the new mesh and swapped in place: a rebuild condition, or
+    a constraint written as `jno.le(d.cell_aspect(), 6)`, keeps reading the mesh the solve uses."""
+    import functools
+
+    @functools.wraps(method)
+    def made(self, *args, **kwargs):
+        node = method(self, *args, **kwargs)
+        self.__dict__.setdefault("_mesh_readouts", []).append((_weakref.ref(node), method, args, kwargs))
+        return node
+
+    return made
+
+
+def _remake_mesh_readouts(d):
+    """After a remesh: every live node of a :func:`_mesh_readout` method, made again on the new mesh
+    and updated in place (its identity, and so every expression holding it, is kept)."""
+    live = []
+    for ref, method, args, kwargs in d.__dict__.get("_mesh_readouts", ()):
+        node = ref()
+        if node is None:
+            continue
+        keep = {k: node.__dict__[k] for k in ("op_id",) if k in node.__dict__}
+        node.__dict__.update(method(d, *args, **kwargs).__dict__)
+        node.__dict__.update(keep)
+        live.append((ref, method, args, kwargs))
+    d.__dict__["_mesh_readouts"] = live
+
+
+# domains with a `rebuild(when=...)`, which `jno.core.solve` watches (weakly: a dropped domain leaves)
+_REBUILDING_DOMAINS = _weakref.WeakSet()
+
 _FACET_BLOCK_FOR = {"line": "vertex", "triangle": "line", "quad": "line", "tetra": "triangle", "hexahedron": "quad"}
 
 
@@ -4015,6 +4051,7 @@ class domain(MeshIOMixin):
         region=None,
     ) -> Any: ...
     @property
+    @_mesh_readout
     def cell_size(self):
         """Element size ``h`` as a symbol usable directly in a weak form.
 
@@ -4044,6 +4081,7 @@ class domain(MeshIOMixin):
         return Variable(tag="cell_size", dim=[0, 1], domain=self, axis="spatial")
 
     @property
+    @_mesh_readout
     def cell_metric(self):
         """Element **metric tensor** ``G = J⁻ᵀJ⁻¹`` as a symbol usable directly in a weak form.
 
@@ -4152,41 +4190,106 @@ class domain(MeshIOMixin):
             expr = FunctionCall(fn, exprs, name=f"shape_stretch_{'xyz'[a]}")
             registry.append({"ids": ids, "axis": a, "expr": expr, "name": f"__shape_stretch_{'xyz'[a]}", "tag": None})
 
-    def stretch(self):
-        """How far a design has stretched this domain from the shape it was built at, as ONE number:
-        the largest factor by which any gap between two face planes has grown or shrunk (``1.0`` at
-        the reference, and for a shape without parameters). A trace node over the shape's parameters,
-        so it reads in a loss, a tracker or a script deciding when the cells have stretched too far
-        and the shape should be rebuilt at the current design::
+    def rebuild(self, *, when, keep_opt_state=True):
+        """Rebuild this domain at the current design whenever ``when`` holds, during ``jno.core.solve``.
 
-            if float(crux.eval([d.stretch()])[0]) > 1.5:   # rebuild the shape at the current design
+        A parameter in the shape's coordinates (``jno.shape.box(0, y0, ...)``) does not remesh: every
+        discretisation built on the domain -- its FEM mesh, a ``jno.peec`` face grid -- is built once at
+        the parameters' initial values and STRETCHED to the design, which keeps the derivative exact but
+        degrades the cells the further the design travels. ``when`` is a trace node over the design,
+        checked after every epoch; once it is true the shape is built again with the current values as
+        its new reference, every ``jno.fem`` and ``jno.peec`` built on the domain follows, and training
+        continues from the same parameters::
 
-        A gap that closes gives ``inf``; under a trace a crossing gives a negative gap, also ``inf``.
+            d.rebuild(when=d.cell_aspect().max > 6)       # the FEM mesh
+            d.rebuild(when=em.cell_aspect().max > 4)      # a PEEC network's face grid
+
+        ``keep_opt_state=False`` restarts the optimizers at each rebuild; by default their state (Adam
+        moments, MMA asymptotes, a schedule's step count) carries on. The objective may jump at a
+        rebuild, by as much as the two discretisations disagree. Each rebuild pays one build and one
+        compile.
+
+        Only geometry from ``jno.shape`` parameters rebuilds. Mesh coordinates moved by
+        ``.trainable()`` have no shape to be rebuilt from, and are refused.
         """
         from ..geometry import parametric as _par
-        from ..trace import FunctionCall
-        from ..utils.solver.parametric_helpers import _collect_runtime_parameter_exprs, mark_global_scalar
+        from ..trace import Placeholder
+
+        if not isinstance(when, Placeholder):
+            raise TypeError(
+                f"domain.rebuild(when=...): `when` must be a trace node over the design, e.g. "
+                f"`d.cell_aspect().max > 6`; got {type(when).__name__}. A plain value is decided once, "
+                "before training, so it cannot say WHEN the cells have degraded."
+            )
+        plan = self.__dict__.get("_shape_plan") or self.__dict__.get("_lazy_plan")
+        if plan is None or getattr(plan, "_node", None) is None or not _par.has_params(plan._node):
+            raise ValueError(
+                "domain.rebuild: this domain's shape has no `jno.np.parameter` in its coordinates, so a "
+                "rebuild would build the same discretisation again. Put the design in the shape -- "
+                "`jno.shape.box(0, y0, ...)` -- to have one."
+            )
+        moved = [
+            e["name"]
+            for e in self.__dict__.get("_trainable_coords", ())
+            if not str(e["name"]).startswith("__shape_stretch_")
+        ]
+        if moved:
+            raise NotImplementedError(
+                f"domain.rebuild: mesh coordinates moved by `.trainable()` ({moved}) have no shape to be "
+                "rebuilt from. Rebuilding follows parameters in the shape's coordinates only."
+            )
+        self._rebuild_spec = {"when": when, "keep_opt_state": bool(keep_opt_state)}
+        _REBUILDING_DOMAINS.add(self)
+
+    def _register_solver(self, solver):
+        """A ``jno.fem`` / ``jno.peec`` built on this domain, which a :meth:`rebuild` must rebuild too."""
+        import weakref
+
+        self.__dict__.setdefault("_solvers", weakref.WeakSet()).add(solver)
+
+    def _rebuild_at(self, values):
+        """Build the shape again with ``values`` (``{layer_id: value}``) as its parameters' reference, in
+        place, and every solver registered on the domain with it. Parameters not in ``values`` keep
+        their current reference."""
+        from ..geometry import parametric as _par
 
         plan = self.__dict__.get("_shape_plan") or self.__dict__.get("_lazy_plan")
-        axes = _par.stretch_planes(plan) if plan is not None and _par.has_params(plan._node) else [None, None, None]
-        axes = [ax for ax in axes if ax is not None]
-        params = {}
-        for _refs, ents in axes:
-            for e in ents:
-                _collect_runtime_parameter_exprs(e, params)
-        names = list(params)
+        for mc in _par.plan_parameters(plan).values():
+            lid = mc.model.layer_id
+            if lid in values:
+                mc.model._rebuild_reference = np.asarray(values[lid])
+        # the shape at the new reference: its primitives hold numbers, built at the old one
+        plan = _par.rereferenced(plan)
+        self._shape_plan = plan
+        if self.__dict__.get("_lazy_plan") is not None:
+            self._lazy_plan = plan
+        if self.__dict__.get("_shape_regions") is not None:
+            self._shape_regions = {name: sub for name, sub in plan._region_items()}
+        if self.__dict__.get("_mesh") is not None:
+            from ..utils.solver.fem_adapt import _apply_new_mesh
 
-        def fn(*vals):
-            at = dict(zip(names, vals))
-            worst = jnp.asarray(1.0)
-            for refs, ents in axes:
-                gr = jnp.asarray(np.diff(refs))
-                gn = jnp.diff(_par.stack(list(ents), at))
-                ratio = jnp.where(gn > 0, jnp.maximum(gn / gr, gr / jnp.where(gn > 0, gn, 1.0)), jnp.inf)
-                worst = jnp.maximum(worst, jnp.max(ratio))
-            return worst
-
-        return mark_global_scalar(FunctionCall(fn, list(params.values()), name="domain_stretch"), f"__stretch_{id(self)}")
+            constructor = plan
+            if getattr(plan, "_structured", None) is not None:
+                constructor, self._structured_grid = self._structured_grid_setup(plan)
+            self._generate_mesh(constructor, getattr(self, "_algorithm", 6))
+            self._trainable_coords = [
+                e for e in self.__dict__.get("_trainable_coords", ()) if not str(e["name"]).startswith("__shape_stretch_")
+            ]
+            for attr in ("_elem_map_content_token", "_gauge_pin_coords"):
+                self.__dict__.pop(attr, None)
+            _apply_new_mesh(self, self.__dict__["_mesh"], copy=False)
+            if self._structured_grid is not None and getattr(self, "mesh_connectivity", None):
+                self.mesh_connectivity["grid"] = dict(self._structured_grid)
+                self._grid_shape = self._structured_grid["shape"]
+            self._register_shape_stretch(plan)
+            for name, where in list(getattr(self, "_tag_predicates", {}).items()):
+                self.tag(name, where)
+            _remake_mesh_readouts(self)
+        solvers = list(self.__dict__.get("_solvers", ()))
+        # networks first: a FEM problem may read a network's readouts (its heat source)
+        for sv in sorted(solvers, key=lambda o: type(o).__name__ != "PEEC"):
+            sv._rebuild()
+        return len(solvers)
 
     def _moving_points(self):
         """``(arg_exprs, rebuild)`` for the mesh coordinates *as the optimiser currently has them*.
@@ -4211,6 +4314,7 @@ class domain(MeshIOMixin):
 
         return [s["expr"] for s in specs], rebuild
 
+    @_mesh_readout
     def cell_volume(self):
         """Per-cell volume (area in 2-D) as a ``(n_cells,)`` node, differentiable in the mesh.
 
@@ -4254,6 +4358,7 @@ class domain(MeshIOMixin):
             )
         return _jno.fn(_vol_quad if kind == "quad" else _vol, args, name="cell_volume")
 
+    @_mesh_readout
     def cell_angles(self, eps: float = 1e-12):
         """Per-cell angles in radians, differentiable in the mesh. **2-D and 3-D.**
 
@@ -4372,6 +4477,7 @@ class domain(MeshIOMixin):
             )
         return _jno.fn(_ang_quad if kind == "quad" else (_ang_2d if dim == 2 else _ang_3d), args, name="cell_angles")
 
+    @_mesh_readout
     def cell_aspect(self, eps: float = 1e-30):
         """Per-cell **aspect ratio** as a ``(n_cells,)`` node, differentiable in the mesh. 2-D and 3-D.
 
