@@ -9,10 +9,21 @@ has a sign, so K_BA is K_AB transposed. The full 2x2 is symmetric, as a partial 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from jno.utils.solver.kernel import lattice_operator
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 G = lambda r: 1.0 / r
 SHAPE, H = (4, 3, 2), (2e-3, 1.5e-3, 1e-3)

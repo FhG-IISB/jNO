@@ -18,7 +18,16 @@ import jno
 from jno.trace import BinaryOp, PointEval, _is_point_coord
 from jno.utils.solver.fem_points import PointShape
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def box(hexes=True):

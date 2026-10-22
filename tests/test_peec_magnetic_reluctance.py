@@ -12,10 +12,21 @@ weak core instead of like the air it is, which no absolute test of a strong core
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from jno.utils.solver.kernel import magnetic_reluctance
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 MU0 = 4e-7 * np.pi
 ELL, AREA = 0.020, 48e-6  # a limb 20 mm long, 6 x 8 mm in section

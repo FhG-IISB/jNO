@@ -26,10 +26,21 @@ discretisation of one turn changed, and the refusal itself is covered in the fro
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import jno
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 CU, MU0 = 5.8e7, 4e-7 * np.pi
 OUT, WIN, DEP, P = 0.024, 0.006, 0.008, 0.002  # outer, window inset, depth, cell pitch

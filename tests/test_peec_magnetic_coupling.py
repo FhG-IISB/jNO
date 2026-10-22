@@ -17,10 +17,21 @@ pointing back here. So the sign is pinned in isolation, against Ampere's law.
 
 import jax
 import numpy as np
+import pytest
 
 from jno.utils.solver.peec import _bar_rule, coupling_generator
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 N, D, Q = (3, 3, 2), (0.002, 0.002, 0.002), 2
 

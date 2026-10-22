@@ -22,7 +22,17 @@ import pytest
 import jno
 from jno.utils.solver.peec import _fuse_triplets
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 SIG, LX, WY, TZ = 5.8e7, 0.040, 0.004, 0.002
 

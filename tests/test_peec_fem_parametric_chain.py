@@ -16,7 +16,17 @@ import jno
 from jno._fem import _walk
 from jno.trace_evaluator import TraceEvaluator
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 mm, CU, P = 1e-3, 5.8e7, 1.0e-3
 

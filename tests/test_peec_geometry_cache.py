@@ -16,12 +16,23 @@ neither case:
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import jno
 import jno.utils.solver.peec as P
 from jno.utils.solver.peec import bar_filaments, line_filaments, solve_network, terminal_nodes
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 SIG = 5.8e7
 QUAD_W = 3 * 2**2  # the sub-point count a bar lattice carries; see jno.peec._QUAD / _QUAD_T

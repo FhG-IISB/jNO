@@ -16,11 +16,22 @@ conductivity and differentiates it, which is the whole mechanism.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import jno
 from jno.utils.solver.peec import bar_filaments, solve_network
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 SIG, MM, H, RV = 5.8e7, 1e-3, 2e-3, 5e-3
 

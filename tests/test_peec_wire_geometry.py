@@ -19,7 +19,17 @@ import jno
 from jno.utils.solver.kernel import pair_matrix
 from jno.utils.solver.peec import line_filaments, solve_network, terminal_nodes
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 SIG, MM, RW = 5.8e7, 1e-3, 1.9e-4
 QUAD_W = 3 * 2**2  # the sub-point count a bar lattice carries; see jno.peec._QUAD / _QUAD_T

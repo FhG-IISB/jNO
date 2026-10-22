@@ -23,7 +23,17 @@ from jno.utils.solver.hmatrix import build, materialize
 from jno.utils.solver.kernel import pair_matrix
 from jno.utils.solver.peec import bar_filaments, lattice_apply
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 G = lambda r: 1.0 / r
 mm = 1e-3

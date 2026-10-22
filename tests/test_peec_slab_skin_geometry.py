@@ -19,10 +19,21 @@ behaviour: thickness is invisible once the current is skin-confined, and matters
 
 import jax
 import numpy as np
+import pytest
 
 import jno
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 CU, MU0 = 5.8e7, 4e-7 * np.pi
 LEN, RAD, ZW, ZTOP = 0.040, 3.0e-4, 2.25e-3, 1.63e-3

@@ -236,10 +236,14 @@ def test_single_element_reproduces_its_own_self_term():
     got = float(pair_quadratic(pos, mom, INV_R, jnp.asarray([wire_self(L, A)]))) * mu0 / (4 * np.pi)
     assert abs(got / ((mu0 * L / (2 * np.pi)) * (np.log(2 * L / A) - 0.75)) - 1) < 1e-12
 
+    # `bar_self` is the exact bar integral (checked in test_peec_bar_self.py); Ruehli's form is only
+    # its l >> w, t asymptote, here l / (w + t) = 31, so it agrees to its own truncation error
     w, t = 1.0e-3, 3.0e-4
-    got = float(pair_quadratic(pos, mom, INV_R, jnp.asarray([bar_self(L, w, t)]))) * mu0 / (4 * np.pi)
-    ref = (mu0 * L / (2 * np.pi)) * (np.log(2 * L / (w + t)) + 0.5 + 0.2235 * (w + t) / L)
-    assert abs(got / ref - 1) < 1e-12
+    g = bar_self(L, w, t)
+    got = float(pair_quadratic(pos, mom, INV_R, jnp.asarray([g]))) * mu0 / (4 * np.pi)
+    assert abs(got / (mu0 / (4 * np.pi) * L**2 * float(np.asarray(g))) - 1) < 1e-12
+    ruehli = (mu0 * L / (2 * np.pi)) * (np.log(2 * L / (w + t)) + 0.5 + 0.2235 * (w + t) / L)
+    assert abs(got / ruehli - 1) < 1e-3
 
 
 def test_pair_matrix_contracts_to_the_quadratic_form_under_any_current():
