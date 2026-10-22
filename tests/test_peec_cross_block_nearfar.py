@@ -90,3 +90,30 @@ def test_the_thin_side_may_come_second():
     ab = np.asarray(cross_block_nearfar(pa, ma, ga, NA, pb, mb, gb, NB, _g, reach=8.0, knear=NB))
     ba = np.asarray(cross_block_nearfar(pb, mb, gb, NB, pa, ma, ga, NA, _g, reach=8.0, knear=NB))
     assert np.allclose(ba, ab.T, rtol=1e-12, atol=0)
+
+
+def test_the_counted_candidate_count_covers_the_near_set_and_no_more():
+    """`_counted_knear`: the candidate count from the near set COUNTED on concrete geometry. With no
+    margin it is the largest near set plus one (the truncation guard needs a candidate beyond it) -- the
+    block equals the uncapped one, and one fewer candidate is the truncated NaN; with the margin it is
+    that count times the margin."""
+    from jno.utils.solver.peec import _counted_knear
+
+    pa, ma, ga, pb, mb, gb = _sides()
+    pos, grp = np.concatenate([pa, pb]), np.concatenate([ga, gb + NA])
+    ri, rj = np.arange(len(pa)), np.arange(len(pa), len(pa) + len(pb))
+    reach = 3.0
+    k = _counted_knear(pos, grp, ri, rj, reach, margin=1.0)
+    # brute force: centres, radii, count per thin-side element
+    ca = pa.reshape(NA, SA, 3).mean(1)
+    cb = pb.reshape(NB, SB, 3).mean(1)
+    ra = np.linalg.norm(pa.reshape(NA, SA, 3) - ca[:, None], axis=-1).max(1)
+    rb = np.linalg.norm(pb.reshape(NB, SB, 3) - cb[:, None], axis=-1).max(1)
+    near = (np.linalg.norm(ca[:, None] - cb[None], axis=-1) < reach * (ra[:, None] + rb[None])).sum(1)
+    assert k == near.max() + 1 and near.max() > 0
+    full = np.asarray(cross_block_nearfar(pa, ma, ga, NA, pb, mb, gb, NB, _g, reach=reach, knear=NB, chunk=5))
+    tight = np.asarray(cross_block_nearfar(pa, ma, ga, NA, pb, mb, gb, NB, _g, reach=reach, knear=k, chunk=5))
+    assert np.abs(tight - full).max() <= 1e-13 * np.abs(full).max()  # the same pairs, summed in another order
+    short = np.asarray(cross_block_nearfar(pa, ma, ga, NA, pb, mb, gb, NB, _g, reach=reach, knear=k - 1, chunk=5))
+    assert np.any(np.isnan(short))  # loud: the chunk that holds the largest near set is NaN
+    assert _counted_knear(pos, grp, ri, rj, reach, margin=1.5) == min(NB, int(np.ceil(1.5 * near.max())))

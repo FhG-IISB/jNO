@@ -3217,7 +3217,44 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
 # Near radius of the wire-lattice coupling, in units of the two elements' radii (None: exact everywhere).
 # See `cross_block_nearfar`; `welded_apply` uses it for every cross block it builds directly.
 _CROSS_REACH = None
-_CROSS_KNEAR = 4096
+_CROSS_KNEAR = 4096  # the candidate cap when the near set cannot be counted (traced geometry, no host)
+# The near set is COUNTED on the reference geometry and the candidate count set to this multiple of
+# its largest member, so a design may bring that many more elements into reach before the block says
+# "truncated" (a NaN, never a quietly missed pair). Measured on a power module: at most 1,294 near
+# lattice elements per wire element at a 1 mm pitch (1,804 at 2 mm), against a cap of 4,096.
+_CROSS_KNEAR_MARGIN = 1.5
+
+
+def _counted_knear(pos, grp, ri, rj, reach, margin=_CROSS_KNEAR_MARGIN, cap=None):
+    """The candidate count for :func:`cross_block_nearfar` between element rows ``ri`` and ``rj`` of a
+    concrete network: ``margin`` times the largest number of thick-side elements inside one thin-side
+    element's near radius (and at least one more than it), at most the thick side's size. Host numpy;
+    the result is structure."""
+    pos, grp = np.asarray(pos), np.asarray(grp)
+
+    def cen_rad(rows):
+        g_ = grp[rows]
+        u, inv = np.unique(g_, return_inverse=True)
+        n = len(u)
+        c = np.zeros((n, 3))
+        np.add.at(c, inv, pos[rows])
+        c /= np.bincount(inv, minlength=n)[:, None]
+        r = np.zeros(n)
+        np.maximum.at(r, inv, np.linalg.norm(pos[rows] - c[inv], axis=1))
+        return c, r
+
+    ca, ra = cen_rad(np.asarray(ri))
+    cb, rb = cen_rad(np.asarray(rj))
+    if len(ra) > len(rb):  # count from the THIN side, as the block chunks over it
+        ca, ra, cb, rb = cb, rb, ca, ra
+    most = 0
+    for lo in range(0, len(ra), 256):
+        d = np.linalg.norm(ca[lo : lo + 256, None, :] - cb[None, :, :], axis=-1)
+        most = max(most, int((d < reach * (ra[lo : lo + 256, None] + rb[None, :])).sum(1).max()))
+    # at least one candidate beyond the largest near set: the truncation guard cannot tell "exactly k
+    # near" from "more than k" (the k-th candidate is near either way), so k = most would read as cut short
+    k = max(int(np.ceil(margin * max(most, 1))), most + 1)
+    return min(len(rb), k if cap is None else min(k, cap))
 
 
 def _element_table(grp, n):
@@ -3291,15 +3328,23 @@ def cross_block_nearfar(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, sca
     Ma, Mb = Am.sum(1), Bm.sum(1)
     ra = jnp.max(jnp.where(jnp.asarray(mk_a), jnp.sqrt(((Ap - Pa[:, None, :]) ** 2).sum(-1)), 0.0), axis=1)
     rb = jnp.max(jnp.where(jnp.asarray(mk_b), jnp.sqrt(((Bp - Pb[:, None, :]) ** 2).sum(-1)), 0.0), axis=1)
-    rows = []
-    for lo in range(0, na, chunk):
-        hi = min(lo + chunk, na)
-        rows.append(
-            _nearfar_rows(
-                Ap[lo:hi], Am[lo:hi], Pa[lo:hi], Ma[lo:hi], ra[lo:hi], Bp, Bm, Pb, Mb, rb, g, float(reach), int(knear)
-            )
-        )
-    return scale * jnp.concatenate(rows, axis=0)
+    # ONE chunk alive at a time: a sequential `lax.map` over equal chunks, each rematerialised
+    # (`_nearfar_rows` is a checkpoint). A Python loop unrolled them into one program, so the compiler
+    # could keep every chunk's (chunk, knear, q, q, 3) displacement live together -- and a reverse pass
+    # batched over several outputs multiplied that again. The last chunk is padded by REPEATING the last
+    # row, not with zeros: a zero row sits at the origin, where its near set could look truncated.
+    nck = -(-na // chunk)
+    pad = nck * chunk - na
+
+    def _chunks(x):
+        x = jnp.concatenate([x, jnp.repeat(x[-1:], pad, axis=0)], axis=0) if pad else x
+        return x.reshape((nck, chunk) + x.shape[1:])
+
+    rows = jax.lax.map(
+        lambda c: _nearfar_rows(*c, Bp, Bm, Pb, Mb, rb, g, float(reach), int(knear)),
+        tuple(_chunks(x) for x in (Ap, Am, Pa, Ma, ra)),
+    )
+    return scale * rows.reshape((nck * chunk,) + rows.shape[2:])[:na]
 
 
 _HSTRUCT_CACHE: dict = {}  # (id(host), block key, operator) -> (host, structure); see _hstruct
@@ -3473,11 +3518,15 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
                     hmat(hm, pi, mi, None, g, scale=mu_scale, b=(pj, mj), transpose=True),
                 )
             else:
-                K = (
-                    cross_block
-                    if _CROSS_REACH is None
-                    else functools.partial(cross_block_nearfar, reach=_CROSS_REACH, knear=_CROSS_KNEAR)
-                )(
+                if _CROSS_REACH is None:
+                    K_fn = cross_block
+                else:
+                    # the near set counted on concrete geometry -- the reference `host`, or `fil` itself
+                    # when it is concrete; a traced `fil` with no host keeps the fixed cap
+                    src = host if host is not None else (None if isinstance(fil.pos, jax.core.Tracer) else fil)
+                    kn = _CROSS_KNEAR if src is None else _counted_knear(src.pos, src.group, ri, rj, _CROSS_REACH)
+                    K_fn = functools.partial(cross_block_nearfar, reach=_CROSS_REACH, knear=kn)
+                K = K_fn(
                     jnp.asarray(fil.pos)[ri],
                     jnp.asarray(fil.mom)[ri],
                     gi,
