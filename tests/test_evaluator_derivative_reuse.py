@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import equinox as eqx
 import foundax
 import jax
 import numpy as np
@@ -22,6 +23,17 @@ import jno
 from jno.trace_evaluator import TraceEvaluator
 
 KEY = jax.random.PRNGKey(0)
+
+
+@pytest.fixture(autouse=True)
+def _full_float32_matmuls():
+    """These tests compare derivatives to round-off of float32. On a GPU, JAX's default float32 matmul runs in
+    TF32 (about 1e-3 relative), which the forward-Laplacian pass amplifies past the tolerance; pin full
+    precision so the tests check the derivatives, not the matmul mode."""
+    with jax.default_matmul_precision("highest"):
+        yield
+
+
 FD = "finite_difference"
 
 
@@ -129,6 +141,97 @@ def test_windowed_laplacian_matches_jax_hessian():
 
 
 # ---------------------------------------------------------------------------
+# automatic differentiation: the derivatives over one point set share their passes
+# ---------------------------------------------------------------------------
+
+RE = 40.0
+
+
+def _three_field_net(width=16, size=0.25):
+    dom = jno.shape.rect(0, 0, 1, 1, size=size).domain()
+    x, y, _ = dom.variable("interior")
+    net = jno.nn(foundax.mlp(in_features=2, output_dim=3, hidden_dims=width, num_layers=2, key=KEY))
+    net.optimizer(optax.adam(1e-3))
+    o = net(x, y)
+    return dom, x, y, net, o, (o[..., 0], o[..., 1], o[..., 2])
+
+
+def _navier_stokes(u, v, p, x, y):
+    """The steady incompressible residuals, summed into one expression."""
+    mom_x = u * u.d(x) + v * u.d(y) + p.d(x) - u.laplacian(x, y) / RE
+    mom_y = u * v.d(x) + v * v.d(y) + p.d(y) - v.laplacian(x, y) / RE
+    return mom_x + mom_y + (u.d(x) + v.d(y))
+
+
+def _optimal_navier_stokes(module):
+    """The same residual with the fewest AD passes: one forward-over-forward pass per coordinate gives the
+    first AND second derivative of all three outputs along it."""
+    eye = np.eye(2, dtype=np.float32)
+
+    def residual(z):
+        f = lambda q: module(q[None, :])[0]  # noqa: E731
+        (d1x, d2x), (d1y, d2y) = (jax.jvp(lambda w, e=e: jax.jvp(f, (w,), (e,))[1], (z,), (e,)) for e in eye)
+        u, v, _ = f(z)
+        mom_x = u * d1x[0] + v * d1y[0] + d1x[2] - (d2x[0] + d2y[0]) / RE
+        mom_y = u * d1x[1] + v * d1y[1] + d1y[2] - (d2x[1] + d2y[1]) / RE
+        return mom_x + mom_y + (d1x[0] + d1y[1])
+
+    return jax.jit(jax.vmap(residual))
+
+
+def test_ad_derivatives_over_one_point_set_cost_what_a_hand_written_residual_costs():
+    """Eight derivative nodes over three outputs of one network: each used to re-run the network under its
+    own reverse pass (3.3x the work of the hand-written step on a Navier-Stokes PINN). Sharing one
+    forward-over-forward pass per coordinate brings it to the hand-written cost."""
+    _, x, y, net, _, (u, v, p) = _three_field_net()
+    expr = _navier_stokes(u, v, p, x, y)
+    evaluator = TraceEvaluator({net.layer_id: net.module})
+    points = jax.random.uniform(jax.random.PRNGKey(1), (64, 2))
+    jno_flops = _flops(jax.jit(lambda q: evaluator.evaluate(expr, {x.tag: q}, {}, None)), points)
+    optimal = _flops(_optimal_navier_stokes(net.module), points)
+
+    got = np.asarray(jax.jit(lambda q: evaluator.evaluate(expr, {x.tag: q}, {}, None))(points)).reshape(-1)
+    want = np.asarray(_optimal_navier_stokes(net.module)(points)).reshape(-1)
+    assert np.allclose(got, want, rtol=1e-4, atol=1e-5)
+    # 1.25: room for the element-wise arithmetic of the residual, which jNO does on (N, 1) columns
+    assert jno_flops <= 1.25 * optimal, f"{jno_flops:.3g} FLOPs vs {optimal:.3g} hand-written"
+
+
+def test_a_node_read_several_times_is_evaluated_once(monkeypatch):
+    """``u`` in every term of a residual, and the outputs of one network call, used to be traced once per
+    reference -- seven forward passes of the network for two distinct calls in a Navier-Stokes loss."""
+    once = _network_dispatches(lambda u, x, y: u - 1.0, monkeypatch)
+    often = _network_dispatches(lambda u, x, y: u * u + 3.0 * u - jno.np.sin(u) - 1.0, monkeypatch)
+    assert often == once
+
+
+def test_shared_ad_derivatives_match_jax():
+    """Every derivative kind the shared pass serves, against JAX on the bare network."""
+    dom, x, y, net, o, (u, v, p) = _three_field_net()
+    exprs = [u.d(x), v.d(y), p.d(x), o.d(x), u.laplacian(x, y), jno.np.hessian(u, [x, y]), u.d(x).d(y), v.d(y).d(y)]
+    crux = jno.core([_navier_stokes(u, v, p, x, y).mse], domain=dom)
+    got = [np.asarray(g)[0] for g in crux.eval(exprs)]
+
+    pts = np.asarray(crux.domain_data.context[x.tag]).reshape(-1, 2)
+    f = lambda q: net.module(q[None, :])[0]  # noqa: E731
+    jac = np.asarray(jax.vmap(jax.jacrev(f))(pts))  # (N, 3, 2)
+    hess = np.asarray(jax.vmap(jax.hessian(f))(pts))  # (N, 3, 2, 2)
+    want = [
+        jac[:, 0, 0:1],
+        jac[:, 1, 1:2],
+        jac[:, 2, 0:1],
+        jac[:, :, 0],
+        hess[:, 0, 0, 0:1] + hess[:, 0, 1, 1:2],
+        hess[:, 0],
+        hess[:, 0, 0, 1:2],
+        hess[:, 1, 1, 1:2],
+    ]
+    for g, w, e in zip(got, want, exprs):
+        assert g.shape == w.shape, f"{e}: {g.shape} != {w.shape}"
+        assert np.allclose(g, w, rtol=1e-4, atol=1e-5), f"{e}: max error {np.abs(g - w).max():.3g}"
+
+
+# ---------------------------------------------------------------------------
 # argument validation
 # ---------------------------------------------------------------------------
 
@@ -155,3 +258,179 @@ def test_the_list_form_and_the_method_form_still_work():
 
     assert jno.np.laplacian(u, [x, y]).trace is True
     assert u.laplacian(x, y).trace is True
+
+
+PER_NODE = "automatic_differentiation:reverse"  # an explicit submethod keeps the per-node path: the oracle
+
+
+def _per_node_vs_shared(build):
+    """The same derivatives through the shared pass and through the per-node path, evaluated together."""
+    dom, exprs_shared, exprs_per_node, net = build()
+    net.optimizer(optax.adam(1e-3))
+    crux = jno.core([(e - 0.0).mse for e in exprs_shared], domain=dom)
+    got = [np.asarray(v) for v in crux.eval(exprs_shared)]
+    want = [np.asarray(v) for v in crux.eval(exprs_per_node)]
+    return got, want
+
+
+def test_time_derivatives_join_the_shared_pass_and_match_the_per_node_path():
+    """``u.t`` (time as one more coordinate, one value for all points) and ``u.tt`` with the Laplacian."""
+
+    def build():
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0, 1.0, 4))
+        x, y, t = dom.variable("interior")
+        net = jno.nn(foundax.mlp(in_features=3, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
+        u = (net(x, y, t) * x * (1 - x)).scalar.bind(x=x, y=y, t=t)
+        shared = [u.t, u.tt, u.laplacian(x, y), u.d(t).d(x)]
+        per_node = [
+            u.d(t, scheme=PER_NODE),
+            u.d(t, scheme=PER_NODE).d(t, scheme=PER_NODE),
+            u.laplacian(x, y, scheme="automatic_differentiation:fwd-over-rev"),
+            u.d(t, scheme=PER_NODE).d(x, scheme=PER_NODE),
+        ]
+        return dom, shared, per_node, net
+
+    got, want = _per_node_vs_shared(build)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape
+        assert np.allclose(g, w, rtol=1e-4, atol=1e-5), np.abs(g - w).max()
+
+
+def test_a_laplacian_of_a_laplacian_matches_the_per_node_path():
+    def build():
+        dom, x, y, net, o, (u, _, _) = _three_field_net()
+        scheme = "automatic_differentiation:fwd-over-rev"
+        return (
+            dom,
+            [u.laplacian(x, y).laplacian(x, y)],
+            [u.laplacian(x, y, scheme=scheme).laplacian(x, y, scheme=scheme)],
+            net,
+        )
+
+    (got,), (want,) = _per_node_vs_shared(build)
+    assert np.allclose(got, want, rtol=1e-3, atol=1e-4), np.abs(got - want).max()
+
+
+def test_third_and_fourth_order_derivatives_match_the_per_node_path():
+    """Orders 3 and 4 by univariate Taylor passes: ``u_xxx``, ``d/dx Lap u``, ``d/dt Lap u`` (time as a
+    coordinate), ``u_xxxx`` and ``d/dt d/dx Lap u``."""
+
+    def build():
+        dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0, 1.0, 4))
+        x, y, t = dom.variable("interior")
+        net = jno.nn(foundax.mlp(in_features=3, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
+        u = (net(x, y, t) * x * (1 - x)).scalar.bind(x=x, y=y, t=t)
+        r, h = PER_NODE, "automatic_differentiation:fwd-over-rev"
+        shared = [
+            u.d(x).d(x).d(x),
+            u.laplacian(x, y).d(x),
+            u.laplacian(x, y).d(t),
+            u.d(x).d(x).d(x).d(x),
+            u.laplacian(x, y).d(x).d(t),
+        ]
+        per_node = [
+            u.d(x, scheme=r).d(x, scheme=r).d(x, scheme=r),
+            u.laplacian(x, y, scheme=h).d(x, scheme=r),
+            u.laplacian(x, y, scheme=h).d(t, scheme=r),
+            u.d(x, scheme=r).d(x, scheme=r).d(x, scheme=r).d(x, scheme=r),
+            u.laplacian(x, y, scheme=h).d(x, scheme=r).d(t, scheme=r),
+        ]
+        return dom, shared, per_node, net
+
+    got, want = _per_node_vs_shared(build)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape
+        assert np.allclose(g, w, rtol=1e-3, atol=1e-4), np.abs(g - w).max()
+
+
+def test_a_taylor_pass_along_an_axis_also_gives_the_lower_derivatives(monkeypatch):
+    """KdV reads u, u_x and u_xxx: one third-order Taylor pass along x carries all three, so no forward-mode or
+    forward-Laplacian pass runs besides it (and the one along t)."""
+    import folx as _folx
+    import jax as _jax
+
+    jvps, laps = [], []
+    real_jvp, real_lap = _jax.jvp, _folx.forward_laplacian
+    monkeypatch.setattr(_jax, "jvp", lambda *a, **k: jvps.append(1) or real_jvp(*a, **k))
+    monkeypatch.setattr(_folx, "forward_laplacian", lambda *a, **k: laps.append(1) or real_lap(*a, **k))
+    d = jno.shape.rect(-1, 0, 1, 1, size=0.25).domain()
+    x, t = d.variable("interior", split=True)[:2]
+    net = jno.nn(foundax.mlp(2, 1, hidden_dims=8, num_layers=2, key=KEY))
+    net.optimizer(optax.adam(1e-3))
+    u = net(x, t)
+    crux = jno.core([(u.d(t) + 6 * u * u.d(x) + u.d(x).d(x).d(x)).mse], domain=d)
+    jvps.clear(), laps.clear()
+    crux.eval([crux.constraints[0]])
+    assert laps == [] and len(jvps) == 1, (len(jvps), len(laps))  # the jvp along t; x is all in the Taylor pass
+
+
+def test_an_ad_derivative_of_a_target_that_couples_points_raises():
+    """``u - mean(u)`` at one point depends on every point; its per-point AD derivative used to be returned
+    silently as if it did not. The coupling is measured when the problem is compiled."""
+    dom, x, y, net, _, (u, _, _) = _three_field_net()
+    net.optimizer(optax.adam(1e-3))
+    coupled = u - jno.np.mean(u, axis=0)
+    with pytest.raises(ValueError, match="OTHER points"):
+        jno.core([coupled.d(x).mse], domain=dom).solve(1)
+
+
+def test_a_differentiated_field_is_not_evaluated_again_for_its_value(monkeypatch):
+    """``u`` in ``u * u.d(x)`` comes from the derivative pass (the target is measured pointwise), not from a
+    second, batched evaluation of the network."""
+    deriv = _network_dispatches(lambda u, x, y: u.d(x) - 1.0, monkeypatch)
+    both = _network_dispatches(lambda u, x, y: u * u.d(x) - 1.0, monkeypatch)
+    assert both == deriv
+
+
+# ---------------------------------------------------------------------------
+# indexing a per-point field
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pick",
+    [
+        lambda o, u, x: o[0],
+        lambda o, u, x: o[1, 0],
+        lambda o, u, x: u[0],
+        lambda o, u, x: u.d(x)[0],
+        lambda o, u, x: (2.0 * o + x)[-1],
+        lambda o, u, x: x[0],
+    ],
+)
+def test_an_integer_index_on_a_per_point_field_raises(pick):
+    """``o[0]`` used to pick collocation point 0 silently, where ``o[..., 0]`` (the first output) was meant."""
+    dom, x, _, _, o, (u, _, _) = _three_field_net()
+    with pytest.raises(IndexError, match=r"\[\.\.\., "):
+        jno.core([(pick(o, u, x) - 1.0).mse], domain=dom)
+
+
+def test_component_and_parameter_indexing_still_work():
+    dom, x, _, _, o, _ = _three_field_net()
+    o[..., 0], o[..., -1], o[:, 0]  # components, and an explicit slice of the point axis
+    p = jno.np.parameter((3,), key=KEY)
+    first = p[0] + 0.0 * x  # a parameter vector is not a point set: its [0] is its first entry
+    crux = jno.core([first.mse], domain=dom)
+    assert np.allclose(np.asarray(crux.eval(first)), np.asarray(crux.eval(p[..., 0] + 0.0 * x)))
+
+
+class _LeadingAxis(eqx.Module):
+    """A pointwise network that returns its values with a leading batch axis of one, ``(1, N, 1)``, as some
+    foundation-model wrappers do."""
+
+    mlp: eqx.Module
+
+    def __call__(self, x, y):
+        return self.mlp(x, y)[None]
+
+
+def test_a_pointwise_network_with_a_leading_unit_axis_is_measured_pointwise():
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain()
+    x, y, _ = dom.variable("interior")
+    net = jno.nn(_LeadingAxis(foundax.mlp(in_features=2, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)))
+    net.optimizer(optax.adam(1e-3))
+    u = net(x, y)
+    crux = jno.core([(jno.np.laplacian(u, [x, y]) - 1.0).mse], domain=dom)
+    stats = crux.solve(1)  # raised "depends on the OTHER points": the unit axis was read as one value for all points
+    assert np.isfinite(float(stats.training_logs[-1]["total_loss"][-1]))
+    assert getattr(u, "_jno_pointwise", None) is not False

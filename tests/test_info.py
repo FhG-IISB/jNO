@@ -49,13 +49,66 @@ def test_domain_info_says_when_the_mesh_is_still_lazy():
     assert "lazy" in jno.info(d).as_dict()["mesh"]["built"]
 
 
+def test_domain_info_reports_the_points_in_use_not_the_mesh_pool():
+    """``variable(tag, sample=(N, None))`` puts N points in the context, and those are what a constraint
+    trains on; the tag row used to report the size of the mesh pool they are drawn beside (4,096 shown for
+    40,000 used)."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.05).domain()
+    d.variable("interior", sample=(1234, None))
+    pool = np.asarray(d._mesh_pool["interior"]).shape[0]
+    assert pool != 1234
+    row = dict(jno.info(d).sections)["tags"]
+    interior = dict(row)["interior"]
+    assert interior.startswith("1,234 points"), interior
+    assert f"mesh {pool:,}" in interior, interior
+
+
+def _mlp(seed=0):
+    import foundax
+
+    return jno.nn(foundax.mlp(2, 1, hidden_dims=16, num_layers=2, key=jax.random.PRNGKey(seed)))
+
+
+def test_network_info_reports_what_training_will_do_with_its_parameters():
+    """The summary ``solve()`` logs, before any solve: the policy and the trainable / frozen / LoRA counts.
+    LoRA adapters are counted although ``solve()`` has not added them yet."""
+    full = dict(jno.info(_mlp()).sections)["parameters"]
+    assert full[0][1] == "full fine-tune · 337 trainable · 0 frozen"
+    frozen = dict(jno.info(_mlp().freeze()).sections)["parameters"]
+    assert frozen[0][1] == "frozen · 0 trainable · 337 frozen"
+    lora = dict(jno.info(_mlp().freeze().lora(rank=2)).sections)["parameters"][0][1]
+    assert lora.startswith("LoRA · ") and " LoRA" in lora.split("frozen")[1], lora
+    n_trainable = int(lora.split(" trainable")[0].split("· ")[-1].replace(",", ""))
+    assert 0 < n_trainable < 337  # only the adapters train
+
+
+def test_core_info_has_a_parameter_section_with_totals():
+    d = jno.shape.rect(0, 0, 1, 1, size=0.25).domain()
+    x, y, _ = d.variable("interior")
+    a, b = _mlp(0), _mlp(1).freeze()
+    a.optimizer(__import__("optax").adam(1e-3))
+    rows = dict(jno.info(jno.core([(a(x, y) - b(x, y)).mse], domain=d)).sections)["parameters"]
+    assert [v for k, v in rows if k == "total"] == ["337 trainable · 337 frozen · 674 total"]
+
+
 def test_fem_info_reports_mode_dofs_and_every_term():
     f = _poisson(_two_region_domain())
     data = jno.info(f).as_dict()
     assert data["form"]["mode"] == "linear"
     assert int(str(data["form"]["dofs"]).replace(",", "")) == int(f.dofs)
-    # every term, classified -- the check that a boundary condition was recognised AS one
-    assert list(data["terms (as classified)"].values()) == list(f.classification)
+    # every term, classified -- the check that a boundary condition was recognised AS one -- next to the
+    # term as written
+    keys = [k for k in data["equations"] if k.startswith("[")]
+    assert keys == [f"[{i}] {c}" for i, c in enumerate(f.classification)]
+
+
+def test_fem_info_writes_the_weak_form():
+    """The terms in mathematical notation: the integrand as the integral it contributes, the attached
+    coefficient by its name, the test function by its (Greek) name, the Dirichlet condition as an equation."""
+    data = jno.info(_poisson(_two_region_domain())).as_dict()["equations"]
+    rows = list(data.values())
+    assert rows[0] == "∫ (k (∂u/∂x ∂φ/∂x + ∂u/∂y ∂φ/∂y) − φ) dx"
+    assert rows[1] == "u = 0"
 
 
 def test_fem_info_deep_adds_symmetry_and_empty_rows():

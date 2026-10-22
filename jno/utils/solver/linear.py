@@ -99,6 +99,27 @@ _CUDSS_CACHE_MAX = 4
 #: than a whole second factorization.
 _PARDISO_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 _PARDISO_CACHE_MAX = 4
+# The matrix TYPE each pattern was last solved as, so a lookup tries that plan first (see `_typed_lookup`).
+_CUDSS_LAST_KIND: dict = {}
+_PARDISO_LAST_KIND: dict = {}
+
+
+def _typed_lookup(cache, last_kind, skey, dhash, data):
+    """``(entry | None, data)`` for a factorization cache keyed by ``(pattern key, matrix type)``.
+
+    The type (symmetric or general) is detected from the values and baked into the symbolic analysis, so
+    each type keeps its own plan: values that switch type on one pattern (a Navier-Stokes tangent that is
+    the symmetric Stokes matrix at u = 0 and unsymmetric afterwards) reuse both plans instead of redoing the
+    analysis on every switch. The plan the pattern last used is tried first, and the type is only
+    re-detected when the values changed, so a repeated solve still costs no detection. ``data`` comes back
+    in the form the returned entry's type needs (symmetrized for a symmetric plan)."""
+    kind = last_kind.get(skey)
+    entry = cache.get((skey, kind)) if kind is not None else None
+    if entry is not None and entry["dhash"] != dhash:
+        kind_now, data = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
+        if kind_now != entry["kind"]:
+            entry = cache.get((skey, kind_now))
+    return entry, data
 
 
 def matrix_diagonal(A):
@@ -557,19 +578,9 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
     # loop is always 1 and an eigen block always m, so this does not fragment the cache in practice.
     skey = (_h(rows, cols), shape, data.dtype.str, bool(transpose), nrhs)
     dhash = _h(data)  # the VALUES: what a numeric factorization depends on
-    entry = _CUDSS_CACHE.get(skey)
-
-    if entry is not None and entry["dhash"] != dhash:
-        # The values changed. They can change the matrix TYPE too (a Newton tangent that starts
-        # symmetric need not stay symmetric), and the type is baked into the plan -- so re-detect
-        # first and throw the plan away if it no longer applies. Only reached when the values
-        # actually differ, so a repeat solve still costs no detection.
-        _kind_now, _data_sym = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
-        if _kind_now != entry["kind"]:
-            _CUDSS_CACHE.pop(skey)["solver"].free()
-            entry = None
-        else:
-            data = _data_sym  # the refactorize below must see the same values the plan was built for
+    # The values can change the matrix TYPE (a Newton tangent that starts symmetric need not stay so), and
+    # the type is baked into the plan: one plan per type, see `_typed_lookup`.
+    entry, data = _typed_lookup(_CUDSS_CACHE, _CUDSS_LAST_KIND, skey, dhash, data)
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
@@ -588,7 +599,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
         except Exception:
             solver.free()  # never cached, so nothing else will ever free it
             raise
-        _CUDSS_CACHE[skey] = entry = {
+        _CUDSS_CACHE[(skey, kind)] = entry = {
             "solver": solver,
             "Ag": Ag,
             "bg": bg,
@@ -605,7 +616,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
             _, old = _CUDSS_CACHE.popitem(last=False)
             old["solver"].free()  # WITHOUT this an evicted factorization leaks device memory
     else:
-        _CUDSS_CACHE.move_to_end(skey)
+        _CUDSS_CACHE.move_to_end((skey, entry["kind"]))
         if entry["dhash"] != dhash:
             # same sparsity AND same type, new values -> refresh the CSR values IN PLACE and
             # re-factorize; the plan (the expensive half) survives. Getting this test wrong would
@@ -618,6 +629,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
             entry["perturbed"] = _cudss_check_factorization(entry["solver"], entry["Ag"], entry["bg"], cp, shape)
             entry["dhash"] = dhash
 
+    _CUDSS_LAST_KIND[skey] = entry["kind"]
     entry["bg"][...] = _to_device_rhs(rhs)
     entry["solver"].reset_operands(b=entry["bg"])
     x = entry["solver"].solve()
@@ -973,7 +985,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     # one factorization ~70 times, and paying a sort per application made it 3x slower than scipy.
     skey = (_h(rows, cols), shape, data.dtype.str)
     dhash = _h(data)
-    entry = _PARDISO_CACHE.get(skey)
+    entry, data = _typed_lookup(_PARDISO_CACHE, _PARDISO_LAST_KIND, skey, dhash, data)
 
     def _build(values, mtype):
         A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
@@ -981,15 +993,6 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         return _pardiso_upper_with_diag(A, _sp, _np) if mtype in (-2, 6, -4, 2, 4) else A
 
     b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
-
-    if entry is not None and entry["dhash"] != dhash:
-        # values changed -> they can change the TYPE, which is baked into the analysis
-        _kind_now, _data_sym = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
-        if _kind_now != entry["kind"]:
-            _PARDISO_CACHE.pop(skey)["solver"].free_memory()
-            entry = None
-        else:
-            data = _data_sym  # the phase-22 refactorize below must see the plan's own values
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
@@ -1002,7 +1005,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         solver._call_pardiso(A, b)
         solver.set_phase(22)
         solver._call_pardiso(A, b)
-        _PARDISO_CACHE[skey] = entry = {
+        _PARDISO_CACHE[(skey, kind)] = entry = {
             "solver": solver,
             "A": A,
             "dhash": dhash,
@@ -1016,13 +1019,14 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
             _, old = _PARDISO_CACHE.popitem(last=False)
             old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
     else:
-        _PARDISO_CACHE.move_to_end(skey)
+        _PARDISO_CACHE.move_to_end((skey, entry["kind"]))
         if entry["dhash"] != dhash:
             entry["A"] = _build(data, entry["mtype"])  # same sparsity -> phase 22 only
             entry["solver"].set_phase(22)
             entry["solver"]._call_pardiso(entry["A"], b)
             entry["dhash"] = dhash
 
+    _PARDISO_LAST_KIND[skey] = entry["kind"]
     solver, A = entry["solver"], entry["A"]
     _pardiso_check_factorization(solver, A, b, _np, shape)
     solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization

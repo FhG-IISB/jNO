@@ -29,6 +29,16 @@ import jno
 from jno.trace import BinaryOp, Hessian, Jacobian, Placeholder, _child_placeholders, fuse_laplacian
 from tests.conftest import MockDomain
 
+
+@pytest.fixture(autouse=True)
+def _full_float32_matmuls():
+    """These tests compare derivatives to round-off of float32. On a GPU, JAX's default float32 matmul runs in
+    TF32 (about 1e-3 relative), which the forward-Laplacian pass amplifies past the tolerance; pin full
+    precision so the tests check the derivatives, not the matmul mode."""
+    with jax.default_matmul_precision("highest"):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------

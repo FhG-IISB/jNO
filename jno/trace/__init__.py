@@ -8,6 +8,7 @@ Operations trace computations and return callable placeholders.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union
 
@@ -4066,7 +4067,7 @@ class Hessian(Placeholder):
         trace: bool = False,
     ):
         self.target = target
-        self.variables = variables if isinstance(variables, list) else [variables]
+        self.variables = list(variables) if isinstance(variables, (list, tuple)) else [variables]
         self.scheme = scheme
         self.trace = trace  # True → Laplacian (sum of diagonal)
         weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
@@ -4093,7 +4094,7 @@ class Jacobian(Placeholder):
         scheme: str = "automatic_differentiation",
     ):
         self.target = target
-        self.variables = variables if isinstance(variables, list) else [variables]
+        self.variables = list(variables) if isinstance(variables, (list, tuple)) else [variables]
         self.scheme = scheme
         weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
         _propagate_weak(self, target, *weak_vars)
@@ -4119,6 +4120,37 @@ class NormalDerivative(Placeholder):
 
     def __repr__(self):
         return f"NormalDerivative({self.target})"
+
+
+def _is_per_point_field(expr) -> bool:
+    """Whether ``expr`` certainly has one entry per collocation point along its first axis.
+
+    True for a network or a coordinate and for what pointwise operations build from them (arithmetic, a
+    component ``[..., i]``, a derivative); anything else met on the way (a reduction, an integral, a
+    user function, a FE symbol) makes the answer "not certain", and :meth:`Placeholder.__getitem__` then
+    indexes as asked. Used by :func:`refuse_point_index`.
+    """
+    seen, stack, found = set(), [expr], False
+    while stack:
+        n = stack.pop()
+        if id(n) in seen or not isinstance(n, Placeholder):
+            continue
+        seen.add(id(n))
+        if isinstance(n, Variable):
+            if getattr(n, "axis", "spatial") != "spatial":
+                return False
+            found = True
+        elif isinstance(n, ModelCall):  # per point through its inputs; a parameter (no inputs) is not
+            stack.extend(a for a in n.args if isinstance(a, Placeholder))
+        elif isinstance(n, BinaryOp):
+            stack.extend((n.left, n.right))
+        elif isinstance(n, (Jacobian, Hessian)):
+            stack.append(n.target)
+        elif isinstance(n, FunctionCall) and getattr(n, "getitem_key", (None,))[:1] == (Ellipsis,):
+            stack.extend(a for a in n.args if isinstance(a, Placeholder))
+        elif not isinstance(n, (Literal, Constant)):
+            return False
+    return found
 
 
 def _component_keeps_axis(expr) -> bool:
@@ -4512,10 +4544,14 @@ class Noise(Placeholder):
 
 
 def check_runtime_values(names, values):
-    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter or leaves one out.
+    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter, leaves one out, or gives
+    a FIELD parameter (one value per cell, node or dof) a value of the wrong size.
 
     Every solve that accepts the values (steady linear and nonlinear, transient, load-path march) checks
-    them here, so the same call fails the same way whichever path the form takes."""
+    them here, so the same call fails the same way whichever path the form takes. ``names`` is the
+    operator's ``runtime_parameter_exprs`` mapping (or just the names, which skips the size check). The
+    size check matters because the element kernels GATHER from a field value and JAX clamps an
+    out-of-range gather: a vector of the wrong length used to solve without a word."""
     unknown = sorted(set(values) - set(names))
     if unknown:
         raise TypeError(f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}.")
@@ -4526,6 +4562,19 @@ def check_runtime_values(names, values):
             f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
             "let `crux` resolve them (the solve is then a trace node, not an array)."
         )
+    for name, expr in names.items() if isinstance(names, dict) else ():
+        model = getattr(expr, "model", None)
+        kind = getattr(model, "_fem_field", None)
+        if not kind or name not in values:
+            continue
+        want = tuple(model.module.value.shape)
+        got = tuple(jnp.shape(values[name]))
+        if math.prod(got) != math.prod(want):
+            per = {"cell": "cell", "node": "mesh node"}.get(kind, "dof of its space")
+            raise ValueError(
+                f"fem.solve(): the field parameter {name!r} takes one value per {per}, shape {want} "
+                f"({math.prod(want)} values); it was given shape {got}. Pass a value of shape {want}."
+            )
 
 
 class FemLinearSystem:
@@ -4632,7 +4681,7 @@ class FemLinearSystem:
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
-        check_runtime_values(names, values)
+        check_runtime_values(self.runtime_parameter_exprs, values)
         return _solve(*(jnp.asarray(values[n]) for n in names))
 
     def __iter__(self):
@@ -4763,6 +4812,7 @@ class FemResidualOperator:
         ``u0`` is the initial guess (default: zeros of the operator size; enable
         x64 — the residual is float64).
         """
+        default_start = u0 is None
         if u0 is None:
             if self.size is None:
                 raise ValueError("FemResidualOperator.solve: pass u0= (operator size is unknown).")
@@ -4790,22 +4840,37 @@ class FemResidualOperator:
         # wrapper needs them when a slip surface moves with runtime coordinates (its P is rebuilt per solve).
         _xa = (lambda a: {"args": a}) if getattr(solve_fn, "wants_args", False) else (lambda a: {})  # noqa: E731
 
-        def _solve(*values):
-            args = dict(zip(names, values))
-            residual_fn = lambda u: self.residual(u, args)  # noqa: E731
+        def _drive(driver, u_start, args):
             # A sparse-direct Newton (``jno.solve.newton(direct=True)``) flags ``wants_jacobian`` and
             # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
             # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
-            if _takes_jacobian(solve_fn) and self.jacobian is not None:
-                return solve_fn(residual_fn, u0, jacobian=self._jacobian_handle(args), **_xa(args))
-            return solve_fn(residual_fn, u0, **_xa(args))
+            def call(res, x0, jac):
+                if _takes_jacobian(driver) and jac is not None:
+                    return driver(res, x0, jacobian=jac, **_xa(args))
+                return driver(res, x0, **_xa(args))
+
+            # From the default start (zeros) on a problem with non-zero prescribed values, first take the
+            # linearised step that carries the boundary increment into the interior (`dirichlet_lift_start`);
+            # otherwise Newton would begin at the projected start, which a large prescribed displacement
+            # can turn inside out. Decided statically -- a caller's own `x0` is left alone -- and called
+            # plainly, so a driver that works on the host runs it as it runs any solve. Only an initial
+            # guess: no gradient flows through it.
+            lift = getattr(self, "lift_start", None) if default_start else None
+            if lift is not None:
+                res_l, jac_l, _gap = lift(u_start, args)
+                u_start = jax.lax.stop_gradient(call(res_l, u_start, jac_l))
+            jac = self._jacobian_handle(args) if self.jacobian is not None else None
+            return call(lambda u: self.residual(u, args), u_start, jac)
+
+        def _solve(*values):
+            return _drive(solve_fn, u0, dict(zip(names, values)))
 
         if values is None:
             node = FunctionCall(_solve, params, name="fem_solve")
             node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
             return node
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
-        check_runtime_values(names, values)
+        check_runtime_values(self.runtime_parameter_exprs, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
         # jit, every call re-stages the solver -- `lax.while_loop` / `custom_root` / `linearize` trace
         # their bodies on each Python call -- so an 8-value sweep cost 48 tracings and the whole point,
@@ -4837,12 +4902,8 @@ class FemResidualOperator:
             first = solve_fn  # the program holds THIS solver's spec objects; a later call binds its own arrays
 
             def _run(u0_arg, pstates, *value_args):
-                args = dict(zip(names, value_args))
-                rf = lambda u: self.residual(u, args)  # noqa: E731
                 with bound_state(precond_state(getattr(first, "precond", None))[0], pstates):
-                    if _takes_jacobian(first) and self.jacobian is not None:
-                        return first(rf, u0_arg, jacobian=self._jacobian_handle(args), **_xa(args))
-                    return first(rf, u0_arg, **_xa(args))
+                    return _drive(first, u0_arg, dict(zip(names, value_args)))
 
             if names:
                 fn = cache[key] = jax.jit(_run)
@@ -6488,6 +6549,41 @@ def _child_placeholders(node):
         out = [e for e in (node.volume_value_expr, node.volume_grad_expr) if e is not None]
         return out + list(node.boundary_value_exprs.values())
     return []
+
+
+def refuse_point_index(expr: Placeholder) -> Placeholder:
+    """``expr`` unchanged, after refusing an integer index on the point axis of a per-point field.
+
+    A per-point field is ``(points, components)``, so on the collocation path ``u[0]`` -- for
+    ``u = net(x, y)``, a coordinate, or what pointwise arithmetic and derivatives build from them -- is
+    POINT 0, broadcast against every other point: a plausible residual of the wrong problem, never an
+    error. Component ``i`` is ``u[..., i]``.
+
+    Weak-form (``jno.fem``) trees are left alone: their lowering reads ``u[i]`` on a trial as the
+    component. That is why this runs where a collocation expression is compiled rather than in
+    ``Placeholder.__getitem__``, which cannot tell the two apart.
+
+    Raises:
+        IndexError: naming the expression and the ``[..., i]`` spelling.
+    """
+    if _contains_variational(expr):
+        return expr
+    seen, stack = set(), [expr]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        key = getattr(node, "getitem_key", None) if isinstance(node, FunctionCall) else None
+        if key and isinstance(key[0], int) and not isinstance(key[0], bool) and _is_per_point_field(node.args[0]):
+            i = key[0]
+            raise IndexError(
+                f"{node.args[0]!r}[{i}] picks collocation POINT {i}: the first axis of a per-point field has one "
+                f"entry per point. For component {i} (an output of a network, a coordinate of a vector field) "
+                f"write [..., {i}]. To read the value at one point, evaluate the field and index the array."
+            )
+        stack.extend(_child_placeholders(node))
+    return expr
 
 
 def fuse_laplacian(expr: Placeholder) -> Placeholder:

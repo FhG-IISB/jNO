@@ -220,3 +220,39 @@ def test_diff_raises_when_wrt_does_not_occur_in_the_energy():
     psi = MU * trace(C)
     with pytest.raises(ValueError, match="does not occur"):
         jno.np.diff(psi, I3 + grad(u, X))  # a FRESH node, not the `F` inside `psi`
+
+
+def _neo_hookean_bar(drop):
+    """Neo-Hookean bar [0,4]x[0,1]^2, clamped at x=0, its x=4 face moved by (0, 0, -drop)."""
+    trace, inner, grad, det, log = jno.np.trace, jno.np.inner, jno.np.grad, jno.np.det, jno.np.log
+    d = jno.shape.box(0.0, 0.0, 0.0, 4.0, 1.0, 1.0, size=0.5).domain()
+    d.tag("root", lambda x, y, z: x < 1e-6)
+    d.tag("tip", lambda x, y, z: x > 4 - 1e-6)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    co = d.variable("interior", split=True)
+    X = [co[0], co[1], co[2]]
+    F, C, _ = _kinematics(u, X)
+    J = det(F)
+    psi = MU / 2 * (trace(C) - 3.0) - MU * log(J) + LAM / 2 * log(J) ** 2
+    return jno.fem(
+        [
+            inner(jno.np.diff(psi, F), grad(phi, X), 2),
+            u(*d.variable("root", split=True)[:3]) - (0.0, 0.0, 0.0),
+            u(*d.variable("tip", split=True)[:3]) - (0.0, 0.0, -drop),
+        ]
+    )
+
+
+def test_a_large_prescribed_displacement_converges_from_rest():
+    """Newton from u = 0 used to start at the PROJECTED state -- the tip face at -drop, its neighbours at 0 --
+    which inverts the cells next to the face (ln J -> NaN after one step). The first step now carries the
+    boundary increment into the interior, as a row-replacement code's would. Oracle: the same state reached by
+    load stepping (drop/2, then drop warm-started), a path that never makes the large jump."""
+    newton = jno.solve.newton(direct=True, rtol=1e-10, atol=1e-12, max_steps=30)
+    lu = jno.solve.lu()
+    direct = np.asarray(_neo_hookean_bar(0.4).solve(nonlinear=newton, linear=lu))
+    half = _neo_hookean_bar(0.2).solve(nonlinear=newton, linear=lu)
+    stepped = np.asarray(_neo_hookean_bar(0.4).solve(nonlinear=newton, linear=lu, x0=half))
+    assert np.isfinite(direct).all()
+    assert np.abs(direct).max() == pytest.approx(0.4, rel=1e-12)  # the tip face holds its prescribed drop
+    np.testing.assert_allclose(direct, stepped, rtol=0, atol=1e-9)  # both Newton-converged to rtol 1e-10
