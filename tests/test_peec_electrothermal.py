@@ -86,12 +86,12 @@ def test_one_way_coupling_reproduces_the_two_solves_done_separately():
         _quiet(
             lambda: jno.fem(
                 [d2.k * (Ti.x * si.x + Ti.y * si.y + Ti.z * si.z) - d2.Q * si, T2(*_pad(d2, "N")) - 300.0]
-            ).solve()
+            ).solve(linear=jno.solve.lu())
         )
     ).reshape(-1)
-    # the hand-written solve runs the default iterative solver (relative tolerance 1e-8 on the residual),
-    # the coupled one a direct solve, so they agree to the iterative solver's accuracy, not to round-off
-    assert np.max(np.abs(field - by_hand)) < 1e-6 * np.max(np.abs(by_hand))
+    # both solves direct, so they agree to round-off; the default iterative solver (1e-8 on the
+    # residual) left 5e-7 here on one machine and 1.4e-6 on another
+    assert np.max(np.abs(field - by_hand)) < 1e-10 * np.max(np.abs(by_hand))
     assert field.max() > 300.0 + 1e-3, "the loss must actually heat the conductor"
 
 
