@@ -73,13 +73,30 @@ def _load():
                 return None
             cache.mkdir(parents=True, exist_ok=True)
             tmp = so.with_suffix(f".{os.getpid()}.tmp")
-            cmd = [nvcc, "-O2", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", f"-I{inc_jax}", f"-I{inc_nv}",
-                   str(_SRC), "-o", str(tmp), f"-L{lib_nv}", "-l:libcudss.so.0", "-Xlinker", f"-rpath={lib_nv}"]
+            cmd = [
+                nvcc,
+                "-O2",
+                "-std=c++17",
+                "-shared",
+                "-Xcompiler",
+                "-fPIC",
+                f"-I{inc_jax}",
+                f"-I{inc_nv}",
+                str(_SRC),
+                "-o",
+                str(tmp),
+                f"-L{lib_nv}",
+                "-l:libcudss.so.0",
+                "-Xlinker",
+                f"-rpath={lib_nv}",
+            ]
             if subprocess.run(cmd, capture_output=True).returncode != 0:
                 return None
             tmp.replace(so)  # atomic: a concurrent builder never loads a half-written library
         lib = ctypes.cdll.LoadLibrary(str(so))
-        lib.jno_cudss_factor.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64] + [ctypes.c_void_p] * 5 + [ctypes.c_int]
+        lib.jno_cudss_factor.argtypes = (
+            [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64] + [ctypes.c_void_p] * 5 + [ctypes.c_int]
+        )
         lib.jno_cudss_factor.restype = ctypes.c_int
         lib.jno_cudss_free.argtypes = [ctypes.c_int64]
         jax.ffi.register_ffi_target("jno_cudss_solve", jax.ffi.pycapsule(lib.jno_cudss_solve), platform="CUDA")
@@ -128,8 +145,17 @@ def factor(slot: int, B, r=None, c=None, matching: int = 5) -> None:
     val = np.ascontiguousarray(B.data, dtype=np.complex128)
     r = np.ascontiguousarray(np.ones(n) if r is None else r, dtype=np.float64)
     c = np.ascontiguousarray(np.ones(n) if c is None else c, dtype=np.float64)
-    st = lib.jno_cudss_factor(int(slot), n, int(B.nnz), ptr.ctypes.data, idx.ctypes.data, val.ctypes.data,
-                              r.ctypes.data, c.ctypes.data, int(matching))
+    st = lib.jno_cudss_factor(
+        int(slot),
+        n,
+        int(B.nnz),
+        ptr.ctypes.data,
+        idx.ctypes.data,
+        val.ctypes.data,
+        r.ctypes.data,
+        c.ctypes.data,
+        int(matching),
+    )
     if st != 0:
         raise RuntimeError(f"jno: cuDSS factorisation failed (status {st}).")
 
