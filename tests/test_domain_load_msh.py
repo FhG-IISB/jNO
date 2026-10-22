@@ -115,6 +115,36 @@ def test_physical_groups_survive_derivation(tmp_path):
     assert len(np.atleast_1d(d.tag_indices["steel"])) > 0
 
 
+def test_gmsh_22_physical_groups_become_tags(tmp_path):
+    """A ``.msh`` 2.2 file carries its physical groups as ``gmsh:physical`` cell data plus a name table
+    (``field_data``), not as ``cell_sets``; they were dropped, so a face the author named ``inlet`` was
+    not a tag and only the derived ``interior`` / ``boundary`` existed."""
+    m, _, _ = Geometries.equi_distant_rect(nx=4, ny=4)(None)
+    pts, tri = np.asarray(m.points), _blocks(m)["triangle"]
+    edges = np.array(
+        [
+            [a, b]
+            for t in tri
+            for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))
+            if pts[a, 0] < 1e-9 and pts[b, 0] < 1e-9
+        ]
+    )
+    mesh = meshio.Mesh(
+        points=pts,
+        cells=[("line", edges), ("triangle", tri)],
+        cell_data={
+            "gmsh:physical": [np.full(len(edges), 1), np.full(len(tri), 2)],
+            "gmsh:geometrical": [np.full(len(edges), 1), np.full(len(tri), 1)],
+        },
+        field_data={"inlet": np.array([1, 1]), "body": np.array([2, 2])},
+    )
+    d = jno.domain(_write(tmp_path, "named22.msh", mesh, "gmsh22"))
+    assert {"inlet", "body", "boundary"} <= set(d.avaiable_mesh_tags)
+    d.variable("inlet", split=True)
+    inlet = np.asarray(d.context["inlet"]).reshape(-1, np.asarray(d.context["inlet"]).shape[-1])
+    assert inlet.shape[0] == 5 and np.allclose(inlet[:, 0], 0.0)  # the 5 nodes of the left edge, nothing else
+
+
 # ------------------------------------------------------------------------ the boundary can be split
 
 

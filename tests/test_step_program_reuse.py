@@ -39,6 +39,17 @@ class TestStepProgramReuse:
         crux.solve(2)
         assert crux._jit_program_cache["step"] is first, "the second solve must reuse the same jitted callable"
 
+    def test_a_reused_step_does_not_announce_a_compile(self, monkeypatch):
+        """The second solve logged "Reusing the compiled step function" and then "JIT compiling step function
+        ... this might take a while" for a program it did not compile."""
+        _, crux = _core()
+        crux.solve(2)
+        said = []
+        monkeypatch.setattr(crux.log, "info", lambda msg, *a, **k: said.append(str(msg)))
+        crux.solve(2)
+        assert any("Reusing the compiled step" in m for m in said)
+        assert not any("JIT compiling step function" in m for m in said), said
+
     def test_reuse_does_not_change_the_answer(self):
         """Two chunks and one chunk of the same length must land in the same place.
 

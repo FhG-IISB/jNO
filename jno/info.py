@@ -40,13 +40,17 @@ _RULE = "─"
 MAX_ROWS = 24
 
 
+_UNCAPPED = {"expression tree"}
+
+
 class Info:
     """A printable report. ``str(...)`` renders it; :meth:`as_dict` returns the same content."""
 
     def __init__(self, title: str, sections: list[tuple[str, list[tuple[str, Any]]]], *, cap: int | None = None):
         self.title = title
         cap = MAX_ROWS if cap is None else cap
-        self.sections = [(name, self._cap(rows, cap)) for name, rows in sections]
+        # a tree is shown whole: cut, it no longer says what the expression is
+        self.sections = [(name, rows if name in _UNCAPPED else self._cap(rows, cap)) for name, rows in sections]
 
     @staticmethod
     def _cap(rows, cap: int):
@@ -85,6 +89,125 @@ def _fmt_n(x) -> str:
         return f"{int(x):,}"
     except Exception:  # noqa: BLE001
         return str(x)
+
+
+def _equation_rows(exprs, labels=None, measures=None) -> list:
+    """The expressions in mathematical notation (:mod:`jno.trace.pretty`), one row each, then the ``where``
+    rows defining the fields and networks they read."""
+    from .trace.pretty import equation, field_names, scheme_notes, where_rows
+
+    exprs = [getattr(e, "_expr", e) for e in exprs]
+    try:
+        names, defs = field_names(exprs)
+    except Exception as e:  # noqa: BLE001 -- a report never fails on an expression it cannot spell
+        return [("", f"unavailable ({type(e).__name__}: {e})")]
+    rows = []
+    for i, e in enumerate(exprs):
+        eq, loss = equation(e, names, measure=measures[i] if measures is not None else None)
+        key = labels[i] if labels is not None and i < len(labels) else f"[{i}]"
+        note = " · ".join(([loss] if loss else []) + scheme_notes(e))  # mse · FD
+        rows.append((key, eq + (f"   ({note})" if note else "")))
+    return rows + where_rows(defs, names)
+
+
+def _parameter_rows(flax_mods: dict, models: dict) -> list:
+    """What training will do with each model's parameters -- the summary ``solve()`` logs, from the same rule
+    (``core._trainable_filter``): per model its policy and trainable / frozen / LoRA counts, then the totals.
+    LoRA adapters do not exist before ``solve()`` adds them; they are counted on a copy."""
+    import jax
+
+    from .architectures.lora import apply_lora
+    from .core import _parameter_counts, _trainable_filter
+
+    models = dict(models)
+    lora_counts = {}
+    for lid, fm in flax_mods.items():
+        if getattr(fm, "_lora_config", None) is not None and lid in models:
+            size = lambda t: sum(int(x.size) for x in jax.tree_util.tree_leaves(t) if hasattr(x, "size"))  # noqa: E731
+            before = size(models[lid])
+            models[lid] = apply_lora(
+                models[lid],
+                key=jax.random.PRNGKey(0),
+                specs=fm._lora_config,
+                param_mask=getattr(fm, "_lora_param_mask", None),
+            )
+            lora_counts[lid] = size(models[lid]) - before
+    counts = _parameter_counts(models, _trainable_filter(models, flax_mods), flax_mods, lora_counts)
+    rows = []
+    for name, policy, train, frozen, lora in counts:
+        rows.append(
+            (
+                f"[{name}]",
+                f"{policy} · {_fmt_n(train)} trainable · {_fmt_n(frozen)} frozen"
+                + (f" · {_fmt_n(lora)} LoRA" if lora else ""),
+            )
+        )
+    if len(counts) > 1:
+        tr, fr, lo = (sum(c[k] for c in counts) for k in (2, 3, 4))
+        rows.append(
+            (
+                "total",
+                f"{_fmt_n(tr)} trainable · {_fmt_n(fr)} frozen · {_fmt_n(tr + fr)} total"
+                + (f" (LoRA {_fmt_n(lo)})" if lo else ""),
+            )
+        )
+    try:
+        import paramax
+
+        wrapped = any(
+            isinstance(leaf, paramax.AbstractUnwrappable)
+            for m in models.values()
+            for leaf in jax.tree_util.tree_leaves(m, is_leaf=lambda x: isinstance(x, paramax.AbstractUnwrappable))
+        )
+        if wrapped:
+            rows.append(("paramax", "parametrised arrays (paramax wrappers) are unwrapped before each forward evaluation"))
+    except ImportError:
+        pass
+    return rows
+
+
+def _expression_tree_rows(c) -> list:
+    """Every constraint of a core as a tree in mathematical notation, each node with its shape.
+
+    The shapes come from one abstract evaluation (``jax.eval_shape``: nothing is computed) on the context the
+    training step sees; a node only evaluated inside a derivative pass has no batched shape and says so."""
+    import jax
+
+    from .trace import FunctionCall
+    from .trace.pretty import _fn_name, field_names, tree, where_rows
+    from .trace_evaluator import TraceEvaluator
+
+    exprs = [getattr(e, "_expr", e) for e in (getattr(c, "constraints", None) or [])]
+    names, defs = field_names(exprs)
+    ctx = c._build_shape_context(min_consecutive=1)
+    evaluator = TraceEvaluator(c._unwrapped_models)
+    shapes: dict = {}
+    dispatch = evaluator._dispatch  # every node passes here, however its value is obtained (memo, shared pass)
+
+    def recording(node, ectx):
+        out = dispatch(node, ectx)
+        if ectx.context is ctx and hasattr(out, "shape"):
+            shapes.setdefault(id(node), str(tuple(out.shape)))
+        return out
+
+    evaluator._dispatch = recording
+    rows, defined = [], {}
+    for i, e in enumerate(exprs):
+        try:
+            jax.eval_shape(lambda e=e: evaluator.evaluate(e, ctx, {}, jax.random.PRNGKey(0)))
+        except Exception as err:  # noqa: BLE001
+            rows.append(("", f"[{i}] shapes unavailable ({type(err).__name__}: {err})"))
+        root, loss = e, ""
+        if isinstance(e, FunctionCall) and _fn_name(e) in ("mse", "mae"):
+            root, loss = e.args[0], f" → {_fn_name(e)} → {shapes.get(id(e), '()')}"
+        lines = tree(root, names, shapes, defined=defined)
+        lines[0] = f"[{i}] {lines[0]}{loss}"
+        rows += [("", ("    " if k else "") + ln) for k, ln in enumerate(lines)]
+    # what the trees use by name, defined once
+    rows += [
+        ("", ("where " if k == "where" else "      ") + v) for k, v in where_rows(defs, names, shapes=defined, width=56)
+    ]
+    return rows
 
 
 def _bytes(n: float) -> str:
@@ -150,13 +273,16 @@ def _info_domain(d, deep: bool) -> Info:
                 continue
             seen_pairs.add(frozenset((a, b)))
         ctx = getattr(d, "context", None) or {}
-        if tag in pool:
-            row = f"{_fmt_n(np.asarray(pool[tag]).shape[0])} points"
+        # The points a constraint trains on are the ones in `context` (what `variable(tag, sample=...)` drew);
+        # the mesh pool beside them is only reported when it differs.
+        n_pool = np.asarray(pool[tag]).shape[0] if tag in pool else None
+        if tag in ctx and np.ndim(ctx[tag]) >= 2:
+            n_used = np.shape(ctx[tag])[-2]
+            row = f"{_fmt_n(n_used)} points" + (f" (mesh {_fmt_n(n_pool)})" if n_pool not in (None, n_used) else "")
+        elif n_pool is not None:
+            row = f"{_fmt_n(n_pool)} points"
         elif entry.get("point_indices") is not None:
             row = f"{_fmt_n(len(entry['point_indices']))} points"
-        elif tag in ctx and np.ndim(ctx[tag]) >= 2:
-            # A region added after the mesh is sampled into `context` on first use, not into the pool.
-            row = f"{_fmt_n(np.shape(ctx[tag])[-2])} points"
         else:
             row = "not sampled yet"
         # Extents for a boundary tag -- the check that `lambda x, y: y > 1-1e-9` actually caught the
@@ -472,7 +598,22 @@ def _info_fem(f, deep: bool) -> Info:
         bb = np.asarray(b).reshape(-1)
         op.append(("load ‖b‖", f"{np.linalg.norm(bb):.4g}" + ("   ← ALL ZERO" if not np.any(bb) else "")))
 
-    sections = [("form", form), ("terms (as classified)", terms), ("field blocks", blocks), ("operator", op)]
+    written = list(getattr(f, "_constraints", None) or [])
+    if written:
+        cls = list(getattr(f, "classification", None) or [])
+        eq_labels = [f"[{i}] {cls[i]}" for i in range(len(written))] if len(cls) == len(written) else None
+        # a weak-form term is the integrand of what it contributes: ∫ (…) dx on a volume, ∫ (…) ds on a surface
+        measures = (
+            [("dx" if c.startswith("volume") else "ds" if c.startswith("surface") else None) for c in cls]
+            if eq_labels
+            else None
+        )
+        equations = _equation_rows(written, eq_labels, measures)
+        sections = [("form", form), ("equations", equations), ("field blocks", blocks), ("operator", op)]
+        if eq_labels is None:
+            sections.insert(2, ("terms (as classified)", terms))
+    else:
+        sections = [("form", form), ("terms (as classified)", terms), ("field blocks", blocks), ("operator", op)]
     st = getattr(f, "stats", None)
     if st:
         sections.append(("last solve", _last_solve_rows(st)))
@@ -598,7 +739,9 @@ def _info_fdm(o, deep: bool) -> Info:
     if d is not None and getattr(d, "time", None):
         t0, t1, nt = d.time
         rows.append(("time", f"[{t0}, {t1}] · {nt} steps"))
-    return Info("fdm (collocation)", [("solver", rows)])
+    written = list(getattr(o, "_constraints", None) or [])
+    sections = [("equations", _equation_rows(written))] if written else []
+    return Info("fdm (collocation)", sections + [("solver", rows)])
 
 
 def _subdomain_label(prob, geom=None) -> str:
@@ -711,12 +854,16 @@ def _info_core(c, deep: bool) -> Info:
             models.append((f"[{key}]", type(m).__name__))
     if len(models) > 1:
         models.append(("total", f"{_fmt_n(total)} parameters"))
-    cons: list = []
+    labels = []
     try:
+        ctx = getattr(getattr(c, "domain", None), "context", None) or {}
         for i, t in enumerate(c.get_constraint_tags(c.constraints)):
-            cons.append((f"[{i}]", str(t)))
+            tags = sorted(map(str, t)) if isinstance(t, (set, list, tuple)) else [str(t)]
+            n = [np.shape(ctx[k])[-2] for k in tags if k in ctx and np.ndim(ctx[k]) >= 2]
+            labels.append(f"[{i}] {', '.join(tags)}" + (f" · {_fmt_n(n[0])} pts" if len(n) == 1 else ""))
     except Exception:  # noqa: BLE001
-        cons = [("count", _fmt_n(len(getattr(c, "constraints", []) or [])))]
+        labels = None
+    cons = _equation_rows(list(getattr(c, "constraints", []) or []), labels)
     training: list = []
     dom = getattr(c, "domain", None)
     if dom is not None:
@@ -766,15 +913,18 @@ def _info_core(c, deep: bool) -> Info:
             coupling = [("method", f"undetermined ({type(e).__name__}: {e})")]
         sections = [("models", models), ("subdomain solves", cons), ("coupling", coupling), ("training", training)]
     else:
-        sections = [("models", models), ("constraints", cons), ("training", training)]
+        try:
+            params = _parameter_rows(c._collect_flax_modules() or {}, getattr(c, "models", None) or {})
+        except Exception as e:  # noqa: BLE001
+            params = [("", f"unavailable ({type(e).__name__}: {e})")]
+        sections = [("models", models), ("parameters", params), ("equations", cons), ("training", training)]
     if deep:
         # What `core.print_tree()` and `core.print_shapes()` used to print. They were two more
         # spellings to know about; as text builders they become sections of the one report.
-        for label, fn in (("computation tree", "_tree_text"), ("tensor shapes", "_shapes_text")):
-            try:
-                sections.append((label, [("", line) for line in str(getattr(c, fn)()).splitlines() if line.strip()]))
-            except Exception as e:  # noqa: BLE001
-                sections.append((label, [("", f"unavailable ({type(e).__name__}: {e})")]))
+        try:
+            sections.append(("expression tree", _expression_tree_rows(c)))
+        except Exception as e:  # noqa: BLE001
+            sections.append(("expression tree", [("", f"unavailable ({type(e).__name__}: {e})")]))
     return Info("core", sections)
 
 
@@ -982,6 +1132,11 @@ def _info_model(m, deep: bool) -> Info:
         rows.append(("frozen", "yes — excluded from the optimizer"))
 
     sections = [("", rows)]
+    if mod is not None:
+        try:
+            sections.append(("parameters", _parameter_rows({0: m}, {0: mod})))
+        except Exception as e:  # noqa: BLE001
+            sections.append(("parameters", [("", f"unavailable ({type(e).__name__}: {e})")]))
     inference: list = []
     for cfg_name, cfg in (("bayesian", getattr(m, "_bayesian_cfg", None)), ("vi", getattr(m, "_vi_cfg", None))):
         if not cfg:

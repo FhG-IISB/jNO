@@ -5143,7 +5143,7 @@ def run_adaptive_transient(
     if values is not None:
         from ...trace import check_runtime_values
 
-        check_runtime_values(_pnames, values)
+        check_runtime_values(dict(getattr(fem._op, "runtime_parameter_exprs", None) or {}), values)
         step_args = {n: jnp.asarray(v) for n, v in values.items()}
     if solve_fn is not None:
         raise NotImplementedError(

@@ -1451,11 +1451,21 @@ class TraceCompiler:
             # over ALL of them, too: a solve or integral node shared by the objective and a constraint is
             # computed once for the whole list, not once per expression (the evaluator's memo is scoped to
             # the outermost evaluate; this makes the list that outermost scope).
-            evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots = True, {}, list(exprs)
+            evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots, evaluator._node_memo = (
+                True,
+                {},
+                list(exprs),
+                {},
+            )
             try:
                 return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
             finally:
-                evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots = False, {}, []
+                evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots, evaluator._node_memo = (
+                    False,
+                    {},
+                    [],
+                    None,
+                )
 
         # Collect tags from ALL expressions so batch inference is scoped.
         expr_tags = set()

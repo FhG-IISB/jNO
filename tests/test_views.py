@@ -943,7 +943,9 @@ class TestBindKwargsForm:
         np.testing.assert_allclose(_eval(u_named.x.expr, ctx), [[2 * 0.5 * 0.7]], atol=1e-6)
         np.testing.assert_allclose(_eval(u_named.xx.expr, ctx), [[2 * 0.7]], atol=1e-6)
         np.testing.assert_allclose(_eval(u_named.xy.expr, ctx), [[2 * 0.5]], atol=1e-6)
-        np.testing.assert_allclose(_eval(u_named.xxy.expr, ctx), [[2.0]], atol=1e-6)
+        # a mixed third derivative comes from a weighted sum of Taylor passes along a few directions, which
+        # costs a few float32 ulp (2.0000019 here), so this one is compared relatively
+        np.testing.assert_allclose(_eval(u_named.xxy.expr, ctx), [[2.0]], rtol=1e-5)
         # 4th order: u.xxxy = 0
         np.testing.assert_allclose(_eval(u_named.xxxy.expr, ctx), [[0.0]], atol=1e-6)
 

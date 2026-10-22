@@ -48,6 +48,7 @@ dependencies = [
     "blackjax>=1.2",
 
     "fenics-basix", "matfree>=0.6.1,<0.7",
+    "folx>=0.2.30,<0.3",  # forward Laplacian: one pass for value, gradient and Laplacian of a PINN target
 ]
 
 [project.urls]

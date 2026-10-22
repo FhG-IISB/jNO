@@ -2207,6 +2207,7 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     # whose `_step_solve` takes the four documented arguments and nothing else).
     step_solve.wants_scale = True
     step_solve.wants_operator = True
+    step_solve.direct = bool(getattr(solver, "direct", False))
     # Value identity for the march cache (`backend_blocks._value_identity`): a fresh closure per fem.solve, but
     # the same solver and preconditioner for the same block (the cache lives on the block) is the same step.
     step_solve.cache_key = (
