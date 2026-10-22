@@ -4240,7 +4240,7 @@ def prolongation_from_ties(
     }
 
 
-def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-12) -> Dict[str, object]:
+def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-12, prescribed=None) -> Dict[str, object]:
     """Master–slave prolongation ``P`` for homogeneous linear constraints ``C·u_node = 0`` at nodes.
 
     One row of ``C`` per condition; the canonical case is a slip / no-penetration wall, where the row
@@ -4265,9 +4265,18 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
     ``prolong_periodic`` / ``restrict_state_periodic``), at **DOF level** (``vec = 1``, ``kept_nodes``
     holding retained DOF ids), so the whole reduce/solve/prolong path is reused unchanged.
 
+    ``prescribed`` maps DOF ids that an essential condition already fixes to their value (``None`` when it
+    is not a concrete number, e.g. time-varying). Such a DOF is never chosen as a pivot: it keeps its own
+    row, so the Dirichlet value can still be imposed into it after the reduction, and it enters the
+    eliminated components' rows like any other retained DOF -- exact for any value. A condition that
+    involves ONLY prescribed components (a slip wall meeting a face that already fixes the normal
+    component, e.g. ``n = e_y`` where ``u_y = 0``) has nothing left to eliminate; it is dropped when the
+    prescribed values satisfy it, and raises when they contradict it or cannot be checked.
+
     Scope: homogeneous conditions only (``C·u = 0``). A non-homogeneous ``C·u = g`` needs an affine
     offset ``u = P ũ + u_0``, which this prolongation cannot carry — the caller must reject it.
     """
+    prescribed = {} if prescribed is None else {int(k): v for k, v in dict(prescribed).items()}
     node_dofs = np.asarray(node_dofs, dtype=np.int64)
     if node_dofs.ndim != 2:
         raise ValueError(f"build_slip_prolongation: node_dofs must be (K, d); got {node_dofs.shape}.")
@@ -4297,6 +4306,7 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
     data: List[float] = []
     eliminated: List[int] = []
     per_node: List[Tuple[np.ndarray, np.ndarray]] = []  # (pivot local ids, reduced coefficient block)
+    dropped: List[Tuple[int, np.ndarray]] = []  # (node index, condition row) satisfied by prescribed values
 
     for a in range(K):
         C = blocks_in[a].copy()  # (m, d)
@@ -4319,24 +4329,49 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
         R = C.copy()
         pivots: List[int] = []
         free = list(range(d))
+        fixed = {j for j in range(d) if int(node_dofs[a, j]) in prescribed}
+        live: List[int] = []  # rows that eliminate a component; a dropped row eliminates none
         for i in range(m):
-            cand = [(abs(R[i, j]), j) for j in free]
-            mag, j = max(cand)
-            if mag <= 1e-8:
+            mag_any = max(abs(R[i, j]) for j in free)
+            if mag_any <= 1e-8:
                 raise ValueError(
                     f"build_slip_prolongation: the conditions at the node with DOFs {node_dofs[a].tolist()} "
-                    f"are numerically parallel (pivot {mag:.3e} after eliminating {pivots}). Two slip "
+                    f"are numerically parallel (pivot {mag_any:.3e} after eliminating {pivots}). Two slip "
                     "surfaces meeting at a near-tangent angle cannot both be imposed exactly; tag the "
                     "shared edge into one region, or impose one of them weakly."
                 )
+            cand = [(abs(R[i, j]), j) for j in free if j not in fixed]
+            mag, j = max(cand) if cand else (0.0, -1)
+            if mag <= 1e-8:
+                # Only prescribed components are left in this condition: it is a statement about values
+                # already fixed, so it constrains nothing new -- provided those values satisfy it.
+                vals = [prescribed[int(node_dofs[a, k])] for k in free if abs(R[i, k]) > 1e-8]
+                if any(v is None for v in vals):
+                    raise ValueError(
+                        f"build_slip_prolongation: the slip condition at the node with DOFs "
+                        f"{node_dofs[a].tolist()} involves only components an essential condition prescribes, "
+                        "with a value that is not a concrete number, so it cannot be checked against them. "
+                        "Prescribe that component as a constant, or keep the slip region off this face."
+                    )
+                res = sum(R[i, k] * complex(prescribed[int(node_dofs[a, k])]).real for k in free if abs(R[i, k]) > 1e-8)
+                ref = max([1.0] + [abs(complex(v)) for v in vals])
+                if abs(res) > 1e-10 * ref:
+                    raise ValueError(
+                        f"build_slip_prolongation: the slip condition at the node with DOFs "
+                        f"{node_dofs[a].tolist()} contradicts the values an essential condition prescribes "
+                        f"there (n·u = {res:.3e} != 0 from the prescribed components alone)."
+                    )
+                dropped.append((a, R[i].copy()))
+                continue
             pivots.append(j)
             free.remove(j)
+            live.append(i)
             R[i] = R[i] / R[i, j]
             for i2 in range(m):
                 if i2 != i:
                     R[i2] = R[i2] - R[i2, j] * R[i]
         # After full reduction: u_pivot[i] = -sum_j R[i, j] * u_free[j]
-        per_node.append((np.array(pivots, dtype=np.int64), R))
+        per_node.append((np.array(pivots, dtype=np.int64), R[live]))
         eliminated.extend(int(node_dofs[a, j]) for j in pivots)
 
     if len(set(eliminated)) != len(eliminated):
@@ -4390,6 +4425,8 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
         "is_selection": False,  # an eliminated row is a weighted combination, never a plain selection
         "is_bloch": False,
         "coupling": "slip",
+        # conditions dropped because the prescribed values alone satisfy them: (node index, row)
+        "dropped": dropped,
     }
 
 

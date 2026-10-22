@@ -5842,13 +5842,21 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
     return out
 
 
-def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells: Any, ele_order: int) -> dict:
+def _build_slip_reduction(
+    domain: Any, slip_bcs: List[Any], fem_obj: Any, cells: Any, ele_order: int, prescribed: Any = None, tv_dofs: Any = None
+) -> dict:
     """Exact elimination of the slip conditions ``n·u = 0`` -> a prolongation in the periodic format.
 
     Each condition removes one velocity component per constrained node (partial-pivoted, see
     :func:`~jno.utils.solver.fem_utils.build_slip_prolongation`); every other field passes through as an
     identity block. Reusing the periodic reduction's dict shape means the reduce / solve / prolong /
     restrict path needs no new branch — ``fem.solve`` sees a reduced system exactly as it does for a tie.
+
+    ``prescribed`` (``(dof, value)`` pairs, coupled numbering) and ``tv_dofs`` (time-varying prescribed
+    DOFs) are the essential conditions of the same form. A prescribed component is never eliminated, and a
+    condition that only restates prescribed values is dropped (see ``build_slip_prolongation``): where a slip
+    wall meets a face that already fixes the normal component, eliminating it would leave that boundary
+    condition no row to be imposed into.
     """
     from jax.experimental import sparse as jsparse
 
@@ -5925,10 +5933,19 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
         nodes = sorted(merged)
         node_dofs = np.asarray([[n * vec_i + c for c in range(vec_i)] for n in nodes], dtype=np.int64)
         coeff_blocks = [np.stack(merged[n], axis=0) for n in nodes]
-        pro = build_slip_prolongation(n_i, node_dofs, coeff_blocks)
+        lo, hi = (int(offsets[i]), int(offsets[i + 1])) if offsets.size > 1 else (0, n_i)
+        fixed_i = {int(d) - lo: _concrete_value(g) for d, g in (prescribed or ()) if lo <= int(d) < hi}
+        fixed_i.update({int(d) - lo: None for d in (tv_dofs or ()) if lo <= int(d) < hi})
+        pro = build_slip_prolongation(n_i, node_dofs, coeff_blocks, prescribed=fixed_i)
         from .utils.solver import slip_runtime as _srt
 
         if _srt.runtime_info(domain, pts_i, np.asarray(pts_i)[nodes]):
+            if pro["dropped"]:
+                raise NotImplementedError(
+                    "jno.fem: a slip surface that moves with runtime coordinates meets a face whose essential "
+                    "condition already fixes the normal component; the runtime prolongation tracks every "
+                    "slip condition and cannot drop the redundant ones."
+                )
             # The slip surface moves with runtime coordinates: keep P's STRUCTURE, rebuild its values per
             # solve (see `slip_runtime`). The plan's P at the build coordinates must equal the reference.
             if runtime is not None:
@@ -5957,7 +5974,12 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
 
         get_logger().info(
             f"jno.fem: slip `n·u = 0` on {'+'.join(by_field[i])} -> {len(nodes)} node(s), "
-            f"{n_i - int(pro['n_red'])} DOF(s) eliminated exactly."
+            f"{n_i - int(pro['n_red'])} DOF(s) eliminated exactly"
+            + (
+                f"; {len(pro['dropped'])} condition(s) already held by prescribed values, not eliminated."
+                if pro["dropped"]
+                else "."
+            )
         )
         blocks.append({"P": pro["P"], "kept": pro["kept_nodes"], "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
@@ -6169,6 +6191,14 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     else:
         fem_obj._periodic_2n = _duplicate_periodic(per)
     return fem_obj
+
+
+def _concrete_value(g: Any) -> Any:
+    """A prescribed value as a Python number, or ``None`` when it is not concrete (traced / array-valued)."""
+    try:
+        return complex(np.asarray(g).reshape(()))
+    except Exception:  # noqa: BLE001 - traced or not a scalar: nothing to compare eagerly
+        return None
 
 
 def _prescribed_dofs(domain: Any) -> Tuple[list, list]:
@@ -7604,6 +7634,8 @@ def _fem_impl(
                     fem_obj,
                     getattr(domain, "_fem_native_assembly_cells", None),
                     int(getattr(domain, "_fem_native_assembly_order", 1)),
+                    prescribed=_dpairs_c,
+                    tv_dofs=_tvdofs_c,
                 )
             periodic = _build_constant_tie_reduction(
                 fem_obj, const_ties, [d for d, _g in _dpairs_c] + _tvdofs_c, slip=_slip_c
@@ -7644,7 +7676,9 @@ def _fem_impl(
         if slip_bcs:
             # Exact slip elimination. Built in the periodic dict shape so the whole reduce / solve /
             # prolong / restrict path below is reused with no new branch.
-            periodic = _build_slip_reduction(domain, slip_bcs, fem_obj, cells, ele_order)
+            periodic = _build_slip_reduction(
+                domain, slip_bcs, fem_obj, cells, ele_order, prescribed=_dpairs, tv_dofs=_tvdofs
+            )
         elif _nonnodal_topo is not None and _nonnodal_topo.get("family") in ("N1E", "N2E", "RT"):
             # Nédélec N1E (H(curl) edge): DOF-level edge prolongation (Floquet/Bloch, with orientation sign)
             periodic = _build_periodic_reduction_n1e(domain, periodic_ties, fem_obj.offsets)

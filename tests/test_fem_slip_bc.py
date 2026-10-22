@@ -375,3 +375,60 @@ def test_a_trainable_coordinate_off_the_slip_surface_is_allowed():
     yb.trainable()
     fem = jno.fem(terms)
     assert fem.dofs > 0
+
+
+# ---------------------------------------------------------------------------------------------
+# A slip wall meeting a face whose essential condition already fixes the normal component. At the shared
+# corner `n·u = 0` and the Dirichlet value say the same thing; eliminating the prescribed component would
+# leave that condition no row to be imposed into, so the build refused the whole problem.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_prescribed_component_is_never_the_pivot():
+    """Tilted normal, u_y prescribed: the elimination must pivot on u_x, the only free choice, and keep u_y."""
+    from jno.utils.solver.fem_utils import build_slip_prolongation
+
+    n = np.array([0.6, 0.8])  # |n_y| > |n_x|, so without the exclusion u_y would be picked
+    pro = build_slip_prolongation(2, np.array([[0, 1]]), n[None, :], prescribed={1: 0.0})
+    assert pro["kept_nodes"].tolist() == [1]
+    P = np.asarray(pro["P"].todense())
+    for ut in (np.array([0.3]), np.array([-1.7])):
+        assert abs(n @ (P @ ut)) < 1e-14
+
+
+def test_a_condition_on_prescribed_components_only_is_dropped_when_they_satisfy_it():
+    """n = e_y with u_y = 0 prescribed: nothing is left to eliminate and nothing is lost."""
+    from jno.utils.solver.fem_utils import build_slip_prolongation
+
+    pro = build_slip_prolongation(2, np.array([[0, 1]]), np.array([[0.0, 1.0]]), prescribed={1: 0.0})
+    assert pro["n_red"] == 2 and len(pro["dropped"]) == 1
+
+
+@pytest.mark.parametrize("prescribed, match", [({1: 0.5}, "contradicts"), ({1: None}, "not a concrete number")])
+def test_a_condition_on_prescribed_components_only_raises_when_it_cannot_hold(prescribed, match):
+    from jno.utils.solver.fem_utils import build_slip_prolongation
+
+    with pytest.raises(ValueError, match=match):
+        build_slip_prolongation(2, np.array([[0, 1]]), np.array([[0.0, 1.0]]), prescribed=prescribed)
+
+
+def test_slip_wall_meeting_a_clamped_face_keeps_both_conditions():
+    """Vector Poisson on the unit square: slip on the top, u = 0 clamped on the left. The two meet at the
+    top-left corner, where `n·u = u_y = 0` repeats the clamp. Both must hold exactly on the solution."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    ct = d.variable("top", normals=True, split=True)
+    cl = d.variable("left", split=True)
+    grad, inner = jno.np.grad, jno.np.inner
+    vi = phi.bind(x=xi, y=yi)
+    weak = inner(grad(u, [xi, yi]), grad(phi, [xi, yi]), n_contract=2) - (1.0 * vi.component(0) + 0.5 * vi.component(1))
+    ut = u(ct[0], ct[1])
+    fem = jno.fem([weak, ct[-2] * ut[0] + ct[-1] * ut[1] - 0.0, u(cl[0], cl[1]) - 0.0])
+
+    sol = np.asarray(fem.solve()).reshape(-1, 2)
+    pts = np.asarray(fem.field_points[0])
+    top, left = np.abs(pts[:, 1] - 1.0) < 1e-9, np.abs(pts[:, 0]) < 1e-9
+    assert np.abs(sol[top, 1]).max() < 1e-12, "slip wall violated"
+    assert np.abs(sol[left]).max() < 1e-12, "clamp lost at the corner the slip wall shares"
+    assert np.abs(sol[top & ~left, 0]).max() > 1e-3, "the wall should slide, not be clamped"
