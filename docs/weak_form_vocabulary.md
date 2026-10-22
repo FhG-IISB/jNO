@@ -51,7 +51,23 @@ f_dot_v = sum(f[k] * vi[k] for k in range(3))        # components, built one at 
 ```
 
 Both assemble to the same operator (to assembly round-off — the products reduce in a different
-order). The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
+order).
+
+`dot(a, b)` is the per-point product NumPy's `dot` would give each point: vector·vector (a
+scalar), matrix·vector, vector·matrix or matrix·matrix, a scaling when one side is a scalar. Which one
+it is follows from each operand's tensor rank, read from the form (a field's `value_shape`, `grad`
+over several coordinates, a view, a constant such as `identity(3)`); an operand whose rank the form
+does not carry — an opaque `function(...)`, a single-coordinate derivative — or a tensor of rank above 2
+raises and names the explicit spelling. `matmul(a, b)` and `a @ b` are the matrix product on the
+trailing two axes.
+
+```python
+C = dot(transpose(F), F)                 # right Cauchy-Green tensor
+t = dot(sigma, n)                        # traction, matrix · vector
+f_dot_v = inner(dot(F, f), vi)           # a pushed-forward vector against the test function
+```
+
+The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
 dropped. Every *other* additive piece of a form must carry exactly one test field, since the test
 field is what selects the block: a source term is `-f * vi`, never `-f`.
 
@@ -97,7 +113,8 @@ Ku = (kernel(x, y) * u_of(y)).integrate(var=x)
 
 `expr.integrate()` is a domain (or boundary) integral; `expr.integrate(var=x)` is the **non-local**
 kernel form (one value per collocation point — Fredholm-type operators); `expr.integrate(t)` is a
-time-window integral.
+time-window integral; `expr.integrate(d)` integrates known fields (frozen data or solutions) over the
+whole mesh, each on its own element.
 
 ## Geometry symbols
 
@@ -118,6 +135,9 @@ adv  = beta[0]*ui.x + beta[1]*ui.y
 fem  = jno.fem([adv*vi + nu*(ui.x*vi.x + ui.y*vi.y) - f*vi
                 + tau * adv * (beta[0]*vi.x + beta[1]*vi.y), u(xb, yb) - 0.0])
 ```
+
+A component of `jno.np.vector` may be a bare number next to per-point expressions: `jno.np.vector(1.0, 0.0, x)`
+broadcasts the numbers over the points and is exactly `jno.np.vector(1.0 + 0.0*x, 0.0*x, x)`.
 
 ## Coefficients & the escape hatch
 

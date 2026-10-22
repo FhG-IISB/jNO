@@ -373,7 +373,17 @@ def _info_fem(f, deep: bool) -> Info:
         )
     if f.mode == "transient":
         form.append(("time window", f"[{getattr(f, 't0', '?')}, {getattr(f, 't1', '?')}]"))
-    if getattr(f, "_periodic", None) is not None:
+    _per = getattr(f, "_periodic", None)
+    if isinstance(_per, dict) and _per.get("coupling") == "constant_tie":
+        form.append(
+            (
+                "tied to a constant",
+                "yes — the tied DOFs are eliminated"
+                + (" after the slip `n·u = 0` (P_slip · P_tie)" if _per.get("with_slip") else "")
+                + ", solved in the reduced space",
+            )
+        )
+    elif _per is not None:
         form.append(("periodic", "yes — solved in the reduced space, then prolonged"))
     rpe = getattr(getattr(f, "_op", None), "runtime_parameter_exprs", None)
     if rpe:
@@ -410,7 +420,14 @@ def _info_fem(f, deep: bool) -> Info:
     for i in range(max(0, len(offs) - 1)):
         name = labels[i] if i < len(labels) else f"block {i}"
         vs = f" · value_shape {tuple(shapes[i])}" if i < len(shapes) and shapes[i] else ""
-        od = f" · P{orders[i]}" if i < len(orders) else ""
+        _vecs = list(getattr(f, "_block_vecs", None) or [])
+        if vs and i < len(_vecs) and len(tuple(shapes[i])) == 2 and _vecs[i] < int(np.prod(shapes[i])):
+            vs += f" (symmetric, {_vecs[i]} stored per node)"
+        _consts = list(getattr(f, "_block_constant", None) or [])
+        if i < len(_consts) and _consts[i]:
+            od = " · constant (one value over the domain)"
+        else:
+            od = f" · P{orders[i]}" if i < len(orders) else ""
         blocks.append((name, f"dofs {offs[i]}:{offs[i + 1]}  ({_fmt_n(offs[i + 1] - offs[i])}){vs}{od}"))
 
     op: list = []

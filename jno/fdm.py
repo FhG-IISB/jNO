@@ -471,9 +471,33 @@ def _iter(node):
     return iter_children(node) or ()
 
 
+def _refuse_fem_only_unknowns(constraints):
+    """``domain.unknown(order=2)`` (or a non-nodal space, a complex field, ``symmetric=True``) has no valued P1
+    nodal field behind it -- it is an FEM trial symbol -- so there is nothing for a strong-form solve to
+    hold. Say that, rather than reporting that no unknown was found."""
+    from .trace import TrialFunction
+
+    def walk(n):
+        n = _unwrap(n)
+        if isinstance(n, TrialFunction) and n.__dict__.get("_fem_only_unknown", False):
+            raise NotImplementedError(
+                f"jno.fdm([...]): the unknown {n.name!r} (order={n.order}, space={n.space!r}, "
+                f"value_shape={n.value_shape}) is FEM-only -- jno.fdm solves for a real P1 nodal field with "
+                "full storage, i.e. `domain.unknown(...)` with order=1, the default space, complex=False and "
+                "symmetric=False. Solve this one with jno.fem([...])."
+            )
+        for c in _iter(n):
+            walk(c)
+
+    for c in constraints:
+        walk(c)
+
+
 def _find_unknown(constraints):
     """The single ``domain.unknown()`` field (a nodal-field-parameter ModelCall's Model) in the list."""
     from .trace import ModelCall
+
+    _refuse_fem_only_unknowns(constraints)
 
     models = {}
 
@@ -599,6 +623,7 @@ def _find_unknowns(constraints):
     system is the same whichever order the equations are listed in."""
     from .trace import ModelCall
 
+    _refuse_fem_only_unknowns(constraints)
     seen, order = set(), []
 
     def walk(n):

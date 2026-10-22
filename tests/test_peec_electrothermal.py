@@ -149,7 +149,8 @@ def test_a_heat_problem_without_the_loss_is_not_coupled():
 def test_a_default_only_attachment_reads_back_as_a_coefficient():
     d = _domain()
     d.attach(k=K_CU)
-    assert float(np.asarray(d.k)) == K_CU
+    # a Literal that reads the attachment when lowered, so a later `d.attach(k=...)` is seen
+    assert float(np.asarray(d.k.value)) == K_CU
 
 
 def test_a_one_element_parameter_is_one_conductivity_for_the_whole_conductor():

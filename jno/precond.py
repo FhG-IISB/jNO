@@ -25,6 +25,9 @@ the per-field blocks of the reduced ``P^T A P`` the solve runs on); :func:`form`
 
 from __future__ import annotations
 
+import functools
+import inspect
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -50,7 +53,6 @@ __all__ = [
     "hypre",
     "ilu",
     "jaxamg",
-    "cached",
     "ams",
     "real_equivalent",
     "gmg",
@@ -60,8 +62,50 @@ __all__ = [
 ]
 
 
+def _reusing(spec, reuse):
+    """``spec`` kept across solves as ``reuse`` says: ``False`` (rebuilt every solve), ``True`` (built on the
+    first solve, then frozen), or an ``int k >= 1`` (rebuilt every k-th solve)."""
+    if reuse is False or reuse is None:
+        return spec
+    if reuse is True:
+        return _Cached(spec, False)
+    if isinstance(reuse, (int, np.integer)) and not isinstance(reuse, bool) and int(reuse) >= 1:
+        return _Cached(spec, int(reuse))
+    raise ValueError(
+        f"jno.precond: reuse={reuse!r} means nothing here. Use reuse=False (rebuild the setup every solve, the "
+        "default), reuse=True (build it on the first solve and keep it), or reuse=k, a whole number >= 1 "
+        "(rebuild it every k-th solve)."
+    )
+
+
+_REUSE_DOC = """
+
+    reuse:
+        Keep what the setup built across solves -- the keyword ``jno.solve.lu`` and ``jno.solve.newton`` use
+        for a factorization and a tangent. ``False`` (default) rebuilds it every solve; ``True`` builds it on
+        the first solve and keeps it, so pass the SAME spec object to every solve; ``k`` (an int) rebuilds it
+        every k-th solve. A kept setup only changes the iteration count, never the answer.
+"""
+
+
+def _reusable(fn):
+    """Give a preconditioner constructor the keyword-only ``reuse=`` argument (see :func:`_reusing`)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, reuse=False, **kwargs):
+        return _reusing(fn(*args, **kwargs), reuse)
+
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+    at = next((i for i, q in enumerate(params) if q.kind is inspect.Parameter.VAR_KEYWORD), len(params))
+    params.insert(at, inspect.Parameter("reuse", inspect.Parameter.KEYWORD_ONLY, default=False, annotation="bool | int"))
+    wrapper.__signature__ = sig.replace(parameters=params)
+    wrapper.__doc__ = (fn.__doc__ or "").rstrip() + _REUSE_DOC
+    return wrapper
+
+
 class _Spec:
-    """Base for ``jno.precond.*`` specs — gives every preconditioner a fluent ``.cached()``.
+    """Base for ``jno.precond.*`` specs.
 
     ``complex_ok`` declares that a spec can be applied to a **complex** operator directly. It is read
     where a consumer would otherwise have to reformulate: AMS splits each complex auxiliary into the
@@ -102,7 +146,7 @@ class _Spec:
 
     def __init_subclass__(cls, **kwargs):
         # Every spec's `materialize` honours `float32`, whichever path calls it -- fem.solve's slots, a
-        # composite spec materialising its children, `.cached()`, a march freezing it -- because the
+        # composite spec materialising its children, `reuse=`, a march freezing it -- because the
         # precision is applied here, around the subclass's own method, rather than at each call site.
         super().__init_subclass__(**kwargs)
         own = cls.__dict__.get("materialize")
@@ -116,13 +160,6 @@ class _Spec:
             materialize._precision_aware = True
             materialize.__doc__ = own.__doc__
             cls.materialize = materialize
-
-    def cached(self, *, refresh=False):
-        """Wrap this preconditioner so its setup is built **once** and reused across solves — the
-        fluent form of :func:`cached`. E.g. ``jno.precond.amg().cached()``. ``refresh`` controls
-        invalidation (``False`` frozen, ``True`` on shape/sparsity change, an ``int k`` to rebuild
-        every k-th materialization, or a ``ctx -> key`` callable)."""
-        return _Cached(self, refresh)
 
     def __eq__(self, other):
         if self.key is None or not isinstance(other, _Spec) or other.key is None:
@@ -486,7 +523,11 @@ class _Hypre(_Spec):
 
     def __init__(self, kind, options):
         self.kind = str(kind)
-        self.options = dict(options)
+        options = dict(options)
+        # the sigma = 0 machinery of AMS: these are not PETSc option-database keys
+        self.interior_nodes = options.pop("interior_nodes", None)
+        self.zero_beta = bool(options.pop("zero_beta", False))
+        self.options = options
 
     def materialize(self, ctx: PrecondContext):
         import numpy as np
@@ -525,6 +566,7 @@ class _Hypre(_Spec):
         pc.setOperators(mat)
         pc.setType("hypre")
         pc.setHYPREType(self.kind)
+        _hypre_high_order = False
         if self.kind == "ams":
             # AMS needs the H(curl) structure: the discrete gradient and the node coordinates. jNO
             # already builds the gradient for its own AMS, from the same topology.
@@ -547,12 +589,58 @@ class _Hypre(_Spec):
                     "the field: jno.precond.triangular((u, jno.precond.hypre(kind='ams')), (p, ...))."
                 )
             pc.setHYPREDiscreteGradient(PETSc.Mat().createAIJ(size=Gs.shape, csr=(Gs.indptr, Gs.indices, Gs.data)))
-            pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
-            pc.setCoordinates(pts)
+            _topo = fem.domain._fem_nonnodal_topology
+            if _topo.get("lowest_order_n1e", True):
+                pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
+                pc.setCoordinates(pts)
+            else:
+                # Degree k: G maps P_m (not the vertices) into the edge space, so vertex coordinates no
+                # longer describe the auxiliary space. hypre takes the vector interpolation Π instead
+                # (HYPRE_AMSSetInterpolations), node-interleaved, column 3j + a <- component a of node j.
+                # ONLY the full Π: petsc4py 3.25 corrupts the heap when handed the per-component list
+                # (measured: `malloc(): invalid size` inside setHYPRESetInterpolations), and the
+                # component-wise cycles (cycle_type >= 10, PETSc's default 13) need exactly those, so
+                # they crash in hypre_AMSSetup. The full-Π cycle (cycle_type 1) is therefore the default
+                # here; an explicit cycle_type option still wins.
+                from .utils.solver.ams import nodal_vector_interpolation
+
+                def _petsc(M):
+                    mi, md = np.asarray(M.indices), np.asarray(M.data)
+                    Ms = sp.csr_matrix((md, (mi[:, 0], mi[:, 1])), shape=tuple(int(x) for x in M.shape))
+                    return Ms, PETSc.Mat().createAIJ(size=Ms.shape, csr=(Ms.indptr, Ms.indices, Ms.data))
+
+                blocks = [_petsc(P) for P in nodal_vector_interpolation(_topo)]
+                dim = len(blocks)
+                full = sp.hstack([b_[0] for b_ in blocks]).tocsc()
+                nL = blocks[0][0].shape[1]
+                inter = np.arange(dim * nL).reshape(dim, nL).T.reshape(-1)  # column 3j + a <- block a, node j
+                full = full[:, inter].tocsr()
+                full_m = PETSc.Mat().createAIJ(size=full.shape, csr=(full.indptr, full.indices, full.data))
+                pc.setHYPRESetInterpolations(dim, None, None, full_m, None)
+                _hypre_high_order = True
+            if self.zero_beta:
+                # the operator has NO mass where sigma = 0 (curl-curl only there): tell AMS the
+                # beta-Poisson problem is zero, so it does not build a mass-weighted gradient correction
+                pc.setHYPRESetBetaPoissonMatrix(None)
+            if self.interior_nodes is not None:
+                m_ = self.interior_nodes(fem) if callable(self.interior_nodes) else self.interior_nodes
+                m_ = np.asarray(m_, dtype=np.float64).reshape(-1)
+                if m_.size != Gs.shape[1]:
+                    raise ValueError(
+                        f"jno.precond.hypre(interior_nodes=...): {m_.size} entries, but the nodal (gradient) "
+                        f"space has {Gs.shape[1]} -- one entry per column of the discrete gradient G, "
+                        "1.0 for a node interior to a sigma = 0 region, 0.0 otherwise."
+                    )
+                pc.setHYPREAMSSetInteriorNodes(PETSc.Vec().createWithArray(m_))
         opts = PETSc.Options()
         for k, v in self.options.items():
             opts.setValue(f"pc_hypre_{self.kind}_{k}", v)
-        pc.setFromOptions()
+        if self.kind == "ams" and _hypre_high_order and "cycle_type" not in self.options:
+            opts.setValue("pc_hypre_ams_cycle_type", 1)  # the full-Π cycle; see above
+            pc.setFromOptions()
+            opts.delValue("pc_hypre_ams_cycle_type")  # the options DB is global: do not leak it into later PCs
+        else:
+            pc.setFromOptions()
         pc.setUp()
 
         xv, bv = mat.createVecRight(), mat.createVecLeft()
@@ -573,6 +661,7 @@ class _Hypre(_Spec):
         return PrecondApplier(apply, apply)
 
 
+@_reusable
 def hypre(kind: str = "ams", *, float32: bool = False, **options) -> _Hypre:
     """**hypre** preconditioners (AMS, BoomerAMG) via PETSc — a reference-grade H(curl) solver.
 
@@ -590,6 +679,12 @@ def hypre(kind: str = "ams", *, float32: bool = False, **options) -> _Hypre:
     (interior-node marking, a restricted gradient, gradient projection). jNO's own :func:`ams` has
     none of that. Measured on an A–V eddy problem where it matters, hypre reached 8.6e-03 with
     interior nodes marked against no progress at all without them.
+
+    Two keywords reach that machinery (they are not PETSc options): ``interior_nodes=`` -- one value
+    per column of the discrete gradient ``G`` (a vertex at degree 1, a ``P_k`` node at degree k), 1.0
+    for a node interior to a ``sigma = 0`` region, or a callable ``fem -> array`` -- and
+    ``zero_beta=True``, which declares that the operator carries no mass there (a pure curl-curl
+    block), so AMS builds no mass-weighted gradient correction.
 
     **It is not automatically faster.** On the same 89,920-DOF H(curl) block of a production-scale
     A–V system, hypre reached 4.33e-09 and jNO's own ``ams()`` reached 8.03e-09 — equivalent. Reach
@@ -734,6 +829,7 @@ class _ILU(_Spec):
         return f"jno.precond.ilu({self.options})"
 
 
+@_reusable
 def ilu(*, float32: bool = False, **options) -> _ILU:
     """**Incomplete LU** (SuperLU ``spilu``) — the classical preconditioner for the A–V eddy-current
     system, and complex-capable, so it applies to the complex operator directly.
@@ -770,6 +866,7 @@ def ilu(*, float32: bool = False, **options) -> _ILU:
     return _precision(_ILU(options), float32)
 
 
+@_reusable
 def real_equivalent(inner, *, float32: bool = False) -> _RealEquivalent:
     """Precondition a COMPLEX system through its fused real-equivalent block, with a **real** inner
     solver — so a real-only preconditioner (an AmgX-style GPU multigrid, say) works on it.
@@ -819,6 +916,7 @@ def real_equivalent(inner, *, float32: bool = False) -> _RealEquivalent:
     return _precision(_RealEquivalent(inner), float32)
 
 
+@_reusable
 def jacobi(*, float32: bool = False) -> _Jacobi:
     """Diagonal (Jacobi) preconditioner ``M^{-1} v = v / diag(A)``.
 
@@ -837,6 +935,7 @@ def jacobi(*, float32: bool = False) -> _Jacobi:
     return _precision(_Jacobi(), float32)
 
 
+@_reusable
 def gmg(
     *, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int | None = None, float32: bool = False
 ) -> _GMG:
@@ -995,7 +1094,8 @@ class _Form(_Spec):
         return self.inner is not False
 
 
-def form(terms, *, inner=None, quad_degree: int = 2, float32: bool = False) -> _Form:
+@_reusable
+def form(terms, *, inner=None, quad_degree: int | None = None, float32: bool = False) -> _Form:
     """**Preconditioners as weak forms**: assemble an auxiliary operator ``Â`` from ordinary
     traced ``jno.fem`` terms and apply ``M^{-1} v = Â^{-1} v`` with ``inner`` (default
     ``jno.solve.lu()``).
@@ -1085,6 +1185,7 @@ def _as_precond(solver, op, v, M=None):
         return solver(op, v, M=M)
 
 
+@_reusable
 def inner(solver, *, precond=None, float32: bool = False) -> _InnerSolve:
     """Use a ``jno.solve`` linear solver as the preconditioner application ``M^{-1} v ≈ A^{-1} v``
     on whatever operator it is materialized against — the natural way to give a diagonal block of
@@ -1274,6 +1375,7 @@ class _Triangular(_Spec):
         return f"jno.precond.triangular(<{len(self.pairs)} blocks>)"
 
 
+@_reusable
 def block_diag(*pairs, float32: bool = False) -> _BlockDiag:
     """Block-**diagonal** preconditioner over the per-field DOF blocks: each ``(field, spec)``
     pair materializes ``spec`` against that field's diagonal sub-operator (``field`` is the
@@ -1290,6 +1392,7 @@ def block_diag(*pairs, float32: bool = False) -> _BlockDiag:
     return _precision(_BlockDiag(list(pairs)), float32)
 
 
+@_reusable
 def triangular(*pairs, float32: bool = False) -> _Triangular:
     """Block **upper-triangular** preconditioner ``P = [[Â_1, A_12, …], [0, Â_2, …], …]`` over
     the per-field blocks — the standard shape for saddle-point systems (Stokes / Taylor–Hood,
@@ -1663,6 +1766,7 @@ class _LSC(_Spec):
         return f"jno.precond.lsc(scaled={self.scaled})"
 
 
+@_reusable
 def lsc(*, inner=None, scaled: bool = True, velocity=None, float32: bool = False) -> _LSC:
     """**Least-squares commutator** Schur-complement approximation — the convection-aware one.
 
@@ -1712,7 +1816,8 @@ def _symbols_for_block(fem, idx, *, value_shape=(), tag="aux"):
     blocks = fem.blocks
     n_blk = int(blocks[idx].stop - blocks[idx].start)
     own_shape = tuple(getattr(fem, "_block_value_shapes", ()) or ())[idx]
-    n_scalar = n_blk // max(1, _value_shape_components(own_shape))
+    _vec_of = getattr(fem, "_field_vec", None)  # stored values per node (n(n+1)/2 for a symmetric field)
+    n_scalar = n_blk // max(1, int(_vec_of(idx)) if _vec_of is not None else _value_shape_components(own_shape))
     coords = dom.variable("interior", split=True)
     axes = ("x", "y", "z")[: int(dom.dimension)]
     want = n_scalar * max(1, _value_shape_components(value_shape))
@@ -1887,6 +1992,7 @@ class _PCD(_Spec):
         return f"jno.precond.pcd(viscosity={self.viscosity}, inflow={self.inflow!r})"
 
 
+@_reusable
 def pcd(*, viscosity, inflow=None, velocity=None, inner=None, float32: bool = False) -> _PCD:
     """**Pressure convection-diffusion** Schur approximation — ``S^-1 ~ A_p^-1 F_p M_p^-1``.
 
@@ -2044,6 +2150,7 @@ class _Saddle(_Spec):
         return f"jno.precond.saddle(mass_weight={self.mass_weight}{lw}{sc})"
 
 
+@_reusable
 def saddle(
     *, mass_weight: float = 1.0, laplace_weight: float | None = None, schur: str = "mass", float32: bool = False
 ) -> _Saddle:
@@ -2154,7 +2261,7 @@ class _AMG(_Spec):
 
     ``traceable`` is a *property* here rather than the class-level flag, because whether this spec can
     be materialised inside a trace depends on whether its hierarchy exists yet. Unbuilt, ``materialize``
-    calls pyamg on the host and must stay eager. **Built** -- via :meth:`build` or ``.cached()`` -- the
+    calls pyamg on the host and must stay eager. **Built** -- via :meth:`build` or ``reuse=True`` -- the
     levels are frozen data and :func:`~jno.utils.solver.amg.vcycle_apply` is pure JAX, so the applier
     traces like any other.
 
@@ -2168,12 +2275,38 @@ class _AMG(_Spec):
     #: difference is what lets an AMS complex auxiliary skip the 2n reformulation; see :class:`_Spec`.
     complex_ok = True
 
-    def __init__(self, cycles, max_levels, coarse_size, smoother_degree):
+    def __init__(self, cycles, max_levels, coarse_size, smoother_degree, nullspace=None):
         self.cycles = cycles
         self.max_levels = max_levels
         self.coarse_size = coarse_size
         self.smoother_degree = smoother_degree
+        if not (nullspace is None or isinstance(nullspace, str) or hasattr(nullspace, "shape")):
+            raise ValueError(f"jno.precond.amg(nullspace={nullspace!r}): must be None, 'rigid' or an (n, k) array.")
+        if isinstance(nullspace, str) and nullspace != "rigid":
+            raise ValueError(f"jno.precond.amg(nullspace={nullspace!r}): must be None, 'rigid' or an (n, k) array.")
+        self.nullspace = nullspace
         self._levels = None
+
+    def _near_null(self, fem, n):
+        """The ``(n, k)`` near-null space handed to smoothed aggregation, or ``None`` for pyamg's constants."""
+        null = self.nullspace
+        if null is None:
+            return None
+        if isinstance(null, str):
+            if fem is None:
+                raise ValueError(
+                    "jno.precond.amg(nullspace='rigid') builds its modes from the problem's DOF coordinates and "
+                    "field layout, which the matrix alone does not carry: pass it through "
+                    "fem.solve(precond=...), or build it with spec.build(A, fem=fem)."
+                )
+            null = _near_null_space(fem, n)
+        null = np.asarray(null, dtype=float).reshape(int(np.shape(null)[0]), -1)
+        if null.shape[0] != n:
+            raise ValueError(
+                f"jno.precond.amg(nullspace=...): the array has {null.shape[0]} rows, but the operator has {n}. "
+                "Give one row per unknown of the system being solved, or use nullspace='rigid'."
+            )
+        return np.ascontiguousarray(null)
 
     @property
     def traceable(self):  # only once the host-side pyamg setup has happened -- see the class docstring
@@ -2190,7 +2323,7 @@ class _AMG(_Spec):
         holds ``_levels``, so its ``id`` cannot be recycled while this spec is alive."""
         return None if self._levels is None else (type(self), id(self._levels), self.cycles)
 
-    def build(self, A) -> "_AMG":
+    def build(self, A, *, fem=None) -> "_AMG":
         """Eager one-time setup from a **concrete** operator (BCOO / dense / ``fem.A`` /
         ``LinearOperator``). Required before use inside traced (jit / vmap / parametric-inverse)
         solves — pyamg cannot run under a trace; the built hierarchy is then frozen closure data.
@@ -2211,20 +2344,32 @@ class _AMG(_Spec):
             max_levels=self.max_levels,
             coarse_size=self.coarse_size,
             smoother_degree=self.smoother_degree,
+            near_null=self._near_null(fem, int(A.shape[0])),
         )
         return self
 
+    def _state(self):
+        """The built hierarchy, for a compiled solve to take as an argument (``None`` until built)."""
+        return self._levels
+
     def materialize(self, ctx: PrecondContext):
         from .utils.solver.amg import build_hierarchy, vcycle_apply
+        from .utils.solver.solver_api import _STATE_OVERRIDE
 
-        levels = self._levels  # persisted ONLY by an explicit eager .build(); None → rebuilt THIS solve
+        # persisted ONLY by an explicit eager .build(); None → rebuilt THIS solve. Inside a compiled solve the
+        # hierarchy it was called with (`precond_state`).
+        levels = _STATE_OVERRIDE.get(id(self), self._levels)
         if levels is None:
             A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
             # Rebuild each solve (NOT persisted): the hierarchy depends on the operator *values*, so
             # silently reusing a stale one across solves would quietly cost iterations. Wrap in
-            # ``.cached()`` (or call ``.build()`` eagerly) to reuse it explicitly. Raises on a tracer.
+            # ``reuse=True`` (or call ``.build()`` eagerly) to reuse it explicitly. Raises on a tracer.
             levels = build_hierarchy(
-                A, max_levels=self.max_levels, coarse_size=self.coarse_size, smoother_degree=self.smoother_degree
+                A,
+                max_levels=self.max_levels,
+                coarse_size=self.coarse_size,
+                smoother_degree=self.smoother_degree,
+                near_null=self._near_null(getattr(ctx, "fem", None), int(A.shape[0])),
             )
         cycles, A_op = self.cycles, ctx.A
 
@@ -2237,11 +2382,25 @@ class _AMG(_Spec):
         return apply
 
     def __repr__(self):
-        return f"jno.precond.amg(cycles={self.cycles}, built={self._levels is not None})"
+        null = (
+            ""
+            if self.nullspace is None
+            else f", nullspace={self.nullspace!r}"
+            if isinstance(self.nullspace, str)
+            else ", nullspace=<array>"
+        )
+        return f"jno.precond.amg(cycles={self.cycles}{null}, built={self._levels is not None})"
 
 
+@_reusable
 def amg(
-    *, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smoother_degree: int = 3, float32: bool = False
+    *,
+    cycles: int = 1,
+    max_levels: int = 10,
+    coarse_size: int = 100,
+    smoother_degree: int = 3,
+    nullspace=None,
+    float32: bool = False,
 ) -> _AMG:
     """Hybrid **algebraic multigrid**: smoothed-aggregation setup by the optional ``pyamg``
     (Vaněk, Mandel & Brezina, Computing 56, 1996; Bell et al., JOSS 8(87):5495, 2023), applied as
@@ -2256,7 +2415,7 @@ def amg(
 
     **Caching is explicit.** The hierarchy is (re)built at each solve — it depends on the operator
     *values*, so silently reusing a stale one would quietly cost iterations. To amortise the setup
-    over a sweep / Newton loop / inverse solve, say so: ``jno.precond.amg().cached()``. Inside a
+    over a sweep / Newton loop / inverse solve, say so: ``jno.precond.amg(reuse=True)``. Inside a
     **traced** context (jit, vmap, a parametric inverse) pyamg cannot run under the trace, so build
     once eagerly first — ``spec.build(fem.A)`` — and the frozen hierarchy is reused (a legitimate
     preconditioner while values drift: speed degrades gracefully, correctness never). A nonlinear
@@ -2265,10 +2424,17 @@ def amg(
     imported lazily — without it a clear ``ImportError`` explains the install. On a matvec-only
     sub-block the matrix is recovered via the (dense) block view.
 
+    ``nullspace=`` is what the coarse grids must represent exactly (Vaněk, Mandel & Brezina, Computing 56,
+    1996, Sec. 3). ``None`` gives pyamg's constants, right for a scalar diffusion-type operator. For a
+    displacement field that leaves the three ROTATIONS unresolved, and the iterations grow with the mesh:
+    pass ``"rigid"`` (translations and infinitesimal rotations from the DOF coordinates -- the modes
+    :func:`schwarz` takes the same way), or an ``(n, k)`` array of your own. Measured on 3-D St.Venant-
+    Kirchhoff at 103k DOFs: 2,913 Jacobi-CG iterations, 961 with plain AMG, 98 with ``"rigid"``.
+
     ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
     double -- see :func:`_materialize_in_float32`.
     """
-    return _precision(_AMG(cycles, max_levels, coarse_size, smoother_degree), float32)
+    return _precision(_AMG(cycles, max_levels, coarse_size, smoother_degree, nullspace), float32)
 
 
 def _fem_concrete_operator(fem):
@@ -2705,6 +2871,7 @@ class _AMS(_Spec):
         return f"jno.precond.ams(aux={self.aux!r})"
 
 
+@_reusable
 def ams(*, aux=None, float32: bool = False) -> _AMS:
     """**AMS** — the auxiliary-space Maxwell preconditioner for H(curl) (Nédélec/N1E) curl-curl
     systems (Hiptmair & Xu, *SIAM J. Numer. Anal.* 45(6):2483, 2007; Kolev & Vassilevski,
@@ -2818,6 +2985,7 @@ class _JaxAMG(_Spec):
         return f"jno.precond.jaxamg(symmetric={self.symmetric})"
 
 
+@_reusable
 def jaxamg(*, config: "dict | None" = None, symmetric: bool = True, float32: bool = False) -> _JaxAMG:
     """GPU AMG **preconditioner** via jaxamg (NVIDIA AmgX wrapped as a JAX primitive) — the
     on-device counterpart of :func:`amg`, and the natural smoother for large elliptic blocks or the
@@ -2825,9 +2993,9 @@ def jaxamg(*, config: "dict | None" = None, symmetric: bool = True, float32: boo
 
     Builds the AMG hierarchy with ``jaxamg.make_preconditioner`` and applies a single cycle as
     ``M⁻¹`` — a proper build-once/apply-many preconditioner (unlike ``jno.precond.inner(jno.solve.amg())``,
-    which re-solves each application). Wrap in ``.cached()`` to reuse the hierarchy across solves::
+    which re-solves each application). Pass ``reuse=True`` to keep the hierarchy across solves::
 
-        fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.jaxamg().cached())
+        fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.jaxamg(reuse=True))
 
     ``config`` is a full AmgX-format dict (default ``{"solver": "AMG"}``). Needs an **assembled**
     operator. Optional dependency — jaxamg (AmgX 2.5+, CUDA 12+, mpi4py/mpi4jax) is imported lazily.
@@ -2851,12 +3019,11 @@ _MISS = object()  # sentinel so the first materialize always builds
 
 
 class _Cached(_Spec):
-    """Spec that memoises another spec's setup across solves; see :func:`cached`."""
+    """Spec that keeps another spec's setup across solves -- what ``reuse=`` builds (see :func:`_reusing`)."""
 
     def __init__(self, spec, refresh):
         self.spec = spec
-        # False → frozen | True → rebuild on sparsity change | int k → rebuild every k-th
-        # materialization | callable ctx→key
+        # False → kept (reuse=True) | int k → rebuilt every k-th materialization (reuse=k)
         self.refresh = refresh
         self._applier = None
         self._key = _MISS
@@ -2866,9 +3033,9 @@ class _Cached(_Spec):
     # `complex_native` selects whether the solve runs on the genuinely complex n-sized operator or on
     # the fused real-equivalent 2n block, and `complex_ok` whether a spec can be applied to a complex
     # operator without reformulation -- so hiding them changes the ANSWER, not the speed. Left
-    # undeclared, `ams().cached()` reported False and quietly took the 2n path, where the block slices
+    # undeclared, a kept `ams()` reported False and quietly took the 2n path, where the block slices
     # cover the wrong half of the operator and AMS is handed the skew-dominated block its own docs
-    # record diverging to 1e+20 on. That made `.cached()` and complex-native mutually exclusive, which
+    # record diverging to 1e+20 on. That made `reuse=` and complex-native mutually exclusive, which
     # is backwards: a complex block preconditioner is the one whose setup most wants reusing.
     #
     # Forwarded explicitly rather than through `__getattr__`, so only these descriptive flags pass and
@@ -2887,14 +3054,14 @@ class _Cached(_Spec):
         back the stored applier -- so it can be materialised inside a trace, and the solve around it
         can be compiled.
 
-        This is the case that matters for many-iteration work. ``.cached()`` is the recipe for a
+        This is the case that matters for many-iteration work. ``reuse=True`` is the recipe for a
         transient run or a Newton loop, where the same preconditioner serves every step; leaving it on
         the eager path meant dispatching the applier op by op on exactly the workloads with the most
         applications to dispatch. The first solve still runs eager (it has to, to build); every solve
         after it compiles.
 
-        ``refresh=`` is excluded: those variants key on the operator and may rebuild through the inner
-        spec, which for ``amg``/``ams``/``form`` is host-side work that no trace can run.
+        A cadence (``reuse=k``) is excluded: it rebuilds through the inner spec, which for
+        ``amg``/``ams``/``form`` is host-side work that no trace can run.
         """
         return self.refresh is False and self._applier is not None
 
@@ -2908,9 +3075,6 @@ class _Cached(_Spec):
         ``id`` cannot be recycled while this spec is alive."""
         return (type(self), id(self._applier)) if self.traceable else None
 
-    def cached(self, *, refresh=False):
-        return self  # already cached — .cached() is idempotent (no double-wrapping)
-
     def prepare(self, fem):  # forward the eager (out-of-trace) build hook, if the inner spec has one
         prep = getattr(self.spec, "prepare", None)
         if callable(prep):
@@ -2919,22 +3083,22 @@ class _Cached(_Spec):
     def _key_of(self, ctx):
         if self.refresh is False:
             return "frozen"
-        if isinstance(self.refresh, bool):  # True → key on the operator's shape + sparsity size
-            A = ctx.A
-            return (A.shape, int(A.bcoo.nse)) if A.bcoo is not None else (A.shape,)
         if isinstance(self.refresh, int):
             # Every k-th materialization: the operator's values drift step by step (a Newton loop, a
             # transient march driving one solve per step), so the hierarchy is rebuilt on a cadence
             # rather than frozen forever or rebuilt every time. In between, the stale setup is a
             # legitimate preconditioner: speed degrades gracefully, correctness never.
             return self._count // max(1, int(self.refresh))
-        if callable(self.refresh):
-            return self.refresh(ctx)
-        raise TypeError(f"cached(refresh=...): expected bool, int, or callable, got {type(self.refresh).__name__}")
+        raise TypeError(f"reuse=: expected True or an int, got {type(self.refresh).__name__}")
 
     def materialize(self, ctx: PrecondContext):
         from jax._src import core as _core
 
+        from .utils.solver.solver_api import _STATE_OVERRIDE
+
+        bound = _STATE_OVERRIDE.get(id(self))
+        if bound is not None:  # a compiled solve hands in the arrays it was called with (`precond_state`)
+            return self._applier_from(bound)
         key = self._key_of(ctx)
         self._count += 1
         if self._applier is not None and key == self._key:
@@ -2943,6 +3107,8 @@ class _Cached(_Spec):
         if _core.trace_state_clean():
             # Built from CONCRETE values: its arrays are constants to any later trace, so it is kept.
             self._applier, self._key = applier, key
+            self._probe = jax.ShapeDtypeStruct((int(ctx.A.shape[0]),), jnp.result_type(getattr(ctx.A, "dtype", float)))
+            self._jaxprs = None
         # Built INSIDE a trace -- the Newton step of a nonlinear march (a scan body), a jitted or
         # differentiated solve -- the applier closes over that trace's tracers. Keeping it handed them to
         # the next trace: UnexpectedTracerError on the FIRST solve of a nonlinear march, on the second
@@ -2950,38 +3116,41 @@ class _Cached(_Spec):
         # kept; inside a trace the build is part of the compiled program anyway.
         return applier
 
+    # The kept applier, as a computation (its jaxprs) and the arrays it closes over (their constants) -- every
+    # constant, integers included: a hierarchy's index arrays are part of it, and leaving them baked into a
+    # reused program would pair a rebuilt hierarchy's values with the first one's indices.
+    def _closed(self):
+        if getattr(self, "_jaxprs", None) is None:
+            fwd = self._applier
+            t = getattr(fwd, "_t", None)
+            jf = jax.make_jaxpr(lambda r: fwd(r))(self._probe)
+            jt = None if t is None else jax.make_jaxpr(lambda r: fwd.T(r))(self._probe)
+            self._jaxprs = (jf, jt)
+        return self._jaxprs
+
+    def _state(self):
+        """The kept applier's arrays, for a compiled solve to take as arguments (``None`` until kept)."""
+        if not self.traceable or getattr(self, "_probe", None) is None:
+            return None
+        jf, jt = self._closed()
+        return (list(jf.consts), None if jt is None else list(jt.consts))
+
+    def _state_tag(self):
+        jf, jt = self._closed()
+        return hash((str(jf.jaxpr), None if jt is None else str(jt.jaxpr)))
+
+    def _applier_from(self, state):
+        from .utils.solver.solver_api import PrecondApplier
+
+        jf, jt = self._closed()
+        cf, ct = state
+        fwd = lambda r: jax.core.eval_jaxpr(jf.jaxpr, cf, r)[0]  # noqa: E731
+        tr = None if jt is None else (lambda r: jax.core.eval_jaxpr(jt.jaxpr, ct, r)[0])  # noqa: E731
+        return PrecondApplier(fwd, tr, low_precision=getattr(self._applier, "low_precision", False))
+
     def __repr__(self):
-        return f"jno.precond.cached({self.spec!r}, refresh={self.refresh}, built={self._applier is not None})"
-
-
-def cached(spec, *, refresh=False):
-    """Memoise any preconditioner's setup so it is built **once** and reused across solves — the
-    plug-and-play way to amortise an expensive setup (a multigrid hierarchy, an assembled auxiliary
-    operator, a jaxamg/AmgX coloring) over a frequency sweep, a Newton loop, or an inverse-problem
-    optimisation, *regardless of which backend does the work*.
-
-    Wraps any spec (``jacobi``, ``amg``, ``form``, a jaxamg-backed preconditioner, or a user
-    ``ctx -> M⁻¹`` callable). ``refresh=False`` (default) freezes the setup from the first solve and
-    reuses it forever — the standard frozen-preconditioner trade (a preconditioner only changes
-    convergence *speed*, never the solution, so reusing a slightly-stale setup is always correct and
-    usually cheap). ``refresh=True`` rebuilds when the operator's shape/sparsity changes (values may
-    still drift under the frozen setup); an ``int k`` rebuilds every k-th materialization — the
-    cadence policy for a Newton loop or transient march whose operator values drift step by step;
-    pass a callable ``ctx -> hashable`` for a custom invalidation key. The wrapped spec's eager ``prepare(fem)`` hook (if any) is forwarded, so it composes with the
-    ``jit``/``vmap``/parametric-inverse build-eagerly requirement unchanged.
-
-    Only a setup built from **concrete** values is kept. One built inside a trace -- the per-step Newton
-    solve of a nonlinear march, a solve under ``jax.jit``/``jax.grad`` -- closes over that trace's
-    intermediate values, so it is used for that trace and not kept: there the cache builds once per
-    trace (once per compiled program), not once per run.
-
-    Reuse the SAME ``cached(...)`` object across the solves you want to share the setup::
-
-        M = jno.precond.cached(jno.precond.amg())          # backend-agnostic — pyamg or jaxamg alike
-        for f in freqs:
-            u = build_fem(f).solve(linear=jno.solve.fgmres(), precond=M)   # hierarchy built once
-    """
-    return _Cached(spec, refresh)
+        reuse = True if self.refresh is False else self.refresh
+        return f"{self.spec!r} with reuse={reuse} (built={self._applier is not None})"
 
 
 class _FSAI(_Spec):
@@ -3293,6 +3462,7 @@ def _near_null_space(fem, n):
     return out
 
 
+@_reusable
 def schwarz(
     *,
     parts: int | None = None,
@@ -3344,6 +3514,7 @@ def schwarz(
     return _precision(_Schwarz(parts, overlap, bool(coarse), bool(restricted), nullspace), float32)
 
 
+@_reusable
 def fsai(*, power: int = 1, float32: bool = False) -> _FSAI:
     """**Factored sparse approximate inverse** for SPD operators: ``M^{-1} = G^T G ~ A^{-1}`` with ``G``
     lower triangular on the pattern of ``tril(A^power)`` (Kolotilina & Yeremin, SIAM J. Matrix Anal. Appl.
@@ -3364,7 +3535,7 @@ def fsai(*, power: int = 1, float32: bool = False) -> _FSAI:
     Cost, measured with CG to 1e-8 on an RTX 3070 (float64): 3-D P1 Poisson (303k unknowns) 89 iterations /
     58 ms against Jacobi's 216 / 76 ms; 3-D P2 (142k) 82 / 39 ms against 197 / 58 ms; 3-D elasticity (206k)
     325 / 387 ms against 778 / 588 ms. The numeric setup costs about one to two solves (101, 115, 530 ms
-    there), so it pays when the factor is REUSED: a constant-operator time march (built once), ``.cached()``
+    there), so it pays when the factor is REUSED: a constant-operator time march (built once), ``reuse=True``
     across solves, or several right-hand sides. ``power=2`` grows the setup steeply with the row width
     (7.1 s on the P2 case for 32 iterations) -- try ``power=1`` first.
 
@@ -3376,6 +3547,7 @@ def fsai(*, power: int = 1, float32: bool = False) -> _FSAI:
     return _precision(_FSAI(power), float32)
 
 
+@_reusable
 def nystrom(*, rank: int = 20, mu: float | None = None, seed: int = 0, float32: bool = False) -> _Nystrom:
     r"""Randomized **Nyström** low-rank preconditioner for SPD operators — the rung between
     ``jacobi`` and a multilevel method.
@@ -3405,6 +3577,7 @@ def nystrom(*, rank: int = 20, mu: float | None = None, seed: int = 0, float32: 
     return _precision(_Nystrom(rank, mu, seed), float32)
 
 
+@_reusable
 def chebyshev(
     *,
     degree: int = 8,

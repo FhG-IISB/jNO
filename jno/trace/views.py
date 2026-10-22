@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from ..jnp_ops import concat
-from . import FunctionCall, Placeholder
+from . import FunctionCall, Placeholder, _matmul
 
 # ---------------------------------------------------------------------------
 # Stable spectral matrix functions (logm / expm / Aⁿ) on symmetric matrices.
@@ -377,8 +377,10 @@ class ScalarView(_DelegatesToPlaceholder):
         return ScalarView(new_expr)
 
     def integrate(self, *args, **kwargs) -> "ScalarView":
-        """Integrate the underlying scalar, preserving the ScalarView type. ``.integrate(fem)`` -- the integral over a FEM
-        solve, one traced number -- is handed through as the node it is."""
+        """Integrate the underlying scalar, preserving the ScalarView type. ``.integrate(fem)`` /
+        ``.integrate(d)`` -- an integral over a solve or a domain, one number -- is handed through as
+        the node it is: re-wrapped, it would carry the quadrature points' coordinate bindings into any
+        form it is multiplied into."""
         if args:
             return self._expr.integrate(*args, **kwargs)
         return self._rewrap(self._expr.integrate(**kwargs))
@@ -689,8 +691,8 @@ class VectorView(_DelegatesToPlaceholder):
         return ComplexVectorView(self._expr)
 
     def integrate(self, *args, **kwargs) -> "VectorView":
-        """Component-wise integral, preserving VectorView type. ``.integrate(fem)`` -- the integral over a FEM
-        solve, one traced number -- is handed through as the node it is."""
+        """Component-wise integral, preserving VectorView type. ``.integrate(fem)`` / ``.integrate(d)``
+        -- integrals over a solve or a domain -- are handed through as the node they are."""
         if args:
             return self._expr.integrate(*args, **kwargs)
         return self._rewrap(self._expr.integrate(**kwargs))
@@ -926,12 +928,12 @@ class VectorView(_DelegatesToPlaceholder):
         if isinstance(other, MatrixView):
             return VectorView(
                 FunctionCall(
-                    lambda v, A: (v[..., jnp.newaxis, :] @ A)[..., 0, :],
+                    lambda v, A: _matmul(v[..., jnp.newaxis, :], A)[..., 0, :],
                     [self._expr, other._expr],
                     "vecmat",
                 )
             )
-        return FunctionCall(lambda a, b: a @ b, [self._expr, _unwrap(other)], "dot")
+        return FunctionCall(_matmul, [self._expr, _unwrap(other)], "dot")
 
 
 # ---------------------------------------------------------------------------
@@ -962,9 +964,9 @@ class ComplexView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return ComplexView(new_expr)
 
-    def integrate(self, **kwargs) -> "ComplexView":
+    def integrate(self, *args, **kwargs) -> "ComplexView":
         """Component-wise integral of the [re, im] split, preserving ComplexView."""
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "ComplexView":
@@ -1144,8 +1146,8 @@ class ComplexVectorView(_DelegatesToPlaceholder):
     def stop_gradient(self) -> "ComplexVectorView":
         return self._rewrap(self._expr.stop_gradient)
 
-    def integrate(self, **kwargs) -> "ComplexVectorView":
-        return self._rewrap(self._expr.integrate(**kwargs))
+    def integrate(self, *args, **kwargs) -> "ComplexVectorView":
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     def d(self, v, scheme: str | None = None) -> "ComplexVectorView":
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
@@ -1321,6 +1323,11 @@ class ComplexPair:
     def bind(self, **kw) -> "ComplexPair":
         return self._map(lambda p: p.bind(**kw))
 
+    def test(self) -> "ComplexPair":
+        """The test function of a complex unknown (``domain.unknown(..., complex=True)``): the pair of the
+        real and imaginary parts' test functions."""
+        return self._map(lambda p: p.test())
+
     partials = bind
 
     def d(self, v, **kw) -> "ComplexPair":
@@ -1421,14 +1428,14 @@ class MatrixView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return MatrixView(new_expr)
 
-    def integrate(self, **kwargs) -> "MatrixView":
+    def integrate(self, *args, **kwargs) -> "MatrixView":
         """Element-wise integral of each matrix component over the integration
         domain (not a matrix-algebra integral) — MatrixView preserved.
 
         Useful for things like the spatial average of an anisotropic
         diffusivity field.  Each ``[i, j]`` entry is integrated independently.
         """
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "MatrixView":
@@ -1493,6 +1500,41 @@ class MatrixView(_DelegatesToPlaceholder):
     def transpose(self) -> "MatrixView":
         """Swap last two dimensions → MatrixView."""
         return MatrixView(FunctionCall(lambda x: x.swapaxes(-2, -1), [self._expr], "transpose"))
+
+    @property
+    def T(self) -> "MatrixView":
+        """``A.T`` — the transpose over the two matrix axes (the last two), like :meth:`transpose`.
+
+        A field's leading axes are points (and test DOFs), so the array ``.T`` that reverses every axis
+        would be wrong here."""
+        return self.transpose()
+
+    def __getitem__(self, key):
+        """``A[i, j]`` → ScalarView of entry ``(i, j)``; ``A[i]`` → VectorView of row ``i``.
+
+        Indices address the matrix axes (the last two), as for a vector view; ``A[..., i, j]`` is the same
+        entry spelled explicitly. Any other key indexes the underlying expression, so a mistake there is
+        the array's own error rather than a silent reinterpretation."""
+        keys = key if isinstance(key, tuple) else (key,)
+        if keys and keys[0] is Ellipsis:
+            keys = keys[1:]
+        if len(keys) == 2 and all(isinstance(k, int) for k in keys):
+            out = ScalarView(self._expr[(Ellipsis,) + tuple(keys)])
+        elif len(keys) == 1 and isinstance(keys[0], int):
+            out = VectorView(self._expr[(Ellipsis, keys[0], slice(None))])
+        else:
+            out = None
+        if out is not None:
+            # Keep a bound view's coordinates, as a vector component does, so `S.bind(x=x, y=y)[0, 1].x`
+            # and a per-entry Dirichlet `S(region)[0, 1] - g` both still see the binding.
+            cv = getattr(self, "_coord_vars", None)
+            if cv:
+                return _with_scheme(out.bind(**cv), getattr(self, "_bind_scheme", None))
+            return out
+        raise TypeError(
+            f"{type(self).__name__}[{key!r}]: a matrix view is indexed by an entry `A[i, j]` or a row `A[i]` "
+            "(integers). Index the underlying expression (`A.expr[...]`) for anything else."
+        )
 
     def log(self) -> "MatrixView":
         """Matrix logarithm ``logm(A)`` via eigendecomposition (symmetric / SPD), with a gradient that
@@ -1651,12 +1693,16 @@ class MatrixView(_DelegatesToPlaceholder):
         if isinstance(other, VectorView):
             return VectorView(
                 FunctionCall(
-                    lambda A, v: (A @ v[..., jnp.newaxis])[..., 0],
+                    lambda A, v: _matmul(A, v[..., jnp.newaxis])[..., 0],
                     [self._expr, other._expr],
                     "matvec",
                 )
             )
-        return MatrixView(FunctionCall(lambda a, b: a @ b, [self._expr, _unwrap(other)], "matmul"))
+        return MatrixView(FunctionCall(_matmul, [self._expr, _unwrap(other)], "matmul"))
+
+    def __rmatmul__(self, other):
+        """``B @ A`` with a constant (array) or an expression on the left → MatrixView."""
+        return MatrixView(FunctionCall(_matmul, [_unwrap(other), self._expr], "matmul"))
 
 
 # ---------------------------------------------------------------------------
@@ -1738,11 +1784,11 @@ class VoigtView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return VoigtView(new_expr)
 
-    def integrate(self, **kwargs) -> "VoigtView":
+    def integrate(self, *args, **kwargs) -> "VoigtView":
         """Component-wise integral over the Voigt-packed tensor — VoigtView
         preserved; each Voigt slot is integrated independently.
         """
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "VoigtView":

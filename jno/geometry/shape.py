@@ -956,6 +956,11 @@ class shape:
 
     # ----- transforms ------------------------------------------------------------
     def extrude(self, height: float) -> "shape":
+        """Sweep a 2-D shape straight up by ``height`` into a 3-D solid.
+
+        An extrusion thinner than the mesh size in force (a foil, a film, a circuit-board copper layer) is
+        meshed as one structured layer of prisms split into tetrahedra: the in-plane size is kept and the
+        thickness is exact, instead of the slivers free meshing makes. This is logged per extrusion."""
         if self.dim != 2:
             raise ValueError("extrude requires a 2-D shape")
         h, ex = _par.split((height,), "extrusion height")

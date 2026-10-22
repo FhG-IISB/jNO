@@ -111,6 +111,7 @@ def build_hierarchy(
     lmin_ratio: float = 1.0 / 30.0,
     safety: float = 1.1,
     bound_iters: int = 20,
+    near_null: Any = None,
 ) -> List[dict]:
     """One-time host-side setup: pyamg smoothed aggregation [1,2] -> frozen JAX level data.
 
@@ -148,7 +149,10 @@ def build_hierarchy(
             "structure you have instead: jno.precond.saddle() / jno.precond.lsc() for the saddle system, "
             "or jno.precond.jacobi() / inner(...) on the block."
         )
-    ml = pyamg.smoothed_aggregation_solver(_A_csr, max_levels=max_levels, max_coarse=coarse_size)
+    # ``near_null`` (n, k): the modes every coarse level interpolates exactly -- pyamg's ``B``. None keeps
+    # pyamg's constants.
+    sa_kw = {} if near_null is None else {"B": np.asarray(near_null, dtype=_A_csr.dtype)}
+    ml = pyamg.smoothed_aggregation_solver(_A_csr, max_levels=max_levels, max_coarse=coarse_size, **sa_kw)
     levels: List[dict] = []
     # Every level in the INPUT operator's precision: pyamg builds some prolongators in float64 whatever it
     # is given, and a float32 hierarchy (jno.precond.amg(float32=True)) mixing the two fails the CSR

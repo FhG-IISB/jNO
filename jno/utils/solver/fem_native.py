@@ -38,6 +38,7 @@ linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary con
 
 from __future__ import annotations
 
+import warnings
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,6 +71,7 @@ from .fem_lagrange import (
 from .fem_utils import (
     _CHUNK_CONSUMED,
     _CHUNK_OVERRIDE,
+    _block_len,
     _cell_region_mask,
     _collect_region_mask_names,
     _collect_tag_mask_names,
@@ -87,7 +89,9 @@ from .fem_utils import (
     cell_chunk,
     compress_eager,
     compress_plan,
+    compress_plan_blocks,
     elem_map,
+    raw_pattern_from_blocks,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .sharding import element_mesh as _element_mesh
@@ -323,6 +327,38 @@ def _lagrange_simplex(dim: int, degree: int, quad_degree: Any = None, cell_type:
         return lagrange_on(cell_type, degree, quad_degree)
     builder = {1: lagrange_interval, 2: lagrange_triangle}.get(int(dim), lagrange_tet)
     return builder(degree, quad_degree)
+
+
+class _ConstantSpec:
+    """The element of a CONSTANT field (``domain.unknown(..., constant=True)``): one basis function equal to
+    one on every cell, with zero gradient and Hessian. It borrows the quadrature rule of the mesh element it
+    is assembled beside, so every field still integrates on one shared rule."""
+
+    def __init__(self, base):
+        nq = int(np.asarray(base.quad_points).shape[0])
+        self.quad_points = base.quad_points
+        self.quad_weights = base.quad_weights
+        self.ref_values = np.ones((nq, 1, 1))
+        dim = int(np.asarray(base.ref_grads).shape[-1])
+        self.ref_grads = np.zeros((nq, 1, 1, dim))
+        self.ref_hess = np.zeros((nq, 1, dim, dim))
+        for name in ("degree", "dim"):
+            if hasattr(base, name):
+                setattr(self, name, getattr(base, name))
+
+
+def _constant_face_table(table):
+    """A facet table for a constant field: the same facet rule, a single basis value of one, zero gradient."""
+    if table is None:
+        return None
+    phi, dphi, qp, tangs, w = table
+    return (
+        jnp.ones(phi.shape[:2] + (1,), phi.dtype),
+        jnp.zeros(dphi.shape[:2] + (1,) + dphi.shape[3:], dphi.dtype),
+        qp,
+        tangs,
+        w,
+    )
 
 
 def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
@@ -789,7 +825,60 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
-def _dirichlet_value_columns(gs, vt, comp, region):
+def _symmetric_ic_values(raw, n, n_nodes):
+    """A whole-field initial value of a symmetric ``n x n`` field -> its stored upper triangle.
+
+    ``raw`` is flat: one constant, one ``n x n`` matrix, or one matrix per node (it is already stored-size
+    when the user wrote the ``n(n+1)/2`` values themselves). An asymmetric matrix is refused when the value
+    is concrete; a traced one (a trainable initial state) is read by its upper triangle."""
+    nn2 = n * n
+    if raw.size not in (nn2, n_nodes * nn2):
+        return raw
+    full = raw.reshape(-1, n, n)
+    if not isinstance(full, jax.core.Tracer):
+        f = np.asarray(full)
+        gap = float(np.max(np.abs(f - np.swapaxes(f, -1, -2)))) if f.size else 0.0
+        if gap > 1e-12 * max(1.0, float(np.max(np.abs(f)))):
+            raise ValueError(
+                f"jno.fem: the initial value of a symmetric=True field is not symmetric (max |G - G^T| = {gap:.3g})."
+            )
+    iu, ju = np.triu_indices(n)
+    return full[:, iu, ju].reshape(-1)
+
+
+def _unique_dirichlet_pairs(pairs):
+    """One ``(dof, value)`` pair per DOF; the LAST condition in the term list wins.
+
+    A node on two Dirichlet regions (the corner where ``left`` meets ``bottom``) is named by both. Every
+    consumer assumes one pair per DOF: the elimination appends one unit-diagonal triplet per pair and BCOO
+    sums duplicates, so a corner node's row became ``2 s u = s g`` -- the corner solved to HALF its value,
+    silently (measured: ``u = 1 + y`` on all four edges of a square gave 0.5 and 1.0 at the corners, against
+    1 and 2). Two DIFFERENT values at one DOF (a lid-driven cavity's top corners: lid 1, wall 0) are a
+    genuine ambiguity in the problem statement; the later condition is kept and the count is logged."""
+    if not pairs:
+        return pairs
+    keep: Dict[int, Any] = {}
+    clash = 0
+    for d, g in pairs:
+        d = int(d)
+        if d in keep:
+            try:
+                if abs(float(keep[d]) - float(g)) > 1e-12 * max(1.0, abs(float(g))):
+                    clash += 1
+            except Exception:  # a traced (net-valued) value: no concrete comparison, the later one wins
+                pass
+        keep[d] = g
+    if clash:
+        from ..logger import get_logger
+
+        get_logger().warning(
+            f"jno.fem: {clash} DOF(s) are prescribed by two Dirichlet conditions with DIFFERENT values (nodes "
+            "shared by two regions, e.g. corners). The condition written LATER in the term list is imposed there."
+        )
+    return list(keep.items())
+
+
+def _dirichlet_value_columns(gs, vt, comp, region, field=None):
     """A Dirichlet value table ``(n_nodes, n_values)`` checked against the clamped components.
 
     ``n_values`` must be 1 (a scalar, the same on every clamped component) or, for an all-component clamp
@@ -799,6 +888,22 @@ def _dirichlet_value_columns(gs, vt, comp, region):
     n_values = gs.shape[1] if gs.ndim == 2 else 1
     if n_values == 1:
         return gs.reshape(-1)
+    if field is not None and field.get("symmetric") and comp is None:
+        n = int(tuple(field["value_shape"])[0])
+        if n_values == n * n:
+            # A full n x n value on a symmetric field: it must BE symmetric, and its upper triangle is what is
+            # stored. Imposing an asymmetric value would silently keep half of it, so it is refused.
+            full = np.asarray(gs, dtype=float).reshape(-1, n, n)
+            gap = float(np.max(np.abs(full - np.swapaxes(full, -1, -2)))) if full.size else 0.0
+            scale = max(1.0, float(np.max(np.abs(full)))) if full.size else 1.0
+            if gap > 1e-12 * scale:
+                raise ValueError(
+                    f"jno.fem: the Dirichlet value on {region!r} is not symmetric (max |G - G^T| = {gap:.3g}), but the "
+                    "field was declared symmetric=True, which stores one value per symmetric pair. Prescribe a "
+                    "symmetric value, or declare the field without symmetric=True."
+                )
+            iu, ju = np.triu_indices(n)
+            return full[:, iu, ju]
     if comp is None and n_values == vt:
         return gs
     what = f"component {int(comp)} (`u(...)[{int(comp)}] - g`)" if comp is not None else f"a {vt}-component field"
@@ -882,7 +987,8 @@ def _seeded_piece(piece):
         proxies = {}
         for n in tests.values():
             pr = _Trial(name="seed", value_shape=getattr(n, "value_shape", ()), order=getattr(n, "order", 1),
-                        space=getattr(n, "space", "Lagrange"))  # fmt: skip
+                        space=getattr(n, "space", "Lagrange"),
+                        symmetric=n.__dict__.get("symmetric", False))  # fmt: skip
             pr.field_key = _SEED_KEY
             proxies[n] = pr
         res = (_substitute(piece, proxies), tuple(tests.values()))
@@ -891,6 +997,25 @@ def _seeded_piece(piece):
     except TypeError:  # not weak-referenceable: recompute next time, it is a trace-time cost only
         pass
     return res
+
+
+def _symmetrise_own_block(Ke, lo: int, hi: int):
+    """``Ke`` with its square test-field block ``Ke[:, lo:hi]`` replaced by ``(B + Bᵀ)/2`` when the block's
+    two triangles already agree to within the solver's symmetry gate (``linear._SYM_ULPS`` of its largest
+    entry), else unchanged. Float addition commutes, so the average is BITWISE symmetric: what LDLᵀ and
+    the eigs guard read. The gate is the solver's own, chosen between measured populations (a tangent's
+    round-off at 0.3-0.5 ulps, the weakest genuine asymmetry -- a 1e-12 advection term -- at ~191), so a
+    non-symmetric form is never averaged. Off-diagonal field blocks pair with ANOTHER kernel's block and
+    are left alone; a complex block is too (its symmetry is Hermitian, not this)."""
+    from .linear import _SYM_ULPS
+
+    if Ke.ndim != 2 or hi - lo != Ke.shape[0] or jnp.iscomplexobj(Ke):
+        return Ke
+    B = Ke[:, lo:hi]
+    gap = jnp.max(jnp.abs(B - B.T))
+    scale = jnp.max(jnp.abs(B))
+    sym = jnp.where(gap <= _SYM_ULPS * jnp.finfo(B.dtype).eps * scale, 0.5 * (B + B.T), B)
+    return Ke.at[:, lo:hi].set(sym)
 
 
 class _FusedVolumeTerms(tuple):
@@ -1107,6 +1232,35 @@ def assemble_fem_native(
                     field_index[f["field_key"]] = len(fields)
                     fields.append(f)
 
+    # A CONSTANT unknown (``domain.unknown(..., constant=True)``) may appear only on a boundary -- an inlet
+    # pressure that multiplies a traction and carries a flow-rate equation there -- so its field is
+    # collected from the boundary terms too. (A mesh field still has to appear in a volume term.)
+    for _exprs in boundary_terms.values():
+        for bare in _exprs:
+            for _, sub in _split_additive_terms(domain, bare):
+                fs, _ = _infer_fields(_lower_statefield_to_trial(sub, {}))
+                for f in fs:
+                    if f.get("constant") and f["field_key"] not in field_index:
+                        field_index[f["field_key"]] = len(fields)
+                        fields.append(f)
+    # ...and a constant that appears only in a tie `u(region) - U` or a pin `U - g` (handed over by jno.fem,
+    # consumed here so an auxiliary assembly on the same domain never sees it).
+    for _U in domain.__dict__.pop("_fem_tied_constants", None) or ():
+        for f in _infer_fields(_U)[0]:
+            if f["field_key"] not in field_index:
+                field_index[f["field_key"]] = len(fields)
+                fields.append(f)
+    # Constants go LAST: their block is the border of the system, and field 0 must be a mesh field (it
+    # supplies `fem.points` and, on a curved or tensor-product cell, the geometry).
+    if any(f.get("constant") for f in fields):
+        fields = [f for f in fields if not f.get("constant")] + [f for f in fields if f.get("constant")]
+        field_index = {f["field_key"]: i for i, f in enumerate(fields)}
+        if fields[0].get("constant"):
+            raise ValueError(
+                "jno.fem: every unknown in this form is a constant (constant=True) -- a constant is solved for "
+                "together with a field on the mesh, not on its own."
+            )
+
     if not fields:
         raise ValueError("assemble_fem_native: no trial fields found in volume_terms.")
 
@@ -1153,7 +1307,23 @@ def assemble_fem_native(
     # Per-field mesh data
     # -------------------------------------------------------------------------
 
-    mesh_data = [_get_mesh(domain, dim, f["order"]) for f in fields]
+    mesh_data = [_get_mesh(domain, dim, 1 if f.get("constant") else f["order"]) for f in fields]
+    # A constant field has ONE node, shared by every cell: its connectivity is a column of zeros, so the
+    # ordinary scatter sums every cell's contribution into it -- which is what makes its test function's
+    # rows integrals over the whole region, and its trial a value seen identically by every element. The
+    # node's coordinate is the mesh centroid; it locates nothing (``fem.field_points`` reports it).
+    mesh_data = [
+        (
+            md[0],
+            md[1],
+            np.mean(np.asarray(md[0]), axis=0, keepdims=True),
+            np.zeros((np.asarray(md[1]).shape[0], 1), np.int64),
+        )
+        if f.get("constant")
+        else md
+        for f, md in zip(fields, mesh_data)
+    ]
+    _const_f = [bool(f.get("constant")) for f in fields]
 
     def _pad_for_cover(md, blk):
         """A cover field's DOF nodes are the mesh nodes repeated ``blk = 1+M`` times.
@@ -1239,6 +1409,8 @@ def assemble_fem_native(
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
     domain._fem_native_field_shapes = [tuple(f["value_shape"]) for f in fields]
+    domain._fem_native_field_constant = [bool(f.get("constant")) for f in fields]
+    domain._fem_native_field_vecs = [int(f["vec"]) for f in fields]  # stored values per node (symmetric: n(n+1)/2)
 
     # -------------------------------------------------------------------------
     # Element specs and JAX constants
@@ -1246,17 +1418,20 @@ def assemble_fem_native(
 
     # On a CURVED cell the map is not affine, so `1/detJ` makes the integrand RATIONAL and no rule is
     # exact any more -- the degree stops being a correctness setting and becomes an accuracy one. Two
-    # extra degrees by default, with `jno.fem(quad_degree=...)` still overriding. Measured on the disk
+    # extra degrees by default; an explicit `jno.fem(quad_degree=...)` is used as written. Measured on the disk
     # rate study this changes the answer by <0.01% (7.6721e-06 -> 7.6719e-06 at degree 8), so it is
     # insurance against a form whose coefficients vary more sharply, not a fix for anything observed.
-    _qd = (quad_degree + 2) if _nonaffine else quad_degree
+    from .fem_utils import _QUAD_EXPLICIT, quad_floor
+
+    _qd = (quad_degree + 2) if (_nonaffine and not _QUAD_EXPLICIT[0]) else quad_degree
     if any(_cover):
         # A cover basis function is h_i * (x - x_i): degree 2, not 1. The entry-side floor
         # (`_fem.py`, max(quad_degree, 2*order)) sees only `order`, which stays 1 here, so the bump
         # has to happen where the enrichment is known. Without it the mass matrix silently
         # under-integrates and only a convergence study would notice.
-        _qd = max(_qd, 2 * (1 + COVER_DEGREE))
-    specs = [_lagrange_simplex(dim, f["order"], _qd, cell_type=_cell_type) for f in fields]
+        _qd = quad_floor(_qd, 2 * (1 + COVER_DEGREE), "the cover-enriched mass term")
+    specs = [_lagrange_simplex(dim, 1 if f.get("constant") else f["order"], _qd, cell_type=_cell_type) for f in fields]
+    specs = [_ConstantSpec(s) if c else s for s, c in zip(specs, _const_f)]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)
@@ -1408,9 +1583,29 @@ def assemble_fem_native(
     # P0 field parameters carry ONE value per element rather than per node, so they gather by cell
     # index and need no interpolation -- the kernel's scalar branch broadcasts them over the quad
     # points. The design variable of density-based topology optimisation is exactly this.
+
+    # A FEM field parameter k(x) carries P1 (mesh-vertex) nodal values -- `jno.np.parameter` accepts P1
+    # symbols only -- so it gathers on the P1 connectivity and interpolates on the P1 basis, whatever
+    # the fields around it are. Tabulated here against the SAME shared quadrature rule as every other
+    # spec so the contraction lines up.
+    #
+    # This used to use whichever field's terms mentioned the parameter. In a single-field P1 problem
+    # that is the same thing, so it went unnoticed; in a coupled problem it is not. A P1 design field
+    # inside `alpha(rho) <u, v>` -- test function a P2 velocity -- had its 21 nodal values gathered with
+    # P2 node ids running past 21, and JAX CLAMPS an out-of-range gather instead of raising, so the
+    # excess silently read the last node. Uniform k(x) hid it completely (every permutation of equal
+    # values is the same field); a non-uniform one was 44% wrong against the same coefficient written
+    # inline. `fem_nonnodal` already interpolates field parameters on P1 for exactly this reason.
+    _p1_shape_vals = None
+    if _field_param_names:
+        _p1_spec = _lagrange_simplex(dim, 1, _qd, cell_type=_cell_type)
+        _p1_shape_vals = jnp.reshape(jnp.asarray(_p1_spec.ref_values), (int(qp_shared.shape[0]), -1))
     from .parametric_helpers import _fem_field_kind
 
     _cell_field_names: set = {n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"}
+    from .parametric_helpers import refuse_space_field_parameters
+
+    refuse_space_field_parameters(_rt_param_exprs, "nodal Lagrange")
 
     # A BARE (non-field) runtime parameter is packed as a single scalar -- ``flat[:1]`` in
     # ``_runtime_vals`` below -- and read back as one. A multi-component one therefore had every entry
@@ -1620,8 +1815,10 @@ def assemble_fem_native(
     # identify). Not an args-dependent row of the kind above -- its held value changes every step -- so it
     # stays in the time-varying stash, whose held value `_tv_hold(t, args)` is evaluated at the time the
     # step's residual/forcing is called at WITH the runtime args. Its exprs only have to reach
-    # `runtime_parameter_exprs` so the solve node hands them over. That is the first-order transient;
-    # the τ load-path march and the second-order (u_tt) block evaluate g(x, t) without args and refuse.
+    # `runtime_parameter_exprs` so the solve node hands them over. That is the first-order transient and
+    # the τ load-path march (`u(top)[1] - g*tau`: displacement control with a trainable grip amplitude,
+    # #103), whose residual is called with (u, args, τ). The second-order (u_tt) block evaluates g(x, t)
+    # and its ġ on the augmented system without args, and refuses.
     _tv_param_exprs: Dict[str, Any] = {}
     _first_order_transient = (
         not tv_dirichlet_external
@@ -1634,12 +1831,14 @@ def assemble_fem_native(
             )
         )
     )
+
     def _reads_position(node):
         from ..._fem import _walk as _w
         from ...trace import Variable as _Var
 
         return any(isinstance(n, _Var) and getattr(n, "axis", "spatial") == "spatial" for n in _w(node))
 
+    _tv_args_ok = _first_order_transient or (_is_march and not tv_dirichlet_external)
     for _i, (_fk, _rg, _comp, _val, _vnode) in enumerate(dirichlet_raw):
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is None or _is_neural_coefficient(_vn):
@@ -1674,18 +1873,18 @@ def assemble_fem_native(
             from ..._fem import _is_temporal_value_node as _is_tv
 
             if _is_tv(_vnode):
-                if _first_order_transient:
+                if _tv_args_ok:
                     _tv_param_exprs.update(_found)  # held value re-formed per (t, args); see above
                     continue
-                # `u(top) - g * tau` on the load path, or g(x, t) on a u_tt block: those consumers evaluate
-                # the value at the step's τ/t only. The parametric branch would hold it constant in τ
-                # (silently un-ramping the load); the temporal one would freeze the parameter at its
-                # stored value (silently un-training it). Neither is right, so refuse.
+                # g(x, t) on a u_tt block: that consumer evaluates the value (and its ġ) at the step's t
+                # only. The parametric branch would hold it constant in t (silently un-ramping the load);
+                # the temporal one would freeze the parameter at its stored value (silently un-training
+                # it). Neither is right, so refuse.
                 raise NotImplementedError(
                     f"jno.fem: the essential value on {_rg!r} is BOTH runtime-parametric "
-                    f"({sorted(_found)}) and time/τ-dependent. That is supported on a first-order transient "
-                    "(`u.t`), not on a τ load-path march or a second-order (`u.tt`) form. There, train the "
-                    "amplitude through a Neumann/body term written as a function of τ/t, or fix one of the two."
+                    f"({sorted(_found)}) and time-dependent. That is supported on a first-order transient "
+                    "(`u.t`) and on a τ load-path march, not on a second-order (`u.tt`) form. There, train "
+                    "the amplitude through a Neumann/body term written as a function of t, or fix one of the two."
                 )
             _dir_param_exprs.update(_found)
             _dir_param_rows.add(_i)
@@ -1716,12 +1915,12 @@ def assemble_fem_native(
             **{n: ModelWeights(m) for n, m in _dir_net_models.items()},
             **{n: ModelWeights(m) for n, m in _ic_net_models.items()},
         }
-    # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
-    # coupled (multi-field) problem, associate it with the field whose test function appears in the
-    # term(s) that reference it (e.g. mu(x)*(grad u . grad v) -> the velocity field), so its nodal values
-    # gather/interpolate on THAT field's mesh. All field params must resolve to one field (a single shared
-    # ``shape_vals`` threads the interpolation), else it is rejected.
-    _field_param_field_idx = 0
+    # A nodal FIELD parameter k(x) carries P1 (mesh-vertex) values and interpolates on the P1 basis --
+    # see the tabulation of ``_p1_shape_vals`` above. Which field's terms mention it no longer decides
+    # anything, so nothing needs resolving here. What IS worth saying out loud is when the surrounding
+    # fields are richer than P1: the coefficient then resolves more coarsely than the fields it
+    # multiplies, which is a modelling fact the caller should know rather than discover from a result.
+    # The canonical case is a P1 design field against a P2 velocity in topology optimisation.
     if _field_param_names and len(fields) > 1:
         from .parametric_helpers import _contains_fem_field_parameter
 
@@ -1733,23 +1932,18 @@ def assemble_fem_native(
                     tfi = _test_field_index(coeff, field_index)
                     if tfi is not None:
                         _pf_idxs.add(int(tfi))
-        if len(_pf_idxs) == 1:
-            _field_param_field_idx = _pf_idxs.pop()
-        else:
-            # A field parameter shared across several fields' terms (a material property common to coupled
-            # equations, e.g. a conductivity in both a thermal and a coupling term) is allowed WHEN those
-            # fields share ONE FE space: same element order on the one mesh -> identical nodes, connectivity
-            # and shape_vals, so k(x) interpolates the same regardless of which field's space we pick. Only
-            # DIFFERING orders are ambiguous (no shared node set) and stay rejected.
-            _orders = {int(fields[i]["order"]) for i in _pf_idxs}
-            if not _pf_idxs or len(_orders) != 1:
-                raise NotImplementedError(
-                    "jno.fem (native): a FEM field parameter k(x) on a coupled (multi-field) problem must "
-                    "appear in the terms of fields sharing ONE FE space (same element order) — its nodal "
-                    "values interpolate on that shared space. Resolved to fields "
-                    f"{sorted(_pf_idxs)} with orders {sorted(_orders)} (differing orders share no node set)."
-                )
-            _field_param_field_idx = min(_pf_idxs)
+        _higher = sorted({int(fields[i]["order"]) for i in _pf_idxs} - {1})
+        if _higher:
+            _names = ", ".join(repr(n) for n in sorted(_field_param_names))
+            warnings.warn(
+                f"jno.fem: the field parameter(s) {_names} carry P1 (mesh-vertex) values and interpolate "
+                f"on the P1 basis, but they appear in terms tested by order-{_higher} field(s). The "
+                "coefficient is therefore resolved more coarsely than the fields it multiplies -- correct, "
+                "but its detail is capped by the vertex mesh (in topology optimisation, that is the design "
+                "resolution). Refine the mesh to resolve k(x) more finely; raising the other fields' order "
+                "will not.",
+                stacklevel=2,
+            )
 
     # -------------------------------------------------------------------------
     # Surface integration setup
@@ -1765,7 +1959,12 @@ def assemble_fem_native(
     # it unpackable-None. These are REFERENCE-space tables -- shape (n_faces, n_q, n_dof) per element
     # order -- so the cost is independent of the mesh size and paid once at build.
     face_tables_per_field = (
-        [_build_face_tables(f["order"], quad_degree, dim, _cell_type) for f in fields]
+        [
+            _constant_face_table(_build_face_tables(1, quad_degree, dim, _cell_type))
+            if f.get("constant")
+            else _build_face_tables(f["order"], quad_degree, dim, _cell_type)
+            for f in fields
+        ]
         if not _refuse_tensor_product_surface(_cell_type)
         else [None] * len(fields)
     )
@@ -2663,7 +2862,7 @@ def assemble_fem_native(
                 # parameter): pack a zero placeholder of the right width. It is only ever read back if
                 # the term actually contains the parameter node, in which case args carries its value.
                 _w = (
-                    n_local_f[_field_param_field_idx]
+                    int(cells_j.shape[1])  # P1 nodes per cell -- the space a field parameter lives on
                     if (name in _field_param_names and name not in _cell_field_names)
                     else 1
                 )
@@ -2675,9 +2874,9 @@ def assemble_fem_native(
                 # broadcasts it over the quad points -- which is what a per-element constant is.
                 pv.append(jnp.reshape(flat[c], (1,)))
             elif name in _field_param_names:
-                # Nodal field parameter -> this cell's local nodal values on its field's mesh (field 0
-                # for a single-field problem; the resolved field for a coupled one).
-                pv.append(flat[cells_f_j[_field_param_field_idx][c]])
+                # Nodal field parameter -> this cell's P1 vertex values, the space the parameter is
+                # defined on, independent of the fields whose terms mention it.
+                pv.append(flat[cells_j[c]])
             else:
                 # A parameter that is on NO FE space is a scalar, broadcast over the cell. An array
                 # here has no cell-to-value map, so `flat[:1]` would spread its FIRST entry over the
@@ -2781,10 +2980,10 @@ def assemble_fem_native(
             # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
             loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
-            # The field parameter's nodal slice is interpolated to the quad points with its field's shape
-            # functions (field 0 single-field; the resolved field for a coupled problem).
+            # The field parameter's nodal slice is interpolated to the quad points with the P1 basis it
+            # is defined on -- not the surrounding field's.
             # _runtime_parameter_value_from_internal_vars reads this top-level shape_vals.
-            loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored module
             loc["neural_coefficients"] = _nt
@@ -2801,9 +3000,9 @@ def assemble_fem_native(
         # (n_test,) layout, so their sum is the group's element residual.
         w = qw_shared * meas
         pieces = tuple(coeff) if isinstance(coeff, _FusedVolumeTerms) else (coeff,)
-        # The TANGENT keeps the per-DOF evaluation (``seeded=False``): its element matrix of a symmetric form
-        # is then bitwise symmetric, which is what admits LDLᵀ and keeps the eigs symmetry guard quiet; the
-        # seeded one is forward-over-reverse and symmetric only to round-off (3e-17 measured).
+        # The TANGENT is forward over this SEEDED evaluation. Forward-over-reverse is symmetric only to
+        # round-off (3e-17 measured), so its element block is averaged within the solver's symmetry gate
+        # (``_symmetrise_own_block``) -- bitwise symmetric, as LDLᵀ and the eigs symmetry guard need.
         seeds = [p for p in (_seeded_piece(pc) for pc in pieces) if p is not None] if seeded else []
         out = _seeded_element_residual(seeds, tfi, per, loc, w) if seeds else None
         plain = pieces if out is None else [pc for pc in pieces if _seeded_piece(pc) is None]
@@ -2887,7 +3086,7 @@ def assemble_fem_native(
             # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
             loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
-            loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
@@ -3215,7 +3414,7 @@ def assemble_fem_native(
         if test_vals is not None:
             loc["test_shape_vals"] = {btfi: test_vals}
         if _field_param_names:
-            loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
@@ -3283,7 +3482,7 @@ def assemble_fem_native(
         }
         _pack_gaps(loc, per_f, n_vec, gaps)  # so an AL multiplier update can read the same gap
         if _field_param_names:
-            loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+            loc["shape_vals"] = _p1_shape_vals
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
@@ -3340,9 +3539,7 @@ def assemble_fem_native(
                 lambda fi, la, gp, _f=formula, _r=region, _p=_pts_ro, _n=_nrm_ro: _surf_elem_readout(
                     fi, la, _f, _r, t, args, gp, _p, _n
                 )
-            )(
-                fids, lv, gsl if gsl else {}
-            )
+            )(fids, lv, gsl if gsl else {})
             # Normalize to the state's declared per-face shape (n_faces, n_quad_surf, *value_shape): a
             # scalar update written with `inner(dir, u.bind(...), 1)` keeps a spurious trailing size-1 axis
             # (harmless in the residual, where it contracts with the test) that must be squeezed here.
@@ -3800,39 +3997,32 @@ def assemble_fem_native(
             _has_bundle = dynamic_topology and bool(args) and TOPOLOGY_ARG in args
             if not _has_bundle and _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
                 return _pattern_cache["val"]
-            _idx_rows, _idx_cols = [], []
-            # int32 SOURCES, not an int32 cast of the result. Under x64 `cdofs` / `cell_all_dofs` are
-            # int64 (`jnp.arange` in the dof-map builder promotes), so every broadcast block below and
-            # both concatenated vectors were int64 -- 8 bytes per raw triplet, three times over, to
-            # produce an array that is cast back down to int32 one line later. Casting the small
-            # (n_cells, n_local) maps ONCE makes the whole pattern pipeline int32. These arrays are
-            # index metadata for the host-side plan; they are never differentiated.
-            _cdofs32 = [_c.astype(jnp.int32) for _c in cdofs]
-            _cad32 = cell_all_dofs.astype(jnp.int32)
+            # The pattern as BLOCKS -- an element block is (cell rows) x (cell columns), never expanded into
+            # its raw triplets: those are ~280 per DOF on a 3-D vector problem, and materialising them (rows,
+            # columns, stack, host copy, sort) was the build's host-memory peak (`compress_plan_blocks`).
+            # int32 numpy: index metadata for the host-side plan, never differentiated.
+            _blocks = []
+            _cdofs32 = [np.asarray(_c, dtype=np.int32) for _c in cdofs]
+            _cad32 = np.asarray(cell_all_dofs, dtype=np.int32)
             for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
-                _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                _idx_rows.append(jnp.broadcast_to(_cdofs32[_tfi_s][:, :, None], _sh).reshape(-1))
-                _idx_cols.append(jnp.broadcast_to(_cad32[:, None, :], _sh).reshape(-1))
+                _blocks.append(("outer", _cdofs32[_tfi_s], _cad32))
             for _region_s, _face_ids_s, _btyped_s in surface_work:
-                _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
+                _pc = np.asarray(parent_j, dtype=np.int64)[np.asarray(_face_ids_s, dtype=np.int64)]
                 _fcols = _cad32[_pc]
                 for _bcoeff_s, _btfi_s in _btyped_s:
-                    _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                    _idx_rows.append(jnp.broadcast_to(_cdofs32[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
-                    _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+                    _blocks.append(("outer", _cdofs32[_btfi_s][_pc], _fcols))
                     # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
                     # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
                     # also drives the main-side reaction. Inactive contact contributes zeros in DATA.
                     if _gap_key_of(_region_s) is not None:
                         _gs = _gap_static(_region_s, _face_ids_s, _btfi_s, args)
-                        _idx_rows.append(_gs["rows_sm"])
-                        _idx_cols.append(_gs["cols_sm"])
+                        # possibly TRACED (a compiled contact march): the plan builder then raises in its
+                        # `try` below and the in-trace fallback takes over, as before
+                        _blocks.append(("flat", _gs["rows_sm"], _gs["cols_sm"]))
                         if _gaps_in(_bcoeff_s, _region_s):
-                            _idx_rows.append(_gs["rows_ms"])
-                            _idx_cols.append(_gs["cols_ms"])
-                            _idx_rows.append(_gs["rows_mm"])
-                            _idx_cols.append(_gs["cols_mm"])
-            _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
+                            _blocks.append(("flat", _gs["rows_ms"], _gs["cols_ms"]))
+                            _blocks.append(("flat", _gs["rows_mm"], _gs["cols_mm"]))
+            _blk_sizes = [_block_len(b) for b in _blocks]  # per-term flat lengths, in append order
             if dynamic_topology:
                 b = (args or {}).get(TOPOLOGY_ARG)
                 _pl = (b or {}).get("plans", [None] * (_my_plan_idx + 1))[_my_plan_idx] if b else None
@@ -3857,31 +4047,16 @@ def assemble_fem_native(
                 # pattern and sent the Dirichlet rows down a different route than the baseline's, which is
                 # measurable: every assembled piece matched bit-for-bit while the STEP differed by 2.6e-3.
                 # So fall through to the ordinary path.
-            _idx_static = (
-                jnp.stack(
-                    [jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
-                )
-                if _idx_rows
-                else None
-            )
-            # Hand the plan builder a HOST copy and let go of the device array before it allocates its
-            # scratch: the two held the same bytes twice through the most memory-hungry phase of the
-            # build. When a plan comes back the raw pattern is DEAD -- the only reader is the
-            # `_plan is None` fallback below, and `_static_idx_for` publishes `_plan[0]` -- so it is
-            # never rebuilt; when compression fails the fallback path needs it on device, so it is
-            # re-uploaded there and only there.
-            _host_idx = None
+            _idx_static = None
             try:
-                _host_idx = np.asarray(_idx_static) if _idx_static is not None else None
-                _idx_static = None  # release the device buffer for the duration of compress_plan
-                _plan = compress_plan(_host_idx) if _host_idx is not None else None
+                _plan = compress_plan_blocks(_blocks) if _blocks else None
             except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
                 # Drop the pattern as the pre-plan code always did: a TRACED one must not be cached
                 # across traces, and the fallback below rebuilds it in-trace anyway.
-                _idx_static, _host_idx, _plan = None, None, None
-            if _plan is None and _host_idx is not None:
-                _idx_static = jnp.asarray(_host_idx)
-            _host_idx = None
+                _plan, _blocks = None, None
+            if _plan is None and _blocks:
+                # the uncompressed fallback needs the raw triplets on device; only here are they built
+                _idx_static = jnp.asarray(raw_pattern_from_blocks(_blocks))
             _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
             return _pattern_cache["val"]
 
@@ -3966,11 +4141,21 @@ def assemble_fem_native(
                 _inv_blocks_cache[key] = hit
             return hit[1]
 
-        def jacobian(u_flat, t=0.0, args=None):
+        def jacobian(u_flat, t=0.0, args=None, *, diag=False):
+            """The assembled tangent (a BCOO); with ``diag=True`` only its DIAGONAL, a ``(total,)`` vector.
+
+            The diagonal runs the same element loop and keeps, per element block, the entries whose global
+            row and column coincide, scattered straight into one vector: no matrix, no sparsity plan, and a
+            batch of element blocks as the only scratch -- what a Jacobi preconditioner on the matrix-free
+            Newton needs (as deal.II's ``MatrixFreeTools::compute_diagonal`` does)."""
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
             # between rounds and the contact block's indices move with it.
             _idx_static, _plan, _blk_sizes = _pattern(args)
+            _dacc = [None]
+            if diag:  # no matrix: the plan and the raw pattern are not used at all
+                _idx_static, _plan = None, None
+                _dacc[0] = jnp.zeros((total,), dtype=u_flat.dtype)
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
@@ -3992,6 +4177,10 @@ def assemble_fem_native(
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             def _emit(flat, rows_fn, cols_fn):
+                if diag:
+                    r, c = rows_fn(), cols_fn()
+                    _dacc[0] = _dacc[0] + jax.ops.segment_sum(jnp.where(r == c, flat, 0.0), r, num_segments=total)
+                    return
                 if _plan is None:
                     data_l.append(flat)
                     rows_l.append(rows_fn())
@@ -4007,9 +4196,24 @@ def assemble_fem_native(
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=False))(la)
+                    # Forward over the SEEDED residual (one reverse pass per cell for every test DOF), not over
+                    # the per-test-DOF evaluation: that one evaluated the integrand k_test x k_trial times per
+                    # point. Its block is symmetric to round-off only, so it is averaged within the solver's
+                    # own symmetry gate (`_symmetrise_own_block`), which makes it bitwise symmetric.
+                    Ke = jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True))(la)
+                    return _symmetrise_own_block(Ke, loc_seg[_t], loc_seg[_t + 1])
 
                 _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
+                if diag:
+                    # per cell: the block's entries at (row a, the column holding the same global DOF)
+                    _rows_t = cd_d[tfi]
+
+                    def _kd(c, la, _k=_ke, _rt=_rows_t):
+                        same = _rt[c][:, None] == cad_d[c][None, :]  # (n_test, n_local_all)
+                        return jnp.sum(jnp.where(same, _k(c, la), 0.0), axis=1)
+
+                    _dacc[0] = _elem_map(_kd, (jnp.arange(n_cells), local_all), _chunk_v, scatter=(_dacc[0], _rows_t))
+                    continue
                 if _plan is not None:
                     # Scatter each CHUNK's element blocks straight into the compressed slots (the residual's
                     # own `scatter=` path), so the (n_cell, n_test, n_local) stack of every cell's block is
@@ -4162,6 +4366,8 @@ def assemble_fem_native(
                             d_mm = -jnp.einsum("fqk,fqvpw,fpl->fqkvplw", w_f, Dum.reshape(n_face, n_q, vt, n_q, vt), w_f)
                             _emit(d_mm.reshape(-1), lambda _g=gs: _g["rows_mm"], lambda _g=gs: _g["cols_mm"])
 
+            if diag:
+                return _dacc[0]
             if _plan is not None:
                 if _acc[0] is None:  # no terms -> empty operator
                     return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
@@ -4305,6 +4511,8 @@ def assemble_fem_native(
         then expanded to the ``1+M`` slots it owns. A Dirichlet condition therefore reaches the
         value and its covers alike -- which is what :func:`_cover_g` then tells apart, giving the
         covers zero rather than ``g``."""
+        if _const_f[fidx]:
+            return [0]  # a constant's one node: `U - g` pins it whatever region the term names
         real = _boundary_node_ids_real(fidx, region)
         blk = _cblk[fidx]
         if blk == 1:
@@ -4411,7 +4619,10 @@ def assemble_fem_native(
                 loc = domain._make_tag_location_fn(region)
                 if loc is None:
                     return []
-                mask = np.asarray(jax.vmap(loc)(jnp.asarray(coords)), dtype=bool).reshape(-1)
+                from ...domain.boundary_region import map_points
+
+                # batched: one vmap over every boundary node x every region facet was the build's peak
+                mask = map_points(loc, coords, getattr(loc, "n_entities", 1)).astype(bool)
             bnodes = bnodes[mask]
         # `d.tag(..., region=...)`: keep only the nodes belonging to that body. Two coincident faces of
         # a non-conforming interface have identical coordinates, so the predicate above selects BOTH;
@@ -4509,21 +4720,27 @@ def assemble_fem_native(
             if _field_vals is not None:
                 gs = _real_dirichlet_values(np.asarray(_field_vals)[nids], region).astype(float)
             elif value_node is not None:
-                raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))))
+                # A matrix field's value (`g(z) * M`) is evaluated point by point: in a batch the
+                # coordinates are (n, 1) columns, which do not broadcast against an n x n matrix (see
+                # `_eval_value_node_at`). Its per-point result is then always (n_nodes, n*n).
+                _pw = comp is None and len(tuple(fields[fidx].get("value_shape") or ())) >= 2
+                _pw = _pw and len(nids) > 0
+                raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), pointwise=_pw)))
                 _real_dirichlet_values(raw, region)  # refuse a complex g before any cast drops Im(g)
                 # Does the result scale with the number of points? A CONSTANT profile returns the
                 # same thing for any batch -- including a constant VECTOR like (gx, gy), whose size
                 # can coincide with the node count -- so shape alone cannot tell. One extra
-                # single-point evaluation settles it and costs nothing.
-                one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
-                if raw.shape == one.shape or len(nids) == 0:
+                # single-point evaluation settles it and costs nothing. (A pointwise evaluation always
+                # scales, so it never needs the test.)
+                one = None if _pw else np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
+                if (not _pw and raw.shape == one.shape) or len(nids) == 0:
                     const = np.real(one).reshape(-1).astype(float)  # constant over the region: (n_values,)
                     gs = np.broadcast_to(const, (len(nids), const.size))
                 else:
                     gs = np.real(raw).reshape(len(nids), -1).astype(float)  # (n_nodes, n_values)
                 # EVERY component, not the first one broadcast to all: `u(wall) - (1.0, -0.5)` on a vector
                 # field used to impose (1.0, 1.0) -- silently, steady and transient alike.
-                gs = _dirichlet_value_columns(gs, vt, comp, region)
+                gs = _dirichlet_value_columns(gs, vt, comp, region, fields[fidx])
             elif callable(value):
                 gs = np.array([float(_real_dirichlet_values(value(p), region)) for p in pts], dtype=float)
             else:
@@ -4543,6 +4760,7 @@ def assemble_fem_native(
         domain._fem_native_dirichlet_args_dofs = args_dofs
         _mask_cover_pins(pairs)
         _gauge_cover_modes(pairs)
+        pairs[:] = _unique_dirichlet_pairs(pairs)  # in place: the stash above is this same list
         return pairs
 
     def _cover_g(fidx, nid, g):
@@ -4747,7 +4965,7 @@ def assemble_fem_native(
                 p = pts_all[nid]
                 if value_node is not None:
                     gv = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None]))).reshape(1, -1)
-                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region)).reshape(-1)
+                    gv = np.asarray(_dirichlet_value_columns(gv.astype(float), vt, comp, region, fields[fidx])).reshape(-1)
                 elif callable(value):
                     gv = np.array([float(value(p))])
                 else:
@@ -4914,6 +5132,8 @@ def assemble_fem_native(
                     raw = jnp.reshape(
                         jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params, t=t0)), (-1,)
                     )
+                if comp is None and fields[fidx].get("symmetric"):
+                    raw = _symmetric_ic_values(raw, int(tuple(fields[fidx]["value_shape"])[0]), nn)
                 if comp is not None:
                     # Per-component IC (e.g. ``u(initial)[0] - g0``): set just component ``comp`` at every
                     # node of the field. ``raw`` is the per-node value (or a single constant to broadcast).
@@ -5309,6 +5529,10 @@ def assemble_fem_native(
     domain._fem_native_term_functional = _make_functional
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
+    # Linear in the unknown, whatever routes it through Newton below (step history does; a box constraint or
+    # a derived field makes the residual itself nonlinear, so those clear it). Newton on such a residual
+    # converges in one EXACT step, so its driver skips the inexact-Newton forcing (`newton_direct`).
+    linear_in_unknown = not nonlinear and not bounded and not derived_specs
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a
     # different linear system whose coefficients the buffers set. The linear branch below builds a
     # ``FemLinearSystem`` from ``_assemble_at(args)``, which has no ``__history__`` to thread — so the
@@ -5409,10 +5633,12 @@ def assemble_fem_native(
 
                     _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
 
-                    def _tv_hold(t):
+                    def _tv_hold(t, args=None):
+                        # `args` substitutes a trainable amplitude in the value (`u(top)[1] - g*tau`), so the
+                        # held value -- and the march built on it -- stays differentiable in it (#103).
                         return jnp.concatenate(
                             [
-                                jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,))
+                                jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t, params=args)), (-1,))
                                 for _d, n, c in _tv_dirichlet
                             ]
                         )
@@ -5424,7 +5650,7 @@ def assemble_fem_native(
                     if _b is not None:
                         u = u.at[_b].set(jnp.asarray(_base_hold(args)).astype(u.dtype))
                     if _t is not None:
-                        u = u.at[_t].set(_tv_hold(t).astype(u.dtype))
+                        u = u.at[_t].set(_tv_hold(t, args).astype(u.dtype))
                     return u
 
                 def res_p(u, args=None, t=0.0, _b=_bd, _t=_tvd):
@@ -5433,11 +5659,14 @@ def assemble_fem_native(
                     if _b is not None:
                         R = R.at[_b].set(u[_b] - _base_hold(args))
                     if _t is not None:
-                        R = R.at[_t].set(u[_t] - _tv_hold(t))
+                        R = R.at[_t].set(u[_t] - _tv_hold(t, args))
                     return R
 
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
                     return bcoo_eliminate_dirichlet(jacobian(_hold_project(u, args, t), t, args), _d)
+
+                def jac_diag_p(u, args=None, t=0.0, _d=_all_d):
+                    return jacobian(_hold_project(u, args, t), t, args, diag=True).at[_d].set(1.0)
 
                 _constrained = _all_d
             else:
@@ -5455,9 +5684,15 @@ def assemble_fem_native(
                     J = jacobian(_s_project(u), t, args)
                     return J if _d is None else bcoo_eliminate_dirichlet(J, _d)
 
+                def jac_diag_p(u, args=None, t=0.0, _d=s_d_dofs):
+                    dg = jacobian(_s_project(u), t, args, diag=True)
+                    return dg if _d is None else dg.at[_d].set(1.0)
+
                 _constrained = s_d_dofs
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            _op.jacobian_diag = jac_diag_p
+            _op.linear_in_unknown = linear_in_unknown
             # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
             # (``staggered(over_relax>1)``) must leave these alone: the sub-solve already puts them exactly
             # on the prescribed value, and stepping past it makes the constraint oscillate as (1-omega)^k
@@ -5527,7 +5762,17 @@ def assemble_fem_native(
                 _f._jno_static_idx = _idx_for(args)
             return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
+        def _jac_diag_np(u, args=None):
+            # the diagonal of `_jac_np`'s matrix: at the projected state, unit on the eliminated rows
+            u = jnp.asarray(u)
+            if not dirichlet_pairs:
+                return jacobian(u, 0.0, args, diag=True)
+            _d, _v, _proj = dirichlet_projection(dirichlet_pairs)
+            return jacobian(_proj(u), 0.0, args, diag=True).at[_d].set(1.0)
+
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.jacobian_diag = _jac_diag_np
+        _op_np.linear_in_unknown = linear_in_unknown
         # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating
         # driver (``staggered(over_relax != 1)``) must leave them alone. Missing here, every NON-parametric
         # problem over-relaxed its prescribed values -- measured g = 2 held at 3.0 after one sweep with

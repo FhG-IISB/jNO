@@ -91,8 +91,15 @@ _INNER = textwrap.dedent(
     out["grad"] = float(jax.grad(loss)(jax.numpy.asarray([1.3]))[0])
 
     fc = cavity()
-    out["cavity"] = np.asarray(fc.solve()).tolist()
-    out["direct"] = np.asarray(fc.solve(nonlinear=jno.solve.newton(direct=True))).tolist()
+    tight = dict(rtol=1e-12, atol=1e-12)
+    # Exact Newton steps: a forced (inexact) root is only as good as its tolerance, and the saddle
+    # turns that into ~1e-9 in the velocities, so two device counts would differ by THAT, not by
+    # anything the split does. Without forcing they agree to round-off.
+    from jno.utils.solver.newton_krylov import exact_steps
+
+    with exact_steps():
+        out["cavity"] = np.asarray(fc.solve(nonlinear=jno.solve.newton(**tight))).tolist()
+        out["direct"] = np.asarray(fc.solve(nonlinear=jno.solve.newton(direct=True, **tight))).tolist()
 
     # a NONLINEAR march: a Newton solve per step, each residual split inside the scan
     import jno.utils.solver.fem_native as FN
@@ -140,13 +147,12 @@ def test_one_device_takes_the_plain_path(one):
 @pytest.mark.parametrize("n_dev", [2, 4])
 def test_the_split_solve_matches_one_device(one, n_dev):
     many = _run(n_dev)
-    # Only the summation order moves, so the answers agree to the SOLVER's tolerance, not to round-off: a
-    # Newton stopped at 1e-8 on a saddle point with a 1e-10 inner solve moved the cavity's pressure by
-    # 1.2e-11 on 4 devices. The reaction problem is SPD and well conditioned, and holds 1e-11.
-    np.testing.assert_allclose(many["reaction"], one["reaction"], rtol=0, atol=1e-11, err_msg="reaction")
-    np.testing.assert_allclose(many["march"], one["march"], rtol=0, atol=1e-11, err_msg="march")
-    for key in ("cavity", "direct"):
-        np.testing.assert_allclose(many[key], one[key], rtol=0, atol=1e-9, err_msg=key)
+    # Only the summation order moves. The cavity is solved with exact Newton steps (see _INNER): a forced root
+    # stops just under its tolerance, and on this saddle that left 1e-9 between device counts at rtol=1e-12
+    # (1.6e-6 at the default 1e-8), with or without a defect in the split. With exact steps every key agrees
+    # to round-off (measured <= 1.5e-15), so 1e-12 would catch a split that drops or doubles anything.
+    for key in ("reaction", "march", "cavity", "direct"):
+        np.testing.assert_allclose(many[key], one[key], rtol=0, atol=1e-12, err_msg=key)
     assert max(abs(x) for x in one["cavity"]) > 0.1, "the cavity must actually flow"
     assert many["reaction_devices"] == n_dev, "the solve did not run across the devices"
     # the compiled J.v: ONE all-reduce, nothing gathered or shifted, and each device's scratch shrinks

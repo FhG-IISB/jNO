@@ -715,7 +715,11 @@ def test_gmres_chunked_reaches_the_true_residual(dtype, check_every):
         A = A + 1j * rng.standard_normal((n, n)) / np.sqrt(n)
     b = rng.standard_normal(n).astype(dtype)
     Aj, d = jnp.asarray(A), jnp.asarray(1 / np.diag(A))
-    solve = jax.jit(lambda b: krylov.gmres_chunked(lambda v: Aj @ v, b, M=lambda v: d * v, tol=1e-10, restart=16, check_every=check_every))
+    solve = jax.jit(
+        lambda b: krylov.gmres_chunked(
+            lambda v: Aj @ v, b, M=lambda v: d * v, tol=1e-10, restart=16, check_every=check_every
+        )
+    )
     x = np.asarray(solve(jnp.asarray(b)))
     assert np.linalg.norm(A @ x - b) <= 1e-10 * np.linalg.norm(b)
 

@@ -74,7 +74,9 @@ curvature term it does not carry. **Facet normals are still straight-facet**, so
 that affects radiation view factors, flux BCs and RCWA's field decomposition is unchanged by this.
 
 Note also that a curved map makes the integrand rational, so **no quadrature rule is exact** any more.
-The default degree is raised by 2 on curved cells and `jno.fem(quad_degree=...)` still overrides;
+The default degree is raised by 2 on curved cells and `jno.fem(quad_degree=...)` still overrides (an explicit degree is used
+as written, also below the default `2 × order`, and a degree below it is reported once with what it integrates
+inexactly);
 measured on the study above, refining the rule moves the answer by less than 0.01 %.
 
 ---
@@ -633,8 +635,29 @@ The restart state is the one a rebuild already re-enters the march with, plus th
 segment starts on. Trajectories are bit-identical with and without checkpointing, including across
 rebuilds (600 and 1,400 steps on a melt ball; `max |Δstate| = max |Δpoints| = 0`).
 
-`checkpoint=` needs `adapt=`, and is refused otherwise. A plain march is one compiled `lax.scan` with no
-host-side boundary to write at; extending it would cost end-to-end reverse-mode differentiation (#141).
+The same `checkpoint=` writes down the fixed-mesh marches too: a transient (`u.t`) march with a built-in
+scheme, and a load-path march (`.i(k)` with `domain(tau=...)`).
+
+```python
+u = fem.solve(checkpoint=jno.solve.checkpoint("runs/heat", every=200)).fn()   # u.t march
+u = fem.solve(checkpoint=jno.solve.checkpoint("runs/plate", every=50))         # tau load path
+```
+
+Those marches are compiled loops, and checkpointing runs them as a host loop of chunks of `every` steps,
+writing the frames to one `frames.npy` memory map and the loop carry to `latest.npz` after each chunk.
+The transient trajectory is bit-identical to the unchecked march on CPU and within 1 ulp on GPU (the
+chunks compile to other shapes than the single scan); the load path agrees to round-off (2.8e-17). With `keep="last"` the result is a `numpy.memmap` of the frames on disk. A store
+records what identifies its march (grid, sizes, scheme, initial state, parameters, operators), so
+resuming a different problem into it raises instead of splicing the two.
+
+!!! warning "A checkpointed march is not differentiable"
+    A chain of scans is not the single scan whose adjoint jNO builds, so `checkpoint=` raises under
+    `jit` / `grad` / `jno.core`. Checkpoint the forward run at named values
+    (`fem.solve(k=2.0, checkpoint=...)`) and differentiate without it.
+
+Every solve that cannot write itself down refuses `checkpoint=` rather than run and leave the directory
+empty: a steady solve, an adaptive time step, a sharded or `solve_fn=` integrator, adaptive / arc-length /
+contact load stepping, and a moving mesh without `adapt=` (one compiled scan, with no boundary to write at).
 
 Two memory leaks in the rebuild path were fixed with it:
 
@@ -730,8 +753,49 @@ per-region values compose for free, calibrated through `crux`. Each target must 
 (`from_regions`), a `domain.tag`, or a mesh-file region. It desugars to `sum_r RegionMask(r)·value_r`,
 inheriting the centroid classification.
 
+**Changing a value after `jno.fem` is built.** `d.<name>` reads plain values (numbers, arrays) from the
+domain when the terms are assembled, so a later `attach` reaches an existing `fem`: its next `solve()`
+re-assembles and says so in the log (`jno.fem: re-assembled, since domain.attach changed 'q' ...`). The
+mesh, and anything built on it such as an enclosure's view factors, is not rebuilt.
+
+```python
+fem = jno.fem([d.k * (ui.x*vi.x + ui.y*vi.y) - d.Q * vi, u(xb, yb) - 0.0])
+T1 = fem.solve()
+d.attach("core", Q=2.0e6)                             # a plain number: watched
+T2 = fem.solve()                                      # re-assembled with the new Q
+```
+
+A value that is itself an expression (a function of position, a `jno.fn`, a trainable parameter) is
+captured when the term is written, so re-attaching one raises at the next solve; build a new `jno.fem`
+after such a change. `d.attached(name)` returns the values as a plain mapping at the moment it is called
+and is not watched.
+
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
+
+### `domain.mask` — a field's values on one region
+
+`d.mask(name)` is a boolean mask over the mesh nodes (`d.mesh.points`): every node of the region's
+cells, read from the mesh's own cell labels. Use it to evaluate a solution on one part:
+
+```python
+T = fem.solve()                       # a P1 scalar field: one value per mesh node
+core = d.mask("core")
+T[core].mean(), T[core].max()
+```
+
+The mask has one entry per mesh node, so it lines up with a solution that has one value per mesh node.
+For other fields, index the part that does:
+
+- **a vector field** (`value_shape=(n,)`): the solution is interleaved per node, `T.reshape(-1, n)[core]`;
+- **P2 and above** on a straight-sided mesh: the solution lists the mesh nodes first and then the added
+  mid-side nodes, so `T[: len(core)][core]` gives the values at the region's vertices. For every DOF of the
+  region, select on `fem.points` (the coordinates the DOFs live on) instead.
+
+A node on an interface belongs to both regions, and on a curved mesh the mid-side nodes are included.
+It works for the parts of a `jno.shape` plan and for the named volumes of a loaded mesh, and raises
+`KeyError` listing the mesh's regions for any other name. Boundary tags go through
+`domain.tag_node_mask` instead.
 
 ---
 

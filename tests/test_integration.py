@@ -321,7 +321,7 @@ class TestMemoryStrategies:
 
         solver, u_net = _make_solver()
         u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
-        stats = solver.solve(20, offload_data=True, batchsize=16)
+        stats = solver.solve(20, offload_data=True, points=16)
 
         logs = stats.training_logs[-1]
         assert logs["losses"].ndim == 2
@@ -356,7 +356,7 @@ class TestMemoryStrategies:
             20,
             checkpoint_gradients=True,
             offload_data=True,
-            batchsize=16,
+            points=16,
         )
 
         logs = stats.training_logs[-1]
@@ -720,7 +720,7 @@ class TestGradientAccumulation:
 
         solver, u_net = _make_solver()
         u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
-        stats = solver.solve(10, batchsize=16, accumulation_steps=2)
+        stats = solver.solve(10, points=16, accumulation_steps=2)
 
         logs = stats.training_logs[-1]
         assert logs["losses"].ndim == 2
@@ -737,7 +737,7 @@ class TestGradientAccumulation:
         u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(
             10,
-            batchsize=16,
+            points=16,
             offload_data=True,
             accumulation_steps=3,
         )
@@ -780,7 +780,7 @@ class TestGradientAccumulation:
         u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(
             10,
-            batchsize=16,
+            points=16,
             accumulation_steps=2,
             checkpoint_gradients=True,
         )

@@ -22,6 +22,15 @@ from ..utils.adaptive import LearningRateSchedule
 from ..utils.iree import IREEModel
 from ..utils.logger import get_logger
 
+
+def _matmul(a, b):
+    """``a @ b`` for the ``@`` operators of the trace: small products lowered elementwise (see
+    :func:`jno.utils.solver.small_linalg.small_matmul`)."""
+    from ..utils.solver.small_linalg import small_matmul  # lazy: jno.utils.solver imports the trace
+
+    return small_matmul(a, b)
+
+
 __all__ = [
     "Placeholder",
     "FunctionCall",
@@ -36,6 +45,7 @@ __all__ = [
     "BinaryOp",
     "Tracker",
     "Constraint",
+    "AugLagConstraint",
     "Model",
     "TunableModule",
     "TunableModuleCall",
@@ -64,6 +74,7 @@ __all__ = [
     "TestFunction",
     "Assembly",
     "GroupedAssembly",
+    "Flow",
     "TrialFunction",
     "FemLinearSystem",
     "FemResidualOperator",
@@ -464,19 +475,19 @@ class Placeholder:
 
         # symbolic path
         if isinstance(other, Placeholder):
-            return FunctionCall(lambda a, b: a @ b, [self, other])
+            return FunctionCall(_matmul, [self, other])
 
         # eager path (other is ndarray)
-        return FunctionCall(lambda a: a @ other, [self])
+        return FunctionCall(lambda a: _matmul(a, other), [self])
 
     def __rmatmul__(self, other) -> FunctionCall:
         """Matrix multiplication: other @ self"""
         other = self._wrap(other)
 
         if isinstance(other, Placeholder):
-            return FunctionCall(lambda a, b: a @ b, [other, self])
+            return FunctionCall(_matmul, [other, self])
 
-        return FunctionCall(lambda b: other @ b, [self])
+        return FunctionCall(lambda b: _matmul(other, b), [self])
 
     def reshape(self, *shape) -> FunctionCall:
         """Reshape this placeholder to a new shape."""
@@ -987,7 +998,13 @@ class Placeholder:
 
     @property
     def T(self) -> FunctionCall:
-        return FunctionCall(lambda x: x.T, [self], "transpose", True)
+        """The transpose over the LAST TWO axes (the matrix axes); a 0-/1-D value is returned as is.
+
+        The array ``.T`` reverses every axis, which is the transpose only for a plain 2-D array. In a trace
+        the leading axes are points (and, at assembly, quadrature points and test DOFs), so on a field of
+        2x2 tensors -- ``grad(u).T`` -- reversing them all produced a ``(2, 2, n)`` array: a broadcast error
+        at best, and for ``n = 2`` a silently wrong number. For a 2-D array both readings agree."""
+        return FunctionCall(lambda x: jnp.swapaxes(x, -1, -2) if jnp.ndim(x) >= 2 else x, [self], "transpose", True)
 
     def eval(self, domain=None):
         """Eagerly evaluate this node and return the array — no ``jno.core`` boilerplate.
@@ -1376,6 +1393,12 @@ class Placeholder:
 
             space_time_integral = u_net(x, t).integrate().integrate(t)
 
+        **Domain integral of known fields** (``var=d`` — a domain): an expression of frozen fields (data, or
+        solutions of any number of forms frozen with ``u.bind(...).freeze(fem.solve())``), parameters and
+        coordinates, integrated over the volume with each field's own element -- so a reciprocity matrix is its
+        formula, e.g. ``C_jk = (eps * inner(grad(Phi[k]), grad(Phi[j]))).integrate(d)``. See
+        ``Domain._integral_node``.
+
         **FEM integral** (``var=fem`` — a ``jno.fem(...)`` object):
         Integrates an expression built from that FEM's own symbols over its basis, at its
         solution, returning a differentiable scalar. This is the FEM twin of the collocation
@@ -1394,8 +1417,8 @@ class Placeholder:
         ``quadrature=`` does not apply: a FEM functional inherits the rule its operator was
         assembled with, which is what makes ``∫ σ(u):ε(u) dΩ`` equal ``uᵀKu`` exactly. Every
         functional over one ``fem`` shares a single solve. See :meth:`jno.fem.eval` for the eager
-        form and for the scope limits (whole volume and tagged boundary regions, steady
-        native-Lagrange problems).
+        form and for the scope limits (steady problems; the whole volume and tagged boundary regions
+        of a native-Lagrange form, the whole volume of a non-nodal one, real or complex).
 
         ``solver=`` picks the backend for that shared solve, the same spec ``fem.solve()`` takes::
 
@@ -1477,8 +1500,53 @@ class Literal(Placeholder):
         return f"Literal({self.value})"
 
 
+class AttachedLiteral(Literal):
+    """A region's attached value inside ``d.<prop>``, read from the domain each time it is lowered.
+
+    ``domain.attach`` can change the value after the term is written; reading it here rather than
+    copying it is what lets a built ``jno.fem`` re-assemble with the new value (the fem watches the
+    property's version, see ``FEM._refresh_attachments``). Only values that resolve to a plain number or
+    array are carried this way. It prints as the ``Literal`` it stands for.
+    """
+
+    def __init__(self, domain, prop: str, target: str):
+        self._domain, self.prop, self.target = domain, prop, target
+
+    @property
+    def value(self):
+        raw = self._domain.__dict__["_region_attachments"][self.prop][self.target]
+        return jnp.asarray(self._domain._resolve_attached(raw))
+
+    def __repr__(self):
+        return f"Literal({self.value})"
+
+
 class FunctionCall(Placeholder):
     """Call to a pure function over traced args."""
+
+    def auglag(self, mu: float = 10.0, every: int = 100) -> "AugLagConstraint":
+        """``(a <= b).auglag(...)``: the comparison as a constraint; see :meth:`Constraint.auglag`.
+
+        Only ``<=`` and ``>=`` qualify. A strict ``<`` / ``>`` bound is refused: its optimum sits on
+        the boundary it excludes, so it has none.
+        """
+        if self.fn is jnp.less_equal or self.fn is jnp.greater_equal:
+            a, b = self.args
+            if not isinstance(a, Placeholder):  # `2.0 <= x` reached here as x >= 2.0 already; this is defensive
+                a, b = b, a
+                sense = "ge" if self.fn is jnp.less_equal else "le"
+            else:
+                sense = "le" if self.fn is jnp.less_equal else "ge"
+            return AugLagConstraint(a, b, sense, mu=mu, every=every)
+        if self.fn is jnp.less or self.fn is jnp.greater:
+            op = "<" if self.fn is jnp.less else ">"
+            raise ValueError(
+                f"auglag: a strict `{op}` has no optimum (it sits on the excluded boundary); write `{op}=` instead."
+            )
+        raise TypeError(
+            f".auglag() applies to a comparison `a <= b` / `a >= b` or to jno.le/jno.ge, not to a "
+            f"call of {getattr(self.fn, '__name__', self.fn)!r}."
+        )
 
     def __init__(
         self,
@@ -2102,8 +2170,11 @@ class Tracker(Placeholder):
         return f"Tracker({self.expr!r}, interval={self.interval})"
 
 
+_SENSE_OP = {"le": "<=", "ge": ">=", "eq": "=="}
+
+
 class Constraint(Placeholder):
-    """Wraps an expression that is an **inequality constraint**, not a loss to minimise.
+    """Wraps an expression that is a **constraint**, not a loss to minimise.
 
     ``jno.core`` evaluates it exactly like a constraint entry -- same compiled function, same
     differentiation -- so its value and gradient are available to a constrained optimiser. What it
@@ -2111,26 +2182,76 @@ class Constraint(Placeholder):
     summing a constraint into the objective makes it a soft penalty, which double-counts against an
     optimiser (MMA, OC, SQP) that already handles it in the dual.
 
-    ``sense`` is ``"le"`` (``expr <= bound``) or ``"ge"``; the stored residual is normalised to the
-    ``g <= 0`` convention either way, so a consumer never has to branch on the sense.
+    ``sense`` is ``"le"`` (``expr <= bound``), ``"ge"`` or ``"eq"`` (``expr == bound``, enforced only
+    through :meth:`auglag`); the stored residual is normalised to the ``g <= 0`` convention (``g == 0``
+    for an equality), so a consumer never has to branch on ``le`` versus ``ge``.
 
     Contrast with :class:`Tracker`, which is also kept out of the loss but is evaluated by a
     *separate* function on an interval, is not differentiated, and is invisible to the optimiser.
     """
 
     def __init__(self, expr: Placeholder, bound: float = 0.0, sense: str = "le"):
-        if sense not in ("le", "ge"):
-            raise ValueError(f"Constraint: sense must be 'le' or 'ge', got {sense!r}.")
+        if sense not in ("le", "ge", "eq"):
+            raise ValueError(f"Constraint: sense must be 'le', 'ge' or 'eq', got {sense!r}.")
+        from .views import _VIEW_TYPES
+
+        # a typed view (u.scalar, or an expression of frozen fields that stays a view) is its Placeholder here,
+        # as in jno.np.* and jno.core.eval: the evaluator has no handler for the view wrapper
+        expr = expr._expr if isinstance(expr, _VIEW_TYPES) else expr
         self.expr = expr
         self.bound = bound
         self.sense = sense
-        # g <= 0 when feasible, whichever way the user wrote it.
-        self.residual = (expr - bound) if sense == "le" else (bound - expr)
+        # g <= 0 when feasible, whichever way the user wrote it; g == 0 for an equality.
+        self.residual = (bound - expr) if sense == "ge" else (expr - bound)
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        op = "<=" if self.sense == "le" else ">="
-        return f"Constraint({self.expr!r} {op} {self.bound})"
+        return f"Constraint({self.expr!r} {_SENSE_OP[self.sense]} {self.bound})"
+
+    def auglag(self, mu: float = 10.0, every: int = 100) -> "AugLagConstraint":
+        """Enforce this constraint by an augmented Lagrangian, so ANY optimiser can be used.
+
+        The constraint stays a reported row; a multiplier penalty is added to the loss, and every
+        ``every`` steps the multiplier is updated from the current violation (method of
+        multipliers, Nocedal & Wright 2006, Sec. 17.4). An equality ``jno.eq`` gets the same treatment
+        with a multiplier of either sign (Sec. 17.3). ``mu`` is the starting penalty weight; it
+        grows tenfold while the violation stops shrinking. The design between updates may violate
+        the constraint: feasibility comes as the multiplier converges, unlike with ``mma``/``gcmma``.
+        The multiplier is ``.multiplier`` (evaluate it with ``crux.eval``)::
+
+            jno.core([loss, jno.le(volume, 0.4).auglag(mu=10.0, every=100)]).solve(5000)
+
+        Args:
+            mu: Starting penalty weight (> 0), in units of the objective per unit violation squared.
+            every: Optimiser steps between multiplier updates: enough for the optimiser to settle
+                on the current augmented loss (a quasi-Newton optimiser needs far fewer than Adam).
+        """
+        return AugLagConstraint(self.expr, self.bound, self.sense, mu=mu, every=every)
+
+
+class AugLagConstraint(Constraint):
+    """A :class:`Constraint` enforced by an augmented Lagrangian; see :meth:`Constraint.auglag`.
+
+    ``jno.core`` keeps it as the constraint row it is and adds :attr:`penalty`, the multiplier term,
+    to the loss UNAVERAGED (the multiplier update reads its exact gradient). It is an ordinary
+    expression marked ``_auglag_penalty``, so its multiplier parameter is collected like any other.
+    ``multiplier`` is the Lagrange multiplier as a node.
+    """
+
+    def __init__(self, expr, bound=0.0, sense="le", *, mu: float = 10.0, every: int = 100):
+        super().__init__(expr, bound, sense)
+        from ..optimizers.auglag import penalty
+
+        self.mu, self.every = float(mu), int(every)
+        self.state, psi = penalty(
+            self.residual, mu=mu, every=every, name=getattr(expr, "_user_name", None), equality=sense == "eq"
+        )
+        self.multiplier = self.state[0]
+        psi._auglag_penalty = True
+        self.penalty = psi
+
+    def __repr__(self):
+        return f"AugLagConstraint({self.expr!r} {_SENSE_OP[self.sense]} {self.bound}, mu={self.mu}, every={self.every})"
 
 
 class Model(Placeholder):
@@ -2364,6 +2485,90 @@ class Model(Placeholder):
                 print(f"Model summary could not be written to summary file: {exc}")
 
         return self
+
+    def flow(
+        self,
+        x0: Any,
+        *cond: Any,
+        time: Any,
+        save: bool = False,
+        noise: Any = None,
+        key: Any = None,
+    ) -> Any:
+        r"""March this network as an ODE **velocity field**: :math:`dx/dt = v(x, t, \ldots)`.
+
+        The network is called as ``v(x, t, *cond)`` -- state first, time second -- and must return the
+        same pytree structure as the state.
+
+        Args:
+            x0: Initial state. Any **pytree** of arrays; the trailing axis is the feature axis, so a
+                scalar field over ``N`` points is ``(N, 1)``, not ``(N,)``. Pass it explicitly rather
+                than drawing it inside: it is the thing an inverse problem optimises.
+            *cond: Extra arguments forwarded to the network unchanged every step -- a class label, a
+                physics parameter, a coefficient field.
+            time: The grid POINTS, as an array/sequence (the primary form) or a ``(t0, t1, n)``
+                triple. Step sizes are the consecutive differences, so a non-uniform schedule needs
+                no extra argument and a **decreasing** grid marches backwards, mapping data to its
+                latent. ``n`` counts points, matching ``domain(time=...)``, and must be a Python int
+                -- it is the scan length.
+            save: Return the whole trajectory (leading axis ``len(time)``) instead of the endpoint.
+            noise: A ``jno.noise`` spec turning the march into an **SDE** -- the deterministic step
+                plus ``draw * sqrt(|dt|)``, redrawn independently at every step. Here the node names
+                a *distribution*, not a draw: its shape comes from the state, so ``ndim=`` and
+                ``like=`` are rejected. Its parameters may be **schedules** -- callables of the march
+                time -- which is what an SDE sampler's ``sigma_t`` needs::
+
+                    v.flow(x0, time=ts, key=k,
+                           noise=jno.noise.gaussian(std=lambda t: 0.3 * jnp.sqrt(t / (1 - t))))
+
+            key: PRNG key for *noise*. Required on the eager path, where there is no solver key to
+                inherit; inside a term list the solver's step key is used and this may be omitted.
+
+        Returns:
+            Any: The final state (same pytree structure as *x0*), or the whole trajectory when
+                *save* is set -- each leaf gaining a leading axis of ``len(time)``. Returns a
+                :class:`Flow` node instead when *x0* or any *cond* is symbolic, in which case the
+                march composes into a ``jno.core([...])`` term list::
+
+                x  = v.flow(x0_array, time=ts)                        # sample after training
+                xg = v.flow(jno.noise.gaussian(ndim=2), time=ts)      # inside a constraint
+
+        Limitations:
+            Heun's method, fixed step, explicit -- no adaptive control and no error estimate, so the
+            step count is the accuracy knob: second order for the ODE, strong order 1/2 with ``noise=``
+            (the Euler--Maruyama increment sets it). No log-density: that needs the divergence of ``v`` with
+            respect to the state, which :func:`jno.np.divergence` (defined over coordinate
+            ``Variable``\ s) does not provide. Dropout must be off: the network is handed the evaluation key unchanged at every
+            step -- only the SDE increment folds in the step index -- so a mask would repeat
+            rather than resample.
+            Reverse mode stores every step, so a march inside a training loss costs its step count in
+            both compute and activation memory -- ``core.solve(checkpoint_gradients=True)`` trades
+            ~30 % compute back for the memory.
+        """
+        ts = resolve_flow_times(time)
+        _validate_flow_noise(noise, key)
+        if any(isinstance(a, Placeholder) for a in (x0, *cond)):
+            return Flow(self, x0, cond, ts, save, noise=noise, key=key)
+
+        # Concrete initial state: run it now. Routed through the evaluator rather than calling the
+        # Equinox module directly so that freeze / lora / dtype apply exactly as they do in training.
+        from ..trace_evaluator import TraceEvaluator
+
+        evaluator = TraceEvaluator({self.layer_id: self.params})
+        ctx = TraceEvaluator._EvalCtx(context={}, var_bindings={}, key=None)
+        n_args = 2 + len(cond)
+
+        def apply(state, t):
+            return evaluator._apply_model(self, [state, t, *cond], [False] * n_args, ctx)
+
+        if noise is not None and key is None:
+            raise ValueError(
+                "flow(noise=...) needs key= on the eager path. A concrete initial state marches "
+                "outside the solver, so there is no step key to inherit; without one the march would "
+                "silently drop the noise and return a deterministic ODE result labelled as an SDE. "
+                "Pass key=jax.random.PRNGKey(seed)."
+            )
+        return march_velocity(apply, x0, ts, save, diffusion=_diffusion_from_noise(noise), key=key)
 
     # ── finetuning helpers ───────────────────────────────────
 
@@ -3287,6 +3492,12 @@ class ModelCall(Placeholder):
         (not a lexical spatial partial), so the strong form reads identically to the weak form
         (``ui.t - nu*(ui.d2(x) + ui.d2(y))``)."""
         if getattr(self.model, "_fem_field", None) == "node":
+            sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+            rank = len(getattr(sym, "value_shape", ()) or ()) if sym is not None else 0
+            if rank == 1:  # a vector unknown binds as the vector view, as its fem trial does (`ui[0]`, `ui.div()`)
+                return self.vector.partials(**named_vars)
+            if rank == 2:  # a matrix unknown as the matrix view (`Si[0, 1]`, `Si.T`, `Si @ W`)
+                return self.matrix.partials(**named_vars)
             return self.field.partials(**named_vars)
         return self.scalar.partials(**named_vars)
 
@@ -3303,6 +3514,38 @@ class ModelCall(Placeholder):
             binding.update(named)
             return self.partials(**binding)
         return super().__call__(*coords, **named)
+
+    # ── an unknown from ``domain.unknown()``: the FEM side of the same field ─────────────
+
+    def _unknown_symbol_or_raise(self, what: str):
+        sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+        if sym is None:
+            raise TypeError(
+                f"{what} is defined for an unknown from `domain.unknown(...)` only; this is a "
+                f"{type(self.model).__name__} output, not an unknown."
+            )
+        return sym
+
+    def test(self) -> "TestFunction":
+        """The FEM **test function** of this unknown (``domain.unknown()``): ``v = u.test()``. In ``jno.fem``
+        the unknown is the trial function and ``v`` its test function -- same space, shape and order."""
+        return self._unknown_symbol_or_raise("u.test()").test()
+
+    def pin(self, value=0.0, mean=False):
+        """Gauge pin of this unknown's constant null space -- see :meth:`TrialFunction.pin`."""
+        return self._unknown_symbol_or_raise("u.pin()").pin(value, mean=mean)
+
+    def dn(self, *coords, **named):
+        """Normal derivative on a boundary region -- see :meth:`TrialFunction.dn`."""
+        return self._unknown_symbol_or_raise("u.dn()").dn(*coords, **named)
+
+    def gap(self, secondary: str, main, *, domain):
+        """Contact gap -- see :meth:`TrialFunction.gap`."""
+        return self._unknown_symbol_or_raise("u.gap()").gap(secondary, main, domain=domain)
+
+    def slide(self, secondary: str, main, *, domain):
+        """Tangential slide -- see :meth:`TrialFunction.slide`."""
+        return self._unknown_symbol_or_raise("u.slide()").slide(secondary, main, domain=domain)
 
     # ── proxied helpers (delegate to Model) ─────────────
 
@@ -3471,6 +3714,206 @@ class ModelCall(Placeholder):
         return self
 
 
+def _validate_flow_noise(noise, key):
+    """Reject the ways ``flow(noise=...)`` could quietly mean something other than an SDE."""
+    if noise is None:
+        if key is not None:
+            raise ValueError(
+                "flow(key=...) was given without noise=. The key exists only to drive the SDE "
+                "increment, so on a deterministic march it would do nothing -- which reads as "
+                "stochastic sampling that is not happening. Pass noise= too, or drop key=."
+            )
+        return
+    if not isinstance(noise, Noise):
+        raise TypeError(
+            f"flow(noise=...) expects a jno.noise spec (jno.noise.gaussian(...), .uniform(...), "
+            f".laplace(...)), got {type(noise).__name__}."
+        )
+    if getattr(noise, "shape_explicit", False):
+        raise ValueError(
+            "flow(noise=...) takes the DISTRIBUTION only -- its shape is the state's, resolved per "
+            "step from the pytree being marched. `ndim=`/`like=` describe a shape and would be "
+            "ignored here, so they are refused rather than silently dropped. Write "
+            "jno.noise.gaussian(std=...) with no shape argument."
+        )
+
+
+def _schedule_value(name, value, t, where):
+    """Resolve a distribution parameter that may be a **schedule** -- a callable of the march time.
+
+    A plain number passes through. A callable is the sigma_t of an SDE sampler and only has meaning
+    while marching, so it raises anywhere there is no march time rather than being silently called
+    with the wrong argument (or, worse, used as a float).
+    """
+    if not callable(value):
+        return value
+    if t is None:
+        raise ValueError(
+            f"{name}= was given a schedule (a callable of the march time t), but {where} there is no "
+            f"march time to evaluate it at. A schedule is only meaningful inside "
+            f"`Model.flow(..., noise=...)`; elsewhere pass a number."
+        )
+    return value(t)
+
+
+def draw_distribution(distribution, params, shape, key, t=None, where="at this noise node"):
+    """Draw one realisation of *distribution* with *shape*. The single implementation.
+
+    Shared by the evaluator's ``Noise`` handler and by the SDE increment inside
+    :func:`march_velocity`, so a noise node means the same thing in a term list and in a march.
+    Parameters may be schedules (callables of *t*) only where a march time exists.
+    """
+
+    def par(name, default):
+        return _schedule_value(name, params.get(name, default), t, where)
+
+    if distribution == "gaussian":
+        return jax.random.normal(key, shape) * par("std", 1.0)
+    if distribution == "uniform":
+        return jax.random.uniform(key, shape, minval=par("low", -1.0), maxval=par("high", 1.0))
+    if distribution == "laplace":
+        std = par("std", 1.0)
+        u = jax.random.uniform(key, shape, minval=1e-6, maxval=1.0 - 1e-6) - 0.5
+        return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
+    raise ValueError(f"Unknown noise distribution {distribution!r}. Choose from: 'gaussian', 'uniform', 'laplace'.")
+
+
+def _diffusion_from_noise(noise):
+    """Build the per-step SDE increment from a ``jno.noise`` spec, or ``None`` for a plain ODE.
+
+    The increment is ``draw * sqrt(|dt|)`` -- Euler--Maruyama on top of the deterministic step. The
+    magnitude uses ``|dt|`` so a *decreasing* grid (marching data back to its latent) is a real
+    backward SDE rather than a NaN from ``sqrt`` of a negative step.
+    """
+    if noise is None:
+        return None
+
+    def diffusion(t0, dt, state, key):
+        leaves, treedef = jax.tree_util.tree_flatten(state)
+        keys = jax.random.split(key, len(leaves))
+        scale = jnp.sqrt(jnp.abs(dt))
+        drawn = [
+            draw_distribution(noise.distribution, noise.params, jnp.shape(leaf), k, t=t0, where="in this march") * scale
+            for leaf, k in zip(leaves, keys)
+        ]
+        return jax.tree_util.tree_unflatten(treedef, drawn)
+
+    return diffusion
+
+
+def resolve_flow_times(time):
+    """Normalise the ``time=`` argument of :meth:`Model.flow` to the grid POINTS.
+
+    An array (or any sequence) is the primary form and is taken as the grid itself, so a non-uniform
+    schedule needs no extra argument, and a *decreasing* grid marches the ODE backwards -- which is
+    how the same trained velocity encodes data back to its latent. A ``(t0, t1, n)`` triple is sugar
+    for ``linspace(t0, t1, n)``; ``n`` counts grid POINTS, matching ``domain(time=(t0, t1, n))``, so
+    the number of steps is ``n - 1``.
+    """
+    if isinstance(time, tuple) and len(time) == 3 and isinstance(time[2], int):
+        t0, t1, n = time
+        if int(n) < 2:
+            raise ValueError(f"time=(t0, t1, n): n counts grid POINTS and must be >= 2 (n - 1 steps), got n={n}.")
+        return jnp.linspace(float(t0), float(t1), int(n))
+
+    ts = jnp.asarray(time, dtype=jnp.result_type(float))
+    if ts.ndim != 1 or ts.shape[0] < 2:
+        raise ValueError(
+            f"time= must be a 1-D sequence of at least 2 grid points, or a (t0, t1, n) triple; got shape {tuple(ts.shape)}."
+        )
+    return ts
+
+
+def march_velocity(apply, x0, ts, save=False, diffusion=None, key=None):
+    """March ``dx/dt = apply(x, t)`` over the grid points *ts*, returning the endpoint (or the path).
+
+    Heun's method (explicit trapezoid): second order, two evaluations per step, and no state beyond
+    ``x`` -- see Butcher, *Numerical Methods for Ordinary Differential Equations* (2nd ed., 2016),
+    §2.3. Fixed-step and explicit: there is no adaptive control and no error estimate, so the step
+    count in *ts* is the accuracy knob.
+
+    The step sizes are the consecutive differences of *ts*, so a non-uniform grid and a decreasing
+    one both work with no flag. The state is any **pytree**; ``apply`` must return the same structure,
+    which is checked at trace time. Written as one :func:`jax.lax.scan`, so the whole march is
+    reverse-mode differentiable in ``x0``, in the weights ``apply`` closes over, and in *ts*.
+
+    With *diffusion* the march becomes an **SDE**: the deterministic Heun step is taken first and the
+    increment ``diffusion(t0, dt, x, subkey)`` is added after it (Euler--Maruyama). Each step draws
+    from ``fold_in(key, i)``, so the increments are **independent across steps** -- a single shared
+    draw would not be Brownian motion at all, and its endpoint variance would be wrong by a factor of
+    the step count. Mixing a second-order deterministic step with an Euler--Maruyama increment gives
+    strong order 1/2 overall, as any explicit fixed-step SDE scheme without Levy-area terms does.
+    """
+    ts = jnp.asarray(ts)
+
+    def step(x, i):
+        t0, t1 = ts[i], ts[i + 1]
+        dt = t1 - t0
+        k1 = apply(x, t0)
+        if jax.tree_util.tree_structure(k1) != jax.tree_util.tree_structure(x):
+            raise ValueError(
+                f"the velocity must return the same pytree structure as the state it is handed: "
+                f"state is {jax.tree_util.tree_structure(x)}, velocity returned "
+                f"{jax.tree_util.tree_structure(k1)}."
+            )
+        predictor = jax.tree_util.tree_map(lambda a, b: a + dt * b, x, k1)
+        k2 = apply(predictor, t1)
+        nxt = jax.tree_util.tree_map(lambda a, b, c: a + 0.5 * dt * (b + c), x, k1, k2)
+        if diffusion is not None:
+            # A fresh subkey PER STEP -- reusing one draw across the march is the failure this
+            # guards: the increments would be perfectly correlated and the endpoint variance would
+            # come out a factor of `len(ts) - 1` too large, worsening as the step count is raised.
+            increment = diffusion(t0, dt, nxt, jax.random.fold_in(key, i))
+            nxt = jax.tree_util.tree_map(lambda a, b: a + b, nxt, increment)
+        return nxt, (nxt if save else None)
+
+    x_end, path = jax.lax.scan(step, x0, jnp.arange(ts.shape[0] - 1))
+    if not save:
+        return x_end
+    # Prepend the initial state so the trajectory lines up with `ts` one-for-one.
+    return jax.tree_util.tree_map(lambda a, b: jnp.concatenate([a[None], b], axis=0), x0, path)
+
+
+class Flow(Placeholder):
+    """A network marched as an ODE velocity field — ``dx/dt = v(x, t, *cond)``.
+
+    Produced by :meth:`Model.flow` when its initial state is *symbolic*, so the march composes into a
+    ``jno.core([...])`` term list rather than only running after training. That is what makes a
+    constraint on **generated** samples expressible (a PDE residual on what the model produces) and
+    what lets a gradient reach an optimisable latent through the whole march.
+
+    Handed a concrete array instead, :meth:`Model.flow` runs the march eagerly and returns the array;
+    this node is never built. Both routes share :func:`march_velocity` and the evaluator's
+    ``_apply_model``, so ``freeze`` / ``lora`` / ``dtype`` apply identically either way.
+
+    ``args`` exposes the children so the attribute-driven tree walkers reach them without a per-type
+    branch.
+    """
+
+    def __init__(self, model, x0, cond, ts, save=False, noise=None, key=None):
+        self.model = model
+        self.x0 = x0
+        self.cond = list(cond)
+        self.ts = ts
+        self.save = bool(save)
+        # A `jno.noise` spec turns the march into an SDE. It is NOT exposed through `args`: it names
+        # a distribution rather than a sub-expression, has no children (shape arguments are refused),
+        # and evaluating it as an array would draw once for the whole march -- the one thing the
+        # per-step redraw exists to prevent.
+        self.noise = noise
+        self.key = key
+        self.op_id = _next_op_id()
+
+    @property
+    def args(self):
+        return [self.x0, *self.cond]
+
+    def __repr__(self):
+        cond = "".join(f", {c}" for c in self.cond)
+        sde = f", sde={self.noise.distribution}" if self.noise is not None else ""
+        return f"flow({self.model}, {self.x0}{cond}, steps={int(jnp.asarray(self.ts).shape[0]) - 1}{sde})"
+
+
 class TunableModule(Placeholder):
     """
     Wraps a Flax module CLASS + ArchSpace.
@@ -3553,7 +3996,7 @@ class OperationDef(Placeholder):
                 if id(node) not in seen_ids:
                     seen_ids.add(id(node))
                     vars_found.append(node)
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow, Noise)):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
@@ -3586,7 +4029,7 @@ class OperationDef(Placeholder):
         def visit(node):
             if isinstance(node, Model):
                 return True
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow)):
                 return True  # ModelCall contains a trainable Model
             elif isinstance(node, BinaryOp):
                 return visit(node.left) or visit(node.right)
@@ -3746,6 +4189,16 @@ def _component_keeps_axis(expr) -> bool:
     return True
 
 
+def _check_symmetric_shape(value_shape, symmetric) -> bool:
+    """``symmetric=True`` is meaningful for a square matrix field only; anything else is refused."""
+    symmetric = bool(symmetric)
+    if symmetric and not (len(value_shape) == 2 and int(value_shape[0]) == int(value_shape[1])):
+        raise ValueError(
+            f"symmetric=True needs a square matrix field, value_shape=(n, n); got value_shape={tuple(value_shape)}."
+        )
+    return symmetric
+
+
 class _FieldComponentIndex:
     """``field[i]`` is the i-th COMPONENT — the mixin that makes one spelling mean one thing.
 
@@ -3762,6 +4215,14 @@ class _FieldComponentIndex:
     from it — the per-component Dirichlet spec and the component-gradient branch of the assembler —
     are unaffected.
     """
+
+    @property
+    def T(self):
+        """A matrix field's transpose swaps its two VALUE axes. The array ``.T`` would reverse every axis,
+        and at assembly the leading ones are quadrature points (and test DOFs)."""
+        if len(tuple(getattr(self, "value_shape", ()) or ())) == 2:
+            return FunctionCall(lambda x: jnp.swapaxes(x, -1, -2), [self], "transpose")
+        return Placeholder.T.fget(self)
 
     def __getitem__(self, key):
         keys = key if isinstance(key, tuple) else (key,)
@@ -4052,21 +4513,40 @@ class Noise(Placeholder):
     ``jax.random.fold_in``, so it is fully reproducible when the global seed
     is fixed (via :func:`jno.setup` or ``.jno.toml``).
 
+    With ``like=`` the draw instead takes the shape of another traced expression, resolved at
+    evaluation time rather than written down — so it follows ``batchsize``, ``points=`` and time
+    windows automatically, where a shape spelled out in the script would silently go stale.
+
     Parameters
     ----------
     distribution : str
         ``'gaussian'``, ``'uniform'``, or ``'laplace'``.
+    like : Placeholder or None
+        Shape reference. Mutually exclusive with ``ndim``.
     **params
         Distribution-specific kwargs: ``std``, ``low``, ``high``, ``ndim``.
     """
 
-    def __init__(self, distribution: str, **params):
+    def __init__(self, distribution: str, like=None, shape_explicit: bool = False, **params):
         self.distribution = distribution
         self.params = params
+        self.like = like
+        # Whether the caller actually asked for a shape. `ndim` defaults to 1, so params alone
+        # cannot tell that apart from silence -- and `flow(noise=...)` must refuse an explicit
+        # shape (its own comes from the state) without refusing every plain distribution.
+        self.shape_explicit = bool(shape_explicit)
         self._noise_id = _next_op_id()
+
+    @property
+    def args(self):
+        """The shape reference, for the tree walkers — it may carry Variables whose tags must be
+        collected even when the reference appears nowhere else in the term list."""
+        return [self.like] if self.like is not None else []
 
     def __repr__(self):
         params_str = ", ".join(f"{k}={v}" for k, v in self.params.items())
+        if self.like is not None:
+            params_str += f", like={self.like}"
         return f"Noise({self.distribution}, {params_str})"
 
 
@@ -4219,7 +4699,11 @@ class FemLinearSystem:
             return solve_fn(A, b)
 
         if values is None:
-            return FemSolutionCall(_solve, params, name="fem_solve", point_space=getattr(self, "_point_space", None))
+            node = FemSolutionCall(_solve, params, name="fem_solve", point_space=getattr(self, "_point_space", None))
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            if periodic is None:  # a shared factorisation needs the operator as assembled (trace_evaluator)
+                node._solve_fls, node._solve_recombine, node._solve_fn = self, None, solve_fn
+            return node
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
@@ -4264,6 +4748,16 @@ class FemLinearSystem:
         return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)}, parametric={self.is_parametric})"
 
 
+#: Compiled solve programs kept per operator (`FemResidualOperator.solve`); least recently used dropped first.
+_EAGER_SOLVE_CACHE_MAX = 8
+
+
+def _takes_jacobian(solve_fn) -> bool:
+    """Whether a composed solver is handed the tangent: an assembled-tangent Newton needs the matrix
+    (``wants_jacobian``), the matrix-free one only its diagonal-only pass (``wants_jacobian_diag``)."""
+    return bool(getattr(solve_fn, "wants_jacobian", False) or getattr(solve_fn, "wants_jacobian_diag", False))
+
+
 class FemResidualOperator:
     """Container for a steady nonlinear FEM residual ``R(u, args) = 0``."""
 
@@ -4279,6 +4773,8 @@ class FemResidualOperator:
     ):
         self.residual = residual_fn
         self.jacobian = jacobian_fn
+        # ``(u, args) -> diag J(u)`` without the matrix, when the assembler provides it (see `_jacobian_handle`)
+        self.jacobian_diag = None
         self.size = size
         self.runtime_parameter_exprs = runtime_parameter_exprs or {}
         self.residual_basis = residual_basis or {}
@@ -4303,6 +4799,17 @@ class FemResidualOperator:
             self.jacobian(u, args),
             -self.residual(u, args),
         )
+
+    def _jacobian_handle(self, args):
+        """``u -> J(u)`` at these ``args``, carrying ``.diag`` (``u -> diag J(u)``) when the assembler has a
+        diagonal-only pass: the matrix-free Newton preconditions with it (``newton_krylov(jacobian_diag=)``)."""
+
+        def jac(u):
+            return self.jacobian(u, args)
+
+        if self.jacobian_diag is not None:
+            jac.diag = lambda u: self.jacobian_diag(u, args)
+        return jac
 
     def solve(self, solve_fn=None, *, u0=None, values=None):
         """Differentiable nonlinear forward solve of ``R(u, θ) = 0`` as a trace node.
@@ -4364,12 +4871,14 @@ class FemResidualOperator:
             # A sparse-direct Newton (``jno.solve.newton(direct=True)``) flags ``wants_jacobian`` and
             # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
             # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
-            if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
+            if _takes_jacobian(solve_fn) and self.jacobian is not None:
+                return solve_fn(residual_fn, u0, jacobian=self._jacobian_handle(args), **_xa(args))
             return solve_fn(residual_fn, u0, **_xa(args))
 
         if values is None:
-            return FunctionCall(_solve, params, name="fem_solve")
+            node = FunctionCall(_solve, params, name="fem_solve")
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            return node
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
         check_runtime_values(names, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
@@ -4383,21 +4892,32 @@ class FemResidualOperator:
         # By the solver's VALUE identity where it has one: `fem.solve` builds a fresh composed solver
         # per call, so `id()` alone never matched and every call re-compiled.
         _sk = getattr(solve_fn, "cache_key", None) or id(solve_fn)
+        from ..utils.solver.newton_krylov import _FORCING
         from ..utils.solver.sharding import element_token
 
         # ... and by the element sharding the residual is traced under: a program compiled across N devices
-        # must not answer a later `shard=False` call (nor the reverse).
-        key = (_sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token())
+        # must not answer a later `shard=False` call (nor the reverse); and by whether Newton steps are
+        # inexact (`_FORCING`, read when the driver is traced), for the same reason.
+        key = (
+            _sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token(), bool(_FORCING[0])
+        )  # fmt: skip
+        # A built preconditioner's arrays are ARGUMENTS of the program, not constants baked into it: a spec
+        # rebuilt between solves (same shapes) reuses the program with its new arrays (`precond_state`).
+        from ..utils.solver.solver_api import bound_state, precond_state
+
+        states = precond_state(getattr(solve_fn, "precond", None))[1]
         cache = self.__dict__.setdefault("_eager_solve_cache", {})
         fn = cache.get(key)
         if fn is None:
+            first = solve_fn  # the program holds THIS solver's spec objects; a later call binds its own arrays
 
-            def _run(u0_arg, *value_args):
+            def _run(u0_arg, pstates, *value_args):
                 args = dict(zip(names, value_args))
                 rf = lambda u: self.residual(u, args)  # noqa: E731
-                if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
-                return solve_fn(rf, u0_arg, **_xa(args))
+                with bound_state(precond_state(getattr(first, "precond", None))[0], pstates):
+                    if _takes_jacobian(first) and self.jacobian is not None:
+                        return first(rf, u0_arg, jacobian=self._jacobian_handle(args), **_xa(args))
+                    return first(rf, u0_arg, **_xa(args))
 
             if names:
                 fn = cache[key] = jax.jit(_run)
@@ -4408,11 +4928,17 @@ class FemResidualOperator:
                 from ..utils.solver.newton_krylov import compiled_with_verdicts
 
                 fn = cache[key] = compiled_with_verdicts(_run)
+            # Bounded: each entry holds an executable. A configuration not used for a while is dropped
+            # (and recompiled if it comes back) rather than kept until the device runs out of memory.
+            while len(cache) > _EAGER_SOLVE_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+        else:
+            cache[key] = cache.pop(key)  # most recently used last
         if names:
-            return fn(u0_t, *vals_t)
+            return fn(u0_t, states, *vals_t)
         from ..utils.solver.newton_krylov import judge_verdicts
 
-        u, verdicts = fn(u0_t)
+        u, verdicts = fn(u0_t, states)
         if not isinstance(u, jax.core.Tracer):  # a caller tracing the solve (grad/vmap) gets the cap only
             judge_verdicts(verdicts)
         return u
@@ -4568,9 +5094,15 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -4580,8 +5112,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)
@@ -4762,6 +5298,75 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
             dom.context[key] = _np.zeros((1, _dim))
         return Variable(tag=key, dim=[0, _dim], domain=dom, axis="spatial")
 
+    def test(self) -> "TestFunction":
+        """This field's **test function**: same space, value shape, order, symmetry and field.
+
+        ``v = u.test()`` is derived from the unknown, so the pair cannot be mismatched. Repeated calls
+        return the same symbol (the one ``fem_symbols`` paired it with, if it came from there)."""
+        t = self.__dict__.get("_test")
+        if t is None:
+            t = TestFunction(
+                name=f"v_{self.name}",
+                value_shape=self.value_shape,
+                order=self.order,
+                space=self.space,
+                symmetric=self.__dict__.get("symmetric", False),
+                constant=self.__dict__.get("_is_constant", False),
+            )
+            t.field_key = self.field_key
+            if "_domain" in self.__dict__:
+                t._domain = self._domain
+            if self.__dict__.get("_complex_field_member", False):
+                t._complex_field_member = True
+            self._test = t
+        return t
+
+    def across(self, main: str, *, domain):
+        """The trace of this field on the tagged boundary face ``main``, as a symbol usable in a weak
+        term integrated on ANOTHER face -- the non-local ingredient of a two-face (thin-layer) condition.
+
+        At every quadrature point of the face the term lives on, the value is this field evaluated at
+        the point of ``main`` facing it (its projection onto ``main``), with ``main``'s own adjacent
+        cell and basis. So a coupling between the two faces of a thin conductor removed from the mesh
+        is written as ordinary terms, once per face -- the exact layered-conductor two-port (Dowell, Proc.
+        IEE 113(8), 1966) in admittance form, ``Y = (1/Zc) [[coth γt, -csch γt], [-csch γt, coth γt]]``,
+        ``Zc = γ/σ``. Per face ``c11 = jωσ coth(γt)/γ`` and ``c12 = -jωσ csch(γt)/γ``; both stay finite as
+        ``ω -> 0`` (``±1/(μt)``), and their sum, the conductance, is a difference of large numbers there --
+        relative accuracy ``~ ε (δ/t)²``, i.e. 1e-9 at 1 Hz for a 35 µm copper foil::
+
+            ua = u.across("cu_bot", domain=d)            # on the top face, read the bottom face
+            n = d.variable("cu_top", normals=True)
+            c11 = 1j*w*sigma*coth(g*t)/g;  c12 = -1j*w*sigma/(g*sinh(g*t))
+            fem = jno.fem([..., c11*inner(u.vector.cross(n), v.vector.cross(n))
+                                + c12*inner(jno.np.cross(ua, n), v.vector.cross(n)), ...])  # + same on cu_bot
+
+        Like :meth:`gap` it is a placeholder symbol: the per-point value is packed during assembly (it is
+        LINEAR in the main face's DOFs, so the operator gains the main-cell columns exactly), and the
+        pairing is frozen at build time from the static mesh -- differentiable in the DOF values, not
+        in the mesh coordinates. Assembled on the non-nodal path, for every family it carries (N1E /
+        N2E / RT of any degree, Lagrange, DG, P0), in 2-D and 3-D.
+
+        **Matched faces.** The two faces should carry matching meshes (e.g. an extruded foil), so each
+        point's partner lies exactly on ``main``. On non-matching faces the partner is the closest point
+        of ``main``, and a strongly coupling coefficient -- the ``±1/(μt)`` of a thin conductor's
+        two-port at low frequency -- then acts like a penalty on that mismatch: correct only to the
+        resolution of the coarser face.
+        """
+        dom = domain
+        if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
+            raise TypeError(f"u.across: `domain=` must be a jno domain, got {type(dom).__name__}.")
+        breg = getattr(dom, "_boundary_regions", {}) or {}
+        if main not in breg:
+            raise ValueError(f"u.across: {main!r} is not a boundary region on this domain. Known: {sorted(breg)}.")
+        import numpy as _np
+
+        n = int(_np.prod(self.value_shape)) if self.value_shape else 1
+        key = f"across_{self.field_key}_{main}"
+        dom.__dict__.setdefault("_across_pairs", {})[key] = (self.field_key, main)
+        if key not in dom.context:  # placeholder so the Variable constructs; assembly packs the value
+            dom.context[key] = _np.zeros((1, n))
+        return Variable(tag=key, dim=[0, n], domain=dom, axis="spatial")
+
     def pin(self, value=0.0, mean=False):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
 
@@ -4843,6 +5448,12 @@ class FrozenField(Placeholder):
     """A field whose DOFs are *pinned* to a known nodal vector ``values`` (e.g. a
     precomputed FE solution), produced by ``u.bind(...).freeze(values)``.
 
+    ``values`` holds one entry per DOF of the source's space: per node (times the value_shape) for
+    Lagrange, per cell for P0, and for N1E / N2E / RT one per DOF (edge circulations, face fluxes: the basis
+    carries the vector). On a non-nodal form a frozen field of ANY of these spaces is a coefficient,
+    evaluated with its space's own basis and Piola map (value and gradient), whether or not the space is
+    among the solved unknowns.
+
     It carries the source field's identity (``field_key`` / ``value_shape`` / ``order``
     / ``space``) so the kernel finds the right basis, and interpolates ``values`` at the
     quadrature points -- its value and its gradient ``.x`` / ``.y`` are therefore concrete
@@ -4865,10 +5476,34 @@ class FrozenField(Placeholder):
         self.space = str(getattr(source, "space", "Lagrange"))
         self.op_id = _next_op_id()
         self.field_key = source.field_key  # share the source field's shape data
+        # VALUES FROM THE TRACE: `u.bind(...).freeze(fem.solve())` -- the solution of a form, known to any
+        # expression read after the solve (and differentiable through it). A solve of a form with several
+        # fields is sliced to this field's block. Read today by `expr.integrate(domain)`.
+        _node = (
+            values._expr
+            if (not isinstance(values, Placeholder) and isinstance(getattr(values, "_expr", None), Placeholder))
+            else values
+        )
+        self.values_node, self.values_block = None, None
+        if isinstance(_node, Placeholder):
+            self.values_node = _node
+            _fem = getattr(_node, "_fem_ref", None)
+            _offs = None if _fem is None else getattr(_fem, "offsets", None)
+            if _offs is not None and len(_offs) > 2:
+                _i = _fem.block_index(source)
+                self.values_block = (int(_offs[_i]), int(_offs[_i + 1]))
+            self._values = None
+            self.frozen_id = _next_op_id()
+            self._domain = domain
+            self._coord_tag = coord_tag
+            return
         _v = jnp.asarray(values)
         # scalar field: a flat global nodal vector (n_nodes,); VECTOR field: (n_nodes, vec) so the assembler
         # gathers each cell's per-node vec-vectors (the kernel interpolates either). value_shape is set above.
-        self.values = _v.reshape(-1) if self.num_components == 1 else _v.reshape(-1, self.num_components)
+        # An H(curl)/H(div) field (N1E, N2E, RT) carries ONE value per DOF (edge circulations, face fluxes):
+        # its vector value comes from the basis, not from per-node components, so it stays flat.
+        _per_dof = self.space.upper() in ("N1E", "N2E", "RT") or self.num_components == 1
+        self._values = _v.reshape(-1) if _per_dof else _v.reshape(-1, self.num_components)
         self.frozen_id = _next_op_id()  # kernel gather-table key
         # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
         # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
@@ -4882,6 +5517,24 @@ class FrozenField(Placeholder):
         for s in self.value_shape:
             n *= int(s)
         return n
+
+    @property
+    def values(self):
+        """The known DOF values. A field frozen to a SOLVE has none until evaluation: it is read by
+        ``expr.integrate(domain)`` and, as a runtime input (one-way coupling), by a non-nodal form; the nodal
+        Lagrange assembler and a standalone ``.eval()`` cannot take it yet."""
+        if self.values_node is not None:
+            raise NotImplementedError(
+                f"{self.name}: a field frozen to a solve (`freeze(fem.solve())`) has its values only inside the "
+                "trace. It is read by `expr.integrate(domain)` and by non-nodal forms (N1E / N2E / RT / DG / P_k "
+                "unknowns); the nodal Lagrange assembler and a standalone `.eval()` need a concrete solution "
+                "array -- freeze that there."
+            )
+        return self._values
+
+    @values.setter
+    def values(self, v):
+        self._values = v
 
     def _field_view(self):
         n = len(self.value_shape)
@@ -4897,7 +5550,9 @@ class FrozenField(Placeholder):
     bind = partials
 
     def __repr__(self):
-        return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
+        if self.values_node is not None:
+            return f"FrozenField(source_key={self.field_key}, values=<solve>)"
+        return f"FrozenField(source_key={self.field_key}, ndof={self._values.shape[0]})"
 
 
 class LoadPathField(FrozenField):
@@ -5476,9 +6131,15 @@ class TestFunction(_FieldComponentIndex, Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -5487,8 +6148,12 @@ class TestFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)
@@ -5708,7 +6373,14 @@ def cse(expr: Placeholder) -> Placeholder:
         elif isinstance(node, FunctionCall):
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
-                node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                rebuilt = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                # keep what the call carries beyond its constructor arguments: ``getitem_key``, a solve's
+                # ``_solve_fls`` / ``_fem_ref`` / ``_linear_spec``, ``_per_evaluation``, an integral's spec --
+                # dropping them silently turned off the shared factorisation and the per-evaluation memo
+                for k, v in vars(node).items():
+                    if k not in vars(rebuilt):
+                        setattr(rebuilt, k, v)
+                node = rebuilt
         elif isinstance(node, Choice):
             new_opts = [_visit(a) if isinstance(a, Placeholder) else a for a in node.options]
             if any(n is not o for n, o in zip(new_opts, node.options)):
@@ -5719,6 +6391,13 @@ def cse(expr: Placeholder) -> Placeholder:
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
                 new_node = ModelCall(node.model, new_args)
+                new_node.op_id = node.op_id
+                node = new_node
+        elif isinstance(node, Flow):
+            new_x0 = _visit(node.x0) if isinstance(node.x0, Placeholder) else node.x0
+            new_cond = [_visit(c) if isinstance(c, Placeholder) else c for c in node.cond]
+            if new_x0 is not node.x0 or any(n is not o for n, o in zip(new_cond, node.cond)):
+                new_node = Flow(node.model, new_x0, new_cond, node.ts, node.save, noise=node.noise, key=node.key)
                 new_node.op_id = node.op_id
                 node = new_node
         elif isinstance(node, OperationDef):
@@ -6091,7 +6770,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.operation.expr)
             for arg in node.args:
                 visit(arg)
-        elif isinstance(node, ModelCall):
+        elif isinstance(node, (ModelCall, Flow, Noise)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -6124,6 +6803,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(node.time_var)
         elif isinstance(node, Tracker):
             visit(node.expr)
+        elif isinstance(node, Constraint):
+            visit(node.residual)
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
@@ -6166,7 +6847,7 @@ def collect_tags(expr: Placeholder) -> set:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
-        elif isinstance(node, ModelCall):
+        elif isinstance(node, (ModelCall, Flow, Noise)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -6281,8 +6962,8 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
                     _visit(arg, depth + 1)
                 else:
                     lines.append(f"{p}  {arg}")
-        elif isinstance(node, ModelCall):
-            lines.append(f"{p}ModelCall({_node_label(node.model)})")
+        elif isinstance(node, (ModelCall, Flow)):
+            lines.append(f"{p}{type(node).__name__}({_node_label(node.model)})")
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     _visit(arg, depth + 1)

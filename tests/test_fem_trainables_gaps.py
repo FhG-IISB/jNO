@@ -7,7 +7,7 @@ linear/nonlinear solves and backward Euler, and most of them bypass the public p
 ``op.residual`` + ``newton_krylov`` directly). This file covers the rest, every one through the public
 path ``jno.core([loss]).solve(...)``:
 
-1. mixed/saddle (Stokes refused -> the Navier-Stokes route), 2. eigenproblems, 3. the non-default
+1. mixed/saddle (Stokes and Navier-Stokes), 2. eigenproblems, 3. the non-default
 time schemes, 4. a network coefficient in 3-D, 5. network weights on a linear solve, 6. Neumann/Robin
 boundary parameters, 7. staggered solves and history marches, 8. a network coefficient in ``jno.fdm``.
 
@@ -144,7 +144,7 @@ def _recover(loss, p, steps):
 
 
 # ----------------------------------------------------------------------------------------------------
-# 1. mixed / saddle: Stokes (refused, loudly) and the Navier-Stokes route
+# 1. mixed / saddle: Stokes and Navier-Stokes with a trainable
 # ----------------------------------------------------------------------------------------------------
 def _flow_terms(nu, *, convective, force_scale=1.0, size=0.3):
     """Taylor-Hood P2/P1 flow in the unit square, no-slip walls, pressure gauged by its mean, driven by
@@ -165,30 +165,36 @@ def _flow_terms(nu, *, convective, force_scale=1.0, size=0.3):
 
 
 @pytest.mark.parametrize("where", ["viscosity", "body_force"])
-def test_stokes_with_a_trainable_is_refused_loudly_with_a_route(where):
-    """Linear Stokes carrying a trainable (viscosity, or a body-force scale) is a coupled LINEAR form with
-    a runtime parameter, which has no parametric assembly. That must be a loud build-time refusal that
-    names a working route (a nonlinear coupled form / a load-path march), never a silently frozen value.
-    This pins the refusal; the gap itself -- no trainable in a linear saddle problem -- is reported."""
+def test_stokes_with_a_trainable_solves_as_the_constant_form_would(where):
+    """Linear Stokes carrying a trainable (viscosity, or a body-force scale) assembles on the parametric
+    coupled linear route. At the parameter's value it must give exactly the solve of the same form with that
+    value written in -- not a value frozen at build, which is what a missing route would look like."""
+    lu = jno.solve.lu  # the saddle point needs a direct solve
+    kwargs = lambda c: {"nu": c, "force_scale": 1.0} if where == "viscosity" else {"nu": 1.0, "force_scale": c}  # noqa: E731
+    want = np.asarray(_evaluate(jno.fem(_flow_terms(convective=False, **kwargs(1.3))).solve(linear=lu())))
     s = _param("s", 1.0)
-    kwargs = {"nu": s, "force_scale": 1.0} if where == "viscosity" else {"nu": 1.0, "force_scale": s}
-    with pytest.raises(NotImplementedError, match="runtime parameter") as err:
-        jno.fem(_flow_terms(convective=False, **kwargs))
-    assert "NONLINEAR" in str(err.value) and "load-path march" in str(err.value)
+    fem = jno.fem(_flow_terms(convective=False, **kwargs(s)))
+    assert fem.is_linear and fem.operator.is_parametric
+    s.initialize(_const(1.3))  # changed after the build: a value baked in at build would still be 1.0
+    got = np.asarray(_evaluate(fem.solve(linear=lu())))
+    np.testing.assert_allclose(got, want, rtol=0, atol=1e-10)  # two direct solves of one system: round-off
 
 
-def test_stokes_refusal_names_the_offending_parameter():
-    """The refusal must say WHICH trainable put the form on the unsupported branch (house rule: name the
-    offending input). With two coefficients in play, "it has a runtime parameter (True)" does not."""
-    nu = _param("visc_mu", 1.0)
-    with pytest.raises(NotImplementedError) as err:
-        jno.fem(_flow_terms(nu, convective=False))
-    assert "visc_mu" in str(err.value), f"the refusal does not name the parameter: {str(err.value)[:200]}"
+def test_stokes_viscosity_gradient_through_crux_matches_fd():
+    """The gradient jno.core takes through the parametric linear Stokes solve equals central finite
+    differences of the same loss (both through the public path)."""
+    lu = jno.solve.lu
+    u_obs = _evaluate(jno.fem(_flow_terms(0.1, convective=False)).solve(linear=lu()))
+    nu = _param("nu", 0.13)
+    loss = (jno.fem(_flow_terms(nu, convective=False)).solve(linear=lu()) - u_obs).mse
+    g, loss0 = _crux_gradient(loss, nu, _read_param(nu), lr=1.0)
+    fd = _central_fd(loss, nu, _const, 0.13, 1e-5)
+    assert loss0 > 0 and abs(g) > 0
+    assert _rel(g, fd) < 1e-5, f"crux {g:.10e} vs FD {fd:.10e} (rel {_rel(g, fd):.2e})"
 
 
 def test_navier_stokes_viscosity_gradient_through_crux_matches_fd():
-    """The nonlinear route the Stokes refusal points to: Navier-Stokes (Taylor-Hood, mean-gauged
-    pressure) with a trainable viscosity. The gradient jno.core takes through the saddle-point Newton
+    """Navier-Stokes (Taylor-Hood, mean-gauged pressure) with a trainable viscosity. The gradient jno.core takes through the saddle-point Newton
     solve must equal central finite differences of the same loss (both through the public path)."""
     lu = jno.solve.lu  # the saddle point needs a direct inner solve (Jacobi cannot see a zero diagonal)
     u_obs = _evaluate(jno.fem(_flow_terms(0.1, convective=True)).solve(linear=lu()))

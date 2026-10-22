@@ -11,6 +11,7 @@ import meshio
 import numpy as np
 
 from ..trace import (
+    AttachedLiteral,
     RegionMask,
     TagMask,
     TensorTag,
@@ -282,6 +283,18 @@ def _scalar_float(value: Any) -> float:
     return float(arr.item())
 
 
+def _is_plain_value(v) -> bool:
+    """A concrete number or array -- what an AttachedLiteral can re-read -- as opposed to an expression,
+    a trainable parameter or a traced value, which are captured as written."""
+    import jax
+
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float, complex, np.number, np.ndarray)):
+        return True
+    return isinstance(v, jax.Array) and not isinstance(v, jax.core.Tracer)
+
+
 def _masked_sum(values, mask_cls, default, *, what: str, key: str):
     """``sum_k mask_cls(k) * values[k]`` — the one desugaring behind ``_by_region`` and ``_by_tag``.
 
@@ -316,7 +329,7 @@ def _masked_sum(values, mask_cls, default, *, what: str, key: str):
         expr = term if expr is None else expr + term
     if expr is None:
         raise ValueError(f"domain.{what}: the {{{key}: value}} mapping is empty.")
-    if default is not None and default != 0:
+    if default is not None and (isinstance(default, AttachedLiteral) or default != 0):
         covered = None
         for k in values:
             m = mask_cls(str(k))
@@ -588,6 +601,45 @@ class _LazyReference(dict):
 
     def __repr__(self):
         return f"{type(self).__name__}(keys={self.keys()!r}, pending={sorted(self._pending)!r})"
+
+
+class _UnknownNamespace:
+    """``domain.unknown`` -- callable as ``d.unknown(...)``, and the shape namespace ``.scalar`` / ``.vector``
+    / ``.matrix``. Each builds the same kind of unknown; the namespace only spells the shape."""
+
+    __slots__ = ("_domain",)
+
+    def __init__(self, domain):
+        self._domain = domain
+
+    def __call__(
+        self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+    ):
+        return self._domain._make_unknown(
+            value_shape=value_shape,
+            name=name,
+            order=order,
+            space=space,
+            complex=complex,
+            symmetric=symmetric,
+            constant=constant,
+        )
+
+    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+        """A scalar unknown, ``value_shape=()``. ``constant=True``: ONE value over the whole domain."""
+        return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant)
+
+    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+        """A vector unknown with ``n`` components, ``value_shape=(n,)``. ``constant=True``: one vector."""
+        return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant)
+
+    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False):
+        """An ``n x m`` matrix unknown. ``symmetric=True`` (square only) stores the ``n(n+1)/2`` upper-triangle
+        values per node while the symbol behaves as the full matrix in every expression. ``constant=True``:
+        one matrix over the whole domain."""
+        return self(
+            value_shape=(int(n), int(m)), name=name, order=order, complex=complex, symmetric=symmetric, constant=constant
+        )
 
 
 class domain(MeshIOMixin):
@@ -1939,7 +1991,9 @@ class domain(MeshIOMixin):
 
         return [loc_fns, vec_ids, val_fns]
 
-    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange"):
+    def variational_symbols(
+        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False
+    ):
         """
         Return generic variational symbols.
 
@@ -1957,6 +2011,10 @@ class domain(MeshIOMixin):
             (3,)  -> 3D vector
         names : tuple[str, str]
             Names of the trial and test symbols.
+        symmetric : bool, default=False
+            For a square matrix field ``value_shape=(n, n)``: store only the upper triangle,
+            ``n(n+1)/2`` values per node (``xx, xy, yy`` in 2-D). The symbol still behaves as the full
+            ``n x n`` matrix in every expression, and its test function is the symmetric one.
 
         Returns
         -------
@@ -1981,6 +2039,10 @@ class domain(MeshIOMixin):
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
         trial_name, test_name = names
+        if symmetric and space != "Lagrange":
+            raise NotImplementedError(f"symmetric=True is wired for nodal Lagrange fields only, not space={space!r}.")
+        if symmetric and complex:
+            raise NotImplementedError("symmetric=True is not wired for a complex field; declare it real, or full.")
         if complex:
             # A complex field is carried as TWO real fields (re, im) — the FEM-friendly
             # representation. The user writes the weak form with ordinary complex algebra
@@ -1995,6 +2057,7 @@ class domain(MeshIOMixin):
             im_te = TestFunction(name=f"{test_name}_im", value_shape=value_shape, order=order, space=space)
             re_te.field_key = re_tr.field_key
             im_te.field_key = im_tr.field_key
+            re_tr._test, im_tr._test = re_te, im_te  # so `u.test()` returns this very pair
             for _s in (re_tr, im_tr, re_te, im_te):
                 _s._domain = self
                 # Mark these as members of a complex (re, im) pair. The real-equivalent weak form
@@ -2003,9 +2066,10 @@ class domain(MeshIOMixin):
                 # touching a complex field to the real-equivalent block path.
                 _s._complex_field_member = True
             return (ComplexPair(re_tr, im_tr), ComplexPair(re_te, im_te))
-        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order, space=space)
-        test = TestFunction(name=test_name, value_shape=value_shape, order=order, space=space)
+        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order, space=space, symmetric=symmetric)
+        test = TestFunction(name=test_name, value_shape=value_shape, order=order, space=space, symmetric=symmetric)
         test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
+        trial._test = test  # so `u.test()` returns this very test function
         # Carry the owning domain so a consumer can recover the mesh / FE space from a
         # symbol alone -- e.g. jno.np.parameter(phi) sizing a field parameter to the
         # space (mirrors how Variable carries its _domain).
@@ -2013,15 +2077,23 @@ class domain(MeshIOMixin):
         test._domain = self
         return (trial, test)
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange"):
+    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False):
         """
         Backward-compatible alias for variational_symbols().
 
         ``space`` selects the element family: ``"Lagrange"`` (default, nodal) or a non-nodal
-        family on triangles — ``"RT"`` (H(div) Raviart-Thomas), ``"N1curl"`` (H(curl) Nedelec),
-        ``"Hermite"`` (C0 value+gradient), ``"Argyris"`` (C1 conforming biharmonic) or ``"Morley"``
-        (non-conforming biharmonic, cheap: 6 DOF). Non-nodal families assemble through the native
-        push-forward engine.
+        family — ``"N1E"`` (H(curl) Nédélec, first kind), ``"N2E"`` (H(curl), second kind: full
+        P_k), ``"RT"`` (H(div) Raviart-Thomas), ``"P0"`` / ``"DG"`` (discontinuous P_0 / P_k),
+        all on triangles and tetrahedra; ``"Hermite"`` (C0 value+gradient), ``"Argyris"`` (C1
+        conforming biharmonic) or ``"Morley"`` (non-conforming biharmonic, cheap: 6 DOF) on
+        triangles. Non-nodal families assemble through the native push-forward engine.
+
+        ``order`` is the polynomial degree. For N1E / N2E / RT it is the basix degree: ``order=1``
+        is the lowest order (N1E_1 = "Whitney edges", 6 DOFs on a tet), ``order=k`` converges at
+        rate ``k`` in the energy norm, with edge, face and interior DOFs oriented per cell by basix's
+        own DOF transformations. ``DG`` takes ``order >= 0``; the C0/C1 plate families have a fixed
+        order and refuse another. A Lagrange field mixed with a non-nodal one (the A-V pair) may
+        carry any order too.
 
         Examples
         --------
@@ -2041,7 +2113,9 @@ class domain(MeshIOMixin):
             weak = curl(E) * curl(v) - k2 * E.dot(v) - J.dot(v)   # `*` = complex product
             fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
         """
-        return self.variational_symbols(value_shape=value_shape, names=names, order=order, complex=complex, space=space)
+        return self.variational_symbols(
+            value_shape=value_shape, names=names, order=order, complex=complex, space=space, symmetric=symmetric
+        )
 
     def test_function(self, value_shape=(), name="phi", order=1):
         """Return only the weak-form test function.
@@ -2075,23 +2149,73 @@ class domain(MeshIOMixin):
             raise ValueError(f"domain.peec_symbols: expected two names, (current, potential); got {names!r}.")
         return self.trial_function(name=names[0]), self.trial_function(name=names[1])
 
-    def unknown(self, value_shape=(), name="u"):
-        """The discrete **unknown solution field** on this domain's mesh — a *valued* P1 nodal field
-        for strong-form / collocation methods (``jno.fdm``, …), the counterpart to the *symbolic*
-        trial from :meth:`fem_symbols`.
+    @property
+    def unknown(self) -> "_UnknownNamespace":
+        """The field you solve for — the same object for ``jno.fem``, ``jno.fdm`` and a PINN residual.
 
-        Where ``fem_symbols()`` gives an abstract weak-form ``TrialFunction`` (valued only during FE
-        assembly), ``unknown()`` gives a field whose DOFs *are* the unknown, so it supports strong-form
-        derivatives (``u.d2(x, scheme=...)``) and is the object a strong-form solver solves for::
+        ``d.unknown(value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False)``,
+        or by shape::
 
-            u = domain.unknown()
-            jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()
+            u = d.unknown.scalar()                          # = d.unknown()
+            U = d.unknown.vector(2, order=2)                # = d.unknown(value_shape=(2,), order=2)
+            S = d.unknown.matrix(2, 2, symmetric=True)      # 3 stored values per node, a 2x2 in expressions
+
+        In ``jno.fem`` the unknown is the trial function and ``u.test()`` its test function (same space,
+        shape, order and symmetry), so the pair cannot be mismatched::
+
+            u = d.unknown(); v = u.test()
+            jno.fem([inner(grad(u), grad(v)) - f * v, u(xb, yb) - 0.0]).solve()
+
+        ``constant=True`` makes it ONE value (vector, matrix) over the whole domain, solved for with the
+        fields: ``U = d.unknown.scalar(constant=True)``; ``u(xr, yr) - U`` ties a field to it on a region
+        exactly, ``U - g`` pins it, and a weak term carrying ``U.test()`` is an integral row (``jno.fem`` only).
+
+        For ``jno.fdm`` it is a *valued* P1 nodal field whose DOFs are the unknown, so it supports
+        strong-form derivatives (``ui.xx``); that needs ``order=1``, a nodal (``"Lagrange"``) space, a real
+        field and full storage. Any other combination is an FEM-only unknown, and ``jno.fdm`` refuses it.
         """
+        return _UnknownNamespace(self)
+
+    def _make_unknown(
+        self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+    ):
+        """Build an unknown -- see :attr:`unknown`."""
+        if self.__dict__.get("_lazy_plan") is not None:
+            _ = self.mesh
+        if constant:
+            # ONE value (vector, matrix) over the whole domain, solved for with the fields. It has no element,
+            # so `order`/`space` do not apply; it is an FEM unknown (jno.fdm has no global unknowns).
+            if complex or str(space) != "Lagrange" or int(order) != 1:
+                raise NotImplementedError(
+                    "domain.unknown(..., constant=True) is one real value over the domain; it takes no order=, "
+                    "space= or complex=."
+                )
+            trial = TrialFunction(name=name, value_shape=value_shape, symmetric=symmetric, constant=True)
+            trial._domain = self
+            trial._fem_only_unknown = True
+            trial.test()  # pair it now, so `U.test()` is one stable symbol
+            return trial
+        trial, _test = self.variational_symbols(
+            value_shape=value_shape,
+            names=(name, f"v_{name}"),
+            order=order,
+            complex=complex,
+            space=space,
+            symmetric=symmetric,
+        )
+        nodal_p1 = int(order) == 1 and str(space) == "Lagrange" and not complex and not symmetric
+        if not nodal_p1:
+            # FEM-only: there is no valued P1 nodal field behind it. Mark it so jno.fdm can say why it
+            # cannot solve for it, instead of reporting that it found no unknown at all.
+            for part in (trial.real, trial.imag) if complex else (trial,):
+                part._fem_only_unknown = True
+            return trial
         from ..architectures.models import parameter
 
-        sym = TrialFunction(name=name, value_shape=value_shape, order=1)
-        sym._domain = self  # so parameter() sizes a P1 nodal field to this mesh's DOFs
-        return parameter(sym)
+        u = parameter(trial)  # a valued P1 nodal field sized to this mesh (jno.fdm solves for its values)
+        # In jno.fem the same object IS the trial function: the assembler lowers it onto this symbol.
+        u.model._unknown_symbol = trial
+        return u
 
     def _register_variational_sample(
         self,
@@ -2284,14 +2408,49 @@ class domain(MeshIOMixin):
                 pred = where(*(p[..., i] for i in range(dim)))
                 return pred if full is None else (pred & full.contains(p))
 
+            _loc.n_entities = 1 if full is None else full.n_entities  # sizes `map_points` batches
             return _loc
 
         region = self._boundary_regions.get(tag, None)
         if region is None:
             return None
-        return lambda p: region.contains(p)
 
-    def tag_node_mask(self, tag, points):
+        def _in_region(p):
+            return region.contains(p)
+
+        _in_region.n_entities = region.n_entities
+        return _in_region
+
+    def mask(self, name: str) -> np.ndarray:
+        """``(n_nodes,)`` bool: the mesh nodes of the named region -- every node of its cells.
+
+        ``name`` is a region of the mesh: a named part of a ``jno.shape`` plan
+        (``(a.name("core") + b.name("clad")).domain().mask("core")``) or a named volume of a
+        loaded mesh. Read from the mesh's own cell labels, so it is exact for this mesh: a node on an
+        interface belongs to both regions, and a curved mesh contributes its mid-side nodes too.
+        Use it to select a field's values on one part, ``T[d.mask("core")]``.
+
+        Membership is structural (host-side numpy), not a differentiable quantity. For a boundary
+        tag, use :meth:`tag_node_mask` instead.
+
+        Raises:
+            KeyError: ``name`` is not a region of this mesh; the message lists the regions it has.
+        """
+        from .mesh_utils import _CURVED_BLOCKS, volume_cell_type
+
+        dim = int(self.dimension)
+        membership = mesh_cell_region_membership(self.mesh, dim)
+        if name not in membership:
+            raise KeyError(f"domain.mask: no region {name!r}; this mesh has regions {sorted(membership)}.")
+        p1 = volume_cell_type(self.mesh, dim)
+        cd = self.mesh.cells_dict
+        # The curved block, when present, holds the same cells in the same order plus the mid-side nodes.
+        block = next((c for c, (base, _n) in _CURVED_BLOCKS.items() if base == p1 and c in cd), p1)
+        mask = np.zeros(len(self.mesh.points), dtype=bool)
+        mask[np.asarray(cd[block])[membership[name]].ravel()] = True
+        return mask
+
+    def tag_node_mask(self, tag, points, *, closure: bool = False):
         """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
 
         The companion to :meth:`_make_tag_location_fn`, and the one an assembler should use when it
@@ -2306,10 +2465,14 @@ class domain(MeshIOMixin):
         with stays where it was -- a tolerance-based proximity test against the region's own points,
         which float32 cannot break.
 
+        ``closure=True`` adds every vertex of the boundary facets the tag selected -- what a FACET-based
+        use needs (the non-nodal path pins a facet's edge/face DOFs when all its vertices are in the
+        tag). The default is the predicate at the vertices, which is what a NODE-based use means: a
+        nodal Dirichlet value or tie can exclude a corner with a vertex predicate, and the closure would
+        put it back.
+
         Returns ``None`` when the tag is unknown, matching ``_make_tag_location_fn``.
         """
-        import jax
-        import jax.numpy as jnp
 
         loc = self._make_tag_location_fn(tag)
         if loc is None:
@@ -2317,16 +2480,14 @@ class domain(MeshIOMixin):
         pts = np.asarray(points)
         n = int(pts.shape[0])
 
-        def _vmapped(fn, num_args=1):
-            # Chunked for the same reason the callers chunked: a geometric region predicate tests one
-            # point against every boundary facet, so an unchunked vmap materialises (n x n_facets) --
-            # 804 MB on a realistic 3-D mesh, which exhausts the device before assembly starts.
-            pj, chunk, out = jnp.asarray(pts), 512, []
-            for s in range(0, n, chunk):
-                blk = pj[s : min(s + chunk, n)]
-                hit = jax.vmap(fn)(blk) if num_args == 1 else jax.vmap(fn)(blk, jnp.arange(s, s + blk.shape[0]))
-                out.append(np.asarray(hit).reshape(-1))
-            return np.concatenate(out) if out else np.zeros(0, dtype=bool)
+        def _vmapped(fn, num_args=1, n_entities=None):
+            # Batched: a geometric region predicate tests one point against every boundary facet, so an
+            # unchunked vmap materialises (n x n_facets) -- 804 MB on a realistic 3-D mesh, which exhausts
+            # the device before assembly starts. The batch is sized by the facet count (`map_points`).
+            from .boundary_region import map_points
+
+            ne = n_entities if n_entities is not None else getattr(fn, "n_entities", 1)
+            return map_points(fn, pts[:n], ne, with_index=num_args != 1)
 
         where = (getattr(self, "_tag_predicates", {}) or {}).get(tag)
         if where is not None:
@@ -2334,8 +2495,33 @@ class domain(MeshIOMixin):
             dim = int(self.dimension)
             mask = np.asarray(where(*(pts64[:, i] for i in range(dim)))).reshape(-1).astype(bool)
             full = self._boundary_regions.get("boundary", None)
-            if full is not None:
-                mask &= _vmapped(full.contains).astype(bool)
+            if tag in (getattr(self, "_tag_regions", {}) or {}) and tag in self._boundary_regions:
+                # a body-owned tag can name facets INSIDE the mesh (a region's own surface): restrict to
+                # the tag's facets, not to the domain boundary
+                full = self._boundary_regions[tag]
+            if full is not None and mask.any():
+                # the boundary test is the costly part (point vs every boundary facet): run it only on
+                # the points the predicate already accepts
+                hit = np.flatnonzero(mask)
+                pts, n = pts[hit], int(hit.size)
+                mask[hit] = _vmapped(full.contains, n_entities=full.n_entities).astype(bool)
+            # ...and, for a FACET-based use (`closure=True`), every vertex of the facets the tag SELECTED.
+            # The tag picks its facets by the predicate at facet centroids, but a node test re-asks it at
+            # the vertices, and the two can disagree: on a curved wall the centroids sit inside the surface
+            # by the chord sagitta, and a predicate written to keep a neighbouring plane out ("not on
+            # z = 0") drops the vertices where the wall MEETS that plane. Every edge touching that junction
+            # then went unpinned in silence -- measured on a mirror-cell eddy problem in a cylindrical can:
+            # L 8 % high. A NODE-based use keeps the vertex predicate, which is how a nodal value or tie
+            # excludes a corner on purpose.
+            reg = self._boundary_regions.get(tag) if closure else None
+            fac = None if reg is None else getattr(reg, "facets", None)
+            if fac is not None and len(fac):
+                from scipy.spatial import cKDTree
+
+                fv = np.unique(np.asarray(fac, dtype=np.float64).reshape(-1, np.asarray(fac).shape[-1])[:, :dim], axis=0)
+                span = float(np.ptp(pts64[:, :dim])) if len(pts64) else 1.0
+                d_, _i = cKDTree(fv).query(pts64[:, :dim], distance_upper_bound=1e-12 * max(span, 1e-30) + 1e-300)
+                mask |= np.isfinite(d_)
             return mask
 
         num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
@@ -2657,6 +2843,48 @@ class domain(MeshIOMixin):
         self._region_attachments = attached
         self._attachment_kind = kinds
 
+    def _integral_node(self, expr, solver=None):
+        """``expr.integrate(d)``: the integral over this domain's volume of an expression of KNOWN fields --
+        frozen data, frozen solutions (``u.bind(...).freeze(fem.solve())``, any number of forms), parameters,
+        coordinates, region masks -- as a differentiable scalar node for ``jno.core``::
+
+            Phi = [phi.bind(x=x, y=y).freeze(f.solve()) for f in fems]
+            C01 = (eps * inner(grad(Phi[0]), grad(Phi[1]))).integrate(d)      # C_01 = ∫ ε ∇φ_0 · ∇φ_1
+
+        Each field is evaluated with its own element (any space); the rule is the simplex quadrature of
+        degree 2k for fields of degree k. Whole volume only, simplex meshes; it follows trainable coordinates, and
+        ``d.cell_size`` / ``d.cell_metric`` resolve per cell (a mesh-quality measure is an integral).
+        An expression with an unknown (trial / test function) is a form, not this: integrate it over its
+        form with ``expr.integrate(fem)``."""
+        from ..trace import FunctionCall
+        from ..utils.solver.fem_known import domain_functional
+
+        if solver is not None:
+            raise TypeError(
+                "expr.integrate(domain, solver=...): an integral over a domain runs no solve; pick the solver "
+                "where the solution is made, `u.freeze(fem.solve(linear=...))`."
+            )
+        from .._fem import _region_and_support, _retag_coords_for_quadrature
+
+        bare = getattr(expr, "expr", expr)
+        try:
+            support, region = _region_and_support(expr, self, integrand=True)
+        except Exception:  # noqa: BLE001  -- an integrand of frozen fields alone names no coordinate region
+            support, region = "volume", "volume"
+        if support != "volume" or region != "volume":
+            raise NotImplementedError(
+                f"expr.integrate(domain): over the whole volume only; this integrand lives on {region!r}."
+            )
+        _retag_coords_for_quadrature(expr, "volume", "volume")
+        fn, inputs = domain_functional(self, bare)
+        keys = [k for k, _n in inputs]
+        node = FunctionCall(lambda *vals: fn(dict(zip(keys, vals))), [n for _k, n in inputs], name="domain_integral")
+        node._per_evaluation = True  # a scalar of its inputs: evaluated once per evaluation
+        # integrals with the same integrand reading other fields of the same elements are evaluated as ONE
+        # batched kernel per evaluation (jno.utils.solver.shared_integral); this is what they are matched by
+        node._integral_spec = {"domain": self, "expr": bare, "fn": fn}
+        return node
+
     def attach(self, target: str | None = None, **props):
         """Declare material properties on an existing **region or boundary tag**, after the domain is built.
 
@@ -2696,8 +2924,10 @@ class domain(MeshIOMixin):
         else:
             key = str(target)
             kinds[key] = self._attachment_target_kind(key)
+        versions = self.__dict__.setdefault("_attach_versions", {})
         for prop, value in props.items():
             attached.setdefault(str(prop), {})[key] = value
+            versions[str(prop)] = versions.get(str(prop), 0) + 1  # a built jno.fem watches this
         self._check_attachment_clashes()
         return self
 
@@ -2796,6 +3026,20 @@ class domain(MeshIOMixin):
                     f"names, or split the tag."
                 )
             resolved = {t: self._resolve_attached(v) for t, v in values.items()}
+            # Plain numbers are emitted as AttachedLiteral leaves, read from the domain whenever the term
+            # is lowered, so a built `jno.fem` re-assembles with a value attached after it was written.
+            # An expression value is captured as written; the expression is marked (`_attached_snapshot`)
+            # so the fem can refuse to solve with it once the property is re-attached.
+            live = {t: AttachedLiteral(self, name, t) if _is_plain_value(v) else v for t, v in resolved.items()}
+            snapshot = not all(_is_plain_value(v) for v in resolved.values())
+            if has_default:
+                snapshot = snapshot or not _is_plain_value(self._resolve_attached(default))
+
+            def mark(e):
+                if snapshot:
+                    e._attached_snapshot = (self, name)
+                return e
+
             if declared == {"surface"}:
                 # No completeness rule on the boundary: tags are not a partition of it, and untagged
                 # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
@@ -2808,7 +3052,7 @@ class domain(MeshIOMixin):
                         f"partition of the boundary -- untagged boundary is natural (do-nothing) -- "
                         f"so a surface default has no meaning. Attach it to each tag instead."
                     )
-                return self._by_tag(resolved)
+                return mark(self._by_tag(live))
             known = set(self.__dict__.get("_shape_regions") or {})
             missing = sorted(known - set(values))
             if missing and not has_default:
@@ -2819,11 +3063,14 @@ class domain(MeshIOMixin):
                 )
             # The explicit targets already won: `default` only fills what they left, so the two
             # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
-            if not resolved and has_default:
-                # Only a default was declared: the coefficient is that value everywhere -- there is no
-                # region to mask, and `_by_region` of an empty mapping is (rightly) an error.
-                return self._resolve_attached(default)
-            return self._by_region(resolved, default=self._resolve_attached(default) if has_default else None)
+            if has_default:
+                dv = self._resolve_attached(default)
+                default_live = AttachedLiteral(self, name, self._DEFAULT_TARGET) if _is_plain_value(dv) else dv
+                if not live:
+                    # Only a default was declared: the coefficient is that value everywhere -- there is
+                    # no region to mask, and `_by_region` of an empty mapping is (rightly) an error.
+                    return mark(default_live)
+            return mark(self._by_region(live, default=default_live if has_default else None))
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def attached(self, name: str) -> dict:
@@ -2890,6 +3137,34 @@ class domain(MeshIOMixin):
         ek = key(ents)
         return np.array([all(tuple(v) in own for v in f) for f in ek], dtype=bool)
 
+    def _region_surface_facets(self, region):
+        """``(E, dim, dim)`` vertex coordinates of the facets separating cells of volume ``region`` from
+        cells of other regions in a conforming mesh (the facets on the domain boundary are not included),
+        or ``None`` without a mesh / named cell regions."""
+        from .mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
+
+        try:
+            mesh = getattr(self, "mesh", None)
+        except Exception:  # noqa: BLE001  a mesh-free domain
+            mesh = None
+        if mesh is None:
+            return None
+        dim = int(self.dimension)
+        memb = mesh_cell_region_membership(mesh, dim).get(str(region))
+        if memb is None:
+            return None
+        cells = np.asarray(p1_cells_dict(mesh)[volume_cell_type(mesh, dim)], dtype=np.int64)
+        memb = np.asarray(memb, dtype=bool)
+        k = cells.shape[1]
+        loc = [tuple(j for j in range(k) if j != i) for i in range(k)]  # local facet = all vertices but one
+        fac = np.sort(np.concatenate([cells[:, list(lf)] for lf in loc]), axis=1)
+        owner = np.tile(np.arange(len(cells)), k)
+        _u, inv, cnt = np.unique(fac, axis=0, return_inverse=True, return_counts=True)
+        inv = inv.reshape(-1)
+        n_in = np.bincount(inv, weights=memb[owner].astype(float), minlength=len(_u))
+        sel = (cnt[inv] == 2) & memb[owner] & (n_in[inv] == 1)  # interior facet, exactly one side in region
+        return np.asarray(mesh.points)[fac[sel]][:, :, :dim]
+
     def _register_tag_boundary_region(self, name, where, region=None):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
         so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
@@ -2936,6 +3211,18 @@ class domain(MeshIOMixin):
                 if "|" in _t and _r.facets is not None:
                     blocks.append(_r.facets)
                     owners.append(_t.rsplit(".", 1)[-1] if "." in _t else None)
+            # ...and the body's own surface where it lies INSIDE a conforming mesh (facets between a cell
+            # of `region` and a cell of another region): a thin conductor meshed with its surroundings
+            # has its faces there, not on the domain boundary.
+            _rs = self._region_surface_facets(region)
+            if _rs is not None and len(_rs):
+                blocks.append(_rs)
+                owners.append(str(region))
+                _mrs = _rs.mean(axis=1)
+                if np.asarray(where(*[_mrs[:, i] for i in range(dim)])).reshape(-1).astype(bool).any():
+                    # the nodal assemblers walk boundary facets only: `jno.fem` routes forms on such a
+                    # tag to the non-nodal path, which integrates interior facets
+                    self.__dict__.setdefault("_interior_face_tags", set()).add(name)
         _bo = [(np.asarray(b), o) for b, o in zip(blocks, owners) if b is not None and len(b)]
         blocks, owners = [b for b, _ in _bo], [o for _, o in _bo]
         # Every block must be the same kind of facet to stack: they are, on the single-cell-type mesh

@@ -23,6 +23,10 @@ Any subclass of `Callback` is a valid callback — override one or more of four 
 
 `on_before_update` intercepts the gradient dict before the optimizer applies its update.  Returning a modified dict redirects the optimizer (for example to apply a preconditioner); returning `None` leaves the gradients unchanged.  The hook requires `inner_steps=1` and no Bayesian models; the solver raises a `ValueError` if those constraints are violated.
 
+A callback that also needs the gradients of some constraint rows (MMA does) can define `jacobian_request()` returning `(rows, lids)`: `jno.core` then computes those rows in the **same** program as the objective gradient — one forward pass and one factorization of every FEM system per step — and passes them to `on_before_update` as `constraint_jacobian`. Return `None` to ask for nothing.
+
+On this path a linear solve inside the step that fails its residual check returns NaN instead of calling back to the host, so the compiled step can be kept in the persistent compile cache. jNO checks every step's loss, gradient and constraint Jacobian and raises `RuntimeError: jno.core.solve: step N gave a non-finite ...`; evaluate the objective and constraints with `crux.eval([...])` at the current parameters to have the failing solve named, with its residual.
+
 The `**kw` for each hook is documented in the [base class source](https://github.com/FhG-IISB/jno/blob/main/jno/utils/adaptive/callbacks.py) — the most useful keys inside `on_epoch_end` are `epoch`, `total_loss`, `individual_losses`, `trainable`, `rng`, and `log`.
 
 ```python

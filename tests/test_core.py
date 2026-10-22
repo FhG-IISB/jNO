@@ -666,6 +666,94 @@ class TestInequalityConstraints:
         assert g.size == 2, "the constraint must be visible to the hook, not just the objective"
         assert float(seen[0]["total_loss"]) == pytest.approx(float(g[0]), rel=1e-6)
 
+    def test_a_parameter_only_in_a_constraint_row_is_a_model_of_the_problem(self):
+        """``c`` appears in a ``jno.le`` row and nowhere else. It used to be missed by the model collection
+        (which did not look inside a constraint), so the first step raised "No model for Model <id>"."""
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
+        c = jnn.parameter((1,), key=jax.random.PRNGKey(1), name="c")
+        c.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
+        tracked = jnn.parameter((1,), key=jax.random.PRNGKey(2), name="t").optimizer(optax.sgd(0.0))
+        crux = jno.core([(a * x - 2.0).mse, jno.le((c * x).mean, 0.4), (tracked * x).mean.tracker(1)], domain=d)
+        crux.solve(1)
+        found = set(crux._collect_flax_modules())
+        assert {a.model.layer_id, c.model.layer_id, tracked.model.layer_id} <= found
+
+    @staticmethod
+    def _rows_problem(n_rows, traces):
+        """Objective (a x - 2)^2 and three entries in a, b, c, the first n_rows of them inequality rows; MMA designs a and b (its
+        Jacobian is taken w.r.t. them), c is trained by another optimiser. Every parameter passes through a
+        custom_vjp whose backward rule counts how often the backward pass is TRACED."""
+
+        @jax.custom_vjp
+        def counted(v):
+            return v
+
+        def fwd(v):
+            return v, None
+
+        def bwd(_res, g):
+            traces.append(1)
+            return (g,)
+
+        counted.defvjp(fwd, bwd)
+
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+
+        def param(name, v, opt):
+            q = jnn.parameter((1,), key=jax.random.PRNGKey(0), name=name)
+            q.initialize(lambda k, sh, dtype=None, _v=v: jnp.full(sh, _v))
+            q.optimizer(opt)
+            return q
+
+        mma = lambda: jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0)  # noqa: E731
+        a, b, c = param("a", 0.7, mma()), param("b", 1.3, mma()), param("c", -0.4, optax.sgd(0.0))
+        A, B, C = (jno.fn(counted, [p]) for p in (a, b, c))
+        raw = [(A * B * x).mean, (A * x * x).mean, (B * x * x).mean + (C * x).mean]
+        rows = [jno.le(raw[0], 0.4), jno.ge(raw[1], 0.1), jno.le(raw[2], 1.0)]
+        # the same forward graph for any n_rows: the entries past n_rows stay in, as plain loss terms
+        return jno.core([(A * x - 2.0).mse] + rows[:n_rows] + raw[n_rows:], domain=d), x, (a, b, c)
+
+    def test_the_jacobian_rows_come_from_one_backward_pass(self, monkeypatch):
+        """Objective gradient and three constraint rows, against the analytic derivatives; and the backward
+        pass is traced as often for three rows as for one (one ``lax.map`` over the seeds, not a pullback
+        per row, which put one copy of the whole backward graph per row into the program)."""
+        from jno.optimizers.mma import MMACallback
+
+        seen = []
+        orig = MMACallback.on_before_update
+
+        def spy(self, *, grads, **kw):
+            jac = kw.get("constraint_jacobian")  # copies: the step donates the gradient buffers afterwards
+            seen.append((jax.tree_util.tree_map(np.array, grads), None if jac is None else np.array(jac)))
+            return orig(self, grads=grads, **kw)
+
+        monkeypatch.setattr(MMACallback, "on_before_update", spy)
+        traces3, traces1 = [], []
+        crux, x, (a, b, c) = self._rows_problem(3, traces3)
+        crux.solve(1)
+        assert seen and seen[0][1] is not None, "MMA got no constraint Jacobian from the step"
+        grads, J = seen[0]
+        m1, m2 = (float(np.asarray(v).reshape(-1)[0]) for v in crux.eval([x.mean, (x * x).mean]))
+        av, bv = 0.7, 1.3
+        cols = np.argsort([a.model.layer_id, b.model.layer_id])  # MMA orders its blocks by layer id
+        want = np.array([[bv * m1, av * m1], [-m2, 0.0], [0.0, m2]])[:, cols]
+        np.testing.assert_allclose(np.asarray(J), want, rtol=1e-6, atol=1e-7)
+        flat = lambda lid: float(np.concatenate([np.ravel(leaf) for leaf in jax.tree_util.tree_leaves(grads[lid])])[0])  # noqa: E731
+        np.testing.assert_allclose(flat(a.model.layer_id), 2 * (av * m2 - 2 * m1), rtol=1e-6)
+        assert flat(b.model.layer_id) == 0.0 and flat(c.model.layer_id) == 0.0, "rows must not leak into the gradient"
+
+        crux1, _x, _p = self._rows_problem(1, traces1)
+        crux1.solve(1)
+        assert traces1, "the counting backward rule was never traced"
+        assert len(traces3) == len(traces1), (
+            f"the backward pass was traced {len(traces3)} times for 3 rows and {len(traces1)} for 1: "
+            "one copy per row is in the program"
+        )
+
     def test_substeps_and_inequality_constraints_are_refused(self):
         """A substep descends the mean of its own SUBSET, where a constraint would act as a penalty.
 

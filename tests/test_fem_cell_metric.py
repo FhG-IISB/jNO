@@ -103,33 +103,46 @@ def test_stretch_is_invisible_to_cell_size_and_not_to_cell_metric(_x64):
     assert tr_st > 2.0 * tr_sq, f"cell_metric must see the stretch: {tr_st:.4g} vs {tr_sq:.4g}"
 
 
-@pytest.mark.parametrize("build", ["1d", "nonnodal"])
-def test_a_path_that_packs_no_jacobian_refuses_by_name(_x64, build):
-    """Only the native 2-D/3-D volume kernel packs an element Jacobian. Everywhere else the symbol must
-    SAY there is no metric.
+def test_the_1d_path_packs_no_jacobian_and_refuses_by_name(_x64):
+    """The 1-D assembler packs no element Jacobian, so the symbol must SAY there is no metric.
 
     The placeholder exists only because the `Variable` constructor requires the tag in
     `domain.context`; it is deliberately zero-size so it can never be mistaken for a metric -- contrast
     an `np.ones` placeholder, which is what `dom.cell_size` had, and which read as a silent h = 1.0.
     """
-    if build == "1d":
-        dom = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
-        u, v = dom.fem_symbols()
-        xi = dom.variable("interior", split=True)[0]
-        ui, vi = u.bind(x=xi), v.bind(x=xi)
-        terms = [ui.x * vi.x - trace(dom.cell_metric) * vi]
-    else:
-        pytest.importorskip("shapely", reason="shapely required for the box domain")
-        from shapely.geometry import box
-
-        dom = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
-        u, v = dom.fem_symbols(space="Morley")
-        xi, yi, _ = dom.variable("interior", split=True)
-        ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-        H = jno.np.hessian
-        terms = [inner(H(ui, [xi, yi]), H(vi, [xi, yi]), n_contract=2) - trace(dom.cell_metric) * vi]
+    dom = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
+    u, v = dom.fem_symbols()
+    xi = dom.variable("interior", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
     with pytest.raises(NotImplementedError, match="native 2-D/3-D assembler"):
-        _ = jno.fem(terms).b
+        _ = jno.fem([ui.x * vi.x - trace(dom.cell_metric) * vi]).b
+
+
+@pytest.mark.parametrize("symbol", ["cell_metric", "cell_size"])
+def test_the_nonnodal_path_packs_the_same_metric_as_the_nodal_one(_x64, symbol):
+    """The non-nodal (H(curl)/H(div)/plate) assembler packs the cell metric too. Oracle: the same load on a
+    Lagrange field, assembled once by the nodal path and once inside a mixed N1E + Lagrange form (which the
+    non-nodal path assembles), on a stretched rectangle -- equal to round-off."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    from shapely.geometry import box
+
+    def load(mixed):
+        d = jno.domain(box(0.0, 0.0, 2.0, 0.5), mesh_size=0.15)
+        p, q = d.fem_symbols(names=("p", "q"))
+        xi, yi, _ = d.variable("interior", split=True)
+        pi_, qi = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+        c = trace(d.cell_metric) if symbol == "cell_metric" else d.cell_size
+        terms = [pi_ * qi - c * qi]
+        if mixed:
+            E, F = d.fem_symbols(value_shape=(2,), names=("E", "F"), space="N1E")
+            terms.append(inner(E.bind(x=xi, y=yi), F.bind(x=xi, y=yi)))
+        fem = jno.fem(terms)
+        b = np.asarray(fem.b).reshape(-1)
+        return b[fem.blocks[fem.block_index(p)]] if mixed else b
+
+    nodal, nonnodal = load(False), load(True)
+    assert np.abs(nodal).max() > 0
+    np.testing.assert_allclose(nonnodal, nodal, rtol=0, atol=1e-12 * np.abs(nodal).max())
 
 
 def test_a_boundary_term_is_refused_by_the_region_resolver(_x64):

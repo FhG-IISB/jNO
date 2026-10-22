@@ -852,7 +852,10 @@ def test_gradient_trackers_run_on_a_trace_containing_a_sparse_solve():
     gn = jno.trackers.gradient_norms(interval=1)
     cs = jno.trackers.cos_similarity(interval=1)
     ga = jno.trackers.gradient_alignment(interval=1)
-    ll = jno.trackers.loss_landscape(interval=1, n_grid=3)
+    # alpha_range=0.25 keeps the grid inside rho > 0: at the default 1.0 a corner drives the density to ~0,
+    # where the SIMP stiffness (emin = 1e-6) is near-singular in float32 and the GPU spsolve's singularity
+    # flag turns on roundoff -- the trackers running through the solve is the point here, not the extent.
+    ll = jno.trackers.loss_landscape(interval=1, n_grid=3, alpha_range=0.25)
 
     _fem_compliance_crux().solve(2, callbacks=[gn, cs, ga, ll])
 

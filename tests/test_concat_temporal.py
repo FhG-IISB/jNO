@@ -55,7 +55,7 @@ def test_bare_temporal_trunk_compiles_promptly():
     res = u.t - 0.1 * (u.xx + u.yy) + u
 
     t0 = time.time()
-    jno.core([res.mse]).solve(epochs=2, batchsize=32)
+    jno.core([res.mse]).solve(epochs=2, points=32)
     assert time.time() - t0 < 120.0, "bare-temporal trunk regressed to the pathological compile path"
 
 

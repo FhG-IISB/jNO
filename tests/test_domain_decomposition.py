@@ -57,7 +57,9 @@ def test_overlapping_schwarz_matches_monolithic():
     f = jnp.asarray(2 * np.pi**2 * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
     lap = lambda u: jno.fdm.laplacian(u, d, method="cotangent")  # noqa: E731
-    newton = jno.solve.newton()
+    # Schwarz judges convergence by the overlap jump at 1e-10, so each subdomain solve must be that accurate:
+    # a forced Newton root is only good to rtol/atol.
+    newton = jno.solve.newton(rtol=1e-13, atol=1e-13)
 
     def solve_pinned(mask, vals):  # solve -Δu = f with `mask` nodes pinned to `vals`
         mask_j, vals_j = jnp.asarray(mask), jnp.asarray(vals)

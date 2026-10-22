@@ -257,3 +257,27 @@ def test_toml_can_turn_the_compile_cache_on(tmp_path, monkeypatch, _restore_cach
         assert _cache_dir() is not None
     finally:
         cfg_module._CONFIG = None
+
+
+def test_solve_leaves_the_compile_cache_settings_alone(tmp_path, _restore_cache_dir):
+    """`core.solve` used to point the cache at a second directory and raise the minimum compile time from 0 to
+    1 s for the rest of the process (overriding an opt-out); the setting made at import / setup must hold."""
+    import jax
+    import optax
+
+    import jno
+    import jno.jnp_ops as jnn
+
+    prev_min = jax.config.jax_persistent_cache_min_compile_time_secs
+    try:
+        for target in (str(tmp_path / "cache"), None):
+            jax.config.update("jax_compilation_cache_dir", target)
+            jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+            d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+            x, _ = d.variable("interior")
+            a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+            jno.core([(a * x - 2.0).mse], domain=d).solve(1)
+            assert jax.config.jax_compilation_cache_dir == target
+            assert jax.config.jax_persistent_cache_min_compile_time_secs == 0.0
+    finally:
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", prev_min)

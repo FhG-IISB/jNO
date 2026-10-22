@@ -130,8 +130,11 @@ def test_nonlinear_stokes_picard_fgmres_triangular():
 
     u_ref = np.asarray(fem.solve(solve_fn=dense_picard))
 
+    # The outer tolerance sets the accuracy: each Picard step is solved only as far as the inexact-Newton
+    # forcing asks, so the iterate meets the residual bound and no more -- and this saddle amplifies a
+    # residual ~1e3-fold into the velocity/pressure (3.4e-5 off at the default 1e-8, 1.4e-8 at 1e-11).
     sol = fem.solve(
-        nonlinear=jno.solve.picard(),
+        nonlinear=jno.solve.picard(rtol=1e-11, atol=1e-11),
         linear=jno.solve.fgmres(tol=1e-10, restart=40, maxiter=4000),
         precond=jno.precond.triangular(
             (u, jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=60))),
