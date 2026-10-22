@@ -190,9 +190,12 @@ def test_cg_solves_a_dirichlet_nonlinear_problem():
 def test_a_starting_iterate_violating_the_boundary_values_converges_the_same():
     g = 0.35
     fem, _d = _poisson(g=g)
-    base = np.asarray(fem.solve())
+    # Both solves converge far below the bound, so the comparison is about the start and not about where
+    # Newton stops: from the default start it now takes a different path (a first linearised step).
+    tight = jno.solve.newton(rtol=1e-12, atol=0.0)
+    base = np.asarray(fem.solve(nonlinear=tight))
     bad = jnp.full((fem.dofs,), -5.0)  # nowhere near the pinned value, nor near the solution
-    got = np.asarray(fem.solve(x0=bad))
+    got = np.asarray(fem.solve(x0=bad, nonlinear=tight))
     rel = np.abs(got - base).max() / np.abs(base).max()
     assert rel < 1e-8, f"a non-conforming x0 changed the answer: rel {rel:.3e}"
     pts = np.asarray(fem.points)
