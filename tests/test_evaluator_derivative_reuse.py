@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import equinox as eqx
 import foundax
 import jax
 import numpy as np
@@ -400,3 +401,25 @@ def test_component_and_parameter_indexing_still_work():
     first = p[0] + 0.0 * x  # a parameter vector is not a point set: its [0] is its first entry
     crux = jno.core([first.mse], domain=dom)
     assert np.allclose(np.asarray(crux.eval(first)), np.asarray(crux.eval(p[..., 0] + 0.0 * x)))
+
+
+class _LeadingAxis(eqx.Module):
+    """A pointwise network that returns its values with a leading batch axis of one, ``(1, N, 1)``, as some
+    foundation-model wrappers do."""
+
+    mlp: eqx.Module
+
+    def __call__(self, x, y):
+        return self.mlp(x, y)[None]
+
+
+def test_a_pointwise_network_with_a_leading_unit_axis_is_measured_pointwise():
+    dom = jno.shape.rect(0, 0, 1, 1, size=0.25).domain()
+    x, y, _ = dom.variable("interior")
+    net = jno.nn(_LeadingAxis(foundax.mlp(in_features=2, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)))
+    net.optimizer(optax.adam(1e-3))
+    u = net(x, y)
+    crux = jno.core([(jno.np.laplacian(u, [x, y]) - 1.0).mse], domain=dom)
+    stats = crux.solve(1)  # raised "depends on the OTHER points": the unit axis was read as one value for all points
+    assert np.isfinite(float(stats.training_logs[-1]["total_loss"][-1]))
+    assert getattr(u, "_jno_pointwise", None) is not False

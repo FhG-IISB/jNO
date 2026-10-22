@@ -579,6 +579,11 @@ def mark_pointwise_targets(exprs, params, context, log=None, n_probe=3):
 
         try:
             out = jax.eval_shape(value, points)
+            lead = next((i for i, s in enumerate(out.shape) if s != 1), len(out.shape))
+            if 0 < lead < len(out.shape) and out.shape[lead] == n:
+                # one value per point behind unit axes, (1, n, ...): a layout the shared pass does not handle, so
+                # the target keeps its own per-node path
+                continue
             if not out.shape or out.shape[0] != n:
                 target._jno_pointwise = False  # one value for the whole point set: a reduction
                 continue
