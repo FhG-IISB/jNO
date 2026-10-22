@@ -1710,6 +1710,11 @@ class domain(MeshIOMixin):
         finally:
             self.__dict__["_building_mesh"] = False
         self._register_shape_stretch(plan)
+        # A region's predicate stood in for its cells only while there were none; the mesh now has
+        # them as a cell set, as an eagerly meshed domain does. Replaying it as a tag would also give
+        # the region a boundary node set, and `jno.fem` would read `u(region) - g` as a surface term.
+        for name in self.__dict__.pop("_region_tag_predicates", ()):
+            self._tag_predicates.pop(name, None)
         # Tags declared while mesh-free carry only their predicate; the mesh-derived half (node
         # pool, boundary region, normals) has had nothing to be derived from until now. Replay them,
         # or a `u(tag) - g` essential condition on such a tag would be read as a whole-domain
@@ -3297,6 +3302,7 @@ class domain(MeshIOMixin):
         for rname, sub in _regions_of(plan):
             self._geometry_tags[rname] = ("interior", None)
             self._tag_predicates[rname] = _region_predicate(sub, tuple(_seen))
+            self.__dict__.setdefault("_region_tag_predicates", set()).add(rname)
             _seen.append(sub)
         for name in self._geometry_tags:
             if name not in self.avaiable_mesh_tags:
