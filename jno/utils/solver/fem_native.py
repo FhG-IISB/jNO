@@ -5540,7 +5540,9 @@ def assemble_fem_native(
             _op.jacobian_diag = jac_diag_p
             # only where a prescribed value can be non-zero: a held (args- or time-dependent) value, or a
             # static one that is not all zeros. A homogeneous problem starts consistent and skips the step.
-            if _constrained is not None and (_held or bool(jnp.any(s_d_vals != 0))):
+            if _constrained is not None and (
+                _held or bool(np.any(np.asarray(s_d_vals) != 0))
+            ):  # on the host: no device copy
                 _op.lift_start = lambda u0, args=None: dirichlet_lift_start(
                     lambda uu: residual(uu, 0.0, args),
                     lambda uu: jacobian(uu, 0.0, args),
