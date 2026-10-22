@@ -2197,6 +2197,8 @@ class core:
 
         from jax._src import profiler as _jax_profiler
 
+        _epochs_run = epochs  # lowered where a callback stops the loop early
+
         if not self.constraints:
             raise ValueError(
                 "solve() requires at least one constraint. "
@@ -4822,6 +4824,7 @@ class core:
                         if cb.on_epoch_end(**cb_info):
                             _stop_requested = True
                     if _stop_requested:
+                        _epochs_run = epoch + inner_steps
                         break
 
                 # Commit the W&B row for this step.  When step= is passed to
@@ -5032,7 +5035,7 @@ class core:
                 )
                 wandb_log_model(self)
 
-        self._total_epochs += epochs
+        self._total_epochs += _epochs_run
         # Hand the optimizer states to the next solve() so schedules continue across the call.
         self._opt_states = opt_states
 
