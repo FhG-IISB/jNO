@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import weakref as _weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
@@ -57,6 +58,34 @@ def _mesh_request_origin() -> str:
     return "something"
 
 
+def _refuse_empty_mesh(mesh, dim: int) -> None:
+    """Refuse a mesh with no nodes — the mesher failed and returned nothing.
+
+    gmsh can fail (``HXT 3D mesh failed``, ``a segment and a facet intersect``) and still hand back
+    a well-formed but EMPTY mesh: zero points, and cell blocks present with zero rows. Nothing
+    downstream notices, so ``.domain()`` returns an object that behaves like a domain until some
+    much later reduction over an empty set fails somewhere unrelated. The gmsh error has scrolled
+    past by then, and the traceback points nowhere near the geometry that caused it.
+
+    One known trigger, measured: a thin CURVED solid inside a host whose cells are larger than the
+    inclusion's DIAMETER. Refining the inclusion does not help; refining the host does. For a 0.75 mm
+    tube in a box, host size 1.6 gives zero tetrahedra while 0.8 gives ~9.7k
+    (``tests/test_shape_line.py::test_a_coarse_host_cannot_mesh_around_a_thin_inclusion``).
+    """
+    n = 0 if getattr(mesh, "points", None) is None else len(mesh.points)
+    if n:
+        return
+    blocks = sorted((getattr(mesh, "cells_dict", None) or {}))
+    raise RuntimeError(
+        f"the mesher returned an EMPTY {dim}-D mesh: no nodes, and cell blocks {blocks or 'none'} "
+        "with no rows. This means meshing failed -- look for a gmsh error above (commonly "
+        "'HXT 3D mesh failed' or 'a segment and a facet intersect'). The usual cause is a thin or "
+        "curved feature inside a region whose target size is too coarse to wrap around it: refine "
+        "the SURROUNDING region (refining the small feature does not help), or give the small "
+        "feature more clearance."
+    )
+
+
 def _refuse_mixed_cells(mesh, dim: int) -> None:
     """Refuse a mesh carrying more than one kind of volume cell.
 
@@ -92,6 +121,41 @@ def _refuse_mixed_cells(mesh, dim: int) -> None:
 #: The facet block a volume cell's boundary is written into, matching what the native constructors
 #: emit (``geometries.py`` / ``emit.py``): a triangle's facet is a 2-node line, a hexahedron's a
 #: 4-node quad.
+def _mesh_readout(method):
+    """Mark a domain method whose node reads the CURRENT mesh (cell sizes, angles, aspect ratios).
+
+    Such a node captures the mesh it was made on. A `domain.rebuild` replaces the mesh, so every node
+    made by a marked method is made again on the new mesh and swapped in place: a rebuild condition, or
+    a constraint written as `jno.le(d.cell_aspect(), 6)`, keeps reading the mesh the solve uses."""
+    import functools
+
+    @functools.wraps(method)
+    def made(self, *args, **kwargs):
+        node = method(self, *args, **kwargs)
+        self.__dict__.setdefault("_mesh_readouts", []).append((_weakref.ref(node), method, args, kwargs))
+        return node
+
+    return made
+
+
+def _remake_mesh_readouts(d):
+    """After a remesh: every live node of a :func:`_mesh_readout` method, made again on the new mesh
+    and updated in place (its identity, and so every expression holding it, is kept)."""
+    live = []
+    for ref, method, args, kwargs in d.__dict__.get("_mesh_readouts", ()):
+        node = ref()
+        if node is None:
+            continue
+        keep = {k: node.__dict__[k] for k in ("op_id",) if k in node.__dict__}
+        node.__dict__.update(method(d, *args, **kwargs).__dict__)
+        node.__dict__.update(keep)
+        live.append((ref, method, args, kwargs))
+    d.__dict__["_mesh_readouts"] = live
+
+
+# domains with a `rebuild(when=...)`, which `jno.core.solve` watches (weakly: a dropped domain leaves)
+_REBUILDING_DOMAINS = _weakref.WeakSet()
+
 _FACET_BLOCK_FOR = {"line": "vertex", "triangle": "line", "quad": "line", "tetra": "triangle", "hexahedron": "quad"}
 
 
@@ -431,6 +495,144 @@ def _facet_current_names(boundary_regions, mid):
     return names
 
 
+def _regions_of(plan):
+    """The ``(name, Shape)`` pairs of a multi-region plan; empty for any other plan."""
+    node = getattr(plan, "_node", None)
+    return tuple(node[1]) if (isinstance(node, tuple) and node and node[0] == "regions") else ()
+
+
+def _declared_size(plan):
+    """The plan's declared mesh resolution, or ``None`` if it has none.
+
+    A multi-region plan carries no size of its own — the sizes sit on its REGIONS — so asking the
+    combined plan reports ``None`` even when every region declared one. Reading only the outer value
+    would tell a domain it has no declared resolution when it plainly does.
+    """
+    own = getattr(plan, "_size", None)
+    if own is not None:
+        return own
+    sizes = [sh._size for _n, sh in _regions_of(plan) if getattr(sh, "_size", None) is not None]
+    if not sizes:
+        return None
+    # A size may be per-axis (a tuple), so regions cannot be compared directly; the finest scalar
+    # component is what "is there a declared resolution, and how fine" means here.
+    return min(sizes, key=lambda v: min(np.atleast_1d(np.asarray(v, dtype=float))))
+
+
+def _is_interface_tag(name, plan):
+    """True for ``"A|B"`` where A and B are both regions of ``plan`` — the mesher's shared facet."""
+    if not isinstance(name, str) or "|" not in name:
+        return False
+    known = {n for n, _ in _regions_of(plan)}
+    return bool(known) and all(part in known for part in name.split("|"))
+
+
+def _region_predicate(sub, earlier):
+    """A region's membership as a coordinate predicate, in the ``(x, y, ...)`` form tags are called with.
+
+    ``Shape.regions`` lets regions OVERLAP and resolves them by declaration order -- a point belongs
+    to the FIRST region containing it, which is how the mesh itself is labelled (``emit._to_meshio``)
+    and how ``fem_utils._cell_region_mask`` reads them back. So membership is "inside me, and inside
+    none declared before me": geometric containment alone is not belonging, and using it would stop
+    the region masks being a partition. ``by_region`` sums ``mask * value``, so a background region
+    declared last -- one that encloses everything -- would have its coefficient added on top of every
+    other region's, silently and physically rather than as an error.
+    """
+
+    def where(*coords):
+        pts = np.stack(np.broadcast_arrays(*[np.asarray(c) for c in coords]), axis=-1).reshape(-1, len(coords))
+        if pts.shape[1] < 3:  # a 2-D plan lives at z = 0
+            pts = np.concatenate([pts, np.zeros((len(pts), 3 - pts.shape[1]))], axis=1)
+        m = np.asarray(sub.contains(pts)).reshape(-1).astype(bool)
+        for prior in earlier:
+            m &= ~np.asarray(prior.contains(pts)).reshape(-1).astype(bool)
+        return m
+
+    # so a consumer can tell a region's own membership from a `d.tag` that REPLACED it under the same name
+    where._jno_region = True
+    return where
+
+
+class _LazyReference(dict):
+    """A dict whose entries for some keys are drawn on first read: a mesh-free domain's reference clouds.
+
+    The keys are known up front (``_pending``), so ``in``, ``len``, iteration and ``keys`` answer without
+    drawing anything; reading a pending key's VALUE draws that one tag (`domain._fill_reference`), and
+    reading all values (``items``, ``values``, ``copy``, pickling) draws every pending tag first. A
+    value set before its draw is kept -- the draw only fills what is still missing.
+    """
+
+    def __init__(self, base, fill):
+        super().__init__(base)
+        self._pending = set()
+        self._fill = fill
+
+    def _need(self, key):
+        if key in self._pending:
+            self._fill(key)
+
+    def _need_all(self):
+        for key in list(self._pending):
+            self._fill(key)
+
+    def __getitem__(self, key):
+        self._need(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._need(key)
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        return key in self._pending or super().__contains__(key)
+
+    def keys(self):
+        return list(super().keys()) + [k for k in self._pending if not super().__contains__(k)]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self):
+        return len(self.keys())
+
+    def items(self):
+        self._need_all()
+        return super().items()
+
+    def values(self):
+        self._need_all()
+        return super().values()
+
+    def copy(self):
+        self._need_all()
+        return dict(super().items())
+
+    def pop(self, key, *default):
+        self._need(key)
+        self._pending.discard(key)
+        return super().pop(key, *default)
+
+    def setdefault(self, key, default=None):
+        self._need(key)
+        return super().setdefault(key, default)
+
+    def __setitem__(self, key, value):
+        self._pending.discard(key)
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._pending.discard(key)
+        if super().__contains__(key):
+            super().__delitem__(key)
+
+    def __reduce__(self):  # pickles (and deep-copies) as the plain dict it stands for
+        self._need_all()
+        return (dict, (dict(super().items()),))
+
+    def __repr__(self):
+        return f"{type(self).__name__}(keys={self.keys()!r}, pending={sorted(self._pending)!r})"
+
+
 class _UnknownNamespace:
     """``domain.unknown`` -- callable as ``d.unknown(...)``, and the shape namespace ``.scalar`` / ``.vector``
     / ``.matrix``. Each builds the same kind of unknown; the namespace only spells the shape."""
@@ -766,18 +968,26 @@ class domain(MeshIOMixin):
             # It can be tagged and sampled from the geometry, which is everything a PINN needs, and
             # the mesh is built only if something later actually reads `.mesh` (see that property).
             # A structured plan is excluded: it has already been swapped for its lattice closure,
-            # which is not a shape and carries no analytic membership.
-            # A NAMED or multi-region plan also stays eager: its `interior_<name>` and
-            # `interface_<a>_<b>` tags are the mesher's conforming sub-bodies and shared facets,
-            # which no amount of point sampling reconstructs. Supporting those mesh-free is a
-            # separate piece of work, not something to half-do here.
+            # which is not a Shape and carries no analytic membership.
+            # A MULTI-REGION plan defers when every region is analytic:
+            # each region tag is then a closed-form membership test (`A` = points inside A's shape),
+            # which is exactly the predicate machinery `tag(name, where)` already uses. Its INTERFACE
+            # tags (`A|B`) are a different matter -- a shared conforming facet is the mesher's, and no
+            # amount of point sampling reconstructs it -- so reading one builds the mesh (see
+            # `variable`). Interiors served analytically, interfaces served by the mesher, nothing
+            # served halfway.
             from ..geometry.shape import _can_sample_meshfree
 
+            # A SINGLY named plan defers too: one name is one sub-body, there is no interface for the
+            # mesher to resolve, and its `_shape_regions` entry is recorded either way — so meshing at
+            # construction bought nothing. Its tag vocabulary is unchanged, deferred or not.
             _defer = (
                 _plan is not None
                 and _plan._structured is None
-                and getattr(_plan, "_region_name", None) is None
-                and _plan._node[0] != "regions"
+                and (
+                    _plan._node[0] != "regions"
+                    or all(getattr(sh, "is_analytic", lambda: False)() for _n, sh in _plan._node[1])
+                )
                 and hasattr(_plan, "is_analytic")
             )
             _why_eager = None
@@ -786,7 +996,7 @@ class domain(MeshIOMixin):
             if _defer:
                 self._lazy_plan = _plan
                 self.dimension = int(_plan.dim)
-                self.ds = _plan._size
+                self.ds = _declared_size(_plan)
                 self._register_geometry_tags(_plan)
                 if self._is_time_dependent and time is not None:
                     self._time_points = np.linspace(time[0], time[1], time[2])
@@ -819,6 +1029,12 @@ class domain(MeshIOMixin):
             # Read from `_plan` (the shape as written) rather than `constructor`, which a structured
             # plan has already replaced with its lattice closure.
             _shape = _plan if _plan is not None else constructor
+            # A plan with `jno.np.parameter`s in its coordinates was built at their initial values;
+            # register the stretch that puts the design back, for every solver that reads the mesh.
+            self._shape_plan = _shape
+            # (A mesh-free domain registers it when its mesh is first built: `_build_deferred_mesh`.)
+            if "_lazy_plan" not in self.__dict__ and getattr(_shape, "_node", None) is not None:
+                self._register_shape_stretch(_shape)
             _region_name = getattr(_shape, "_region_name", None)
             if getattr(_shape, "_node", (None,))[0] == "regions" or _region_name is not None:
                 items = tuple(_shape._region_items())
@@ -1523,6 +1739,12 @@ class domain(MeshIOMixin):
             self._apply_mesh(self.__dict__.get("_mesh"))
         finally:
             self.__dict__["_building_mesh"] = False
+        self._register_shape_stretch(plan)
+        # A region's predicate stood in for its cells only while there were none; the mesh now has
+        # them as a cell set, as an eagerly meshed domain does. Replaying it as a tag would also give
+        # the region a boundary node set, and `jno.fem` would read `u(region) - g` as a surface term.
+        for name in self.__dict__.pop("_region_tag_predicates", ()):
+            self._tag_predicates.pop(name, None)
         # Tags declared while mesh-free carry only their predicate; the mesh-derived half (node
         # pool, boundary region, normals) has had nothing to be derived from until now. Replay them,
         # or a `u(tag) - g` essential condition on such a tag would be read as a whole-domain
@@ -1623,6 +1845,11 @@ class domain(MeshIOMixin):
         Nothing detects this today, and the wrong choice produces a plausible number rather than an
         error -- so pass the finer region first.
         """
+        # An interface is the mesher's shared conforming facet, so asking for one is asking for the
+        # mesh — the same contract `.mesh` and `.points` keep. A deferred multi-region domain serves
+        # its region INTERIORS analytically, but it cannot name their interfaces until they exist.
+        if self._needs_mesh_now():
+            self._build_deferred_mesh()
         registry = getattr(self, "_interface_registry", {}) or {}
         if not regions:
             return sorted(registry)
@@ -1938,6 +2165,24 @@ class domain(MeshIOMixin):
     def trial_function(self, value_shape=(), name="u", order=1):
         """Advanced helper for explicit FEM-only authoring."""
         return TrialFunction(name=name, value_shape=value_shape, order=order)
+
+    def peec_symbols(self, names=("i", "v")):
+        """The two terminal symbols a partial-element circuit is written on: ``(i, v)``.
+
+        ``v`` is a terminal POTENTIAL and ``i`` a terminal CURRENT, and a port is one relation on one
+        of them::
+
+            i, v = d.peec_symbols()
+            p, n = d.variable("DC+", split=True)[:3], d.variable("DC-", split=True)[:3]
+            emag = jno.peec([v(*p) - v(*n) - 1.0, i(*n) - 0.0], freq=1e6)
+
+        They are ordinary trial functions -- the asymmetry is in what each MEANS to
+        :func:`jno.peec`, not in the objects -- so the constraint reads like the circuit relation it
+        is, and the region binding carries which terminal it applies to.
+        """
+        if len(names) != 2:
+            raise ValueError(f"domain.peec_symbols: expected two names, (current, potential); got {names!r}.")
+        return self.trial_function(name=names[0]), self.trial_function(name=names[1])
 
     @property
     def unknown(self) -> "_UnknownNamespace":
@@ -2733,12 +2978,13 @@ class domain(MeshIOMixin):
         # rather than sent through the facets-vs-cells test below: such a region routinely reaches the
         # outer boundary (the air box of any real device does), which would register it as a boundary
         # region too and make it look ambiguous when it is not.
+        # A shape region is decided WITHOUT the mesh: reading `self.mesh` builds it, and a domain that
+        # no FEM ever meshes -- a PEEC network of solids and wires -- then fails in gmsh just for being
+        # given a material.
+        if target in (getattr(self, "_shape_regions", {}) or {}) or target in (getattr(self, "_source_regions", {}) or {}):
+            return "volume"
         _mesh_regions = mesh_cell_region_membership(getattr(self, "mesh", None), int(self.dimension))
-        if (
-            target in (getattr(self, "_shape_regions", {}) or {})
-            or target in (getattr(self, "_source_regions", {}) or {})
-            or target in _mesh_regions
-        ):
+        if target in _mesh_regions:
             return "volume"
         if target not in (getattr(self, "_tag_predicates", {}) or {}) and target not in (
             getattr(self, "_boundary_regions", {}) or {}
@@ -2856,6 +3102,10 @@ class domain(MeshIOMixin):
             if has_default:
                 dv = self._resolve_attached(default)
                 default_live = AttachedLiteral(self, name, self._DEFAULT_TARGET) if _is_plain_value(dv) else dv
+                if not live:
+                    # Only a default was declared: the coefficient is that value everywhere -- there is
+                    # no region to mask, and `_by_region` of an empty mapping is (rightly) an error.
+                    return mark(default_live)
             return mark(self._by_region(live, default=default_live if has_default else None))
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
@@ -3077,50 +3327,85 @@ class domain(MeshIOMixin):
             label = _classify(plan._node, float(p[0]), float(p[1]), float(p[2]))
             if label is not None and label[1] not in self._geometry_tags:
                 self._geometry_tags[label[1]] = ("boundary", label[1])
+        # A multi-region plan's regions are interior tags, named exactly as the mesher names them
+        # (the region's own name), so a script reads the same whether or not a mesh was ever built.
+        _seen = []
+        for rname, sub in _regions_of(plan):
+            self._geometry_tags[rname] = ("interior", None)
+            self._tag_predicates[rname] = _region_predicate(sub, tuple(_seen))
+            self.__dict__.setdefault("_region_tag_predicates", set()).add(rname)
+            _seen.append(sub)
         for name in self._geometry_tags:
             if name not in self.avaiable_mesh_tags:
                 self.avaiable_mesh_tags.append(name)
         self._populate_reference_pool()
 
     def _populate_reference_pool(self):
-        """Give ``_mesh_pool`` a reference point cloud per tag.
+        """Give ``_mesh_pool`` a reference point cloud per tag -- drawn when first READ, not here.
 
         This is **not** the collocation set -- `variable`/`sample` bypass the pool entirely and draw
         fresh from the geometry every call. It exists because a mesh-free domain still has readers
         that legitimately need *some* finite cloud to work against: `distance_function`'s KD-tree,
         `summary`, `plot`, and the pool-shape reporting. Leaving it empty made those degrade
         silently rather than loudly, which is the failure mode this codebase least wants.
+
+        Drawing every tag here made the constructor the most expensive step of a build: on a
+        welded network of 57 solids and wires, 67 of 70 s went into these clouds (rejection-sampling
+        each small named face against the whole union, one Python ``_classify`` per point), and a
+        solver that never reads them paid it on every rebuild. So the three stores are
+        `_LazyReference` dicts: every tag is listed at once (``in``, ``boundary_tags()``), and a
+        tag's cloud is drawn on the first read of its value (`_fill_reference`).
         """
-        rng = np.random.default_rng(0)  # fixed: a reference cloud must not wobble between reads
-        dim = int(self.dimension)
-        for name, (kind, sub) in self._geometry_tags.items():
-            n = self._REFERENCE_INTERIOR if kind == "interior" else self._REFERENCE_BOUNDARY
-            try:
-                pts, nrm = self._draw_geometry_points(kind, sub, None, n, rng, kind == "boundary")
-            except RuntimeError:
-                continue  # a region that cannot be drawn has no reference cloud; it still samples
-            # Deduplicate: a 1-D domain's boundary is exactly two points, and a reference cloud of
-            # 1024 copies of them is not a point cloud, it is a broadcasting hazard.
-            pts, _keep = np.unique(pts, axis=0, return_index=True)
-            self._mesh_pool[name] = pts
+        self._mesh_pool = _LazyReference(self._mesh_pool, self._fill_reference)
+        self._boundary_regions = _LazyReference(self._boundary_regions, self._fill_reference)
+        self._boundary_registry = _LazyReference(self._boundary_registry, self._fill_reference)
+        self._reference_stores = (self._mesh_pool, self._boundary_regions, self._boundary_registry)
+        for name, (kind, _sub) in self._geometry_tags.items():
+            if not dict.__contains__(self._mesh_pool, name):
+                self._mesh_pool._pending.add(name)
             if kind == "boundary":
                 # so `boundary_tags()` lists the faces that exist, rather than only the ones a
                 # predicate happened to name. The facet arrays stay empty until there is a mesh.
-                self._boundary_regions.setdefault(name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8))
-                self._boundary_registry.setdefault(
-                    name,
-                    {
-                        "tag": name,
-                        "entity_kind": "point",
-                        "point_indices": np.arange(len(pts), dtype=int),
-                        "points": pts,
-                    },
-                )
-            # Deliberately NOT `normals_by_tag`. That dict is mesh-derived everywhere else, and the
-            # deferred build replaces it wholesale -- so filling it here creates arrays that go stale
-            # the moment anything asks for a mesh, and a caller holding both across that boundary
-            # gets a reference cloud's normals against the mesh's node indices. Mesh-free normals
-            # are computed per draw in `_draw_geometry_points`, which cannot go stale.
+                for store in self._reference_stores[1:]:
+                    if not dict.__contains__(store, name):
+                        store._pending.add(name)
+
+    def _fill_reference(self, name):
+        """Draw tag ``name``'s reference cloud into the stores that still wait for it."""
+        import zlib
+
+        stores = [s for s in self._reference_stores if name in s._pending]
+        for store in stores:
+            store._pending.discard(name)
+        kind, sub = self._geometry_tags[name]
+        # one generator PER TAG, seeded from its name: a cloud must not wobble between reads, and
+        # with lazy draws the order the tags are read in must not change any of them either
+        rng = np.random.default_rng([0, zlib.crc32(name.encode())])
+        n = self._REFERENCE_INTERIOR if kind == "interior" else self._REFERENCE_BOUNDARY
+        try:
+            pts, _nrm = self._draw_geometry_points(kind, sub, None, n, rng, kind == "boundary")
+        except RuntimeError:
+            return  # a region that cannot be drawn has no reference cloud; it still samples
+        # Deduplicate: a 1-D domain's boundary is exactly two points, and a reference cloud of
+        # 1024 copies of them is not a point cloud, it is a broadcasting hazard.
+        pts, _keep = np.unique(pts, axis=0, return_index=True)
+        dim = int(self.dimension)
+        pool, regions, registry = self._reference_stores
+        if pool in stores:
+            dict.setdefault(pool, name, pts)
+        if regions in stores:
+            dict.setdefault(regions, name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8))
+        if registry in stores:
+            dict.setdefault(
+                registry,
+                name,
+                {"tag": name, "entity_kind": "point", "point_indices": np.arange(len(pts), dtype=int), "points": pts},
+            )
+        # Deliberately NOT `normals_by_tag`. That dict is mesh-derived everywhere else, and the
+        # deferred build replaces it wholesale -- so filling it here creates arrays that go stale
+        # the moment anything asks for a mesh, and a caller holding both across that boundary
+        # gets a reference cloud's normals against the mesh's node indices. Mesh-free normals
+        # are computed per draw in `_draw_geometry_points`, which cannot go stale.
 
     _REFERENCE_INTERIOR = 4096  #: reference-cloud size for an interior tag (not the collocation count)
     _REFERENCE_BOUNDARY = 1024  #: reference-cloud size for a boundary tag
@@ -3492,6 +3777,7 @@ class domain(MeshIOMixin):
         if mesh is None:
             boundary_indices = np.asarray([], dtype=np.int64)
         else:
+            _refuse_empty_mesh(mesh, int(self.dimension))
             if not getattr(self, "_keep_orphan_nodes", False):
                 mesh = self._drop_orphan_nodes(mesh)
             _refuse_mixed_cells(mesh, int(self.dimension))
@@ -4091,6 +4377,7 @@ class domain(MeshIOMixin):
         region=None,
     ) -> Any: ...
     @property
+    @_mesh_readout
     def cell_size(self):
         """Element size ``h`` as a symbol usable directly in a weak form.
 
@@ -4120,6 +4407,7 @@ class domain(MeshIOMixin):
         return Variable(tag="cell_size", dim=[0, 1], domain=self, axis="spatial")
 
     @property
+    @_mesh_readout
     def cell_metric(self):
         """Element **metric tensor** ``G = J⁻ᵀJ⁻¹`` as a symbol usable directly in a weak form.
 
@@ -4190,6 +4478,145 @@ class domain(MeshIOMixin):
             raise ValueError(f"domain: no {key!r} cells on this mesh — cell geometry is unavailable.")
         return np.asarray(cells, dtype=np.int64)
 
+    def _register_shape_stretch(self, plan):
+        """Make the mesh follow a parametric plan: one coordinate spec per axis that a design moves,
+        on the vertices it moves, valued by the stretch between the plan's face planes
+        (:func:`jno.geometry.parametric.stretch_planes`). It rides the same route as
+        ``x.trainable()`` (``_trainable_coords``), so ``jno.fem`` scatters it into the assembly
+        geometry and ``∂(solve)/∂(parameter)`` is the shape derivative along the stretch."""
+        from ..geometry import parametric as _par
+
+        if not _par.has_params(plan._node):
+            return
+        axes = _par.stretch_planes(plan)
+        if all(a is None for a in axes):
+            return  # only a line moves: its solver moves it, the mesh does not carry it
+        from ..trace import FunctionCall
+        from ..utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+        pts = np.asarray(self.mesh.points)
+        registry = self.__dict__.setdefault("_trainable_coords", [])
+        for a, ax in enumerate(axes):
+            if ax is None or a >= pts.shape[1]:
+                continue
+            refs, ents = ax
+            ids = _par.moving_ids(pts[:, a], refs, ents)
+            if ids.size == 0:
+                continue
+            params = {}
+            for e in ents:
+                _collect_runtime_parameter_exprs(e, params)
+            names, exprs = list(params), list(params.values())
+            col = jnp.asarray(pts[ids, a])
+
+            def fn(*vals, _n=tuple(names), _r=refs, _e=tuple(ents), _c=col):
+                at = {n: v for n, v in zip(_n, vals)}
+                return _par.stretch_column(_c, _r, _e, at)
+
+            expr = FunctionCall(fn, exprs, name=f"shape_stretch_{'xyz'[a]}")
+            registry.append({"ids": ids, "axis": a, "expr": expr, "name": f"__shape_stretch_{'xyz'[a]}", "tag": None})
+
+    def rebuild(self, *, when, keep_opt_state=True):
+        """Rebuild this domain at the current design whenever ``when`` holds, during ``jno.core.solve``.
+
+        A parameter in the shape's coordinates (``jno.shape.box(0, y0, ...)``) does not remesh: every
+        discretisation built on the domain -- its FEM mesh, a ``jno.peec`` face grid -- is built once at
+        the parameters' initial values and STRETCHED to the design, which keeps the derivative exact but
+        degrades the cells the further the design travels. ``when`` is a trace node over the design,
+        checked after every epoch; once it is true the shape is built again with the current values as
+        its new reference, every ``jno.fem`` and ``jno.peec`` built on the domain follows, and training
+        continues from the same parameters::
+
+            d.rebuild(when=d.cell_aspect().max > 6)       # the FEM mesh
+            d.rebuild(when=em.cell_aspect().max > 4)      # a PEEC network's face grid
+
+        ``keep_opt_state=False`` restarts the optimizers at each rebuild; by default their state (Adam
+        moments, MMA asymptotes, a schedule's step count) carries on. The objective may jump at a
+        rebuild, by as much as the two discretisations disagree. Each rebuild pays one build and one
+        compile.
+
+        Only geometry from ``jno.shape`` parameters rebuilds. Mesh coordinates moved by
+        ``.trainable()`` have no shape to be rebuilt from, and are refused.
+        """
+        from ..geometry import parametric as _par
+        from ..trace import Placeholder
+
+        if not isinstance(when, Placeholder):
+            raise TypeError(
+                f"domain.rebuild(when=...): `when` must be a trace node over the design, e.g. "
+                f"`d.cell_aspect().max > 6`; got {type(when).__name__}. A plain value is decided once, "
+                "before training, so it cannot say WHEN the cells have degraded."
+            )
+        plan = self.__dict__.get("_shape_plan") or self.__dict__.get("_lazy_plan")
+        if plan is None or getattr(plan, "_node", None) is None or not _par.has_params(plan._node):
+            raise ValueError(
+                "domain.rebuild: this domain's shape has no `jno.np.parameter` in its coordinates, so a "
+                "rebuild would build the same discretisation again. Put the design in the shape -- "
+                "`jno.shape.box(0, y0, ...)` -- to have one."
+            )
+        moved = [
+            e["name"]
+            for e in self.__dict__.get("_trainable_coords", ())
+            if not str(e["name"]).startswith("__shape_stretch_")
+        ]
+        if moved:
+            raise NotImplementedError(
+                f"domain.rebuild: mesh coordinates moved by `.trainable()` ({moved}) have no shape to be "
+                "rebuilt from. Rebuilding follows parameters in the shape's coordinates only."
+            )
+        self._rebuild_spec = {"when": when, "keep_opt_state": bool(keep_opt_state)}
+        _REBUILDING_DOMAINS.add(self)
+
+    def _register_solver(self, solver):
+        """A ``jno.fem`` / ``jno.peec`` built on this domain, which a :meth:`rebuild` must rebuild too."""
+        import weakref
+
+        self.__dict__.setdefault("_solvers", weakref.WeakSet()).add(solver)
+
+    def _rebuild_at(self, values):
+        """Build the shape again with ``values`` (``{layer_id: value}``) as its parameters' reference, in
+        place, and every solver registered on the domain with it. Parameters not in ``values`` keep
+        their current reference."""
+        from ..geometry import parametric as _par
+
+        plan = self.__dict__.get("_shape_plan") or self.__dict__.get("_lazy_plan")
+        for mc in _par.plan_parameters(plan).values():
+            lid = mc.model.layer_id
+            if lid in values:
+                mc.model._rebuild_reference = np.asarray(values[lid])
+        # the shape at the new reference: its primitives hold numbers, built at the old one
+        plan = _par.rereferenced(plan)
+        self._shape_plan = plan
+        if self.__dict__.get("_lazy_plan") is not None:
+            self._lazy_plan = plan
+        if self.__dict__.get("_shape_regions") is not None:
+            self._shape_regions = {name: sub for name, sub in plan._region_items()}
+        if self.__dict__.get("_mesh") is not None:
+            from ..utils.solver.fem_adapt import _apply_new_mesh
+
+            constructor = plan
+            if getattr(plan, "_structured", None) is not None:
+                constructor, self._structured_grid = self._structured_grid_setup(plan)
+            self._generate_mesh(constructor, getattr(self, "_algorithm", 6))
+            self._trainable_coords = [
+                e for e in self.__dict__.get("_trainable_coords", ()) if not str(e["name"]).startswith("__shape_stretch_")
+            ]
+            for attr in ("_elem_map_content_token", "_gauge_pin_coords"):
+                self.__dict__.pop(attr, None)
+            _apply_new_mesh(self, self.__dict__["_mesh"], copy=False)
+            if self._structured_grid is not None and getattr(self, "mesh_connectivity", None):
+                self.mesh_connectivity["grid"] = dict(self._structured_grid)
+                self._grid_shape = self._structured_grid["shape"]
+            self._register_shape_stretch(plan)
+            for name, where in list(getattr(self, "_tag_predicates", {}).items()):
+                self.tag(name, where)
+            _remake_mesh_readouts(self)
+        solvers = list(self.__dict__.get("_solvers", ()))
+        # networks first: a FEM problem may read a network's readouts (its heat source)
+        for sv in sorted(solvers, key=lambda o: type(o).__name__ != "PEEC"):
+            sv._rebuild()
+        return len(solvers)
+
     def _moving_points(self):
         """``(arg_exprs, rebuild)`` for the mesh coordinates *as the optimiser currently has them*.
 
@@ -4213,6 +4640,7 @@ class domain(MeshIOMixin):
 
         return [s["expr"] for s in specs], rebuild
 
+    @_mesh_readout
     def cell_volume(self):
         """Per-cell volume (area in 2-D) as a ``(n_cells,)`` node, differentiable in the mesh.
 
@@ -4256,6 +4684,7 @@ class domain(MeshIOMixin):
             )
         return _jno.fn(_vol_quad if kind == "quad" else _vol, args, name="cell_volume")
 
+    @_mesh_readout
     def cell_angles(self, eps: float = 1e-12):
         """Per-cell angles in radians, differentiable in the mesh. **2-D and 3-D.**
 
@@ -4374,6 +4803,7 @@ class domain(MeshIOMixin):
             )
         return _jno.fn(_ang_quad if kind == "quad" else (_ang_2d if dim == 2 else _ang_3d), args, name="cell_angles")
 
+    @_mesh_readout
     def cell_aspect(self, eps: float = 1e-30):
         """Per-cell **aspect ratio** as a ``(n_cells,)`` node, differentiable in the mesh. 2-D and 3-D.
 
@@ -5034,6 +5464,13 @@ class domain(MeshIOMixin):
 
         sample_tag = source_tag
 
+        # An INTERFACE tag (`A|B`) is the mesher's shared conforming facet between two regions. No
+        # amount of point sampling reconstructs it, so naming one on a deferred domain IS a request
+        # for the mesh -- served rather than refused, and only for a tag whose two halves are both
+        # known regions, so a typo still gets the "unknown tag" message instead of a surprise build.
+        if self.__dict__.get("_lazy_plan") is not None and _is_interface_tag(sample_tag, self._lazy_plan):
+            self._build_deferred_mesh()
+
         if self._is_geometry_tag(sample_tag) and isinstance(sample, tuple) and len(sample) > 0:
             if sample[0] is None:
                 # "No count" on a mesh-free domain could mean collocation points or the node set,
@@ -5044,7 +5481,7 @@ class domain(MeshIOMixin):
                 # is no declared resolution and nothing to hand back, so it refuses rather than
                 # inventing one -- guessing there would be silent, since finite differences over a
                 # single collocation point return a number, just not the one that was asked for.
-                if getattr(self.__dict__.get("_lazy_plan"), "_size", None) is None:
+                if _declared_size(self.__dict__.get("_lazy_plan")) is None:
                     raise ValueError(
                         f"domain.variable({tag!r}): this domain is mesh-free and no mesh size was "
                         f"declared, so the tag has no node set to hand back and no natural point "

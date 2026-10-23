@@ -189,6 +189,65 @@ def test_compile_cache_is_on_by_default_with_optouts():
     jno.enable_compile_cache()  # restore for the rest of the session
 
 
+# A coefficient that reads a MODULE-LEVEL name: the kernel bakes that name's value at trace time, so
+# the key must carry it. Keying only code + closure + defaults reused the first build's kernel when a
+# sweep changed the global between builds -- the same answer for every value, no warning.
+_GLOBAL_F = 1.0
+
+
+def _global_source(x, y):
+    return _GLOBAL_F + 0.0 * x
+
+
+def _poisson2d_fn(source, size=0.28):
+    d = jno.shape.rect(0, 0, 1, 1, size=size).domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    f = jno.fn(source, [xi, yi])
+    return jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])
+
+
+def test_a_changed_global_scalar_changes_the_solution():
+    """f = a global read by a lambda: the problem is linear in f, so doubling it doubles u."""
+    global _GLOBAL_F
+    try:
+        sols = {}
+        for val in (1.0, 2.0):
+            _GLOBAL_F = val
+            sols[val] = np.asarray(_poisson2d_fn(lambda x, y: _GLOBAL_F + 0.0 * x).solve())
+        np.testing.assert_allclose(sols[2.0], 2.0 * sols[1.0], rtol=1e-6, atol=1e-9)
+    finally:
+        _GLOBAL_F = 1.0
+
+
+def test_a_redefined_global_function_changes_the_solution():
+    """The lambda calls a module-level function that a sweep redefines between builds."""
+    global _global_source
+    keep = _global_source
+    try:
+        sols = {}
+        for val in (1.0, 3.0):
+
+            def _global_source(x, y, val=val):
+                return val + 0.0 * x
+
+            sols[val] = np.asarray(_poisson2d_fn(lambda x, y: _global_source(x, y)).solve())
+        np.testing.assert_allclose(sols[3.0], 3.0 * sols[1.0], rtol=1e-6, atol=1e-9)
+    finally:
+        _global_source = keep
+
+
+def test_an_unchanged_global_still_hits():
+    """Keying the globals must not cost the identical rebuild its cache hit."""
+    _poisson2d_fn(_global_source).solve()
+    before = _snap()
+    _poisson2d_fn(_global_source).solve()
+    d = _delta(before)
+    assert d["misses"] == 0 and d["content_hits"] > 0, f"an unchanged global recompiled: {d}"
+
+
 class TestEmptyArraysAreHashable:
     """An empty array must not take down the cache key that is trying to hash it.
 

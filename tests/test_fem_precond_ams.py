@@ -73,7 +73,7 @@ def test_ams_complex_eddy_matches_sparse_lu():
     gradient + real 2n-block Π), so a passing solve confirms the reformulation is exact."""
     fem = _complex_eddy(0.3, freq=1e6, eps=1e-3)
     x_lu = _solve(fem)  # default: complex sparse-LU on the real-equivalent block
-    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-8, restart=120, maxiter=600), precond=jno.precond.ams())
+    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-10, restart=120, maxiter=600), precond=jno.precond.ams())
     assert x_ams.dtype == np.complex128
     assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-8
 
@@ -98,7 +98,7 @@ def test_ams_complex_eddy_extreme_scale_matches_lu():
     Js = vec(0.0 * x, 0.0 * x, jno.np.where(x > 0.5, 1.0, 0.0))
     fem = jno.fem([nu * inner(cu, cv) + 1j * omega * (sig + sigma * 1e-3) * inner(ui, vi) - inner(Js, vi)])
     x_lu = _solve(fem)
-    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-8, restart=200, maxiter=20), precond=jno.precond.ams())
+    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-10, restart=200, maxiter=20), precond=jno.precond.ams())
     assert x_ams.dtype == np.complex128
     assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-7
 

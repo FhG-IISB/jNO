@@ -137,6 +137,7 @@ nav:
       - Limits & build time: fem/limitations.md
     - Finite Difference Method: fdm.md
     - Rigorous Coupled-Wave Analysis: rcwa.md
+    - Partial-Element Equivalent Circuits: peec.md
     - Solvers & preconditioners: solvers.md
     - Domain decomposition: domain-decomposition.md
     - Inverse Problems: inverse-problems.md
@@ -210,6 +211,11 @@ nav:
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
     - RCWA:
       - "Binary Grating — diffraction orders": tutorials/12-rcwa/binary-grating-orders.md
+    - PEEC:
+      - "Two-Wire Loop — R and L with nothing meshed": tutorials/13-peec/two-wire-loop.md
+      - "Busbar Pair — skin and proximity effect": tutorials/13-peec/busbar-frequency.md
+      - "Cored Transformer — open secondary and core loss": tutorials/13-peec/cored-transformer.md
+      - "Inverse Corrosion — recovering a parameter": tutorials/13-peec/inverse-corrosion.md
     - Generative:
       - "Flow Matching — eight-mode ring": tutorials/13-generative/flow-matching-ring.md
   - Reference:

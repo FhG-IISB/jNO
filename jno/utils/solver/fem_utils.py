@@ -687,7 +687,9 @@ def _gather_runtime_parameter_tags(node, out=None):
 
     if out is None:
         out = []
-    if _is_runtime_scalar_parameter(node):
+    from .parametric_helpers import _is_global_scalar
+
+    if _is_runtime_scalar_parameter(node) or _is_global_scalar(node):
         name = _parameter_name(node)
         if name not in out:
             out.append(name)
@@ -1993,6 +1995,13 @@ def _eval_integrand(domain, node, local):
         )
 
     if isinstance(node, FunctionCall):
+        from .parametric_helpers import _is_global_scalar, _parameter_name
+
+        if _is_global_scalar(node):
+            # one value per solve (another solver's readout): crux evaluated it, the kernel reads it
+            val = _runtime_parameter_value_from_internal_vars(local, _parameter_name(node))
+            if val is not None:
+                return val
         args = [_eval_integrand(domain, arg, local) for arg in node.args]
         kwargs = node.kwargs if node.kwargs else {}
         return node.fn(*args, **kwargs)
@@ -5290,7 +5299,7 @@ def _structure_token(obj, seen, renumber):
     return _leaf_content_token(obj, seen)
 
 
-def _fn_content_key(fn, chunk, seen=None, renumber=None):
+def _fn_content_key(fn, chunk, seen=None, renumber=None, path=()):
     """The CONTENT twin of :func:`_bake_fingerprint`: everything a jit of ``fn`` would bake, keyed by
     value -- recursing through nested functions (fresh objects per build, identical code and captures
     across rebuilds), containers walked canonically (see :func:`_structure_token`). ``None`` disables
@@ -5311,7 +5320,78 @@ def _fn_content_key(fn, chunk, seen=None, renumber=None):
     tok = _structure_token((captured, fn.__defaults__ or ()), seen, renumber)
     if tok is None:
         return None
-    return (fn.__code__, tok, chunk)
+    glob = _globals_token(fn, renumber, path + (id(fn),))
+    if glob is None:
+        return None
+    return (fn.__code__, tok, glob, chunk)
+
+
+def _global_names(code):
+    """The module-level names ``code`` may read: its ``co_names`` and those of every code object nested
+    in it (a lambda or comprehension inside the function reads the same globals). Attribute names are
+    in ``co_names`` too; only the ones that are also keys of ``__globals__`` count, and a spurious one
+    only makes the key stricter."""
+    names, stack = set(), [code]
+    while stack:
+        c = stack.pop()
+        names.update(c.co_names)
+        stack.extend(k for k in c.co_consts if hasattr(k, "co_names"))
+    return sorted(names)
+
+
+_LIBRARY_ROOTS = frozenset({"jno", "jax", "jaxlib", "numpy", "scipy", "equinox", "optax", "lineax", "optimistix"})
+
+
+def _is_library(obj):
+    return (getattr(obj, "__module__", None) or "").split(".")[0] in _LIBRARY_ROOTS
+
+
+def _globals_read(fn):
+    """``(name, value)`` for every module-level name ``fn``'s code reads -- for USER code only. A
+    function defined in jNO or a library it builds on is not redefined while a process runs, and its
+    globals are that library's internals (caches, registries), so they are left out of the key."""
+    if _is_library(fn):
+        return []
+    g = getattr(fn, "__globals__", None) or {}
+    return [(n, g[n]) for n in _global_names(fn.__code__) if n in g]
+
+
+def _globals_token(fn, renumber, path):
+    """Content token of the module-level values ``fn`` reads, or ``None`` (no content key).
+
+    A jit bakes a global's value at trace time exactly as it bakes a closure cell, so a sweep that
+    changes ``P = 10.0`` or redefines ``def source(x)`` between two builds is a different program. Keying
+    only the code, closure and defaults reused the first build's kernel for every later value: the
+    same solution each time, without a warning. Modules, classes and library functions are keyed by
+    name (stable within a process); a user function recurses into its own code, closure and globals.
+    ``path`` holds the functions above this one along global edges: a global naming one of them (a
+    recursive helper) is keyed by that position, its content is already in the key."""
+    import types as _types
+
+    parts = []
+    for name, val in _globals_read(fn):
+        if isinstance(val, _types.ModuleType):
+            t = ("module", val.__name__)
+        elif isinstance(val, type):
+            t = ("type", val.__module__, val.__qualname__)
+        elif isinstance(val, _types.FunctionType) and not _is_library(val):
+            if id(val) in path:
+                t = ("cycle", path.index(id(val)))
+            else:
+                sub = _fn_content_key(val, None, None, renumber, path)
+                t = None if sub is None else ("fn",) + sub
+        elif callable(val) and (_is_library(val) or getattr(val, "__module__", None) == "builtins"):
+            # a user callable that is not a plain function (a jitted wrapper, an instance) is not keyed
+            # by name: redefining it keeps the name, so it falls through and bails below
+            qual = getattr(val, "__qualname__", None) or getattr(val, "__name__", None)
+            mod = getattr(val, "__module__", None)
+            t = None if not (qual and mod) else ("callable", mod, qual)
+        else:
+            t = _structure_token(val, set(), renumber)
+        if t is None:
+            return None
+        parts.append((name, t))
+    return tuple(parts)
 
 
 def _baked_arrays(obj, seen=None):
@@ -5358,7 +5438,9 @@ def _bake_fingerprint(fn, chunk):
         captured = tuple(c.cell_contents for c in (fn.__closure__ or ()))
     except ValueError:  # a cell that is not filled yet (recursive closure)
         return None
-    baked = (captured, fn.__defaults__ or ())
+    # the module-level values the code reads are baked too (see `_globals_token`); by identity here, so
+    # a global rebound to a new value or a redefined function is a new key
+    baked = (captured, fn.__defaults__ or (), tuple(v for _, v in _globals_read(fn)))
     leaves, treedef = jax.tree_util.tree_flatten(baked)
     if any(isinstance(leaf, jax.core.Tracer) for leaf in leaves):
         return None

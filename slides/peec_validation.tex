@@ -1,0 +1,142 @@
+% Build: lualatex peec_validation.tex (twice).  The theme also wants fraunhofer_iisb.png beside
+% this file for the title mark and footer; the repo ignores *.png, so copy it from the design
+% skill's assets/ when rebuilding.  Missing it is a silent no-op -- the deck just goes unbranded.
+\documentclass[aspectratio=169,8pt,t]{beamer}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\graphicspath{{./}{../figures/}}
+\usetheme{Modern}
+
+\title[PEEC validation]{Validating the jNO PEEC solver}
+\subtitle{Where the disagreement came from, and what closed it}
+\author{Leon Armbruster}\institute{}\date{\today}
+
+\begin{document}
+{\setbeamertemplate{footline}{}\begin{frame}[plain]\titlepage\end{frame}}
+
+% ---------------------------------------------------------------- 1. the problem
+\begin{frame}{Three solvers disagree on the same power module}
+\vfill
+\hi{The measurement.}\quad Loop inductance between the DC$+$ and DC$-$ terminals of one layout, at
+$1$\,MHz, on geometry all three codes read from the same file.
+\vfill
+\begin{center}
+\begin{tabular}{lrl}
+\toprule
+ & loop inductance & \\
+\midrule
+Ansys Q3D \textnormal{(AC RL)} & $20.641$\,nH & $21\,209$ elements, converged to $0.331\,\%$ \\
+pypeec 5.8.0 & $21.4$\,nH & not converged \\
+\hi{jNO} & \hi{$26.4$\,nH} & \hi{$+28\,\%$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vfill
+\hi{The reference is not the weak point.}\quad Q3D's AC RL solve is adaptively refined over twelve
+passes and independently converged. So a $28\,\%$ gap has to be explained on our side --- and the
+first job is to decide whether it is the \hi{method} or the \hi{mesh}.
+\vfill
+\end{frame}
+
+% ---------------------------------------------------------------- 2. the analytic test
+\begin{frame}{The method is right where an exact answer exists}
+\vfill
+\hi{The case.}\quad One straight copper bar, $40\times4\times0.51$\,mm, driven end to end at
+$1$\,kHz --- the current fills the section, so both the resistance and the inductance are known.
+\vfill
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+ & $R$ & error & $L$ & error \\
+\midrule
+analytic & $338.0\,\mu\Omega$ & --- & $27.207$\,nH\srcnote{Grover, \textit{Inductance Calculations}, 1946} & --- \\
+\hi{jNO} & \hi{$337.2\,\mu\Omega$} & \hi{$-0.2\,\%$} & \hi{$27.731$\,nH} & \hi{$+1.9\,\%$} \\
+pypeec & $332.7\,\mu\Omega$ & $-1.6\,\%$ & $26.673$\,nH & $-2.0\,\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vfill
+\hi{The result.}\quad jNO lands on the exact DC resistance and sits inside Grover's own accuracy.
+Whatever the module gap is, it is not the partial-inductance formulation.
+\vfill
+\end{frame}
+
+% ---------------------------------------------------------------- 3. the diagnosis
+\begin{frame}{The gap is resolution, amplified by cancellation}
+\vfill
+\hi{One cell across the narrowest conductor.}\quad Every layout has a $1.00$\,mm minimum trace
+width, and the runs above used a $1.0$\,mm pitch. Current crowding at a trace edge cannot appear in
+a discretisation that has no edge to crowd against.
+\vfill
+\hi{And the quantity reported magnifies it.}\quad The loop inductance with the baseplate is a small
+difference of two large numbers,
+\[
+  20.6 \;=\; 54.5 \;-\; 33.9 \quad\text{nH},
+\]
+so a $1\,\%$ error in the bare loop arrives as $2.64\,\%$ in the answer. Converging on the
+\hi{plate-less} loop instead removes the amplification --- and it is the only quantity here with a
+clean reference sequence.
+\vfill
+\hi{What that predicts.}\quad Uniform refinement should march toward $54.505$\,nH and be
+unaffordable long before it arrives. It does: $58.803 \to 57.957 \to 57.340$\,nH at $1.0$, $0.5$,
+$0.4$\,mm, i.e.\ $13\,381 \to 53\,458 \to 83\,705$ elements to remove half the error.
+\vfill
+\end{frame}
+
+% ---------------------------------------------------------------- 4. the accounting
+\begin{frame}{Corrected, the two PEEC codes agree}
+\vfill
+\begin{center}
+\begin{tabular}{lrl}
+\toprule
+ & plate-less loop & \\
+\midrule
+Ansys Q3D \textnormal{(AC RL)} & $54.505$\,nH & converged, $0.331\,\%$ over 12 passes \\
+\midrule
+jNO, extrapolated & $54.87$\,nH & $+0.7\,\%$ \\
+pypeec, extrapolated & $55.69$\,nH & $+2.2\,\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vfill
+\hi{Two independent codes, one answer.}\quad At matched pitch jNO and pypeec agree to $\sim\!1\,\%$,
+and both extrapolate onto Q3D's converged value. The $+28\,\%$ was under-resolution seen through a
+$2.64\times$ amplifier --- not a solver defect in any of the three.
+\vfill
+\hi{Priced and dismissed along the way.}\quad Frequency (flat $1$--$10$\,MHz), the ground plane
+(already included, at the real separation), capacitance ($663\times$ the inductive impedance), bond
+wires, the dies, and lateral mesh density --- each measured and eliminated rather than argued away.
+\vfill
+\end{frame}
+
+% ---------------------------------------------------------------- 5. the fix
+\begin{frame}{Putting the elements where the physics needs them}
+\vfill
+\hi{If the diagnosis is right, grading the mesh should pay for itself.}\quad Every trace is an
+axis-aligned rectangle, so the coordinates to refine toward are axis-aligned --- which a graded
+rectilinear grid expresses exactly, with no hanging nodes. It gives up translation invariance, so
+the FFT no longer applies and the operator becomes hierarchical (H-matrix + ACA).
+\vfill
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+mesh & elements & $L$ & vs.\ $54.505$\,nH \\
+\midrule
+uniform $1.0$\,mm & $13\,381$ & $58.803$\,nH & $+7.88\,\%$ \\
+uniform $0.5$\,mm & $53\,458$ & $57.957$\,nH & $+6.33\,\%$ \\
+uniform $0.4$\,mm & $83\,705$ & $57.340$\,nH & $+5.20\,\%$ \\
+\midrule
+\hi{graded} & \hi{$8\,192$} & \hi{$57.299$\,nH} & \hi{$+5.13\,\%$} \\
+\hi{graded} & \hi{$14\,111$} & \hi{$56.604$\,nH} & \hi{$+3.85\,\%$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vfill
+\hi{$8\,192$ graded elements match $83\,705$ uniform ones}, and $14\,111$ beat them outright while
+still falling --- where the uniform sequence had flattened. The elements were never the problem;
+their placement was.
+\vfill
+\end{frame}
+
+\end{document}

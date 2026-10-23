@@ -883,6 +883,9 @@ class _TraceFDM:
         self.unknowns = _find_unknowns(constraints)  # coupled system ⇒ several, in declaration order
         self.unknown = self.unknowns[0]  # the single-field paths (transient/flux/parametric) use this
         self.domain = self.unknown._fem_field_domain
+        from .geometry.parametric import refuse_if_parametric
+
+        refuse_if_parametric(self.domain, "jno.fdm", "its stencils read the mesh points as constants")
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])  # nodes per field
         # A vector unknown (`domain.unknown(value_shape=(2,))`) is one DOF block per component, so the DOF
         # vector is [u_0 components…, u_1 components…] in declaration order; `_nf` counts BLOCKS.

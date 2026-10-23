@@ -61,7 +61,7 @@ from .trace import (
     refuse_point_index,
 )
 from .trace_compiler import TraceCompiler
-from .trace_evaluator import mark_pointwise_targets
+from .trace_evaluator import TraceEvaluator, mark_pointwise_targets
 from .tuner import ArchSpace, DeviceConfig, Tuner
 from .utils import (
     LearningRateSchedule,
@@ -69,6 +69,7 @@ from .utils import (
     get_seed,
     statistics,
 )
+from .utils.adaptive.callbacks import Callback as _CallbackBase
 from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
 
@@ -408,6 +409,40 @@ def _active_model_lids(exprs):
     return set(_reachable_models(exprs))
 
 
+def _refuse_collocation_on_parametric_shape(constraints):
+    """A loss that samples a domain whose shape has `jno.np.parameter`s in its coordinates would sample
+    the REFERENCE geometry whatever the design: the points are drawn once, at the parameters' initial
+    values, and nothing moves them. Refused by name until collocation follows the stretch (the solvers
+    that do -- jno.fem, jno.peec -- consume their domain inside their own solve, not here)."""
+    from .geometry import parametric as _par
+    from .utils.solver.solver_helper import iter_children as _iter_children_core
+
+    seen, bad = set(), {}
+
+    def walk(node):
+        if id(node) in seen or not isinstance(node, Placeholder):
+            return
+        seen.add(id(node))
+        if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
+            dom = getattr(node, "_domain", None)
+            plan = getattr(dom, "_shape_plan", None) or getattr(dom, "__dict__", {}).get("_lazy_plan")
+            if plan is not None and getattr(plan, "_node", None) is not None and _par.has_params(plan._node):
+                bad[id(dom)] = getattr(node, "tag", "?")
+        for c in _iter_children_core(node) or ():
+            walk(c)
+
+    for c in constraints or ():
+        walk(c)
+    if bad:
+        raise NotImplementedError(
+            f"jno.core: a loss samples the domain variable(s) {sorted(set(bad.values()))} of a shape with "
+            "`jno.np.parameter`s in its coordinates. Collocation points are drawn at the parameters' "
+            "initial values and do not move with the design, so this loss would see the reference geometry "
+            "whatever the parameters. Solve on that domain with jno.fem or jno.peec (which follow it) and "
+            "put their readouts in the loss, or build the shape with numbers."
+        )
+
+
 def _reachable_models(exprs) -> Dict[int, Any]:
     """Map ``layer_id -> Model`` for every Model reachable without crossing stop_gradient.
 
@@ -538,6 +573,55 @@ def _extract_user_name(orig_expr) -> str | None:
     elif isinstance(orig_expr, Tracker):
         return getattr(orig_expr.expr, "_user_name", None)
     return None
+
+
+class _RebuildWatch(_CallbackBase):
+    """Stops a training stretch at the first epoch where a watched domain's ``when`` holds, and keeps
+    the parameter values it held at -- what the rebuild builds the shape at."""
+
+    def __init__(self, domains):
+        from ._fem import _walk
+
+        self.domains = list(domains)
+        self._fns = []
+        for d in self.domains:
+            when = d._rebuild_spec["when"]
+            mcs = {m.model.layer_id: m for m in _walk(when) if type(m).__name__ == "ModelCall"}
+            fn = jax.jit(lambda tab, _w=when: TraceEvaluator(tab).evaluate(_w, context={}))
+            self._fns.append((d, mcs, fn))
+        self.arm()
+
+    def arm(self):
+        self.fired, self.modules, self.values, self.epochs_run = [], {}, {}, 0
+
+    def holding(self, modules):
+        """The watched domains whose condition holds with the parameter modules ``{layer_id: module}``
+        (a parameter not in it keeps its own)."""
+        out = []
+        for d, mcs, fn in self._fns:
+            tab = {lid: modules.get(lid, mc.model.module) for lid, mc in mcs.items()}
+            hold = np.asarray(fn(tab))
+            if hold.size != 1:
+                raise ValueError(
+                    f"domain.rebuild(when=...): the condition gave {hold.size} values; it must be ONE. "
+                    "Reduce it first, e.g. `d.cell_aspect().max > 6`."
+                )
+            if bool(hold.reshape(())):
+                out.append(d)
+        return out
+
+    def on_epoch_end(self, *, epoch, trainable, **kwargs) -> bool:
+        self.fired = self.holding(trainable)
+        if self.fired:
+            # copies: the training loop donates these buffers to its next step
+            self.modules = {
+                lid: jax.tree_util.tree_map(lambda a: jnp.copy(a) if isinstance(a, jax.Array) else a, m)
+                for lid, m in trainable.items()
+            }
+            self.values = {lid: np.asarray(getattr(m, "value", m)) for lid, m in self.modules.items()}
+            self.epochs_run = int(epoch) + 1
+            return True
+        return False
 
 
 def _release_idle_solver_memory() -> None:
@@ -744,6 +828,19 @@ class core:
         # Domain-decomposition coupling: `jno.core([A, B, ...])` where each item is a subdomain solve
         # (`jno.fdm([...])` carrying a named region via `domain.region(...)`) — couple by overlapping
         # Schwarz instead of PINN training. `.solve()` delegates to the coupling driver.
+        # A jno.peec network and the jno.fem problem it heats are coupled by their references (`em.loss`
+        # in the heat source, the FEM field in sigma) and solved by `heat.solve()` / `em.solve()`, not
+        # listed here: a core is for losses. Listing them is refused with the spelling that works.
+        from .utils.solver.electrothermal import detect_pair
+
+        if detect_pair(constraints) is not None:
+            raise TypeError(
+                "jno.core: a jno.peec network and a jno.fem problem are not losses. A pair coupled through "
+                "`em.loss` is solved by solving either: `T = heat.solve()` (the converged field) and "
+                "`sol = em.solve()` (the network there). Put their readouts in jno.core to optimise -- "
+                "`jno.core([sol.L / L0 + jno.np.max(T) / T0, jno.le(...)])`."
+            )
+
         _detected = _detect_subdomains(constraints)
         self._dd_subdomains = None
         if _detected is not None:
@@ -775,6 +872,7 @@ class core:
                 self.domain = _trivial_domain()
         else:
             self.domain = None
+        _refuse_collocation_on_parametric_shape(constraints)
         self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
@@ -2332,9 +2430,31 @@ class core:
                     crux.solve(1_500, substeps=[[0, 1], [2, 3]])
                     # 1500 outer epochs × 2 substeps = 3000 effective gradient steps
 
+        A domain with a ``rebuild(when=...)`` is watched: after every epoch its condition is read at
+        the current parameters, and once it holds the domain and the solvers built on it are rebuilt at
+        the current design and training continues (see :meth:`jno.domain.rebuild`). Callbacks then see
+        one ``on_solve_begin`` / ``on_training_end`` per stretch of training between rebuilds.
+
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
+        watched = self._rebuild_watch()
+        if watched and not self.__dict__.get("_in_rebuild_segment", False):
+            return self._solve_rebuilding(
+                watched,
+                epochs,
+                dict(
+                    batchsize=batchsize,
+                    checkpoint_gradients=checkpoint_gradients,
+                    offload_data=offload_data,
+                    inner_steps=inner_steps,
+                    accumulation_steps=accumulation_steps,
+                    min_consecutive=min_consecutive,
+                    profile=profile,
+                    substeps=substeps,
+                ),
+                callbacks,
+            )
         # Domain-decomposition coupling: the constraints are subdomain solve problems, not losses —
         # couple them by the inferred method (line Dirichlet-Neumann or overlapping Schwarz), no PINN
         # training. `epochs` maps to the coupling iteration cap (line DN needs a few hundred).
@@ -2349,6 +2469,8 @@ class core:
         from contextlib import nullcontext
 
         from jax._src import profiler as _jax_profiler
+
+        _epochs_run = epochs  # lowered where a callback stops the loop early
 
         if not self.constraints:
             raise ValueError(
@@ -4981,6 +5103,7 @@ class core:
                         if cb.on_epoch_end(**cb_info):
                             _stop_requested = True
                     if _stop_requested:
+                        _epochs_run = epoch + inner_steps
                         break
 
                 # Commit the W&B row for this step.  When step= is passed to
@@ -5195,7 +5318,7 @@ class core:
                 )
                 wandb_log_model(self)
 
-        self._total_epochs += epochs
+        self._total_epochs += _epochs_run
         # Hand the optimizer states to the next solve() so schedules continue across the call.
         self._opt_states = opt_states
 
@@ -5472,6 +5595,67 @@ class core:
             visit(expr)
 
         return choices
+
+    def _rebuild_watch(self):
+        """The domains with a ``rebuild(when=...)`` whose condition reads this core's parameters."""
+        from .domain.domain_class import _REBUILDING_DOMAINS
+
+        if not _REBUILDING_DOMAINS:
+            return []
+        from ._fem import _walk
+
+        # by the parameter OBJECTS: layer ids restart with every core, so an old domain's condition
+        # could otherwise name this core's parameters
+        ours = {id(m) for m in self._collect_flax_modules().values()}
+        out = []
+        for d in list(_REBUILDING_DOMAINS):
+            when = d._rebuild_spec["when"]
+            mine = {id(m.model) for m in _walk(when) if type(m).__name__ == "ModelCall"}
+            if mine & ours:
+                out.append(d)
+        return out
+
+    def _solve_rebuilding(self, watched, epochs, kw, callbacks):
+        """:meth:`solve` in stretches that end where a watched domain's condition holds; between two,
+        the domain is rebuilt at the current design. The optimizer state carries over (a second
+        ``solve`` continues the first), unless a domain asked for ``keep_opt_state=False``."""
+        watch = _RebuildWatch(watched)
+        done, out = 0, None
+        while done < epochs:
+            watch.arm()
+            self._in_rebuild_segment = True
+            try:
+                out = self.solve(epochs - done, callbacks=list(callbacks or []) + [watch], **kw)
+            finally:
+                self._in_rebuild_segment = False
+            if not watch.fired:
+                break  # the stretch ran to its end, or a user callback stopped it
+            done += watch.epochs_run
+            if done >= epochs:
+                break  # it held on the last epoch: there is no training left to rebuild for
+            n = sum(d._rebuild_at(watch.values) for d in watch.fired)
+            self.__dict__.setdefault("_rebuild_epochs", []).append(self._total_epochs)
+            self.log.info(
+                f"rebuild after epoch {self._total_epochs}: `when` held on {len(watch.fired)} domain(s); the shape "
+                f"is rebuilt at the current design with {n} solver(s), and training continues"
+            )
+            modules, fired = watch.modules, list(watch.fired)
+            watch = _RebuildWatch(watched)  # its compiled conditions read the old discretisation
+            still = watch.holding(modules)
+            if still:
+                raise RuntimeError(
+                    f"domain.rebuild: `when` still holds on {len(still)} domain(s) just rebuilt at the current "
+                    "design, so the next epoch would rebuild again, and again. A fresh discretisation "
+                    "cannot satisfy this condition here: loosen it, or make the cells finer (a smaller "
+                    "`size=` / `pitch=`) so the rebuilt cells meet it."
+                )
+            self._jit_program_cache = None
+            self._eval_cache = weakref.WeakKeyDictionary()
+            if self.domain in fired:
+                self.domain_data = self.prepare_domain_data(self.domain)
+            if not all(d._rebuild_spec["keep_opt_state"] for d in fired):
+                self._opt_states = None
+        return out
 
     def eval(
         self,

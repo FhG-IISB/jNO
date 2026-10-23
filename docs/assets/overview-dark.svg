@@ -39,11 +39,12 @@
 <text x="666" y="58" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#0D1117" text-anchor="middle">4</text>
 <text x="682" y="58" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#E6EDF3" text-anchor="start" letter-spacing="0.5">SOLVE / TRAIN</text>
 <path d="M656 72 h156" stroke="#242D38" stroke-width="1"/>
-<text x="656" y="90" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="600" fill="#2DD4BF" text-anchor="start">jno.fem · jno.fdm</text>
-<text x="656" y="105" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="600" fill="#2DD4BF" text-anchor="start">jno.rcwa · jno.core</text>
-<text x="656" y="124" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#9BA7B4" text-anchor="start">four front doors, one</text>
-<text x="656" y="138" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#9BA7B4" text-anchor="start">term list — sparse,</text>
-<text x="656" y="152" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#9BA7B4" text-anchor="start">matrix-free, GPU-ready</text>
+<text x="656" y="86" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="600" fill="#2DD4BF" text-anchor="start">jno.fem · jno.fdm</text>
+<text x="656" y="100" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="600" fill="#2DD4BF" text-anchor="start">jno.rcwa · jno.peec</text>
+<text x="656" y="114" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="600" fill="#2DD4BF" text-anchor="start">jno.core</text>
+<text x="656" y="131" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#9BA7B4" text-anchor="start">five front doors, one</text>
+<text x="656" y="145" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#9BA7B4" text-anchor="start">term list — sparse,</text>
+<text x="656" y="159" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#9BA7B4" text-anchor="start">matrix-free, GPU-ready</text>
 <path d="M832.0 92.0 l5 5 l-5 5" fill="none" stroke="#9BA7B4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
 <rect x="846" y="28" width="184" height="138" rx="10" fill="#141B23" stroke="#27313C"/>
 <path d="M856 28.5 h164" stroke="#2DD4BF" stroke-width="3" stroke-linecap="round" fill="none"/>

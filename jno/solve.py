@@ -55,6 +55,7 @@ __all__ = [
     "cocg",
     "chebyshev",
     "amg",
+    "hierarchical",
     "newton",
     "picard",
     "staggered",
@@ -260,13 +261,14 @@ def dense() -> LinearSolver:
 
 
 def _unit_scaled(M, b):
-    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for ``jax.scipy.sparse.linalg.gmres``.
+    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for a left-preconditioned GMRES.
 
-    JAX's GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below ``tol·‖b‖``, an
-    UNpreconditioned norm. A preconditioner far from unit scale moves that test by its scale: with Jacobi
-    on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of 1.5e-4 read as 7.5e-9
-    and was returned without a single iteration. A constant multiple of ``M`` leaves the Krylov iterates
-    unchanged and puts both norms on the same scale, so ``tol`` means what it says."""
+    Left-preconditioned GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below
+    ``tol·‖b‖``, an UNpreconditioned norm. A preconditioner far from unit scale moves that test by its
+    scale: with Jacobi on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of
+    1.5e-4 read as 7.5e-9 and was returned without a single iteration. A constant multiple of ``M``
+    leaves the Krylov iterates unchanged and puts both norms on the same scale, so ``tol`` means what
+    it says."""
     Mb = jnp.linalg.norm(M(b))
     scale = jnp.where(Mb > 0, jnp.linalg.norm(b) / jnp.where(Mb > 0, Mb, 1.0), 1.0)
     return lambda r: scale * M(r)
@@ -302,6 +304,26 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
                 lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol_, atol=atol, maxiter=maxiter, M=M),
                 f"jno.solve.{name}",
             )
+        elif name == "gmres":
+            # Ours, not jax's: jax's batched GMRES finishes every restart cycle whatever the residual
+            # (30 preconditioner applies where 3 suffice, under a multigrid M), and its incremental one
+            # reads a loop predicate back to the host several times per step, which on a GPU drains
+            # the stream each time. `gmres_chunked` checks every few steps. Left-preconditioned with
+            # M rescaled, so it stops on the same quantity jax's did and `tol` keeps its meaning.
+            from .utils.solver.krylov import gmres_chunked
+            from .utils.solver.solver_api import record_iterations
+
+            restart = fixed["restart"]
+
+            def raw(mv, rhs, M, x0, _side="forward"):
+                if M is not None:
+                    M = _unit_scaled(M, rhs)
+                # `maxiter` counts restart cycles, as it does for jax's (whose default is 10 n of them)
+                cycles = maxiter if maxiter is not None else 10 * rhs.shape[0]
+                record_iterations(None, f"jno.solve.{name}", side=_side)
+                return gmres_chunked(
+                    mv, rhs, M=M, x0=x0, tol=tol_, atol=atol, restart=restart, maxiter=cycles * restart, side="left"
+                )
         else:
             from .utils.solver.krylov import gmres as _scaled_gmres
             from .utils.solver.solver_api import record_iterations
@@ -342,11 +364,12 @@ def bicgstab(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = 2
 
 
 def gmres(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = None, restart: int = 30) -> LinearSolver:
-    """Restarted GMRES (``jax.scipy.sparse.linalg.gmres``) -- non-symmetric systems where
-    BiCGStab's erratic convergence hurts; memory grows with ``restart``. For an *iterative*
+    """Restarted GMRES (:func:`jno.utils.solver.krylov.gmres_chunked`) --
+    non-symmetric systems where BiCGStab's erratic convergence hurts; memory grows with ``restart``.
+    Stops on the preconditioned residual, as JAX's GMRES does. For an *iterative*
     (e.g. multigrid-with-tolerance) preconditioner a flexible variant (FGMRES) is required --
     planned; see ``plans/fem-solver-api.md``."""
-    return _krylov("gmres", tol, atol, maxiter, restart=restart, solve_method="batched")
+    return _krylov("gmres", tol, atol, maxiter, restart=restart)
 
 
 def _raw_on(raw, mv, rhs, M, x0, side):
@@ -2336,3 +2359,54 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
     return ContactSpec(
         capture=None if capture is None else float(capture), rounds=int(rounds), tol=float(tol), relax=float(relax)
     )
+
+
+def hierarchical(*, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, floor: int = 2000):
+    """**Hierarchical (H-matrix) compression** of an integral-equation operator, for `jno.peec`.
+
+    PEEC is fast only on a uniform lattice: identical bars on a regular grid make the partial
+    inductance block-Toeplitz, so an FFT applies it in ``O(N log N)``. Anything else -- a bond wire
+    welded to a trace layer, two parts at different pitches, a locally refined mesh -- has no such
+    structure and is formed **densely**. That is why welding is expensive: a 6,806-bar lattice solves
+    in 0.213 s and adding one 19-filament wire takes it to 33.4 s, and a 12,000-element module
+    allocated 2.7 GB to build a 46 MB coupling block.
+
+    This compresses those blocks instead. Clusters that are far apart compared to their own size
+    couple through a numerically low-rank block, found by ACA from sampled rows and columns::
+
+        emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
+        sol = emag.solve(operator=jno.solve.hierarchical(tol=1e-6))
+
+    **Opt-in, and exact without it.** The default path is unchanged, so this changes no existing
+    answer; ask for it and the operator becomes approximate to ``tol``, which the solver's residual
+    check still guards.
+
+    **Correct and verified, but not yet worth switching on.** A bar lattice compresses 3.27x at
+    1,540 elements rising to 5.76x at 4,589, accurate to 8.2e-09 -- and yet a whole welded solve is
+    3-5x SLOWER with it at every size measured, and peaks higher. A dense matvec is one BLAS call
+    where a compressed one is hundreds of small matmuls (0.018 s against 0.186 s at 1,540 elements),
+    and at a few thousand elements the operator is not the memory bottleneck either. Where the
+    crossover lies is not established; see :mod:`~jno.utils.solver.hmatrix` for the numbers.
+
+    Args:
+        tol: relative accuracy asked of each compressed block.
+        leaf: cluster size at which the tree stops splitting. Smaller compresses BETTER (4.85x at 64
+            against 2.46x at 256): larger leaves mean coarser blocks, and less of the matrix reaches
+            an admissible pair.
+        eta: admissibility constant. Barely matters here -- 4.85x at 2 against 4.93x at 4 -- so it is
+            rarely worth changing.
+        floor: blocks smaller than this on their short side are left EXACT. Below it compression does
+            not pay (1.38x at 370 elements), and a slower approximate operator is a defect rather
+            than a trade.
+
+    Returns:
+        The spec to pass as ``solve(operator=...)``.
+
+    **Limits, up front.** ACA suits asymptotically smooth kernels; ``1/r`` and its derivatives are
+    fine, an oscillatory ``exp(ikr)/r`` at high ``kr`` is not. The build is host work that only pays
+    above a few thousand elements. And a block ACA cannot compress to under half its size is kept
+    dense, so on a small or poorly separated network this correctly does nothing at all.
+    """
+    from .utils.solver.hmatrix import HierarchicalSpec
+
+    return HierarchicalSpec(tol=tol, leaf=leaf, eta=eta, floor=floor)

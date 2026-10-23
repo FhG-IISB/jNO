@@ -34,6 +34,10 @@ def _poisson(d):
 
 def test_domain_info_reports_mesh_regions_and_attachments():
     d = _two_region_domain()
+    # analytic regions defer the mesh; info reports that without building it
+    assert jno.info(d).as_dict()["mesh"]["built"] == "no — still a lazy shape plan"
+    assert d.__dict__.get("_mesh") is None
+    d.mesh
     rep = jno.info(d)
     text, data = str(rep), rep.as_dict()
     assert "domain" in text and "2D" in text

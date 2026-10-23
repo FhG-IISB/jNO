@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ..architectures.lora import LoRAWrapper, _normalize_wrappers
 from ..tuner import Arch, ArchSpace
@@ -2605,6 +2606,39 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
+    def derives(self, expr):
+        """Take this parameter's value from ``expr`` each solve instead of training it.
+
+        A coupled problem has coefficients that are neither constants nor unknowns: they are
+        *computed* from the rest of the state. The ohmic loss driving a thermal solve is the
+        canonical one -- it is whatever the electromagnetic solve just produced, and re-deriving it
+        is the coupling::
+
+            q = jno.np.parameter(qs, name="q").derives(jno.fn(cell_loss, [rho]))
+            fem = jno.fem([d.k * grad(T) . grad(s) - q * s, T(sink) - 300.0])
+
+        ``expr`` is a trace EXPRESSION, not a value and not a callable: a graph description, so
+        nothing is captured and nothing is stored. It is dispatched wherever the parameter would
+        have been read, which is once per solve at the whole-field level -- never inside the element
+        kernel -- so it may return the parameter's full array and the usual per-cell/per-node
+        threading applies to the result unchanged.
+
+        That is what makes the coupling jittable. A value handed over by mutation (``.update(...)``)
+        would have to be a tracer to carry a gradient, and a tracer stored on a python object
+        belongs to the trace that made it -- reusing one later raises ``UnexpectedTracerError``,
+        far from the cause. An expression has no such problem, and it also keeps the coupling part
+        of the problem statement rather than an ordering of calls.
+
+        A derived parameter is **not trained**: it carries no design freedom of its own, so it takes
+        no optimizer and needs no bounds. It stays a *runtime* parameter rather than a frozen
+        coefficient, because its value still changes every solve.
+        """
+        self._derived_expr = expr
+        self._frozen = True  # not a design variable: its value is computed, never searched
+        self._trainable_param_mask = None
+        self._mask_scope_pending = False
+        return self
+
     def constrain(self, transform: Callable) -> "Model":
         """Apply a paramax reparameterization to trainable parameter leaves.
 
@@ -3523,6 +3557,11 @@ class ModelCall(Placeholder):
 
     def freeze(self):
         self.model.freeze()
+        return self
+
+    def derives(self, expr):
+        """Take this parameter's value from ``expr`` each solve — see :meth:`Model.derives`."""
+        self.model.derives(expr)
         return self
 
     def unfreeze(self):
@@ -4577,6 +4616,42 @@ def check_runtime_values(names, values):
             )
 
 
+class FemSolutionCall(FunctionCall):
+    """The node a parametric ``fem.solve()`` returns: the nodal solution, and callable at POINTS.
+
+    ``u(px, py, pz)`` -- coordinate arrays (numbers, arrays or ``jno.np.parameter``s) -- is a node whose
+    value is the solution at those points, through the shape functions of the elements holding them
+    (``fem_points.PointShape``). It composes like any expression (``u(pa...) - u(pb...)``), ``.eval()``s
+    to an array, and differentiates through the solve and in the points. Any other call keeps
+    ``FunctionCall``'s meaning."""
+
+    def __init__(self, fn, args, name=None, point_space=None, **kw):
+        super().__init__(fn, args, name=name, **kw)
+        self._point_space = point_space
+
+    def __call__(self, *coords, **named):
+        if not coords or named or not all(_is_point_coord(c) for c in coords):
+            if len(coords) == 1 and not named:
+                return super().__call__(coords[0])
+            raise TypeError(
+                "jno.fem: call the solution with point coordinate ARRAYS, one per axis -- u(px, py, pz) -- "
+                "made of numbers, arrays or jno.np.parameter(...)s."
+            )
+        if self._point_space is None:
+            raise NotImplementedError("jno.fem: this solve cannot be read at points (no point space was built for it).")
+        shape_fn, cdofs0 = self._point_space()
+        nodes = [c if isinstance(c, Placeholder) else Literal(c) for c in coords]
+
+        def _at(u, *cs):
+            cs = [jnp.reshape(jnp.asarray(c), (-1,)) for c in cs]
+            n = max(int(c.shape[0]) for c in cs)
+            pos = jnp.stack([jnp.broadcast_to(c, (n,)) for c in cs], axis=1)
+            cell, N = shape_fn(pos)
+            return jnp.sum(N * jnp.reshape(u, (-1,))[cdofs0[cell]], axis=1)
+
+        return FunctionCall(_at, [self, *nodes], name="fem_point_value")
+
+
 class FemLinearSystem:
     """Container for a steady linear FEM system ``A(args) x = b(args)``."""
 
@@ -4673,7 +4748,7 @@ class FemLinearSystem:
             return solve_fn(A, b)
 
         if values is None:
-            node = FunctionCall(_solve, params, name="fem_solve")
+            node = FemSolutionCall(_solve, params, name="fem_solve", point_space=getattr(self, "_point_space", None))
             node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
             if periodic is None:  # a shared factorisation needs the operator as assembled (trace_evaluator)
                 node._solve_fls, node._solve_recombine, node._solve_fn = self, None, solve_fn
@@ -5019,6 +5094,44 @@ class GaugePin:
     def __repr__(self):
         extra = ", mean=True" if self.mean else ""
         return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r}{extra})"
+
+
+def _is_point_coord(c) -> bool:
+    """A coordinate that names a POINT rather than a region: a number, an array, a runtime parameter
+    (``jno.np.parameter``), or arithmetic of those. A region ``Variable`` -- or anything built on one,
+    like ``x + 1`` -- is not: calling a field with it binds the field to that region, as it always has."""
+    if isinstance(c, Variable):
+        return False
+    if isinstance(c, (int, float, np.ndarray, np.number)) or isinstance(c, jax.Array):
+        return True
+    if isinstance(c, (Literal, Constant)):
+        return True
+    if isinstance(c, ModelCall):
+        return len(c.args) == 0 and bool(getattr(c.model, "_is_parameter", False))
+    if isinstance(c, BinaryOp):
+        return _is_point_coord(c.left) and _is_point_coord(c.right)
+    return False
+
+
+class PointEval(Placeholder):
+    """A field evaluated at POINTS: ``v(px, py, pz)`` with point coordinates (numbers, arrays or
+    ``jno.np.parameter``s, one array per axis). On a test function inside ``jno.fem([...])`` it is a
+    point load, ``sum_i c_i v(p_i)``; on a solution node it is the solution's value there. Both go
+    through the shape functions of the element that contains each point (``fem_points.PointShape``)."""
+
+    def __init__(self, field, coords):
+        self.of = field  # the field evaluated (`field` is taken: a Placeholder property)
+        self.coords = tuple(coords)
+
+    def __repr__(self):
+        return f"{self.of!r}@points"
+
+
+def _point_call(field, coords, named):
+    """``PointEval`` when every spatial coordinate names a point; None for today's region binding."""
+    if named or not coords or not all(_is_point_coord(c) for c in coords):
+        return None
+    return PointEval(field, coords)
 
 
 class TrialFunction(_FieldComponentIndex, Placeholder):
@@ -5369,6 +5482,9 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         without the filter the ``t`` would silently bind to ``z``.
         """
         spatial = [c for c in coords if getattr(c, "axis", "spatial") != "temporal"]
+        pe = _point_call(self, spatial, named)
+        if pe is not None:  # u(px, py, pz) with point coordinates: the field at those points
+            return pe
         binding = {axis: c for axis, c in zip(("x", "y", "z"), spatial)}
         binding.update(named)
         if not binding:
@@ -6140,6 +6256,9 @@ class TestFunction(_FieldComponentIndex, Placeholder):
         rather than bound to a spatial axis — the region carries the time.
         """
         spatial = [c for c in coords if getattr(c, "axis", "spatial") != "temporal"]
+        pe = _point_call(self, spatial, named)
+        if pe is not None:  # phi(px, py, pz) with point coordinates: a point load in a weak form
+            return pe
         binding = {axis: c for axis, c in zip(("x", "y", "z"), spatial)}
         binding.update(named)
         if not binding:

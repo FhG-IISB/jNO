@@ -491,11 +491,16 @@ class MMACallback(_Callback):
         self._n_constraints = int(kw["n_constraints"])
         lids = [lid for lid, _ in self._blocks]
 
-        def _losses(sub, rest, context, rng):
+        def _losses(sub, rest, context, rng, rows):
             trainable = {**rest, **sub}
             full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
             residuals = compiled_fn(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
-            return jnp.stack([jnp.mean(r) for r in residuals])
+            # Only the asked-for rows are reduced, so whatever the others need -- the objective's own
+            # solve, typically the expensive part of the model -- is dead code and is dropped when
+            # this compiles. Stacking every row and pulling back a zero cotangent does NOT drop it:
+            # the zero is a computed array, so the adjoint solve runs on it and needs the forward one.
+            # Measured on an inductance design: the field solve re-ran every step, 190 ms of 550 ms.
+            return jnp.stack([jnp.mean(residuals[i]) for i in rows])
 
         # `rowwise_jacobian`, not `jacrev`: `jacrev` vmaps its pullback across the output rows, which
         # through a `fem.solve()` batches the adjoint `spsolve`s into block-diagonal systems (one
@@ -518,7 +523,14 @@ class MMACallback(_Callback):
             compiled_fn_ineq = ineq_fn
             losses_fn, rows = _ineq_losses, list(range(len(self._ineq)))
         else:
-            losses_fn, rows = _losses, list(self._ineq)
+            # Reduce only the inequality rows, so the objective's own solve is dead code in the Jacobian
+            # (see `_losses`); the stacked rows are then numbered 0..n-1.
+            _ineq_rows = list(self._ineq)
+
+            def losses_fn(sub, rest, context, rng):
+                return _losses(sub, rest, context, rng, _ineq_rows)
+
+            rows = list(range(len(_ineq_rows)))
 
         def jac(trainable, context, rng):
             sub = {lid: trainable[lid] for lid in lids}
@@ -535,7 +547,8 @@ class MMACallback(_Callback):
         self._jac_fn = jax.jit(jac)
         if self._gcmma:
             # Values only, of every row: GCMMA's inner loop compares them with its approximation.
-            self._values_fn = jax.jit(lambda trainable, context, rng: _losses(trainable, {}, context, rng))
+            _all_rows = list(range(self._n_constraints))
+            self._values_fn = jax.jit(lambda trainable, context, rng: _losses(trainable, {}, context, rng, _all_rows))
 
     def _report_initial_feasibility(self, g, dg):
         """Say where every ``jno.le`` row starts, and refuse one no step can ever satisfy.
@@ -632,13 +645,25 @@ class MMACallback(_Callback):
             self._report_initial_feasibility(g, dg)
 
         spec = _BlendedSpec(self._blocks, [p.size for p in x_parts], k=self._k)
+        # A variable with lower == upper is FIXED -- a keep-in held at full material, say. MMA scales
+        # its asymptotes and move limit by the box width, so a zero-width box divides by zero and the
+        # NaN it makes poisons the dual for every other variable: measured, every free density ran
+        # to its lower bound while the objective rose. Fixed variables are taken out of the
+        # subproblem and keep their value.
+        free = xmax - xmin > 0
+        if not free.all():
+            spec.subset(free)
+        sub = lambda a: None if a is None else a[free]  # noqa: E731
+        x_fixed = np.minimum(np.maximum(x, xmin), xmax)  # a fixed variable sits at its bound
         if self._gcmma:
             # The objective as core descends it: the mean of the rows that are not `jno.le`.
             obj = np.ones(g_all.size, dtype=bool)
             obj[np.asarray(self._ineq, dtype=int)] = False
             ineq = np.asarray(self._ineq, dtype=int)
 
-            def evaluate(xh):
+            def evaluate(xf):
+                xh = x_fixed.copy()
+                xh[free] = xf
                 trial = dict(trainable)
                 off = 0
                 for lid, un, size in unravels:
@@ -647,18 +672,18 @@ class MMACallback(_Callback):
                 vals = np.asarray(self._values_fn(trial, context, rng), dtype=np.float64).reshape(-1)
                 return float(vals[obj].mean()), vals[ineq]
 
-            x_new, self._low, self._upp, info = gcmma_step(
-                x,
+            xf, self._low, self._upp, info = gcmma_step(
+                x[free],
                 float(g_all[obj].mean()),
-                df0,
+                df0[free],
                 g,
-                dg,
+                dg[:, free],
                 self._low,
                 self._upp,
-                xmin,
-                xmax,
-                self._xold1,
-                self._xold2,
+                xmin[free],
+                xmax[free],
+                sub(self._xold1),
+                sub(self._xold2),
                 self._k,
                 spec,
                 evaluate,
@@ -676,24 +701,26 @@ class MMACallback(_Callback):
                         "(Further such steps are counted and reported at the end.)"
                     )
         else:
-            x_new, self._low, self._upp, lam = mma_subproblem(
-                x,
+            xf, self._low, self._upp, lam = mma_subproblem(
+                x[free],
                 None,
-                df0,
+                df0[free],
                 g,
-                dg,
+                dg[:, free],
                 self._low,
                 self._upp,
-                xmin,
-                xmax,
-                self._xold1,
-                self._xold2,
+                xmin[free],
+                xmax[free],
+                sub(self._xold1),
+                sub(self._xold2),
                 self._k,
                 spec,
                 spec.dual_iters,
                 with_multipliers=True,
             )
             self.multipliers = np.asarray(lam, dtype=np.float64)
+        x_new = x_fixed
+        x_new[free] = xf
         self._xold2, self._xold1 = self._xold1, x.copy()
         self._k += 1
 
@@ -747,6 +774,10 @@ class _BlendedSpec:
     block; letting them differ per block would make one subproblem out of two inconsistent
     approximations.
     """
+
+    def subset(self, keep):
+        """Restrict the per-variable parameters to the variables the subproblem actually moves."""
+        self.move = np.asarray(self.move)[keep]
 
     def __init__(self, blocks, sizes, k: int = 0):
         first = blocks[0][1]

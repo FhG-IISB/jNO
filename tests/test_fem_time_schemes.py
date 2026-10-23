@@ -434,6 +434,6 @@ def test_forward_euler_through_a_solver_slot():
     """θ = 0: the pre-built step matrix M + 0·A has empty constraint rows; it carries Δt·A there."""
     fem = _heat(400, T=0.01)
     ref = np.asarray(fem.solve(time=jno.solve.theta(0.0)).fn())
-    got = np.asarray(fem.solve(time=jno.solve.theta(0.0), linear=jno.solve.gmres()).fn())
+    got = np.asarray(fem.solve(time=jno.solve.theta(0.0), linear=jno.solve.gmres(tol=1e-10)).fn())
     assert np.isfinite(got).all() and np.abs(got - ref).max() < 1e-8
     assert np.abs(got[1:, _on_boundary(fem)]).max() < 1e-12

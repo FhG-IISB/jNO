@@ -377,8 +377,13 @@ class ScalarView(_DelegatesToPlaceholder):
         return ScalarView(new_expr)
 
     def integrate(self, *args, **kwargs) -> "ScalarView":
-        """Integrate the underlying scalar, preserving the ScalarView type."""
-        return self._rewrap(self._expr.integrate(*args, **kwargs))
+        """Integrate the underlying scalar, preserving the ScalarView type. ``.integrate(fem)`` /
+        ``.integrate(d)`` -- an integral over a solve or a domain, one number -- is handed through as
+        the node it is: re-wrapped, it would carry the quadrature points' coordinate bindings into any
+        form it is multiplied into."""
+        if args:
+            return self._expr.integrate(*args, **kwargs)
+        return self._rewrap(self._expr.integrate(**kwargs))
 
     @property
     def stop_gradient(self) -> "ScalarView":
@@ -686,8 +691,11 @@ class VectorView(_DelegatesToPlaceholder):
         return ComplexVectorView(self._expr)
 
     def integrate(self, *args, **kwargs) -> "VectorView":
-        """Component-wise integral, preserving VectorView type."""
-        return self._rewrap(self._expr.integrate(*args, **kwargs))
+        """Component-wise integral, preserving VectorView type. ``.integrate(fem)`` / ``.integrate(d)``
+        -- integrals over a solve or a domain -- are handed through as the node they are."""
+        if args:
+            return self._expr.integrate(*args, **kwargs)
+        return self._rewrap(self._expr.integrate(**kwargs))
 
     @property
     def stop_gradient(self) -> "VectorView":
@@ -2182,7 +2190,7 @@ class FieldViewWithPartials(ScalarView):
         cv = object.__getattribute__(self, "_coord_vars")
         sc = object.__getattribute__(self, "_spatial_coords")
         other_cv = getattr(other, "_coord_vars", None) if other is not None else None
-        tie_tags = None
+        tie_tags = extra = None
         if other_cv:
             conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
             if conflict and _is_periodic_tie_combination(
@@ -2190,7 +2198,15 @@ class FieldViewWithPartials(ScalarView):
             ):
                 # jno.fdm periodic tie `u(A) - u(B)`: the BinaryOp discards the per-side views, so stash
                 # the two region tags here (the only place they survive) for the classifier to read.
-                tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+                prior = getattr(self, "_periodic_tie", None)
+                if prior is not None:
+                    # An ALREADY-tied view meeting a third region does not re-tie: `v(A) - v(B) - Z*i(C)`
+                    # used to come out stamped ('A', 'C'), quietly losing B and describing a pair the
+                    # user never wrote. Keep the original pair and record the newcomer separately, so a
+                    # reader can tell a two-terminal form from a three-terminal one instead of guessing.
+                    tie_tags, extra = prior, _tag_of_coord_vars(other_cv)
+                else:
+                    tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
             else:
                 merged = dict(cv)
                 for name, var in other_cv.items():
@@ -2203,6 +2219,12 @@ class FieldViewWithPartials(ScalarView):
                         )
                     merged[name] = var
                 cv = merged
+        if tie_tags is None:
+            # An operation on a stamped tie keeps the stamp: `u(A) - u(B) - g` discards the tie's
+            # own view at the OUTER subtraction, and the region tags survive nowhere else. Whether
+            # the offset form means anything is the reading solver's call -- jno.fem still refuses
+            # it, loudly, because _tie_phase does not recognise the outer `-`.
+            tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
         new = FieldViewWithPartials.__new__(FieldViewWithPartials)
         ScalarView.__init__(new, new_expr)
         object.__setattr__(new, "_coord_vars", cv)
@@ -2210,6 +2232,9 @@ class FieldViewWithPartials(ScalarView):
         _with_scheme(new, getattr(self, "_bind_scheme", None))  # `.bind(..., scheme=...)` survives arithmetic
         if tie_tags is not None:
             object.__setattr__(new, "_periodic_tie", tie_tags)
+        extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)
+        if extra is not None:
+            object.__setattr__(new, "_tie_extra", extra)
         return new
 
     # ------------------------------------------------------------------
@@ -2393,7 +2418,7 @@ def _make_named_with_partials_cls(view_cls):
             """
             cv = object.__getattribute__(self, "_coord_vars")
             other_cv = getattr(other, "_coord_vars", None) if other is not None else None
-            tie_tags = None
+            tie_tags = extra = None
             if other_cv:
                 conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
                 if conflict and _is_periodic_tie_combination(
@@ -2402,7 +2427,11 @@ def _make_named_with_partials_cls(view_cls):
                     # FEM periodic tie `u(A) - u(B)`: a constraint we never differentiate, so the
                     # `.x`-ambiguity guard does not apply. The BinaryOp discards the per-side views, so
                     # stash the two region tags here (the only place they survive) for jno.fem to read.
-                    tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+                    prior = getattr(self, "_periodic_tie", None)
+                    if prior is not None:  # see the note in FieldViewWithPartials._rewrap
+                        tie_tags, extra = prior, _tag_of_coord_vars(other_cv)
+                    else:
+                        tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
                 else:
                     merged = dict(cv)
                     for name, var in other_cv.items():
@@ -2415,9 +2444,16 @@ def _make_named_with_partials_cls(view_cls):
                             )
                         merged[name] = var
                     cv = merged
+            if tie_tags is None:
+                # see the note in FieldViewWithPartials._rewrap: an operation on a stamped tie keeps
+                # the stamp, because the outer op discards the tie's own view.
+                tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
             res = _with_scheme(type(self)(new_expr, cv), getattr(self, "_bind_scheme", None))
             if tie_tags is not None:
                 object.__setattr__(res, "_periodic_tie", tie_tags)
+            extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)
+            if extra is not None:
+                object.__setattr__(res, "_tie_extra", extra)
             return res
 
         def __getattr__(self, key: str):

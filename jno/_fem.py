@@ -534,6 +534,104 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
+def _split_point_terms(constraints):
+    """Take the POINT loads out of a term list: ``(point_terms, rest)``.
+
+    A test function called with point coordinates, ``v(px, py, pz)`` (see ``trace.PointEval``), is a
+    point load. Each term is split additively; a piece holding a point evaluation must be
+    ``coefficient * v(points)`` with a point-free coefficient (numbers, arrays, ``jno.np.parameter``s
+    and arithmetic of those), and becomes ``(coefficient, PointEval)``. The other pieces of the same
+    term are kept, as one term, for the usual classification. Anything else raises by name: a point
+    evaluation is never dropped or integrated as if it were a region."""
+    from .trace import BinaryOp, Literal, PointEval, TestFunction, _is_point_coord
+
+    def pieces(e, sign=1.0):
+        if isinstance(e, BinaryOp) and e.op in ("+", "-"):
+            return pieces(e.left, sign) + pieces(e.right, sign if e.op == "+" else -sign)
+        return [(sign, e)]
+
+    def factors(e):
+        if isinstance(e, BinaryOp) and e.op == "*":
+            return factors(e.left) + factors(e.right)
+        if isinstance(e, BinaryOp) and e.op == "/":
+            return factors(e.left) + [("inv", e.right)]
+        return [e]
+
+    point_terms, rest = [], []
+    for c in constraints:
+        if not _contains(c, PointEval):
+            rest.append(c)
+            continue
+        keep = None
+        for sign, piece in pieces(_bare(c)):
+            if not _contains(piece, PointEval):
+                term = piece if sign > 0 else Literal(-1.0) * piece
+                keep = term if keep is None else keep + term
+                continue
+            fs = factors(piece)
+            pe = [f for f in fs if isinstance(f, PointEval)]
+            others = [f for f in fs if not isinstance(f, PointEval)]
+            trial = [f for f in pe if not isinstance(f.of, TestFunction)]
+            if trial:
+                raise NotImplementedError(
+                    f"jno.fem: {trial[0]!r} -- a TRIAL field at points inside a weak form (a point constraint or "
+                    "coupling) is not supported yet. Point LOADS are: `c * v(px, py, pz)` with the test function."
+                )
+            if len(pe) != 1 or any(isinstance(f, tuple) and isinstance(f[1], PointEval) for f in others):
+                raise ValueError(
+                    f"jno.fem: a point term must be `coefficient * v(px, py, pz)` with ONE point evaluation of the "
+                    f"test function as a factor; got {piece!r}."
+                )
+            if not isinstance(pe[0].of, TestFunction):
+                raise NotImplementedError(
+                    f"jno.fem: {pe[0]!r} -- a TRIAL field at points inside a weak form (a point constraint or "
+                    "coupling) is not supported yet. Point LOADS are: `c * v(px, py, pz)` with the test function."
+                )
+            coef = Literal(sign)
+            for f in others:
+                inv = isinstance(f, tuple)
+                g = f[1] if inv else f
+                if not _is_point_coord(g):
+                    raise ValueError(
+                        f"jno.fem: the coefficient of a point load may only hold numbers, arrays and "
+                        f"`jno.np.parameter`s (and arithmetic of those); {g!r} is not one. A coefficient that "
+                        "depends on the solution or on position is not a point load."
+                    )
+                coef = coef / g if inv else coef * g
+            point_terms.append((coef, pe[0]))
+        if keep is not None:
+            rest.append(keep)
+    return point_terms, rest
+
+
+def _point_value(e, args):
+    """The value of a point-free expression (numbers, arrays, parameters, arithmetic) given ``args``."""
+    import jax as _jax
+
+    from .trace import BinaryOp, Constant, Literal, ModelCall
+
+    if isinstance(e, (int, float, np.ndarray, np.number)) or isinstance(e, _jax.Array):
+        return jnp.asarray(e)
+    if isinstance(e, (Literal, Constant)):
+        return jnp.asarray(e.value)
+    if isinstance(e, ModelCall):
+        name = getattr(e.model, "_parameter_name", None)
+        if args and name in args:
+            return jnp.asarray(args[name])
+        if getattr(e.model, "_frozen", False) and getattr(e.model, "_weight_tree", None) is not None:
+            return jnp.asarray(e.model._weight_tree)  # a .freeze()d (known) value
+        raise ValueError(
+            f"jno.fem: the point term uses parameter {name!r}, which has no value here: pass it to `fem.solve({name}=...)`."
+        )
+    if isinstance(e, BinaryOp):
+        a, b = _point_value(e.left, args), _point_value(e.right, args)
+        ops = {"+": jnp.add, "-": jnp.subtract, "*": jnp.multiply, "/": jnp.divide, "**": jnp.power}
+        if e.op not in ops:
+            raise ValueError(f"jno.fem: operator {e.op!r} in a point term is not supported.")
+        return ops[e.op](a, b)
+    raise ValueError(f"jno.fem: {e!r} is not a number, array or parameter.")
+
+
 def _reject_source_terms(fem_obj: Any, where: str) -> None:
     """Fail loud if the weak form carries a **load** — a term with a test function but no trial.
 
@@ -551,6 +649,11 @@ def _reject_source_terms(fem_obj: Any, where: str) -> None:
     from .utils.solver.weak_form import _split_additive_terms
 
     dom = getattr(fem_obj, "domain", None)
+    if getattr(fem_obj, "_point_loads", 0):
+        raise ValueError(
+            f"{where}: the weak form carries point loads (`c * v(px, py, pz)`). An eigenproblem K x = λ M x "
+            "is homogeneous -- a load is not part of the pencil and would be silently ignored. Drop them."
+        )
     for c, cl in zip(getattr(fem_obj, "_constraints", None) or [], fem_obj.classification or []):
         if not (isinstance(cl, str) and (cl.startswith("volume") or cl.startswith("surface"))):
             continue
@@ -1866,6 +1969,45 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
+#: set by the evaluation sites that hand ``_eval_value_node_at`` the MOVED node positions of a moving
+#: mesh (coordinate parameters); everywhere else a position-dependent value on a moving mesh is refused
+_FOLLOWS_MOVING_MESH = __import__("contextvars").ContextVar("jno_follows_moving_mesh", default=False)
+
+
+def _follows_moving_mesh():
+    """Context: the points handed to ``_eval_value_node_at`` inside are where the mesh is NOW."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        tok = _FOLLOWS_MOVING_MESH.set(True)
+        try:
+            yield
+        finally:
+            _FOLLOWS_MOVING_MESH.reset(tok)
+
+    return cm()
+
+
+def _refuse_stale_position(variables, where="a condition's value"):
+    """A position-dependent value on a mesh that coordinate parameters move, evaluated at the reference
+    node positions by a path that does not follow the motion, would answer for the old shape -- raise."""
+    if _FOLLOWS_MOVING_MESH.get():
+        return
+    for v in variables:
+        if getattr(v, "axis", "spatial") != "spatial":
+            continue
+        dom = getattr(v, "_domain", None)
+        if dom is not None and getattr(dom, "__dict__", {}).get("_trainable_coords"):
+            raise NotImplementedError(
+                f"jno.fem: {where} depends on position (it reads {getattr(v, 'tag', '?')!r}) on a mesh that "
+                "coordinate parameters move (`x.trainable()` or a parametric shape), and this path "
+                "evaluates it at the REFERENCE node positions -- it would not follow the design. Supported: "
+                "an essential (Dirichlet) value and an initial condition on a P1 field. Write this one "
+                "without the coordinates, or build the shape with numbers."
+            )
+
+
 def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
@@ -1891,6 +2033,7 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     from .trace_evaluator import TraceEvaluator
 
     variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    _refuse_stale_position(variables)
     temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
     if temporal and t is None:
         raise ValueError(
@@ -2369,6 +2512,15 @@ class FEM:
         self._op = op
         self._mode = mode
         self.classification = classification
+        # A problem heated by a jno.peec network's `em.loss` is coupled to it: the network learns which
+        # problem its loss heats, so `em.solve()` and `self.solve()` converge the pair, once, together.
+        from .utils.solver.electrothermal import peec_source_of
+
+        _em = peec_source_of(self)
+        if _em is not None:
+            _em._heat = self
+        if hasattr(domain, "_register_solver"):
+            domain._register_solver(self)  # a `domain.rebuild` rebuilds this problem with the domain
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
@@ -2640,10 +2792,47 @@ class FEM:
             u = u - mask * (_weighted(load, u) / total)
         return u
 
+    def _rebuild(self):
+        """Assemble this problem again from its term list, in place, on a domain that has just been
+        rebuilt (`domain.rebuild`): every trace node holding this object then solves the new one."""
+        if self._constraints is None:
+            return  # an internal sub-problem; the problem that owns it is rebuilt instead
+        import jno
+
+        cur = jno.fem(self._constraints, **self._fem_kwargs)
+        self.__dict__.update(cur.__dict__)
+        from .utils.solver.electrothermal import peec_source_of
+
+        em = peec_source_of(self)
+        if em is not None:
+            if em.__dict__.get("_heat") is cur:
+                em._heat = self  # the rebuild's throw-away object registered itself as the heated problem
+            et = em.__dict__.get("_coupling")
+            if et is not None:
+                et._result = None
+
     def solve(self, *args, **kwargs):
-        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature."""
+        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature.
+
+        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that
+        network (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the
+        same state ``em.solve()`` then reads the network at. ``tol=`` / ``max_iter=`` set the fixed point."""
         self._refresh_attachments()
         import time as _time
+
+        from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
+
+        _em = peec_source_of(self)
+        if _em is not None:
+            extra = sorted(set(kwargs) - {"tol", "max_iter"})
+            if args or extra:
+                raise ValueError(
+                    "jno.fem: this problem is heated by a jno.peec network's `em.loss`, so its solve is the "
+                    f"coupled fixed point, which takes only tol= and max_iter= (got {extra or 'positional args'}). "
+                    "The network's own solve settings go on jno.peec(..., operator=, restart=, matrix_free=)."
+                )
+            out = coupled(_em, self).solve(**kwargs)
+            return jnp.asarray(out.field) if isinstance(out, ElectroThermalSolution) else out
 
         from .utils.logger import get_logger
         from .utils.solver import newton_krylov as _nk
@@ -4606,9 +4795,12 @@ class FEM:
         def _run(u, *vals):
             return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
 
+        from .utils.solver.parametric_helpers import mark_global_scalar
+
         node = FunctionCall(_run, [sol, *params], name="fem_integral")
         node._per_evaluation = True  # a scalar of the parameters: evaluated once per evaluation
-        return node
+        # one number per solve: usable as another FEM's coefficient, read once rather than per point
+        return mark_global_scalar(node, f"__fem_integral_{id(expr)}")
 
     def _functional_solution(self, solver=None):
         """The one solve every functional over this system shares.
@@ -7810,6 +8002,10 @@ def _fem_impl(
     # Variables in place, so classifying up front prevents one constraint's retag from
     # leaking into another's region detection — e.g. two surface terms on the same
     # region (a Neumann load + a Robin term) that share the bound boundary coordinates.
+    # Point loads (a test function called at point coordinates) are not region terms: they are taken
+    # out here, before classification, and assembled by the native path through the shape functions
+    # of the elements that hold the points.
+    point_terms, constraints = _split_point_terms(list(constraints))
     classified = [
         (c, _contains(c, TestFunction), _contains(c, TrialFunction), *_region_and_support(c, domain)) for c in constraints
     ]
@@ -7906,6 +8102,20 @@ def _fem_impl(
         dirichlet_raw.append((U.field_key, "__constant__", ucomp, _value_from_node(_vn), _vn))
         classification.append(f"dirichlet@{U.name}" + ("" if ucomp is None else f"[{ucomp}]"))
     classification.extend(f"tie@{region}->{U.name}" for _fk, region, _c, U, _uc in const_ties)
+    _plan = getattr(domain, "_shape_plan", None)
+    if _plan is not None and getattr(_plan, "_node", None) is not None:
+        from .geometry import parametric as _par
+
+        _wires = _par.unfollowed(_plan) if _par.has_params(_plan._node) else []
+        if _wires:
+            raise NotImplementedError(
+                f"jno.fem: the line region(s) {_wires} have `jno.np.parameter`s in their vertices or "
+                "radius. The mesh follows a design by stretching along x, y and z between face planes, "
+                "which does not move a tube along its own path, so this FEM would integrate over the "
+                "wire at its reference position whatever the design. Keep the parametric wire out of "
+                "the meshed domain (a jno.peec line on its own, its heat as point loads), or give it "
+                "numbers."
+            )
 
     if is_vpinn and multifield:
         # Single-field is a real boundary, not a guard: the network-trial lowering wraps ONE primary
@@ -8210,6 +8420,12 @@ def _fem_impl(
     if getattr(domain, "dimension", None) == 1 and not is_vpinn:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
+        if getattr(domain, "_trainable_coords", None):
+            raise NotImplementedError(
+                "jno.fem: the 1-D assembler does not read coordinate parameters (`x.trainable()`), so it "
+                "would solve the reference mesh whatever the design. Moving a 1-D mesh is not supported yet."
+            )
+
         _order_1d = _infer_order(constraints)
         # ---- complex 1D: the same real-equivalent split the 2D/3D and non-nodal paths use ----
         # Every other `_is_complex_form` dispatch sits BELOW this branch, so before this a `1j` on a
@@ -8396,6 +8612,30 @@ def _fem_impl(
     # by `kron(P_node, I_vec)`, which `_finalize` already asks for with `vec or 1`. Only the TRANSIENT
     # route pre-builds its reduction in its own branch, so it still falls through here.
     _native_periodic_ok = not periodic_ties or not is_transient
+    if point_terms:
+        # v1 of point loads: the steady, real, native Lagrange path. Anywhere else they are refused
+        # rather than dropped -- the other routes have no place to put them.
+        why = (
+            "a transient form"
+            if is_transient
+            else "a complex form"
+            if _is_complex_form(domain, ir)
+            else "a network-coefficient (VPINN) form"
+            if is_vpinn
+            else "periodic ties"
+            if periodic_ties
+            else "an evolving state"
+            if _evolution
+            else None
+            if _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+            else "this mesh/element"
+        )
+        if why is not None:
+            raise NotImplementedError(
+                f"jno.fem: point loads (`c * v(px, py, pz)`) are supported on steady, real Lagrange problems; "
+                f"this one has {why}."
+            )
+        domain._fem_point_terms = point_terms  # read (and cleared) by assemble_fem_native
     if (
         not is_vpinn
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
@@ -8421,7 +8661,11 @@ def _fem_impl(
             evolution=_evolution,
             bounded=bool(_bounds),
         )
-        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+        if point_terms:
+            classification.append(f"point x{len(point_terms)}")
+        _fem_obj = FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
+        _fem_obj._point_loads = len(point_terms)
+        return _finalize(_fem_obj)
 
     # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively.
     # ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so wrapping each term in ``.real`` /
@@ -9218,6 +9462,8 @@ def _assemble_second_order_time(
 ):
     r"""Reduce a linear second-order-in-time weak form to a first-order augmented block.
 
+    Assembled once, on the reference mesh: a moving mesh (coordinate parameters) is refused below.
+
     A second-order semidiscrete system :math:`M_2 \ddot u + C \dot u + K u = F` is rewritten with
     the velocity :math:`v = \dot u` as the first-order block
     :math:`M_\text{aug}\,\dot y + A_\text{aug}\,y = c_\text{aug}` in :math:`y = [u; v]`::
@@ -9257,6 +9503,12 @@ def _assemble_second_order_time(
     first-order system); runtime parameters on a *coupled* form (the parametric coupled steady
     assembly underneath does not exist yet).
     """
+    if getattr(domain, "_trainable_coords", None):
+        raise NotImplementedError(
+            "jno.fem: a second-order-in-time form (`u.tt`) is assembled once, on the reference mesh, so "
+            "coordinate parameters (`x.trainable()`, a parametric shape) would not move it -- it would solve "
+            "the old shape whatever the design. Not supported yet; a first-order (`u.t`) or steady form is."
+        )
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
     from .utils.solver.fem_utils import bcoo_set_dirichlet_rows, bcoo_zero_rows

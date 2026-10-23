@@ -682,6 +682,12 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     (P1 vertices), so the cell Jacobian, ``JxW`` and physical gradients are exact for P1/P2 nodal
     bases.
     """
+    if getattr(domain, "_trainable_coords", None):
+        raise NotImplementedError(
+            "jno.fem: the VPINN / grouped weak-form context is built once from the reference mesh, so "
+            "coordinate parameters (`x.trainable()`, a parametric shape) would not move it. Not supported "
+            "yet; use an FE trial field (`d.fem_symbols()`), whose assembly follows the moving mesh."
+        )
     dim = int(domain.dimension)
     # element-type label -> polynomial order: TRI6/TET10 == P2; generic "TRI-P{k}"/"TET-P{k}" carries k.
     order = 2 if element_type in ("TRI6", "TET10") else (int(element_type.split("-P")[1]) if "-P" in element_type else 1)
@@ -1160,6 +1166,9 @@ TOPOLOGY_ARG = "__topology__"
 """``args`` key carrying a runtime CONNECTIVITY bundle -- see ``assemble_fem_native(dynamic_topology=)``."""
 
 
+_NO_POINTS = "__jno_no_point_loads__"  # an `args` flag: assemble without the point loads (static placeholders)
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1438,6 +1447,31 @@ def assemble_fem_native(
     ref_hess_all = [None if s.ref_hess is None else jnp.asarray(s.ref_hess) for s in specs]
     cells_f_j = [jnp.asarray(cf, dtype=jnp.int32) for cf in cells_f_all]  # list of (n_cells, n_local_i)
 
+    # Point loads handed over by `jno.fem` (`c * v(px, py, pz)`), read once and cleared.
+    _point_terms = list(getattr(domain, "_fem_point_terms", None) or [])
+    domain._fem_point_terms = None
+    _point_shape = None
+    if _point_terms:
+        if len(fields) != 1 or vecs[0] != 1:
+            raise NotImplementedError(
+                "jno.fem: point loads are implemented for ONE scalar field so far; this form has "
+                f"{len(fields)} field(s) of widths {list(vecs)}."
+            )
+        from .fem_points import PointShape
+
+        _point_shape = PointShape(_cell_type, pts_p1, cells_p1, cells_f_all[0], dim)
+
+    def _point_space():
+        """``(PointShape, cell DOFs)`` for reading the solution at points (one scalar order-1 field)."""
+        if len(fields) != 1 or vecs[0] != 1:
+            raise NotImplementedError(
+                f"jno.fem: a point value `u(px, py, pz)` is implemented for ONE scalar field so far; this form has "
+                f"{len(fields)} field(s) of widths {list(vecs)}."
+            )
+        from .fem_points import PointShape
+
+        return (_point_shape or PointShape(_cell_type, pts_p1, cells_p1, cells_f_all[0], dim)), cdofs[0]
+
     # Per-field cell DOF index arrays: (n_cells, n_local_i * vec_i)
     cdofs = []
     for i in range(len(fields)):
@@ -1532,6 +1566,19 @@ def assemble_fem_native(
     for _exprs in boundary_terms.values():
         for bare in _exprs:
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
+    # Point loads handed over by `jno.fem` (`c * v(px, py, pz)`): their coefficients and coordinates may
+    # be runtime parameters too, so they join the parameter set the solve threads through.
+    # Their parameters ride `runtime_parameter_exprs` (so the solve receives their values in `args`) but stay
+    # OUT of `runtime_parameter_tags`: they are read by the point assembly, not packed per element -- a
+    # (n_points,) array there would be refused as a field on no FE space. Same split as the coordinate
+    # parameters below.
+    from ...trace import Placeholder as _Ph
+
+    _pt_param_exprs: Dict[str, Any] = {}
+    for _pc, _pe in _point_terms:
+        for _node in (_pc, *_pe.coords):
+            if isinstance(_node, _Ph):
+                _collect_runtime_parameter_exprs(_node, _pt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
     # P0 field parameters carry ONE value per element rather than per node, so they gather by cell
@@ -1600,6 +1647,10 @@ def assemble_fem_native(
     _neural = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags)
     neural_param_names, _neural_models = _neural.param_names, _neural.models
     _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
+    _param_and_neural_exprs = {
+        **_param_and_neural_exprs,
+        **{k: e for k, e in _pt_param_exprs.items() if k not in _param_and_neural_exprs},
+    }
 
     # Trainable mesh-coordinate parameters (geometry design variables) registered by
     # ``Variable.trainable()`` on a spatial coordinate: their value is scattered into the P1 geometry
@@ -1781,10 +1832,34 @@ def assemble_fem_native(
             )
         )
     )
+
+    def _reads_position(node):
+        from ..._fem import _walk as _w
+        from ...trace import Variable as _Var
+
+        return any(isinstance(n, _Var) and getattr(n, "axis", "spatial") == "spatial" for n in _w(node))
+
     _tv_args_ok = _first_order_transient or (_is_march and not tv_dirichlet_external)
     for _i, (_fk, _rg, _comp, _val, _vnode) in enumerate(dirichlet_raw):
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is None or _is_neural_coefficient(_vn):
+            continue
+        if _coord_specs and _reads_position(_vnode):
+            # A moving mesh (coordinate parameters) and a value that depends on POSITION, g(x): the
+            # boundary nodes move, so g is re-evaluated where they are now, from the runtime args --
+            # the parametric-row route below. Held at the reference it would answer for the old shape.
+            from ..._fem import _is_temporal_value_node as _is_tv
+
+            if _is_tv(_vnode):
+                raise NotImplementedError(
+                    f"jno.fem: the essential value on {_rg!r} depends on both position and time, on a "
+                    "moving mesh (coordinate parameters). The time-varying path holds it at the reference "
+                    "node positions, so it would not follow the mesh: write it independent of x, or of t."
+                )
+            _found_c: Dict[str, Any] = {}
+            _collect_runtime_parameter_exprs(_vnode, _found_c)
+            _dir_param_exprs.update(_found_c)
+            _dir_param_rows.add(_i)
             continue
         if (
             isinstance(_vn, ModelCall)
@@ -2303,6 +2378,20 @@ def assemble_fem_native(
     # Cell-level field data builder (called inside vmap'd kernels)
     # -------------------------------------------------------------------------
 
+    def _moved_dof_points(fidx, args):
+        """Field ``fidx``'s DOF coordinates where the coordinate parameters put them. Its DOFs must be the
+        mesh vertices (a P1 field): a higher-order field's edge and face nodes are not what the
+        parameters index, and moving them by the vertices' rule is not implemented -- refused."""
+        base = jnp.asarray(np.asarray(pts_f_all[fidx]))
+        if base.shape[0] != pts_j.shape[0]:
+            raise NotImplementedError(
+                "jno.fem: a position-dependent value on a moving mesh (coordinate parameters) needs the "
+                f"field's DOFs to be the mesh vertices; this field has {base.shape[0]} DOF points on "
+                f"{pts_j.shape[0]} vertices (a higher-order space). Use a P1 field, or a value that "
+                "does not depend on position."
+            )
+        return _apply_coord_params(base, args)
+
     def _apply_coord_params(pts, args):
         """Scatter trainable mesh-coordinate parameters (``Variable.trainable()`` on a spatial coordinate)
         into the P1 geometry points, so the cell Jacobian and quad-point coordinates become differentiable
@@ -2785,10 +2874,27 @@ def assemble_fem_native(
                 # P0 -> this cell's single value. Width 1, so the kernel takes its scalar branch and
                 # broadcasts it over the quad points -- which is what a per-element constant is.
                 pv.append(jnp.reshape(flat[c], (1,)))
-            else:
+            elif name in _field_param_names:
                 # Nodal field parameter -> this cell's P1 vertex values, the space the parameter is
                 # defined on, independent of the fields whose terms mention it.
-                pv.append(flat[cells_j[c]] if name in _field_param_names else flat[:1])
+                pv.append(flat[cells_j[c]])
+            else:
+                # A parameter that is on NO FE space is a scalar, broadcast over the cell. An array
+                # here has no cell-to-value map, so `flat[:1]` would spread its FIRST entry over the
+                # whole mesh -- silently, and the answer stays plausible: measured 361.19 K against
+                # the 355.72 K the same 2789 values give when declared on P0. Refuse it instead.
+                # (Shapes are static under trace, so this branch is decided at trace time.)
+                if flat.shape[0] > 1:
+                    raise ValueError(
+                        f"jno.fem: the weak form uses parameter {name!r}, which carries "
+                        f"{flat.shape[0]} values but is bound to no FE space, so nothing says which "
+                        "value belongs to which element -- only the first would be used, for every "
+                        "element. Declare it on a space instead: "
+                        "`jno.np.parameter(d.fem_symbols(space='P0')[1])` for one value per ELEMENT "
+                        "(the design variable of a density topology optimisation), or "
+                        "`jno.np.parameter(u)` for one per NODE. A genuine scalar keeps shape (1,)."
+                    )
+                pv.append(flat[:1])
         return tv + tuple(pv)
 
     # -------------------------------------------------------------------------
@@ -2994,13 +3100,14 @@ def assemble_fem_native(
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
         return loc, meas
 
-    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
+    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None, pts=None):
         """Per-quadrature-point VALUE of an evolution formula on cell ``c`` -> ``(n_quad, *value_shape)``.
 
         The formula carries NO test function, so it is *evaluated* at the quad points rather than
         integrated -- this is the internal-state update the load-step march applies after each solve.
-        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
-        loc, _meas = _vol_readout_loc(c, local_all, t, args)
+        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers. ``pts``
+        is the moved geometry under coordinate parameters (the caller scatters it once per call)."""
+        loc, _meas = _vol_readout_loc(c, local_all, t, args, pts)
         return _eval_integrand(domain, formula, loc)
 
     def _vol_elem_functional(c, local_all, formula, rnames=(), t=0.0, args=None, pts=None):
@@ -3037,8 +3144,10 @@ def assemble_fem_native(
             # runs inside the march's differentiated scan, so those intermediates are retained for the
             # backward pass. One test-DOF's worth of cost per cell is the honest proxy: the readout carries
             # no test function, so there is no element block -- only the per-quadrature-point value.
+            # a moving mesh (coordinate parameters): the state is read where the quad points now are
+            _pts_ro = _apply_coord_params(pts_j, args) if _coord_specs else None
             nxt = _elem_map(
-                lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args),
+                lambda c, la, _f=formula, _p=_pts_ro: _vol_elem_readout(c, la, _f, t, args, _p),
                 (jnp.arange(n_cells), local_all),
                 _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
             )
@@ -3387,12 +3496,12 @@ def assemble_fem_native(
                 loc["qp_history"] = {kk: sbuf[kk][fi] for kk in surface_history_specs if kk in sbuf}
         return loc, face_w * jac_f
 
-    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None, gaps=None):
+    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None, gaps=None, pts=None, normals=None):
         """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
 
         The formula carries no test function, so it is *evaluated*, not integrated -- the advance for a
-        surface state (a slip)."""
-        loc, _w = _surf_readout_loc(fi, local_all, region, t, args, gaps=gaps)
+        surface state (a slip). ``pts`` / ``normals``: the moved geometry under coordinate parameters."""
+        loc, _w = _surf_readout_loc(fi, local_all, region, t, args, pts, normals, gaps=gaps)
         return _eval_integrand(domain, formula, loc)
 
     def _surf_elem_functional(fi, local_all, formula, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
@@ -3425,9 +3534,13 @@ def assemble_fem_native(
             # An augmented-Lagrangian update `lam.evolves(max(0, lam.i(-1) - c*g))` reads the gap here,
             # so the same main-side gather the residual uses has to reach the readout.
             gsl = _gap_slices(region, fids, {k: _gap_gather(u_flat, k, args) for k in _gap_tables}, args)
-            vals = jax.vmap(lambda fi, la, gp, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args, gp))(
-                fids, lv, gsl if gsl else {}
-            )
+            _pts_ro = _apply_coord_params(pts_j, args) if _coord_specs else None
+            _nrm_ro = _surface_normals(_pts_ro) if _pts_ro is not None else None
+            vals = jax.vmap(
+                lambda fi, la, gp, _f=formula, _r=region, _p=_pts_ro, _n=_nrm_ro: _surf_elem_readout(
+                    fi, la, _f, _r, t, args, gp, _p, _n
+                )
+            )(fids, lv, gsl if gsl else {})
             # Normalize to the state's declared per-face shape (n_faces, n_quad_surf, *value_shape): a
             # scalar update written with `inner(dir, u.bind(...), 1)` keeps a spurious trailing size-1 axis
             # (harmless in the residual, where it contracts with the test) that must be squeezed here.
@@ -3575,6 +3688,29 @@ def assemble_fem_native(
             "wrong elements with every shape still matching -- refused rather than answered wrongly."
         )
 
+    def _point_positions(pe, args):
+        """``(n, dim)`` point coordinates of a point evaluation, from numbers, arrays or parameters."""
+        from ..._fem import _point_value
+
+        cs = [jnp.reshape(_point_value(c, args), (-1,)) for c in pe.coords]
+        if len(cs) != dim:
+            raise ValueError(f"jno.fem: {pe!r} gives {len(cs)} coordinate(s) on a {dim}-D mesh.")
+        n = max(int(c.shape[0]) for c in cs)
+        if any(int(c.shape[0]) not in (1, n) for c in cs):
+            raise ValueError(
+                f"jno.fem: the coordinate arrays of {pe!r} have different lengths {[int(c.shape[0]) for c in cs]}."
+            )
+        return jnp.stack([jnp.broadcast_to(c, (n,)) for c in cs], axis=1)
+
+    def _point_load(pcoef, pe, args, pts_dyn):
+        """``(cell, c_i N_a(p_i))`` of one point term: the elements holding the points and the loads."""
+        from ..._fem import _point_value
+
+        pos = _point_positions(pe, args)
+        coef = jnp.broadcast_to(jnp.reshape(_point_value(pcoef, args), (-1,)), (pos.shape[0],))
+        cell, N = _point_shape(pos, pts_dyn)
+        return cell, coef[:, None] * N
+
     def _make_residual(terms, bterms=None):
         """Build the free global residual ``R(u_flat) -> (total,)`` (volume + optional surface).
 
@@ -3582,6 +3718,7 @@ def assemble_fem_native(
         ``None`` (the default) to assemble volume terms only — used for the transient mass matrix,
         where boundary contributions must not appear."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
+        point_work = list(_point_terms) if bterms is not None else []
 
         def residual(u_flat, t=0.0, args=None):
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
@@ -3671,6 +3808,11 @@ def assemble_fem_native(
                             pts_dyn,
                             _nrm_for(region),
                         )
+            # point loads: c_i * v(p_i) -> c_i N_a(p_i) on the DOFs of the element holding p_i. Not part of
+            # a volume-only build (`bterms is None`: the transient mass matrix), like the surface terms.
+            for pcoef, pe in point_work if not (args and args.get(_NO_POINTS)) else ():
+                cell_, w_ = _point_load(pcoef, pe, args, pts_dyn)
+                R = R.at[cd_d[0][cell_].reshape(-1)].add(w_.reshape(-1))
             return R
 
         return residual
@@ -4760,10 +4902,15 @@ def assemble_fem_native(
                         pts_all[np.asarray(nid_list, dtype=np.int64)] if nid_list else np.zeros((0, dim)),
                     )
                 node_ids, pts = _static_dirichlet_cache[_lk]
-                raw = jnp.asarray(_eval_at(value_node, jnp.asarray(pts), params=a)).reshape(-1)
-                # Constant vs spatial profile: a constant returns the same shape for ANY batch (the
-                # static-path trick) -- one extra single-point evaluation decides, shapes are static.
-                one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a)).reshape(-1)
+                if _coord_specs and node_ids:
+                    pts = _moved_dof_points(fidx, a)[jnp.asarray(node_ids, dtype=jnp.int32)]
+                from ..._fem import _follows_moving_mesh
+
+                with _follows_moving_mesh():  # `pts` are the moved boundary nodes (or nothing moves)
+                    raw = jnp.asarray(_eval_at(value_node, jnp.asarray(pts), params=a)).reshape(-1)
+                    # Constant vs spatial profile: a constant returns the same shape for ANY batch (the
+                    # static-path trick) -- one extra single-point evaluation decides, shapes are static.
+                    one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a)).reshape(-1)
                 if raw.shape == one.shape or not node_ids:
                     gvals = jnp.broadcast_to(raw.reshape(-1)[:1], (len(node_ids),))
                 else:
@@ -4977,10 +5124,15 @@ def assemble_fem_native(
                     s0 = _cover_state0(s0, fidx, comp, u0_node, params)
                     continue
                 pts_ic = pts_f_all[fidx]  # (n_nodes_f[fidx], 2)
+                if _coord_specs and params is not None and _reads_position(u0_node):
+                    pts_ic = _moved_dof_points(fidx, params)  # a moving mesh: u0(x) where the nodes are now
                 nn, vv = n_nodes_f[fidx], vecs[fidx]
-                raw = jnp.reshape(
-                    jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params, t=t0)), (-1,)
-                )
+                from ..._fem import _follows_moving_mesh
+
+                with _follows_moving_mesh():  # the moved nodes when the mesh moves (state0_fn re-forms it)
+                    raw = jnp.reshape(
+                        jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params, t=t0)), (-1,)
+                    )
                 if comp is None and fields[fidx].get("symmetric"):
                     raw = _symmetric_ic_values(raw, int(tuple(fields[fidx]["value_shape"])[0]), nn)
                 if comp is not None:
@@ -5003,7 +5155,9 @@ def assemble_fem_native(
             return s0
 
         common["state0"] = _state0_at({n: m.module for n, m in _ic_net_models.items()} if _ic_net_models else None)
-        if _ic_net_models:
+        # re-formed from args when a net is the IC, or when the mesh moves under a position-dependent IC
+        _ic_moves = bool(_coord_specs) and any(_reads_position(_essential_spec(_bare(ic))[1]) for ic in ic_residuals)
+        if _ic_net_models or _ic_moves:
             common["state0_fn"] = _state0_at
 
         dirichlet_pairs = _build_dirichlet_pairs()
@@ -5439,6 +5593,7 @@ def assemble_fem_native(
         or history_specs
         or surface_history_specs
         or _coord_specs
+        or _pt_param_exprs  # a point load's coefficient or position is a parameter
     ):
         from ...trace import FemLinearSystem
 
@@ -5578,8 +5733,11 @@ def assemble_fem_native(
         # Static placeholder for .A/.b: scalar params at 0, networks (coefficient + Dirichlet) at stored
         # weights, Dirichlet-value parameters at their STORED value (like the nets: `fem.b` then reflects
         # the initialized boundary value rather than an arbitrary zero condition).
+        # Point loads are left out of it (`_NO_POINTS`): their positions may be parameters, and at an
+        # arbitrary placeholder value they need not even lie in the mesh -- a solve always passes them.
         a0, b0 = _assemble_at(
-            {n: 0.0 for n in runtime_parameter_tags}
+            {_NO_POINTS: True}
+            | {n: 0.0 for n in runtime_parameter_tags}
             | {n: _neural_models[n].module for n in neural_param_names}
             | {n: m.module for n, m in _dir_net_models.items()}
             | {n: jnp.asarray(nd.model.module.value) for n, nd in _dir_param_exprs.items()}
@@ -5594,6 +5752,7 @@ def assemble_fem_native(
             # parameter basis), so every runtime parameter -- affine or not -- takes the re-assembly route.
             metadata={"nonaffine_operator": True},
         )
+        op._point_space = _point_space  # what `u(px, py, pz)` on the solve node reads with
         return op, "linear", offs
 
     # nonlinear (non-parametric)

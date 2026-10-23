@@ -1,0 +1,830 @@
+# Partial-Element Equivalent Circuits (PEEC)
+
+`jno.peec` solves for the **current distribution in a conductor network** — resistance, loop
+inductance, current sharing between parallel paths, and the ohmic loss that feeds a thermal model. It
+is the method of choice for a busbar, a power-module layout, a transformer winding or a bond-wire
+loop: geometry that is *mostly metal in mostly air*, where meshing the surrounding space would be the
+whole cost.
+
+Unlike [`jno.fem`](fem/index.md), a partial-element method **never meshes the air**. A conductor becomes
+filaments carrying its centreline and cross-section, and the operator is Ruehli's Neumann double
+integral over their pairs (Ruehli, *Inductance calculations in a complex integrated circuit
+environment*, IBM J. Res. Dev. **16**(5), 470 (1972); *Equivalent circuit models for three-dimensional
+multiconductor systems*, IEEE Trans. Microwave Theory Tech. **22**(3), 216 (1974)). Kirchhoff's laws
+over those partial elements are the whole system.
+
+!!! info "No optional extra"
+    `jno.peec` is part of the core install. It needs no backend beyond JAX and SciPy.
+
+## The front door — geometry, material, and what is impressed on the terminals
+
+The input is a **constraint list**, exactly as [`jno.fem`](fem/index.md) takes one. The conductors and
+their conductivity come from the geometry; the list says only what is impressed on the terminals.
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)
+import jno
+
+SIG = 5.8e7                                          # copper, S/m
+L, W, T = 0.040, 0.004, 0.3e-3                       # a power-module trace, ONE cell thick
+trace = (jno.shape.box(0, 0, 0, L, W, T, size=(1e-3, 1e-3, T))
+         .attach(sigma=SIG).name("trace"))
+
+d = trace.domain()
+d.tag("A", lambda x, y, z: x < 1.1e-3)               # the two pads, by position
+d.tag("B", lambda x, y, z: x > L - 1.1e-3)
+
+i, v = d.peec_symbols()
+at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
+
+sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).solve()
+print(f"R = {float(sol.R) * 1e6:.2f} uOhm    L = {float(sol.L) * 1e9:.2f} nH")
+```
+
+`d.peec_symbols()` hands back the two circuit quantities — a terminal **current** `i` and a nodal
+**potential** `v` — and `at(...)` splats a tagged region into the coordinates a port is written on.
+
+### Four constraint forms, and only four
+
+| form | meaning |
+|---|---|
+| `v(A) - v(B) - g` | a **source**: `g` volts impressed across the port |
+| `v(A) - g` | a **fixed potential**: `A` held at `g` |
+| `i(A) - g` | a **fixed current**: `g` amps injected at `A` |
+| `v(A) - v(B) - Z*i(A)` | a **two-terminal device**: Ohm's law, `Z` ohms between the pads |
+
+The first three are the whole vocabulary of a port. The fourth is what puts a **component** in the
+network without meshing it as metal:
+
+```python
+# a MOSFET's on-resistance, as a circuit element rather than as geometry
+constraints = [
+    v(*at("DCP")) - v(*at("DCN")) - 1.0,
+    v(*at("MD")) - v(*at("MS")) - 5e-3 * i(*at("MD")),
+]
+```
+
+!!! tip "A device parameter belongs in the circuit, not the geometry"
+    Voxelise a 0.18 mm die on a 0.285 mm grid and its resistance follows the grid — which is both
+    wrong and the reason the grid had to be fine. As a device it is exact and costs nothing.
+
+## Conductors — lines and solids
+
+A conductor is one of two things.
+
+=== "A line — `jno.shape.line`"
+
+    A tube swept along a polyline: a bond wire, a via, a round conductor. Its filaments follow the
+    centreline, and its cross-section is the tube radius.
+
+    ```python
+    wire = jno.shape.line(
+        [(0, 0, 0), (5e-3, 0, 2e-3), (10e-3, 0, 0)],    # the arc of a bond wire
+        r=1.9e-4, size=1e-3,
+    ).attach(sigma=5.8e7).name("wire")
+    ```
+
+=== "A solid — any closed-form shape"
+
+    Voxelised onto a lattice: nodes at cell centres, elements the bars joining adjacent centres. Any
+    shape with a closed-form `contains` works, not just a box — including CSG.
+
+    ```python
+    plate = jno.shape.box(0, 0, 0, 0.02, 0.006, 1e-3, size=(1e-3, 1e-3, 1e-3))
+    plate = plate.attach(sigma=5.8e7).name("plate")
+    ```
+
+Solids on the same lattice **share it**, and a line landing on a solid is **welded** where the metal
+touches — so a bond wire arcing onto a trace carries current across the joint with no extra
+declaration.
+
+### Composing a layout — `+` is not union
+
+Two different operators, and mixing them up is the first thing that bites:
+
+| | |
+|---|---|
+| `a \| b`, `a - b`, `a & b` | **CSG**, within one conductor — an L-shaped trace, a hole through a plane |
+| `a.name(..) + b.name(..)` | **region composition** — separate conductors, each with its own `sigma` |
+
+A whole layout is therefore CSG for each part, `+` between them, and the cell pitch goes on the
+**Shape** (`size=`), not on `.domain()`:
+
+```python
+mm, P = 1e-3, 0.5e-3
+lower = (jno.shape.box(0, 0, 0, 30*mm, 6*mm, 0.5*mm, size=(P, P, P))
+         - jno.shape.cylinder(12*mm, 3*mm, -1*mm, 0, 0, 3*mm, r=1.2*mm)).name("lower")
+via   = jno.shape.box(26*mm, 2*mm, 0.5*mm, 29*mm, 4*mm, 1.5*mm, size=(P, P, P)).name("via")
+upper = (jno.shape.box(20*mm, 2*mm, 1.5*mm, 40*mm, 4*mm, 2.0*mm, size=(P, P, P))
+         | jno.shape.box(36*mm, 2*mm, 1.5*mm, 40*mm, 10*mm, 2.0*mm)).name("upper")
+
+d = (lower.attach(sigma=CU) + via.attach(sigma=CU) + upper.attach(sigma=AL)).domain()
+d.tag("IN",  lambda x, y, z: x < 0.6*mm)
+d.tag("OUT", lambda x, y, z: (y > 9.4*mm) & (z > 1.4*mm))     # a pad on the OTHER layer
+```
+
+Two layers, a via between them, a cut-out, an L-shape and two materials — the via conducts because
+the geometry says the metal touches, not because anything declared a connection.
+
+!!! warning "One lattice, one pitch"
+    Every solid voxelises onto the **same** grid, so the pitch has to resolve the thinnest feature in
+    the whole layout. A 35 µm foil beside a 3 mm busbar is expensive for that reason, not because
+    either is hard on its own. Wires (`Shape.line`) are exempt — they carry their own analytic
+    cross-section and weld to whatever they land on.
+
+!!! warning "A lattice conducts centre-to-centre"
+    Nodes sit at cell centres, so the conducting span of an `n`-cell run is `extent × (n-1)/n`, not
+    `extent`. This is the standard convention (pypeec uses it too) and it converges as `1/n`, but on a
+    coarse grid it is a visible offset rather than a rounding error.
+
+## Conductivity is a design variable as often as it is a constant
+
+`.attach(sigma=...)` takes three spellings, and a gradient flows back through all three:
+
+```python
+.attach(sigma=5.8e7)                              # a material
+.attach(sigma=lambda x, y, z: SIG * rho(x, y))    # a FIELD: the density is the design
+.attach(sigma=SIG * rho)                          # one value per element
+.attach(sigma=(sx, sy, sz))                       # ANISOTROPIC — and each of the three may
+                                                  # itself be any of the above
+```
+
+A callable is evaluated at each element — cell centres for a solid's lattice, midpoints for a wire —
+and its arity is positional, exactly as an attached FEM coefficient's is, so `lambda x, y` is a planar
+field. That is the usual one: a trace is thin, and its material varies across the board rather than
+through the 0.57 mm of it.
+
+!!! tip "Prefer the callable to the vector"
+    A callable says nothing about the pitch, so it survives a change of `size=`. A per-element vector
+    cannot — and it must be the right length, which for a lattice is **one value per cell, not per
+    bar**. A 40 × 4 × 1 cell trace has 160 cells and 276 bars; the vector is 160 long. A wrong length
+    raises and names both numbers.
+
+A field is what makes a **density (SIMP) topology optimisation** expressible here. What it does *not*
+do is move the geometry: the lattice is fixed, so a cell whose conductivity goes to zero is still a
+cell, still joined by bars, and still counted as metal by the thickness runs behind the skin term.
+That is the ordinary fixed-mesh treatment, and it is why a converged density has to be **read back out
+as a shape** rather than assumed to be one.
+
+A conductivity may also be **traced**, which is what closes an electro-thermal loop — copper is about
+31 % more resistive at 100 °C than at 20 °C.
+
+!!! info "Anisotropy is diagonal, and a wire projects it"
+    The bars are axis-aligned, so an off-diagonal conductivity has nowhere to live in this
+    discretisation — `(sx, sy, sz)` is the whole vocabulary. A `Shape.line` is one-dimensional, so
+    what reaches it is the component along its own tangent, `t · σ · t`, which is the physically
+    right answer rather than a refusal: a transverse conductivity cannot drive current along a
+    filament. A `(3,)` array on a conductor with exactly three elements is ambiguous and raises.
+
+## Frequency and the skin effect
+
+Pass `freq=` a scalar or an array. Each filament carries **one** current, and its self term is the DC
+geometric mean distance, so the skin effect **within** a filament is not resolved by subdivision — it
+enters as an analytic **surface impedance** on elements that span the whole thickness.
+
+That gives a hard rule, and `jno.peec` enforces it when the network is discretised rather than returning a wrong number:
+
+!!! danger "One cell through the thickness, or thirty times finer"
+    An element may take the surface impedance only when it **is** the whole thickness — there it is
+    exact at any frequency. Otherwise the cells must resolve the skin depth (at least two per `δ`).
+    Anything in between falls back to the DC resistance, and is **refused**:
+
+    ```
+    jno.peec: 712 of 712 elements sit in a conductor that is 2 elements thick where each is
+    1 mm, against a skin depth of 0.06609 mm at 1e+06 Hz -- 30.3 skin depths through it.
+    Neither model applies there: ... Use ONE cell through the thickness -- the surface
+    impedance is exact there at any frequency -- or at least 30x finer so two cells fit in a
+    skin depth.
+    ```
+
+    A power-module trace is 0.3 mm of copper and `δ` at 100 kHz is 0.21 mm, so **one cell through the
+    thickness is the right model** for almost every layout problem — and it is also the cheap one.
+
+## Magnetic materials
+
+**What a region carries decides what it is.** There is no mode flag, no solver argument and no second
+entry point — `Shape.attach` is already generic, so declaring a core needs no new mechanism:
+
+| a region attaching | is |
+|---|---|
+| `sigma=` | a conductor |
+| `mu_r=` | a core that does not conduct — ferrite, a powder core |
+| both | a conducting magnetic material — a lamination, a lossy core |
+| neither | refused: there is nothing to solve on it |
+
+The four constraint forms are **unchanged**. A port is electric whether or not there is a core in the
+picture, so nothing you already know stops being true:
+
+```python
+core = (jno.shape.box(0, 0, 0, 0.024, 0.024, 0.008, size=(0.002,) * 3)
+        - jno.shape.box(0.006, 0.006, -0.002, 0.018, 0.018, 0.010)).attach(mu_r=1000.0).name("core")
+
+d = (core + turn).domain()       # `turn`: one solid turn threading the window, elided here
+...
+sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).solve()
+print(float(sol.L) * 1e9)        # 916.7 nH, against mu0 mu_r A / l = 837.8 nH
+```
+
+Delete the `.attach(mu_r=...)` and the same script solves the air-cored inductor, which is the
+comparison a designer wants anyway. Here that is 18.3 nH — the core is worth a factor of 50.
+
+!!! warning "That 2 mm pitch is a demonstration pitch, not a converged one"
+    Refining the core to `1 x 2 x 2` mm moves `L` by **16 %** — and moves it from 9 % *above* the
+    reluctance law to 10 % *below*. A core mesh converges no faster than a conductor mesh does, so
+    treat a single run as an order-of-magnitude answer until you have refined it twice.
+
+    What **is** sharp on a coarse mesh is the *scaling*. `L` approaches proportionality to `mu_r`
+    from below as the core takes over from the air path in series with it — 1803.2 / 17759.7 /
+    177324.8 nH at 2000 / 20000 / 200000, so decade ratios of 9.849 then 9.985 — and it is flat in
+    frequency over two decades. Trust the trends before the absolute value.
+
+Both numbers, and the winding this elides, are `tests/test_peec_magnetic_oracle.py`.
+
+### What the core actually is, in the solve
+
+A magnetic material is not a coefficient on the conductor solve. It is a **second unknown field** —
+magnetisation fluxes on the core's own mesh — coupled to the electric one (Torchio et al., *A PEEC
+method with magnetic materials*, IEEE TMTT **66**(5), 2018):
+
+$$ \mathbf{Z}\,\mathbf{I}_c + j\omega \mathbf{K}^{\!\top} \mathbf{I}_m - \mathbf{A}^{\!\top}\boldsymbol{\varphi} = 0,
+\qquad \left(\mathbf{R}_m + \mathbf{A}_m^{\!\top} \mathbf{P}_m \mathbf{A}_m\right) \mathbf{I}_m = \mathbf{K}\,\mathbf{I}_c $$
+
+Two consequences are worth knowing about rather than discovering:
+
+- **The constitutive quantity is the susceptibility** `chi = mu_r - 1`, not `mu_r`. What circulates in
+  the magnetic mesh is the magnetisation, and air adds none — so `mu_r = 1` is not a weak core, it is
+  *no* core, and it is dropped at the front door with a warning rather than solved as one.
+- **`sol.L` includes the magnetisation's flux**; `sol.field(points)` does not. The port inductance is
+  the total linkage, but a probed `B` sums the conductor currents only.
+
+A complex `mu_r` is accepted and is how core loss will enter — the imaginary part of `chi` is the lossy
+component of the magnetisation, exactly as a complex permittivity carries dielectric loss.
+
+!!! danger "Three limits, and each is refused rather than approximated"
+    **Not at DC.** The magnetisation reaches the circuit only through `j w K'`, which is identically
+    zero at `omega = 0` — so the core would be solved for and then have no effect, and the inductance
+    returned would be the coreless one. Solve at a frequency; `L` is flat well below the first
+    resonance, so any small one gives the magnetostatic answer.
+
+    **Not welded to a `Shape.line`.** A weld already needs a dense cross block and a whole-system
+    factorisation; a coupled magnetic system on top of that is untested. Model the winding as a solid.
+
+    **Linear.** There is no saturation and no B-H curve — `mu_r` is a constant of the material.
+
+### What a core costs to solve
+
+The preconditioner treats the electric and magnetic halves independently and **neglects the coupling
+between them** — pypeec's choice, and it keeps the electric preconditioner the one already measured
+and tuned. That is why a core defaults to `restart=64` rather than a lattice's 16, exactly as a welded
+network does: the residual polynomial has more to do, and the deeper subspace is *faster*, not slower.
+
+Measured on the square-ring core, `mu_r = 2000`, refining 1,044 → 2,160 magnetic elements:
+
+| | restart 16 | restart 64 | restart 128 |
+|---|---|---|---|
+| 2,160 magnetic elements | **fails** at 5.1e-06, 30.5 s | 9.5 s | 10.8 s |
+
+**Core strength is not what costs.** `mu_r` of 2,000, 20,000 and 200,000 all converge at the *shallow*
+subspace in 1.7 s on the coarse mesh. It is the mesh that costs. If a refined core stalls, `restart=`
+deeper is the first thing to try — the error message says so, and here it is also three times faster.
+
+A frequency sweep is nearly free per extra point: three frequencies cost about what one does, because
+the geometry-dependent operators are rebuilt once per solve rather than per point.
+
+### The gap is quantised, like every other lattice dimension
+
+A core is a solid, so it is cut into whole cells, and a **gap is a whole number of cells**. Asking for
+0.5 mm on a 2 mm pitch silently cuts nothing at all. Worse, cutting about a cell *centre* catches an
+odd number of rows and about a cell *face* an even number, so the reachable gaps are not what a naive
+sweep assumes. Pitch the lattice to the gap you mean to resolve, and check the element count moves
+when you widen it.
+
+This is the same quantisation that applies to a trace-to-plane spacing, and it is the reason a gap
+sweep is a rebuild per point rather than a gradient — see [Geometry as a design
+variable](#geometry-as-a-design-variable). The **permeability**, by contrast, is differentiable like
+any other material value: `jax.grad` through `mu_r` matches a central difference to five digits.
+
+## The geometry is discretised once
+
+The host work — which cells are metal, which nodes a pad owns, which filaments weld to which — runs on
+the **first** `solve()`, and the network keeps it. Every later solve reuses it, so a design loop pays
+for it once:
+
+```python
+emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5)   # discretised on the first solve
+
+@jax.jit
+def loss(rho):
+    return emag.solve(sigma={"trace": SIG * rho}).joule
+```
+
+A solve after the first is **pure JAX**, so it jits and composes into `jno.core` through `jno.fn`
+exactly as `fem.solve()` does — which is what puts a PEEC objective behind `.optimizer()`,
+`jno.optimizers.mma` and `jno.le`. Measured on a 1,540-bar plate: **42×** on the value and **23×** on
+the gradient, because the host pass, not the solve, was the cost.
+
+!!! warning "A network freezes its STRUCTURE at the first solve"
+    A design variable may change a **conductivity**, and stretch the cells it was discretised into —
+    a wire's path and radius, a solid's faces on a `faces` grid (see below) — but never add or renumber
+    them. Make a new `jno.peec` for a new topology.
+
+## Grading the mesh
+
+By default every solid shares **one pitch**, taken from its own `size=`. That is what keeps the
+operator translation-invariant, and therefore what lets the apply be an FFT — but it cannot serve a
+real layout. A power module puts a 1.00 mm minimum trace on a plate tens of millimetres across, and
+resolving that trace uniformly costs one to three million elements, so the runs you can afford have
+**one cell across the narrowest conductor** — and current crowding has no edge to crowd against in a
+discretisation with no edge.
+
+`grid=` refines toward every conductor face instead:
+
+```python
+emag = jno.peec(
+    [v(*at("DC+")) - v(*at("DC-")) - 1.0],
+    freq=1e6,
+    grid=jno.peec.graded(fine=0.4e-3, halo=1.0e-3),
+)
+sol = emag.solve(operator=jno.solve.hierarchical(tol=1e-6))
+```
+
+Measured on layout1's plate-less loop against a converged Ansys Q3D reference of **54.505 nH**:
+
+| mesh | elements | `L` | error |
+|---|---:|---:|---:|
+| uniform 1.0 mm | 13 381 | 58.803 nH | +7.88 % |
+| uniform 0.5 mm | 53 458 | 57.957 nH | +6.33 % |
+| uniform 0.4 mm | 83 705 | 57.340 nH | +5.20 % |
+| **graded** | **8 192** | 57.299 nH | +5.13 % |
+| **graded** | **14 111** | 56.604 nH | **+3.85 %** |
+
+8 192 graded elements match 83 705 uniform ones, and 14 111 beat them outright while still falling —
+where the uniform sequence had flattened. The elements were never the problem; their placement was.
+
+!!! warning "A graded grid has no FFT"
+    Grading gives up translation invariance, so `lattice_apply` **refuses** a graded lattice rather
+    than returning the uniform-grid answer — which would be right where the spacing is constant and
+    wrong everywhere it changes. Pass `operator=jno.solve.hierarchical(...)` to `solve()`.
+
+`fine` is the cell size at a face and `halo` how far that reaches either side of one; the base
+spacing away from every face stays each shape's own `size=`. An axis with no interior face is left
+alone, so a grid is only refined where there is something to resolve.
+
+## Reading the solution
+
+| readout | what it is |
+|---|---|
+| `sol.Z` / `sol.R` | terminal impedance of the source port, ohm |
+| `sol.L` | loop inductance from the **field energy**, `Iᴴ Lp I / \|I_port\|²`, henry |
+| `sol.joule` | ohmic dissipation at the solved excitation, `Σ R_k \|I_k\|²`, watt |
+| `sol.dissipation()` | `{region: W/m³}` — total loss, shaped for `d.attach`; `.sigma` / `.mu_r` split it |
+| `sol.current(t)` | net current injected at terminal `t`, amp |
+| `sol.voltage(a, b=None)` | potential at terminal `a`, or the difference `a - b`, volt |
+| `sol.i` | the filament currents themselves |
+| `sol.field(points)` | magnetic flux density at `(n, 3)` positions, tesla — see below |
+| `sol.export_vtk(path)` | the solved currents as line cells, for ParaView |
+| `sol.partial` | the dense `(n, n)` partial inductances — **formed on demand**, never at solve time |
+
+`L` comes from the energy rather than `Im(Z)/ω` so that it is defined at DC too, and so that it stays
+the loop inductance the currents actually produce: at a frequency where they redistribute, that is a
+different (smaller) number than the DC one, which is the effect worth seeing.
+
+### The field off the metal
+
+A partial-element method never meshes the air, so the field away from the conductors is not a solved
+unknown — it is a Biot-Savart sum over the currents that **were** solved for:
+
+```python
+B = sol.field(probe_points)          # (n, 3) tesla, free space
+```
+
+It is a readout, not a second problem: no boundary condition, and differentiable in the currents
+**and** in the points — which is what an EMI objective over a keep-out volume needs.
+
+!!! warning "Free space, and off the metal"
+    `field()` sums the **conductor** currents only. With a core in the model its magnetisation also
+    produces flux, and that part is not in this readout — the port inductance from `sol.L` does
+    include it, but a probed `B` does not. A probe inside a conductor's own cross-section is
+    **refused**: the kernel is singular
+    there, and the field inside the metal is not what this computes. (A point on the *axis* of a
+    straight filament is not the dangerous case — the field vanishes there by symmetry.)
+
+### An open terminal
+
+A terminal that carries no current is invisible to `current` and to the port impedance — a
+transformer's unloaded secondary is the case that matters. Its induced voltage is in the nodal
+potentials, and `voltage` is how they are read:
+
+```python
+sol = jno.peec([
+    v(*at("P+")) - v(*at("P-")) - 1.0,   # drive the primary
+    i(*at("S+")) - 0.0,                  # secondary open: no current
+    v(*at("S-")) - 0.0,                  # and a reference to measure against
+], freq=100e3).solve()
+
+ratio = abs(complex(sol.voltage("S+", "S-")))    # volts per volt in
+```
+
+Prefer the two-terminal form. A single potential is defined only against whatever the solve pinned —
+a declared ground, or the source's negative side when there is exactly one source and no ground — so
+it moves if that reference changes, while a difference does not.
+
+A terminal's potential is its pad's, exactly as the source and device rows define it: an unweighted
+pad is shorted, so any of its nodes carries it; a `weights=` pad is deliberately not shorted and is
+then the weighted sum, with the same unnormalised weights the constraint rows use.
+
+### Core loss
+
+A **complex** `mu_r` is a lossy core — the imaginary part of χ is the lossy component of the
+magnetisation, exactly as a complex permittivity carries dielectric loss:
+
+```python
+core = Shape.box(...).attach(mu_r=2000 - 200j).name("core")
+...
+d = sol.dissipation()
+d["core"]        # W/m³, everything that region dissipates
+d.mu_r["core"]   # the core-loss part alone
+d.sigma["bar"]   # the ohmic part of a conductor
+```
+
+The mapping itself is the **total**, so the thermal path below is unchanged and a region that is
+both conductor and core never contributes half of itself by accident. The channels are named after
+the property that caused them — the same spelling in and out, as with `.attach(k=...)` and `d.k`.
+
+!!! note "Checked by power balance"
+    Driven by 1 V a passive network takes in `Re(1/Z)`, and that comes back out as ohmic loss plus
+    core loss and nothing else. That is the oracle the core-loss channel is tested against, so it
+    carries no convention of its own.
+
+### Electro-thermal coupling
+
+The loss heats the conductor, and a hotter conductor is more resistive -- copper by about 0.39 %/K. The
+two problems are written as two term lists that refer to each other -- the network's conductivity reads
+the FEM field, the FEM's source is the network's loss -- and those references are the coupling:
+
+```python
+T, s = d.fem_symbols()
+d.attach(sigma=SIG20 / (1 + ALPHA * (T - 293.15)), k=400.0)   # sigma depends on the FEM field T
+
+i, v = d.peec_symbols()
+em = jno.peec([v(*at("P")) - v(*at("N")) - 1.0], freq=1e6)
+
+heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(*at("N")) - 300.0])
+
+T_conv = heat.solve()       # the converged field: a fixed point, sigma(T) <-> T
+sol = em.solve()            # the network at that field: sol.R, sol.L, sol.current("P"), ...
+```
+
+`em.loss` is the loss density of each conductor [W/m^3], a coefficient the weak form uses like any
+other; the coupled solve fills it in. Solving either problem converges the pair once, and the other's
+solve reads that same state. The temperature reaches each PEEC element by linear interpolation
+of the FEM field at the element centre. With a trainable `jno.np.parameter` in either problem,
+`heat.solve()` returns the converged field as a trace node over the parameters and `em.solve()` readouts
+computed from that node, and the gradient goes through the fixed point by `jax.lax.custom_root` --
+implicit differentiation, not unrolled iterations. To optimise, put those readouts in `jno.core`.
+
+!!! warning "Scope"
+    The heat problem must be **linear** in its field (a constant or region-wise `k`), the field a scalar
+    P1 field on the same domain, and the network solved at **one** frequency. The geometry is frozen at
+    the first solve, as for any network. A conductivity written in a FEM field cannot be solved without its
+    FEM problem: `em.solve()` refuses and says how to write it.
+
+`sol.dissipation()` still returns the `{region: W/m^3}` mapping, for a thermal model outside jNO.
+
+## Solver controls
+
+All three are optional and all three live on `solve()`.
+
+```python
+sol = built.solve(restart=48, matrix_free=None, devices={"MD": 6.1e-3})
+```
+
+`restart`
+:   GMRES restart depth on the matrix-free path. The default is chosen **by structure**: `16` for a
+    plain lattice, `64` for a welded network. Neither suits both — a welded network's port excitation
+    spreads over far more of the operator's eigenmodes, so it needs the deeper subspace, while a
+    lattice converges in about 35 steps and a deeper one is only `O(m²)` orthogonalisation it never
+    uses:
+
+    | | restart 16 | restart 64 |
+    |---|---|---|
+    | welded module, 27,533 elements | 49.5 s | **32.8 s** |
+    | plain lattice, 10,048 bars | **0.39 s** | 1.12 s |
+
+    Raise it further when a solve refuses: at a 0.7 mm pitch (21,980 bars) 16 left a 9.3e-06 residual
+    where 1e-6 was wanted, while 48 converged *and* finished sooner — 176 s against the 290 s the
+    shallower one spent failing.
+
+`matrix_free`
+:   `None` decides by structure: a network containing a bar lattice is applied by **FFT**, anything
+    else forms the dense operator. `False` forces the dense path — exact, but `O(N²)` memory.
+
+`devices`
+:   `{terminal: Z}` overriding a device's impedance at solve time. A device value that **depends on
+    the solved state** cannot be a constant in the constraint list; a SiC die's on-resistance rises
+    about 0.5 %/K, so an electro-thermal fixed point has to re-impress it every pass.
+
+!!! failure "A solve that does not converge raises"
+    It never returns the unconverged iterate. The message names both levers — `solve(restart=48)` and
+    `solve(matrix_free=False)`.
+
+## A conductor with no terminal
+
+A body no port touches — a ground plane under a trace layer, a shield, a floating heatsink — carries
+only the currents the rest of the network induces in it. Its potential is undetermined (add any
+constant and every current is unchanged), so `jno.peec` **pins one of its nodes automatically** and
+says so:
+
+```
+peec: 1 conductor piece(s) carry no terminal, so their potential floats. One node of each has
+been pinned as a reference. This removes a singular direction and changes no current, impedance
+or loss -- the balance it replaces is implied by the others.
+```
+
+It changes nothing measurable: on an isolated body `1ᵀA = 0`, so the current balance it replaces is
+already implied by the others. **Just include the plane** — no ground constraint of your own.
+
+!!! tip "Ground it yourself only to say where zero is"
+    If you do add `v(GND) - 0.0`, tag exactly **one** node. A multi-node terminal ties its nodes
+    equipotential, which is a real short across that part of the conductor rather than a reference —
+    worth 0.5 % on a module's loop inductance, measured.
+
+## Stacked layers — one cell each
+
+A uniform lattice has one pitch per axis, so **one cell per conductor through the thickness** needs
+every layer to be `dz` thick *and* to start on a grid line. A real DBC stack (0.37 mm bottom metal,
+0.60 mm ceramic, 0.57 mm traces) is tiled by no single `dz`.
+
+Take `dz` from the layer whose thickness matters most and place the others an integer number of cells
+away:
+
+```python
+T   = (3.65 - 3.08) * mm            # the trace copper -> dz
+z1  = 3.08 * mm - T                 # the plane's top: one empty cell below the traces
+plane = jno.shape.box(x0, y0, z1 - T, x1, y1, z1, size=(P, P, T))
+```
+
+That gives plane / gap / traces — three cells, one per conductor, so the surface impedance is exact
+at any frequency. The cost is a stated approximation to the geometry: the plane is modelled at the
+trace thickness and its separation snaps to a whole cell.
+
+!!! warning "It is worth the trouble"
+    On a real half-bridge module at 1 MHz, omitting the ground plane gave **28.3 nH** against the
+    module's own reference of 21.7 nH — **+31 %**. With the plane included on a snapped grid:
+    **20.9 nH, −3.6 %**. A return plane is not a detail.
+
+## Geometry as a design variable
+
+Two things about the geometry *can* move under a gradient without rebuilding.
+
+### A wire's route and gauge
+
+`line_filaments(points=..., radii=...)` recomputes a wire's geometry in JAX from vertices that may be
+traced, while the **structure** — how many filaments a segment is cut into, which endpoints are the
+same node — stays as the reference geometry decided it. The lattice cannot do this: its occupancy is a
+discrete in/out test per cell and the FFT needs a regular grid, so its nodes cannot move at all. Wires
+can, and on a power module they are where the loop inductance lives.
+
+Gauge matters for a reason that is not "thicker is better" (it is, trivially): given a **fixed total
+cross-section**, which wires should carry it? A wire carrying no power current is spending copper for
+nothing.
+
+### A pad's position — weighted terminals
+
+`solve(weights=...)` makes a terminal a prescribed current **distribution** over its nodes instead of a
+short across them — one weight per node of its support.
+
+This is what makes a terminal's **position** a design variable. Unweighted, a pad is an equipotential
+node *set*, and which nodes are in the set is a step function of where the pad is: sliding a die a
+quarter of a millimetre changes the answer by nothing at all, and then by 8 % when a node crosses the
+boundary. Weighted, the support is a frozen superset covering the travel and the weights are smooth in
+the position, so **the gradient exists** — the same structure-frozen, values-traced split as `sigma`.
+
+!!! warning "Keep the support tight"
+    The support is a frozen superset covering the whole travel, and its size drives the conditioning
+    of the constraint block. A die that needs ±5 mm of travel should not be given a ±20 mm support:
+    measured, widening supports to 120–168 nodes pushed the required `restart` from 16 to 160 and a
+    single 11,000-bar solve to about twelve minutes.
+
+### A solid's faces — `grid=jno.peec.faces(...)`
+
+A lattice's **coordinates** are not structural; only its cell counts, its occupancy and its node
+numbering are. On a grid with a line on every conductor face those three are fixed by the layout's
+topology, and the lines themselves can move:
+
+```python
+emag = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3))   # every face a grid line
+op = jno.solve.hierarchical(tol=1e-6)
+L = lambda x0, x1: jnp.real(emag.solve(operator=op, geometry={"trace": (x0, y0, z0, x1, y1, z1)}).L)
+jax.grad(L, argnums=(0, 1))(x0, x1)                                          # exact, no rebuild
+```
+
+A solid named in `geometry=` gives its six faces `(x0, y0, z0, x1, y1, z1)`. Each face moves its grid
+line; every line between two face lines keeps its reference fraction of the gap, so the cells stretch
+and nothing is renumbered. Bar lengths, cross-sections, quadrature points, self terms, the skin
+thickness and the sheet offsets are all recomputed in jax from the moved lines -- the same split
+`line_filaments` makes for a wire's vertices. A trace's width, length and position, a die's position and
+a layer's thickness are therefore design variables with exact reverse-mode derivatives, measured
+against central differences of rebuilt networks with the same cell counts
+(`tests/test_peec_traced_grid.py`).
+
+What it needs and what it refuses, up front:
+
+- **The hierarchical operator.** A faces grid is not translation-invariant, so there is no FFT; and
+  under `geometry=` the cluster tree and the ACA pivots are built **once from the reference geometry**
+  and refilled from the moved one. A uniform lattice refuses a moved solid by name rather than
+  ignoring it.
+- **Lines may not cross.** Moving a face past another line, or closing a cell, changes the structure:
+  rebuild at that design. The check runs when the values are concrete; under a trace it cannot.
+- **A shared face has one position.** Two touching solids may both name their common line, with the
+  same value; different values raise when concrete.
+- **Wires are given separately.** A wire landing on a moved face must be moved with it through its own
+  `geometry=` entry; `nodes` stays at the reference, since which nodes a pad owns is structural.
+
+#### In `jno.core`: parameters in the shape's coordinates
+
+The same move, with the faces as `jno.np.parameter`s, is written where the numbers were -- in the
+shape. A box face, an extruded rect, a translation, a line's vertices and its radius all take an
+expression in parameters; the network's readouts are then trace nodes and go straight into `jno.core`:
+
+```python
+w = jno.np.parameter((1,), name="w")
+w.initialize(jax.nn.initializers.constant(12e-3))           # the reference the network is built at
+w.optimizer(jno.optimizers.mma(move=0.2, lower=6e-3, upper=20e-3))
+trace = jno.shape.box(0, 0, 0, w, 2e-3, 5e-4, size=1e-3).attach(sigma=CU).name("trace")
+wire = jno.shape.line([(2e-3, 1e-3, 5e-4), (2e-3, 1e-3, 1.5e-3 + h), ...], r=rr).attach(sigma=AL).name("w")
+...
+s = jno.peec(cons, freq=1e6, grid=jno.peec.faces(pitch=1e-3)).solve(operator=jno.solve.hierarchical(tol=1e-6))
+jno.core([s.L, jno.le(...)]).solve(50)
+```
+
+Settings of how a network is solved live on the network --
+`jno.peec(cons, freq, grid=jno.peec.faces(pitch=1e-3), operator=jno.solve.hierarchical(tol=1e-6))` (or
+`restart=`, `matrix_free=`) -- so every solve uses them, the coupled one included; a keyword to `solve()`
+overrides them for an uncoupled network. With a parameter in either problem, `heat.solve()` is the
+converged field as a trace node, and `em.solve().L` / `.R` / `.current(t)` / `.dissipation()` are the
+network's readouts at that field, trace nodes too.
+
+Every parameter needs an initial value: the shape is built -- discretised, and meshed for a `jno.fem`
+on the same domain -- at the parameters' initial values, and moved from there under a trace. The rules
+above (no crossing, one value per shared line) hold unchanged. Refused by name: a parameter in a disk,
+cylinder, sphere, polygon, rotation, revolution or fillet (a curved surface does not move with the
+grid lines), a parametric solid that is not an axis-aligned box, a moved face on a uniform lattice,
+and the old `.attach(path=, radius=, faces=)` spelling. A property `jno.peec` does not read (anything
+but `sigma` and `mu_r`) is named once in a warning: it may be a `jno.fem` coefficient on the same
+domain, or a misspelling. Pinned against `solve(geometry=)` and central differences
+(`tests/test_peec_parametric_shape.py`).
+
+A long move stretches the cells further and further from the ones the network was built with.
+`em.cell_aspect()` (each metal cell's longest side over its shortest) and `em.cell_size()` read the
+grid at the design, as trace nodes, and `d.rebuild(when=...)` re-discretises the network -- and any
+`jno.fem` on the same domain -- at the current design when a condition on them holds, then training
+continues:
+
+```python
+d.rebuild(when=em.cell_aspect().max > 4)
+jno.core([s.L, ...]).solve(200)          # rebuilt at the design whenever the cells pass aspect 4
+```
+
+The readouts made before a rebuild solve the new network. A rebuilt network equals one built from
+scratch with that design as its reference (`tests/test_domain_rebuild.py`). A thin layer one cell thick
+has a large aspect at the reference already; set the threshold against the value there.
+
+## Validation
+
+Every layer is checked against an oracle that does not go through the layer below it.
+
+| what | oracle |
+|---|---|
+| self inductance of a straight round wire | `L = (μ₀l/2π)[ln(2l/a) − 3/4]`, to 2 % |
+| a circular loop | the closed-form loop formula; convergence in quadrature order **and** segment count |
+| DC resistance of a lattice | `span / (σ·W·T)` exactly, to machine precision |
+| series / parallel / crossover networks | closed-form `ΣR + jωΣLp` and the DC conductance ratio |
+| the FFT matrix-free apply | the **dense** operator built by `pair_matrix`, on every case |
+| every gradient | a central difference, to ~1e-6 relative |
+| the whole solve, end to end | **pypeec 5.8.0**, an independent PEEC code, on the same 20,480-cell grid: `R` agrees to 0.28 %, `L` to 0.08 % |
+| the `O(N log N)` inductance | the `O(N²)` pair sum it replaced, to 1e-11 relative |
+| a rectangular bar's partial inductance | Grover's rectangular-bar formula, `L = (μ₀l/2π)[ln(2l/(w+t)) + ½ + 0.2235(w+t)/l]` |
+| a near-neighbour mutual between two cells | a volume Monte-Carlo of the Neumann double integral — wrong in a completely different way from a Gauss rule |
+
+!!! note "A conductor thick against the skin depth carries a current sheet per face"
+    `R` uses a shape-aware **surface impedance**, so it knows the current is confined to a skin layer
+    at the conductor's faces. With one current per element the **partial inductance** did not: the
+    current had nowhere to sit but the middle of the cell, so a return plane's *thickness* changed `L`
+    at a frequency where the copper below the skin layer is electromagnetically invisible, and a trace
+    over a plane looked like a wider loop than it is.
+
+    A solid that is one cell thick and thicker than a skin depth is therefore discretised as **two
+    sheets**, one on each face, coupled through the 2-port slab impedance
+    (`slab_transfer_impedance`). The solve finds the split between them. The sheet is drawn on the
+    face, because the internal reactance of the skin layer is already in the surface impedance;
+    near the threshold the two sheets are the conductor's two halves, so `L` stays continuous in
+    frequency.
+
+    | case | one current per element | sheet per face |
+    |---|---|---|
+    | ground plane 0.4 → 1.6 mm under a microstrip, 100 kHz, `Im Z / ω` (pypeec 5.8.0: −0.05 %) | +21.3 % | −2.5 % |
+    | strip over a plane, 1 MHz, per-length `L` against the closed-form microstrip | +52 % | +7.0 % |
+    | power module, 1 MHz, 1 mm pitch, facing faces on the grid, against Ansys Q3D (20.641 nH) | +20.1 % | **+3.1 %** |
+
+    Three things to know. A sweep is discretised at its **lowest** frequency, so a conductor is
+    paired only if it is skin-confined at every point. A family is paired only when all of it is one
+    conductor thickness, so traces and a plate of different thickness on one grid keep one current
+    each; give them the same cell height. And a network with a **magnetic core** keeps one current
+    per element.
+
+    `sol.L` is the field-energy inductance, which leaves out the internal inductance of the skin
+    layer, as a solver that puts the current on the surface (Q3D's AC RL solve) does. pypeec reports
+    `Im Z / ω`, which includes it.
+
+!!! warning "A lattice element is a cube, and the quadrature costs what that implies"
+    Sub-points sample an element's **volume**: `quad` along its axis, `quad_t` across each transverse
+    direction, so `quad · quad_t²` = **12** per element at the defaults. Sampling only along the axis
+    leaves the cross-section a point, which over-counts every near-neighbour mutual — measured against
+    the volume integral, **+1.2 %** when an element is 8× longer than it is thick, **+15.3 %** at a
+    cube, **+48.8 %** at 8× shorter. That is a wrong *trend*, not just a wrong number: it survives a
+    convergence study, because refining a lattice adds exactly the mutuals that are over-counted.
+
+    The price is that the count rose from 3 to 12, and the **dense and welded** paths pay it
+    quadratically — a welded module that solved in 27 s can now take minutes. The FFT lattice path is
+    unaffected in `N`; only its one-off kernel build grows. Lower `quad_t` if a model is all wires,
+    where a filament is thin by construction and gains nothing from transverse sampling.
+
+## Cost — what to expect
+
+Measured on one CPU core-set, a copper bar discretised as a plain lattice. *Discretise* is the host pass
+of the first solve; *warm* is a repeat solve on the kept network.
+
+| bars | discretise | warm solve (`R`), CPU | `L` |
+|---|---|---|---|
+| 712 | 0.22 s | 0.04 s | 0.02 s |
+| 6,688 | 0.19 s | 0.16 s | 0.02 s |
+| 23,688 | 0.21 s | 0.46 s | 0.03 s |
+| 57,472 | 0.52 s | 1.16 s | 0.04 s |
+| 113,800 | 0.40 s | 2.03 s | 0.08 s |
+
+Three things to read off it.
+
+- **The discretisation is cheap and flat.** The host pass is well under a second even at 57k bars, and
+  it runs once per network.
+- **The first solve is dominated by compilation**, not arithmetic — a few seconds against a warm solve
+  of well under one. For a one-shot answer that is the number you feel; in a design loop it is paid once.
+- **The solve is linear in the bars**, and the frequency does not change its cost.
+
+!!! tip "The GPU is worth using, and was not always"
+    The solve is matrix-free and the partial-inductance apply is an FFT, so it belongs on a GPU: at
+    23,688 bars that apply is **3.2× quicker** there. It did not show up in the solve until the
+    constraint block stopped being assembled one jax op per node — thousands of eager dispatches that
+    cost the same whichever device they dispatch to, and hid the operator they were wrapped around.
+
+    | 23,688 bars, warm solve | CPU | GPU |
+    |---|---|---|
+    | before | 0.781 s | 0.801 s |
+    | after | 0.641 s | **0.317 s** |
+
+    Note the CPU column moved too: this was never a GPU-specific problem, only a GPU-visible one.
+
+    The second thing in the way was the preconditioner's sparse LU, re-run on every `solve()` — at
+    40,000 nodes that was 1.5 s, **53 % of the whole solve**, all of it on the host. It is now cached
+    on content, which is what makes the GPU pull ahead at size:
+
+    | 113,800 bars (40,000 cells) | jNO CPU | jNO GPU |
+    |---|---|---|
+    | DC | 2.03 s | **0.92 s** |
+    | 10 kHz | 2.12 s | **0.95 s** |
+
+    The cache is keyed on the conductivity and the frequency, so a repeated solve and a gradient's
+    adjoint pass are free — and a design loop that moves the conductivity every iteration is not.
+    That miss is deliberate: reusing a factorisation built for a *different* conductivity is a claim
+    about preconditioning, not a caching decision, and this does not make it.
+
+!!! tip "`L` is a quadratic form, evaluated through the operator"
+    `sol.L` used to walk every pair — `O(N²)` behind a solve that is linear — and cost **76 s at 57,472
+    bars against a 2.3 s solve**, thirty times the answer it was reporting on. It now contracts through
+    the same block-Toeplitz apply the matrix-free solve is built on, which is `O(N log N)`:
+
+    | bars | 6,688 | 23,688 | 57,472 |
+    |---|---|---|---|
+    | pair sum | 1.43 s | 16.2 s | 76.5 s |
+    | through the apply | 0.02 s | 0.03 s | 0.04 s |
+
+    to the same value in every case. A network with no lattice — a polyline's filaments are not
+    Toeplitz — keeps the pair sum, which is the honest path when there is no structure to exploit.
+
+## Limits, up front
+
+- A conductor is a `Shape.line` tube **or** a closed-form solid. A CSG *plan* has no centreline and no
+  cross-section, so it cannot be a line — build the conductor from `Shape.line`, or discretise it as a
+  solid.
+- Each filament carries **one** current: the skin effect within a filament is not represented, except
+  that a one-cell solid thicker than a skin depth carries a sheet per face. See
+  [Frequency and the skin effect](#frequency-and-the-skin-effect).
+- A **built** network freezes its STRUCTURE. A conductivity may be traced, a wire's vertices and
+  radius may be traced, and on a `faces` grid a solid's six faces may be traced; cell counts,
+  occupancy and numbering may not -- see [A solid's faces](#a-solids-faces-gridjnopeecfaces).
+- A network of wires alone has no lattice structure, so it forms the **dense** operator — that is the
+  small-network path.
+- There is no dielectric and no displacement current: this is a conductor solver, not a full-wave one.
+- A magnetic core is solved (see [Magnetic materials](#magnetic-materials)), with three limits of its
+  own: **not at DC**, **not welded to a `Shape.line`**, and **linear** — there is no saturation.
