@@ -30,6 +30,7 @@ import numpy as _np
 
 if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
     from .utils.solver.fem_adapt import AdaptSpec
+    from .utils.solver.hmatrix import HierarchicalSpec
     from .utils.solver.march_checkpoint import CheckpointSpec
 
 from .utils.solver.solver_api import (
@@ -2361,7 +2362,7 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
     )
 
 
-def hierarchical(*, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, floor: int = 2000):
+def hierarchical(*, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, floor: int = 2000) -> "HierarchicalSpec":
     """**Hierarchical (H-matrix) compression** of an integral-equation operator, for `jno.peec`.
 
     PEEC is fast only on a uniform lattice: identical bars on a regular grid make the partial
