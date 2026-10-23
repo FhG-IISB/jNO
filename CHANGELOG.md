@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.4.2] — 2026-10-23
+
+jNO 0.4.2 adds `jno.peec`, a differentiable partial-element equivalent-circuit solver, and makes a shape's coordinates design variables shared by PEEC and FEM. PINN derivatives are cheaper: every AD derivative on one point set now comes from one shared forward-mode pass. `jno.info` writes the equations in math notation. A comparison against other FEM libraries on the same problems found the FEM fixes below.
+
+### Breaking changes and migration
+- `d.stretch()` is removed: geometry moves through `jno.np.parameter` expressions in the shape's own coordinates, and `d.rebuild(when=...)` re-meshes during training (#185).
+- A derivative of a target that couples points (it is not pointwise) raises; it used to return a wrong derivative (#186).
+- An integer index on the point axis, `net(x, y)[0]`, raises; it picked collocation point 0 and broadcast it, where `[..., 0]` was meant (#186).
+- A field parameter of the wrong size in `fem.solve(k=v)` raises (#186).
+- A mixed partial of order 3 or more is a weighted sum of univariate Taylor passes and carries a few float32 ulp more round-off than nested passes (#186).
+
+### Added
+- `jno.peec`: conductors as bar lattices, round-wire filaments and two-terminal devices in one equation list; readouts `L`, `R`, `Z`, terminal currents and voltages and dissipation, each with its adjoint. FFT operator on uniform lattices, hierarchical (ACA) on graded `faces` grids, matrix-free GMRES with a near-field preconditioner (optionally cuDSS) (#185).
+- Geometry design variables: `jno.np.parameter` in box/rect faces, extrusion height, translation, a line's vertices and radius. A PEEC face grid and a FEM mesh on the same domain both follow the design, with exact derivatives; what cannot move is refused by name (#185).
+- Electro-thermal coupling through references: a `jno.fem` heated by `em.loss` and a network whose sigma(T) reads that field converge as one differentiable fixed point (#185).
+- `d.rebuild(when=...)`: the shape is rebuilt at the current design when a condition holds during `jno.core.solve`; solvers and readouts follow, `keep_opt_state=` decides whether the optimizer state carries over (#185).
+- FEM point loads and point values (#185).
+- PINN derivatives: one jvp pass per coordinate for all AD derivatives on a point set, Laplacians by a forward-Laplacian pass (`folx`), order 3 and up by univariate Taylor passes (Griewank, Utke & Walther 2000). The Kovasznay Navier–Stokes training step went from 3.3x to 1.3x the FLOPs of a hand-written step (#186).
+- `jno.info` writes the equations of a core, a fem and an fdm in math notation, reports what training does with each model's parameters, and with `deep=True` draws every constraint as one expression tree with shapes (#186).
+
+### Fixed: silent wrong answers
+- The FEM kernel cache ignored module-level names a coefficient reads: a sweep changing a global between `jno.fem` builds got the first build's solution every time (#185).
+- `.msh` 2.2 physical groups were dropped; they now become tags (#186).
+- `fem.solve(k=v)` with a field parameter of the wrong length solved with clamped gathers (#186).
+
+### Fixed
+- A solve stopped early by a callback advanced the epoch count by the full request, so the next solve's schedules skipped ahead (#185).
+- PEEC near-field preconditioner values follow traced geometry; the hierarchical structure cache is keyed on the network (#185).
+- `symgrad(u, coords)` accepts a coordinate tuple (#186).
+- A direct solver works in a parametric transient march (#186).
+- PARDISO and cuDSS keep one plan per matrix type, so a Newton solve switching between symmetric and general values on one pattern no longer redoes the symbolic analysis (#186).
+- Newton from rest with large prescribed values takes a first linearised step that moves the interior with the boundary, instead of inverting the cells next to it (#186).
+- A tag in `jno.info` reports the points in use, not the mesh pool; a reused step no longer announces a JIT compile (#186).
+
+### Packaging
+- New dependency `folx` (forward Laplacian) (#186); the CUDA sources in `jno/_ext` ship with the package (#185).
+
 ## [0.4.1] — 2026-10-21
 
 jNO 0.4.1 continues the correctness work of 0.4.0: about thirty more silent wrong answers are fixed, among them RCWA layer thickness and polarisation, a field parameter in a coupled form, properties attached after a build, and early stopping on constrained problems. It adds higher-order Nédélec and Raviart–Thomas elements, matrix-valued and constant unknowns, band structures and contour integration in `fem.eigs`, GCMMA and an augmented Lagrangian for constraints, flow matching, and checkpointed fixed-mesh marches. Repeated nonlinear solves in an optimisation loop do less work: inexact Newton steps, reusable preconditioners and one factorisation per form. Read the breaking changes before upgrading: `cached()` preconditioners are replaced by `reuse=`, and some solves that used to return now raise.

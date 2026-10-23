@@ -133,7 +133,7 @@ for mod, extra, unlocks in OPTIONAL:
 In the repository's default pixi environment (which adds `pymetis`), on a CPU, it prints:
 
 ```text
-jNO 0.4.1 · JAX 0.10.1 · x64=False
+jNO 0.4.2 · JAX 0.10.1 · x64=False
 devices: ['cpu:0']
    no  mmgpy         [fem]   adaptive remeshing — fem.solve(adapt=...)
    no  pypardiso     [fem]   sparse-direct on CPU — jno.solve.lu(backend="pardiso")
