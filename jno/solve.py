@@ -666,14 +666,9 @@ def _root_driver(
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
             # drag where the matrix-free Krylov inner solve stalls). Needs the assembler-provided Jacobian.
             if jacobian is None:
-                raise ValueError(
-                    "The sparse-direct Newton needs the ASSEMBLED Jacobian, which only the native "
-                    "nonlinear FEM assembler / transient stepper provides -- a matrix-free residual has "
-                    "no assembled tangent to factorize. Reached either via "
-                    "fem.solve(nonlinear=jno.solve.newton(direct=True)) or by a direct linear slot "
-                    "(fem.solve(linear=jno.solve.lu()/dense()/amg()), which selects this driver); on a "
-                    "matrix-free-only problem use an iterative linear= (cg/bicgstab/gmres/fgmres)."
-                )
+                # No assembled tangent (a residual-only operator, or a Coupling that did not declare which
+                # DOFs it touches): the user asked for a direct solve, so materialise the Jacobian DENSELY.
+                jacobian, linear_solve = _dense_tangent(residual_fn, u0, linear_solve)
             from .utils.solver.newton_krylov import newton_direct
 
             return newton_direct(
@@ -731,6 +726,30 @@ def _root_driver(
         traits={"rtol": rtol, "atol": atol, "carries_tangent": bool(reuse), "reports_info": direct is not False},
         config=config,
     )
+
+
+def _dense_tangent(residual_fn, u0, linear_solve):
+    """``(jacobian, linear_solve)`` for a direct Newton on a problem with no assembled tangent.
+
+    The Jacobian is formed by forward-mode AD of the whole residual -- ``n`` JVPs per Newton step into an
+    ``n x n`` dense matrix -- and factorised with dense LU unless a ``linear=`` slot was given (it then
+    receives the dense matrix). Exact and differentiable, but its cost is ``O(n^2)`` memory and ``O(n^3)``
+    per factorisation, so it is announced with its size. There is no cap: what fits depends on the machine,
+    and an allocation that does not fit fails where it is made."""
+    from .utils.logger import get_logger
+
+    n = int(_np.size(u0))
+    get_logger().warning(
+        f"newton(direct=True): this problem has no assembled tangent (a residual-only operator, or a "
+        f"jno.Coupling that does not declare the DOFs it touches), so its Jacobian is materialised DENSE by "
+        f"forward-mode AD: {n} x {n} = {8 * n * n / 2**20:.1f} MB, {n} JVPs and a dense LU per Newton step. "
+        f"Fine for small problems; for large ones use the matrix-free default (drop direct=True)."
+    )
+
+    def jacobian(u):
+        return jax.jacfwd(lambda v: jnp.asarray(residual_fn(v)).reshape(-1))(jnp.asarray(u).reshape(-1))
+
+    return jacobian, linear_solve if linear_solve is not None else (lambda A, b: jnp.linalg.solve(A, b))
 
 
 def newton(

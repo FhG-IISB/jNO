@@ -216,14 +216,6 @@ def test_nonlinear_direct_newton_differentiable():
     assert abs(a - 1.0) < 0.05, f"alpha not recovered through the direct Newton adjoint: {a}"
 
 
-def test_direct_newton_without_assembled_jacobian_raises():
-    """As a bare driver (no assembled Jacobian threaded in) ``direct=True`` fails loud: a sparse-direct
-    step needs the assembler's tangent, provided only on the native nonlinear / transient paths."""
-    solver = jno.solve.newton(direct=True)
-    with pytest.raises(ValueError, match="ASSEMBLED Jacobian"):
-        solver(lambda w: w, jnp.zeros(3))
-
-
 # ---------------------------------------------------------------------------
 # a DIRECT linear= slot on a nonlinear problem: it must reach the assembled tangent
 # ---------------------------------------------------------------------------

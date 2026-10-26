@@ -506,14 +506,18 @@ class PendingElementExpr:
 
     .. important::
        The block this produces is **dense** in element space. It reads like a weak term and is not
-       one: its Jacobian couples every element to every other, which is why ``fem.solve`` stays on
-       matrix-free Newton-Krylov rather than assembling a sparse tangent.
+       one: its Jacobian couples every element to every other. The expression records which DOFs its
+       gathers read (``_reads``), and :meth:`Enclosure.load` hands that support to the ``Coupling``, so
+       ``jno.fem`` can assemble the block as a dense ``k x k`` patch on exactly those DOFs, next to the
+       sparse local tangent, instead of leaving the whole solve matrix-free.
 
     Args:
         fn: the recorded computation, ``u -> per-element array``, applied once the solution is known.
+        reads: the DOFs ``fn`` reads (any integer array); ``None`` when unknown, and then nothing may
+            assume a support.
     """
 
-    __slots__ = ("_fn",)
+    __slots__ = ("_fn", "_reads")
 
     # NumPy checks this before trying to coerce an unknown right operand, so `ndarray @ pending`
     # reaches __rmatmul__ instead of being turned into an object array. JAX arrays already return
@@ -521,8 +525,10 @@ class PendingElementExpr:
     __array_priority__ = 1000.0
     __array_ufunc__ = None
 
-    def __init__(self, fn):
+    def __init__(self, fn, reads=None):
         self._fn = fn
+        # The DOFs `fn` reads, as a sorted index array; None when unknown (then nothing may assume a support).
+        self._reads = None if reads is None else np.unique(np.asarray(reads, dtype=np.int64).reshape(-1))
 
     def __call__(self, u):
         return self._fn(u)
@@ -531,8 +537,9 @@ class PendingElementExpr:
         fn = self._fn
         if isinstance(other, PendingElementExpr):
             g = other._fn
-            return PendingElementExpr(lambda u: op(g(u), fn(u)) if swap else op(fn(u), g(u)))
-        return PendingElementExpr(lambda u: op(other, fn(u)) if swap else op(fn(u), other))
+            reads = None if self._reads is None or other._reads is None else np.union1d(self._reads, other._reads)
+            return PendingElementExpr(lambda u: op(g(u), fn(u)) if swap else op(fn(u), g(u)), reads)
+        return PendingElementExpr(lambda u: op(other, fn(u)) if swap else op(fn(u), other), self._reads)
 
     def __add__(self, o):
         return self._lift(o, lambda a, b: a + b)
@@ -569,7 +576,7 @@ class PendingElementExpr:
 
     def __neg__(self):
         fn = self._fn
-        return PendingElementExpr(lambda u: -fn(u))
+        return PendingElementExpr(lambda u: -fn(u), self._reads)
 
     def apply(self, fn):
         """Record an arbitrary elementwise/array function, for anything the operators do not cover
@@ -582,7 +589,7 @@ class PendingElementExpr:
             PendingElementExpr: the extended record.
         """
         inner = self._fn
-        return PendingElementExpr(lambda u: fn(inner(u)))
+        return PendingElementExpr(lambda u: fn(inner(u)), self._reads)
 
     def __repr__(self):
         return "PendingElementExpr(<pending nonlocal term; pass to enclosure.load>)"
@@ -677,7 +684,7 @@ class Enclosure:
         on it is recorded, and :meth:`load` closes it into a ``jno.Coupling``. That is what lets a
         nonlocal term be written as an expression in the ``jno.fem([...])`` list rather than a lambda."""
         if isinstance(u, Placeholder):
-            return PendingElementExpr(self.field)
+            return PendingElementExpr(self.field, reads=self.nodes)
         u = jnp.asarray(u).reshape(-1)
         return 0.5 * (u[self.elements[:, 0]] + u[self.elements[:, 1]])
 
@@ -703,7 +710,12 @@ class Enclosure:
             from .._fem import Coupling  # local: jno._fem imports the domain package
 
             tags = ",".join(map(str, self.tags)) if getattr(self, "tags", None) else "enclosure"
-            return Coupling(lambda u: self.load(q(u), size=size), name=f"enclosure[{tags}]")
+            c = Coupling(lambda u: self.load(q(u), size=size), name=f"enclosure[{tags}]")
+            # Exact support: the gathers read q._reads, and the scatter writes onto this enclosure's nodes.
+            # jno.fem assembles the coupling's Jacobian as a dense block on these DOFs only.
+            if q._reads is not None:
+                c._support = np.union1d(q._reads, self.nodes)
+            return c
         q = jnp.asarray(q).reshape(-1)
         n = int(size) if size is not None else int(np.asarray(self.domain.mesh.points).shape[0])
         w = self._node_weights.astype(q.dtype)

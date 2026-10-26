@@ -1597,7 +1597,15 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
         inner = _nm(nonlinear, _newton) if not fem_obj.is_linear else _lin()
         return f"solve: transient · {step} · per step {inner}"
     if mode == "nonlinear":
-        default_inner = "bicgstab (assembled)" if _assembled and nonlinear is None else "bicgstab (matrix-free)"
+        # What the Newton slot does with the tangent decides the inner solve: direct=True factorises it (or, with
+        # none assembled, a dense one it materialises), direct=None iterates on it, direct=False ignores it.
+        _direct = getattr(nonlinear, "direct", None) if nonlinear is not None else None
+        if _direct is True:
+            default_inner = "lu (assembled tangent)" if _assembled else "dense (materialised Jacobian)"
+        elif _assembled and _direct is None:
+            default_inner = "bicgstab (assembled)"
+        else:
+            default_inner = "bicgstab (matrix-free)"
         return f"solve: nonlinear · {_nm(nonlinear, _newton)} · inner {_lin(default_inner)}"
     return f"solve: {mode} · {_lin()}"
 
@@ -7221,9 +7229,66 @@ class Coupling:
         self.name = str(name)
         self.field_key = field_key
         self.params = list(params or [])  # jno.np.parameter nodes used only inside this coupling
+        # The DOFs (of its field block) this coupling reads and writes, when known EXACTLY -- set by
+        # `enclosure.load`. With it, jno.fem assembles the coupling's Jacobian as a dense block on those
+        # DOFs next to the sparse local tangent; without it the solve stays matrix-free (see _wrap_couplings).
+        self._support = None
 
     def __repr__(self):
         return f"Coupling({self.name!r})"
+
+
+#: Above this many bytes the dense coupling block of an assembled tangent is logged as a WARNING, not as
+#: info: it is still built (there is no cap -- what fits depends on the machine), but the user should know.
+_COUPLING_BLOCK_WARN_BYTES = 256 * 2**20
+
+
+def _coupling_support(couplings, slices):
+    """The global DOFs every coupling reads and writes, sorted -- or None when one did not declare its support."""
+    parts = []
+    for c, (lo, _hi) in zip(couplings, slices):
+        sup = getattr(c, "_support", None)
+        if sup is None:
+            return None
+        parts.append(lo + np.asarray(sup, dtype=np.int64).reshape(-1))
+    return np.unique(np.concatenate(parts)) if parts else None
+
+
+def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, log):
+    """``J(u, args) = J_local(u, args) + B(u, args)``: the assembled local tangent plus the couplings' Jacobian
+    as a dense ``k x k`` block on their declared ``support`` (k DOFs), in ONE BCOO.
+
+    ``B`` comes from forward-mode AD of the coupling residual restricted to the support: k JVPs per call,
+    exact, and differentiable like everything else. It is exact only because the support is: every coupling
+    reads and writes nothing outside it (``enclosure.load`` declares the nodes its gathers read and its
+    scatter writes). Entries that coincide with the local tangent's are summed by the solvers
+    (``sum_duplicates``), so the two need not be merged here."""
+    S = np.asarray(support, dtype=np.int64)
+    k = int(S.size)
+    nbytes = 8 * k * k
+    msg = (
+        f"jno.fem: the coupling(s) {names} get an assembled tangent: a dense {k} x {k} block on the DOFs they "
+        f"couple ({nbytes / 2**20:.1f} MB) next to the sparse local tangent, recomputed by {k} JVPs per "
+        f"Newton step."
+    )
+    if nbytes > _COUPLING_BLOCK_WARN_BYTES:
+        log.warning(msg + " It is large; if it does not fit, the allocation will fail where it is built.")
+    else:
+        log.info(msg)
+    S_j = jnp.asarray(S, dtype=jnp.int32)
+    block_idx = np.stack([np.repeat(S, k), np.tile(S, k)], axis=1)  # row-major, matching B.reshape(-1)
+
+    def jacobian(u, args=None):
+        import jax.experimental.sparse as jsparse
+
+        u = jnp.asarray(u).reshape(-1)
+        J_loc = local_jacobian(u, args)
+        B = jax.jacfwd(lambda us: coupling_residual(u.at[S_j].set(us), args)[S_j])(u[S_j])  # B[i, j] = dc_Si/du_Sj
+        data = jnp.concatenate([J_loc.data, B.reshape(-1).astype(J_loc.data.dtype)])
+        idx = jnp.concatenate([J_loc.indices, jnp.asarray(block_idx, dtype=J_loc.indices.dtype)])
+        return jsparse.BCOO((data, idx), shape=(n, n))
+
+    return jacobian
 
 
 def _check_movable_bc_nodes(domain: Any, dirichlet_raw: Any, boundary_terms: Any) -> None:
@@ -7427,6 +7492,14 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
 
     op = fem_obj._op
     rpe = _merge_coupling_params(getattr(op, "runtime_parameter_exprs", {}))
+    # An ASSEMBLED tangent for the coupled residual, when every coupling declared exactly which DOFs it
+    # touches: the local tangent plus a dense block on those DOFs. Without it the solve stays matrix-free
+    # (Newton-Krylov), and `newton(direct=True)` materialises the whole Jacobian densely instead.
+    support = _coupling_support(couplings, slices)
+    _names = [c.name for c in couplings]
+    from .utils.logger import get_logger
+
+    _log = get_logger()
     if fem_obj._mode == "linear":
         # local residual R_local(u, args) = A(args) u - b(args)
         def residual(u, args=None, _op=op):
@@ -7437,7 +7510,14 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
                 A, b = _op
             return (A @ u) - jnp.asarray(b).reshape(-1) + coupling_residual(u, args)
 
-        fem_obj._op = FemResidualOperator(residual, size=n, runtime_parameter_exprs=rpe)
+        def local_jacobian(u, args=None, _op=op):
+            return _op.evaluate(args)[0] if isinstance(_op, FemLinearSystem) else _op[0]
+
+        jac = None
+        _A = op.A if isinstance(op, FemLinearSystem) else op[0]  # None: formed per call by a parametric operator_fn
+        if support is not None and (_A is None or hasattr(_A, "indices")):
+            jac = _with_coupling_block(local_jacobian, coupling_residual, support, n, _names, _log)
+        fem_obj._op = FemResidualOperator(residual, jacobian_fn=jac, size=n, runtime_parameter_exprs=rpe)
         # The promoted operator states its essential rows like every other residual operator does, so an
         # extrapolating driver (`staggered(over_relax>1)`) leaves them on their prescribed values.
         fem_obj._op.dirichlet_dofs = d_dofs
@@ -7451,16 +7531,21 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
         def residual(u, args=None, *rest, _base=base_residual):
             return jnp.asarray(_base(u, args, *rest)).reshape(-1) + coupling_residual(u, args)
 
+        base_jac = getattr(op, "jacobian", None)
+        jac = None
+        if support is not None and base_jac is not None:
+            jac = _with_coupling_block(base_jac, coupling_residual, support, n, _names, _log)
         wrapped = FemResidualOperator(
-            residual, jacobian_fn=None, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
+            residual, jacobian_fn=jac, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
         )
         # Everything else the assembler hung on the operator describes the SAME problem and must survive
         # the wrap: the step-history layout and state readout that make `fem.solve()` march a
         # `domain(tau=...)` grid (dropped, the march never started and the first residual raised on an
         # unbuffered `u.i(-1)`), the load-path fields, the derived-field rules, the contact search and
         # the Dirichlet DOF set. Only what the wrap changes is not copied: the residual; the tangent,
-        # which cannot see the opaque coupling (the solve goes matrix-free, as for every Coupling); and
-        # the runtime parameters, now merged with the coupling's.
+        # which gains the coupling block above when the couplings declared their support and is dropped
+        # otherwise (the solve then goes matrix-free); and the runtime parameters, now merged with the
+        # coupling's.
         for _k, _v in vars(op).items():
             if _k not in ("residual", "jacobian", "runtime_parameter_exprs"):
                 setattr(wrapped, _k, _v)
