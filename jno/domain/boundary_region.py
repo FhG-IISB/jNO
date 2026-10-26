@@ -73,6 +73,17 @@ class BoundaryRegion:
         The three callers that build a sub-region from a parent's facets used to choose the field with
         ``edges if dim == 2 else triangles``, so a quadrilateral facet was written into ``triangles``
         and read back as a triangle. Dispatching in one place makes that impossible.
+
+        Args:
+            tag: the region's tag.
+            dim: the spatial dimension.
+            points: the mesh points.
+            ents: the facets, ``(E, k, dim)`` vertex coordinates (``k = 2`` edges, ``3`` triangles,
+                ``4`` quadrilaterals).
+            tol: membership tolerance.
+
+        Returns:
+            BoundaryRegion: the region.
         """
         ents = np.asarray(ents)
         field = _FIELD_BY_ARITY.get(int(ents.shape[1])) if ents.ndim == 3 else None
@@ -130,6 +141,14 @@ class BoundaryRegion:
         return jnp.any((plane_dist <= self.tol) & inside)
 
     def contains(self, p):
+        """Whether a point lies on this region (on one of its edges in 2-D, its facets in 3-D).
+
+        Args:
+            p: the point; only its first ``dim`` coordinates are used.
+
+        Returns:
+            A boolean (traceable) scalar.
+        """
         import jax.numpy as jnp
 
         p = jnp.asarray(p)[: self.dim]

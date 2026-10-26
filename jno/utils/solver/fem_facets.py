@@ -74,13 +74,12 @@ _LOCAL_FACES_HEX: Tuple[Tuple[int, int, int, int], ...] = (
 class FacetConnectivity(NamedTuple):
     """Boundary facet connectivity for a P1 simplex mesh.
 
-    Attributes
-    ----------
-    parent_cell : ``(n_bfaces,)`` int64 — global cell index of each boundary face.
-    local_face  : ``(n_bfaces,)`` int64 — local face index within the parent cell.
-    face_nodes  : ``(n_bfaces, n_nodes_per_face)`` int64 — global node ids
-                  (P1 corner nodes only; excludes P2 edge-midpoints).
-    n_bfaces    : total number of boundary faces.
+    Attributes:
+        parent_cell (``(n_bfaces,)`` int64 — global cell index of each boundary face.)
+        local_face (``(n_bfaces,)`` int64 — local face index within the parent cell.)
+        face_nodes (``(n_bfaces, n_nodes_per_face)`` int64 — global node ids): (P1 corner nodes only;
+            excludes P2 edge-midpoints).
+        n_bfaces (total number of boundary faces.)
     """
 
     parent_cell: np.ndarray  # (n_bfaces,) int64
@@ -249,12 +248,10 @@ def build_facet_connectivity(cells: np.ndarray, cell_type: str = "triangle") -> 
 
     A face is on the boundary if it belongs to exactly one cell.
 
-    Parameters
-    ----------
-    cells     : ``(n_cells, n_verts_per_cell)``  global vertex indices (P1 connectivity;
-                P2 ``triangle6`` / ``tetra10`` arrays work — only the first 3/4 columns
-                are read).
-    cell_type : ``"triangle"`` (2-D, 3-node) or ``"tetrahedron"`` (3-D, 4-node).
+    Args:
+        cells (``(n_cells, n_verts_per_cell)``  global vertex indices (P1 connectivity;): P2
+            ``triangle6`` / ``tetra10`` arrays work — only the first 3/4 columns are read).
+        cell_type (``"triangle"`` (2-D, 3-node) or ``"tetrahedron"`` (3-D, 4-node).)
     """
     cells = np.asarray(cells)
     local_faces, n_face_nodes = _face_table(cell_type)
@@ -346,17 +343,15 @@ def facet_quad_data(
     map from the reference face (interval [0,1] for a 2-D edge, reference triangle
     for a 3-D face) to the physical face.
 
-    Parameters
-    ----------
-    points     : ``(n_nodes, dim)``  global mesh coordinates.
-    face_nodes : ``(n_face_nodes,)`` global node indices of the face.
-    gp         : ``(n_quad,)`` for a 2-D edge, ``(n_quad, 2)`` for a 3-D face —
-                 reference quadrature points.
+    Args:
+        points (``(n_nodes, dim)``  global mesh coordinates.)
+        face_nodes (``(n_face_nodes,)`` global node indices of the face.)
+        gp (``(n_quad,)`` for a 2-D edge, ``(n_quad, 2)`` for a 3-D face —): reference quadrature
+            points.
 
-    Returns
-    -------
-    xq        : ``(n_quad, dim)``  physical quadrature coordinates.
-    jac_scale : scalar — the Jacobian scaling (edge length or face area).
+    Returns:
+        ``(n_quad, dim)``  physical quadrature coordinates.: xq
+        scalar — the Jacobian scaling (edge length or face area).: jac_scale
     """
     verts = np.asarray(points)[np.asarray(face_nodes)]  # (n_face_nodes, dim)
     gp = np.asarray(gp)

@@ -129,7 +129,14 @@ def available() -> bool:
 
 
 class Plan:
-    """The fixed sparsity of one symmetric matrix and the device slot that holds its factors."""
+    """The fixed sparsity of one symmetric matrix and the device slot that holds its factors.
+
+    Attributes:
+        rows: row indices of the sparsity pattern.
+        cols: column indices.
+        n: matrix size.
+        complex_values: whether the values are complex.
+    """
 
     def __init__(self, rows, cols, n, complex_values=False):
         lib = _load()

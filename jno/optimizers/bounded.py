@@ -20,7 +20,16 @@ import optax
 
 
 class BoundedOptimizer:
-    """``opt`` with its iterates projected onto ``[lower, upper]``; see :func:`bounded`."""
+    """An optimiser with its iterates projected onto ``[lower, upper]``: what :func:`bounded` returns.
+
+    Each step of ``inner`` is followed by a projection (clipping) of the parameter onto the box, after
+    jNO's learning-rate scale has been applied.
+
+    Args:
+        inner: the optimiser being bounded (an optax transform, or one of jNO's sentinels).
+        lower: lower bound, a scalar or an array broadcasting to the parameter's shape.
+        upper: upper bound, likewise.
+    """
 
     def __init__(self, inner, lower, upper):
         from .engd import ENGDOptimizer

@@ -5,6 +5,12 @@ import numpy as np
 
 
 class Geometries:
+    """Mesh constructors for simple domains: a 1-D line and structured rectangles and boxes.
+
+    Each returns a ``constructor(geo)`` for ``jno.domain(constructor=...)``. New code builds domains
+    with ``jno.shape`` (``jno.shape.rect(...).structured().domain()``).
+    """
+
     @staticmethod
     def line(x_range=(0, 1), mesh_size=0.1):
         """Create a 1D line domain.
@@ -15,6 +21,13 @@ class Geometries:
         ``cell_set`` with no vertex block, so ``variable("left"/"right"/"boundary")``
         could not resolve. The explicit two-block form is exactly the contract
         ``_extract_points_from_mesh`` consumes (endpoints named ``left``/``right``).
+
+        Args:
+            x_range: the interval ``(x0, x1)``.
+            mesh_size: target element length.
+
+        Returns:
+            ``constructor(geo) -> (meshio.Mesh, dim, ds)``, the ``jno.domain`` geometry-function contract.
         """
 
         def constructor(geo):
@@ -46,6 +59,10 @@ class Geometries:
         """Structured 2-D mesh of a rectangle, with ``cell_sets`` for boundary extraction.
 
         Args:
+            x_range: ``(x0, x1)``.
+            y_range: ``(y0, y1)``.
+            nx: cells along x.
+            ny: cells along y.
             cell: ``"triangle"`` (default) splits every grid rectangle into two triangles;
                 ``"quad"`` keeps it whole, giving ``nx*ny`` quadrilaterals. The grid nodes are
                 identical either way — only the connectivity differs.
@@ -202,6 +219,12 @@ class Geometries:
         (``left/right/bottom/top/front/back`` + ``boundary``, ``interior`` for the volume).
 
         Args:
+            x_range: ``(x0, x1)``.
+            y_range: ``(y0, y1)``.
+            z_range: ``(z0, z1)``.
+            nx: cells along x.
+            ny: cells along y.
+            nz: cells along z.
             cell: ``"tetra"`` (default) splits every voxel into six Kuhn tets, all sharing the
                 voxel's main diagonal so the subdivision is conforming across voxels; ``"hex"``
                 keeps the voxel whole, giving ``nx*ny*nz`` hexahedra and **quadrilateral**

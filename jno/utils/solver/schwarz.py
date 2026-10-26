@@ -37,7 +37,27 @@ class SchwarzPattern(NamedTuple):
     """The symbolic phase (pattern only). ``idx``: each part's unknowns (padded with ``n``, out of range);
     ``own``: which of them the part OWNS (the non-overlapping partition); ``lrow``/``lcol``/``lpos``: every
     local-matrix entry as (row, col) in the part and its position in A's sorted unique entries (``nnz`` = a
-    zero slot, ``nnz + 1`` = a one slot for the padded diagonal)."""
+    zero slot, ``nnz + 1`` = a one slot for the padded diagonal).
+
+    Attributes:
+        n: system size.
+        p: number of parts.
+        m: unknowns per part (padded).
+        nnz: unique entries of ``A``.
+        checksum: identifies ``A``'s pattern.
+        idx: ``(p, m)`` each part's unknowns.
+        own: ``(p, m)`` which of them the part owns.
+        lrow: ``(p, L)`` local-matrix rows.
+        lcol: ``(p, L)`` local-matrix columns.
+        lpos: ``(p, L)`` their positions in ``A``'s unique entries.
+        part: ``(n,)`` owner of each unknown.
+        crow: ``(nnz,)`` coarse index ``part[r] * p + part[c]`` of each entry.
+        erow: ``(nnz,)`` row of each entry.
+        ecol: ``(nnz,)`` column of each entry.
+        null: ``(n, k)`` near-null-space vectors of the coarse space.
+        diso: unknowns with no neighbours (eliminated rows), solved by their diagonal.
+        dpos: position of their diagonal in ``A``'s unique entries.
+    """
 
     n: int
     p: int

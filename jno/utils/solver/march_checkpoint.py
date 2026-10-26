@@ -56,9 +56,60 @@ def _obj(x):
     return a
 
 
+# docstring-from: jno.solve.checkpoint
 @dataclass(frozen=True)
 class CheckpointSpec:
-    """What :func:`jno.solve.checkpoint` builds; see there for the user-facing documentation."""
+    """**Checkpoint a march** to disk: ``fem.solve(checkpoint=...)``.
+
+    A march holds every frame in memory and returns them only when ``solve()`` returns, so a run
+    that dies -- OOM, a kill, a power cut -- yields **nothing**, however far it got. This writes
+    frames to ``path`` as they are produced and records what the march needs to restart, so a dead
+    run costs the last partial chunk instead of everything. Three marches write themselves down:
+
+    - a **transient** (``u.t``) march, with a built-in scheme -- the default theta, or ``time=``
+      ``theta`` / ``bdf2`` / ``sdirk`` / ``rosenbrock`` / ``exponential``;
+    - a **load-path** march (``.i(k)`` with ``domain(tau=...)``), on its fixed grid or an explicit
+      ``tau=<schedule>``;
+    - a **moving mesh** (a geometry term) with ``adapt=jno.solve.remesh(...)``. Its restart is the
+      tuple a topology rebuild already re-enters the march with,
+      ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``.
+
+    The fixed-mesh marches (transient, load path) are compiled loops, and checkpointing runs them as a
+    host loop of compiled chunks of ``every`` steps instead. The arithmetic is the same -- the transient
+    trajectory is bit-identical on CPU and within 1 ulp on GPU, the load path agrees to round-off (2.8e-17) -- but a chain of
+    scans is not one scan, so **a checkpointed march cannot be differentiated**: under ``jit`` / ``grad`` /
+    ``jno.core`` it raises. Checkpoint the forward run (``fem.solve(<param>=value, checkpoint=...)``) and
+    differentiate without it. (Unrelated to ``jax.checkpoint``, which is gradient rematerialisation.)
+
+    Every other solve refuses ``checkpoint=`` rather than accept it and write nothing: a steady solve, an
+    adaptive time step, a sharded or ``solve_fn=`` integrator, adaptive / arc-length / contact load
+    stepping, and a fixed-mesh ``adapt=``.
+
+    ``every`` -- steps between writes. A moving mesh also writes at every rebuild, which is where the
+    field layout changes and therefore where a restart has to begin anyway.
+
+    ``keep`` -- ``"last"`` (default) **drops written frames from memory**: a moving mesh's trajectory
+    loads them from disk on demand, and a fixed-mesh march returns its frames as a ``numpy.memmap`` of
+    ``<path>/frames.npy``. ``"all"`` keeps everything resident, and checkpoints purely for
+    crash-resilience.
+
+    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over. A finished
+    run (``complete`` in its manifest) is never resumed; delete the directory to redo it. A fixed-mesh
+    store records what identifies its march (grid, sizes, scheme, initial state, parameters, operators),
+    and resuming a DIFFERENT march into it raises instead of splicing the two together.
+
+    Example::
+
+        traj = fem.solve(
+            nonlinear=jno.solve.newton(direct=True),
+            adapt=jno.solve.remesh(alpha=1.2, every=1),
+            checkpoint=jno.solve.checkpoint("runs/ball", every=500),
+        )
+        u = fem_heat.solve(checkpoint=jno.solve.checkpoint("runs/heat", every=200)).fn()  # transient
+
+    Returns:
+        CheckpointSpec: pass as ``fem.solve(checkpoint=...)``.
+    """
 
     path: str
     every: int = 500
@@ -133,6 +184,11 @@ class MarchCheckpoint:
     The march appends frames as it produces them and calls :meth:`flush` at a safe boundary -- every
     ``every`` steps, and always immediately before a rebuild, since a rebuild is exactly where the
     layout changes and where a restart would have to begin anyway.
+
+    Args:
+        spec: the ``jno.solve.checkpoint(...)`` spec (path, cadence, what to keep).
+        meta: what identifies the march; resuming into a store with different meta raises.
+        reopen: open an existing store to resume instead of starting a new one.
     """
 
     def __init__(self, spec: CheckpointSpec, *, meta: dict, reopen: bool = False):
@@ -154,10 +210,20 @@ class MarchCheckpoint:
     # -- writing ---------------------------------------------------------------------------------
 
     def append(self, t: float, state, points, cells, layout) -> None:
+        """Buffer one frame (written at the next :meth:`flush`).
+
+        Args:
+            t: the frame's time.
+            state: the solution vector.
+            points: the mesh points at this frame (the mesh may move).
+            cells: the mesh cells at this frame.
+            layout: the field layout of ``state``.
+        """
         self._buf.append((float(t), np.asarray(state), np.asarray(points), np.asarray(cells)))
         self._layout = layout
 
     def pending(self) -> int:
+        """Number of buffered frames not yet written."""
         return len(self._buf)
 
     def flush(self, *, resume: dict | None = None, domain=None, complete: bool = False) -> None:
@@ -165,6 +231,11 @@ class MarchCheckpoint:
 
         Order matters: the chunk lands BEFORE the manifest that references it, so a crash midway
         leaves a manifest that is merely behind, never one that points at a file which is not there.
+
+        Args:
+            resume: the loop state to resume from, if any.
+            domain: the domain at this point, saved when the mesh has changed.
+            complete: mark the run finished.
         """
         if self._buf:
             fname = f"frames_{self.n_frames:06d}.npz"
@@ -301,7 +372,12 @@ class requested:
 
     A march that can write itself down calls :func:`claim`; on exit, a request NOBODY claimed raises, so a
     path that cannot checkpoint (a traced evaluation, a sharded or user-supplied integrator, a scheme with
-    its own loop) can never return a trajectory while the directory stays empty."""
+    its own loop) can never return a trajectory while the directory stays empty.
+
+    Args:
+        spec: the checkpoint spec, or ``None`` (no request).
+        what: a description of the solve, used in the error when nothing claims the request.
+    """
 
     def __init__(self, spec: CheckpointSpec | None, what: str):
         self.req = None if spec is None else _Request(spec)
@@ -376,6 +452,13 @@ class FixedMarchCheckpoint:
 
     ``meta`` identifies the march (grid, sizes, carry structure). Resuming into a store whose meta differs
     raises rather than splicing two different problems' frames together.
+
+    Args:
+        spec: the ``jno.solve.checkpoint(...)`` spec.
+        kind: the march kind recorded in the manifest.
+        meta: what identifies the march (see above).
+        shape: ``(n_frames, n_dofs)`` of the trajectory.
+        dtype: its dtype.
     """
 
     def __init__(self, spec: CheckpointSpec, *, kind: str, meta: dict, shape: tuple, dtype):
@@ -417,7 +500,12 @@ class FixedMarchCheckpoint:
         """Persist the frames written so far, then the carry at ``step``, then the manifest naming it.
 
         The order is the crash contract: a manifest never names a step whose carry or frames are not on
-        disk, so a kill at any instant leaves a store that resumes from an earlier, consistent step."""
+        disk, so a kill at any instant leaves a store that resumes from an earlier, consistent step.
+
+        Args:
+            step: the last step whose frames are complete.
+            payload: the loop carry and residual history at ``step``.
+        """
         self.frames.flush()
         tmp = os.path.join(self.dir, "latest.tmp.npz")
         np.savez(tmp, **{k: np.asarray(v) for k, v in payload.items()})
@@ -425,7 +513,14 @@ class FixedMarchCheckpoint:
         self._write_manifest(step=int(step), complete=False)
 
     def finish(self, step: int):
-        """Mark the run complete and return the trajectory: the memory map (``keep="last"``), or a copy in RAM."""
+        """Mark the run complete and return the trajectory: the memory map (``keep="last"``), or a copy in RAM.
+
+        Args:
+            step: the final step.
+
+        Returns:
+            The trajectory, ``(n_frames, n_dofs)``.
+        """
         self.frames.flush()
         self._write_manifest(step=int(step), complete=True)
         return self.frames if self.spec.keep == "last" else np.array(self.frames)

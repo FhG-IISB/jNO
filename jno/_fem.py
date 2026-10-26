@@ -2494,16 +2494,19 @@ def _rotation_bc_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, 
 # the FEM container
 # ---------------------------------------------------------------------------
 class FEM:
-    """Assembled FEM artefacts produced by :func:`fem` (no solve).
+    """Assembled FEM artefacts produced by :func:`fem` (no solve yet).
 
-    Attributes
-    ----------
-    domain, mesh, problem:
-        the owning jNO domain, its meshio mesh, and the assembled problem object.
-    dofs:
-        total number of degrees of freedom.
-    classification:
-        human-readable summary of how each residual was bucketed.
+    Attributes:
+        domain, mesh, problem: the owning jNO domain, its meshio mesh, and the assembled problem object.
+        dofs: total number of degrees of freedom.
+        classification: human-readable summary of how each residual was bucketed.
+
+    Args:
+        domain: the domain the problem lives on.
+        op: the assembled operator (linear system, residual operator or time block).
+        classification: how each residual was bucketed.
+        mode: the route fixed at build: ``"linear"``, ``"nonlinear"``, ``"transient"`` or ``"complex"``.
+        offsets: start offset of each field block in the DOF vector (multi-field problems).
     """
 
     def __init__(self, domain: Any, op: Any, classification: List[str], *, mode: str, offsets: Any = None):
@@ -2559,6 +2562,7 @@ class FEM:
 
     @property
     def is_transient(self) -> bool:
+        """Whether the problem marches in time (a ``u.t`` / ``u.tt`` term was found)."""
         return self._mode == "transient"
 
     @property
@@ -2572,6 +2576,7 @@ class FEM:
 
     @property
     def is_linear(self) -> bool:
+        """Whether the form is linear in the unknowns (for a transient problem: its spatial operator)."""
         if self._mode == "transient":
             return bool(self._op.is_linear())
         return self._mode == "linear"
@@ -2811,20 +2816,221 @@ class FEM:
             if et is not None:
                 et._result = None
 
-    def solve(self, *args, **kwargs):
-        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature.
+    # docstring-from: jno._fem.FEM._solve_inner
+    def solve(
+        self,
+        solve_fn=None,
+        *,
+        adapt=None,
+        checkpoint=None,
+        contact=None,
+        continuation=None,
+        x0=None,
+        nonlinear=None,
+        linear=None,
+        precond=None,
+        time=None,
+        tau=None,
+        basis=None,
+        shard=None,
+        profile=False,
+        **kwargs,
+    ) -> Any:
+        """Differentiable forward solve as a trace node — the inverse-problem entry.
 
-        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that
-        network (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the
-        same state ``em.solve()`` then reads the network at. ``tol=`` / ``max_iter=`` set the fixed point."""
+        Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
+        (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
+        equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
+        on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
+        to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
+        refinement step is non-differentiable (discrete remeshing); gradients are exact on
+        the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
+        See :func:`jno.solve.remesh` for h-adaptivity and :func:`jno.solve.relocate` for the
+        fixed-connectivity (r-adaptive) alternative, whose vertex map is differentiable in the monitor
+        and needs no cross-mesh transfer.
+
+        A **moving mesh** is not a solve argument: put a geometry term ``coord.d(t) - velocity`` in the
+        ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
+        frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
+        term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
+        (operator-split ALE; nodal-Lagrange fields, real). A weak form may read the mesh velocity
+        ``xi.d(ti)`` (the nodal values then ride with the mesh), and
+        ``adapt=jno.solve.remesh(criterion=<mesh-geometry condition>)`` rebuilds a mesh that degrades.
+
+        Delegates to :meth:`FemLinearSystem.solve` (steady linear),
+        :meth:`FemResidualOperator.solve` (steady nonlinear), or
+        :meth:`SemidiscreteTimeBlock.solve` (transient). The result is a jNO field: compare it
+        to data and train any ``jno.np.parameter`` in the weak form through
+        ``crux.solve``::
+
+            alpha = jno.np.parameter((1,), name="alpha")
+            fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+            crux = jno.core([(fem.solve() - u_obs).mse])   # domain inferred from the solve node
+            crux.solve(n)                      # recovers alpha
+
+        ``solve_fn`` is **your** solver (jNO writes none):
+
+        * steady linear: ``(A, b) -> u``. The **default** is a matrix-free **Jacobi-preconditioned**
+          BiCGStab on the BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``),
+          GPU-safe, handles general (non-symmetric) systems, ``jit`` + grad; it raises on
+          non-convergence. For the indefinite saddle-point systems where Jacobi does not help, pass a
+          **direct** ``solve_fn`` — ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no
+          dependency, robust on CPU), or bring your own. It receives the operator **exactly as
+          assembled** — the BCOO, never a densified copy — so a sparse solver of your choosing
+          (scipy SuperLU, PETSc, anything taking triplets) can be dropped straight in. jNO does not
+          pick the representation for you: densifying is ``O(n^2)`` on an ``O(nnz)`` operator (20.5
+          GiB against 9.4 MiB at ``n=51843``), which would defeat the point at the sizes where you
+          would reach for your own solver. A **dense** solver must densify itself:
+          ``lambda A, b: jnp.linalg.solve(A.todense(), b)``;
+        * steady nonlinear: ``(residual_fn, u0) -> u`` (default :func:`jno.solve.newton`: Newton on
+          the assembled tangent with a Jacobi-BiCGStab inner solve, matrix-free Newton-Krylov where
+          there is no assembled tangent; implicit-diff, no optimistix; pass ``u0=`` for the guess);
+        * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
+          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
+          ``dt``, each step solved by the same default Newton; ``save_ts=`` overrides
+          the sample times, default the domain's time grid). For a custom integrator build it
+          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``. Evaluated eagerly,
+          the built-in schemes keep only the states the ``save_ts`` frames read and return a HOST NumPy
+          array; under ``jit``/``grad`` the march stays one scan (docs: solvers, "What a march keeps").
+
+        Enable x64 — the assembly is float64.
+
+        For a **complex** steady linear problem (complex coefficients in the weak form),
+        ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
+        ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
+        to choose the real block solver.
+
+        **Solver slots** (callables-only; alternative to ``solve_fn``, which stays the total
+        override — passing both is an error). The solver space factorises into four orthogonal
+        slots; each takes a configured callable from ``jno.solve`` / ``jno.precond`` (or your
+        own with the same contract, see those modules), and every ``None`` keeps today's
+        default::
+
+            fem.solve(
+                x0        = None,                   # warm start (initial guess / iterate)
+                nonlinear = jno.solve.newton(),     # linearization driver (nonlinear mode)
+                linear    = jno.solve.gmres(),      # inner linear solve
+                precond   = jno.precond.jacobi(),   # v -> M^{-1} v spec, materialized per solve
+            )
+
+        The slots compose into a ``solve_fn`` internally, so each dispatch path below keeps its
+        periodic reduction and implicit-differentiation behaviour; slot solvers receive the
+        **BCOO** operator (no densification). On the (matrix-free) **nonlinear** path a
+        ``precond`` spec is materialized per Newton/Picard linearization against the JVP
+        operator — ``form`` / ``inner(...)`` / ``chebyshev`` / pre-built ``amg`` and their
+        ``block_diag``/``triangular`` compositions work; ``jacobi`` (needs the assembled
+        diagonal) does not. On a **transient** problem the slots configure the *per-step*
+        solves of the default theta-stepper: ``linear``/``precond`` see the step operator
+        ``M + θ·dt·A`` (materialized once, before the time loop, when the operator is
+        time-independent — an AMG hierarchy / auxiliary form is then reused by every step),
+        ``nonlinear`` drives each implicit step, each step warm-starts from the previous state
+        (``x0`` is rejected — the ICs own the initial state). Not yet supported: slots on
+        complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
+        invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
+
+        ``basis=U`` solves in the span of an ``(n_dofs, k)`` **Galerkin basis** instead of the full space:
+        the reduced system ``UᵀA U x = Uᵀb`` is ``k×k``, and the answer is lifted back to ``u = U x`` so
+        nothing downstream changes. This is the reduced-order-model (POD) entry — build ``U`` from a few
+        full solves with :func:`jno.solve.svd`, then every later solve in the family costs ``k`` unknowns::
+
+            snapshots = jnp.stack([build(p).solve() for p in sweep])   # (n_snapshots, n_dofs)
+            _, s, Vt  = jno.solve.svd(snapshots, k=10)
+            u = build(p_new).solve(basis=Vt.T)                         # 10 unknowns, full field back
+
+        Unlike every other way of solving here, this returns an **approximation**, so the relative residual
+        of the FULL system at the lifted solution is measured (one matvec) and a basis that does not span
+        the solution fails loud rather than returning a plausible wrong field — the measured value stays on
+        ``fem.basis_residual``, and ``fem.BASIS_RESIDUAL_LIMIT`` relaxes the bar for deliberately coarse
+        work. ``U`` must be orthonormal. It composes with ``linear=``/``precond=`` (which see the reduced
+        operator) and is differentiable in the basis itself under ``jax.grad`` — the learned-subspace path.
+        Steady and **first-order transient** (linear and nonlinear); a transient block is reduced once at
+        solve time and the marcher steps in the reduced space, returning the trajectory at full width —
+        certified there by the projection error of the initial state rather than a residual. Refused,
+        each with its own reason: second-order-in-time, complex, and periodic-tied problems. A reduced NONLINEAR solve returns a deferred trace node, as a periodic one does. Nonlinear
+        reduction is a memory win, not a speed one: the full-order residual is still evaluated per Newton
+        step (no hyper-reduction).
+
+        ``shard=`` controls multi-device execution of the default steady-linear solve. The default
+        (``None``) is **automatic**: the operator's nonzero axis is partitioned across every visible
+        device and one ``all-reduce`` combines the partial scatter-adds. That is a placement decision,
+        not a different algorithm — the answer moves only by reduction order (~1e-14) — and it is on by
+        default because the alternative on a multi-device box is idle silicon. On a single-device host
+        it resolves to the untouched single-device path. ``shard=False`` (or ``1``) opts out,
+        ``shard=N`` pins a device count, and a device list pins exactly; over-requesting fails loud.
+        What shards: the steady-linear solve (default or a Krylov slot with Jacobi or no preconditioner), a
+        linear transient march, and a NONLINEAR solve or march -- which has no operator to partition, so
+        its cells are split instead (one all-reduce per residual or ``J.v``). Sparse-direct branches
+        (periodic, 1-D, fused-complex, ``lu``) cannot; ``adapt=``, moving geometry and a deferred node
+        evaluated by ``crux`` are not wired. ``docs/fem/inverse.md`` has the full table.
+
+        ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
+        count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
+        Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
+        work to time.
+
+        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
+        (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
+        ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
+        accepted.
+
+        Args:
+            solve_fn: your own solver, the total override (see above); ``None`` uses the defaults.
+            adapt: ``jno.solve.remesh(...)`` (h-adaptivity) or ``jno.solve.relocate(...)`` (r-adaptivity).
+            checkpoint: ``jno.solve.checkpoint(path, every=...)`` writes a transient or load-path march to
+                disk as it runs and resumes from it, e.g. ``fem.solve(checkpoint=jno.solve.checkpoint("runs/heat",
+                every=200))``.
+            contact: ``jno.solve.contact()`` re-runs the contact pairing (``u.gap`` / ``u.slide``) from the
+                deformed configuration until it settles; required when a gap lists several candidate surfaces.
+            continuation: ``jno.solve.continuation(k=values)`` marches a parameter through ``values``, each
+                solve warm-started from the last (``"all"`` as first argument returns the whole family).
+            x0: warm start for the iterative solve.
+            nonlinear: the linearisation driver slot (``jno.solve.newton()``, ...).
+            linear: the inner linear solver slot (``jno.solve.gmres()``, ``jno.solve.lu()``, ...).
+            precond: the preconditioner slot (``jno.precond.jacobi()``, ``jno.precond.amg()``, ...).
+            time: the time scheme of a transient problem (``jno.solve.theta(0.5)``, ``bdf2``, ...,
+                optionally ``.adaptive()``).
+            tau: the load-step schedule of a ``domain(tau=...)`` march: ``jno.solve.adaptive(limit=...)``,
+                ``jno.solve.arclength(...)``, or a recorded ``fem.tau_schedule`` to replay.
+            basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
+            shard: multi-device execution (see above).
+            profile: run inside a JAX trace and report the time (see above).
+            **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
+                make a parametric form concrete for this solve.
+
+        Returns:
+            The solution: a DOF vector (steady), a ``(n_steps, n_dofs)`` trajectory (transient), a
+            deferred trace node (parametric or periodic nonlinear), or an ``AdaptiveTrajectory`` (moving
+            mesh).
+        """
         self._refresh_attachments()
         import time as _time
 
         from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
 
+        # Forward only what was given: the defaults are `_solve_inner`'s own, and the coupled path below has
+        # to tell an argument the caller passed from one left at its default.
+        slots = dict(
+            adapt=adapt,
+            checkpoint=checkpoint,
+            contact=contact,
+            continuation=continuation,
+            x0=x0,
+            nonlinear=nonlinear,
+            linear=linear,
+            precond=precond,
+            time=time,
+            tau=tau,
+            basis=basis,
+            shard=shard,
+        )
+        given = {k: v for k, v in slots.items() if v is not None}
+        if profile:
+            given["profile"] = profile
+        args = () if solve_fn is None else (solve_fn,)
+
         _em = peec_source_of(self)
         if _em is not None:
-            extra = sorted(set(kwargs) - {"tol", "max_iter"})
+            extra = sorted((set(kwargs) - {"tol", "max_iter"}) | set(given))
             if args or extra:
                 raise ValueError(
                     "jno.fem: this problem is heated by a jno.peec network's `em.loss`, so its solve is the "
@@ -2843,7 +3049,7 @@ class FEM:
         prev_linear = _nk._LINEAR_FORM[0]
         _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
         try:
-            out = self._solve_inner(*args, **kwargs)
+            out = self._solve_inner(*args, **given, **kwargs)
         finally:
             _nk._LINEAR_FORM[0] = prev_linear
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
@@ -3063,6 +3269,40 @@ class FEM:
         count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
+
+        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
+        (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
+        ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
+        accepted.
+
+        Args:
+            solve_fn: your own solver, the total override (see above); ``None`` uses the defaults.
+            adapt: ``jno.solve.remesh(...)`` (h-adaptivity) or ``jno.solve.relocate(...)`` (r-adaptivity).
+            checkpoint: ``jno.solve.checkpoint(path, every=...)`` writes a transient or load-path march to
+                disk as it runs and resumes from it, e.g. ``fem.solve(checkpoint=jno.solve.checkpoint("runs/heat",
+                every=200))``.
+            contact: ``jno.solve.contact()`` re-runs the contact pairing (``u.gap`` / ``u.slide``) from the
+                deformed configuration until it settles; required when a gap lists several candidate surfaces.
+            continuation: ``jno.solve.continuation(k=values)`` marches a parameter through ``values``, each
+                solve warm-started from the last (``"all"`` as first argument returns the whole family).
+            x0: warm start for the iterative solve.
+            nonlinear: the linearisation driver slot (``jno.solve.newton()``, ...).
+            linear: the inner linear solver slot (``jno.solve.gmres()``, ``jno.solve.lu()``, ...).
+            precond: the preconditioner slot (``jno.precond.jacobi()``, ``jno.precond.amg()``, ...).
+            time: the time scheme of a transient problem (``jno.solve.theta(0.5)``, ``bdf2``, ...,
+                optionally ``.adaptive()``).
+            tau: the load-step schedule of a ``domain(tau=...)`` march: ``jno.solve.adaptive(limit=...)``,
+                ``jno.solve.arclength(...)``, or a recorded ``fem.tau_schedule`` to replay.
+            basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
+            shard: multi-device execution (see above).
+            profile: run inside a JAX trace and report the time (see above).
+            **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
+                make a parametric form concrete for this solve.
+
+        Returns:
+            The solution: a DOF vector (steady), a ``(n_steps, n_dofs)`` trajectory (transient), a
+            deferred trace node (parametric or periodic nonlinear), or an ``AdaptiveTrajectory`` (moving
+            mesh).
         """
         # ONE site, in the public entry: the mode-specific paths below return at different points
         # (nonlinear and transient both bypass `_compose_slots`), so logging inside them left two of
@@ -3244,12 +3484,6 @@ class FEM:
         from .utils.profiling import profile_solve
 
         return profile_solve(_run_with_stats, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
-
-    # `solve` is a thin timing/logging wrapper, so its own signature is `(*args, **kwargs)` -- which
-    # erased every solver slot from `help(fem.solve)`, IDE completion and `inspect.signature` (a test
-    # asserting `shard=` is accepted failed on exactly that). Point both at the real one.
-    solve.__wrapped__ = _solve_inner
-    solve.__doc__ = _solve_inner.__doc__
 
     #: relative residual of the FULL system above which a ``basis=`` solve is refused. Not a tuning
     #: knob: at this size the basis does not span the solution at all (a modelling error), rather than
@@ -4573,11 +4807,18 @@ class FEM:
             return self
         return fem(self._constraints, _dd_overlap=True, **(getattr(self, "_fem_kwargs", None) or {}))
 
-    def pinned_solver(self, node_ids, *, nonlinear=None):
+    def pinned_solver(self, node_ids):
         """A reusable ``f(values) -> field`` that solves the linear system with ``node_ids`` pinned to
         ``values`` (row-replacement) — the interface Dirichlet data a coupled Schwarz step supplies. The
         (fixed) matrix is prefactored once; each iteration only re-solves against a new right-hand side.
-        The dense LU runs on the host (robust: the GPU ``cuSolver`` dense path can be flaky)."""
+        The dense LU runs on the host (robust: the GPU ``cuSolver`` dense path can be flaky).
+
+        Args:
+            node_ids: the DOFs to pin.
+
+        Returns:
+            Callable: ``f(values) -> field``.
+        """
         import numpy as _np
         import scipy.linalg as _sla
 
@@ -4932,6 +5173,14 @@ class FEM:
         Refused by name rather than guessed: a **transient trajectory** ``(n_steps, n_dofs)`` — pass one
         step, ``fem.export(traj[k], ...)`` — and a **complex** solution, where taking a part silently is
         exactly the kind of quiet choice that hides a wrong answer; pass ``sol.real`` / ``sol.imag``.
+
+        Args:
+            solution: one solution vector (a single step of a trajectory).
+            save_path: the output path; a multi-field problem inserts the field name before the extension.
+            file_format: a ``meshio`` format name; ``None`` infers it from the extension.
+
+        Returns:
+            list: the paths written.
         """
         import os
 
@@ -5287,18 +5536,22 @@ class FEM:
 
     @property
     def t0(self):
+        """Start time of a transient problem (``None`` if steady)."""
         return self._time_block().t0 if self.is_transient else None
 
     @property
     def t1(self):
+        """End time of a transient problem (``None`` if steady)."""
         return self._time_block().t1 if self.is_transient else None
 
     @property
     def dt(self):
+        """Time step of a transient problem (``None`` if steady)."""
         return self._time_block().dt if self.is_transient else None
 
     @property
     def dofs(self) -> Optional[int]:
+        """Total number of degrees of freedom (``None`` when not yet known)."""
         if self._mode == "linear" and self._b is not None:
             return int(jnp.asarray(self._b).reshape(-1).shape[0])
         if self._mode == "nonlinear":
@@ -7274,6 +7527,7 @@ def _refuse_point_indexing(constraints: Any) -> None:
 _TIED_CONSTANT_DOMAINS: List[Any] = []
 
 
+# docstring-from: jno._fem._fem_impl
 def fem(
     constraints: Any,
     *,
@@ -7281,13 +7535,47 @@ def fem(
     chunk: Any = None,
     _dd_overlap: bool = False,
 ) -> FEM:
-    """Assemble a flat list of traced residuals into an :class:`FEM` — see :func:`_fem_impl`.
+    """Assemble a flat list of traced residuals into an :class:`FEM`: the finite-element front door.
 
-    This thin wrapper exists only to scope ``chunk=`` over the assembly. The element-chunk policy has
-    to be in force while the assembler builds its closures (it is captured there, not read when they
-    later run), and threading a parameter through ten ``assemble_fem_native`` call sites to say the
-    same thing would be churn for no gain.
+    The term list is the whole problem: weak terms (those containing a test function), essential
+    conditions ``u(region) - g``, initial conditions, ties and pins. Linear or nonlinear, steady or
+    transient is read off the terms, not configured::
+
+        u = d.unknown(); v = u.test()
+        grad = lambda w: jno.np.jacobian(w, [x, y])
+        fem = jno.fem([jno.np.inner(grad(u), grad(v)) - f * v,   # -Δu = f, weak form
+                       u(xb, yb) - 0.0])                          # u = 0 on the boundary
+        sol = fem.solve()                                         # differentiable
+
+    Args:
+        constraints: A residual expression or list of them. Weak terms (containing the test function)
+            and essential conditions (``u(region) - g``) are auto-classified.
+        quad_degree: Quadrature degree. Omitted (the default), it is ``2 x order`` of the field -- what
+            integrates its mass term exactly (6 for a Hermite beam, 12 for Argyris, ...). Given, it is
+            used as written, also below that: a form with only gradients of a P1 field is exact at
+            degree 0, at a quarter of the points in 3-D. A degree below the default is reported once
+            with what it integrates inexactly. The element type is derived from the domain's dimension
+            and the trial's ``order``.
+        chunk: Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
+            device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
+            positive int pins the cell count. A single ``vmap`` over every cell materialises the whole
+            batched intermediate at once, and on a 3-D mesh that intermediate — not the assembled
+            operator — is what sets the memory ceiling. Chunking capped the peak of a 3-D nonlinear
+            solve at 509 MiB where it had been 2324 MiB, for roughly 15% more assembly time. The default
+            needs no tuning: a chunk may use ~0.15% of device memory, so the same problem that must be
+            split on an 8 GB card runs unsplit — and therefore at full speed — on an 80 GB one. Pin it
+            when you know better than the heuristic: a very large per-cell block, an unusual device, or
+            to reproduce the unchunked behaviour exactly. This lives on ``jno.fem`` rather than on
+            ``fem.solve`` because it is an assembly-time decision: the steady-linear operator is built
+            here, before any solve. Setting it on a problem whose assembler has no element loop (1-D,
+            non-nodal) is an error rather than a silent no-op.
+
+    Returns:
+        FEM: the assembled problem; call :meth:`FEM.solve`, :meth:`FEM.eigs` or read ``fem.operator``.
     """
+    # This wrapper only scopes `chunk=` over the assembly: the element-chunk policy has to be in force while
+    # the assembler builds its closures (it is captured there, not read when they later run), and threading a
+    # parameter through every `assemble_fem_native` call site to say the same thing would be churn.
     from .utils.solver import fem_utils as _fn  # the chunk policy's home; both assemblers read it
 
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
@@ -7350,37 +7638,43 @@ def _fem_impl(
     quad_degree: int | None = None,
     _dd_overlap: bool = False,
 ) -> FEM:
-    """Assemble a flat list of traced residuals into an :class:`FEM`.
+    """Assemble a flat list of traced residuals into an :class:`FEM`: the finite-element front door.
 
-    Parameters
-    ----------
-    constraints:
-        A residual expression or list of them. Weak terms (containing the test
-        function) and essential conditions (``u(region) - g``) are auto-classified.
-    quad_degree:
-        Quadrature degree. Omitted (the default), it is ``2 x order`` of the field -- what integrates its
-        mass term exactly (6 for a Hermite beam, 12 for Argyris, ...). Given, it is used as written, also
-        below that: a form with only gradients of a P1 field is exact at degree 0, at a quarter of the
-        points in 3-D. A degree below the default is reported once with what it integrates inexactly.
-        The element type is derived from the domain's dimension and the trial's ``order``.
-    chunk:
-        Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
-        device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
-        positive int pins the cell count.
+    The term list is the whole problem: weak terms (those containing a test function), essential
+    conditions ``u(region) - g``, initial conditions, ties and pins. Linear or nonlinear, steady or
+    transient is read off the terms, not configured::
 
-        A single ``vmap`` over every cell materialises the whole batched intermediate at once, and on
-        a 3-D mesh that intermediate — not the assembled operator — is what sets the memory ceiling.
-        Chunking capped the peak of a 3-D nonlinear solve at 509 MiB where it had been 2324 MiB, for
-        roughly 15% more assembly time.
+        u = d.unknown(); v = u.test()
+        grad = lambda w: jno.np.jacobian(w, [x, y])
+        fem = jno.fem([jno.np.inner(grad(u), grad(v)) - f * v,   # -Δu = f, weak form
+                       u(xb, yb) - 0.0])                          # u = 0 on the boundary
+        sol = fem.solve()                                         # differentiable
 
-        The default needs no tuning: a chunk may use ~0.15% of device memory, so the same problem
-        that must be split on an 8 GB card runs unsplit — and therefore at full speed — on an 80 GB
-        one. Pin it when you know better than the heuristic: a very large per-cell block, an unusual
-        device, or to reproduce the unchunked behaviour exactly.
+    Args:
+        constraints: A residual expression or list of them. Weak terms (containing the test function)
+            and essential conditions (``u(region) - g``) are auto-classified.
+        quad_degree: Quadrature degree. Omitted (the default), it is ``2 x order`` of the field -- what
+            integrates its mass term exactly (6 for a Hermite beam, 12 for Argyris, ...). Given, it is
+            used as written, also below that: a form with only gradients of a P1 field is exact at
+            degree 0, at a quarter of the points in 3-D. A degree below the default is reported once
+            with what it integrates inexactly. The element type is derived from the domain's dimension
+            and the trial's ``order``.
+        chunk: Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
+            device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
+            positive int pins the cell count. A single ``vmap`` over every cell materialises the whole
+            batched intermediate at once, and on a 3-D mesh that intermediate — not the assembled
+            operator — is what sets the memory ceiling. Chunking capped the peak of a 3-D nonlinear
+            solve at 509 MiB where it had been 2324 MiB, for roughly 15% more assembly time. The default
+            needs no tuning: a chunk may use ~0.15% of device memory, so the same problem that must be
+            split on an 8 GB card runs unsplit — and therefore at full speed — on an 80 GB one. Pin it
+            when you know better than the heuristic: a very large per-cell block, an unusual device, or
+            to reproduce the unchunked behaviour exactly. This lives on ``jno.fem`` rather than on
+            ``fem.solve`` because it is an assembly-time decision: the steady-linear operator is built
+            here, before any solve. Setting it on a problem whose assembler has no element loop (1-D,
+            non-nodal) is an error rather than a silent no-op.
 
-        This lives on ``jno.fem`` rather than on ``fem.solve`` because it is an assembly-time
-        decision: the steady-linear operator is built here, before any solve. Setting it on a problem
-        whose assembler has no element loop (1-D, non-nodal) is an error rather than a silent no-op.
+    Returns:
+        FEM: the assembled problem; call :meth:`FEM.solve`, :meth:`FEM.eigs` or read ``fem.operator``.
     """
     from .utils.solver.fem_route import neumann
     from .utils.solver.weak_form import (

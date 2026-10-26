@@ -109,36 +109,30 @@ class RcwaError(ValueError):
 def detect_layers(E, z, tol=1e-3, slices=None, locate=None):
     """Group a z-sampled permittivity into RCWA layers.
 
-    Parameters
-    ----------
-    E:
-        ``(Nz, Ng, Ng)`` permittivity sampled on the unit-cell grid at each height ``z``.
-    z:
-        ``(Nz,)`` ascending heights.
-    tol:
-        In-plane change below which two adjacent z-slices are the same material.
-    slices:
-        If given, staircase a continuously-varying ``eps`` into this many layers instead of raising.
-    locate:
-        ``locate(z_lo, z_hi) -> z`` places the interface between two neighbouring layers, given heights
-        inside each (their middle samples). Without it the interface is put halfway between the last
-        sample of one layer and the first of the next, so a thickness is only known to one sample spacing.
-        The front door passes a bisection on the permittivity itself, which finds a sharp interface
-        exactly and a mesh field's interface where its interpolant crosses halfway between the layers.
+    Args:
+        E: ``(Nz, Ng, Ng)`` permittivity sampled on the unit-cell grid at each height ``z``.
+        z: ``(Nz,)`` ascending heights.
+        tol: In-plane change below which two adjacent z-slices are the same material.
+        slices: If given, staircase a continuously-varying ``eps`` into this many layers instead of
+            raising.
+        locate: ``locate(z_lo, z_hi) -> z`` places the interface between two neighbouring layers, given
+            heights inside each (their middle samples). Without it the interface is put halfway between
+            the last sample of one layer and the first of the next, so a thickness is only known to one
+            sample spacing. The front door passes a bisection on the permittivity itself, which finds a
+            sharp interface exactly and a mesh field's interface where its interpolant crosses halfway
+            between the layers.
+        A layer's thickness is the distance between the interfaces that bound it -- not between its
+            first
+        and last samples, which is short by up to one spacing (a 0.2 slab sampled every 1/63 came out
+        11/63 = 0.175 thick, and its reflectance 0.34 against Airy's 0.62).
 
-    A layer's thickness is the distance between the interfaces that bound it -- not between its first
-    and last samples, which is short by up to one spacing (a 0.2 slab sampled every 1/63 came out
-    11/63 = 0.175 thick, and its reflectance 0.34 against Airy's 0.62).
+    Returns:
+        list[tuple[float, np.ndarray]]: ``[(thickness, eps_xy), ...]`` super→substrate; the two ambients
+            have thickness ``inf``.
 
-    Returns
-    -------
-    list[tuple[float, np.ndarray]]
-        ``[(thickness, eps_xy), ...]`` super→substrate; the two ambients have thickness ``inf``.
-
-    Raises
-    ------
-    RcwaError
-        If ``eps`` varies continuously in z and ``slices`` is None (RCWA needs invariant slabs).
+    Raises:
+        RcwaError: If ``eps`` varies continuously in z and ``slices`` is None (RCWA needs invariant
+            slabs).
     """
     Nz = len(z)
     if E.shape[0] != Nz:
@@ -367,39 +361,32 @@ class _Sol:
         aperture ``NA``, summed over the illumination ``source``. Everything (wavelength, period, the complex
         mask spectrum) is read from the solve; only the optics are yours.
 
-        Parameters
-        ----------
-        NA:
-            Numerical aperture of the projection lens (an order passes the pupil when its direction cosine
-            ``|α| ≤ NA``).
-        source:
-            Illumination. A **float** ``σ`` → conventional (a filled disk of partial-coherence radius ``σ``);
-            a **(σ_in, σ_out) tuple** → annular; a raw **array** of pupil weights (differentiable, for
-            source-mask optimization).
-        defocus:
-            Defocus (same length unit as the geometry); applies the quadratic pupil phase.
-        grid:
-            Real-space resolution of the returned image (one period).
-        kind:
-            ``"T"`` (transmissive DUV mask, default) or ``"R"`` (reflective EUV mask).
-        polarization:
-            ``None`` (default) → **scalar** imaging of the field component along the incident polarization
-            (``E_x`` for an x-polarized solve), correct at low NA. A string turns on the
-            **vector high-NA** model, which rotates each order's transverse ``(E_x, E_y)`` to the 3-D wafer
-            field through the Richards-Wolf/Flagello vector pupil (so the TM component loses contrast at large
-            angles): ``"x"`` / ``"y"`` → linearly polarized illumination; ``"unpolarized"`` → the two averaged.
+        Args:
+            NA: Numerical aperture of the projection lens (an order passes the pupil when its direction
+                cosine ``|α| ≤ NA``).
+            source: Illumination. A **float** ``σ`` → conventional (a filled disk of partial-coherence
+                radius ``σ``); a **(σ_in, σ_out) tuple** → annular; a raw **array** of pupil weights
+                (differentiable, for source-mask optimization).
+            defocus: Defocus (same length unit as the geometry); applies the quadratic pupil phase.
+            grid: Real-space resolution of the returned image (one period).
+            kind: ``"T"`` (transmissive DUV mask, default) or ``"R"`` (reflective EUV mask).
+            polarization: ``None`` (default) → **scalar** imaging of the field component along the incident
+                polarization (``E_x`` for an x-polarized solve), correct at low NA. A string turns on the
+                **vector high-NA** model, which rotates each order's transverse ``(E_x, E_y)`` to the 3-D
+                wafer field through the Richards-Wolf/Flagello vector pupil (so the TM component loses
+                contrast at large angles): ``"x"`` / ``"y"`` → linearly polarized illumination;
+                ``"unpolarized"`` → the two averaged.
 
-        Returns
-        -------
-        A ``(grid, grid)`` JAX intensity array over one period -- differentiable in the mask design and the
-        source, so ``jax.grad`` of a printed-vs-target loss drives OPC / ILT / SMO.
+        Returns:
+            A ``(grid, grid)`` JAX intensity array over one period -- differentiable in the mask design and
+                the
+            source, so ``jax.grad`` of a printed-vs-target loss drives OPC / ILT / SMO.
 
-        Notes
-        -----
-        Uses the shift-invariant (Kirchhoff-like) Abbe sum on this single solve's rigorous spectrum; full
-        angular rigor (re-solving the mask per source point) is a heavier option. The vector pupil follows
-        Flagello, Milster & Rosenbluth, *J. Opt. Soc. Am. A* **13**, 53 (1996), with the aplanatic
-        ``1/√(cosθ)`` apodization; at NA→0 it reduces to the scalar image.
+        Note:
+            Uses the shift-invariant (Kirchhoff-like) Abbe sum on this single solve's rigorous spectrum; full
+            angular rigor (re-solving the mask per source point) is a heavier option. The vector pupil follows
+            Flagello, Milster & Rosenbluth, *J. Opt. Soc. Am. A* **13**, 53 (1996), with the aplanatic
+            ``1/√(cosθ)`` apodization; at NA→0 it reduces to the scalar image.
         """
         wl = self._wl  # may be a tracer (a wavelength parameter) -- keep jax-native
         Px, Py = float(self._period[0]), float(self._period[1])
@@ -641,6 +628,18 @@ class Rcwa:
 
     Most users reach this through :func:`jno.rcwa` with a problem list; construct it directly only when
     you already have the ``[(thickness, eps), ...]`` stack, period and truncation in hand.
+
+    Args:
+        layers: the stack, ``[(thickness, eps), ...]`` from top to bottom; ``eps`` is a scalar or a
+            permittivity grid (2-D array, or a ``(…, 3, 3)`` tensor grid).
+        period: the lattice periods ``(Lx, Ly)``.
+        orders: Fourier truncation (approximate number of retained orders).
+        wavelength: free-space wavelength; may instead be given to :meth:`solve`.
+        k_in: transverse incident wavevector ``(kx, ky)``.
+        formulation: the ``fmmax`` Fourier factorization; ``"JONES_DIRECT_FOURIER"`` (default) converges
+            well for high-contrast dielectrics, where the naive rule converges poorly.
+        assume_periodic: skip the check that each layer's grid is periodic.
+        polarization: ``"x"``, ``"y"``, or a Jones vector ``(p_x, p_y)``.
     """
 
     def __init__(
@@ -789,7 +788,7 @@ class Rcwa:
             fn = self._core_jit = jax.jit(core)
         return fn(grids, thick, jnp.asarray(wl), jnp.asarray(kin), tuple(jnp.asarray(p) for p in pol))
 
-    def solve(self, inc=None, wavelength=None, k_in=None, layers=None, source=None, polarization=None):
+    def solve(self, *, wavelength=None, k_in=None, layers=None, source=None, polarization=None):
         """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
         not conserved.
 
@@ -798,7 +797,22 @@ class Rcwa:
         construction-time shape guards run once, eagerly, so the solve itself stays trace-clean).
 
         ``source`` (a dict built by the front door) drives an **internal-source** emission solve instead of
-        plane-wave incidence -- see :meth:`_solve_source`; it returns an :class:`_EmitterSol`."""
+        plane-wave incidence -- see :meth:`_solve_source`; it returns an :class:`_EmitterSol`.
+
+        Args:
+            wavelength: free-space wavelength; overrides the construction value.
+            k_in: transverse incident wavevector; overrides the construction value.
+            layers: ``[(thickness, eps), ...]`` replacing the stack for this solve (JAX arrays allowed).
+            source: an internal-source description (built by :func:`jno.rcwa`); switches to an emission solve.
+            polarization: incident polarization override.
+
+        Returns:
+            The solution: efficiencies (``.efficiency("T")``, ``.order(m, n)``) or, with ``source``, the
+            emitted powers.
+
+        Raises:
+            RcwaError: if the wavelength is unknown or energy is not conserved.
+        """
         fm = self.fm
         wl = wavelength if wavelength is not None else self.wavelength
         if wl is None:
@@ -887,7 +901,20 @@ class Rcwa:
 # =====================================================================================
 @dataclass
 class RcwaSpec:
-    """Everything the RCWA engine needs, inferred from a jNO problem. Inspectable without fmmax."""
+    """Everything the RCWA engine needs, inferred from a jNO problem. Inspectable without fmmax.
+
+    Attributes:
+        period: lattice periods ``(Lx, Ly)``.
+        layers: the stack, ``[(thickness, eps_xy), ...]``.
+        wavelength: free-space wavelength.
+        k_in: transverse incident wavevector ``(kx, ky)``.
+        source_face: the illuminated face's tag.
+        ambient_faces: the tags of the two ambient (radiating) faces.
+        periodic_axes: the Floquet-tied axes and their face pairs.
+        source: an internal-source (dipole/Gaussian) emission spec, or ``None`` for plane-wave incidence.
+        polarization: incident transverse Jones vector ``(p_x, p_y)``, unit norm.
+        polarization_from: how the polarization was decided (given, read from a vector source, or inferred).
+    """
 
     period: tuple
     layers: list  # [(thickness, eps_xy), ...]
@@ -2037,39 +2064,38 @@ def rcwa(
     ``k_in`` is nudged off the singular Γ-point, and the source must sit in a finite (contrast-defined) layer.
     Scalar Helmholtz only for now; a boundary incidence + internal source together raise.
 
-    Parameters
-    ----------
-    problem:
-        The same constraint list you would pass to :func:`jno.fem`, or an already-built ``FEM``.
-    orders:
-        Fourier truncation for the modal solve.
-    wavelength:
-        Free-space wavelength (same length unit as the geometry). Optional — inferred from the
-        superstrate (assumed vacuum) when omitted. Pass it to override or if no ambient is vacuum.
-    grid, nz:
-        Transverse resolution and number of z-samples used to detect the layer stack.
-    slices:
-        Staircase a continuously-varying permittivity into this many layers instead of raising.
-    smoothing:
-        Subpixel-smoothing factor (default ``1`` = off). ``smoothing=k`` supersamples each RCWA pixel
-        ``k×k`` and area-averages the permittivity, anti-aliasing material boundaries. Recommended (``2``–``4``)
-        for **inverse design**: it cuts Fourier (Gibbs) ringing so fewer ``orders`` converge, and makes the
-        gradient w.r.t. a boundary-moving design parameter smooth rather than staircased. Costs ``k²``× more
-        coefficient evaluations (cheap) — the fmmax eigensolve size is unchanged.
-    polarization:
-        The incident polarization: ``"x"``, ``"y"``, or a transverse Jones vector ``(p_x, p_y)`` (complex
-        entries give elliptical light). Usually inferred, and the choice is logged and kept on
-        ``spec.polarization`` / ``spec.polarization_from``. A **vector** (curl-curl) list carries it in its
-        incident field ``E_inc``. A **scalar** Helmholtz list is solved in the polarization for which Maxwell
-        reduces exactly to the written equation -- E along the axis every layer is invariant along, when the
-        incidence has no component along it (a 1-D grating: E parallel to its lines; TE) -- so ``jno.rcwa``
-        and ``jno.fem`` answer the same equation. A stack patterned along both axes has no such
-        polarization; it is solved x-polarized, and the log says so.
+    Args:
+        problem: The same constraint list you would pass to :func:`jno.fem`, or an already-built
+            ``FEM``.
+        orders: Fourier truncation for the modal solve.
+        wavelength: Free-space wavelength (same length unit as the geometry). Optional — inferred from
+            the superstrate (assumed vacuum) when omitted. Pass it to override or if no ambient is
+            vacuum.
+        grid, nz: Transverse resolution and number of z-samples used to detect the layer stack.
+        slices: Staircase a continuously-varying permittivity into this many layers instead of raising.
+        params: values of the problem's ``jno.np.parameter`` nodes, by name, used for the eager
+            inference (structure, source, wavelength) instead of their initial values.
+        formulation: the ``fmmax`` Fourier factorization; ``"JONES_DIRECT_FOURIER"`` (default) converges
+            well for high-contrast dielectrics, where the naive rule converges poorly.
+        smoothing: Subpixel-smoothing factor (default ``1`` = off). ``smoothing=k`` supersamples each
+            RCWA pixel ``k×k`` and area-averages the permittivity, anti-aliasing material boundaries.
+            Recommended (``2``–``4``) for **inverse design**: it cuts Fourier (Gibbs) ringing so fewer
+            ``orders`` converge, and makes the gradient w.r.t. a boundary-moving design parameter smooth
+            rather than staircased. Costs ``k²``× more coefficient evaluations (cheap) — the fmmax
+            eigensolve size is unchanged.
+        polarization: The incident polarization: ``"x"``, ``"y"``, or a transverse Jones vector ``(p_x,
+            p_y)`` (complex entries give elliptical light). Usually inferred, and the choice is logged
+            and kept on ``spec.polarization`` / ``spec.polarization_from``. A **vector** (curl-curl)
+            list carries it in its incident field ``E_inc``. A **scalar** Helmholtz list is solved in
+            the polarization for which Maxwell reduces exactly to the written equation -- E along the
+            axis every layer is invariant along, when the incidence has no component along it (a 1-D
+            grating: E parallel to its lines; TE) -- so ``jno.rcwa`` and ``jno.fem`` answer the same
+            equation. A stack patterned along both axes has no such polarization; it is solved
+            x-polarized, and the log says so.
 
-    Returns
-    -------
-    _RcwaProblem
-        Holds the inferred :class:`RcwaSpec` (``.spec``) and a :meth:`~_RcwaProblem.solve`.
+    Returns:
+        _RcwaProblem: Holds the inferred :class:`RcwaSpec` (``.spec``) and a
+            :meth:`~_RcwaProblem.solve`.
     """
     sub = int(smoothing)
     if sub < 1:

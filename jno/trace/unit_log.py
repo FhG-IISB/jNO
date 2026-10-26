@@ -77,9 +77,21 @@ class UnitLogger:
         return [w for _, _, ws in self.entries for w in ws]
 
     def record(self, label: str, unit: Optional[Unit], warnings: Sequence[str] = ()) -> None:
+        """Record one node's inferred unit and any warnings.
+
+        Args:
+            label: the node's printable label.
+            unit: its inferred unit, or ``None`` if unknown.
+            warnings: dimensional inconsistencies found at this node.
+        """
         self.entries.append((label, unit, list(warnings)))
 
     def render(self) -> str:
+        """The log as text: one line per node with its unit and warnings.
+
+        Returns:
+            str: the rendered log.
+        """
         width = max((len(label) for label, _, _ in self.entries), default=0)
         lines = []
         for label, unit, warnings in self.entries:
@@ -91,6 +103,11 @@ class UnitLogger:
         return "\n".join(lines)
 
     def write(self, path: str) -> None:
+        """Write the rendered log to a file.
+
+        Args:
+            path: the output file.
+        """
         header = "# jno dimensional-analysis log\n# node  →  inferred unit  [warnings]\n\n"
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(header + self.render() + "\n")
@@ -284,19 +301,14 @@ def check(nodes, log: Optional[str] = None) -> UnitLogger:
     recording any dimensional inconsistencies.  Optionally writes a
     human-readable log.
 
-    Parameters
-    ----------
-    nodes:
-        A traced expression or a sequence of them (e.g. the residuals passed to
-        ``jno.fem([...])``).
-    log:
-        If given, a filesystem path the per-node log is written to.
+    Args:
+        nodes: A traced expression or a sequence of them (e.g. the residuals passed to
+            ``jno.fem([...])``).
+        log: If given, a filesystem path the per-node log is written to.
 
-    Returns
-    -------
-    UnitLogger
-        Inspect ``.entries`` (``(label, unit, warnings)`` triples) or
-        ``.warnings`` (flat list) programmatically.
+    Returns:
+        UnitLogger: Inspect ``.entries`` (``(label, unit, warnings)`` triples) or ``.warnings`` (flat
+            list) programmatically.
     """
     if not isinstance(nodes, (list, tuple)):
         nodes = [nodes]
@@ -520,7 +532,14 @@ def _additive_terms(node, sign: int = 1) -> List[Tuple[int, object]]:
 
 
 class TermInfo:
-    """One additive term of a residual: its node, sign, unit, magnitude, π."""
+    """One additive term of a residual: its node, sign, unit, magnitude, π.
+
+    Args:
+        term: the term's expression.
+        sign: its sign in the sum (+1 or -1).
+        unit: its inferred unit, or ``None``.
+        scale: its characteristic magnitude, or ``None``.
+    """
 
     def __init__(self, term, sign: int, unit: Optional[Unit], scale: Optional[float]):
         self.term = term
@@ -534,7 +553,13 @@ class TermInfo:
 
 
 class ResidualReport:
-    """Per-residual non-dimensionalization result."""
+    """Per-residual non-dimensionalization result.
+
+    Args:
+        root: the residual expression.
+        terms: its additive terms.
+        ref_index: index of the reference term, or ``None``.
+    """
 
     def __init__(self, root, terms: List[TermInfo], ref_index: Optional[int]):
         self.root = root
@@ -543,16 +568,26 @@ class ResidualReport:
 
     @property
     def pis(self) -> List[Optional[float]]:
+        """The dimensionless group ``π`` of each term (``None`` where it could not be formed)."""
         return [t.pi for t in self.terms]
 
 
 class NondimReport:
-    """Result of :func:`nondimensionalize`: one :class:`ResidualReport` each."""
+    """Result of :func:`nondimensionalize`: one :class:`ResidualReport` each.
+
+    Args:
+        residuals: one :class:`ResidualReport` per residual.
+    """
 
     def __init__(self, residuals: List[ResidualReport]):
         self.residuals = residuals
 
     def render(self) -> str:
+        """The report as text: per residual, each term's unit, magnitude and ``π``.
+
+        Returns:
+            str: the rendered report.
+        """
         blocks = []
         for r in self.residuals:
             labels = [_label(t.term) for t in r.terms]
@@ -568,6 +603,11 @@ class NondimReport:
         return "\n\n".join(blocks)
 
     def write(self, path: str) -> None:
+        """Write the rendered report to a file.
+
+        Args:
+            path: the output file.
+        """
         header = "# jno non-dimensionalization report\n# per additive term: inferred unit, characteristic magnitude, dimensionless group π\n\n"
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(header + self.render() + "\n")
@@ -584,20 +624,14 @@ def nondimensionalize(nodes, ref: Optional[int] = None, report: Optional[str] = 
     Phase A only — this is pure analysis and does **not** change what the solver
     computes.
 
-    Parameters
-    ----------
-    nodes:
-        A residual expression or a sequence of them.
-    ref:
-        Index of the reference term whose magnitude normalises the groups.
-        Defaults to the first term with both a known unit and a known scale.
-    report:
-        If given, a path the human-readable report is written to.
+    Args:
+        nodes: A residual expression or a sequence of them.
+        ref: Index of the reference term whose magnitude normalises the groups. Defaults to the first
+            term with both a known unit and a known scale.
+        report: If given, a path the human-readable report is written to.
 
-    Returns
-    -------
-    NondimReport
-        ``.residuals[i].terms[j].pi`` holds each term's dimensionless group.
+    Returns:
+        NondimReport: ``.residuals[i].terms[j].pi`` holds each term's dimensionless group.
     """
     if not isinstance(nodes, (list, tuple)):
         nodes = [nodes]
@@ -665,6 +699,10 @@ class Rescaler:
     Produced by :func:`rescale`.  Holds the characteristic length(s) ``L`` of
     each coordinate and the field scale ``U`` so a rescaled problem can be set
     up and its solution recovered: ``u_physical(x) = U · û(x / L)``.
+
+    Args:
+        coords: ``[(tag, (d0, d1), L), ...]``, one entry per scaled coordinate column.
+        field_scale: the field scale ``U``, or ``None``.
     """
 
     def __init__(self, coords, field_scale: Optional[float]):
@@ -809,19 +847,14 @@ def rescale(constraints, domain=None):
     Phase B — opt-in.  Returns ``(transformed_constraints, rescaler)``; nothing
     is solved and the input *domain* is never mutated.
 
-    Parameters
-    ----------
-    constraints:
-        A residual expression or a sequence of them.
-    domain:
-        Unused for the transform itself; accepted so callers can pair it with
-        ``rescaler.rescaled_domain(domain)``.
+    Args:
+        constraints: A residual expression or a sequence of them.
+        domain: Unused for the transform itself; accepted so callers can pair it with
+            ``rescaler.rescaled_domain(domain)``.
 
-    Returns
-    -------
-    (list, Rescaler)
-        The transformed constraints (same length/order as the input) and the
-        back-map :class:`Rescaler`.
+    Returns:
+        (list, Rescaler): The transformed constraints (same length/order as the input) and the back-map
+            :class:`Rescaler`.
     """
     from . import BinaryOp, Literal
 

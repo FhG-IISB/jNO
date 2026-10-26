@@ -82,8 +82,7 @@ def _normalize_losses(losses: tuple) -> jnp.ndarray:
 
 
 class WeightSchedule:
-    """
-    Stateless loss weight schedule.
+    """Stateless loss weight schedule.
 
     Wraps a list of:
       - constants, or
@@ -93,6 +92,12 @@ class WeightSchedule:
 
     This is JAX- and jit-compatible as long as the underlying functions
     use only JAX operations.
+
+    Args:
+        weight_fns: a list of constants or functions ``(t, losses) -> weight`` (one per loss term), or
+            one function returning the whole weight vector.
+        min_weight: lower clamp on every weight.
+        max_weight: upper clamp on every weight.
     """
 
     def __init__(
@@ -118,8 +123,7 @@ class WeightSchedule:
 
 
 class ReLoBRaLo:
-    """
-    Adaptive loss balancing via relative residual scaling.
+    """Adaptive loss balancing via relative residual scaling.
 
     Reference: Bischof & Kraus, "Multi-Objective Loss Balancing for
     Physics-Informed Deep Learning" (2021/2025).
@@ -134,6 +138,14 @@ class ReLoBRaLo:
 
     Import:
         from jno.utils.adaptive.weights import ReLoBRaLo
+
+    Args:
+        num_losses: number of loss terms; ``None`` takes it from the first call.
+        alpha: EMA factor blending the historical weights with the new ones (close to 1 is smooth).
+        tau: softmax temperature over the loss ratios.
+        expected_rho: probability of the "look back to the previous step" branch of the Bernoulli
+            coin flip (otherwise the ratios are taken against the initial losses).
+        seed: seed of the coin flip.
     """
 
     def __init__(
@@ -283,8 +295,7 @@ def relobralo(
 
 
 class LbPINNsLossBalancing:
-    """
-    Self-adaptive loss balancing via learnable log-variances.
+    """Self-adaptive loss balancing via learnable log-variances.
 
     Reference: Xiang, Peng, Liu & Yao, "Self-adaptive loss balanced
     Physics-informed neural networks" (2022).
@@ -307,6 +318,17 @@ class LbPINNsLossBalancing:
 
     Import:
         from jno.utils.adaptive.weights import LbPINNsLossBalancing
+
+    Args:
+        num_losses: number of loss terms; ``None`` takes it from the first call.
+        init_s: initial log-variances ``s_j``, one value for all or one per loss.
+        lr_s: Adam learning rate for ``s``.
+        beta1: Adam's first-moment decay.
+        beta2: Adam's second-moment decay.
+        eps_adam: Adam's epsilon.
+        s_min: lower clamp on ``s``.
+        s_max: upper clamp on ``s``.
+        loss_floor: floor on the losses, so a vanishing loss does not divide by zero.
     """
 
     def __init__(
@@ -472,8 +494,7 @@ def lbpinns_loss_balancing(
 
 
 class SoftAdapt:
-    """
-    Adaptive loss balancing via softmax over loss ratios.
+    """Adaptive loss balancing via softmax over loss ratios.
 
     Reference: Heydari, Narang & Zweig, "SoftAdapt: Techniques for
     Adaptive Loss Weighting of Neural Networks with Multi-Part Loss
@@ -490,6 +511,11 @@ class SoftAdapt:
 
     Import:
         from jno.utils.adaptive.weights import SoftAdapt
+
+    Args:
+        num_losses: number of loss terms; ``None`` takes it from the first call.
+        beta: softmax temperature (smaller is sharper).
+        loss_floor: floor on the losses, so a vanishing loss does not divide by zero.
     """
 
     def __init__(
@@ -585,8 +611,7 @@ def softadapt(
 
 
 class DWA:
-    """
-    Dynamic Weight Average for multi-task / multi-loss training.
+    """Dynamic Weight Average for multi-task / multi-loss training.
 
     Reference: Liu, Johns & Davison, "End-to-End Multi-Task Learning
     with Attention" (CVPR 2019).
@@ -602,6 +627,11 @@ class DWA:
 
     Import:
         from jno.utils.adaptive.weights import DWA
+
+    Args:
+        num_losses: number of loss terms; ``None`` takes it from the first call.
+        temperature: softmax temperature ``T`` (larger is more uniform).
+        loss_floor: floor on the losses, so a vanishing loss does not divide by zero.
     """
 
     def __init__(
@@ -704,8 +734,7 @@ def dwa(
 
 
 class RLW:
-    """
-    Random Loss Weighting via symmetric Dirichlet sampling.
+    """Random Loss Weighting via symmetric Dirichlet sampling.
 
     Reference: Lin, Ye, Xu, Shi & Zhang, "Reasonable Effectiveness
     of Random Weighting: A Litmus Test for Multi-Task Learning"
@@ -722,6 +751,11 @@ class RLW:
 
     Import:
         from jno.utils.adaptive.weights import RLW
+
+    Args:
+        num_losses: number of loss terms; ``None`` takes it from the first call.
+        alpha: Dirichlet concentration (1 is uniform over the simplex).
+        seed: seed of the sampling.
     """
 
     def __init__(

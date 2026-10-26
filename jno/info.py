@@ -44,7 +44,13 @@ _UNCAPPED = {"expression tree"}
 
 
 class Info:
-    """A printable report. ``str(...)`` renders it; :meth:`as_dict` returns the same content."""
+    """A printable report: ``str(...)`` renders it; :meth:`as_dict` returns the same content.
+
+    Args:
+        title: the report's heading.
+        sections: ``[(section_title, [(label, value), ...]), ...]``.
+        cap: rows shown per section before the rest are summarised (default ``MAX_ROWS``).
+    """
 
     def __init__(self, title: str, sections: list[tuple[str, list[tuple[str, Any]]]], *, cap: int | None = None):
         self.title = title
@@ -1453,9 +1459,30 @@ def _guarded(fn, obj, deep, label):
 
 
 def info(obj: Any = None, *, deep: bool = False, context: Any = None) -> Info:
-    """Report what ``obj`` is and whether it is what you meant. See the module docstring.
+    """Report what ``obj`` is and whether it is what you meant.
 
-    With no argument, reports the **environment** instead: x64, device, memory, versions.
+    One front door for every jNO object: it dispatches on what it is handed and returns a printable
+    :class:`Info`::
+
+        print(jno.info(d))                       # a domain: mesh, quality, tags, attachments
+        print(jno.info(fem))                     # a form: mode, blocks, classification
+        print(jno.info(fem, deep=True))          # + operator sparsity, symmetry, empty rows
+        print(jno.info(jno.solve.newton(direct=True)))   # what that spec actually does
+        print(jno.info())                        # the environment: x64, device, memory, versions
+
+    It is cheap by default (anything that costs an assembly or a factorisation sits behind
+    ``deep=True``) and never forces a lazy result: a transient solve is reported as the trace node it
+    is. ``Info.as_dict()`` returns the same content as data.
+
+    Args:
+        obj: the object to describe (a domain, shape, ``jno.fem`` problem, ``jno.core``, solver spec,
+            expression, solved array, ...); ``None`` reports the environment instead.
+        deep: also run the expensive checks (assembly, sparsity, symmetry, residuals).
+        context: for a solved array, the ``jno.fem`` problem it came from, so the report splits it
+            into its field blocks.
+
+    Returns:
+        Info: the report.
     """
     if obj is None:
         return _info_env(deep)

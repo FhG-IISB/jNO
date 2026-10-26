@@ -14,6 +14,9 @@ class statistics:
         history.training_logs         # list of per-solve()-call dicts
         history.training_logs[-1]["total_loss"]   # full array from last call
         history.plot("./runs/loss.png")           # quick visualization
+
+    Args:
+        logs: the per-``solve()``-call log dicts.
     """
 
     def __init__(self, logs):
@@ -206,6 +209,11 @@ class statistics:
         return self
 
     def save(self, path: str):
+        """Pickle the training history (with ``cloudpickle``).
+
+        Args:
+            path: the output file.
+        """
         import cloudpickle
 
         with open(path, "wb") as f:
@@ -227,7 +235,8 @@ class statistics:
         Returns:
             core instance with trained parameters
 
-        Example:
+        Example::
+
             sol = core.load("trained_model.pkl")
         """
         import cloudpickle

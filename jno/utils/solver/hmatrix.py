@@ -103,6 +103,14 @@ class HMatrix(NamedTuple):
     Covers both shapes the welded path needs. ``square`` is one element set against itself -- the
     partial inductance of a conductor, whose diagonal is the self term. Not square is one set against
     a DIFFERENT one, which is `cross_block`: two welded parts coupling, with no diagonal at all.
+
+    Attributes:
+        shape: ``(n_row_elements, n_col_elements)``.
+        nsub: sub-points per element on each side.
+        near: ``((rows, cols), ...)`` inadmissible blocks, evaluated densely.
+        far: ``((rows, cols, ipiv, jpiv), ...)`` admissible blocks, as ACA skeletons.
+        ranks: the rank ACA needed for each far block.
+        square: whether row and column elements are the same set.
     """
 
     shape: tuple  #: (n_row_elements, n_col_elements)
@@ -789,11 +797,52 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
     return apply
 
 
+# docstring-from: jno.solve.hierarchical
 class HierarchicalSpec:
-    """What ``jno.solve.hierarchical(...)`` returns: how to compress, not what to compress.
+    """**Hierarchical (H-matrix) compression** of an integral-equation operator, for `jno.peec`.
 
-    A value object, deliberately -- it carries no geometry, so one spec serves every block of a
-    welded network and the same spec can be reused across a frequency sweep.
+    PEEC is fast only on a uniform lattice: identical bars on a regular grid make the partial
+    inductance block-Toeplitz, so an FFT applies it in ``O(N log N)``. Anything else -- a bond wire
+    welded to a trace layer, two parts at different pitches, a locally refined mesh -- has no such
+    structure and is formed **densely**. That is why welding is expensive: a 6,806-bar lattice solves
+    in 0.213 s and adding one 19-filament wire takes it to 33.4 s, and a 12,000-element module
+    allocated 2.7 GB to build a 46 MB coupling block.
+
+    This compresses those blocks instead. Clusters that are far apart compared to their own size
+    couple through a numerically low-rank block, found by ACA from sampled rows and columns::
+
+        emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
+        sol = emag.solve(operator=jno.solve.hierarchical(tol=1e-6))
+
+    **Opt-in, and exact without it.** The default path is unchanged, so this changes no existing
+    answer; ask for it and the operator becomes approximate to ``tol``, which the solver's residual
+    check still guards.
+
+    **Correct and verified, but not yet worth switching on.** A bar lattice compresses 3.27x at
+    1,540 elements rising to 5.76x at 4,589, accurate to 8.2e-09 -- and yet a whole welded solve is
+    3-5x SLOWER with it at every size measured, and peaks higher. A dense matvec is one BLAS call
+    where a compressed one is hundreds of small matmuls (0.018 s against 0.186 s at 1,540 elements),
+    and at a few thousand elements the operator is not the memory bottleneck either. Where the
+    crossover lies is not established; see :mod:`~jno.utils.solver.hmatrix` for the numbers.
+
+    Args:
+        tol: relative accuracy asked of each compressed block.
+        leaf: cluster size at which the tree stops splitting. Smaller compresses BETTER (4.85x at 64
+            against 2.46x at 256): larger leaves mean coarser blocks, and less of the matrix reaches
+            an admissible pair.
+        eta: admissibility constant. Barely matters here -- 4.85x at 2 against 4.93x at 4 -- so it is
+            rarely worth changing.
+        floor: blocks smaller than this on their short side are left EXACT. Below it compression does
+            not pay (1.38x at 370 elements), and a slower approximate operator is a defect rather
+            than a trade.
+
+    Returns:
+        The spec to pass as ``solve(operator=...)``.
+
+    **Limits, up front.** ACA suits asymptotically smooth kernels; ``1/r`` and its derivatives are
+    fine, an oscillatory ``exp(ikr)/r`` at high ``kr`` is not. The build is host work that only pays
+    above a few thousand elements. And a block ACA cannot compress to under half its size is kept
+    dense, so on a small or poorly separated network this correctly does nothing at all.
     """
 
     __slots__ = ("tol", "leaf", "eta", "floor")
@@ -810,5 +859,12 @@ class HierarchicalSpec:
         Below the floor the dense block is both exact and faster, so this returns False and the
         caller keeps the exact path. A compression slower than what it replaces is a defect, not a
         tuning choice.
+
+        Args:
+            na: elements on the row side of the block.
+            nb: elements on the column side.
+
+        Returns:
+            bool: ``True`` when the block is at least ``floor`` on both sides.
         """
         return min(na, nb) >= self.floor

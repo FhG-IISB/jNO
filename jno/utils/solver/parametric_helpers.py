@@ -222,10 +222,12 @@ class NeuralSlots:
 
     @property
     def any(self) -> bool:
+        """Whether the block has any neural coefficient (frozen or trainable)."""
         return bool(self.all_names)
 
     @property
     def any_trainable(self) -> bool:
+        """Whether any of them is trainable."""
         return bool(self.param_names)
 
 

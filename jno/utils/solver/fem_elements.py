@@ -21,12 +21,11 @@ A per-DOF orientation sign (from :mod:`fem_topology`) multiplies the whole basis
 function so the two cells sharing an edge agree on its sign. The Piola formula and
 the ``div_phys`` identity are validated against ``basix``'s own ``push_forward``.
 
-References
-----------
-P.-A. Raviart, J.-M. Thomas, *A mixed finite element method for 2nd order elliptic
-problems*, in Mathematical Aspects of FEM, Lecture Notes in Math. 606 (1977).
-J.-C. Nédélec, *Mixed finite elements in* R^3, Numer. Math. 35 (1980) 315–341
-(first-kind H(curl) edge elements; the 2-D triangle restriction used here).
+References:
+    P.-A. Raviart, J.-M. Thomas, *A mixed finite element method for 2nd order elliptic
+    problems*, in Mathematical Aspects of FEM, Lecture Notes in Math. 606 (1977).
+    J.-C. Nédélec, *Mixed finite elements in* R^3, Numer. Math. 35 (1980) 315–341
+    (first-kind H(curl) edge elements; the 2-D triangle restriction used here).
 """
 
 from __future__ import annotations
@@ -43,20 +42,27 @@ from .small_linalg import small_inv
 class ElementSpec(NamedTuple):
     """Reference-cell data for one non-nodal element family on triangles.
 
-    ``ref_values``  basis values at quad points, ``(n_quad, n_dof, value_size)``.
-    ``ref_div``     reference divergence ``(n_quad, n_dof)`` for H(div) families
-                    (``None`` otherwise).
-    ``ref_grads``   reference gradient ``d(Phi_ref)_k / d(xi)_m`` of the vector basis,
-                    ``(n_quad, n_dof, value_size, tdim)`` — used by the divergence/gradient
-                    push-forward; ``None`` for families that don't need it.
-    ``local_edges`` the family's reference edge ordering (DOF k <-> edge k for the
-                    lowest-order edge elements), matching :mod:`fem_topology`.
-    ``ref_curl``    reference (2-D scalar) curl ``(n_quad, n_dof)`` for H(curl) families
-                    (``None`` otherwise).
-    ``ref_hess``    reference second derivatives ``d²(Phi_ref) / d(xi)_i d(xi)_j``,
-                    ``(n_quad, n_dof, value_size, tdim, tdim)`` (symmetric) — used to assemble
-                    4th-order (biharmonic) weak forms via :func:`identity_pushforward_hess`;
-                    ``None`` for families that don't tabulate it.
+    Attributes:
+        family: the element family.
+        n_dof: DOFs per cell.
+        value_size: components of the basis functions.
+        quad_points: ``(n_quad, tdim)`` reference quadrature points.
+        quad_weights: ``(n_quad,)`` quadrature weights.
+        ref_values: basis values at the quadrature points, ``(n_quad, n_dof, value_size)``.
+        ref_div: reference divergence ``(n_quad, n_dof)`` for H(div) families, else ``None``.
+        ref_grads: reference gradient ``d(Phi_ref)_k / d(xi)_m`` of the vector basis,
+            ``(n_quad, n_dof, value_size, tdim)``, used by the divergence/gradient push-forward;
+            ``None`` for families that do not need it.
+        local_edges: the family's reference edge ordering (DOF k <-> edge k for the lowest-order edge
+            elements), matching :mod:`fem_topology`.
+        ref_curl: reference (2-D scalar) curl ``(n_quad, n_dof)`` for H(curl) families, else ``None``.
+        ref_hess: reference second derivatives ``d²(Phi_ref) / d(xi)_i d(xi)_j``,
+            ``(n_quad, n_dof, value_size, tdim, tdim)`` (symmetric), used for 4th-order (biharmonic)
+            weak forms via :func:`identity_pushforward_hess`; ``None`` for families that do not
+            tabulate it.
+        ref_aux: element-specific extra reference data (e.g. Argyris nodal tabulations).
+        degree: the basix degree (1 = lowest order).
+        entity_dofs: basix ``entity_dofs``: local DOF ids per ``(dim, local entity)``.
     """
 
     family: str

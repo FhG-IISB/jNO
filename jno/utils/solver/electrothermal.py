@@ -117,7 +117,17 @@ class ElectroThermalSolution:
 
 
 class ElectroThermal:
-    """The coupled solve behind ``heat.solve()`` / ``em.solve()`` of a pair coupled through ``em.loss``. See the module docstring."""
+    """The coupled solve behind ``heat.solve()`` / ``em.solve()`` of a pair coupled through ``em.loss``.
+
+    A fixed point on the FEM temperature: the network is solved with the conductivity at the current
+    temperature, its loss density is the FEM heat source, and the FEM solve gives the next temperature.
+    Differentiable through the converged state (``jax.lax.custom_root``) when a trainable parameter sits
+    in either problem. Built by :func:`coupled`; one instance is shared by both problems.
+
+    Args:
+        em: the ``jno.peec`` network.
+        heat: the ``jno.fem`` problem whose source is ``em.loss``.
+    """
 
     def __init__(self, em, heat):
         self.em, self.heat = em, heat
@@ -248,7 +258,12 @@ class ElectroThermal:
     def solve(self, *, tol: float = 1e-8, max_iter: int = 50):
         """Converge the coupled field, once: later calls return the same result. Returns an
         :class:`ElectroThermalSolution`, or -- when a trainable ``jno.np.parameter`` sits in either
-        problem -- a trace node of the converged FEM field over them (its ``.em`` the network there)."""
+        problem -- a trace node of the converged FEM field over them (its ``.em`` the network there).
+
+        Args:
+            tol: relative change of the temperature at which the fixed point is converged.
+            max_iter: maximum fixed-point iterations.
+        """
         if self._result is not None and self._result[0] == (tol, max_iter):
             return self._result[1]
         out = self._solve(tol=tol, max_iter=max_iter)

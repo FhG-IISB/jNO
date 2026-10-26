@@ -53,7 +53,16 @@ _SOFTPLUS_INV_ONE = math.log(math.expm1(1.0))
 
 
 class MDDecoupleState(NamedTuple):
-    """State for :func:`md_decouple`. Gains and sphere norms live here, never in the params."""
+    """State for :func:`md_decouple`. Gains and sphere norms live here, never in the params.
+
+    Attributes:
+        base_state: the base optimiser's state over the full pytree (directions on 2-D leaves).
+        gain_state: ``optax.adam(gain_lr)`` state over the raw gains.
+        raw_row: raw row gains on 2-D leaves (``()`` placeholders elsewhere).
+        raw_col: raw column gains on 2-D leaves.
+        sphere_c: ``‖W_init‖_F`` on 2-D leaves.
+        count: step counter.
+    """
 
     base_state: Any  # base optimizer state over the full pytree (direction Ŵ on 2-D leaves)
     gain_state: Any  # optax.adam(gain_lr) state over the raw-gain pytrees (raw_row, raw_col)
@@ -237,16 +246,40 @@ def md_decouple(
 #     use a pure-gradient base (adam / sgd / soap / muon).
 #   * Driving the direction LR η_W from the model's .scale() schedule — in v1 η_W is carried by the
 #     base optimizer you pass, and the sentinel forces the model's outer LR-scale to 1.0.
+# docstring-from: jno.optimizers.md_decouple.md
 class MDOptimizer:
-    """Sentinel stored on a model via ``net.optimizer(jno.optimizers.md(...))``.
+    """Return a Magnitude–Direction Decoupling sentinel for ``net.optimizer()``.
 
-    Not an optax ``GradientTransformation`` — ``jno.core.solve()`` detects this object, builds the
-    real :func:`md_decouple` transform from it via :meth:`build`, and forces the model's outer
-    learning-rate scale to ``1.0`` so the nonlinear ``W_new − W`` update is applied intact. The
-    direction learning rate η_W is carried by the ``base`` optimizer you pass.
+    Magnitude–Direction (MD) Decoupling (Hägele, Hernández-Cano, Kosson & Jaggi, 2026,
+    arXiv:2606.25971, Algorithm 2) factorizes each weight matrix ``W = diag(γ_row) Ŵ diag(γ_col)``
+    into a fixed-Frobenius-norm direction ``Ŵ`` on a hypersphere and learnable per-row/per-column
+    magnitude gains, updated at separate rates. It removes the need for weight decay and warmup and
+    transfers the optimal learning rate across model width. The split lives entirely inside the
+    optimizer — the model still sees one fused weight tensor.
 
-    See :func:`md` for the public constructor and the list of not-yet-implemented features above
-    this class.
+    Unlike the bare :func:`md_decouple` transform, this sentinel form lets ``jno.core`` force the
+    model's outer learning-rate scale to ``1.0`` automatically, so the nonlinear ``W_new − W``
+    update is never corrupted — you do **not** need a separate ``net.scale(1.0)`` call. The
+    direction learning rate η_W is the LR of the ``base`` optimizer you pass.
+
+    Args:
+        base: the direction optimizer — any pure-gradient optax ``GradientTransformation`` carrying
+            η_W (e.g. ``optax.adam(1e-3)``). Line-search bases are not supported (see the module).
+        gain_lr: learning rate η_γ of the separate Adam that steps the magnitude gains.
+        gain_axis: ``("row", "col")`` (default), ``("row",)``, or ``("col",)``. ``"scalar"`` is not
+            yet implemented.
+        gain_map: positive map for the gains; only ``"softplus"`` in v1.
+
+    Example::
+
+        import optax, jno
+        net.optimizer(jno.optimizers.md(optax.adam(1e-3), gain_lr=1e-3))
+        crux = jno.core(losses)
+        crux.solve(2000)
+
+    References:
+        Hägele, Hernández-Cano, Kosson & Jaggi, *Improving Neural Network Training by Decoupling
+        the Magnitude and Direction of Weight Vectors*, 2026, arXiv:2606.25971, Algorithm 2.
     """
 
     def __init__(

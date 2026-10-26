@@ -14,20 +14,16 @@ from .fem_utils import (
 
 @dataclass(frozen=True)
 class DirichletBC:
-    """
-    Essential boundary-condition descriptor for FEM assembly.
+    """Essential boundary-condition descriptor for FEM assembly.
 
     Instances are created through `dirichlet(...)` and later normalized by
     `expand_bcs(...)` during `domain.init_fem_native(...)`.
 
-    Parameters
-    ----------
-    tags:
-        Boundary tag names on which the Dirichlet condition is applied.
-    values:
-        Boundary value specification. Supported forms are handled by
-        `_normalize_dirichlet_value(...)` and include `None`, scalars,
-        callables, component lists/tuples, and component dictionaries.
+    Args:
+        tags: Boundary tag names on which the Dirichlet condition is applied.
+        values: Boundary value specification. Supported forms are handled by
+            `_normalize_dirichlet_value(...)` and include `None`, scalars, callables, component
+            lists/tuples, and component dictionaries.
     """
 
     tags: tuple[str, ...]
@@ -36,17 +32,14 @@ class DirichletBC:
 
 @dataclass(frozen=True)
 class NeumannBC:
-    """
-    Natural boundary-condition descriptor for FEM assembly.
+    """Natural boundary-condition descriptor for FEM assembly.
 
     Instances are created through `neumann(...)`. The tags mark boundary
     regions whose weak-form boundary terms should be included in surface
     assembly.
 
-    Parameters
-    ----------
-    tags:
-        Boundary tag names treated as natural/surface regions.
+    Args:
+        tags: Boundary tag names treated as natural/surface regions.
     """
 
     tags: tuple[str, ...]
@@ -54,26 +47,27 @@ class NeumannBC:
 
 @dataclass(frozen=True)
 class PeriodicBC:
-    """
-    Periodic boundary-condition descriptor.
+    """Periodic boundary-condition descriptor.
 
-    Each pair identifies a main and secondary boundary whose degrees of freedom
-    must be identified through a prolongation matrix.
+    Each pair identifies a main and secondary boundary whose degrees of freedom are identified through
+    a prolongation matrix.
+
+    Attributes:
+        pairs: ``((main_tag, secondary_tag), ...)``.
     """
 
     pairs: tuple[tuple[str, str], ...]
 
 
 def periodic(*pairs):
-    """
-    Create periodic boundary-condition pairings.
+    """Create periodic boundary-condition pairings.
 
-    Example
-    -------
-    periodic(
-        ("left", "right"),
-        ("bottom", "top"),
-    )
+    Example::
+
+        periodic(
+            ("left", "right"),
+            ("bottom", "top"),
+        )
     """
     normalized = []
 
@@ -97,18 +91,13 @@ def periodic(*pairs):
 
 
 def _as_tags(tags) -> tuple[str, ...]:
-    """
-    Normalize one boundary tag or a sequence of tags into a non-empty tuple.
+    """Normalize one boundary tag or a sequence of tags into a non-empty tuple.
 
-    Parameters
-    ----------
-    tags:
-        Either a string tag or a sequence of tag-like objects.
+    Args:
+        tags: Either a string tag or a sequence of tag-like objects.
 
-    Returns
-    -------
-    tuple[str, ...]
-        Normalized tuple of boundary tag strings.
+    Returns:
+        tuple[str, ...]: Normalized tuple of boundary tag strings.
     """
     if isinstance(tags, str):
         return (tags,)
@@ -121,8 +110,7 @@ def _as_tags(tags) -> tuple[str, ...]:
 
 
 def dirichlet(tags, values=None):
-    """
-    Create a Dirichlet boundary-condition descriptor.
+    """Create a Dirichlet boundary-condition descriptor.
 
     This is the public helper used in FEM setup, for example:
 
@@ -133,52 +121,38 @@ def dirichlet(tags, values=None):
             ]
         )
 
-    Parameters
-    ----------
-    tags:
-        Boundary tag or list of boundary tags.
-    values:
-        Boundary value specification. For scalar unknowns, this can be a scalar
-        or callable. For vector unknowns, this can also be a component list,
-        tuple, or dictionary.
+    Args:
+        tags: Boundary tag or list of boundary tags.
+        values: Boundary value specification. For scalar unknowns, this can be a scalar or callable. For
+            vector unknowns, this can also be a component list, tuple, or dictionary.
 
-    Returns
-    -------
-    DirichletBC
-        Boundary-condition descriptor consumed by `expand_bcs(...)`.
+    Returns:
+        DirichletBC: Boundary-condition descriptor consumed by `expand_bcs(...)`.
     """
     return DirichletBC(tags=_as_tags(tags), values=values)
 
 
 def neumann(tags):
-    """
-    Create a Neumann/natural boundary-condition descriptor.
+    """Create a Neumann/natural boundary-condition descriptor.
 
     This marks boundary regions whose weak-form boundary terms should be
     assembled through surface kernels.
 
-    Parameters
-    ----------
-    tags:
-        Boundary tag or list of boundary tags.
+    Args:
+        tags: Boundary tag or list of boundary tags.
 
-    Returns
-    -------
-    NeumannBC
-        Boundary-condition descriptor consumed by `expand_bcs(...)`.
+    Returns:
+        NeumannBC: Boundary-condition descriptor consumed by `expand_bcs(...)`.
     """
     return NeumannBC(tags=_as_tags(tags))
 
 
 def expand_bcs(bcs, vec: int):
-    """
-    Normalize user boundary-condition descriptors for FEM initialization.
+    """Normalize user boundary-condition descriptors for FEM initialization.
 
-    Returns
-    -------
-    tuple
-        ``(dirichlet_tags, dirichlet_value_fns, neumann_tags, periodic_pairs)``.
-        ``periodic_pairs`` is a list of ``(main_tag, secondary_tag)`` tuples.
+    Returns:
+        tuple: ``(dirichlet_tags, dirichlet_value_fns, neumann_tags, periodic_pairs)``.
+            ``periodic_pairs`` is a list of ``(main_tag, secondary_tag)`` tuples.
     """
     dirichlet_tags = []
     dirichlet_value_fns = {}

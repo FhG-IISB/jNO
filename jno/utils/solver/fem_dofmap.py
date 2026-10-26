@@ -223,7 +223,27 @@ class DofMap:
     (``n_verts`` = all mesh points, used or not), which is what keeps a P1 field's DOF = its vertex.
 
     ``blocks[dim]`` and ``orient[dim]`` give the per-cell basis transform ``B`` (see the module doc);
-    ``signs`` is set instead when ``B`` is diagonal ``±1`` for every cell."""
+    ``signs`` is set instead when ``B`` is diagonal ``±1`` for every cell.
+
+    Attributes:
+        family: the basix element family.
+        degree: the element degree.
+        cell: ``"triangle"`` or ``"tetrahedron"``.
+        tdim: topological dimension.
+        n_dofs: number of global DOFs.
+        ndof_local: DOFs per cell.
+        cell_dofs: ``(n_cells, ndof_local)`` global DOF of each reference DOF.
+        entity_dofs: basix ``entity_dofs`` (local DOF ids per ``(dim, local entity)``).
+        n_entity_dofs: DOFs per entity, by dimension.
+        entity_offset: first global DOF of each dimension.
+        n_entities: number of entities, by dimension.
+        cell_entities: per dimension, ``(n_cells, n_local)`` global entity ids.
+        entity_vertices: per dimension, ``(n_entities, dim + 1)`` sorted global vertices.
+        orient: per dimension, the per-cell entity orientation data.
+        blocks: per dimension, the per-cell basis transform blocks.
+        signs: ``(n_cells, ndof_local)`` ``±1`` when every transform is diagonal, else ``None``.
+        element: the basix element.
+    """
 
     family: str
     degree: int
@@ -263,6 +283,7 @@ class DofMap:
     # ---- per-cell transform -------------------------------------------------------------------
     @property
     def is_diagonal(self) -> bool:
+        """Whether every cell's basis transform is a diagonal of ``±1`` (then ``signs`` holds it)."""
         return self.signs is not None
 
     def jax_tables(self):
@@ -293,6 +314,14 @@ class DofMap:
         return transform_from_tables(self.jax_tables(), self.ndof_local, c)
 
     def cell_transform_np(self, c: int) -> np.ndarray:
+        """The basis transform ``B`` of one cell, as a dense NumPy matrix.
+
+        Args:
+            c: the cell index.
+
+        Returns:
+            ``(ndof_local, ndof_local)`` array.
+        """
         B = np.eye(self.ndof_local)
         for dim, blk in self.blocks.items():
             for k, idx in enumerate(self.entity_dofs[dim]):
@@ -308,7 +337,14 @@ class DofMap:
 
     def dof_entity_centroids(self, points: np.ndarray) -> np.ndarray:
         """``(n_dofs, gdim)``: the centroid of the mesh entity each global DOF belongs to (a vertex, edge
-        midpoint, face or cell centroid) -- where a DOF "lives", e.g. to select the DOFs on a plane."""
+        midpoint, face or cell centroid) -- where a DOF "lives", e.g. to select the DOFs on a plane.
+
+        Args:
+            points: the mesh points, ``(n_points, gdim)``.
+
+        Returns:
+            ``(n_dofs, gdim)`` array.
+        """
         pts = np.asarray(points)
         out = np.zeros((self.n_dofs, pts.shape[1]))
         for d in range(self.tdim + 1):
@@ -320,6 +356,15 @@ class DofMap:
         return out
 
     def entity_global_dofs(self, dim: int, e: int) -> np.ndarray:
+        """The global DOFs owned by one mesh entity.
+
+        Args:
+            dim: the entity dimension (0 vertices, 1 edges, ...).
+            e: the entity index within that dimension.
+
+        Returns:
+            The global DOF indices.
+        """
         nd = self.n_entity_dofs[dim]
         return self.entity_offset[dim] + e * nd + np.arange(nd)
 

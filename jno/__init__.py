@@ -142,7 +142,17 @@ def le(expr, bound=0.0):
 
 
 def ge(expr, bound=0.0):
-    """An inequality constraint ``expr >= bound``. See :func:`le`."""
+    """An inequality constraint ``expr >= bound``, for a constrained optimiser (MMA, GCMMA) or ``.auglag()``.
+
+    The mirror of :func:`le`; see there for how constraints enter ``jno.core``.
+
+    Args:
+        expr: the constrained scalar expression.
+        bound: the lower bound.
+
+    Returns:
+        Constraint: the constraint row.
+    """
     return Constraint(expr, bound, "ge")
 
 
@@ -157,11 +167,22 @@ def eq(expr, bound=0.0):
 
 
 def auglag(constraint, mu=10.0, every=100):
-    """``jno.auglag(c, ...)`` is ``c.auglag(...)``: an augmented-Lagrangian constraint.
+    """``jno.auglag(c, ...)`` is ``c.auglag(...)``: enforce a constraint by an augmented Lagrangian.
 
-    ``constraint`` is a :func:`le` / :func:`ge` / :func:`eq` constraint or a comparison ``a <= b`` /
-    ``a >= b``.
-    See :meth:`jno.trace.Constraint.auglag`.
+    The constraint stays a reported row; a multiplier penalty is added to the loss and the multiplier
+    is updated from the violation every ``every`` steps, so any optimiser can be used.
+
+    Args:
+        constraint: a :func:`le` / :func:`ge` / :func:`eq` constraint or a comparison ``a <= b`` /
+            ``a >= b``.
+        mu: starting penalty weight (> 0); it grows tenfold while the violation stops shrinking.
+        every: optimiser steps between multiplier updates.
+
+    Returns:
+        AugLagConstraint: the constraint; its multiplier is ``.multiplier``.
+
+    Raises:
+        TypeError: for anything that is not a constraint or comparison.
     """
     if not hasattr(constraint, "auglag"):
         raise TypeError(

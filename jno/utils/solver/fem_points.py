@@ -55,7 +55,15 @@ class PointShape:
     ``cells_basix``, ``N`` ``(n, nv)`` its shape functions at the points.
 
     ``pts`` ``(n_nodes, >=dim)`` the vertex coordinates, ``cells_vtk`` / ``cells_basix`` the same cells
-    in the mesh's own vertex order (for the search) and in basix order (for the shape functions)."""
+    in the mesh's own vertex order (for the search) and in basix order (for the shape functions).
+
+    Attributes:
+        cell_type: the mesh's cell type.
+        pts: ``(n_nodes, >= dim)`` vertex coordinates.
+        cells_vtk: the cells in the mesh's vertex order.
+        cells_basix: the same cells in basix order.
+        dim: spatial dimension.
+    """
 
     def __init__(self, cell_type: str, pts, cells_vtk, cells_basix, dim: int):
         cell_type = _MESHIO.get(cell_type, cell_type)

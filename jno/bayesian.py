@@ -219,40 +219,32 @@ class _PriorsNamespace:
     with ``.mask(M).bayesian()`` (the kernel sees only the masked
     subset; the prior closure scans whatever subset it's handed).
 
-    References
-    ----------
-    Sun, Y., Song, Z., Hewitt, A., & Kingma, D. P. (2019).
-        *Functional Variational Bayesian Neural Networks.* ICLR 2019
-        (layer-wise priors matching He / Xavier scales).
+    References:
+        Sun, Y., Song, Z., Hewitt, A., & Kingma, D. P. (2019).
+            *Functional Variational Bayesian Neural Networks.* ICLR 2019
+            (layer-wise priors matching He / Xavier scales).
 
-    Wenzel, F., Roth, K., Veeling, B., Świątkowski, J., Tran, L.,
-        Mandt, S., … Nowozin, S. (2020).  *How Good is the Bayes
-        Posterior in Deep Neural Networks Really?*  ICML 2020.
-        (Cold-posterior effect with N(0, 1/fan_in) priors.)
+        Wenzel, F., Roth, K., Veeling, B., Świątkowski, J., Tran, L.,
+            Mandt, S., … Nowozin, S. (2020).  *How Good is the Bayes
+            Posterior in Deep Neural Networks Really?*  ICML 2020.
+            (Cold-posterior effect with N(0, 1/fan_in) priors.)
     """
 
     @staticmethod
     def gaussian(sigma: float = 10.0, *, fan_in_aware: bool = False):
         """Isotropic Gaussian log-prior — ``log p = -‖θ‖² / (2σ²)``.
 
-        Parameters
-        ----------
-        sigma : float, default ``10.0``
-            Standard deviation of the prior.  ``sigma=10`` is wide
-            enough to be "effectively flat" at typical parameter
-            scales; pass smaller values (``1.0``, ``0.1``) for stronger
-            shrinkage toward zero.
-        fan_in_aware : bool, default ``False``
-            When ``True``, scale ``σ`` per-leaf by ``1/sqrt(fan_in)``
-            — matches He / Xavier initialisation conventions.  Only
-            applies to weight tensors (``ndim >= 2``); biases and
-            scalars use the base ``sigma`` unchanged.
+        Args:
+            sigma (float, default ``10.0``): Standard deviation of the prior.  ``sigma=10`` is wide enough
+                to be "effectively flat" at typical parameter scales; pass smaller values (``1.0``, ``0.1``)
+                for stronger shrinkage toward zero.
+            fan_in_aware (bool, default ``False``): When ``True``, scale ``σ`` per-leaf by
+                ``1/sqrt(fan_in)`` — matches He / Xavier initialisation conventions.  Only applies to weight
+                tensors (``ndim >= 2``); biases and scalars use the base ``sigma`` unchanged.
 
-        Returns
-        -------
-        callable
-            ``pytree -> scalar log p`` for use as ``prior=`` on
-            :meth:`Model.bayesian` / :meth:`Model.vi`.
+        Returns:
+            callable: ``pytree -> scalar log p`` for use as ``prior=`` on :meth:`Model.bayesian` /
+                :meth:`Model.vi`.
         """
         return _gaussian_prior_fn(float(sigma), bool(fan_in_aware))
 
@@ -282,12 +274,9 @@ class _PriorsNamespace:
         too expensive (the horseshoe needs auxiliary scale variables
         that don't fit jno's pure ``logdensity_fn`` interface).
 
-        Parameters
-        ----------
-        df : float, default ``4.0``
-            Degrees of freedom.  Must be ``> 2`` for finite variance.
-        scale : float, default ``1.0``
-            Scale parameter (analogue of σ for the Gaussian).
+        Args:
+            df (float, default ``4.0``): Degrees of freedom.  Must be ``> 2`` for finite variance.
+            scale (float, default ``1.0``): Scale parameter (analogue of σ for the Gaussian).
         """
         return _student_t_prior_fn(float(df), float(scale))
 
@@ -311,15 +300,11 @@ class _PriorsNamespace:
         the He-style ``N(0, 1/fan_in)`` prior used in Wenzel et al.
         2020 and Sun et al. 2019.
 
-        Parameters
-        ----------
-        base_sigma : float, default ``1.0``
-            Base sigma for weight tensors; scaled per-layer when
-            ``fan_in_aware=True``.
-        default_sigma : float, default ``1.0``
-            Sigma for biases and scalars (no fan-in concept).
-        fan_in_aware : bool, default ``True``
-            Apply ``1/sqrt(fan_in)`` scaling on weight tensors.
+        Args:
+            base_sigma (float, default ``1.0``): Base sigma for weight tensors; scaled per-layer when
+                ``fan_in_aware=True``.
+            default_sigma (float, default ``1.0``): Sigma for biases and scalars (no fan-in concept).
+            fan_in_aware (bool, default ``True``): Apply ``1/sqrt(fan_in)`` scaling on weight tensors.
         """
         return _layerwise_gaussian_prior_fn(float(base_sigma), float(default_sigma), bool(fan_in_aware))
 
@@ -551,14 +536,13 @@ def build_vi_handle(cfg: dict) -> _KernelHandle:
     ``GradientTransformation``), ``prior``, ``num_samples``,
     ``posterior_draws``, plus user-supplied factory kwargs.
 
-    References
-    ----------
-    Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
-        *Stochastic Variational Inference.* JMLR 14(1), 1303-1347.
+    References:
+        Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
+            *Stochastic Variational Inference.* JMLR 14(1), 1303-1347.
 
-    Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., & Blei, D. M.
-        (2017). *Automatic Differentiation Variational Inference.*
-        JMLR 18(1), 430-474.
+        Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., & Blei, D. M.
+            (2017). *Automatic Differentiation Variational Inference.*
+            JMLR 18(1), 430-474.
     """
     factory = cfg["factory"]
     kind = _detect_kind(factory)
@@ -857,6 +841,13 @@ class PathfinderInitializer(_BayesianInitializer):
     *Pathfinder: Parallel quasi-Newton variational inference.*
     Journal of Machine Learning Research, 23(306), 1-49.
     https://arxiv.org/abs/2108.03782
+
+    Attributes:
+        maxiter: L-BFGS iterations of the Pathfinder fit.
+        num_samples: ELBO sample budget passed to ``pathfinder.approximate``.
+        maxcor: L-BFGS history size.
+        imm_estimator_samples: draws from the fitted ``q`` used to estimate the diagonal inverse mass matrix.
+        lbfgs_kwargs: further L-BFGS options (``ftol``, ``gtol``, ``maxls``, ...).
     """
 
     maxiter: int = 30
@@ -957,23 +948,28 @@ class LaplaceInitializer(_BayesianInitializer):
       well-approximated by a Gaussian; falls back to ridge-regularised
       sampling if H is ill-conditioned.
 
-    References
-    ----------
-    MacKay, D. J. C. (1992).  *A Practical Bayesian Framework for
-    Backpropagation Networks.*  §6 (Laplace approximation around the
-    posterior mode).  Neural Computation, 4(3), 448-472.
-    https://doi.org/10.1162/neco.1992.4.3.448
+    References:
+        MacKay, D. J. C. (1992).  *A Practical Bayesian Framework for
+        Backpropagation Networks.*  §6 (Laplace approximation around the
+        posterior mode).  Neural Computation, 4(3), 448-472.
+        https://doi.org/10.1162/neco.1992.4.3.448
 
-    Daxberger, E., Kristiadi, A., Immer, A., Eschenhagen, R., Bauer, M.,
-    & Hennig, P. (2021).  *Laplace Redux — Effortless Bayesian Deep
-    Learning.*  §2 (Laplace approximations for neural networks).
-    Advances in Neural Information Processing Systems (NeurIPS).
-    https://arxiv.org/abs/2106.14806
+        Daxberger, E., Kristiadi, A., Immer, A., Eschenhagen, R., Bauer, M.,
+        & Hennig, P. (2021).  *Laplace Redux — Effortless Bayesian Deep
+        Learning.*  §2 (Laplace approximations for neural networks).
+        Advances in Neural Information Processing Systems (NeurIPS).
+        https://arxiv.org/abs/2106.14806
 
-    Magnani, E., Krämer, N., Pförtner, M., & Hennig, P. (2024).
-    *Linearization Turns Neural Operators into Function-Valued
-    Gaussian Processes.*  §3 (linearised-Laplace for neural
-    operators).  https://arxiv.org/abs/2406.05072
+        Magnani, E., Krämer, N., Pförtner, M., & Hennig, P. (2024).
+        *Linearization Turns Neural Operators into Function-Valued
+        Gaussian Processes.*  §3 (linearised-Laplace for neural
+        operators).  https://arxiv.org/abs/2406.05072
+
+    Attributes:
+        map_steps: optimiser steps of the MAP search.
+        map_optimizer: an optax optimiser for the MAP search; ``None`` is ``optax.adam(1e-2)``.
+        hessian_strategy: ``"diagonal"`` (default, ``O(D)`` memory) or ``"full"`` (``O(D²)``).
+        ridge: added to the Hessian's diagonal before inversion.
     """
 
     map_steps: int = 500
@@ -1140,6 +1136,14 @@ class SVGDInitializer(_BayesianInitializer):
     update rule).  Advances in Neural Information Processing Systems
     (NeurIPS), 29, 2378-2386.
     https://arxiv.org/abs/1608.04471
+
+    Attributes:
+        num_iters: SVGD steps.
+        num_particles: particle count; ``None`` is ``max(num_chains, 32)``.
+        optimizer: an optax optimiser for the particle updates; ``None`` is ``optax.adam(1e-1)``.
+        kernel: a blackjax kernel; ``None`` is blackjax's RBF.
+        init_jitter: std of the initial particle perturbation; ``None`` picks
+            ``max(0.1 * std(position), 1e-3)``.
     """
 
     num_iters: int = 500
@@ -1677,39 +1681,30 @@ def rhat(chain, *, strategy: str = "auto") -> jnp.ndarray:
     component.  R-hat ≈ 1.0 indicates the chains are exploring the same
     distribution; values above ~1.05 suggest non-convergence.
 
-    Parameters
-    ----------
-    chain : array
-        ``(K, N, *param)`` posterior chain.
-    strategy : {"auto", "multichain", "split"}, default "auto"
-        How to estimate R-hat:
+    Args:
+        chain (array): ``(K, N, *param)`` posterior chain.
+        strategy ({"auto", "multichain", "split"}, default "auto"): How to estimate R-hat: * ``"auto"``
+            (default): split-R-hat when K == 1, multichain R-hat when K >= 2 — preserves the historical
+            behaviour. * ``"multichain"``: require K >= 2; raise ``ValueError`` if not. Use when you've
+            explicitly run multiple chains and want a loud failure if the layout doesn't carry them. *
+            ``"split"``: split every chain in half and treat the halves as 2K independent chains.
+            Useful as a stationarity check on top of cross-chain mixing for K >= 2.
 
-        * ``"auto"`` (default): split-R-hat when K == 1, multichain
-          R-hat when K >= 2 — preserves the historical behaviour.
-        * ``"multichain"``: require K >= 2; raise ``ValueError`` if not.
-          Use when you've explicitly run multiple chains and want a
-          loud failure if the layout doesn't carry them.
-        * ``"split"``: split every chain in half and treat the halves
-          as 2K independent chains.  Useful as a stationarity check
-          on top of cross-chain mixing for K >= 2.
+    Note:
+        For K=1 the default ``"auto"`` strategy falls back to single-chain
+        split-R-hat (still informative for stationarity but not as strong
+        as a true multi-chain diagnostic).  Pass ``strategy="multichain"``
+        to forbid this silent fallback.
 
-    Notes
-    -----
-    For K=1 the default ``"auto"`` strategy falls back to single-chain
-    split-R-hat (still informative for stationarity but not as strong
-    as a true multi-chain diagnostic).  Pass ``strategy="multichain"``
-    to forbid this silent fallback.
+    References:
+        Gelman, A., & Rubin, D. B. (1992). *Inference from iterative
+            simulation using multiple sequences.* Statistical Science 7(4),
+            457-511.
 
-    References
-    ----------
-    Gelman, A., & Rubin, D. B. (1992). *Inference from iterative
-        simulation using multiple sequences.* Statistical Science 7(4),
-        457-511.
-
-    Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., & Bürkner, P.-C.
-        (2021). *Rank-Normalization, Folding, and Localization: An
-        Improved R̂ for Assessing Convergence of MCMC.* Bayesian
-        Analysis 16(2), 667-718.
+        Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., & Bürkner, P.-C.
+            (2021). *Rank-Normalization, Folding, and Localization: An
+            Improved R̂ for Assessing Convergence of MCMC.* Bayesian
+            Analysis 16(2), 667-718.
     """
     if strategy not in ("auto", "multichain", "split"):
         raise ValueError(f"rhat: strategy must be one of 'auto', 'multichain', 'split'; got {strategy!r}.")
@@ -1759,11 +1754,10 @@ def ess(chain) -> jnp.ndarray:
     across chains, summed with the initial-monotone-sequence truncation
     rule of Geyer (1992).
 
-    References
-    ----------
-    Gelman, A., Carlin, J. B., Stern, H. S., Dunson, D. B., Vehtari, A.,
-        & Rubin, D. B. (2014). *Bayesian Data Analysis*, 3rd ed.,
-        Chapman & Hall/CRC, §11.5.
+    References:
+        Gelman, A., Carlin, J. B., Stern, H. S., Dunson, D. B., Vehtari, A.,
+            & Rubin, D. B. (2014). *Bayesian Data Analysis*, 3rd ed.,
+            Chapman & Hall/CRC, §11.5.
     """
     chain = jnp.asarray(chain)
     if chain.ndim < 2:

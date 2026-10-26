@@ -51,7 +51,14 @@ def _read_toml(path: Path) -> dict[str, Any]:
 
 
 def load_config(force: bool = False) -> dict[str, Any]:
-    """Read and cache the jNO config.  Returns ``{}`` if no file is found."""
+    """Read and cache the jNO config (``.jno.toml``); ``{}`` if no file is found.
+
+    Args:
+        force: re-read the file even if a cached copy exists.
+
+    Returns:
+        dict: the parsed configuration.
+    """
     global _CONFIG, _CONFIG_PATH
     if _CONFIG is not None and not force:
         return _CONFIG
@@ -275,10 +282,9 @@ def enable_compile_cache(directory: str | None = None) -> str:
     ``jax_persistent_cache_min_compile_time_secs`` of 1.0 s skips every one of these compilations,
     which are individually sub-second.
 
-    Parameters
-    ----------
-    directory : cache location. ``None`` uses ``$JNO_COMPILE_CACHE_DIR`` if set, else
-        ``~/.cache/jno/xla``.
+    Args:
+        directory (cache location. ``None`` uses ``$JNO_COMPILE_CACHE_DIR`` if set, else):
+            ``~/.cache/jno/xla``.
     """
     import jax
 

@@ -25,12 +25,11 @@ equal-volume sphere overestimates it by 20 % (energy-weighted; up to 171 % on a 
 a fixed volume the sphere minimises the mean interior distance and so maximises ``<1/r>``. Passing
 ``self_g=None`` therefore raises rather than silently substituting a far-field value.
 
-References
-----------
-Ruehli, *Equivalent Circuit Models for Three-Dimensional Multiconductor Systems*, IEEE Trans.
-Microwave Theory Tech. 22(3):216, 1974 — the partial-element formulation.
-Torchio, Peng, Moreno & Bettini, *A FFT-PEEC method*, IEEE Trans. Power Electron. 37(3), 2022 —
-the translational-invariance argument behind :func:`lattice_operator`.
+References:
+    Ruehli, *Equivalent Circuit Models for Three-Dimensional Multiconductor Systems*, IEEE Trans.
+    Microwave Theory Tech. 22(3):216, 1974 — the partial-element formulation.
+    Torchio, Peng, Moreno & Bettini, *A FFT-PEEC method*, IEEE Trans. Power Electron. 37(3), 2022 —
+    the translational-invariance argument behind :func:`lattice_operator`.
 """
 
 from __future__ import annotations

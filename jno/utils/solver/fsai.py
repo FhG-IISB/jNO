@@ -37,6 +37,13 @@ class FsaiPattern(NamedTuple):
     trace from the operator's (traced) indices -- a closed-over table is baked into the compiled program
     as a constant, once per use, and at 300k unknowns that made a 3.9 GB executable the GPU refused to
     load. ``checksum`` lets the trace confirm the operator still has the pattern G was built for.
+
+    Attributes:
+        n: system size.
+        nnz: unique ``(row, col)`` positions of ``A``.
+        checksum: two modular sums of ``A``'s sorted keys.
+        groups: per distinct row width ``w``, ``(rows, J)`` with ``J`` ``(b, w)``.
+        power: the sparsity-pattern power ``G`` was built from.
     """
 
     n: int

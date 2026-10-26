@@ -136,6 +136,10 @@ class Dissipation(dict):
     ``.sigma`` is the ohmic loss and ``.mu_r`` the core loss, each named after what the region
     attached -- the same spelling in and out, as with ``.attach(k=...)`` and ``d.k``, so no channel
     needs a vocabulary invented for it. A region declaring both appears in both, under its own name.
+
+    Args:
+        channels: ``{property: {region: W/m^3}}`` per loss mechanism (``"sigma"``, ``"mu_r"``); the
+            mapping itself becomes their per-region sum.
     """
 
     def __init__(self, channels):
@@ -176,6 +180,24 @@ class PEECSolution:
     """What a solved network hands back.
 
     ``Z``/``R``/``L`` describe the source port; with an array ``freq`` each is an array over it.
+
+    Built by :meth:`BuiltPEEC.solve`, not by hand.
+
+    Args:
+        freq: the frequency, or the array of frequencies, solved at.
+        cur: filament currents (per frequency for an array ``freq``).
+        fil: the filament set (geometry, lengths, areas, owners).
+        terms: per-terminal injected currents.
+        port: the source-port voltage(s).
+        res: per-filament resistance at the solve frequency (surface resistance included).
+        vol: per-filament volume, for the dissipation density.
+        owner: per-filament region index.
+        names: the region names ``owner`` indexes.
+        link: the flux-linkage readout, when the problem has coupled coils.
+        pot: node potentials.
+        pads: the terminal node sets the solve used.
+        mag: ``(currents, reluctances, volumes, owners, names)`` of the magnetic network, or Nones.
+        lp_apply: the partial-inductance apply the solve used, reused by ``L``.
     """
 
     def __init__(
@@ -385,7 +407,7 @@ class PEECSolution:
         """Magnetic flux density at ``points``, tesla — ``(n, 3)``, or ``(n_freq, n, 3)`` swept.
 
         A partial-element method never meshes the air, so the field off the metal is not a solved
-        unknown: it is the Biot-Savart sum over the currents that WERE solved for,
+        unknown: it is the Biot-Savart sum over the currents that WERE solved for::
 
             B(r) = (mu0 / 4 pi) * sum_k I_k * (dl_k x (r - r_k)) / |r - r_k|^3
 
@@ -399,6 +421,9 @@ class PEECSolution:
 
         Args:
             points: ``(n, 3)`` positions, in metres. May be traced.
+
+        Returns:
+            The flux density, ``(n, 3)`` (or ``(n_freq, n, 3)`` for a frequency sweep).
         """
         pts = jnp.asarray(points, dtype=float)
         if pts.ndim != 2 or pts.shape[1] != 3:
@@ -737,6 +762,14 @@ class ParametricSolution:
     ever traced.
 
     ``solve(sigma=...)`` with concrete values is the way back to a plain number.
+
+    Args:
+        built: the :class:`BuiltPEEC` network.
+        exprs: the parameter expressions the material and geometry carry, by name.
+        params: the ``jno.np.parameter`` nodes they read.
+        solve_kw: the keyword arguments of the solve, passed on to every traced readout.
+        geometry: the line (wire) geometry, when vertices or radii are parameters.
+        faces: the solid geometry, when box faces are parameters.
     """
 
     def __init__(self, built, exprs, params, solve_kw=None, geometry=None, faces=None):
@@ -882,8 +915,33 @@ class ParametricSolution:
         }
 
 
+# docstring-from: jno.peec.peec
 class PEEC:
-    """A partial-element problem: built from the constraint list, solved by :meth:`solve`."""
+    """Build a partial-element circuit problem from its port constraints.
+
+    Args:
+        constraints: the ports — ``v(A) - v(B) - g``, ``v(A) - g``, ``i(A) - g``.
+        grid: how to discretise the solids. ``None`` is one uniform pitch from each shape's own
+            ``size=``, which keeps the operator translation-invariant and therefore an FFT.
+            :func:`jno.peec.graded` instead refines toward every conductor face, which is where the
+            current crowds — and gives up the FFT, so the solve then needs
+            ``operator=jno.solve.hierarchical(...)`` and says so if it is missing.
+        freq: frequency in Hz, scalar or array (``omega = 2 pi f`` inside). An array solves at each
+            and every port readout becomes an array over it.
+
+            **The filament self-term is the DC geometric mean distance**, so the skin effect WITHIN
+            a filament is not represented. Redistribution BETWEEN conductors is (that is what the
+            method is for); to capture it inside one, split a conductor that is wide against the
+            skin depth into filaments across its section.
+        operator, restart, matrix_free: how THIS network is solved -- the same settings
+            :meth:`BuiltPEEC.solve` takes, kept on the network so every solve uses them, the ones a
+            coupled solve of a network and the jno.fem problem its ``em.loss`` heats included. A keyword given to ``solve()`` overrides
+            them for that call. ``grid=jno.peec.faces(...)`` needs ``operator=jno.solve.hierarchical(...)``
+            (or ``matrix_free=False``, dense) here, since its lattice has no FFT.
+
+    Returns:
+        :class:`PEEC` — call ``.solve()``.
+    """
 
     def __init__(self, constraints, freq=0.0, grid=None, operator=None, restart=None, matrix_free=None):
         self.constraints = list(constraints)
@@ -1360,7 +1418,11 @@ class PEEC:
 
     def cell_size(self):
         """Per-cell size of the network's solid grid at the design, ``(dx dy dz)^(1/3)`` per metal
-        cell, as a trace node over the parameters. See :meth:`cell_aspect`."""
+        cell, as a trace node over the parameters. See :meth:`cell_aspect`.
+
+        Returns:
+            A trace node, one size per metal cell.
+        """
         return self._cell_node("size")
 
     def _cell_node(self, kind):
@@ -1420,6 +1482,13 @@ class PEEC:
         With a `jno.np.parameter` in the material or the geometry, the readouts are trace nodes for
         `jno.core` instead. Keyword arguments are those of :meth:`BuiltPEEC.solve` -- ``sigma=``,
         ``geometry=``, ``operator=`` for a graded lattice, and the rest.
+
+        Args:
+            **kw: passed to :meth:`BuiltPEEC.solve`: ``sigma=`` (conductivity overrides by region),
+                ``geometry=`` (parameter values for the geometry), ``operator=`` (for a graded lattice), ...
+
+        Returns:
+            PEECSolution | ParametricSolution: the solution (trace-node readouts when parameters are present).
         """
         heat = self.__dict__.get("_heat")
         if heat is not None:
@@ -1443,6 +1512,19 @@ class BuiltPEEC:
     Made by the first :meth:`peec.solve` and kept on the network (:meth:`peec._build`). Holds the filaments, the terminal node sets and the conductivity
     resolvers -- all of it concrete -- so :meth:`solve` touches nothing but jax and can be put
     inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
+
+    Args:
+        spec: the :class:`PEEC` problem it was built from.
+        fil: the filaments (geometry, lengths, areas, owners, skin data).
+        terms: the terminal node sets.
+        part_names: region names, indexed by the filaments' owners.
+        resolve: per-region conductivity resolvers (values or parameter expressions).
+        mag: the magnetic (core) network, or ``None``.
+        mag_names: region names of the magnetic network.
+        param_exprs: parameter expressions in the material and geometry, by name.
+        lines: wire (line-region) geometry, for parametric vertices and radii.
+        solids: the solid lattice cells.
+        solid_geom: the solid geometry, for parametric box faces.
     """
 
     def __init__(

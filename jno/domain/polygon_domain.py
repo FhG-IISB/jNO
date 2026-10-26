@@ -220,6 +220,20 @@ class PolygonDomain(domain):
     The class preserves the ``jno.domain`` variable/context contract but does
     not create a mesh. Point sets are materialized only when ``variable`` or
     ``sample`` is called with an explicit sample count.
+
+    Args:
+        vertices: the polygon's vertices ``[(x, y), ...]``, or a ``{name: vertices}`` dict of regions.
+        name: the region name of a single polygon.
+        geometry: a Shapely geometry instead of ``vertices``.
+        regions: ``{name: Shapely geometry}`` of named regions.
+        source_edges: ``{tag: [line geometries]}`` of explicit boundary segments.
+        time: ``(t0, t1, n)`` for a time-dependent problem.
+        compute_mesh_connectivity: build mesh connectivity once a mesh exists.
+        mesh_size: default target element size for :meth:`build_mesh`.
+        sampler: a point sampler applied to every interior region.
+        samplers: ``{region: sampler}`` per named region, overriding ``sampler``.
+        resampling_strategy: a resampling strategy applied to every region.
+        resampling_strategies: ``{region: strategy}`` per named region.
     """
 
     def __init__(
@@ -365,7 +379,21 @@ class PolygonDomain(domain):
         resampling_strategy: Optional[Any] = None,
         resampling_strategies: Optional[Mapping[str, Any]] = None,
     ) -> "PolygonDomain":
-        """Create one CSG domain from a mapping of region names to vertices."""
+        """Create one CSG domain from a mapping of region names to vertices.
+
+        Args:
+            polygons: ``{name: [(x, y), ...]}``.
+            time: ``(t0, t1, n)`` for a time-dependent problem.
+            compute_mesh_connectivity: build mesh connectivity once a mesh exists.
+            mesh_size: default target element size for :meth:`build_mesh`.
+            sampler: a point sampler applied to every interior region.
+            samplers: ``{region: sampler}`` per named region, overriding ``sampler``.
+            resampling_strategy: a resampling strategy applied to every region.
+            resampling_strategies: ``{region: strategy}`` per named region.
+
+        Returns:
+            PolygonDomain: the domain.
+        """
         _require_shapely()
         regions: Dict[str, BaseGeometry] = {}
         source_edges: Dict[str, List[BaseGeometry]] = {}
@@ -404,7 +432,21 @@ class PolygonDomain(domain):
         resampling_strategy: Optional[Any] = None,
         resampling_strategies: Optional[Mapping[str, Any]] = None,
     ) -> "PolygonDomain":
-        """Create one CSG domain from named Shapely polygonal regions."""
+        """Create one CSG domain from named Shapely polygonal regions.
+
+        Args:
+            regions: ``{name: Shapely geometry}``.
+            time: ``(t0, t1, n)`` for a time-dependent problem.
+            compute_mesh_connectivity: build mesh connectivity once a mesh exists.
+            mesh_size: default target element size for :meth:`build_mesh`.
+            sampler: a point sampler applied to every interior region.
+            samplers: ``{region: sampler}`` per named region, overriding ``sampler``.
+            resampling_strategy: a resampling strategy applied to every region.
+            resampling_strategies: ``{region: strategy}`` per named region.
+
+        Returns:
+            PolygonDomain: the domain.
+        """
         _require_shapely()
         normalized_regions: Dict[str, BaseGeometry] = {}
         source_edges: Dict[str, List[BaseGeometry]] = {}
@@ -517,22 +559,16 @@ class PolygonDomain(domain):
         """Define a named sub-region addressable via ``domain.variable(name)`` and usable
         as a FEM boundary-condition location.
 
-        Parameters
-        ----------
-        name:
-            Region tag name (e.g. ``"inlet"``, ``"right_top"``).
-        where:
-            * a shapely geometry — a boundary ``LineString``/``MultiLineString`` or an area
-              ``Polygon``/``MultiPolygon`` registered directly;
-            * a point predicate ``f(x, y) -> bool`` selecting the part of the active
-              **boundary** where it holds (evaluated per analytic edge-segment midpoint, so
-              it selects whole polygon edges);
-            * a ``str`` aliasing an already-registered tag.
-        kind:
-            ``"boundary"`` or ``"interior"``. ``None`` auto-detects from the geometry
-            (area → interior, line → boundary); predicates are boundary-only for now.
-
-        Returns ``self`` for chaining.
+        Args:
+            name: Region tag name (e.g. ``"inlet"``, ``"right_top"``).
+            where: * a shapely geometry — a boundary ``LineString``/``MultiLineString`` or an area
+                ``Polygon``/``MultiPolygon`` registered directly; * a point predicate ``f(x, y) -> bool``
+                selecting the part of the active **boundary** where it holds (evaluated per analytic
+                edge-segment midpoint, so it selects whole polygon edges); * a ``str`` aliasing an
+                already-registered tag.
+            kind: ``"boundary"`` or ``"interior"``. ``None`` auto-detects from the geometry (area →
+                interior, line → boundary); predicates are boundary-only for now.
+            Returns ``self`` for chaining.
         """
         _require_shapely()
         name = str(name)
@@ -688,6 +724,14 @@ class PolygonDomain(domain):
         This is intended for imported boundary-condition/radiation surfaces
         that are subsets of component boundaries rather than whole closed
         polygons.
+
+        Args:
+            tag: the new boundary tag.
+            segments: the segments, ``[[(x0, y0), (x1, y1)], ...]``.
+            normal_geometry: the geometry whose outward side defines the normals; ``None`` uses the domain.
+
+        Returns:
+            PolygonDomain: ``self``.
         """
         _require_shapely()
         line_geometries = []
@@ -1337,6 +1381,9 @@ class PolygonDomain(domain):
         call (10× the currently-sampled count, min 1000) so that resampling
         strategies can explore the full domain rather than being confined to
         the initial sample.
+
+        Args:
+            tag: the point set to draw for.
         """
         import re
 
@@ -1362,6 +1409,7 @@ class PolygonDomain(domain):
             pts, nrm = self._sample_boundary(base, n_candidates, with_normals=True)
             return pts, nrm
 
+    # docstring-from: jno.domain.domain_class.domain.sample
     def sample(
         self,
         sample_spec: Dict[str, Tuple[int, Optional[Any]]],
@@ -1369,6 +1417,26 @@ class PolygonDomain(domain):
         return_indices: bool = False,
         time_value: float | None = None,
     ):
+        """Sample points from the domain.
+
+        Args:
+            sample_spec: Mapping of tag names to ``(n_samples, optional_sampler)``, e.g.
+                ``{"interior": (2000, None), "boundary": (500, None)}``. For time-dependent problems use
+                ``"initial"`` to sample points at ``t = t0``: ``{"interior": (2000, None), "initial": (500, None)}``.
+            normals: Also compute the boundary normals of the sampled points.
+            return_indices: Also return the indices of the sampled mesh points.
+            time_value: The time at which a fixed-time slice (``"initial"``) is taken; default the start time.
+
+        If domain was batched (e.g., 10 * domain), samples n_samples for each
+        batch independently and concatenates results.
+
+        Shapes stored in ``self.context``:
+
+        * **Always**: ``(B, T, N, D_spatial)`` for spatial tags.
+          For steady-state problems T=1.
+        * **Time-dependent only**: ``(T, 1)`` for ``"__time__"``
+          (shared across batches).
+        """
         # After build_mesh(), tags with sample count None and a matching
         # _mesh_pool entry are delegated to the parent's mesh sampler so the
         # mesh-node path drives .integrate() and FD. Tags with an explicit
@@ -1522,6 +1590,7 @@ class PolygonDomain(domain):
         where=None,
     ) -> Any: ...
 
+    # docstring-from: jno.domain.domain_class.domain.variable
     def variable(
         self,
         tag: str,
@@ -1536,6 +1605,81 @@ class PolygonDomain(domain):
         time_value: Optional[float] = None,
         where=None,
     ) -> Any:
+        """Create Variable placeholders for a tagged point set or tensor.
+
+        Args:
+            tag: Name of the point set (e.g., 'interior', 'boundary')
+                or tensor tag (e.g., 'diffusivity')
+            where: Optional spatial predicate ``f(x, y[, z]) -> bool`` (or a shapely geometry).
+                 When given, the region ``tag`` is defined on the fly -- exactly as
+                 :meth:`tag` would -- and then its coordinates are returned, so naming a
+                 region and grabbing its coords is a single call::
+
+                     xl, yl, zl, _ = dom.variable("left", where=lambda x, y, z: x < 1e-6)
+            sample: Optional sampling specification for this tag:
+                - (n_samples, sampler) tuple to trigger sampling
+                - np.ndarray / jnp.ndarray to register a tensor tag
+
+                When ``sample`` is an array, the leading dimension determines
+                how the tensor is routed by the compiler:
+
+                  * ``shape[0] == B`` (the domain's effective batch count) —
+                    vmapped over the batch axis, one row per sample.
+                  * ``shape[0] == 1`` — broadcast across the batch.
+                  * ``shape[0]`` anything else — *shared*: the full array is
+                    exposed at every step (use this for labeled supervised
+                    data, lookup tables, or gather indices that are not
+                    aligned with the physics batch).
+
+                A routed tensor of rank >= 3 is ``(B, T, ...)``. A missing time axis is
+                inserted where axis 1 cannot be time -- a steady ``(B, H, W, C)``, or
+                per-node data ``(B, n, k)`` whose ``n`` is a point set's node count --
+                and refused where it could be; ``(B, 1, n, k)`` is never ambiguous.
+
+            resampling_strategy: Optional ResamplingStrategy for adaptive point selection
+            normals: If True, also compute and return normal vectors for this tag
+            reverse_normals: If True, flip the sign of the normal vectors
+            follow_normals: If True, the normal is the **deformed** surface's normal, recomputed from
+                ``x = X + u`` each time the residual is evaluated, instead of the reference surface's.
+                That is the difference between a **dead** load and a **follower** load: gravity still
+                points down after a body tips over (reference), while pressure stays perpendicular to
+                the skin however the skin moves (deformed). Contact belongs with pressure — the contact
+                force is normal to the surfaces that are actually touching.
+
+                **Use it with finite-strain kinematics, not with** ``sym(grad u)``. The reference and
+                deformed normals differ by ``O(theta)`` for a surface rotation ``theta``, and that is
+                exactly the regime where the small-strain measure also fails: ``sym(grad u)`` is not
+                rotation invariant, so a pure rotation manufactures ``cos(theta) - 1`` of strain out of
+                nothing. Measured on a sheet-forming march at 38 degrees, ``||sym(grad u)|| = 0.300``
+                against a Green-Lagrange strain of ``1.9e-17``. Following the normal there buys a better
+                force *direction* applied to a materially wrong *stress*, which is worse than either
+                mistake alone because it looks more correct. Write ``F = I + grad u``,
+                ``E = (F^T F - I)/2`` and a PK stress, and then follow the normal.
+
+                It makes the form **nonlinear**: the traction direction now depends on the solution, so
+                a form that assembles as ``linear`` without it needs a Newton solve with it.
+            view_factor: If True, also compute the diffuse view-factor matrix of this boundary point set
+                (and its visibility matrix), stored as the tensor tags ``f_<tag>`` and ``v_<tag>``. Not
+                supported on batched domains.
+            point_data: With an array ``sample``, store it as per-point data in the context rather than
+                as a tensor (parameter) tag.
+            split: Return the coordinate Variables as separate elements (``x, y, [z], t``) rather than
+                packed.
+            return_indices: Whether to also return the indices of the selected mesh points.
+            time_value: For a time-dependent domain, the time at which an ``"initial"`` or fixed-time
+                slice is taken (default: the start time).
+            region: With ``where=``, restrict the new tag to one body or region -- the way to pick a
+                single side of a non-conforming interface.
+
+        Returns:
+            For point sets: Tuple of Variable placeholders, one per dimension.
+            For point sets with normals=True: with ``split=True``, the flat tuple of coordinate + normal
+                *component* variables ``(x, y, [z], t, nx, ny, [nz])``; with ``split=False`` (the default),
+                the boundary normal as a **single vector** Variable — so it drops straight into vector ops,
+                e.g. ``u.vector.cross(domain.variable(region, normals=True))``. (Coordinates in that case come
+                from a separate ``domain.variable(region)`` / ``split=True`` call.)
+            For tensor tags: Single TensorTag placeholder.
+        """
         # Define-and-fetch: a predicate names the region here, then we return its coordinates.
         if where is not None:
             self.tag(tag, where)
@@ -1613,6 +1757,7 @@ class PolygonDomain(domain):
         return result
 
     def copy(self) -> "PolygonDomain":
+        """A deep copy of this domain."""
         return copy.deepcopy(self)
 
     def __rmul__(self, n: int) -> "PolygonDomain":
@@ -1747,6 +1892,14 @@ class PolygonDomain(domain):
         return PolygonDomain(other)
 
     def union(self, other: Any) -> "PolygonDomain":
+        """The union of this domain and ``other`` (also ``a + b``).
+
+        Args:
+            other: another polygon domain, a Shapely geometry, or vertices.
+
+        Returns:
+            PolygonDomain: the new domain.
+        """
         other_poly = self._coerce_other(other)
         return self._new_from_csg(
             other_poly,
@@ -1755,6 +1908,14 @@ class PolygonDomain(domain):
         )
 
     def intersection(self, other: Any) -> "PolygonDomain":
+        """The intersection of this domain and ``other``.
+
+        Args:
+            other: another polygon domain, a Shapely geometry, or vertices.
+
+        Returns:
+            PolygonDomain: the new domain.
+        """
         other_poly = self._coerce_other(other)
         return self._new_from_csg(
             other_poly,
@@ -1763,6 +1924,14 @@ class PolygonDomain(domain):
         )
 
     def difference(self, other: Any) -> "PolygonDomain":
+        """This domain minus ``other`` (also ``a - b``).
+
+        Args:
+            other: another polygon domain, a Shapely geometry, or vertices.
+
+        Returns:
+            PolygonDomain: the new domain.
+        """
         other_poly = self._coerce_other(other)
         return self._new_from_csg(
             other_poly,
@@ -1771,6 +1940,14 @@ class PolygonDomain(domain):
         )
 
     def symmetric_difference(self, other: Any) -> "PolygonDomain":
+        """The symmetric difference of this domain and ``other``.
+
+        Args:
+            other: another polygon domain, a Shapely geometry, or vertices.
+
+        Returns:
+            PolygonDomain: the new domain.
+        """
         other_poly = self._coerce_other(other)
         return self._new_from_csg(
             other_poly,
@@ -1825,6 +2002,7 @@ class PolygonDomain(domain):
                 the names used to construct the source regions (e.g. the
                 ``name`` argument of ``jno.domain`` or keys of
                 ``from_polygons`` / ``from_regions``).
+            sizes: alias of ``region_mesh_sizes``; merged with it (``region_mesh_sizes`` wins).
             interpolate: Controls how ``region_mesh_sizes`` is enforced inside
                 each region (default ``True``).
 

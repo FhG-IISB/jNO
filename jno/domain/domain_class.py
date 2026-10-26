@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import weakref as _weakref
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
 import cloudpickle
 import jax.numpy as jnp
@@ -27,6 +27,14 @@ from .mesh_utils import VOLUME_BLOCKS_BY_DIM, mesh_cell_region_membership
 from .mesh_utils import base_cell_type as _base_cell_type
 from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
+
+if TYPE_CHECKING:
+    from ..trace import ModelCall
+    from ..trace.views import ComplexPair
+
+    #: what ``domain.unknown(...)`` returns: a valued P1 nodal field (``ModelCall``, solvable by ``jno.fdm``
+    #: too), an FEM-only trial symbol (other spaces and orders, or ``constant=True``), or a complex pair
+    Unknown = Union[ModelCall, TrialFunction, ComplexPair]
 
 #: The space-filling cell blocks of each dimension. A mesh is expected to carry exactly one.
 #: Re-exported from :mod:`jno.domain.mesh_utils`, which is where the canonical list lives now that
@@ -644,7 +652,7 @@ class _UnknownNamespace:
 
     def __call__(
         self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False, constant=False
-    ):
+    ) -> "Unknown":
         return self._domain._make_unknown(
             value_shape=value_shape,
             name=name,
@@ -655,15 +663,15 @@ class _UnknownNamespace:
             constant=constant,
         )
 
-    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
         """A scalar unknown, ``value_shape=()``. ``constant=True``: ONE value over the whole domain."""
         return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant)
 
-    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
         """A vector unknown with ``n`` components, ``value_shape=(n,)``. ``constant=True``: one vector."""
         return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant)
 
-    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False):
+    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False) -> "Unknown":
         """An ``n x m`` matrix unknown. ``symmetric=True`` (square only) stores the ``n(n+1)/2`` upper-triangle
         values per node while the symbol behaves as the full matrix in every expression. ``constant=True``:
         one matrix over the whole domain."""
@@ -1252,7 +1260,8 @@ class domain(MeshIOMixin):
 
         When sample() is called, it will sample n times and concatenate results.
 
-        Example:
+        Example::
+
             domain = 10 * domain.from_mesh(domain.rect, {...}, 0.05)
             domain.sample({"interior": (100, None)})  # Results in 1000 interior points
         """
@@ -1803,14 +1812,10 @@ class domain(MeshIOMixin):
         return max(1e-8, 1e-10 * max(diag, 1.0))
 
     def boundary_tags(self):
-        """
-        Return the available boundary tag names on the mesh.
+        """Return the available boundary tag names on the mesh.
 
-        Returns
-        -------
-        list[str]
-            Registered boundary tags that can be used for Dirichlet or
-            Neumann conditions.
+        Returns:
+            list[str]: Registered boundary tags that can be used for Dirichlet or Neumann conditions.
         """
         return sorted(self._boundary_registry.keys())
 
@@ -1880,20 +1885,15 @@ class domain(MeshIOMixin):
         return tuple(sides[str(r)] for r in regions)
 
     def dirichlet(self, tags, values=None):
-        """
-        Create a symbolic Dirichlet boundary-condition descriptor.
+        """Create a symbolic Dirichlet boundary-condition descriptor.
 
-        Parameters
-        ----------
-        tags : str | list[str]
-            Boundary tag or tags where the condition is applied.
-        values : callable | list[callable] | dict[int, callable] | None, optional
-            Prescribed boundary values. ``None`` gives a homogeneous condition.
+        Args:
+            tags (str | list[str]): Boundary tag or tags where the condition is applied.
+            values (callable | list[callable] | dict[int, callable] | None, optional): Prescribed boundary
+                values. ``None`` gives a homogeneous condition.
 
-        Returns
-        -------
-        object
-            Boundary-condition descriptor for use with ``init_fem_native(..., bcs=...)``.
+        Returns:
+            object: Boundary-condition descriptor for use with ``init_fem_native(..., bcs=...)``.
         """
         try:
             from ..utils.solver.fem_route import dirichlet as _dirichlet_bc
@@ -1904,18 +1904,13 @@ class domain(MeshIOMixin):
         return _dirichlet_bc(tags, values)
 
     def neumann(self, tags):
-        """
-        Create a symbolic Neumann boundary-condition descriptor.
+        """Create a symbolic Neumann boundary-condition descriptor.
 
-        Parameters
-        ----------
-        tags : str | list[str]
-            Boundary tag or tags where the condition is active.
+        Args:
+            tags (str | list[str]): Boundary tag or tags where the condition is active.
 
-        Returns
-        -------
-        object
-            Boundary-condition descriptor for use with ``init_fem_native(..., bcs=...)``.
+        Returns:
+            object: Boundary-condition descriptor for use with ``init_fem_native(..., bcs=...)``.
         """
         try:
             from ..utils.solver.fem_route import neumann as _neumann_bc
@@ -1926,11 +1921,10 @@ class domain(MeshIOMixin):
         return _neumann_bc(tags)
 
     def periodic(self, *pairs):
-        """
-        Create a periodic boundary-condition descriptor.
+        """Create a periodic boundary-condition descriptor.
 
-        Example
-        -------
+        Example::
+
             domain.init_fem_native(
                 bcs=[domain.periodic(("left", "right"), ("bottom", "top"))],
             )
@@ -1944,23 +1938,15 @@ class domain(MeshIOMixin):
         return _periodic_bc(*pairs)
 
     def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
-        """
-        Build JAX-FEM Dirichlet boundary data from tagged user input.
+        """Build JAX-FEM Dirichlet boundary data from tagged user input.
 
-        Parameters
-        ----------
-        dirichlet_tags : list[str]
-            Boundary tags with Dirichlet constraints.
-        dirichlet_value_fns : dict | None, optional
-            Mapping from tag to value function definition.
-        vec : int, default=1
-            Number of field components.
+        Args:
+            dirichlet_tags (list[str]): Boundary tags with Dirichlet constraints.
+            dirichlet_value_fns (dict | None, optional): Mapping from tag to value function definition.
+            vec (int, default=1): Number of field components.
 
-        Returns
-        -------
-        list
-            JAX-FEM ``dirichlet_bc_info`` in the form
-            ``[location_fns, vec_ids, value_fns]``.
+        Returns:
+            list: JAX-FEM ``dirichlet_bc_info`` in the form ``[location_fns, vec_ids, value_fns]``.
         """
         if dirichlet_value_fns is None:
             dirichlet_value_fns = {}
@@ -2029,43 +2015,35 @@ class domain(MeshIOMixin):
     def variational_symbols(
         self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False
     ):
-        """
-        Return generic variational symbols.
+        """Return generic variational symbols.
 
         ``order`` is the element polynomial degree for this field (1 = P1, 2 = P2).
         It is per-field (mixed methods like Taylor-Hood use different orders for
         different fields); the domain mesh stays linear and the FEM assembly mesh is
         promoted as needed.
 
-        Parameters
-        ----------
-        value_shape : tuple, default=()
-            Shape of the field value at one spatial point:
-            ()    -> scalar
-            (2,)  -> 2D vector
-            (3,)  -> 3D vector
-        names : tuple[str, str]
-            Names of the trial and test symbols.
-        symmetric : bool, default=False
-            For a square matrix field ``value_shape=(n, n)``: store only the upper triangle,
-            ``n(n+1)/2`` values per node (``xx, xy, yy`` in 2-D). The symbol still behaves as the full
-            ``n x n`` matrix in every expression, and its test function is the symmetric one.
+        Args:
+            value_shape (tuple, default=()): Shape of the field value at one spatial point: ()    -> scalar
+                (2,)  -> 2D vector (3,)  -> 3D vector
+            names (tuple[str, str]): Names of the trial and test symbols.
+            symmetric (bool, default=False): For a square matrix field ``value_shape=(n, n)``: store only
+                the upper triangle, ``n(n+1)/2`` values per node (``xx, xy, yy`` in 2-D). The symbol still
+                behaves as the full ``n x n`` matrix in every expression, and its test function is the
+                symmetric one.
 
-        Returns
-        -------
-        (trial, test)
-            Symbolic variational placeholders carrying shape metadata.
+        Returns:
+            (trial, test): Symbolic variational placeholders carrying shape metadata.
 
-        Examples
-        --------
-        Scalar Poisson:
-            u, phi = domain.fem_symbols()
+        Example::
 
-        2D vector elasticity:
-            u, v = domain.fem_symbols(value_shape=(2,))
+            Scalar Poisson:
+                u, phi = domain.fem_symbols()
 
-        3D vector elasticity:
-            u, v = domain.fem_symbols(value_shape=(3,))
+            2D vector elasticity:
+                u, v = domain.fem_symbols(value_shape=(2,))
+
+            3D vector elasticity:
+                u, v = domain.fem_symbols(value_shape=(3,))
         """
         # Asking for variational symbols IS asking for a finite-element space, and that space is
         # defined on a mesh. Build it here, at the point the intent is unambiguous, rather than
@@ -2113,8 +2091,7 @@ class domain(MeshIOMixin):
         return (trial, test)
 
     def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False):
-        """
-        Backward-compatible alias for variational_symbols().
+        """Backward-compatible alias for variational_symbols().
 
         ``space`` selects the element family: ``"Lagrange"`` (default, nodal) or a non-nodal
         family — ``"N1E"`` (H(curl) Nédélec, first kind), ``"N2E"`` (H(curl), second kind: full
@@ -2130,23 +2107,23 @@ class domain(MeshIOMixin):
         order and refuse another. A Lagrange field mixed with a non-nodal one (the A-V pair) may
         carry any order too.
 
-        Examples
-        --------
-        Scalar:
-            u, phi = domain.fem_symbols()
+        Example::
 
-        Vector:
-            u, v = domain.fem_symbols(value_shape=(2,))
+            Scalar:
+                u, phi = domain.fem_symbols()
 
-        Mixed order (Taylor-Hood: P2 velocity, P1 pressure):
-            u, v = domain.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
-            p, q = domain.fem_symbols(names=("p", "q"))  # order=1
+            Vector:
+                u, v = domain.fem_symbols(value_shape=(2,))
 
-        Complex field (e.g. time-harmonic Maxwell / Helmholtz) — one symbol that is a
-        genuine complex trial/test (carried as two coupled real fields under the hood):
-            E, v = domain.fem_symbols(value_shape=(2,), complex=True)
-            weak = curl(E) * curl(v) - k2 * E.dot(v) - J.dot(v)   # `*` = complex product
-            fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
+            Mixed order (Taylor-Hood: P2 velocity, P1 pressure):
+                u, v = domain.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+                p, q = domain.fem_symbols(names=("p", "q"))  # order=1
+
+            Complex field (e.g. time-harmonic Maxwell / Helmholtz) — one symbol that is a
+            genuine complex trial/test (carried as two coupled real fields under the hood):
+                E, v = domain.fem_symbols(value_shape=(2,), complex=True)
+                weak = curl(E) * curl(v) - k2 * E.dot(v) - J.dot(v)   # `*` = complex product
+                fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
         """
         return self.variational_symbols(
             value_shape=value_shape, names=names, order=order, complex=complex, space=space, symmetric=symmetric
@@ -2213,7 +2190,7 @@ class domain(MeshIOMixin):
 
     def _make_unknown(
         self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False, constant=False
-    ):
+    ) -> "Unknown":
         """Build an unknown -- see :attr:`unknown`."""
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
@@ -2259,20 +2236,14 @@ class domain(MeshIOMixin):
         region_id: str,
         context_tag: str | None = None,
     ):
-        """
-        Register one sampled quadrature/surface tag as a variational region.
+        """Register one sampled quadrature/surface tag as a variational region.
 
-        Parameters
-        ----------
-        sample_tag : str
-            User-facing / variable-facing tag used in domain.variable(...)
-            e.g. "fem_gauss", "gauss_right", "gauss_wall_3"
-        support : str
-            "volume" or "boundary"
-        region_id : str
-            Geometry-level region id, e.g. "volume", "right", "wall_3", ...
-        context_tag : str | None
-            Internal context key if different from sample_tag.
+        Args:
+            sample_tag (str): User-facing / variable-facing tag used in domain.variable(...) e.g.
+                "fem_gauss", "gauss_right", "gauss_wall_3"
+            support (str): "volume" or "boundary"
+            region_id (str): Geometry-level region id, e.g. "volume", "right", "wall_3", ...
+            context_tag (str | None): Internal context key if different from sample_tag.
         """
         if not hasattr(self, "_variational_sampling_registry"):
             self._variational_sampling_registry = {}
@@ -2292,14 +2263,11 @@ class domain(MeshIOMixin):
         null space of a pure-Dirichlet Stokes problem so the saddle system is
         non-singular and solvable directly (no ``lstsq``/zero-mean workaround).
 
-        Parameters
-        ----------
-        name : str
-            Tag for the pinned node; usable in :meth:`variable` and as a Dirichlet
-            region in :func:`jno.fem`.
-        xy : array-like
-            Target coordinates; the nearest mesh vertex is pinned (vertices are
-            shared by P1 and P2 fields, so the pin lands on a node of either).
+        Args:
+            name (str): Tag for the pinned node; usable in :meth:`variable` and as a Dirichlet region in
+                :func:`jno.fem`.
+            xy (array-like): Target coordinates; the nearest mesh vertex is pinned (vertices are shared by
+                P1 and P2 fields, so the pin lands on a node of either).
         """
         from .boundary_region import BoundaryRegion
 
@@ -2410,19 +2378,14 @@ class domain(MeshIOMixin):
         return self
 
     def _make_tag_location_fn(self, tag):
-        """
-        Build a point-membership function for a boundary tag.
+        """Build a point-membership function for a boundary tag.
 
-        Parameters
-        ----------
-        tag : str
-            Boundary tag name.
+        Args:
+            tag (str): Boundary tag name.
 
-        Returns
-        -------
-        callable | None
-            Function returning whether a point belongs to the tagged region,
-            or ``None`` if the tag is unknown.
+        Returns:
+            callable | None: Function returning whether a point belongs to the tagged region, or ``None`` if
+                the tag is unknown.
         """
         # A domain.tag(name, where) region resolves to: the predicate AND on the domain boundary.
         # the assembler applies a location-fn to EVERY node, so a bare predicate selecting a thick region
@@ -5336,7 +5299,7 @@ class domain(MeshIOMixin):
 
         Args:
             tag: Name of the point set (e.g., 'interior', 'boundary')
-                 or tensor tag (e.g., 'diffusivity')
+                or tensor tag (e.g., 'diffusivity')
             where: Optional spatial predicate ``f(x, y[, z]) -> bool`` (or a shapely geometry).
                  When given, the region ``tag`` is defined on the fly -- exactly as
                  :meth:`tag` would -- and then its coordinates are returned, so naming a
@@ -5344,8 +5307,8 @@ class domain(MeshIOMixin):
 
                      xl, yl, zl, _ = dom.variable("left", where=lambda x, y, z: x < 1e-6)
             sample: Optional sampling specification for this tag:
-                    - (n_samples, sampler) tuple to trigger sampling
-                    - np.ndarray / jnp.ndarray to register a tensor tag
+                - (n_samples, sampler) tuple to trigger sampling
+                - np.ndarray / jnp.ndarray to register a tensor tag
 
                 When ``sample`` is an array, the leading dimension determines
                 how the tensor is routed by the compiler:
@@ -5385,7 +5348,18 @@ class domain(MeshIOMixin):
 
                 It makes the form **nonlinear**: the traction direction now depends on the solution, so
                 a form that assembles as ``linear`` without it needs a Newton solve with it.
-            return_indices: Wether or not to return the indices of the sampled points
+            view_factor: If True, also compute the diffuse view-factor matrix of this boundary point set
+                (and its visibility matrix), stored as the tensor tags ``f_<tag>`` and ``v_<tag>``. Not
+                supported on batched domains.
+            point_data: With an array ``sample``, store it as per-point data in the context rather than
+                as a tensor (parameter) tag.
+            split: Return the coordinate Variables as separate elements (``x, y, [z], t``) rather than
+                packed.
+            return_indices: Whether to also return the indices of the selected mesh points.
+            time_value: For a time-dependent domain, the time at which an ``"initial"`` or fixed-time
+                slice is taken (default: the start time).
+            region: With ``where=``, restrict the new tag to one body or region -- the way to pick a
+                single side of a non-conforming interface.
 
         Returns:
             For point sets: Tuple of Variable placeholders, one per dimension.
@@ -5710,10 +5684,10 @@ class domain(MeshIOMixin):
             u_phys = net(jno.np.concat([x, y], axis=-1)) * d  # u=0 on ∂Ω
 
         Args:
-            tag:           Source tag whose points get distances computed.
+            tag: Source tag whose points get distances computed.
             boundary_tags: Tags used as boundary reference. Defaults to
-                           ["boundary"] if present, else all non-interior tags.
-            name:          Context key for the result. Auto-generated if None.
+                ["boundary"] if present, else all non-interior tags.
+            name: Context key for the result. Auto-generated if None.
         """
         import numpy as _np
 
@@ -5762,7 +5736,8 @@ class domain(MeshIOMixin):
     def __getitem__(self, tag: str) -> Tuple[Variable, ...]:
         """Shorthand for domain.variable(tag).
 
-        Example:
+        Example::
+
             x, y = domain['interior']
         """
         return self.variable(tag)
@@ -5879,7 +5854,7 @@ class domain(MeshIOMixin):
 
         Returns:
             order: (N,) index array such that ``pts[order]`` forms a
-                   proper polygon.
+                proper polygon.
         """
         n = len(pts)
         if n <= 2:
@@ -5962,7 +5937,7 @@ class domain(MeshIOMixin):
 
         Args:
             tags: List of tag names that form the enclosure, e.g.
-                  ``["interior_boundary", "interior_boundary_outer"]``.
+                ``["interior_boundary", "interior_boundary_outer"]``.
             opaque_tags: Optional list of tag names whose boundary edges block
                   rays but whose points do **not** participate in the view-factor
                   matrix.  Use this for solid obstacles inside the enclosure,
@@ -6410,11 +6385,12 @@ class domain(MeshIOMixin):
         Sample points from the domain.
 
         Args:
-            sample_spec: Dictionary mapping tag names to (n_samples, optional_sampler)
-                        Example: {"interior": (2000, None), "boundary": (500, None)}
-
-                        For time-dependent problems, use "initial" to sample points at t=0:
-                        Example: {"interior": (2000, None), "initial": (500, None)}
+            sample_spec: Mapping of tag names to ``(n_samples, optional_sampler)``, e.g.
+                ``{"interior": (2000, None), "boundary": (500, None)}``. For time-dependent problems use
+                ``"initial"`` to sample points at ``t = t0``: ``{"interior": (2000, None), "initial": (500, None)}``.
+            normals: Also compute the boundary normals of the sampled points.
+            return_indices: Also return the indices of the sampled mesh points.
+            time_value: The time at which a fixed-time slice (``"initial"``) is taken; default the start time.
 
         If domain was batched (e.g., 10 * domain), samples n_samples for each
         batch independently and concatenates results.

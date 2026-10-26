@@ -28,15 +28,42 @@ import numpy as np
 from ..utils.adaptive.callbacks import Callback as _Callback
 
 
+# docstring-from: jno.optimizers.mma.mma
 class MMAOptimizer:
-    """Sentinel stored on a model by ``p.optimizer(jno.optimizers.mma(...))``.
+    """Return an MMA sentinel to pass to ``.optimizer()`` on a design variable.
 
-    Not an optax ``GradientTransformation``. ``jno.core.solve()`` detects it, injects
-    ``optax.sgd(1.0)`` as the transform that applies the step, and prepends a single
-    :class:`MMACallback` covering **every** model marked this way -- MMA solves one joint
-    subproblem, because the design variables are coupled through the shared constraints.
+    Args:
+        move: Move limit as a fraction of the box width -- the most a variable may change in one
+            iteration. The single most important knob: too large oscillates, too small crawls.
+            ``0.1``-``0.2`` is usual for densities, much smaller for geometry.
+        lower, upper: Box bounds — a scalar, or an array of one bound per variable. A density is
+            ``lower=1e-3`` (not 0, which makes the stiffness singular) and ``upper=1.0``. A nodal
+            coordinate is bounded per node, since the limit is on its movement about its OWN
+            initial position: ``lower=x0 - 2``, ``upper=x0 + 2``.
+        asy_init: Initial asymptote distance, as a fraction of the box width.
+        asy_shrink, asy_grow: Asymptote adaptation. A variable that just reversed direction has its
+            asymptotes pulled in by ``asy_shrink`` (damping the oscillation); one moving steadily
+            has them pushed out by ``asy_grow`` (accelerating). This history-dependence is what
+            distinguishes MMA from a fixed convex approximation.
+        move_gamma: Per-iteration decay of the move limit, ``move_k = move * move_gamma**k``,
+            floored at ``move_min``. MMA does not converge to a point: near the optimum the
+            iterates keep chattering at the scale of the move limit, which is fine for the design
+            but means a relative-change convergence test never fires. Shrinking the limit late in
+            the run damps that chatter. ``1.0`` (the default) is no decay, i.e. the classic method.
+        move_min: Floor on the decayed move limit, so the design never freezes outright.
+        raa: Small positive term keeping the approximation strictly convex when a gradient vanishes.
+        dual_iters: Projected-gradient iterations on the dual. The dual is concave in ``lambda``
+            and low-dimensional (one per constraint), so this is cheap; a single constraint is
+            solved by bisection instead and ignores this.
 
-    See :func:`mma` for the public constructor.
+    Example -- compliance minimisation under a volume constraint::
+
+        rho.optimizer(jno.optimizers.mma(move=0.2, lower=1e-3, upper=1.0))
+        jno.core([compliance, jno.le(vol_frac, 0.4)], domain=d).solve(200)
+
+    References:
+        Svanberg, *The method of moving asymptotes -- a new method for structural optimization*,
+        International Journal for Numerical Methods in Engineering **24**(2), 1987, 359-373.
     """
 
     def __init__(
@@ -130,7 +157,12 @@ def mma(
 
 
 class GCMMAOptimizer(MMAOptimizer):
-    """Sentinel for :func:`gcmma`: MMA's, plus the inner-iteration budget. See :func:`gcmma`."""
+    """Sentinel for :func:`gcmma`: an :class:`MMAOptimizer` plus the inner-iteration budget.
+
+    Args:
+        max_inner: most re-solves of one outer step before it is accepted as is.
+        **kw: the :func:`mma` options (``move``, ``lower``, ``upper``, the asymptote settings, ...).
+    """
 
     def __init__(self, *, max_inner: int = 10, **kw):
         super().__init__(**kw)
@@ -433,6 +465,11 @@ class MMACallback(_Callback):
 
     State that MMA needs and optax has no place for -- the asymptotes and the two previous iterates
     -- lives on this object, host-side, exactly as ``ENGDCallback`` keeps its Gram cache.
+
+    Args:
+        blocks: ``(layer_id, MMAOptimizer)`` pairs, in the order their variables are concatenated into
+            the design vector.
+        inequality_idx: rows of ``individual_losses`` that are ``jno.le`` / ``jno.ge`` constraints.
     """
 
     def __init__(self, blocks: List[Any], inequality_idx: List[int]):
@@ -474,7 +511,13 @@ class MMACallback(_Callback):
 
     # -- hooks -------------------------------------------------------------
     def on_solve_begin(self, **kw):
-        """Capture what is needed to evaluate the constraint Jacobian on demand."""
+        """Capture what is needed to evaluate the constraint Jacobian on demand.
+
+        Keyword Args:
+            The solve context of :meth:`Callback.on_solve_begin`; this hook reads
+            ``compiled_constraints_fn``, ``n_constraints``, ``batchsize``, ``frozen``, ``static``,
+            ``min_consecutive`` and (optionally) ``constraint_names``.
+        """
         import equinox as eqx
         import jax
         import jax.numpy as jnp
@@ -595,7 +638,34 @@ class MMACallback(_Callback):
                 f"{', and immovable' if dead else ''})"
             )
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_before_update
     def on_before_update(self, *, grads, trainable, context, rng, epoch, **kw):
+        """Called between gradient computation and the optimizer update.
+
+        Subclasses may return a modified ``grads`` dict to redirect the
+        optimizer (e.g. to apply a preconditioner), or ``None`` to leave the
+        gradients unchanged.  The returned dict must have the same pytree
+        structure as ``grads``.
+
+        Called only when the solver detects that at least one active callback
+        overrides this method (it is a no-op in the base class).  Requires
+        ``inner_steps=1`` and no Bayesian models.
+
+        Keyword Args:
+            grads: Parameter gradient pytree ``{lid: model_params}``.
+            trainable: Current trainable parameter pytree.
+            context: Domain context (current batch).
+            rng: Current JAX PRNG key (Python-side; not consumed here).
+            epoch (int): Current outer epoch (Python integer, 0-indexed).
+            total_loss: The scalar loss at this step, as descended.
+            individual_losses: Per-entry values, one per ``jno.core`` constraint entry --
+                **including** any ``jno.le``/``jno.ge`` inequality constraints, which are
+                evaluated with everything else but held out of ``total_loss``. A constrained
+                optimiser reads its ``g_j`` here rather than recomputing them.
+
+        Returns:
+            Modified ``grads`` dict, or ``None`` to leave unchanged.
+        """
         import jax
         from jax.flatten_util import ravel_pytree
 
@@ -733,7 +803,13 @@ class MMACallback(_Callback):
             off += size
         return out
 
-    def on_training_end(self, **kw):
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_training_end
+    def on_training_end(self):
+        """Called once after the training loop ends (also after an early stop).
+
+        Returns:
+            None.
+        """
         if self._not_conservative:
             from jno.utils.logger import get_logger
 

@@ -51,7 +51,13 @@ class Arch:
 
 @dataclass
 class UniqueGroup:
-    """A one-hot choice group (categorical)."""
+    """A one-hot choice group (categorical).
+
+    Attributes:
+        name: the axis name.
+        options: the candidate values.
+        category: ``"architecture"``, ``"training"`` or ``"optimizer"``.
+    """
 
     name: str
     options: Tuple
@@ -60,7 +66,15 @@ class UniqueGroup:
 
 @dataclass
 class FloatGroup:
-    """A continuous float parameter."""
+    """A continuous float parameter.
+
+    Attributes:
+        name: the axis name.
+        low: lower end of the range.
+        high: upper end.
+        log_scale: sample on a log scale.
+        category: ``"architecture"``, ``"training"`` or ``"optimizer"``.
+    """
 
     name: str
     low: float
@@ -71,7 +85,14 @@ class FloatGroup:
 
 @dataclass
 class IntGroup:
-    """A discrete integer parameter."""
+    """A discrete integer parameter.
+
+    Attributes:
+        name: the axis name.
+        low: lower end of the range.
+        high: upper end.
+        category: ``"architecture"``, ``"training"`` or ``"optimizer"``.
+    """
 
     name: str
     low: int
@@ -125,6 +146,14 @@ class ArchSpace:
         ``keep="last"`` keeps only the final solution (homotopy). Consumed by ``crux.tune`` on a
         constraint set containing a parametric ``fem.solve()`` node; the march runs through the same
         engine as the solver tests (:func:`jno.utils.solver.solver_api.run_continuation`).
+
+        Args:
+            name: the axis name (a parameter name in the constraint set).
+            values: the values to march through, in order.
+            keep: ``"all"`` collects every solution, ``"last"`` only the final one.
+
+        Returns:
+            ArchSpace: ``self``, for chaining.
         """
         import numpy as _np
 
@@ -262,9 +291,15 @@ class ArchSpace:
 
     @property
     def groups(self) -> List:
+        """The search axes declared so far, in order."""
         return self._groups
 
     def is_empty(self) -> bool:
+        """Whether no axis has been declared.
+
+        Returns:
+            bool: ``True`` for an empty space.
+        """
         return len(self._groups) == 0
 
     def get_architecture_groups(self) -> List:
@@ -287,8 +322,11 @@ class ArchSpace:
         """Build Nevergrad parametrization.
 
         Args:
-            categories: Optional list of categories to include.
-                       If None, includes all categories.
+            categories: Optional list of categories to include (``"architecture"``, ``"training"``,
+                ``"optimizer"``). If None, includes all categories.
+
+        Returns:
+            The Nevergrad parametrization of the space.
         """
         import nevergrad as ng
 
@@ -330,11 +368,15 @@ class ArchSpace:
         return Arch(choices=tuple(choices))
 
     def sample(self, **overrides) -> Arch:
-        """Create an Arch with default (first) options, or override.
+        """An :class:`Arch` with each axis at its default, or at a given value.
 
-        For UniqueGroup: uses first option as default
-        For FloatGroup: uses midpoint as default
-        For IntGroup: uses midpoint as default
+        Defaults: the first option of a ``unique`` axis, the midpoint of a float or int range.
+
+        Args:
+            **overrides: axis name to the value to use instead of its default.
+
+        Returns:
+            Arch: the configuration.
         """
         choices = []
         for g in self._groups:
@@ -382,7 +424,12 @@ class ArchSpace:
 
 @dataclass
 class DeviceConfig:
-    """Configuration for parallel device usage."""
+    """Configuration for parallel device usage.
+
+    Attributes:
+        devices: the devices to spread trials over.
+        num_workers: number of trials run in parallel.
+    """
 
     devices: List
     num_workers: int
@@ -459,7 +506,11 @@ class DeviceConfig:
 
 
 class Tuner:
-    """Mixin class providing the sweep method with parallel execution support."""
+    """Mixin providing ``crux.tune`` / ``sweep``, with parallel execution support.
+
+    Args:
+        core_inst: the ``jno.core`` instance being tuned.
+    """
 
     def __init__(self, core_inst):
         self.core = core_inst
@@ -547,7 +598,7 @@ class Tuner:
         Args:
             space: ArchSpace defining the search space (architecture + training params)
             optimizer: Nevergrad optimizer name (e.g., "NGOpt", "OnePlusOne", "CMA"),
-                      class, or None for exhaustive grid search
+                class, or None for exhaustive grid search
             budget: Number of configurations to try (ignored for grid search)
             devices: Device specification for parallel execution:
                 - None: auto-detect and use all available devices
@@ -1213,10 +1264,10 @@ class Tuner:
 
 
 class tune:
-    """
-    Tuning utilities accessible as pnp.tune.
+    """Tuning utilities accessible as pnp.tune.
 
-    Example:
+    Example::
+
         space = pnp.tune.space()
         space.onehot("act", ["tanh", "sin"])
         best = pnp.tune.solve(space, loss_fn, budget=10)
@@ -1239,8 +1290,8 @@ class tune:
         Run architecture search.
 
         Args:
-            space:  ArchSpace defining the search space.
-            loss_fn:  Function Arch -> float (your training pipeline).
+            space: ArchSpace defining the search space.
+            loss_fn: Function Arch -> float (your training pipeline).
             budget: Number of architectures to evaluate.
             optimizer: Nevergrad optimizer name.
             verbose: Print progress.

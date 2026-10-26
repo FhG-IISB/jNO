@@ -125,6 +125,19 @@ class PDEformer2Wrapper(eqx.Module):
     The graph tensors are stored as numpy arrays and converted to JAX arrays
     via ``jax.lax.stop_gradient`` inside ``__call__`` so they are never updated
     by the optimizer.
+
+    Args:
+        pde_model: the PDEformer-2 network.
+        node_type: per-node type ids of the PDE DAG.
+        node_scalar: per-node scalar values (coefficients).
+        node_function: per-node function values (sampled initial/boundary functions).
+        in_degree: per-node in-degree.
+        out_degree: per-node out-degree.
+        attn_bias: the graph attention bias.
+        spatial_pos: shortest-path distances between nodes (Graphormer spatial encoding).
+        t_arg_idx: position of ``t`` among the call's arguments.
+        x_arg_idx: position of ``x``.
+        y_arg_idx: position of ``y``.
     """
 
     pde_model: Any  # jax_pdeformer2.PDEformer — fully trainable
@@ -203,7 +216,12 @@ class PDEformer2Wrapper(eqx.Module):
 
 
 class PDEGraphBuilder:
-    """Builds a PDEformer-2 DAG node-by-node and produces static tensors."""
+    """Builds a PDEformer-2 DAG node-by-node and produces static tensors.
+
+    Args:
+        n_inr_nodes: number of INR (function-encoder) nodes the model expects.
+        function_num_branches: number of branches each function node is split into.
+    """
 
     def __init__(self, n_inr_nodes: int, function_num_branches: int):
         self.n_inr_nodes = int(n_inr_nodes)
@@ -244,6 +262,18 @@ class PDEGraphBuilder:
         return uf_id
 
     def add_op(self, type_name: str, *parent_ids: int) -> int:
+        """Add an operator node with edges from its operands.
+
+        Args:
+            type_name: the operator type, one of ``OPERATOR_NODE_TYPES`` (``"add"``, ``"mul"``, ``"dx"``, ...).
+            *parent_ids: node ids of the operands.
+
+        Returns:
+            int: the new node's id.
+
+        Raises:
+            ValueError: for an unknown operator type.
+        """
         if type_name not in OPERATOR_NODE_TYPES:
             raise ValueError(f"Unknown operator type '{type_name}'")
         nid = self._add_scalar(type_name)
@@ -252,6 +282,14 @@ class PDEGraphBuilder:
         return nid
 
     def add_coef(self, value: float) -> int:
+        """Add a scalar coefficient node.
+
+        Args:
+            value: the coefficient.
+
+        Returns:
+            int: the new node's id.
+        """
         return self._add_scalar("coef", value)
 
     def add_ic(self, values: np.ndarray, x_pts, y_pts, t_pts) -> int:
@@ -282,6 +320,14 @@ class PDEGraphBuilder:
         return ic_id
 
     def add_eq0(self, lhs_id: int) -> int:
+        """Add the ``= 0`` node closing an equation.
+
+        Args:
+            lhs_id: node id of the equation's left-hand side.
+
+        Returns:
+            int: the new node's id.
+        """
         return self.add_op("eq0", lhs_id)
 
     # -- tensor assembly --------------------------------------------------
@@ -382,7 +428,13 @@ class PDEGraphBuilder:
 
 
 class PDETraceWalker:
-    """Maps jNO trace nodes to PDEformer-2 DAG nodes."""
+    """Maps jNO trace nodes to PDEformer-2 DAG nodes.
+
+    Args:
+        target_model: the PDEformer model; its calls map to the unknown-function node.
+        builder: the graph builder that receives the nodes.
+        uf_id: node id of the unknown function ``u``.
+    """
 
     def __init__(self, target_model: Model, builder: PDEGraphBuilder, uf_id: int):
         self.target_model = target_model
@@ -390,6 +442,17 @@ class PDETraceWalker:
         self.uf_id = uf_id
 
     def walk(self, expr) -> int:
+        """Translate one trace expression into DAG nodes, recursively.
+
+        Args:
+            expr: the jNO expression (a residual or one of its sub-terms).
+
+        Returns:
+            int: the node id representing ``expr``.
+
+        Raises:
+            UnsupportedPDEOperatorError: for an operation PDEformer-2 has no node type for.
+        """
         # ModelCall referencing the PDEformer model → uf
         if isinstance(expr, ModelCall):
             if expr.model is self.target_model:

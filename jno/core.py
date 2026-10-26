@@ -610,7 +610,23 @@ class _RebuildWatch(_CallbackBase):
                 out.append(d)
         return out
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, *, epoch, trainable, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         self.fired = self.holding(trainable)
         if self.fired:
             # copies: the training loop donates these buffers to its next step
@@ -1079,7 +1095,14 @@ class core:
         return data
 
     def wrap_constraints(self, constraints: List) -> List:
-        """Auto-wrap raw expressions in OperationDef."""
+        """Auto-wrap raw expressions in :class:`OperationDef`, so every constraint is a compiled operation.
+
+        Args:
+            constraints: the constraint list (expressions, operations, inequality constraints).
+
+        Returns:
+            list: the wrapped constraints, in order.
+        """
         wrapped: List[Any] = []
         for expr in constraints:
             if isinstance(expr, (OperationDef, OperationCall)):
@@ -1143,8 +1166,8 @@ class core:
 
         Args:
             opt_fn: Optimizer factory with the rate baked in, e.g. ``optax.adam(1e-3)``.
-            scale:  Optional ``LearningRateSchedule`` / ``dlrs(...)`` / float that
-                    multiplies the optimizer's learning rate (see :meth:`Model.scale`).
+            scale: Optional ``LearningRateSchedule`` / ``dlrs(...)`` / float that
+                multiplies the optimizer's learning rate (see :meth:`Model.scale`).
         """
         for fm in self._collect_flax_modules().values():
             fm.optimizer(opt_fn)
@@ -1153,7 +1176,14 @@ class core:
         return self
 
     def get_constraint_tags(self, constraints: List) -> List[str]:
-        """Get the primary tag for each constraint."""
+        """The primary domain tag (point set) each constraint is evaluated on.
+
+        Args:
+            constraints: the wrapped constraints.
+
+        Returns:
+            list[str]: one tag per constraint.
+        """
         tags = []
         for expr in constraints:
             tag = get_primary_tag(expr)
@@ -1211,7 +1241,14 @@ class core:
         return node
 
     def compute_tensor_dims(self, domain) -> Dict[str, Tuple]:
-        """Compute input dimensions for each context entry."""
+        """Input dimensions for each context entry, used to initialise the models.
+
+        Args:
+            domain: the domain whose context arrays are measured.
+
+        Returns:
+            dict: tag to its dimension tuple.
+        """
         tensor_dims = {}
         if hasattr(domain, "context"):
             for name, tensor in domain.context.items():
@@ -1575,8 +1612,14 @@ class core:
         * makes progress logging trivial (no ``io_callback``).
 
         Args:
+            batchsize: mini-batch size (``None`` for full batch).
+            frozen: the frozen half of the partitioned parameters (``eqx.partition``).
+            static: the static (non-array) half.
+            group_lr_schedules: per-parameter-group schedules ``{layer_id_str: [(mask, schedule), ...]}`` set
+                with ``model.mask(...).scale(...)``.
+            min_consecutive: minimum number of consecutive time steps per constraint evaluation.
             per_model_opts: ``{layer_id_str: optax_chain}`` per-model optimizers.
-            lr_schedules:   ``{layer_id_str: LearningRateSchedule}``.
+            lr_schedules: ``{layer_id_str: LearningRateSchedule}``.
             checkpoint_gradients: Wrap constraint evaluations in ``jax.checkpoint``.
             compiled_constraints_fn: Override the default combined constraint function.
                 Used by ``substeps`` to supply per-substep compiled functions.
@@ -1832,6 +1875,18 @@ class core:
 
         where ``samples`` is a dict keyed by ``bayesian_handles`` keys, each
         entry stacked along a leading axis of length ``keep``.
+
+        Args:
+            bayesian_handles: ``{key: _KernelHandle}`` of the Bayesian models.
+            batchsize: mini-batch size (``None`` for full batch).
+            frozen: the frozen half of the partitioned parameters (``eqx.partition``).
+            static: the static (non-array) half.
+            compiled_constraints_fn: override of the combined constraint function.
+            checkpoint_gradients: wrap constraint evaluations in ``jax.checkpoint``.
+            min_consecutive: minimum number of consecutive time steps per constraint evaluation.
+            warmup: number of warm-up (discarded) steps.
+            keep: number of samples kept.
+            thin: steps between kept samples.
         """
         if compiled_constraints_fn is None:
             compiled_constraints_fn = self.compiled_constraints_fn
@@ -2033,6 +2088,16 @@ class core:
 
         Used by gradient accumulation to compute gradients on multiple
         micro-batches before averaging and applying a single update.
+
+        Args:
+            batchsize: mini-batch size (``None`` for full batch).
+            frozen: the frozen half of the partitioned parameters (``eqx.partition``).
+            static: the static (non-array) half.
+            checkpoint_gradients: wrap constraint evaluations in ``jax.checkpoint``.
+            min_consecutive: minimum number of consecutive time steps per constraint evaluation.
+            jacobian: ``(rows, lids)`` to also return constraint-row Jacobians for a constrained optimiser
+                (MMA): the rows of ``individual_losses`` and the parameter blocks, raveled in that order.
+                ``None`` returns only the objective gradient.
         """
         loss_fn = self._make_loss_fn(
             self.compiled_constraints_fn,
@@ -2109,6 +2174,11 @@ class core:
                 -> (trainable, opt_states)
 
         Used together with :meth:`make_grad_fn` for gradient accumulation.
+
+        Args:
+            per_model_opts: ``{layer_id_str: optax_chain}`` per-model optimizers.
+            lr_schedules: ``{layer_id_str: LearningRateSchedule}``.
+            group_lr_schedules: per-parameter-group schedules, as for :meth:`make_step_fn`.
         """
         lid_keys = sorted(per_model_opts.keys())
         base_epoch = self._total_epochs
@@ -2155,6 +2225,15 @@ class core:
         return apply_fn
 
     def compile(self, mesh: Optional[Tuple[int, ...]] = (1, 1)):
+        """Compile the constraint list: wrap, deduplicate and fuse expressions, prepare the domain data,
+        and initialise and shard the models.
+
+        Called by :meth:`solve` and :meth:`eval`; call it directly only to compile ahead of time.
+
+        Args:
+            mesh: device-mesh shape ``(batch, model)`` for data and model parallelism; ``(1, 1)`` runs
+                on one device.
+        """
         # === Parallelism ===
         self._setup_parallelism(mesh)
 
@@ -5483,7 +5562,7 @@ class core:
         Args:
             space: ArchSpace defining the search space (architecture + training params)
             optimizer: Nevergrad optimizer name (e.g., "NGOpt", "OnePlusOne", "CMA"),
-                      class, or None for exhaustive grid search
+                class, or None for exhaustive grid search
             budget: Number of configurations to try (ignored for grid search)
             devices: Device specification for parallel execution:
                 - None: auto-detect and use all available devices
@@ -5669,7 +5748,7 @@ class core:
 
         Args:
             operation: Expression(s) to evaluate.
-            domain:    Override the stored domain.
+            domain: Override the stored domain.
             min_consecutive: Consecutive-time-step window for time-dependent
                 expressions.
             key: Optional PRNG key for stochastic ops.

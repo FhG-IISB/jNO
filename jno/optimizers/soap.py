@@ -30,13 +30,31 @@ class Preconditioner:
         self.matrices = tuple(matrices)
 
     def tree_flatten(self) -> tuple[tuple[PreconditionerMatrix, ...], None]:
+        """Pytree flattening: the preconditioner matrices as children, no auxiliary data."""
         return (self.matrices, None)
 
     @classmethod
     def tree_unflatten(cls, aux_data: None, children: tuple[PreconditionerMatrix, ...]) -> "Preconditioner":
+        """Pytree unflattening.
+
+        Args:
+            aux_data: unused.
+            children: the preconditioner matrices.
+
+        Returns:
+            Preconditioner: the rebuilt object.
+        """
         return cls(children)
 
     def map(self, fn: Callable[[PreconditionerMatrix], PreconditionerMatrix]) -> "Preconditioner":
+        """Apply ``fn`` to every preconditioner matrix.
+
+        Args:
+            fn: ``matrix -> matrix``.
+
+        Returns:
+            Preconditioner: the mapped preconditioner.
+        """
         return Preconditioner(fn(m) for m in self.matrices)
 
 
