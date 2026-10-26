@@ -3487,7 +3487,21 @@ def fdm(constraints):
 
     For the accurate whole-Laplacian stencil write ONE term,
     ``u.laplacian(x, y, scheme="finite_difference:cotangent")``; per-axis ``d2`` refuses that
-    sub-scheme, because summing one per axis would multiply the Laplacian by the dimension."""
+    sub-scheme, because summing one per axis would multiply the Laplacian by the dimension.
+
+    Example::
+
+        u = d.unknown()
+        ui = u.bind(x=xi, y=yi)
+        sol = jno.fdm([-(ui.xx + ui.yy) - 1.0, u(xb, yb) - 0.0]).solve()
+
+    Args:
+        constraints: the residual expressions: strong-form interior terms (the PDE), boundary terms
+            (Dirichlet values or flux conditions), initial conditions, periodic ties.
+
+    Returns:
+        The FDM problem; call ``.solve()``.
+    """
     if not isinstance(constraints, (list, tuple)):
         raise TypeError(
             "jno.fdm expects a constraint LIST, e.g. jno.fdm([-u.laplacian(x, y) - f, u(xb, yb) - 0.0]) "

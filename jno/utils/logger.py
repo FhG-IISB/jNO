@@ -4,9 +4,12 @@ from typing import Optional, Tuple, Union
 
 
 class Logger:
-    """
-    A flexible logger that can log to file and/or console.
-    Now supports multiple independent instances instead of singleton.
+    """A logger that writes to a file and/or the console; several independent instances may coexist.
+
+    Args:
+        path: directory for the log file.
+        log_print: ``(to_file, to_console)`` switches.
+        name: the underlying ``logging`` logger's name.
     """
 
     def __init__(
@@ -134,22 +137,52 @@ class Logger:
         return None
 
     def info(self, message: str) -> None:
+        """Log ``message`` at INFO level (to the console and/or file, per ``log_print``).
+
+        Args:
+            message: the text to log.
+        """
         self._output(message, logging.INFO)
 
     def warning(self, message: str) -> None:
+        """Log ``message`` at WARNING level (to the console and/or file, per ``log_print``).
+
+        Args:
+            message: the text to log.
+        """
         self._output(message, logging.WARNING)
 
     def error(self, message: str) -> None:
+        """Log ``message`` at ERROR level (to the console and/or file, per ``log_print``).
+
+        Args:
+            message: the text to log.
+        """
         self._output(message, logging.ERROR)
 
     def debug(self, message: str) -> None:
+        """Log ``message`` at DEBUG level (to the console and/or file, per ``log_print``).
+
+        Args:
+            message: the text to log.
+        """
         self._output(message, logging.DEBUG)
 
     def critical(self, message: str) -> None:
+        """Log ``message`` at CRITICAL level (to the console and/or file, per ``log_print``).
+
+        Args:
+            message: the text to log.
+        """
         self._output(message, logging.CRITICAL)
 
     def quiet(self, message: str, level: int = logging.INFO) -> None:
-        """Log to file only, no console output."""
+        """Log to the file only, with no console output.
+
+        Args:
+            message: the text to log.
+            level: a ``logging`` level (``logging.INFO``, ``logging.WARNING``, ...).
+        """
         self._output_file_only(message, level)
 
     def close(self):
@@ -173,22 +206,52 @@ class PrintFallback:
         return None
 
     def info(self, message: str) -> None:
+        """Log ``message`` at INFO level (printed).
+
+        Args:
+            message: the text to log.
+        """
         print(f"INFO: {message}")
 
     def warning(self, message: str) -> None:
+        """Log ``message`` at WARNING level (printed).
+
+        Args:
+            message: the text to log.
+        """
         print(f"WARNING: {message}")
 
     def error(self, message: str) -> None:
+        """Log ``message`` at ERROR level (printed).
+
+        Args:
+            message: the text to log.
+        """
         print(f"ERROR: {message}")
 
     def debug(self, message: str) -> None:
+        """Log ``message`` at DEBUG level (printed).
+
+        Args:
+            message: the text to log.
+        """
         print(f"DEBUG:  {message}")
 
     def critical(self, message: str) -> None:
+        """Log ``message`` at CRITICAL level (printed).
+
+        Args:
+            message: the text to log.
+        """
         print(f"CRITICAL: {message}")
 
     def quiet(self, message: str, level: int = logging.INFO) -> None:
-        """In fallback mode, quiet does nothing."""
+        """Do nothing: the print fallback has no file to log quietly to.
+
+        Args:
+            message: the text to log. (ignored).
+            level: a ``logging`` level (ignored).
+        """
         pass
 
     def close(self):

@@ -23,7 +23,13 @@ def _default_float_dtype():
 
 
 class BatchNorm(eqx.Module):
-    """Simple stateless batch normalization (always uses per-batch statistics)."""
+    """Simple stateless batch normalization (always uses per-batch statistics).
+
+    Args:
+        num_features: size of the normalised (last) axis.
+        eps: added to the variance for stability.
+        **kwargs: accepted and ignored, for signature compatibility with other BatchNorm layers.
+    """
 
     weight: jnp.ndarray
     bias: jnp.ndarray
@@ -147,7 +153,17 @@ def compute_Fourier_modes(ndims: int, nks: Sequence[int], Ls: Sequence[float]) -
 
 
 class Conv2d(eqx.Module):
-    """2-D convolution operating on NHWC data."""
+    """2-D convolution operating on NHWC data.
+
+    Args:
+        in_channels: number of input channels.
+        out_channels: number of output channels.
+        kernel_size: kernel size, an int (square) or ``(kh, kw)``.
+        strides: stride ``(sh, sw)``.
+        padding: ``"SAME"`` or ``"VALID"`` (as for ``jax.lax.conv_general_dilated``).
+        use_bias: add a learned bias.
+        key: PRNG key for the weight initialisation.
+    """
 
     weight: jnp.ndarray  # (kH, kW, in_ch, out_ch)
     bias: Optional[jnp.ndarray]
@@ -195,7 +211,17 @@ class Conv2d(eqx.Module):
 
 
 class ConvTranspose2d(eqx.Module):
-    """Transpose 2-D convolution in NHWC layout."""
+    """Transpose 2-D convolution in NHWC layout.
+
+    Args:
+        in_channels: number of input channels.
+        out_channels: number of output channels.
+        kernel_size: kernel size, an int (square) or ``(kh, kw)``.
+        strides: stride ``(sh, sw)``.
+        padding: ``"SAME"`` or ``"VALID"`` (as for ``jax.lax.conv_general_dilated``).
+        use_bias: add a learned bias.
+        key: PRNG key for the weight initialisation.
+    """
 
     weight: jnp.ndarray  # (kH, kW, out_ch, in_ch)
     bias: Optional[jnp.ndarray]

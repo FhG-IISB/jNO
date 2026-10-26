@@ -31,17 +31,17 @@ LRFunction = Callable[[Union[int, jnp.ndarray], jnp.ndarray], jnp.ndarray]
 
 
 class LearningRateSchedule:
-    """
-    Stateless learning rate schedule.
+    """Stateless learning-rate schedule.
 
-    Wraps either:
-      - a constant scalar, or
-      - a function (t, losses) -> scalar
+    Wraps either a constant or a function ``(t, losses) -> rate`` and clamps the result to
+    ``[min_lr, max_lr]``. It is JAX- and jit-compatible as long as the function uses only JAX
+    operations. Build one with the class methods (``constant``, ``cosine``, ``warmup_cosine``,
+    ``exponential``, ``piecewise_constant``) or pass your own function.
 
-    and clamps the result to [min_lr, max_lr].
-
-    This is JAX- and jit-compatible as long as the underlying function
-    uses only JAX operations.
+    Args:
+        fn: a constant rate, or a function of the step ``t`` and the per-constraint losses.
+        min_lr: lower clamp on the returned rate.
+        max_lr: upper clamp on the returned rate.
     """
 
     def __init__(
@@ -75,7 +75,16 @@ class LearningRateSchedule:
 
     @classmethod
     def constant(cls, lr: float, *, min_lr: float = 1e-10, max_lr: float = 1.0):
-        """Constant learning rate."""
+        """A constant learning rate.
+
+        Args:
+            lr: the rate.
+            min_lr: lower clamp on the returned rate.
+            max_lr: upper clamp on the returned rate.
+
+        Returns:
+            LearningRateSchedule: the schedule; pass it to ``model.optimizer(...).scale(...)`` or ``crux.solve(..., lr=...)``.
+        """
         return cls(float(lr), min_lr=min_lr, max_lr=max_lr)
 
     @classmethod
@@ -88,7 +97,18 @@ class LearningRateSchedule:
         min_lr: float = 1e-10,
         max_lr: float = 1.0,
     ):
-        """Cosine decay from lr0 -> lr_end over total_steps."""
+        """Cosine decay from ``lr0`` to ``lr_end`` over ``total_steps``.
+
+        Args:
+            total_steps: length of the decay, in steps.
+            lr0: the starting rate.
+            lr_end: the final rate.
+            min_lr: lower clamp on the returned rate.
+            max_lr: upper clamp on the returned rate.
+
+        Returns:
+            LearningRateSchedule: the schedule; pass it to ``model.optimizer(...).scale(...)`` or ``crux.solve(..., lr=...)``.
+        """
         T = float(total_steps)
         lr0 = float(lr0)
         lr_end = float(lr_end)
@@ -112,7 +132,19 @@ class LearningRateSchedule:
         min_lr: float = 1e-10,
         max_lr: float = 1.0,
     ):
-        """Linear warmup to lr0, then cosine decay to lr_end."""
+        """Linear warm-up to ``lr0``, then cosine decay to ``lr_end``.
+
+        Args:
+            total_steps: total length of the schedule, in steps.
+            warmup_steps: length of the linear warm-up.
+            lr0: the peak rate, reached at the end of the warm-up.
+            lr_end: the final rate.
+            min_lr: lower clamp on the returned rate.
+            max_lr: upper clamp on the returned rate.
+
+        Returns:
+            LearningRateSchedule: the schedule; pass it to ``model.optimizer(...).scale(...)`` or ``crux.solve(..., lr=...)``.
+        """
         T = int(total_steps)
         W = int(warmup_steps)
         lr0 = float(lr0)
@@ -144,10 +176,19 @@ class LearningRateSchedule:
         min_lr: float = 1e-10,
         max_lr: float = 1.0,
     ):
-        """
-        Exponential decay:
-          lr(t) = max(lr_end, lr0 * decay_rate^(t/decay_steps))
-        If staircase=True uses floor(t/decay_steps).
+        """Exponential decay, ``lr(t) = max(lr_end, lr0 * decay_rate ** (t / decay_steps))``.
+
+        Args:
+            lr0: the starting rate.
+            decay_rate: factor applied every ``decay_steps``.
+            decay_steps: steps per factor of ``decay_rate``.
+            lr_end: floor of the decay.
+            staircase: use ``floor(t / decay_steps)`` (step-wise decay) instead of a smooth one.
+            min_lr: lower clamp on the returned rate.
+            max_lr: upper clamp on the returned rate.
+
+        Returns:
+            LearningRateSchedule: the schedule; pass it to ``model.optimizer(...).scale(...)`` or ``crux.solve(..., lr=...)``.
         """
         lr0 = float(lr0)
         decay_rate = float(decay_rate)
@@ -173,11 +214,16 @@ class LearningRateSchedule:
         min_lr: float = 1e-10,
         max_lr: float = 1.0,
     ):
-        """
-        Piecewise constant schedule.
+        """Piecewise-constant schedule.
 
-        boundaries: increasing step indices, e.g. [1000, 5000]
-        values: len(boundaries)+1 values, e.g. [5e-4, 2e-4, 5e-5]
+        Args:
+            boundaries: increasing step indices where the rate changes, e.g. ``[1000, 5000]``.
+            values: ``len(boundaries) + 1`` rates, e.g. ``[5e-4, 2e-4, 5e-5]``.
+            min_lr: lower clamp on the returned rate.
+            max_lr: upper clamp on the returned rate.
+
+        Returns:
+            LearningRateSchedule: the schedule; pass it to ``model.optimizer(...).scale(...)`` or ``crux.solve(..., lr=...)``.
         """
         b = jnp.asarray(list(boundaries), dtype=jnp.int32)
         v = jnp.asarray(list(values), dtype=jnp.float32)
@@ -198,10 +244,9 @@ class LearningRateSchedule:
 
 
 class DLRS:
-    """
-    Loss-based Dynamic Learning Rate Scheduler (DLRS).
+    """Loss-based Dynamic Learning Rate Scheduler (DLRS).
 
-    Implements the paper\'s idea: adjust the learning rate based on a normalized
+    Implements the paper's idea: adjust the learning rate based on a normalized
     loss-slope computed from a sequence of loss values, and scale the adjustment
     by the order-of-magnitude of the current learning rate.
 
@@ -211,7 +256,7 @@ class DLRS:
       - The scheduler is called once per training iteration (epoch/step).
       - We treat the scalar "batch loss" as the total loss at that step,
         and keep a rolling window of recent total losses to emulate the
-        paper\'s within-epoch batch-loss array.
+        paper's within-epoch batch-loss array.
 
     Update rule (host-side, stateful):
       mean  = average(loss_window)
@@ -225,6 +270,16 @@ class DLRS:
 
     Import:
         from jno.utils.adaptive.lrscheduler import DLRS
+
+    Args:
+        lr0: the starting rate.
+        window: number of recent losses the slope is computed over.
+        decremental_factor: step taken (in units of ``10^k``) when the loss rises steeply.
+        stagnation_factor: step taken when the loss stagnates.
+        increment_factor: step taken (upward) when the loss falls.
+        min_lr: lower clamp.
+        max_lr: upper clamp.
+        eps: guards the slope's division by the window mean.
     """
 
     def __init__(

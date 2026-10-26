@@ -48,6 +48,10 @@ class Unit:
 
     Instances are immutable value objects: equality and hashing are by the
     (zero-stripped) exponent map, so ``Unit.parse("m/s") == Unit.parse("m s^-1")``.
+
+    Args:
+        exponents: ``{base: power}`` over the SI bases (``"m"``, ``"kg"``, ``"s"``, ``"A"``, ``"K"``,
+            ``"mol"``, ``"cd"``); zero powers are dropped. ``None`` is dimensionless.
     """
 
     __slots__ = ("_exp",)
@@ -71,6 +75,15 @@ class Unit:
         fractional (``m^1/2``).  Recognises the 7 SI bases plus the aliases in
         :data:`_ALIASES` (``T``→K, ``Pa``, ``N``, ``J``, ``W``, ``Hz``, …).
         Dimensionless is spelled ``''``, ``'1'``, or ``'-'``.
+
+        Args:
+            spec: the unit string, or a :class:`Unit` (returned unchanged).
+
+        Returns:
+            Unit: the parsed unit.
+
+        Raises:
+            ValueError: for an unknown unit symbol or malformed string.
         """
         if isinstance(spec, Unit):
             return spec
@@ -132,6 +145,11 @@ class Unit:
 
     # -- queries --------------------------------------------------------------
     def is_dimensionless(self) -> bool:
+        """Whether every exponent is zero.
+
+        Returns:
+            bool: ``True`` for a dimensionless unit.
+        """
         return not self._exp
 
     def __eq__(self, other) -> bool:

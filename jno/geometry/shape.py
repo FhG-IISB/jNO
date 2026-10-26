@@ -665,6 +665,10 @@ class Selector:
 
     Returned by :meth:`shape.edge` / :meth:`shape.edges_from`; combined with ``|``.
     Resolved against a built mesh's classified boundary (name + originating leaf key).
+
+    Attributes:
+        names: sub-boundary auto-names selected (e.g. ``"top"``).
+        keys: leaf keys selected (provenance).
     """
 
     names: FrozenSet[str] = frozenset()
@@ -674,6 +678,15 @@ class Selector:
         return Selector(self.names | other.names, self.keys | other.keys)
 
     def matches(self, key: int, local_name: str) -> bool:
+        """Whether a leaf is selected, by its local sub-boundary name or its leaf key.
+
+        Args:
+            key: the leaf's key.
+            local_name: the sub-boundary's name on that leaf (e.g. ``"top"``).
+
+        Returns:
+            bool: ``True`` if the selector names it.
+        """
         return local_name in self.names or key in self.keys
 
 
@@ -706,6 +719,12 @@ class shape:
     re-list every *other* field to carry it — so a field added later is silently dropped by whichever
     derivation forgets it, and the plan quietly meshes as something the caller did not ask for. That
     is not hypothetical: ``.quad().attach(k=1.0)`` used to erase the quadrilateral choice outright.
+
+    Build one with the constructors (``jno.shape.rect``, ``disk``, ``box``, ``polygon``, ``cylinder``,
+    ``sphere``, ``regions``), combine with ``+``, ``-``, ``&`` and the transforms, and call ``.domain()``.
+
+    Attributes:
+        dim: the shape's dimension (1, 2 or 3).
     """
 
     _node: tuple
@@ -728,20 +747,46 @@ class shape:
     # ----- primitive constructors ------------------------------------------------
     @classmethod
     def rect(cls, x0: float, y0: float, x1: float, y1: float, size: Size = None) -> "shape":
-        """Axis-aligned rectangle. Any corner coordinate may be an expression in
-        ``jno.np.parameter``\\ s: the shape is built at their initial values and the expression kept
-        for the solvers to move it (see :mod:`jno.geometry.parametric`)."""
+        r"""Axis-aligned rectangle. Any corner coordinate may be an expression in
+        ``jno.np.parameter``\ s: the shape is built at their initial values and the expression kept
+        for the solvers to move it (see :mod:`jno.geometry.parametric`).
+
+        Args:
+            x0: left edge.
+            y0: bottom edge.
+            x1: right edge.
+            y1: top edge.
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the new shape; call ``.domain()`` to mesh it.
+
+        Boundaries are named ``left``, ``right``, ``bottom``, ``top``.
+        """
         refs, ex = _par.split((x0, y0, x1, y1), "rect coordinate")
         return cls(_leaf(Rect(*refs), ex), 2, size)
 
     @classmethod
     def disk(cls, cx: float, cy: float, r: float, size: Size = None) -> "shape":
+        """A disk of radius ``r`` centred at ``(cx, cy)``; its boundary is named ``arc``.
+
+        Args:
+            cx: centre x.
+            cy: centre y.
+            r: radius.
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the new shape; call ``.domain()`` to mesh it.
+        """
         _no_params("disk", cx, cy, r)
         return cls(("leaf", Disk(cx, cy, r), next(_LEAF_KEYS)), 2, size)
 
     @classmethod
     def box(cls, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float, size: Size = None) -> "shape":
-        """Axis-aligned box. Any face coordinate may be an expression in ``jno.np.parameter``\\ s::
+        r"""Axis-aligned box. Any face coordinate may be an expression in ``jno.np.parameter``\ s::
 
             w = jno.np.parameter((1,), name="w")
             w.initialize(jax.nn.initializers.constant(12e-3))
@@ -749,13 +794,36 @@ class shape:
 
         The shape is built -- meshed, sampled, discretised -- at the parameters' initial values, and
         the expression is kept: the domain stretches its mesh and a PEEC network its grid lines to
-        where the parameters put the faces, under a trace (see :mod:`jno.geometry.parametric`)."""
+        where the parameters put the faces, under a trace (see :mod:`jno.geometry.parametric`).
+
+        Args:
+            x0: lower x face.
+            y0: lower y face.
+            z0: lower z face.
+            x1: upper x face.
+            y1: upper y face.
+            z1: upper z face.
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the new shape; call ``.domain()`` to mesh it.
+        """
         refs, ex = _par.split((x0, y0, z0, x1, y1, z1), "box coordinate")
         return cls(_leaf(Box(*refs), ex), 3, size)
 
     @classmethod
     def polygon(cls, points, size: Size = None) -> "shape":
-        """Arbitrary 2-D polygon from ordered ``(x, y)`` vertices; edges auto-named ``e0, e1, ...``."""
+        """Arbitrary 2-D polygon from ordered ``(x, y)`` vertices; edges auto-named ``e0, e1, ...``.
+
+        Args:
+            points: the vertices in order, ``[(x, y), ...]`` (the polygon closes itself).
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the new shape; call ``.domain()`` to mesh it.
+        """
         _no_params("polygon", points)
         pts = tuple((float(px), float(py)) for px, py in points)
         return cls(("leaf", Polygon(pts), next(_LEAF_KEYS)), 2, size)
@@ -764,7 +832,22 @@ class shape:
     def cylinder(
         cls, x: float, y: float, z: float, dx: float, dy: float, dz: float, r: float, size: Size = None
     ) -> "shape":
-        """Right cylinder: base centre ``(x,y,z)``, axis vector ``(dx,dy,dz)``, radius ``r``."""
+        """Right cylinder: base centre ``(x,y,z)``, axis vector ``(dx,dy,dz)``, radius ``r``.
+
+        Args:
+            x: base centre x.
+            y: base centre y.
+            z: base centre z.
+            dx: axis vector x (its length is the height).
+            dy: axis vector y.
+            dz: axis vector z.
+            r: radius.
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the new shape; call ``.domain()`` to mesh it.
+        """
         _no_params("cylinder", x, y, z, dx, dy, dz, r)
         return cls(("leaf", Cylinder(x, y, z, dx, dy, dz, r), next(_LEAF_KEYS)), 3, size)
 
@@ -814,7 +897,19 @@ class shape:
 
     @classmethod
     def sphere(cls, cx: float, cy: float, cz: float, r: float, size: Size = None) -> "shape":
-        """Sphere centred ``(cx,cy,cz)`` radius ``r``."""
+        """Sphere centred ``(cx,cy,cz)`` radius ``r``.
+
+        Args:
+            cx: centre x.
+            cy: centre y.
+            cz: centre z.
+            r: radius.
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the new shape; call ``.domain()`` to mesh it.
+        """
         _no_params("sphere", cx, cy, cz, r)
         return cls(("leaf", Sphere(cx, cy, cz, r), next(_LEAF_KEYS)), 3, size)
 
@@ -844,6 +939,14 @@ class shape:
         A positional ``{name: shape}`` **dict** is accepted for names that are not valid Python
         identifiers -- ``shape.regions({"Quartz.1": q1, "Quartz.2": q2})``. Dict order is priority
         order, exactly as for keywords, and the two forms may be combined (dict entries first).
+
+        Args:
+            mapping: optional ``{name: shape}`` dict, for names that are not Python identifiers.
+            **named: region name to shape, in priority order; ``conforming=False`` meshes the regions
+                independently (see above).
+
+        Returns:
+            shape: the multi-region shape.
         """
         conforming = named.pop("conforming", True)
         if not isinstance(conforming, bool):
@@ -911,13 +1014,32 @@ class shape:
         ``d.<name>`` raises if **any** region failed to attach that name, listing the ones that did
         not: a forgotten material surfaces at first use rather than as a region that silently
         conducts nothing. Repeated calls merge (last wins), so properties can be built up in stages.
-        Apply after :meth:`name` -- like ``name``, a later transform drops the attachment."""
+        Apply after :meth:`name` -- like ``name``, a later transform drops the attachment.
+
+        Args:
+            **props: property name to value (number, expression, trainable array, or a function of the
+                coordinates).
+
+        Returns:
+            shape: a copy carrying the properties.
+        """
         merged = dict(self._attach or {})
         merged.update(props)
         return replace(self, _attach=merged)
 
+    # docstring-from: jno.geometry.shape.shape.sized
     def size(self, size: Size) -> "shape":
-        """Alias for :meth:`sized` -- ``.size(h)`` reads better in a chain than ``.sized(h)``."""
+        """Return a copy of this shape with its target mesh size set.
+
+        ``.size(h)`` is the same method, and reads better in a chain.
+
+        Args:
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the resized copy.
+        """
         return self.sized(size)
 
     def _region_items(self):
@@ -976,6 +1098,14 @@ class shape:
         the origin (the common axisymmetric case) -- other axes raise at build time. Swept
         faces inherit the profile edge's auto-name (``arc``, ``e0``, ...); a partial sweep
         adds ``back``/``front`` end caps.
+
+        Args:
+            axis_point: a point on the axis, ``(x, y, z)`` (the origin).
+            axis_dir: the axis direction, ``(1, 0, 0)`` or ``(0, 1, 0)``.
+            angle: sweep angle in radians.
+
+        Returns:
+            shape: the 3-D solid.
         """
         if self.dim != 2:
             raise ValueError("revolve requires a 2-D shape")
@@ -1053,7 +1183,17 @@ class shape:
         return replace(self, _node=("fillet", self, float(radius), where), _region_name=None)
 
     def sized(self, size: Size) -> "shape":
-        """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
+        """Return a copy of this shape with its target mesh size set.
+
+        ``.size(h)`` is the same method, and reads better in a chain.
+
+        Args:
+            size: target mesh size: a number, a function ``f(x, y[, z]) -> h`` for a graded mesh, or
+                ``None`` for gmsh's default. Can also be set later with :meth:`sized`.
+
+        Returns:
+            shape: the resized copy.
+        """
         return replace(self, _size=size)
 
     def curved(self, order: int = 2) -> "shape":
@@ -1213,6 +1353,11 @@ class shape:
         raise ValueError(f"unknown node kind {kind!r}")
 
     def keys(self) -> FrozenSet[int]:
+        """The keys of every leaf primitive in this shape.
+
+        Returns:
+            frozenset[int]: the leaf keys.
+        """
         return frozenset(k for _, _, k in self.leaves())
 
     def contains(self, points, tol: float = 1e-9):
@@ -1280,6 +1425,14 @@ class shape:
         optimising the geometry itself does not go through here.
 
         ``sweep``/``fillet`` have no closed form and raise; ``revolve`` is not wired yet.
+
+        Args:
+            *coords: either one ``(N, dim)`` array of points, or the coordinate ``Variable`` nodes
+                (``x, y`` or ``x, y, z``).
+            dim: force the dimension of the query (default: the shape's own).
+
+        Returns:
+            The signed distances (an array for points, a trace node for Variables).
         """
         if len(coords) == 1 and getattr(coords[0], "ndim", 0) == 2:
             pts = coords[0]
@@ -1349,6 +1502,15 @@ class shape:
 
         Falls back to the boundary tessellation for a ``sweep``/``fillet`` plan; that path logs
         what it did rather than pretending it stayed analytic.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator``; ``None`` makes a fresh unseeded one.
+            tol: shrink the accepted region by this much (points at least ``tol`` inside).
+            max_rounds: cap on rejection rounds before giving up.
+
+        Returns:
+            The points, ``(n, 3)``.
         """
         rng = np.random.default_rng() if rng is None else rng
         n = int(n)
@@ -1396,6 +1558,14 @@ class shape:
         survives only if the shape actually changes across it (``contains`` differs a hair either
         side), which is what trims the parts of a leaf's boundary that a boolean cut away and what
         orients the normal outward — no winding convention is assumed.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator``; ``None`` makes a fresh unseeded one.
+            max_rounds: cap on rejection rounds before giving up.
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
         """
         rng = np.random.default_rng() if rng is None else rng
         n = int(n)
@@ -1467,6 +1637,14 @@ class shape:
         shape itself (via ``size=`` / :meth:`sized`). So ``shape.rect(0, 0, 1, 1, size=0.1).domain()``
         replaces ``jno.domain(shape.rect(0, 0, 1, 1, size=0.1))``, and batching still composes as
         ``B * shape.rect(...).domain()``.
+
+        Args:
+            **kwargs: ``jno.domain`` options: ``time=(t0, t1, n)`` for a transient problem,
+                ``tau=(s0, s1, n)`` for a load-step march, ``algorithm=`` (gmsh meshing algorithm id),
+                ``compute_mesh_connectivity=``, ``keep_orphan_nodes=``.
+
+        Returns:
+            domain: the meshed domain.
         """
         import jno
 
@@ -1517,6 +1695,13 @@ class BoundaryMesh:
     a box is a full 90 deg wrong, and only the frequency of that falls with resolution, never the
     magnitude). Membership is likewise the polyhedron's, not the true solid's: the two differ by
     the sagitta, O(h^2).
+
+    Attributes:
+        points: ``(P, 3)`` vertices.
+        facets: ``(F, k)`` segments (``k = 2``, 2-D shape) or triangles (``k = 3``).
+        normals: ``(F, 3)`` unit outward normals.
+        measures: ``(F,)`` facet lengths or areas.
+        dim: the shape's dimension.
     """
 
     points: np.ndarray  # (P, 3)
@@ -1537,6 +1722,13 @@ class BoundaryMesh:
         A ray from each query point crosses a closed surface an odd number of times exactly when the
         point is inside. No orientation is assumed, which is what lets :meth:`_oriented` use this to
         *derive* the outward direction rather than trusting the mesher's winding.
+
+        Args:
+            points: query points, ``(N, d)``.
+            tol: unused by the crossing test; kept for the primitive ``contains`` signature.
+
+        Returns:
+            A boolean mask, ``(N,)``.
         """
         q = _to3(np.asarray(points, dtype=float))
         if len(q) == 0:
@@ -1597,6 +1789,13 @@ class BoundaryMesh:
         uniformly inside it -- the triangle case by the reflected-barycentric map of Turk, "Generating
         Random Points in Triangles", Graphics Gems, 1990. The normal is the facet's own, so it is
         exact wherever the facet is (everywhere on a flat face) and O(h) on a curved one.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator``; ``None`` makes a fresh unseeded one.
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
         """
         rng = np.random.default_rng() if rng is None else rng
         n = int(n)
@@ -1618,7 +1817,16 @@ class BoundaryMesh:
         return pts, self.normals[idx]
 
     def sample_interior(self, n: int, rng=None, max_rounds: int = 10_000):
-        """``(n, 3)`` points drawn uniformly from inside the tessellated boundary, by rejection."""
+        """``(n, 3)`` points drawn uniformly from inside the tessellated boundary, by rejection.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator``; ``None`` makes a fresh unseeded one.
+            max_rounds: cap on rejection rounds before giving up.
+
+        Returns:
+            The points, ``(n, 3)``.
+        """
         rng = np.random.default_rng() if rng is None else rng
         n = int(n)
         if n <= 0:

@@ -76,6 +76,10 @@ class MeshConnectivity(dict):
 
     Deferring rather than deleting is deliberate: a domain that *does* radiate still gets the same
     matrix, computed identically, at the moment it is needed.
+
+    Args:
+        *args: as for ``dict``.
+        **kwargs: as for ``dict``.
     """
 
     def __init__(self, *args, **kwargs):
@@ -97,12 +101,19 @@ class MeshConnectivity(dict):
         return super().__contains__(key) or key in self._deferred
 
     def get(self, key, default=None):  # dict.get does NOT consult __missing__
+        """``mc[key]`` if present (computing a deferred entry on first read), else ``default``.
+
+        Args:
+            key: the entry name.
+            default: returned when the key is absent.
+        """
         try:
             return self[key]
         except KeyError:
             return default
 
     def keys(self):
+        """All entry names, including deferred ones not yet computed."""
         return (super().keys() | self._deferred.keys()) if self._deferred else super().keys()
 
 
@@ -265,6 +276,11 @@ def mesh_cell_region_membership(mesh, dim: int):
 
 
 class MeshUtils:
+    """Static mesh helpers: boundary extraction and normals, nodal measures, visibility and view-factor matrices.
+
+    The class is a namespace; every method is static.
+    """
+
     #: Memory budget, in float64 elements, for one row-block of the axisymmetric ring kernel's
     #: (M, M, n_phi) intermediate. Lower it if the view-factor build OOMs on a small GPU; it changes
     #: only how the work is split, never the result.
@@ -412,24 +428,20 @@ class MeshUtils:
 
     @staticmethod
     def compute_nodal_ds(mesh_connectivity, boundary_indices=None):
-        """
-        Compute element measure (length/area/volume) attributed to each node.
+        """Compute element measure (length/area/volume) attributed to each node.
 
         For boundary view factors:
         - 1D domain: ds = length of adjacent line segments (÷2 per node)
         - 2D domain: ds = length of adjacent boundary edges (÷2 per node)
         - 3D domain: ds = area of adjacent boundary faces (÷3 per node)
 
-        Parameters
-        ----------
-        mesh_connectivity : dict
-            Preprocessed mesh connectivity from _preprocess_mesh_connectivity
-        boundary_indices : array, optional
-            Indices of boundary nodes. If None, returns ds for all nodes.
+        Args:
+            mesh_connectivity (dict): Preprocessed mesh connectivity from _preprocess_mesh_connectivity
+            boundary_indices (array, optional): Indices of boundary nodes. If None, returns ds for all
+                nodes.
 
-        Returns
-        -------
-        ds : ndarray of shape (n_boundary_points,)
+        Returns:
+            ndarray of shape (n_boundary_points,): ds
         """
         dimension = mesh_connectivity["dimension"]
         points = mesh_connectivity["points"]
@@ -525,9 +537,20 @@ class MeshUtils:
 
     @staticmethod
     def get_boundary_normals(mesh, k=8, boundary_nodes=None):
-        """``boundary_nodes`` is an optional boolean over node ids, true for at least every node on the
+        """Outward unit normals at the boundary nodes of a mesh.
+
+        ``boundary_nodes`` is an optional boolean over node ids, true for at least every node on the
         boundary, which prunes the face count without changing its answer -- see
-        :func:`jno.utils.solver.fem_facets._boundary_faces`."""
+        :func:`jno.utils.solver.fem_facets._boundary_faces`.
+
+        Args:
+            mesh: the ``meshio.Mesh``.
+            k: neighbours used for the k-NN fit where a facet-based normal is unavailable.
+            boundary_nodes: optional boolean mask over node ids (see above).
+
+        Returns:
+            The normals, one per node.
+        """
         points = mesh.points
         # A curved mesh stores second-order blocks; boundary topology and apex orientation come from
         # the vertices, which `p1_cells_dict` supplies. The normals stay straight-facet for now --
@@ -796,17 +819,15 @@ class MeshUtils:
         Comm. ACM 5(8), 1962): a point is inside when a ray cast along +x crosses the boundary an
         odd number of times.
 
-        Parameters
-        ----------
-        pts : (m, 2) array of query points.
-        edges : (n_edges, 2) array of indices into `all_points`, or None.
-        all_points : (n, >=2) array holding the edge endpoints.
-        block : int, cap on the (points x edges) temporary, processed in chunks of this many pairs.
+        Args:
+            pts ((m, 2) array of query points.)
+            edges ((n_edges, 2) array of indices into `all_points`, or None.)
+            all_points ((n, >=2) array holding the edge endpoints.)
+            block (int, cap on the (points x edges) temporary, processed in chunks of this many pairs.)
 
-        Returns
-        -------
-        (m,) bool array, True where the point is inside. All-True when `edges` is None, matching
-        the caller's "no boundary information, assume inside" fallback.
+        Returns:
+            (m,) bool array, True where the point is inside. All-True when `edges` is None, matching
+            the caller's "no boundary information, assume inside" fallback.
         """
         pts = np.atleast_2d(pts)
         if edges is None or len(edges) == 0:
@@ -889,29 +910,20 @@ class MeshUtils:
     @staticmethod
     @jax.jit
     def get_visibility_matrix_ordered(P_bnd: jnp.ndarray, P_int: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute visibility matrix for boundary points considering interior points.
+        """Compute visibility matrix for boundary points considering interior points.
 
-        Parameters
-        ----------
-        P_bnd : jnp.ndarray
-            (n_bnd, 2) boundary points of the mesh (simple polygon).
-        P_int : jnp.ndarray
-            (n_int, 2) interior points of the mesh.
+        Args:
+            P_bnd (jnp.ndarray): (n_bnd, 2) boundary points of the mesh (simple polygon).
+            P_int (jnp.ndarray): (n_int, 2) interior points of the mesh.
 
-        Returns
-        -------
-        jnp.ndarray
-            (n_bnd, n_bnd) boolean visibility matrix.
-            VM[i,j] = 1 if boundary point i can "see" boundary point j.
-
-        Two boundary points are visible if:
-        1. The line segment between them does not intersect any boundary edge
-
-        (except at the endpoints themselves).
-        2. The ray passes through the interior (midpoint inside polygon).
-        3. No other boundary point lies on the segment between them.
-
+        Returns:
+            jnp.ndarray: (n_bnd, n_bnd) boolean visibility matrix. VM[i,j] = 1 if boundary point i can "see"
+                boundary point j.
+            Two boundary points are visible if
+            1. The line segment between them does not intersect any boundary edge
+            (except at the endpoints themselves).
+            2. The ray passes through the interior (midpoint inside polygon).
+            3. No other boundary point lies on the segment between them.
         """
 
         def order_boundary_points(P):
@@ -979,18 +991,15 @@ class MeshUtils:
                 return (o1 * o2 < 0.0) & (o3 * o4 < 0.0)
 
             def point_on_segment(A, B, P_test, tol=1e-8):
-                """
-                Check if point P_test lies on segment AB (excluding endpoints).
+                """Check if point P_test lies on segment AB (excluding endpoints).
 
-                Parameters
-                ----------
-                A, B : points defining the segment
-                P_test : point to test
-                tol : tolerance for collinearity and bounds checking
+                Args:
+                    A, B (points defining the segment)
+                    P_test (point to test)
+                    tol (tolerance for collinearity and bounds checking)
 
-                Returns
-                -------
-                bool : True if P_test is strictly on segment AB (not at endpoints)
+                Returns:
+                    True if P_test is strictly on segment AB (not at endpoints): bool
                 """
                 # Vector from A to B
                 AB = B - A
@@ -1120,8 +1129,7 @@ class MeshUtils:
     def get_visibility_matrix_raytrace(
         boundary_points, boundary_edges, interior_point=None, n_ray_samples: int = 3
     ) -> jnp.ndarray:
-        """
-        Compute visibility matrix via segment–edge intersection tests.
+        """Compute visibility matrix via segment–edge intersection tests.
 
         Two boundary points see each other if and only if the straight line
         between them does **not** cross any boundary edge (excluding the
@@ -1132,20 +1140,16 @@ class MeshUtils:
         The computation is fully vectorized over target points for each
         source point, giving O(N · E) work per source row.
 
-        Parameters
-        ----------
-        boundary_points : array-like, shape (N, 2)
-            Coordinates of the boundary discretisation points.
-        boundary_edges : array-like, shape (E, 2)
-            Index pairs into *boundary_points* defining the boundary segments.
-        interior_point : ignored (kept for API compatibility)
-        n_ray_samples : ignored (kept for API compatibility)
+        Args:
+            boundary_points (array-like, shape (N, 2)): Coordinates of the boundary discretisation points.
+            boundary_edges (array-like, shape (E, 2)): Index pairs into *boundary_points* defining the
+                boundary segments.
+            interior_point (ignored (kept for API compatibility))
+            n_ray_samples (ignored (kept for API compatibility))
 
-        Returns
-        -------
-        jnp.ndarray, shape (N, N)
-            Binary visibility matrix (float32).  ``VM[i, j] = 1`` means
-            point *i* can see point *j*.
+        Returns:
+            jnp.ndarray, shape (N, N): Binary visibility matrix (float32).  ``VM[i, j] = 1`` means point *i*
+                can see point *j*.
         """
 
         import numpy as np
@@ -1212,29 +1216,35 @@ class MeshUtils:
 
     @staticmethod
     def extract_boundary_edges(triangles: jnp.ndarray, n_points: int) -> jnp.ndarray:
-        """
-        Extract boundary edges from triangle connectivity.
+        """Extract boundary edges from triangle connectivity.
         Boundary edges appear in exactly one triangle.
 
-        Parameters
-        ----------
-        triangles : jnp.ndarray
-            (n_tri, 3) triangle connectivity.
-        n_points : int
-            Unused; kept because callers pass it positionally.
+        Args:
+            triangles (jnp.ndarray): (n_tri, 3) triangle connectivity.
+            n_points (int): Unused; kept because callers pass it positionally.
 
-        Returns
-        -------
-        jnp.ndarray
-            (n_boundary_edges, 2) boundary edge indices, each sorted low-to-high. The edges come
-            back in lexicographic order rather than first-encountered order -- they describe an
-            unordered edge set, and the callers either re-index or chain them into loops.
+        Returns:
+            jnp.ndarray: (n_boundary_edges, 2) boundary edge indices, each sorted low-to-high. The edges
+                come back in lexicographic order rather than first-encountered order -- they describe an
+                unordered edge set, and the callers either re-index or chain them into loops.
         """
         return jnp.array(MeshUtils._get_boundary_elements(np.asarray(triangles), "triangle"))
 
     @staticmethod
     @jax.jit
     def get_view_factor_3d(P, VM, Nrm, ds):
+        """Point-to-point diffuse view-factor matrix of a 3-D enclosure surface, ``F_ij = cosθ_i cosθ_j ds_j / (π r²)``
+        with occlusion from ``VM`` and the self-pair removed.
+
+        Args:
+            P: boundary points, ``(n, d)``.
+            VM: the visibility matrix, ``(n, n)`` (0/1, occlusion).
+            Nrm: unit normals pointing into the enclosure, ``(n, d)``.
+            ds: per-point boundary measure (length or area).
+
+        Returns:
+            The view-factor matrix ``F``, ``(n, n)``.
+        """
         n_pts = P.shape[0]
 
         v = P[None, :, :] - P[:, None, :]  # (N,N,3), x_j - x_i
@@ -1266,6 +1276,18 @@ class MeshUtils:
     @staticmethod
     @jax.jit
     def get_view_factor_2d(P, VM, Nrm, ds):
+        """Point-to-point diffuse view-factor matrix of a 2-D enclosure, ``F_ij = cosθ_i cosθ_j ds_j / (2 r)``
+        with occlusion from ``VM`` and the self-pair removed.
+
+        Args:
+            P: boundary points, ``(n, d)``.
+            VM: the visibility matrix, ``(n, n)`` (0/1, occlusion).
+            Nrm: unit normals pointing into the enclosure, ``(n, d)``.
+            ds: per-point boundary measure (length or area).
+
+        Returns:
+            The view-factor matrix ``F``, ``(n, n)``.
+        """
         n_pts = P.shape[0]
 
         v = P[None, :, :] - P[:, None, :]
@@ -1308,6 +1330,16 @@ class MeshUtils:
         a midpoint quadrature (``n_phi`` uniform samples) of the diffuse point-to-ring kernel. The
         factor ``r_j`` is the cylindrical Jacobian of the ring. Only the self-pair (diagonal) is
         removed; same-surface concave self-view is left to the visibility matrix ``VM``.
+
+        Args:
+            P: boundary points in the meridional plane, ``(n, 2)`` as ``(r, z)``.
+            VM: the visibility matrix, ``(n, n)``.
+            Nrm: unit normals pointing into the enclosure, ``(n, 2)``.
+            ds: per-point boundary measure.
+            n_phi: azimuthal samples.
+
+        Returns:
+            The view-factor matrix, ``(n, n)``.
 
         Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (view factors;
         bodies of revolution / the crossed-strings and ring-integration constructions).
@@ -1352,6 +1384,17 @@ class MeshUtils:
 
     @staticmethod
     def get_view_factor_1d(P, VM, Nrm, ds):
+        """View factors in 1-D: every point sees the other end fully, so all ones.
+
+        Args:
+            P: boundary points.
+            VM: unused.
+            Nrm: unused.
+            ds: unused.
+
+        Returns:
+            ``jnp.ones(n)``.
+        """
         n_pts = P.shape[0]
         return jnp.ones(n_pts)
 
@@ -1370,6 +1413,16 @@ class MeshUtils:
         midpoint/point kernel). Integrating over the element extent (rather than a single point) is what
         makes the near-field self-view of concave surfaces accurate. ``VM`` is the element-to-element
         visibility (0/1) carrying occlusion; only the self-pair (diagonal) is otherwise removed.
+
+        Args:
+            E0: element start points, ``(m, 2)``.
+            E1: element end points, ``(m, 2)``.
+            Nrm: unit element normals pointing into the enclosure, ``(m, 2)``.
+            VM: element-to-element visibility (0/1), ``(m, m)``.
+            n_quad: Gauss points per element.
+
+        Returns:
+            The view-factor matrix, ``(m, m)``.
 
         Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (diffuse view factors).
         """
@@ -1412,7 +1465,16 @@ class MeshUtils:
         contiguously per element, so ``reshape(m, n_quad, ...)`` recovers the element blocks). Exposed so
         an occlusion test can be evaluated at the SAME points the kernel uses, rather than once per
         element at its midpoint -- element-level visibility makes a partially-shadowed element
-        all-or-nothing, which converges only at O(h)."""
+        all-or-nothing, which converges only at O(h).
+
+        Args:
+            E0: element start points, ``(m, 2)``.
+            E1: element end points, ``(m, 2)``.
+            n_quad: Gauss points per element.
+
+        Returns:
+            The points, ``(m * n_quad, 2)``.
+        """
         E0, E1 = np.asarray(E0), np.asarray(E1)
         gx, _ = np.polynomial.legendre.leggauss(int(n_quad))
         s = (gx + 1.0) * 0.5  # -> [0, 1]
@@ -1455,6 +1517,18 @@ class MeshUtils:
         * ``(m*n_quad, m*n_quad, n_phi)`` — per-azimuth visibility at the **quadrature points** (see
           :meth:`meridional_quad_points`). Same as above but resolves the shadow boundary within an
           element, so a partially-shadowed element is partially shadowed. Preferred.
+
+        Args:
+            E0: element start points, ``(m, 2)``.
+            E1: element end points, ``(m, 2)``.
+            Nrm: unit element normals pointing into the enclosure, ``(m, 2)``.
+            VM: the visibility mask, in one of the three shapes above.
+            n_quad: Gauss points per element.
+            n_phi: azimuthal samples.
+            r_min: softening of the near-field ``1/R^2`` singularity.
+
+        Returns:
+            The view-factor matrix, ``(m, m)``.
 
         Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (bodies of revolution).
         """
@@ -1535,23 +1609,16 @@ class MeshUtils:
 
     @staticmethod
     def precompute_p1_line_geometry(points, elements):
-        """
-        Precompute P1 line element geometry (lengths and shape function gradients).
+        """Precompute P1 line element geometry (lengths and shape function gradients).
 
-        Parameters
-        ----------
-        points : ndarray of shape (n_points, 1)
-            Node coordinates
-        elements : ndarray of shape (n_elements, 2)
-            Line element connectivity (node indices)
+        Args:
+            points (ndarray of shape (n_points, 1)): Node coordinates
+            elements (ndarray of shape (n_elements, 2)): Line element connectivity (node indices)
 
-        Returns
-        -------
-        length : ndarray of shape (n_elements,)
-            Length of each line element
-        grad_phi : ndarray of shape (n_elements, 2)
-            Gradient of each shape function on each element
-            grad_phi[e, i] = d(phi_i)/dx on element e
+        Returns:
+            ndarray of shape (n_elements,): length: Length of each line element
+            ndarray of shape (n_elements, 2): grad_phi: Gradient of each shape function on each element
+                grad_phi[e, i] = d(phi_i)/dx on element e
         """
         n_elements = elements.shape[0]
 

@@ -268,25 +268,16 @@ def _grouped_vmap(
     4. Restores the original ``mesh_connectivity``.
     5. Concatenates all group outputs in the original batch order.
 
-    Parameters
-    ----------
-    scan_fn : callable
-        The per-sample evaluation function ``(spatial_vals, rng_key) -> result``.
-    spatial_ctx : tuple of arrays
-        Context arrays (potentially batched along axis 0).
-    ctx_in_axes : tuple
-        Per-array vmap in_axes (0 or None).
-    spatial_tag_order : tuple of str
-        Tag names corresponding to ``spatial_ctx``.
-    fd_domain : domain
-        The domain with ``_sub_domains`` and ``_domain_mesh_connectivities``.
-    batch_domain_map : ndarray of int, shape (B,)
-        Maps each batch index to its source domain index.
-    B : int
-        Total batch size.
-    key : jax random key or None
-    is_multi : bool
-        If True, scan_fn returns a list of arrays (multi-expression).
+    Args:
+        scan_fn (callable): The per-sample evaluation function ``(spatial_vals, rng_key) -> result``.
+        spatial_ctx (tuple of arrays): Context arrays (potentially batched along axis 0).
+        ctx_in_axes (tuple): Per-array vmap in_axes (0 or None).
+        spatial_tag_order (tuple of str): Tag names corresponding to ``spatial_ctx``.
+        fd_domain (domain): The domain with ``_sub_domains`` and ``_domain_mesh_connectivities``.
+        batch_domain_map (ndarray of int, shape (B,)): Maps each batch index to its source domain index.
+        B (int): Total batch size.
+        key (jax random key or None)
+        is_multi (bool): If True, scan_fn returns a list of arrays (multi-expression).
     """
     connectivities = fd_domain._domain_mesh_connectivities
     original_mc = fd_domain.mesh_connectivity
@@ -406,6 +397,9 @@ class TraceCompiler:
 
         Traverses depth-first so that dependencies (modules whose outputs feed
         into other modules) are collected before the modules that consume them.
+
+        Args:
+            expr: the expression to walk.
 
         Returns:
             List of ``(Model, call_args | None)`` tuples.
@@ -546,13 +540,20 @@ class TraceCompiler:
 
     @staticmethod
     def merge_pretrained_params(pretrained_params: dict, new_params: dict, logger) -> dict:
-        """
-        Merge pretrained weights with new params, replacing embedding/recovery layers
+        """Merge pretrained weights with new params, replacing embedding/recovery layers
         when shapes don't match (for different channel dimensions).
 
         A concise summary (counts) is logged to the main logger.  Detailed
         per-parameter information is written to ``weight_merge.log`` in the
         same directory as the logger's output path.
+
+        Args:
+            pretrained_params: the loaded parameter tree.
+            new_params: the freshly initialised parameter tree.
+            logger: the jNO logger to report to.
+
+        Returns:
+            dict: the merged parameters.
         """
         stats = {"matched": 0, "replaced": 0}
         details: list = []  # collect per-param detail lines
@@ -964,6 +965,15 @@ class TraceCompiler:
 
         The model was already fully constructed at factory time — we just
         return ``layer.module``, optionally loading pretrained weights.
+
+        Args:
+            layer: the :class:`Model` node.
+            arg_shapes: shapes of the layer's call arguments (unused for Equinox modules).
+            rng: PRNG key (unused for Equinox modules, which are built eagerly).
+            logger: the jNO logger to report to.
+
+        Returns:
+            The Equinox module, with pretrained weights loaded if requested.
         """
         if not isinstance(layer, Model):
             raise ValueError(f"Unknown layer type: {type(layer)}")
@@ -1041,6 +1051,13 @@ class TraceCompiler:
         already constructed eagerly at factory time — we just store it
         directly (with optional pretrained weight loading).
 
+        Args:
+            all_ops: every :class:`OperationDef` of the problem (the compiled operation set).
+            domain_dim: the domain's spatial dimension.
+            tensor_dims: input dimensions per context entry (:meth:`core.compute_tensor_dims`).
+            rng: PRNG key.
+            logger: the jNO logger to report to.
+
         Returns:
             all_models: Dict mapping layer_id -> callable model
             rng: Updated RNG key
@@ -1078,6 +1095,14 @@ class TraceCompiler:
         The ``"__time__"`` context entry (shape ``(T, 1)``) is **not**
         batched — it is shared and scanned over T together with the
         spatial arrays.
+
+        Args:
+            expr: the expression to compile.
+            all_ops: every :class:`OperationDef` of the problem (the compiled operation set).
+
+        Returns:
+            Callable: the compiled function ``(params, context=None, batchsize=None, key=None,
+            min_consecutive=1)``.
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
@@ -1439,6 +1464,13 @@ class TraceCompiler:
 
         Mirrors ``compile_traced_expression`` exactly — only
         ``evaluate_single_point_set`` changes.
+
+        Args:
+            exprs: the constraint expressions.
+            all_ops: every :class:`OperationDef` of the problem (the compiled operation set).
+
+        Returns:
+            Callable: one function returning the list of residual arrays.
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"

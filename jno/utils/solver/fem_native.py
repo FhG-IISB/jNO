@@ -22,18 +22,17 @@ New components (this module only):
 * :func:`fem_facets.build_facet_connectivity` / :func:`fem_facets.compute_face_normals`
   — boundary face connectivity + outward normals for surface integration.
 
-References
-----------
-Matrix extraction via ``jax.jacfwd(residual)(zeros)`` follows Griewank & Walther,
-*Evaluating Derivatives*, SIAM (2008), §3.5 — the same pattern as :mod:`fem_1d`
-and :mod:`fem_nonnodal`.
+References:
+    Matrix extraction via ``jax.jacfwd(residual)(zeros)`` follows Griewank & Walther,
+    *Evaluating Derivatives*, SIAM (2008), §3.5 — the same pattern as :mod:`fem_1d`
+    and :mod:`fem_nonnodal`.
 
-Scope
------
-Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes (single- and multi-field,
-linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary conditions
-(2D edge / 3D tet-face surface quadrature).  Niches outside this scope raise a clear
-``NotImplementedError`` from ``jno.fem`` rather than assembling silently.
+    Scope
+    -----
+    Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes (single- and multi-field,
+    linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary conditions
+    (2D edge / 3D tet-face surface quadrature).  Niches outside this scope raise a clear
+    ``NotImplementedError`` from ``jno.fem`` rather than assembling silently.
 """
 
 from __future__ import annotations

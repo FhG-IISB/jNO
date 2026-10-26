@@ -64,6 +64,12 @@ class PrecondApplier:
     ``fwd`` is the forward applier; ``t`` the transpose applier, or ``None`` for a **symmetric**
     preconditioner (Jacobi, an SPD auxiliary form) -- then ``.T`` is the applier itself. A bare
     callable preconditioner (no ``.T``) still works: callers fall back to reusing ``M``.
+
+    Args:
+        fwd: the forward applier ``v -> M^{-1} v``.
+        t: the transpose applier, or ``None`` for a symmetric preconditioner.
+        low_precision: applied in a lower precision than the solve, so only approximately
+            symmetric and linear (``jno.solve.cg`` then switches to flexible CG).
     """
 
     __slots__ = ("_fwd", "_t", "low_precision", "nonsymmetric")
@@ -82,6 +88,7 @@ class PrecondApplier:
 
     @property
     def T(self) -> "PrecondApplier":
+        """The transpose applier ``v -> M^{-T} v`` (the applier itself for a symmetric preconditioner)."""
         return self if self._t is None else PrecondApplier(self._t, self._fwd, low_precision=self.low_precision)
 
 
@@ -155,7 +162,18 @@ class LinearOperator:
     ) -> "LinearOperator":
         """Wrap a bare matvec. Optional hooks upgrade it: ``t_mv`` (transposed matvec — else
         derived exactly via ``jax.linear_transpose``), ``diag_fn``/``dense_fn`` (else those
-        accessors raise), ``shape`` (else ``None``)."""
+        accessors raise), ``shape`` (else ``None``).
+
+        Args:
+            mv: the matvec ``v -> A v``.
+            t_mv: the transposed matvec ``v -> A^T v``.
+            diag_fn: ``() -> diag(A)``.
+            dense_fn: ``() -> A`` as a dense array.
+            shape: ``(n, m)``.
+
+        Returns:
+            LinearOperator: the operator.
+        """
         op = cls.__new__(cls)
         op._A = None
         op._mv = mv
@@ -168,6 +186,7 @@ class LinearOperator:
 
     @property
     def shape(self):
+        """``(n, m)``, or ``None`` for a matvec-only operator built without a shape."""
         if self._A is None:
             s = self._shape
         else:
@@ -177,6 +196,14 @@ class LinearOperator:
         return (s[1], s[0]) if self._transposed else tuple(s)
 
     def mv(self, v):
+        """Apply the operator, ``A v`` (``Aᵀ v`` for a transposed view).
+
+        Args:
+            v: the vector.
+
+        Returns:
+            The product.
+        """
         if self._mv is not None:
             if self._transposed:
                 if self._t_mv is not None:
@@ -198,6 +225,7 @@ class LinearOperator:
 
     @property
     def T(self) -> "LinearOperator":
+        """The transposed operator (exact: ``t_mv`` if given, else ``jax.linear_transpose`` of the matvec)."""
         if self._mv is not None:
             op = LinearOperator.from_matvec(
                 self._mv,
@@ -214,6 +242,14 @@ class LinearOperator:
         return op
 
     def diag(self):
+        """The diagonal of the assembled operator.
+
+        Returns:
+            The diagonal vector.
+
+        Raises:
+            TypeError: for a matvec-only operator without ``diag_fn``.
+        """
         if self._A is None:
             if self._diag_fn is not None:
                 return self._diag_fn()  # a (square) block's diagonal is transpose-invariant
@@ -221,6 +257,14 @@ class LinearOperator:
         return matrix_diagonal(self._A)  # transpose shares the diagonal
 
     def dense(self):
+        """The operator as a dense matrix (small systems and tests only).
+
+        Returns:
+            The dense array.
+
+        Raises:
+            TypeError: for a matvec-only operator without ``dense_fn``.
+        """
         if self._A is None:
             if self._dense_fn is not None:
                 M = self._dense_fn()
@@ -231,6 +275,7 @@ class LinearOperator:
 
     @property
     def bcoo(self):
+        """The assembled sparse BCOO matrix, or ``None`` for a matvec-only operator."""
         return self._A if hasattr(self._A, "todense") else None
 
     def astype(self, dtype) -> "LinearOperator":
@@ -653,6 +698,15 @@ class LinearSolver:
     That default is deliberate: a key that omits a parameter would serve a cached solve configured
     the *other* way, which is a wrong answer, while no key merely forgoes a speed-up. So a new
     solver is slow until its key is written, never silently wrong.
+
+    Args:
+        fn: the solve, ``(op, b, M, x0) -> x``.
+        name: display name (``jno.info`` and logs).
+        traits: transform support, ``{"vmap": "native" | "sequential" | "no", "jit": bool}``.
+        direct: whether it is a direct (factorising) solver.
+        key: the value identity (see above); ``None`` disables compiling the slot path.
+        settings: the configured options, for reporting.
+        accepts_rtol: whether a per-call ``rtol=`` (inexact Newton forcing) is accepted.
     """
 
     def __init__(
@@ -739,6 +793,13 @@ class NonlinearSolver:
     solve, so it is robust on indefinite/ill-conditioned systems (Taylor-Hood saddles, stiff drag). It
     composes only where the assembler provides that Jacobian (native nonlinear FEM / the transient
     stepper), which threads it in via ``jacobian=``.
+
+    Args:
+        fn: the driver, ``(residual_fn, u0, *, linear_solve, jacobian) -> u``.
+        name: display name.
+        traits: transform support, as for :class:`LinearSolver`.
+        direct: assembled-Jacobian sparse-direct Newton (see above).
+        config: the configured options, for reporting.
     """
 
     def __init__(
@@ -874,6 +935,12 @@ class PrecondContext:
     forms" primitive (weighted mass matrices, low-order proxies, shifted operators). On a
     reduced system the form (assembled on the full finite-element space) is reduced with the
     same ``P`` as ``ctx.A``, so the two act on the same space.
+
+    Args:
+        A: the operator being preconditioned.
+        fem: the owning :class:`jno.FEM`, or ``None``.
+        grid: the structured-grid descriptor, for geometric multigrid.
+        mesh: the device mesh of a sharded solve, or ``None``.
     """
 
     def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None, mesh: Any = None):
@@ -973,6 +1040,7 @@ class PrecondContext:
         return op
 
     def diag(self):
+        """The diagonal of ``ctx.A``."""
         return self.A.diag()
 
     @property
@@ -990,13 +1058,28 @@ class PrecondContext:
     @property
     def blocks(self):
         """Per-field ``slice``s of ``A`` -- of the REDUCED system when the solve runs on one (see
-        :func:`_field_layout`); ``fem.blocks`` itself always slices the full solution."""
+        :func:`_field_layout`); ``fem.blocks`` itself always slices the full solution.
+
+        Raises:
+            TypeError: when there is no per-field block structure.
+        """
         blocks, _red = _field_layout(self.fem, self._n())
         if blocks is None:
             raise TypeError("PrecondContext.blocks: no per-field block structure (single field, or no FEM attached).")
         return blocks
 
     def block_slice(self, field) -> slice:
+        """The DOF slice of one field.
+
+        Args:
+            field: a trial symbol of the owning FEM, or a block index.
+
+        Returns:
+            slice: the field's slice of ``ctx.A``.
+
+        Raises:
+            TypeError: if a symbol is given and no FEM is attached.
+        """
         if isinstance(field, int):  # plain block index
             return self.blocks[field]
         if self.fem is None:
@@ -1004,6 +1087,15 @@ class PrecondContext:
         return self.blocks[self.fem.block_index(field)]
 
     def sub(self, i, j=None) -> LinearOperator:
+        """The ``(i, j)`` sub-operator, applied through the full operator's matvec.
+
+        Args:
+            i: the row field (symbol or index).
+            j: the column field; ``None`` means ``i`` (a diagonal block).
+
+        Returns:
+            LinearOperator: the block.
+        """
         si = self.block_slice(i)
         sj = si if j is None else self.block_slice(j)
         A = self.A
@@ -1032,6 +1124,15 @@ class PrecondContext:
         return LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=diag_fn, dense_fn=dense_fn, shape=(ni, nj))
 
     def assemble(self, terms, *, quad_degree: int | None = None) -> LinearOperator:
+        """Assemble an auxiliary weak form as a preconditioner operator (see above).
+
+        Args:
+            terms: the weak-form term list, as for ``jno.fem``.
+            quad_degree: quadrature degree; ``None`` uses ``jno.fem``'s default.
+
+        Returns:
+            LinearOperator: the assembled (and, on a reduced system, reduced) operator.
+        """
         import jax.experimental.sparse as jsp
 
         from ... import fem as _fem_entry

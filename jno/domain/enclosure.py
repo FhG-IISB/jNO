@@ -508,6 +508,9 @@ class PendingElementExpr:
        The block this produces is **dense** in element space. It reads like a weak term and is not
        one: its Jacobian couples every element to every other, which is why ``fem.solve`` stays on
        matrix-free Newton-Krylov rather than assembling a sparse tangent.
+
+    Args:
+        fn: the recorded computation, ``u -> per-element array``, applied once the solution is known.
     """
 
     __slots__ = ("_fn",)
@@ -570,7 +573,14 @@ class PendingElementExpr:
 
     def apply(self, fn):
         """Record an arbitrary elementwise/array function, for anything the operators do not cover
-        (``gap.field(u).apply(jnp.exp)``)."""
+        (``gap.field(u).apply(jnp.exp)``).
+
+        Args:
+            fn: an array function applied to the per-element values.
+
+        Returns:
+            PendingElementExpr: the extended record.
+        """
         inner = self._fn
         return PendingElementExpr(lambda u: fn(inner(u)))
 
@@ -581,20 +591,32 @@ class PendingElementExpr:
 class Enclosure:
     """Geometric handle for an enclosure-radiation surface set (see module docstring).
 
-    Attributes
-    ----------
-    view_factor : (m, m) jnp.ndarray
-        Element-to-element diffuse view factor ``F`` (rows = receiving elements). Quality-gated on build.
-    elements : (m, 2) np.ndarray
-        Global mesh node-index pairs for each boundary element (endpoints are FEM nodes).
-    element_tags : (m,) np.ndarray[object]
-        The tag each element belongs to (for per-surface emissivity).
-    areas : (m,) jnp.ndarray
-        Per-element measure: edge length (2D) or ring area ``2*pi*r*length`` (axisymmetric).
-    normals : (m, 2) jnp.ndarray
-        Unit element normals pointing into the enclosure.
-    nodes : (k,) np.ndarray
-        Unique global node indices used by the enclosure (FEM DOFs for a scalar P1 field).
+    Attributes:
+        view_factor ((m, m) jnp.ndarray): Element-to-element diffuse view factor ``F`` (rows = receiving
+            elements). Quality-gated on build.
+        elements ((m, 2) np.ndarray): Global mesh node-index pairs for each boundary element (endpoints
+            are FEM nodes).
+        element_tags ((m,) np.ndarray[object]): The tag each element belongs to (for per-surface
+            emissivity).
+        areas ((m,) jnp.ndarray): Per-element measure: edge length (2D) or ring area ``2*pi*r*length``
+            (axisymmetric).
+        normals ((m, 2) jnp.ndarray): Unit element normals pointing into the enclosure.
+        nodes ((k,) np.ndarray): Unique global node indices used by the enclosure (FEM DOFs for a scalar
+            P1 field).
+
+    Built by ``d.enclosure(...)``.
+
+    Args:
+        domain: the domain the surfaces belong to.
+        tags: the boundary tags forming the enclosure.
+        F: the view-factor matrix.
+        elements: per-element global node pairs.
+        element_tags: per-element tag.
+        areas: per-element measure.
+        normals: per-element unit normals into the enclosure.
+        midpoints: per-element midpoints.
+        axisymmetric: whether the geometry is axisymmetric (ring elements).
+        endpoints: per-element endpoint coordinates, when kept.
     """
 
     def __init__(self, domain, tags, F, elements, element_tags, areas, normals, midpoints, axisymmetric, endpoints=None):
@@ -611,14 +633,17 @@ class Enclosure:
 
     @property
     def size(self) -> int:
+        """Number of boundary elements ``m``."""
         return int(self._F.shape[0])
 
     @property
     def view_factor(self):
+        """The element-to-element diffuse view factor ``F``, ``(m, m)`` (rows: receiving elements)."""
         return self._F
 
     @property
     def nodes(self) -> np.ndarray:
+        """The unique global mesh node indices the enclosure touches."""
         return np.unique(self.elements)
 
     def tag_mask(self, tag: str) -> np.ndarray:
@@ -626,7 +651,14 @@ class Enclosure:
         return self.element_tags == tag
 
     def emissivity(self, values) -> jnp.ndarray:
-        """Per-element emissivity ``(m,)`` from a ``{tag: eps}`` mapping (or a scalar for all surfaces)."""
+        """Per-element emissivity ``(m,)`` from a ``{tag: eps}`` mapping (or a scalar for all surfaces).
+
+        Args:
+            values: a scalar for every surface, or ``{tag: eps}``.
+
+        Returns:
+            jnp.ndarray: one emissivity per element.
+        """
         if np.isscalar(values):
             return jnp.full(self.size, float(values))
         eps = np.zeros(self.size)
@@ -693,7 +725,18 @@ class Enclosure:
 
     def check(self, *, closure_atol: float = 5e-2, reciprocity_atol: float = 1e-7):
         """F-quality gate: raise if closure or reciprocity exceeds tolerance (mesh too coarse / normals
-        mis-oriented / surfaces not enclosing). Returns ``self`` for chaining."""
+        mis-oriented / surfaces not enclosing). Returns ``self`` for chaining.
+
+        Args:
+            closure_atol: tolerance on ``max|Σ_j F_ij - 1|``.
+            reciprocity_atol: tolerance on ``max|A_i F_ij - A_j F_ji|``.
+
+        Returns:
+            Enclosure: ``self``.
+
+        Raises:
+            ValueError: if either error exceeds its tolerance.
+        """
         closure, reciprocity = self.quality()
         if reciprocity > reciprocity_atol:
             raise ValueError(

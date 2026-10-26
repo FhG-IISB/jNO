@@ -97,7 +97,15 @@ class Callback:
         return None
 
     def on_training_end(self, **kwargs) -> None:
-        """Called once after the training loop finishes."""
+        """Called once after the training loop ends (also after an early stop).
+
+        Args:
+            **kwargs: none are passed today (``core.solve`` calls ``on_training_end()``); accepted so
+                a later version can add context without breaking existing callbacks.
+
+        Returns:
+            None.
+        """
 
 
 def _resolve_constraint_indices(user_constraints, solver_constraints, callback_name: str) -> list[int]:
@@ -244,7 +252,23 @@ class CheckpointCallback(Callback):
 
     # -- hooks ---------------------------------------------------------------
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> None:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         ocp = self._ocp
         epoch: int = kwargs["epoch"]
         trainable = kwargs["trainable"]
@@ -285,7 +309,17 @@ class CheckpointCallback(Callback):
             self._upload_wandb_artifact(epoch, metadata=metadata)
             self._log_wandb_histograms(trainable, epoch)
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_training_end
     def on_training_end(self, **kwargs) -> None:
+        """Called once after the training loop ends (also after an early stop).
+
+        Args:
+            **kwargs: none are passed today (``core.solve`` calls ``on_training_end()``); accepted so
+                a later version can add context without breaking existing callbacks.
+
+        Returns:
+            None.
+        """
         self._manager.wait_until_finished()
 
     # -- wandb ---------------------------------------------------------------
@@ -481,7 +515,34 @@ class EarlyStoppingCallback(Callback):
 
     # -- hooks ---------------------------------------------------------------
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         self._ineq = list(kwargs.get("inequality_idx") or [])
         eq = set(kwargs.get("equality_idx") or [])
         # Positions of the equality rows among the constraint rows, which are in `_ineq` order.
@@ -508,7 +569,23 @@ class EarlyStoppingCallback(Callback):
         g[self._eq_cols] = np.abs(g[self._eq_cols])
         return float(g.max())
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         if self._ineq:
             rows = np.asarray(jax.device_get(kwargs["individual_losses"])).reshape(-1)
             if self._violation(rows[np.asarray(self._ineq)]) > 1e-6:
@@ -612,7 +689,34 @@ class _PerLossGradCallback(Callback, _LiveValue):
         self._epochs: list = []
         self._init_live_value()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         from jno.utils.explainability import make_per_loss_grad_fn
 
         self._constraint_names: list = kwargs.get("constraint_names", [])
@@ -664,7 +768,23 @@ class GradientNormsCallback(_PerLossGradCallback):
         super().__init__(interval, mask)
         self._norms: list = []
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         out = self._compute(kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"])
         if out is not None:
             norms, _, _ = out
@@ -724,7 +844,23 @@ class CosSimilarityCallback(_PerLossGradCallback):
         super().__init__(interval, mask)
         self._cos: list = []
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         out = self._compute(kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"])
         if out is not None:
             _, cos_matrix, _ = out
@@ -804,7 +940,23 @@ class GradientAlignmentCallback(_PerLossGradCallback):
         super().__init__(interval, mask)
         self._align: list = []
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         out = self._compute(kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"])
         if out is not None:
             _, _, alignment = out
@@ -879,7 +1031,34 @@ class LossLandscapeCallback(Callback, _LiveValue):
         self._landscapes: list = []
         self._init_live_value()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         from jno.utils.explainability import make_landscape_fn
 
         self._landscape_fn = jax.jit(
@@ -896,7 +1075,23 @@ class LossLandscapeCallback(Callback, _LiveValue):
         )
         self._landscape_fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         if self._landscape_fn is None:
             return False
         epoch = kwargs["epoch"]
@@ -990,7 +1185,34 @@ class ResidualStatsCallback(Callback, _LiveValue):
         self._p99: list = []
         self._init_live_value()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         from jno.utils.explainability import make_residual_stats_fn
 
         self._n_constraints = kwargs["n_constraints"]
@@ -1015,7 +1237,23 @@ class ResidualStatsCallback(Callback, _LiveValue):
         )
         self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         if self._fn is None:
             return False
         epoch = kwargs["epoch"]
@@ -1151,7 +1389,34 @@ class InputSensitivityCallback(Callback, _LiveValue):
         self._values: list = []
         self._init_live_value()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         from jno.utils.explainability import make_expression_eval_fn
 
         if "all_ops" not in kwargs:
@@ -1171,7 +1436,23 @@ class InputSensitivityCallback(Callback, _LiveValue):
         )
         self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         if self._fn is None:
             return False
         epoch = kwargs["epoch"]
@@ -1280,7 +1561,34 @@ class NTKSpectrumCallback(Callback, _LiveValue):
         self._all: list = []
         self._init_live_value()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         from jno.utils.explainability import make_ntk_spectrum_fn
 
         if "all_ops" not in kwargs:
@@ -1302,7 +1610,23 @@ class NTKSpectrumCallback(Callback, _LiveValue):
         )
         self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         if self._fn is None:
             return False
         epoch = kwargs["epoch"]
@@ -1412,7 +1736,34 @@ class HessianSpectrumCallback(Callback, _LiveValue):
         self._sharpness: list = []
         self._init_live_value()
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         from jno.utils.explainability import make_hessian_spectrum_fn
 
         solver_constraints = kwargs.get("constraint_exprs")
@@ -1437,7 +1788,23 @@ class HessianSpectrumCallback(Callback, _LiveValue):
         # HVP lazily on first call.
         self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
     def on_epoch_end(self, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
         if self._fn is None:
             return False
         epoch = kwargs["epoch"]
@@ -1593,7 +1960,34 @@ class ENGDCallback(Callback):
         self._unravel = None
         self._G_cache = None
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         import equinox as eqx
         import paramax as _paramax
 
@@ -1675,7 +2069,34 @@ class ENGDCallback(Callback):
             _ = self._ls_jit(trainable, nat, kwargs["context"], kwargs["rng"])
             jax.block_until_ready(_)
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_before_update
     def on_before_update(self, *, grads, trainable, context, rng, epoch, **kwargs):
+        """Called between gradient computation and the optimizer update.
+
+        Subclasses may return a modified ``grads`` dict to redirect the
+        optimizer (e.g. to apply a preconditioner), or ``None`` to leave the
+        gradients unchanged.  The returned dict must have the same pytree
+        structure as ``grads``.
+
+        Called only when the solver detects that at least one active callback
+        overrides this method (it is a no-op in the base class).  Requires
+        ``inner_steps=1`` and no Bayesian models.
+
+        Keyword Args:
+            grads: Parameter gradient pytree ``{lid: model_params}``.
+            trainable: Current trainable parameter pytree.
+            context: Domain context (current batch).
+            rng: Current JAX PRNG key (Python-side; not consumed here).
+            epoch (int): Current outer epoch (Python integer, 0-indexed).
+            total_loss: The scalar loss at this step, as descended.
+            individual_losses: Per-entry values, one per ``jno.core`` constraint entry --
+                **including** any ``jno.le``/``jno.ge`` inequality constraints, which are
+                evaluated with everything else but held out of ``total_loss``. A constrained
+                optimiser reads its ``g_j`` here rather than recomputing them.
+
+        Returns:
+            Modified ``grads`` dict, or ``None`` to leave unchanged.
+        """
         if self._gram_and_solve_jit is None or self._unravel is None:
             return None
 

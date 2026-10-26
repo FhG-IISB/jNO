@@ -30,23 +30,16 @@ import numpy as np
 class SimplexPool:
     """Flat list of simplices for in-JIT uniform sampling.
 
-    Attributes
-    ----------
-    simplices:
-        Vertex coordinates, shape ``(T, V, D)``.  ``V`` is the number of
-        vertices per simplex (2 for segments, 3 for triangles).  ``D`` is the
-        spatial dimension.
-    weights:
-        Per-simplex measure (length for V=2, area for V=3), shape ``(T,)``.
-        Not normalised; the sampler divides by ``weights.sum()`` at use time so
-        downstream code can rely on the raw measures.
-    kind:
-        Either ``"lerp"`` (V=2, uniform-on-segment via linear interpolation)
-        or ``"barycentric"`` (V=3, uniform-on-triangle via the sqrt trick).
-    normals:
-        Optional ``(T, D)`` per-simplex outward unit normal.  Populated only
-        for boundary tags so the sampler can simultaneously emit ``n_<tag>``
-        alongside the spatial coordinates.
+    Attributes:
+        simplices: Vertex coordinates, shape ``(T, V, D)``.  ``V`` is the number of vertices per simplex
+            (2 for segments, 3 for triangles).  ``D`` is the spatial dimension.
+        weights: Per-simplex measure (length for V=2, area for V=3), shape ``(T,)``. Not normalised; the
+            sampler divides by ``weights.sum()`` at use time so downstream code can rely on the raw
+            measures.
+        kind: Either ``"lerp"`` (V=2, uniform-on-segment via linear interpolation) or ``"barycentric"``
+            (V=3, uniform-on-triangle via the sqrt trick).
+        normals: Optional ``(T, D)`` per-simplex outward unit normal.  Populated only for boundary tags
+            so the sampler can simultaneously emit ``n_<tag>`` alongside the spatial coordinates.
     """
 
     simplices: jnp.ndarray

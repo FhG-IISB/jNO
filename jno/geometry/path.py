@@ -22,7 +22,18 @@ def _pad3(p):
 
 
 class Path:
-    """A contour/trajectory under construction. Start at a point, then chain segments."""
+    """A contour/trajectory under construction: start at a point, then chain segments.
+
+    Example::
+
+        p = jno.Path(0, 0).line_to(1, 0, name="bottom").arc_to(0, 1, through=(0.7071, 0.7071)).line_to(0, 0)
+        d = p.face(size=0.05).domain()
+
+    Args:
+        x: start point x.
+        y: start point y.
+        z: start point z (0 for a planar contour).
+    """
 
     __slots__ = ("_start", "_segs")
 
@@ -38,18 +49,50 @@ class Path:
         return p
 
     def line_to(self, x: float, y: float, z: float = 0.0, name: Optional[str] = None) -> "Path":
-        """Straight segment to ``(x, y, z)``."""
+        """Append a straight segment to ``(x, y, z)``.
+
+        Args:
+            x: end point x.
+            y: end point y.
+            z: end point z.
+            name: boundary name of this segment (default: auto-named).
+
+        Returns:
+            Path: the extended path.
+        """
         return Path._extend(self._start, self._segs + (("line", (float(x), float(y), float(z)), name),))
 
     def arc_to(self, x: float, y: float, z: float = 0.0, through=None, name: Optional[str] = None) -> "Path":
-        """Circular arc to ``(x, y, z)`` passing through the point ``through`` (a 3-point arc)."""
+        """Append a circular arc to ``(x, y, z)`` passing through ``through`` (a 3-point arc).
+
+        Args:
+            x: end point x.
+            y: end point y.
+            z: end point z.
+            through: a point on the arc, ``(x, y[, z])``; required.
+            name: boundary name of this segment (default: auto-named).
+
+        Returns:
+            Path: the extended path.
+
+        Raises:
+            ValueError: if ``through`` is missing.
+        """
         if through is None:
             raise ValueError("arc_to requires through=<point on the arc>")
         seg = ("arc", (float(x), float(y), float(z)), _pad3(through), name)
         return Path._extend(self._start, self._segs + (seg,))
 
     def face(self, name: str = "interior", size=None):
-        """Close the contour (using its x,y) and return it as a 2-D :class:`~jno.geometry.shape.shape`."""
+        """Close the contour (using its x, y) and return it as a 2-D :class:`~jno.geometry.shape.shape`.
+
+        Args:
+            name: the region name of the enclosed face.
+            size: target mesh size, a number or a function ``f(x, y)``.
+
+        Returns:
+            shape: the face.
+        """
         from .primitives import Contour
         from .shape import _LEAF_KEYS
         from .shape import shape as _shape

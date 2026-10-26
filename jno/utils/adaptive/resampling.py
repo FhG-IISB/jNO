@@ -257,6 +257,13 @@ class CR3(ResamplingStrategy):
         Kept separate from :meth:`resample` because gamma is state carried BETWEEN resamples: doing
         the update inside a traced call would either capture a tracer in ``self`` or be dropped.
         Returns a JAX scalar; the caller decides when to make it concrete.
+
+        Args:
+            residuals: the current PDE residuals at the collocation points.
+            gate_values: the causal gate value at each point.
+
+        Returns:
+            The next gamma, a JAX scalar.
         """
         Lg = jnp.mean(residuals**2 * gate_values)
         step = self.eta_g * jnp.minimum(jnp.exp(-self.epsilon * Lg), self.delta_max)
@@ -813,9 +820,12 @@ class RAD(ResamplingStrategy):
 
 
 class RandomResampling(ResamplingStrategy):
-    """Randomly resample a fraction of collocation points.
+    """Randomly resample a fraction of the collocation points, a baseline for the adaptive strategies.
 
-    Useful as a baseline to prevent overfitting to specific points.
+    Args:
+        resample_every: resample every this many epochs.
+        resample_fraction: fraction of the points to replace each time, in ``[0, 1]``.
+        start_epoch: first epoch at which resampling may happen.
     """
 
     needs_residuals = False

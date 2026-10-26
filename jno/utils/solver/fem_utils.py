@@ -3726,35 +3726,24 @@ def build_periodic_prolongation(
     integral (L2) constraint, so it is more accurate for fields the main space cannot
     represent — measured at 4-40% lower RMS error on a non-matching 3-D interface.
 
-    Parameters
-    ----------
-    points:
-        ``(n_nodes, dim)`` array of FEM node coordinates (the assembly mesh).
-    pairs:
-        Ordered ``(main_tag, secondary_tag)`` boundary pairings, e.g.
-        ``[("left", "right"), ("bottom", "top")]``.
-    tag_indices:
-        Mapping from boundary tag name to the global node ids on that tag.
-    vec:
-        Number of scalar components per node. ``vec > 1`` returns the
-        node-major expansion ``kron(P_node, I_vec)``.
-    tol:
-        Coordinate-matching tolerance for the in-interface coordinates. When
-        ``None`` it is derived from the bounding-box diagonal.
-    facets:
-        Optional ``{main_tag: (n_facets, k) node-id array}`` of the main
-        boundary facets, required only for the non-matching (interpolatory) path.
+    Args:
+        points: ``(n_nodes, dim)`` array of FEM node coordinates (the assembly mesh).
+        pairs: Ordered ``(main_tag, secondary_tag)`` boundary pairings, e.g. ``[("left", "right"),
+            ("bottom", "top")]``.
+        tag_indices: Mapping from boundary tag name to the global node ids on that tag.
+        vec: Number of scalar components per node. ``vec > 1`` returns the node-major expansion
+            ``kron(P_node, I_vec)``.
+        tol: Coordinate-matching tolerance for the in-interface coordinates. When ``None`` it is derived
+            from the bounding-box diagonal.
+        facets: Optional ``{main_tag: (n_facets, k) node-id array}`` of the main boundary facets,
+            required only for the non-matching (interpolatory) path.
 
-    Returns
-    -------
-    dict with keys:
-        ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
-        ``P_node``          : node-level prolongation (``vec == 1`` form).
-        ``kept_nodes``      : sorted global ids of the retained (main/free) nodes.
-        ``secondary_to_main`` : resolved secondary-node -> main-node mapping (exact ties).
-        ``n_full``          : full node count.
-        ``n_red``           : reduced node count.
-        ``vec``             : component count used.
+    Returns:
+        dict with keys: ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
+            ``P_node``          : node-level prolongation (``vec == 1`` form). ``kept_nodes``      :
+            sorted global ids of the retained (main/free) nodes. ``secondary_to_main`` : resolved
+            secondary-node -> main-node mapping (exact ties). ``n_full``          : full node count.
+            ``n_red``           : reduced node count. ``vec``             : component count used.
     """
     pts = np.asarray(points, dtype=np.float64)
     n_nodes = pts.shape[0]

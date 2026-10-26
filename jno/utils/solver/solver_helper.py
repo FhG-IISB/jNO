@@ -256,10 +256,10 @@ def is_temporal_var(node: Any) -> bool:
 
 
 def max_temporal_derivative_order(node: Any) -> int:
-    """
-    Return the maximum temporal derivative order found in an expression tree.
+    """Return the maximum temporal derivative order found in an expression tree.
 
-    Examples:
+    Example::
+
         grad(u, t)          -> 1
         grad(grad(u,t), t)  -> 2
         Hessian(u, [t])     -> 2

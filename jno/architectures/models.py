@@ -219,18 +219,52 @@ class nn:
         model = jno.nn.wrap(foundax.mlp(2, hidden_dims=64, key=key))
     """
 
-    def __new__(cls, module=None, *args, **kwargs):
-        """Alias ``nn(module, ...)`` to ``nn.wrap(module, ...)``.
+    # docstring-from: jno.architectures.models.nn.wrap
+    def __new__(cls, module=None, space=None, name: str = "", weight_path: str = None):
+        """Wrap a module for use in the jno pipeline.
 
-        This keeps the fluent factory API while allowing direct callable usage.
-        Calling ``nn()`` with no arguments still creates an instance.
+        This is the primary method for integrating custom architectures into
+        the jno framework. It handles both standard wrapping and architecture
+        search scenarios.
+
+        Args:
+            module: An ``eqx.Module`` instance (for standard use), a legacy
+                Flax ``nn.Module``, or a class (for architecture search).
+            space: Optional ``ArchSpace`` for hyperparameter tuning. When
+                provided, ``module`` must be a class, not an instance.
+            name: Optional display name.
+            weight_path: Optional path to pretrained weights.
+
+        Returns:
+            Model: Standard wrapped module (when space=None).
+            TunableModule: Tunable module for architecture search (when space provided).
+
+        Raises:
+            ValueError: If ``space`` is provided but ``module`` is an instance.
+
+        Example:
+            >>> # Wrap a custom equinox module
+            >>> import foundax
+            >>> model = nn.wrap(foundax.mlp(2, output_dim=1, key=jax.random.PRNGKey(0)))
         """
-        if module is None and not args and not kwargs:
+        # ``jno.nn(module, ...)`` is ``jno.nn.wrap(module, ...)``; ``jno.nn()`` with nothing still makes an instance.
+        if module is None and space is None and not name and weight_path is None:
             return super().__new__(cls)
-        return cls.wrap(module, *args, **kwargs)
+        return cls.wrap(module, space=space, name=name, weight_path=weight_path)
 
     @staticmethod
     def linear(in_features: int, out_features: int, use_bias: bool = True, *, key: Any = None):
+        """A batched linear layer, :class:`jno.architectures.linear.Linear` (``(..., in) -> (..., out)``).
+
+        Args:
+            in_features: input size.
+            out_features: output size.
+            use_bias: add a learned bias.
+            key: PRNG key; ``None`` draws one from jNO's global seed.
+
+        Returns:
+            Linear: the layer (wrap it with ``jno.nn(...)`` to use it in a trace).
+        """
         return Linear(in_features, out_features, use_bias, key=_resolve_key(key))
 
     @staticmethod

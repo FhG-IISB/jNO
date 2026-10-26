@@ -57,8 +57,28 @@ def fornberg(offsets, deriv: int) -> np.ndarray:
     return c[:, m]
 
 
+# docstring-from: jno.stencils.fd
 class FDStencil(str):
-    """A finite-difference stencil spec (see :func:`fd`). A ``str``, so it is a valid ``scheme=``."""
+    """A finite-difference stencil, for ``scheme=``: see the module docstring.
+
+    Args:
+        order: accuracy order of a central stencil (even). Default 2.
+        points: integer offsets the stencil reads, e.g. ``(-2, -1, 0, 1)``; weights by Fornberg.
+        weights: ``{offset: weight}`` of a first-derivative stencil for unit spacing (divided by h).
+        boundary: order of the one-sided stencil used where the interior one does not fit. Default: the
+            interior order.
+        upwind: the wind (an expression: a number, a formula, a field, the unknown itself; a vector wind gives
+            its component along each axis). The first derivative is then upwind-biased per node, of order
+            ``order`` (default 1): it reads the side the wind comes from.
+        fit: unstructured meshes: the degree of the local polynomial least-squares fit the derivatives are read
+            from (default ``order + deriv − 1``: a first derivative of a degree-``order`` fit, a second of a
+            degree-``order+1`` one).
+        rings: unstructured meshes: how many rings of neighbours the fit uses (default: the fewest giving every
+            node 1.5× as many neighbours as the fit has coefficients).
+        average: the coefficient between nodes in the conservative form of ``(κ·u.x).x``: ``"exact"`` (κ at
+            the half-points; the default when κ reads no stored field), ``"arithmetic"`` (the default
+            otherwise) or ``"harmonic"``.
+    """
 
     order: int | None
     points: tuple | None
@@ -135,7 +155,16 @@ class FDStencil(str):
 
         Interior nodes share one stencil; the nodes too close to an end for it get a one-sided stencil of
         order ``boundary`` with as many points, shifted inward. A periodic axis uses the interior stencil
-        everywhere (the caller wraps)."""
+        everywhere (the caller wraps).
+
+        Args:
+            deriv: the derivative order (1 or 2).
+            n: the number of nodes along the axis.
+            periodic: whether the axis is periodic.
+
+        Returns:
+            list: one ``(offsets, weights)`` pair per node.
+        """
         if self.weights is not None:
             if deriv != 1:
                 raise ValueError(

@@ -614,6 +614,9 @@ class TraceEvaluator:
     Node handlers are registered via the ``_HANDLERS`` class-level dispatch
     table.  To add support for a new trace node type, define a method
     ``_eval_<NodeType>(self, expr, ctx)`` and add an entry in ``_HANDLERS``.
+
+    Args:
+        params: the model parameters, ``{layer_id: module}``, the evaluated networks read.
     """
 
     # Sentinel: the sampled points ARE the mesh vertices, so the mesh→sampled map is the identity and the
@@ -654,7 +657,19 @@ class TraceEvaluator:
         key=None,
         active_region=None,
     ) -> jnp.ndarray:
-        """Evaluate expression for a SINGLE batch (no batch dimension)."""
+        """Evaluate an expression for a SINGLE batch (no batch dimension).
+
+        Args:
+            expr: the expression.
+            context: the point and parameter arrays by tag, ``(N, D)`` for points.
+            var_bindings: substitutions ``{id(Variable): node}`` applied while evaluating (used by kernel
+                integrals and point evaluations); empty for an ordinary evaluation.
+            key: PRNG key for noise nodes.
+            active_region: unused; the region is resolved from the expression.
+
+        Returns:
+            jnp.ndarray: the value, ``(N,)`` or ``(N, K)``.
+        """
         ctx = self._EvalCtx(
             context=context or {},
             var_bindings=var_bindings or {},
@@ -3424,8 +3439,7 @@ class TraceEvaluator:
             raise ValueError(f"Unsupported normalized coeff shape {coeff.shape}")
 
     def _assemble_grad_basis_integrand(self, coeff_vec, v_grads_JxW_flat, flat_entity_nodes, num_total_nodes):
-        """
-        Assemble coeff : grad(phi)-type terms.
+        """Assemble coeff : grad(phi)-type terms.
 
         Supported canonical cases
         -------------------------
@@ -3437,10 +3451,9 @@ class TraceEvaluator:
             coeff_vec         : (Nq_total, vec, dim)
             v_grads_JxW_flat  : (Nq_total, n_loc, test_vec, dim)
 
-        Notes
-        -----
-        The assembler may provide test_vec = 1 even for vector-valued problems. In that case
-        the test gradient weights are broadcast over the coefficient component axis.
+        Note:
+            The assembler may provide test_vec = 1 even for vector-valued problems. In that case
+            the test gradient weights are broadcast over the coefficient component axis.
         """
         coeff_vec = jnp.asarray(coeff_vec)
         v_grads_JxW_flat = jnp.asarray(v_grads_JxW_flat)

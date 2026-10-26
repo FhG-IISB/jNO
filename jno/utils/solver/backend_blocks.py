@@ -140,8 +140,7 @@ def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
 
 @dataclass
 class SemidiscreteTimeBlock:
-    """
-    Solver-agnostic semidiscrete transient block.
+    """Solver-agnostic semidiscrete transient block.
 
     A `SemidiscreteTimeBlock` is returned by:
 
@@ -152,8 +151,8 @@ class SemidiscreteTimeBlock:
     `residual`, `state0`, `dt`) and step it with your own integrator, or hand it to
     `fem.solve()`'s default backward-Euler.
 
-    Supported payloads
-    ------------------
+    Supported payloads:
+
     Linear semidiscrete payload:
 
         M u_dot + A(t, args) u = c + f(t, args)
@@ -180,61 +179,47 @@ class SemidiscreteTimeBlock:
         residual(u, t, args)
         jacobian(u, t, args)
 
-    Important fields
-    ----------------
-    backend:
-        Backend identifier. Usually `"fem_time"`.
-    mode:
-        Time-integration mode hint, usually `"implicit"` or `"explicit"`.
-    time_order:
-        Temporal order of the semidiscrete problem. Currently first-order
-        FEM-time blocks are supported by the adapters.
-    spatial_kind:
-        Spatial discretization origin, usually `"weak_form"`.
-    ir:
-        Lowered weak-form IR used to construct this block.
-    mass_expr:
-        Symbolic mass-like weak-form expression, if available.
-    residual_expr:
-        Symbolic residual-like weak-form expression, if available.
-    boundary_exprs:
-        Boundary weak-form terms grouped by boundary region id.
-    rhs:
-        Optional RHS callable. Usually unused for semidiscrete weak-form blocks.
-    jacobian:
-        Nonlinear residual Jacobian callable `jacobian(u, t, args)`.
-    mass:
-        Mass operator callable `mass(t, args)`.
-    residual:
-        Nonlinear residual callable `residual(u, t, args)`.
-    nonlinear_runtime:
-        Runtime diagnostics for nonlinear semidiscrete-time assembly.
-    state0:
-        Initial state vector.
-    initial_conditions:
-        Raw initial-condition object, if supplied.
-    t0, t1:
-        Start and end time.
-    dt:
-        Time-step size or time-step hint.
-    eval_context:
-        FEM evaluation context copied from the domain.
-    metadata:
-        Classification, lowering, and diagnostic metadata.
-    M, A:
-        Linear semidiscrete mass and optional constant operator matrices.
-    operator_fn:
-        Optional runtime linear-operator callback ``operator_fn(t, args)``.
-        When populated, adapters evaluate it at runtime instead of using the
-        constant ``A`` matrix. This keeps inverse parameters differentiably
-        connected to the physical solve.
-    affine_bias:
-        Constant affine vector `c` in `M u_dot + A u = c + f(t)`.
-    forcing_vector_fn:
-        Optional forcing callback `f(t, args)`.
-    forcing_mode:
-        Text label describing how forcing is represented, for example
-        `"none"`, `"weak_auto"`, `"user_callback"`, or `"embedded_residual"`.
+    Attributes:
+        backend: Backend identifier. Usually `"fem_time"`.
+        mode: Time-integration mode hint, usually `"implicit"` or `"explicit"`.
+        time_order: Temporal order of the semidiscrete problem. Currently first-order FEM-time blocks
+            are supported by the adapters.
+        spatial_kind: Spatial discretization origin, usually `"weak_form"`.
+        ir: Lowered weak-form IR used to construct this block.
+        mass_expr: Symbolic mass-like weak-form expression, if available.
+        residual_expr: Symbolic residual-like weak-form expression, if available.
+        boundary_exprs: Boundary weak-form terms grouped by boundary region id.
+        rhs: Optional RHS callable. Usually unused for semidiscrete weak-form blocks.
+        jacobian: Nonlinear residual Jacobian callable `jacobian(u, t, args)`.
+        mass: Mass operator callable `mass(t, args)`.
+        residual: Nonlinear residual callable `residual(u, t, args)`.
+        nonlinear_runtime: Runtime diagnostics for nonlinear semidiscrete-time assembly.
+        state0: Initial state vector.
+        initial_conditions: Raw initial-condition object, if supplied.
+        t0: Start time.
+        t1: End time.
+        dt: Time-step size or time-step hint.
+        eval_context: FEM evaluation context copied from the domain.
+        metadata: Classification, lowering, and diagnostic metadata.
+        M: Mass matrix of the linear payload.
+        A: Optional constant operator matrix of the linear payload.
+        operator_fn: Optional runtime linear-operator callback ``operator_fn(t, args)``. When populated,
+            adapters evaluate it at runtime instead of using the constant ``A`` matrix. This keeps
+            inverse parameters differentiably connected to the physical solve.
+        affine_bias: Constant affine vector `c` in `M u_dot + A u = c + f(t)`.
+        forcing_vector_fn: Optional forcing callback `f(t, args)`.
+        forcing_mode: Text label describing how forcing is represented, for example `"none"`,
+            `"weak_auto"`, `"user_callback"`, or `"embedded_residual"`.
+        mass_residual: state-dependent mass as a backward-Euler residual ``∫ c(u)(u - u_prev) v``, when
+            the mass coefficient depends on ``u``.
+        mass_residual_jac: its exact Jacobian ``(u, t, args) -> J``.
+        state0_fn: ``args -> s0`` for a parametric initial state (a network-valued initial condition).
+        mass_fn: ``(t, args) -> M`` for a parametric mass on the linear path.
+        runtime_parameter_exprs: the runtime parameters the form declares, by name.
+        operator_basis: affine decomposition of the operator in the parameters, by name.
+        forcing_basis: affine source/load callbacks, ``forcing_basis[name](t) -> vector``.
+        prolongation: periodic prolongation matrix ``P`` (``n_full x n_red``), or ``None``.
+        step_merge_plan: host-side merge plan for the step tangent ``J + M/dt``, or ``None``.
     """
 
     backend: str = "transient"

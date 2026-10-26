@@ -17,16 +17,15 @@ setup matrix, correctness never does. Rebuild (``spec.build(A)``) when it drifts
 
 pyamg is an **optional** dependency (lazily imported here only); everything else is jNO + JAX.
 
-References
-----------
-[1] P. Vaněk, J. Mandel, M. Brezina, *Algebraic Multigrid by Smoothed Aggregation for Second and
-    Fourth Order Elliptic Problems*, Computing 56, 1996 — the SA-AMG setup this delegates to.
-[2] N. Bell, L. N. Olson, J. Schroder, B. Zaman, *PyAMG: Algebraic Multigrid Solvers in Python*,
-    J. Open Source Software 8(87):5495, 2023.
-[3] M. Adams, M. Brezina, J. Hu, R. Tuminaro, *Parallel Multigrid Smoothing: Polynomial versus
-    Gauss-Seidel*, J. Comput. Phys. 188, 2003 — polynomial (Chebyshev) smoothing as the
-    parallel/GPU-friendly substitute for Gauss-Seidel; smoothing window ``[lmax/30, 1.1 lmax]``
-    per pyamg's convention.
+References:
+    [1] P. Vaněk, J. Mandel, M. Brezina, *Algebraic Multigrid by Smoothed Aggregation for Second and
+        Fourth Order Elliptic Problems*, Computing 56, 1996 — the SA-AMG setup this delegates to.
+    [2] N. Bell, L. N. Olson, J. Schroder, B. Zaman, *PyAMG: Algebraic Multigrid Solvers in Python*,
+        J. Open Source Software 8(87):5495, 2023.
+    [3] M. Adams, M. Brezina, J. Hu, R. Tuminaro, *Parallel Multigrid Smoothing: Polynomial versus
+        Gauss-Seidel*, J. Comput. Phys. 188, 2003 — polynomial (Chebyshev) smoothing as the
+        parallel/GPU-friendly substitute for Gauss-Seidel; smoothing window ``[lmax/30, 1.1 lmax]``
+        per pyamg's convention.
 """
 
 from __future__ import annotations

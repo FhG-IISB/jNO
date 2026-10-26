@@ -61,6 +61,22 @@ class Filaments(NamedTuple):
     the array is two nonzeros per column, and holding it densely is what the size of a real problem
     goes into. On the example power module -- 137,350 bars over 55,000 nodes -- dense is 60 GB and
     sparse is a few MB.
+
+    Attributes:
+        pos: ``(N*quad, 3)`` sub-point positions.
+        mom: ``(N*quad, 3)`` tangent x length x Gauss weight.
+        self_g: ``(N,)`` per-filament self term.
+        group: ``(N*quad,)`` filament label of each sub-point.
+        incidence: ``(n_node, N)`` sparse; ``+1`` where a filament leaves a node, ``-1`` where it enters.
+        length: ``(N,)`` filament lengths.
+        area: ``(N,)`` conducting cross-sections.
+        nodes: ``(n_node, 3)`` node positions.
+        part: ``(N,)`` index of the shape each filament came from.
+        skin: ``(N,)`` transverse size the skin effect acts over.
+        round_: ``(N,)`` whether the section is round (cylindrical internal impedance) or a bar (slab).
+        span: ``(N,)`` elements across the conductor's thickness here.
+        lattice: the grid description when the elements sit on one (the FFT path), else ``None``.
+        pair: transfer-impedance pairing across a thickness, else ``None``.
     """
 
     pos: object  # (N*quad, 3) sub-point positions
@@ -1985,13 +2001,41 @@ def _warn_once(msg: str) -> None:
         logging.getLogger("jno").warning(msg)
 
 
+# docstring-from: jno.peec._graded
 @dataclass(frozen=True)
 class GradedGrid:
-    """Ask `bar_filaments` for a grid refined toward every conductor face.
+    """Refine the grid toward every conductor face: ``grid=jno.peec.graded(fine=..., halo=...)``.
 
-    Built by :func:`jno.peec.graded`. Carries only the two numbers the user chooses -- how fine to
-    get and how far that reaches -- because everything else (the extent, the base pitch, which
-    coordinates are features) is already in the geometry.
+    One pitch cannot serve a real layout. Every module here puts a 1.00 mm minimum trace on a plate
+    tens of millimetres across, and resolving that trace uniformly costs one to three million
+    elements — so the runs that could be afforded had ONE cell across the narrowest conductor, and
+    current crowding has no edge to crowd against in a discretisation with no edge.
+
+    Grading toward the faces puts the elements where that happens. Measured on layout1's plate-less
+    loop against a converged Ansys Q3D reference of 54.505 nH::
+
+        uniform 1.0 mm    13 381 elements    58.803 nH    +7.88 %
+        uniform 0.5 mm    53 458 elements    57.957 nH    +6.33 %
+        uniform 0.4 mm    83 705 elements    57.340 nH    +5.20 %
+        graded             8 192 elements    57.299 nH    +5.13 %
+        graded            14 111 elements    56.604 nH    +3.85 %
+
+    8 192 graded elements match 83 705 uniform ones, and 14 111 beat them while still falling —
+    where the uniform sequence had flattened.
+
+    Args:
+        fine: cell size near a conductor face, metres.
+        halo: how far that fine spacing reaches either side of a face, metres. The base spacing away
+            from every face stays each shape's own ``size=``.
+
+    Returns:
+        A grid spec for ``jno.peec(..., grid=...)``.
+
+    Note:
+        A graded grid is **not** translation-invariant, so there is no FFT for it. Pass
+        ``operator=jno.solve.hierarchical(...)`` to ``solve()``; `lattice_apply` refuses a graded
+        lattice rather than returning the uniform-grid answer, which would be right where the
+        spacing is constant and wrong everywhere it changes.
     """
 
     fine: float
@@ -2036,13 +2080,31 @@ def _graded_edges(shapes, lo, hi, base, fine, halo):
     return out
 
 
+# docstring-from: jno.peec._faces
 @dataclass(frozen=True)
 class FacesGrid:
-    """Ask `bar_filaments` for a grid with a line on EVERY conductor face, uniform in between.
+    """A grid line on every conductor face, uniform in between: ``grid=jno.peec.faces(pitch=...)``.
 
-    Built by :func:`jno.peec.faces`. The one grid on which a solid's extents can be design
-    variables: a face that is a grid line can move with its line, and the cells between two face
-    lines stretch while their count, their owner and their numbering stay as built.
+    The grid on which a solid's GEOMETRY is a design variable. Every face of every solid is a cell
+    boundary, so ``BuiltPEEC.solve(geometry={"trace": (x0, y0, z0, x1, y1, z1)})`` can move that
+    face with its line while the cells between two face lines stretch -- cell counts, ownership and
+    node numbering stay as built, and the loop inductance is differentiable in a trace's width,
+    length and position, a die's position and a layer's thickness, exactly as it already is in a
+    wire's vertices. Between consecutive faces the cells are ``max(1, round(gap / pitch))`` equal
+    ones, so a clearance narrower than the pitch is still one cell rather than a short.
+
+    Args:
+        pitch: the cell size between faces, metres; one number or one per axis.
+
+    Returns:
+        A grid spec for ``jno.peec(..., grid=...)``.
+
+    Note:
+        Like a graded grid this one is not translation-invariant: solve with
+        ``operator=jno.solve.hierarchical(...)``. Under ``geometry=`` the hierarchical structure is
+        built once from the reference geometry and refilled from the moved one, so a design that
+        moves a face far -- past another line, or so that a cell closes -- needs a rebuild at that
+        design rather than a stretch.
     """
 
     pitch: object  # one length, or one per axis

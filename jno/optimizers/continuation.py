@@ -34,8 +34,67 @@ import numpy as np
 from ..utils.adaptive.callbacks import Callback as _Callback
 
 
+# docstring-from: jno.optimizers.continuation.simp_continuation
 class SIMPContinuation(_Callback):
-    """Raise the SIMP exponent on the paper's schedule. See :func:`simp_continuation`."""
+    """Raise the SIMP exponent once the objective settles and the design is still grey.
+
+    Register it **after** the design optimiser's own callback -- ``jno.core`` applies
+    ``on_before_update`` hooks in list order, each seeing the previous one's gradients, and this
+    one only replaces the ``penal`` entry.
+
+    Args:
+        penal: The ``jno.np.parameter`` used as the SIMP exponent in the weak form. Give it
+            ``optax.sgd(1.0)`` and initialise it to ``start``; this hook writes it directly.
+        density: The design-density parameter, read to compute ``M_nd`` (eq. 20).
+        start: Initial exponent. 3 is the paper's, and the field's, default.
+        step: Increment per continuation step.
+        maximum: Ceiling, so a design that never binarises cannot run the exponent away.
+        tol: Relative-change tolerance for "the objective has converged" (the paper's 1e-4).
+        window: How many consecutive intervals must all be below ``tol`` (the paper's three).
+        mnd_tol: Grey-level target. Above this, the exponent keeps rising. **1e-4**, which is
+            what the paper states in Sec. 3.1 -- 'if the gray level indicator M_nd remains
+            larger than 10^-4, the penalization factor is increased by one until the criterion
+            on M_nd is satisfied'. This default was 1e-2, attributed to the paper in the same
+            breath; a design at M_nd = 1e-2 still carries visible intermediate-density members,
+            which is the difference between their Fig. 4d and Fig. 4e.
+        physical: Optional map from the design density to the physical one, e.g.
+            ``d.patch_filter()``. Pass it whenever the density is reparameterised with
+            ``constrain(...)``: the hook sees the partitioned trainable half, where the paramax
+            wrapper cannot be applied, so ``M_nd`` would otherwise be measured on the wrong field.
+        watch: Index into ``individual_losses`` whose convergence is tested, instead of the total
+            loss. Pass the compliance term's index whenever the objective also carries a decaying
+            penalty -- the total then keeps moving because the penalty does, and the window never
+            closes.
+        every: Sample the convergence window every ``n`` iterations, so ``window`` samples span an
+            *interval* rather than ``window`` consecutive steps. The paper's criterion is over
+            three iteration intervals; with ``every=1`` the test is much stricter than theirs and
+            a run that is still making steady progress never satisfies it.
+        patience: Raise ``penal`` after this many samples without a raise, even if the objective
+            has not converged. Left ``None`` the behaviour is exactly the paper's. Set it when the
+            objective does not settle -- an unregularised run that fragments rather than
+            converging, or an MMA iterate that keeps oscillating above ``tol`` -- because there
+            ``penal`` otherwise sits at ``start`` for the whole run and the design has no reason to
+            go binary, which is backwards: penalisation is needed most where convergence is worst.
+
+    Attributes:
+        history: One ``(epoch, penal, reason)`` per raise, ``reason`` being ``"converged"`` or
+            ``"stalled"``. **Three-tuples**, not pairs -- ``reason`` was added with ``patience``.
+        m_nd: The grey-level indicator (eq. 20) at the last sample, on the physical density.
+
+    Example::
+
+        penal = jno.np.parameter((1,), name="penal")
+        penal.initialize(lambda k, s, dtype=None: jnp.full(s, 3.0))
+        penal.optimizer(optax.sgd(1.0))
+        cont = jno.optimizers.simp_continuation(penal, rho)
+        jno.core([...], domain=d).solve(300, callbacks=[cont])
+        for epoch, penal_new, why in cont.history:
+            print(epoch, penal_new, why)   # when each step fired, and what fired it
+
+    References:
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 2.3.2, Fig. 4a.
+        Sigmund, *Struct. Multidisc. Optim.* **21**(2), 2001, 120-127 (SIMP and continuation).
+    """
 
     def __init__(
         self,
@@ -75,7 +134,34 @@ class SIMPContinuation(_Callback):
         recent = self._losses[-(self.window + 1) :]
         return all(abs(b - a) <= self.tol * max(abs(a), 1e-30) for a, b in zip(recent[:-1], recent[1:]))
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_before_update
     def on_before_update(self, *, grads, trainable, epoch, **kw):
+        """Called between gradient computation and the optimizer update.
+
+        Subclasses may return a modified ``grads`` dict to redirect the
+        optimizer (e.g. to apply a preconditioner), or ``None`` to leave the
+        gradients unchanged.  The returned dict must have the same pytree
+        structure as ``grads``.
+
+        Called only when the solver detects that at least one active callback
+        overrides this method (it is a no-op in the base class).  Requires
+        ``inner_steps=1`` and no Bayesian models.
+
+        Keyword Args:
+            grads: Parameter gradient pytree ``{lid: model_params}``.
+            trainable: Current trainable parameter pytree.
+            context: Domain context (current batch).
+            rng: Current JAX PRNG key (Python-side; not consumed here).
+            epoch (int): Current outer epoch (Python integer, 0-indexed).
+            total_loss: The scalar loss at this step, as descended.
+            individual_losses: Per-entry values, one per ``jno.core`` constraint entry --
+                **including** any ``jno.le``/``jno.ge`` inequality constraints, which are
+                evaluated with everything else but held out of ``total_loss``. A constrained
+                optimiser reads its ``g_j`` here rather than recomputing them.
+
+        Returns:
+            Modified ``grads`` dict, or ``None`` to leave unchanged.
+        """
         import equinox as eqx
         import jax
         import jax.numpy as jnp
@@ -232,8 +318,26 @@ def simp_continuation(
     )
 
 
+# docstring-from: jno.optimizers.continuation.geometric_decay
 class GeometricDecay(_Callback):
-    """Multiply a scalar parameter by ``gamma`` every iteration. See :func:`geometric_decay`."""
+    """Decay a scalar parameter geometrically, ``b_iter = gamma * b_(iter-1)`` — eq. (41).
+
+    Written for the perimeter barrier's weight (Jung, Yun & Kim, *Computers & Structures* **331**
+    (2026) 108403, eq. 40-41). The objective is ``C - beta * P* log(P* - P)``: with ``beta`` fixed,
+    the barrier holds the design well short of the target ``P*`` forever, because the penalty is
+    still paying for perimeter it is allowed to spend. Shrinking ``beta`` lets the design approach
+    ``P*`` from below as the run proceeds — the paper's own words, "to reduce the approximation
+    error of the perimeter constraint", and the standard interior-point continuation.
+
+    Give the parameter ``optax.sgd(1.0)`` and initialise it to ``start``; this hook writes it
+    directly, the same way :class:`SIMPContinuation` writes ``penal``.
+
+    Args:
+        param: The scalar ``jno.np.parameter`` to decay.
+        gamma: Decay factor per iteration, in ``(0, 1]``. ``1.0`` is no decay.
+        start: Initial value. Must match the parameter's initializer.
+        minimum: Floor, so the barrier never vanishes entirely and let the design cross ``P*``.
+    """
 
     def __init__(self, param: Any, gamma: float, *, start: float = 1.0, minimum: float = 0.0):
         if not 0.0 < float(gamma) <= 1.0:
@@ -243,7 +347,34 @@ class GeometricDecay(_Callback):
         self.value = float(start)
         self.history: List[float] = []
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_before_update
     def on_before_update(self, *, grads, epoch, **kw):
+        """Called between gradient computation and the optimizer update.
+
+        Subclasses may return a modified ``grads`` dict to redirect the
+        optimizer (e.g. to apply a preconditioner), or ``None`` to leave the
+        gradients unchanged.  The returned dict must have the same pytree
+        structure as ``grads``.
+
+        Called only when the solver detects that at least one active callback
+        overrides this method (it is a no-op in the base class).  Requires
+        ``inner_steps=1`` and no Bayesian models.
+
+        Keyword Args:
+            grads: Parameter gradient pytree ``{lid: model_params}``.
+            trainable: Current trainable parameter pytree.
+            context: Domain context (current batch).
+            rng: Current JAX PRNG key (Python-side; not consumed here).
+            epoch (int): Current outer epoch (Python integer, 0-indexed).
+            total_loss: The scalar loss at this step, as descended.
+            individual_losses: Per-entry values, one per ``jno.core`` constraint entry --
+                **including** any ``jno.le``/``jno.ge`` inequality constraints, which are
+                evaluated with everything else but held out of ``total_loss``. A constrained
+                optimiser reads its ``g_j`` here rather than recomputing them.
+
+        Returns:
+            Modified ``grads`` dict, or ``None`` to leave unchanged.
+        """
         import jax
         import jax.numpy as jnp
 
@@ -278,8 +409,63 @@ def geometric_decay(param: Any, gamma: float, *, start: float = 1.0, minimum: fl
     return GeometricDecay(param, gamma, start=start, minimum=minimum)
 
 
+# docstring-from: jno.optimizers.continuation.heaviside_continuation
 class HeavisideContinuation(_Callback):
-    """Ramp a projection sharpness from ``start`` to ``maximum``. See :func:`heaviside_continuation`."""
+    """Sharpen a density projection over a declared number of iterations.
+
+    A smoothed-Heaviside projection (see :func:`jno.np.heaviside`) is only useful if its sharpness
+    rises: at ``beta = 1`` it barely projects, and starting at the final ``beta`` gives the optimiser
+    a near-step map to descend through and it stalls in the first grey design it finds. The standard
+    answer is continuation, and this is it.
+
+    **The ramp is keyed to this callback's own invocation count, never to ``epoch``.** That is the
+    whole design and it is not a detail: ``epoch`` is per-``solve()``-call, so a schedule reading it
+    ramps once per CHUNK and the physics then depends on how the driver loop was written. Measured on
+    a 3-D bracket, the same 250-iteration run reached ``beta`` 10.8 at ``CHUNK=10`` and 1.6 at
+    ``CHUNK=50``, with ``M_nd`` 0.008 against 0.078 -- two different optimisations wearing the same
+    configuration. Counting invocations is chunk-independent by construction: ``solve(1)`` five times
+    and ``solve(5)`` once give the identical ramp.
+
+    ``over`` is **required and cannot be inferred**. ``on_solve_begin`` does not carry the run
+    length, and a driver that also stops on a wall clock does not know it either until it stops --
+    so any inference would be wrong exactly where it matters, on the short run. Pass the
+    fraction-of-the-run form directly, ``over=int(0.8 * ITERS)``, which is what the schedule means.
+
+    Register it BEFORE any callback that reads the projected density, so they see the current value:
+    callbacks fire in list order, each seeing the previous one's ``grads``. With
+    :func:`simp_continuation` that is::
+
+        beta = jno.np.parameter((1,), name="beta")
+        beta.dtype(jnp.float64)
+        beta.initialize(lambda k, sh, dtype=None: jnp.full(sh, 1.0))
+        beta.optimizer(optax.sgd(1.0))
+
+        hv = jno.optimizers.heaviside_continuation(beta, maximum=16.0, over=int(0.8 * ITERS))
+        sc = jno.optimizers.simp_continuation(penal, rho, physical=lambda r: hv.project(patch(r)))
+        crux.solve(CHUNK, callbacks=[hv, sc])
+
+    Give the parameter ``optax.sgd(1.0)`` and initialise it to ``start``; this hook writes it
+    directly, the same way :class:`SIMPContinuation` writes ``penal``.
+
+    **Scope note.** ``penal`` and ``beta`` both binarise, by different means -- SIMP makes grey
+    expensive, projection makes it unreachable. The paper's schedule raises ``penal`` only. Running
+    both is legitimate and is what a Heaviside topology optimisation usually does, but they compound,
+    so watch ``M_nd`` rather than assuming the two are independent.
+
+    Args:
+        param: The scalar ``jno.np.parameter`` used as ``beta``.
+        start: Initial sharpness. Must match the parameter's initializer. ``1.0`` is nearly linear.
+        maximum: Final sharpness, held once the ramp saturates.
+        over: Iterations from ``start`` to ``maximum``. Required.
+        hold: Iterations at ``start`` before the ramp begins, so the topology can form first.
+        schedule: ``"geometric"`` (default, multiplicative in beta) or ``"linear"``.
+
+    Attributes:
+        value: The current sharpness.
+        progress: Position along the ramp, ``[0, 1]``.
+        saturated: Whether ``maximum`` has been reached.
+        history: One entry per invocation.
+    """
 
     def __init__(
         self,
@@ -322,6 +508,7 @@ class HeavisideContinuation(_Callback):
 
     @property
     def saturated(self) -> bool:
+        """Whether the ramp has reached ``maximum``."""
         return self.progress >= 1.0
 
     def project(self, rho):
@@ -329,12 +516,45 @@ class HeavisideContinuation(_Callback):
 
         ``simp_continuation(physical=...)`` measures ``M_nd`` on the physical density and cannot see
         a map that lives in the trace, so hand it ``lambda r: hv.project(patch(r))``.
+
+        Args:
+            rho: the density (array) to project.
+
+        Returns:
+            The projected density.
         """
         from ..trace import heaviside as _heaviside
 
         return _heaviside(rho, self.value)
 
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_before_update
     def on_before_update(self, *, grads, epoch, **kw):
+        """Called between gradient computation and the optimizer update.
+
+        Subclasses may return a modified ``grads`` dict to redirect the
+        optimizer (e.g. to apply a preconditioner), or ``None`` to leave the
+        gradients unchanged.  The returned dict must have the same pytree
+        structure as ``grads``.
+
+        Called only when the solver detects that at least one active callback
+        overrides this method (it is a no-op in the base class).  Requires
+        ``inner_steps=1`` and no Bayesian models.
+
+        Keyword Args:
+            grads: Parameter gradient pytree ``{lid: model_params}``.
+            trainable: Current trainable parameter pytree.
+            context: Domain context (current batch).
+            rng: Current JAX PRNG key (Python-side; not consumed here).
+            epoch (int): Current outer epoch (Python integer, 0-indexed).
+            total_loss: The scalar loss at this step, as descended.
+            individual_losses: Per-entry values, one per ``jno.core`` constraint entry --
+                **including** any ``jno.le``/``jno.ge`` inequality constraints, which are
+                evaluated with everything else but held out of ``total_loss``. A constrained
+                optimiser reads its ``g_j`` here rather than recomputing them.
+
+        Returns:
+            Modified ``grads`` dict, or ``None`` to leave unchanged.
+        """
         import jax
         import jax.numpy as jnp
 

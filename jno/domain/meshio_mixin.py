@@ -122,12 +122,21 @@ class MeshIOMixin(MeshUtils):
 
         The output can be opened in ParaView, PyVista, or many browser-based
         viewers that support VTK-compatible formats.
+
+        Args:
+            save_path: the output file.
+            file_format: a ``meshio`` format name (``"vtk"``, ``"vtu"``); ``None`` infers it from the extension.
         """
         self._write_meshio_safely(save_path, file_format=file_format)
         self.log.info(f"Saved mesh to {save_path}")
 
     def export_msh(self, save_path: str = "./runs/domain.msh", file_format: str = "gmsh22"):
-        """Export the current mesh to Gmsh .msh format."""
+        """Export the current mesh to Gmsh ``.msh`` format.
+
+        Args:
+            save_path: the output file.
+            file_format: the ``meshio`` Gmsh variant, ``"gmsh22"`` (default, widest compatibility) or ``"gmsh"`` (4.1).
+        """
         self._write_meshio_safely(save_path, file_format=file_format)
         self.log.info(f"Saved mesh to {save_path}")
 
@@ -145,6 +154,12 @@ class MeshIOMixin(MeshUtils):
         - vtk/vtu: VTK mesh export
         - msh: Gmsh mesh export
         - html/htm: interactive browser view via Plotly
+
+        Args:
+            save_path: the output file.
+            fmt: the format; ``None`` takes it from the extension.
+            show_sampled: overlay the sampled collocation points. (images and HTML).
+            figsize: figure size in inches (images).
         """
         import os
 
@@ -177,7 +192,13 @@ class MeshIOMixin(MeshUtils):
         figsize: Tuple[int, int] = (10, 8),
         show_sampled: bool = True,
     ):
-        """Plot the actual mesh (elements), optionally overlaying sampled points."""
+        """Plot the mesh (elements), optionally overlaying the sampled points, and save it.
+
+        Args:
+            save_path: the image file.
+            figsize: figure size in inches.
+            show_sampled: overlay the sampled collocation points.
+        """
         import os
 
         import matplotlib.pyplot as plt
@@ -281,6 +302,10 @@ class MeshIOMixin(MeshUtils):
         """Export an interactive mesh visualization as HTML (Plotly).
 
         Open the generated HTML in any browser to rotate/pan/zoom.
+
+        Args:
+            save_path: the HTML file.
+            show_sampled: overlay the sampled collocation points.
         """
         import os
 
