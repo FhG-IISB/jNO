@@ -1136,6 +1136,18 @@ def _frozen_field_basis_index(node, fields, field_index):
     )
 
 
+def _unindexed_parameter_use(node, name, parent_indexes=False):
+    """True if runtime parameter ``name`` occurs in ``node`` other than as the direct operand of an
+    index (``k[i]``), i.e. used whole."""
+    from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+    from .solver_helper import iter_children
+
+    if _is_runtime_scalar_parameter(node) and _parameter_name(node) == name:
+        return not parent_indexes
+    indexes = getattr(node, "getitem_key", None) is not None
+    return any(_unindexed_parameter_use(c, name, indexes) for c in iter_children(node) or ())
+
+
 def _declared_parameter_size(expr):
     """Number of components a runtime parameter was declared with, or ``None`` if unreadable.
 
@@ -1607,30 +1619,29 @@ def assemble_fem_native(
 
     refuse_space_field_parameters(_rt_param_exprs, "nodal Lagrange")
 
-    # A BARE (non-field) runtime parameter is packed as a single scalar -- ``flat[:1]`` in
-    # ``_runtime_vals`` below -- and read back as one. A multi-component one therefore had every entry
-    # past the first SILENTLY DISCARDED: `parameter((2,))` initialised to [2.0, 999.0] and to
-    # [2.0, 0.001] assembled bit-identical operators. Indexing it (`k[1] * ...`, the natural spelling
-    # for an anisotropic coefficient) instead died deep in the trace layer on a bare
-    # ``IndexError: array is 0-dimensional``, naming nothing the user wrote.
-    #
-    # Refuse it here, where the declared shape is still visible. Only when the size is *known* to
-    # exceed one: a shape this cannot read stays on the existing path rather than becoming a false
-    # refusal. Field (nodal) and cell (P0) parameters are exempt -- they are many-valued by
-    # construction and have their own gather.
+    # A VECTOR parameter (bare, declared with more than one component) reaches the kernel whole and is
+    # read component by component, ``k[0] * ui.x * vi.x + k[1] * ui.y * vi.y``: one vector lets one
+    # optimiser see every component jointly. Used whole it has no meaning in a scalar form (it would
+    # broadcast a vector into every quadrature value; it used to be truncated silently to its first
+    # entry), so every occurrence must be indexed. Only a size *known* to exceed one counts: a shape
+    # this cannot read stays on the scalar path. Field (nodal) and cell (P0) parameters are
+    # many-valued by construction and have their own gather.
+    _vector_param_sizes: Dict[str, int] = {}
     for _pname in runtime_parameter_tags:
         if _pname in _field_param_names or _pname in _cell_field_names:
             continue
         _psize = _declared_parameter_size(_rt_param_exprs.get(_pname))
         if _psize is not None and _psize > 1:
+            _vector_param_sizes[_pname] = _psize
+    for _pname, _psize in _vector_param_sizes.items():
+        _all_terms = [*volume_terms, *(e for _exprs in boundary_terms.values() for e in _exprs)]
+        if any(_unindexed_parameter_use(t, _pname) for t in _all_terms):
             raise NotImplementedError(
-                f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components, but a "
-                "bare (non-field) parameter reaches the element kernel as a single scalar -- the "
-                "remaining components would be silently dropped, and indexing it (k[1]) fails inside the "
-                "trace layer. Use one scalar parameter per component (`kx = jno.np.parameter((1,)); ky = "
-                "jno.np.parameter((1,))`, then `kx * ui.x * vi.x + ky * ui.y * vi.y`), or a FIELD "
-                "parameter `jno.np.parameter(<P1 symbol>)` for one value per node."
+                f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components and is "
+                "used whole in a scalar form. Index it, k[i] for component i (e.g. "
+                "`k[0] * ui.x * vi.x + k[1] * ui.y * vi.y`), or declare it with one component."
             )
+    vector_parameter_tags: Tuple[str, ...] = tuple(sorted(_vector_param_sizes))
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
     # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is
@@ -2864,12 +2875,15 @@ def assemble_fem_native(
                 _w = (
                     int(cells_j.shape[1])  # P1 nodes per cell -- the space a field parameter lives on
                     if (name in _field_param_names and name not in _cell_field_names)
-                    else 1
+                    else _vector_param_sizes.get(name, 1)
                 )
                 pv.append(jnp.zeros((_w,), dtype))
                 continue
             flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
-            if name in _cell_field_names:
+            if name in _vector_param_sizes:
+                # The whole vector, every cell alike; the kernel indexes it (a scalar placeholder broadcasts).
+                pv.append(jnp.broadcast_to(flat, (_vector_param_sizes[name],)))
+            elif name in _cell_field_names:
                 # P0 -> this cell's single value. Width 1, so the kernel takes its scalar branch and
                 # broadcasts it over the quad points -- which is what a per-element constant is.
                 pv.append(jnp.reshape(flat[c], (1,)))
@@ -2971,6 +2985,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, "cell_size": h_qp, "cell_metric": G_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": rnames,
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype) + cell_masks,
             "trial_value_shape": fields[tfi]["value_shape"],
@@ -3076,6 +3091,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, "cell_size": h_qp, "cell_metric": G_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": rnames,
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype)
             + tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames),
@@ -3400,6 +3416,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, f"n_{region}": n_vec},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": (),
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
             # This face's 0/1 value for every tag the boundary terms reference, so `TagMask` resolves
@@ -3475,6 +3492,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, f"n_{region}": n_vec},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": (),
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
             "trial_value_shape": fields[0]["value_shape"],

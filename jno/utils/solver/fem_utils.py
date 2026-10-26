@@ -939,6 +939,9 @@ def _runtime_parameter_value_from_internal_vars(local, name):
         return None
     arr = jnp.asarray(volume_vars[idx])
     flat = jnp.reshape(arr, (-1,))
+    # Vector parameter: the whole vector; the form indexes it (k[i]) to a scalar coefficient.
+    if name in local.get("vector_parameter_tags", ()):
+        return flat
     # Scalar coefficient (incl. per-cell-constant): one value -> broadcast to quad.
     if flat.shape[0] == 1:
         return flat[0]
