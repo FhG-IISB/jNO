@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import weakref as _weakref
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
 import cloudpickle
 import jax.numpy as jnp
@@ -27,6 +27,14 @@ from .mesh_utils import VOLUME_BLOCKS_BY_DIM, mesh_cell_region_membership
 from .mesh_utils import base_cell_type as _base_cell_type
 from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
+
+if TYPE_CHECKING:
+    from ..trace import ModelCall
+    from ..trace.views import ComplexPair
+
+    #: what ``domain.unknown(...)`` returns: a valued P1 nodal field (``ModelCall``, solvable by ``jno.fdm``
+    #: too), an FEM-only trial symbol (other spaces and orders, or ``constant=True``), or a complex pair
+    Unknown = Union[ModelCall, TrialFunction, ComplexPair]
 
 #: The space-filling cell blocks of each dimension. A mesh is expected to carry exactly one.
 #: Re-exported from :mod:`jno.domain.mesh_utils`, which is where the canonical list lives now that
@@ -644,7 +652,7 @@ class _UnknownNamespace:
 
     def __call__(
         self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False, constant=False
-    ):
+    ) -> "Unknown":
         return self._domain._make_unknown(
             value_shape=value_shape,
             name=name,
@@ -655,15 +663,15 @@ class _UnknownNamespace:
             constant=constant,
         )
 
-    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
         """A scalar unknown, ``value_shape=()``. ``constant=True``: ONE value over the whole domain."""
         return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant)
 
-    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False):
+    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
         """A vector unknown with ``n`` components, ``value_shape=(n,)``. ``constant=True``: one vector."""
         return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant)
 
-    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False):
+    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False) -> "Unknown":
         """An ``n x m`` matrix unknown. ``symmetric=True`` (square only) stores the ``n(n+1)/2`` upper-triangle
         values per node while the symbol behaves as the full matrix in every expression. ``constant=True``:
         one matrix over the whole domain."""
@@ -2182,7 +2190,7 @@ class domain(MeshIOMixin):
 
     def _make_unknown(
         self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False, constant=False
-    ):
+    ) -> "Unknown":
         """Build an unknown -- see :attr:`unknown`."""
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
