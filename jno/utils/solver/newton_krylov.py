@@ -1060,13 +1060,28 @@ def newton_direct(
         factorizations=_nfact,
     )
 
+    from .linear import sparse_lu_solve
+
+    def _lu_rescued(A, rhs):
+        """``linear_solve(A, rhs)``, re-solved by sparse LU when it missed. Only the implicit-diff tangent takes
+        this: it IS the gradient, and with the tangent assembled an exact solve is always at hand. An iterative
+        solve that converges on ``J`` can still fail on ``Jᵀ`` -- measured on a conduction + enclosure-radiation
+        tangent: Jacobi-BiCGStab and its Jacobi-GMRES rescue both left relative residual 2.4 on the adjoint,
+        while sparse LU solved it. A healthy solve pays one SpMV for the check."""
+        x = linear_solve(A, rhs)
+        if linear_solve is sparse_lu_solve or not hasattr(A, "indices"):  # already exact, or a dense matrix
+            return x
+        eps = float(jnp.finfo(rhs.dtype).eps)
+        r_rel = jnp.linalg.norm(A @ x - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
+        return jax.lax.cond(r_rel < max(1e-8, 1e4 * eps), lambda: x, lambda: sparse_lu_solve(A, rhs))
+
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
         J = jacobian_fn(root)
         # Gated on both sides like the Krylov tangents: a direct solve fails differently (a singular
         # or near-singular tangent, not a step cap) but fails just as quietly, and the transpose is
         # the half no caller ever inspects.
-        fwd = lambda _mv, rhs: _gated_direct(J, rhs, linear_solve, "the newton_direct tangent", "forward")  # noqa: E731
-        tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, linear_solve, "the newton_direct tangent", "transpose")  # noqa: E731
+        fwd = lambda _mv, rhs: _gated_direct(J, rhs, _lu_rescued, "the newton_direct tangent", "forward")  # noqa: E731
+        tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, _lu_rescued, "the newton_direct tangent", "transpose")  # noqa: E731
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
     if info is not None:

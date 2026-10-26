@@ -119,3 +119,29 @@ def test_bare_direct_newton_without_a_tangent_goes_dense_and_says_so(capfd):
     w = jno.solve.newton(direct=True)(lambda w: w**3 + w - 2.0, jnp.zeros(3))
     np.testing.assert_allclose(np.asarray(w), 1.0, rtol=1e-8)  # Newton stops at |r| < atol = 1e-8
     assert "materialised DENSE" in capfd.readouterr().out
+
+
+def test_direct_newton_gradient_is_exact_when_the_iterative_tangent_solve_misses():
+    """The implicit-diff tangent re-solves by sparse LU when the configured solve misses. Here the solve is a
+    single Jacobi sweep: good enough to drive Newton to the root (slowly), far too loose for the gradient, which
+    must still be exactly ``J^-T`` applied to the cotangent."""
+    import jax.experimental.sparse as jsparse
+
+    from jno.utils.solver.newton_krylov import newton_direct
+
+    rng = np.random.default_rng(1)
+    n = 6
+    A = np.diag(np.full(n, 4.0)) + rng.uniform(-0.5, 0.5, (n, n))  # non-symmetric, diagonally dominant
+    A = jnp.asarray(A)
+    jac = lambda w: jsparse.BCOO.fromdense(A + jnp.diag(3.0 * w**2), nse=n * n)  # noqa: E731
+    jacobi_sweep = lambda J, b: b / J.todense().diagonal()  # noqa: E731
+
+    def solve(b):
+        return newton_direct(lambda w: A @ w + w**3 - b, jac, jnp.zeros(n), linear_solve=jacobi_sweep,
+                             rtol=0.0, atol=1e-12, max_steps=500)  # fmt: skip
+
+    b = jnp.asarray(rng.uniform(1.0, 2.0, n))
+    u = solve(b)
+    g = np.asarray(jax.grad(lambda bb: jnp.sum(solve(bb)))(b))
+    J = np.asarray(A) + np.diag(3.0 * np.asarray(u) ** 2)
+    np.testing.assert_allclose(g, np.linalg.solve(J.T, np.ones(n)), rtol=1e-10)
