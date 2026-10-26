@@ -2817,7 +2817,25 @@ class FEM:
                 et._result = None
 
     # docstring-from: jno._fem.FEM._solve_inner
-    def solve(self, *args, **kwargs):
+    def solve(
+        self,
+        solve_fn=None,
+        *,
+        adapt=None,
+        checkpoint=None,
+        contact=None,
+        continuation=None,
+        x0=None,
+        nonlinear=None,
+        linear=None,
+        precond=None,
+        time=None,
+        tau=None,
+        basis=None,
+        shard=None,
+        profile=False,
+        **kwargs,
+    ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
         Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
@@ -2989,9 +3007,30 @@ class FEM:
 
         from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
 
+        # Forward only what was given: the defaults are `_solve_inner`'s own, and the coupled path below has
+        # to tell an argument the caller passed from one left at its default.
+        slots = dict(
+            adapt=adapt,
+            checkpoint=checkpoint,
+            contact=contact,
+            continuation=continuation,
+            x0=x0,
+            nonlinear=nonlinear,
+            linear=linear,
+            precond=precond,
+            time=time,
+            tau=tau,
+            basis=basis,
+            shard=shard,
+        )
+        given = {k: v for k, v in slots.items() if v is not None}
+        if profile:
+            given["profile"] = profile
+        args = () if solve_fn is None else (solve_fn,)
+
         _em = peec_source_of(self)
         if _em is not None:
-            extra = sorted(set(kwargs) - {"tol", "max_iter"})
+            extra = sorted((set(kwargs) - {"tol", "max_iter"}) | set(given))
             if args or extra:
                 raise ValueError(
                     "jno.fem: this problem is heated by a jno.peec network's `em.loss`, so its solve is the "
@@ -3010,7 +3049,7 @@ class FEM:
         prev_linear = _nk._LINEAR_FORM[0]
         _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
         try:
-            out = self._solve_inner(*args, **kwargs)
+            out = self._solve_inner(*args, **given, **kwargs)
         finally:
             _nk._LINEAR_FORM[0] = prev_linear
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
@@ -3445,12 +3484,6 @@ class FEM:
         from .utils.profiling import profile_solve
 
         return profile_solve(_run_with_stats, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
-
-    # `solve` is a thin timing/logging wrapper, so its own signature is `(*args, **kwargs)` -- which
-    # erased every solver slot from `help(fem.solve)`, IDE completion and `inspect.signature` (a test
-    # asserting `shard=` is accepted failed on exactly that). `__wrapped__` points `inspect.signature`
-    # at the real one; the docstring is copied into the source by tools/sync_docstrings.py.
-    solve.__wrapped__ = _solve_inner
 
     #: relative residual of the FULL system above which a ``basis=`` solve is refused. Not a tuning
     #: knob: at this size the basis does not span the solution at all (a modelling error), rather than
