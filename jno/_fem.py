@@ -5012,6 +5012,7 @@ class FEM:
         from .trace import FunctionCall
         from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 
+        expr = _lower_unknowns(expr)  # a `domain.unknown()` field is the trial here, not a coefficient
         bare = getattr(expr, "expr", expr)
         op = getattr(self, "operator", None)
         declared = dict(getattr(op, "runtime_parameter_exprs", None) or {})
