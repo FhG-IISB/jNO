@@ -96,12 +96,8 @@ class Callback:
         """
         return None
 
-    def on_training_end(self, **kwargs) -> None:
+    def on_training_end(self) -> None:
         """Called once after the training loop ends (also after an early stop).
-
-        Args:
-            **kwargs: none are passed today (``core.solve`` calls ``on_training_end()``); accepted so
-                a later version can add context without breaking existing callbacks.
 
         Returns:
             None.
@@ -310,12 +306,8 @@ class CheckpointCallback(Callback):
             self._log_wandb_histograms(trainable, epoch)
 
     # docstring-from: jno.utils.adaptive.callbacks.Callback.on_training_end
-    def on_training_end(self, **kwargs) -> None:
+    def on_training_end(self) -> None:
         """Called once after the training loop ends (also after an early stop).
-
-        Args:
-            **kwargs: none are passed today (``core.solve`` calls ``on_training_end()``); accepted so
-                a later version can add context without breaking existing callbacks.
 
         Returns:
             None.

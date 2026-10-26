@@ -655,7 +655,6 @@ class TraceEvaluator:
         context: Dict[str, jnp.ndarray] = None,
         var_bindings: Dict = None,
         key=None,
-        active_region=None,
     ) -> jnp.ndarray:
         """Evaluate an expression for a SINGLE batch (no batch dimension).
 
@@ -665,7 +664,6 @@ class TraceEvaluator:
             var_bindings: substitutions ``{id(Variable): node}`` applied while evaluating (used by kernel
                 integrals and point evaluations); empty for an ordinary evaluation.
             key: PRNG key for noise nodes.
-            active_region: unused; the region is resolved from the expression.
 
         Returns:
             jnp.ndarray: the value, ``(N,)`` or ``(N, K)``.

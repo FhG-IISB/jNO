@@ -788,7 +788,7 @@ class Rcwa:
             fn = self._core_jit = jax.jit(core)
         return fn(grids, thick, jnp.asarray(wl), jnp.asarray(kin), tuple(jnp.asarray(p) for p in pol))
 
-    def solve(self, inc=None, wavelength=None, k_in=None, layers=None, source=None, polarization=None):
+    def solve(self, *, wavelength=None, k_in=None, layers=None, source=None, polarization=None):
         """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
         not conserved.
 
@@ -800,8 +800,6 @@ class Rcwa:
         plane-wave incidence -- see :meth:`_solve_source`; it returns an :class:`_EmitterSol`.
 
         Args:
-            inc: unused (accepted for backward compatibility; the incidence is set by ``k_in`` and
-                ``polarization``).
             wavelength: free-space wavelength; overrides the construction value.
             k_in: transverse incident wavevector; overrides the construction value.
             layers: ``[(thickness, eps), ...]`` replacing the stack for this solve (JAX arrays allowed).

@@ -960,7 +960,7 @@ class TraceCompiler:
         )
 
     @staticmethod
-    def build_single_layer_params(layer, arg_shapes, rng, logger):
+    def build_single_layer_params(layer, rng, logger):
         """Retrieve or construct the model for a single layer.
 
         The model was already fully constructed at factory time — we just
@@ -968,8 +968,7 @@ class TraceCompiler:
 
         Args:
             layer: the :class:`Model` node.
-            arg_shapes: shapes of the layer's call arguments (unused for Equinox modules).
-            rng: PRNG key (unused for Equinox modules, which are built eagerly).
+            rng: PRNG key for a callable initializer that was given no key of its own.
             logger: the jNO logger to report to.
 
         Returns:
@@ -1073,7 +1072,7 @@ class TraceCompiler:
                 seen.add(layer.layer_id)
 
                 rng, init_rng = jax.random.split(rng)
-                model = TraceCompiler.build_single_layer_params(layer, None, init_rng, logger)
+                model = TraceCompiler.build_single_layer_params(layer, init_rng, logger)
                 all_models[layer.layer_id] = model
 
         return all_models, rng

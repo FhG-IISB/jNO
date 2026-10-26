@@ -4774,7 +4774,7 @@ class FEM:
             return self
         return fem(self._constraints, _dd_overlap=True, **(getattr(self, "_fem_kwargs", None) or {}))
 
-    def pinned_solver(self, node_ids, *, nonlinear=None):
+    def pinned_solver(self, node_ids):
         """A reusable ``f(values) -> field`` that solves the linear system with ``node_ids`` pinned to
         ``values`` (row-replacement) — the interface Dirichlet data a coupled Schwarz step supplies. The
         (fixed) matrix is prefactored once; each iteration only re-solves against a new right-hand side.
@@ -4782,7 +4782,6 @@ class FEM:
 
         Args:
             node_ids: the DOFs to pin.
-            nonlinear: unused; reserved for a nonlinear variant.
 
         Returns:
             Callable: ``f(values) -> field``.

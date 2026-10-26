@@ -804,12 +804,8 @@ class MMACallback(_Callback):
         return out
 
     # docstring-from: jno.utils.adaptive.callbacks.Callback.on_training_end
-    def on_training_end(self, **kwargs):
+    def on_training_end(self):
         """Called once after the training loop ends (also after an early stop).
-
-        Args:
-            **kwargs: none are passed today (``core.solve`` calls ``on_training_end()``); accepted so
-                a later version can add context without breaking existing callbacks.
 
         Returns:
             None.

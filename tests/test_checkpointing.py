@@ -373,7 +373,7 @@ class TestCheckpointCallback:
         net = jno.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
         net.initialize(str(ckpt_dir / str(latest_step)))
 
-        loaded_model = TraceCompiler.build_single_layer_params(net, None, key, logging.getLogger(__name__))
+        loaded_model = TraceCompiler.build_single_layer_params(net, key, logging.getLogger(__name__))
 
         expected_leaves = jax.tree_util.tree_leaves(eqx.filter(reference_model, eqx.is_array))
         loaded_leaves = jax.tree_util.tree_leaves(eqx.filter(loaded_model, eqx.is_array))
@@ -412,7 +412,7 @@ class TestCheckpointCallback:
         net = jno.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
         net.initialize(str(ckpt_dir))
 
-        loaded_model = TraceCompiler.build_single_layer_params(net, None, key, logging.getLogger(__name__))
+        loaded_model = TraceCompiler.build_single_layer_params(net, key, logging.getLogger(__name__))
 
         expected_leaves = jax.tree_util.tree_leaves(eqx.filter(reference_model, eqx.is_array))
         loaded_leaves = jax.tree_util.tree_leaves(eqx.filter(loaded_model, eqx.is_array))
@@ -446,7 +446,7 @@ class TestCheckpointCallback:
         logger = logging.getLogger(__name__)
         caplog.clear()
         with caplog.at_level(logging.INFO, logger=logger.name):
-            TraceCompiler.build_single_layer_params(net, None, key, logger)
+            TraceCompiler.build_single_layer_params(net, key, logger)
 
         messages = [record.getMessage() for record in caplog.records]
         assert any(msg.startswith("Orbax checkpoint:") and "params matched" in msg for msg in messages)
