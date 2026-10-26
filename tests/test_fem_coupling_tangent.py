@@ -103,7 +103,9 @@ def test_gradient_through_the_direct_newton_matches_finite_differences():
     d, u, gap, Q, conduction, walls = _rings()
     k = jno.np.parameter((1,), name="k")
     fem = jno.fem([conduction(k), gap.load(Q @ gap.field(u) ** 4), *walls])
-    nl = jno.solve.newton(direct=True, rtol=0.0, atol=1e-10)
+    # atol=1e-8 is ~6e-14 of ||r(x0)|| = 1.7e5; the residual floor at the root is ~2e-10 (1e-15 relative), so
+    # the 1e-10 this used to ask for was below round-off and passed only when an iterate happened to dip under it.
+    nl = jno.solve.newton(direct=True, rtol=0.0, atol=1e-8)
     x0 = jnp.full(fem.dofs, 600.0)
     mean_T = lambda kv: jnp.mean(fem.solve(x0=x0, nonlinear=nl, k=jnp.reshape(kv, (1,))))  # noqa: E731
     k0, h = 20.0, 1e-3
